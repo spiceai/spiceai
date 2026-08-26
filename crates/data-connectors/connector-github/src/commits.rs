@@ -23,6 +23,7 @@ use super::{
     filter_pushdown, inject_parameters, scalar_utf8_value,
 };
 use crate::github::{GithubRef, GithubRestClient, error_checker};
+use crate::identity::{insert_identity_into_rows, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use connector_graphql::graphql::{
     ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
@@ -155,7 +156,11 @@ impl GitHubTableArgs for CommitsTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             Some(COMMITS_JSON_POINTER),
-            UnnestBehavior::Custom(Box::new(custom_unnestter)),
+            UnnestBehavior::Custom({
+                let owner = self.owner.clone();
+                let repo = self.repo.clone();
+                Box::new(move |object: &Value| custom_unnestter(object, &owner, &repo))
+            }),
             Some(gql_schema()),
         )
     }
@@ -766,7 +771,7 @@ fn inject_commit_ref_parameter(
     ))
 }
 
-fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
+fn custom_unnestter(object: &Value, owner: &str, repo: &str) -> Result<Vec<Value>> {
     let Value::Object(repository) = object else {
         return Ok(Vec::new());
     };
@@ -809,8 +814,9 @@ fn custom_unnestter(object: &Value) -> Result<Vec<Value>> {
             );
         }
 
-        let flattened =
+        let mut flattened =
             unnest_json_object_to_depth(Value::Object(commit), 1, &DuplicateBehavior::Error)?;
+        insert_identity_into_rows(&mut flattened, owner, Some(repo));
         commits.extend(flattened);
     }
 
@@ -850,7 +856,7 @@ fn extract_associated_pull_request_number(value: &Value) -> Value {
 }
 
 fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new("sha", DataType::Utf8, true),
         Field::new("id", DataType::Utf8, true),
         Field::new("ref", DataType::Utf8, true),
@@ -876,7 +882,11 @@ fn gql_schema() -> SchemaRef {
         Field::new("changed_files", DataType::Int64, true),
         Field::new("associated_pull_request_number", DataType::Int64, true),
         Field::new("status", DataType::Utf8, true),
-    ]))
+    ];
+
+    push_identity_fields(&mut fields, true);
+
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -966,39 +976,48 @@ mod tests {
 
     #[test]
     fn test_custom_unnester_inserts_ref_and_flattens_pr_number() {
-        let rows = custom_unnestter(&json!({
-            "default_ref": {
-                "ref": "main"
-            },
-            "selected_ref": {
-                "ref": "trunk",
-                "target": {
-                    "history": {
-                        "nodes": [
-                            {
-                                "sha": "abc123",
-                                "status": {
-                                    "status": "SUCCESS"
-                                },
-                                "authorName": {
-                                    "author_name": "Alice"
-                                },
-                                "associated_pull_request_number": {
-                                    "nodes": [
-                                        { "number": 42 }
-                                    ]
+        let rows = custom_unnestter(
+            &json!({
+                "default_ref": {
+                    "ref": "main"
+                },
+                "selected_ref": {
+                    "ref": "trunk",
+                    "target": {
+                        "history": {
+                            "nodes": [
+                                {
+                                    "sha": "abc123",
+                                    "status": {
+                                        "status": "SUCCESS"
+                                    },
+                                    "authorName": {
+                                        "author_name": "Alice"
+                                    },
+                                    "associated_pull_request_number": {
+                                        "nodes": [
+                                            { "number": 42 }
+                                        ]
+                                    }
                                 }
-                            }
-                        ]
+                            ]
+                        }
                     }
                 }
-            }
-        }))
+            }),
+            "spiceai",
+            "spiceai",
+        )
         .expect("custom unnest should succeed");
 
         assert_eq!(rows.len(), 1);
         let row = rows[0].as_object().expect("row should be an object");
         assert_eq!(row.get("ref"), Some(&Value::String("trunk".to_string())));
+        assert_eq!(
+            row.get("owner"),
+            Some(&Value::String("spiceai".to_string()))
+        );
+        assert_eq!(row.get("repo"), Some(&Value::String("spiceai".to_string())));
         assert_eq!(
             row.get("author_name"),
             Some(&Value::String("Alice".to_string()))
@@ -1012,12 +1031,16 @@ mod tests {
 
     #[test]
     fn test_custom_unnester_rejects_missing_requested_ref() {
-        let err = custom_unnestter(&json!({
-            "default_ref": {
-                "ref": "main"
-            },
-            "selected_ref": null
-        }))
+        let err = custom_unnestter(
+            &json!({
+                "default_ref": {
+                    "ref": "main"
+                },
+                "selected_ref": null
+            }),
+            "spiceai",
+            "spiceai",
+        )
         .expect_err("missing requested ref should fail");
 
         assert!(

@@ -46,9 +46,15 @@ use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
 use issues::IssuesTableArgs;
+use milestones::MilestonesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use release_assets::ReleaseAssetsTableArgs;
+use releases::ReleasesTableArgs;
+use repos::ReposTableArgs;
+use review_threads::ReviewThreadsTableArgs;
+use reviews::ReviewsTableArgs;
 use runtime_component::dataset::DatasetSpec;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
@@ -62,6 +68,7 @@ use token_provider::github_app_token::GitHubAppTokenProvider;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
+use users::UsersTableArgs;
 
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -72,14 +79,26 @@ use runtime_parameters::{ParameterSpec, Parameters};
 pub mod github;
 
 mod commits;
+mod identity;
 mod issues;
 mod members;
+mod milestones;
+mod nested_connection;
 mod projects;
 mod pull_requests;
 mod rate_limit;
+mod release_assets;
+mod releases;
+mod repos;
+mod review_threads;
+mod reviews;
 mod stargazers;
+mod users;
 mod workflow_runs;
 mod workflows;
+
+#[cfg(test)]
+mod test_util;
 
 type GitHubConcurrencyLimits = HashMap<String, (usize, Arc<Semaphore>)>;
 
@@ -331,15 +350,27 @@ impl Github {
                         format!("{endpoint}/repos/{owner}/{repo}/stargazers?per_page=1")
                     }
                     "files" => format!("{endpoint}/repos/{owner}/{repo}/git/trees/HEAD"),
+                    "releases" | "release_assets" => {
+                        format!("{endpoint}/repos/{owner}/{repo}/releases?per_page=1")
+                    }
+                    "milestones" => {
+                        format!("{endpoint}/repos/{owner}/{repo}/milestones?per_page=1")
+                    }
                     // Projects validation is handled during query execution via error_checker
                     // since classic projects API is deprecated and returns HTTP 410
                     "projects" => return Ok(()),
+                    // `reviews`, `review_threads` and `repo` all read from the
+                    // repository itself, which is what the fallback checks.
                     _ => format!("{endpoint}/repos/{owner}/{repo}"),
                 }
             } else {
                 // For organization resources
                 match resource_type {
                     "members" => format!("{endpoint}/orgs/{owner}/members?per_page=1"),
+                    // `/users/{login}` resolves an organization as well as a user,
+                    // so it validates both owner shapes.
+                    "user" => format!("{endpoint}/users/{owner}"),
+                    "repos" => format!("{endpoint}/users/{owner}/repos?per_page=1"),
                     // Projects validation is handled during query execution via error_checker
                     // since classic projects API is deprecated and returns HTTP 410
                     "projects" => return Ok(()),
@@ -439,6 +470,30 @@ impl Github {
             githubHealthCheck: organization(login: "{org}") {{
                 id
                 name
+            }}
+        }}"#
+        )
+    }
+
+    /// `repositoryOwner` resolves both an organization and a user, so this
+    /// serves an owner-level dataset that does not require an organization.
+    fn get_health_check_for_repository_owner(login: &str) -> String {
+        format!(
+            r#"{{
+            githubHealthCheck: repositoryOwner(login: "{login}") {{
+                id
+                login
+            }}
+        }}"#
+        )
+    }
+
+    fn get_health_check_for_user(login: &str) -> String {
+        format!(
+            r#"{{
+            githubHealthCheck: user(login: "{login}") {{
+                id
+                login
             }}
         }}"#
         )
@@ -1001,6 +1056,24 @@ impl std::str::FromStr for GitHubQueryMode {
     }
 }
 
+/// Warns when a dataset asks for a query mode its table does not implement.
+///
+/// Only `pulls` and `issues` translate filters into GitHub search qualifiers.
+/// Ignoring the setting silently would leave a user believing their `WHERE`
+/// clause is being pushed down to GitHub when the whole resource is being
+/// scanned instead.
+fn warn_if_search_mode_unsupported(
+    query_mode: &GitHubQueryMode,
+    table_type: &str,
+    connector_component: &ConnectorComponent,
+) {
+    if *query_mode == GitHubQueryMode::Search {
+        tracing::warn!(
+            "The parameter 'github_query_mode' is not supported for the {connector_component}, as a '{table_type}' table, so 'search' will be ignored and the whole resource read instead. Remove 'github_query_mode' from the dataset. For details, visit: {GITHUB_CONNECTOR_DOCS_URL}#common-parameters"
+        );
+    }
+}
+
 fn warn_if_provided(
     parameters: Vec<(&str, bool)>,
     table_type: &str,
@@ -1030,8 +1103,10 @@ const DEFAULT_MAX_COMMENTS_FETCHED: u32 = 25;
 /// node hard limit on a single GraphQL query.
 const MAX_COMMENTS_FETCHED: u32 = 75;
 
-// Organization-level resources (2 segments: owner/resource_type)
-const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects"];
+// Owner-level resources (2 segments: owner/resource_type). `owner` is an
+// organization for `members` and `projects`, and either an organization or a
+// user for `repos` and `user`.
+const ORG_LEVEL_RESOURCES: &[&str] = &["members", "projects", "repos", "user"];
 
 // Repository-level resources (3+ segments: owner/repo/resource_type[/...])
 const REPO_LEVEL_RESOURCES: &[&str] = &[
@@ -1042,6 +1117,12 @@ const REPO_LEVEL_RESOURCES: &[&str] = &[
     "projects",
     "files",
     "workflows",
+    "reviews",
+    "review_threads",
+    "releases",
+    "release_assets",
+    "milestones",
+    "repo",
 ];
 
 /// Parsed GitHub path components
@@ -1225,6 +1306,7 @@ impl DataConnector for Github {
             }
             ("commits", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "commits", &component);
+                warn_if_search_mode_unsupported(&query_mode, "commits", &component);
                 self.create_commits_table_provider(
                     parsed.owner,
                     repo,
@@ -1249,8 +1331,136 @@ impl DataConnector for Github {
                 )
                 .await
             }
+            ("reviews", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "reviews", &component);
+                warn_if_search_mode_unsupported(&query_mode, "reviews", &component);
+
+                let table_args = Arc::new(ReviewsTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: repo.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("review_threads", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "review_threads", &component);
+                warn_if_search_mode_unsupported(&query_mode, "review_threads", &component);
+
+                let table_args = Arc::new(ReviewThreadsTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: repo.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("releases", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "releases", &component);
+                warn_if_search_mode_unsupported(&query_mode, "releases", &component);
+
+                let table_args = Arc::new(ReleasesTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: repo.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("release_assets", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "release_assets", &component);
+                warn_if_search_mode_unsupported(&query_mode, "release_assets", &component);
+
+                let table_args = Arc::new(ReleaseAssetsTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: repo.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("milestones", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "milestones", &component);
+                warn_if_search_mode_unsupported(&query_mode, "milestones", &component);
+
+                let table_args = Arc::new(MilestonesTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: repo.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("repo", Some(repo)) => {
+                warn_if_provided(pull_request_specific_params, "repo", &component);
+                warn_if_search_mode_unsupported(&query_mode, "repo", &component);
+
+                let table_args = Arc::new(ReposTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: Some(repo.to_string()),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                )
+                .await
+            }
+            ("repos", None) => {
+                warn_if_provided(pull_request_specific_params, "repos", &component);
+                warn_if_search_mode_unsupported(&query_mode, "repos", &component);
+
+                let table_args = Arc::new(ReposTableArgs {
+                    owner: parsed.owner.to_string(),
+                    repo: None,
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_repository_owner(parsed.owner)
+                )
+                .await
+            }
+            ("user", None) => {
+                warn_if_provided(pull_request_specific_params, "user", &component);
+                warn_if_search_mode_unsupported(&query_mode, "user", &component);
+
+                let table_args = Arc::new(UsersTableArgs {
+                    login: parsed.owner.to_string(),
+                    component,
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    Some(table_args),
+                    Github::get_health_check_for_user(parsed.owner)
+                )
+                .await
+            }
             ("stargazers", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "stargazers", &component);
+                warn_if_search_mode_unsupported(&query_mode, "stargazers", &component);
 
                 let table_args = Arc::new(StargazersTableArgs {
                     owner: parsed.owner.to_string(),
@@ -1261,6 +1471,7 @@ impl DataConnector for Github {
             }
             ("files", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "files", &component);
+                warn_if_search_mode_unsupported(&query_mode, "files", &component);
                 self.create_files_table_provider(
                     parsed.owner,
                     repo,
@@ -1271,6 +1482,7 @@ impl DataConnector for Github {
             }
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
+                warn_if_search_mode_unsupported(&query_mode, "workflows", &component);
 
                 let client = self.create_rest_client().context(data_connector_api::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
@@ -1341,6 +1553,7 @@ impl DataConnector for Github {
             }
             ("projects", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
+                warn_if_search_mode_unsupported(&query_mode, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
                     owner: parsed.owner.to_string(),
                     repo: Some(repo.to_string()),
@@ -1355,6 +1568,7 @@ impl DataConnector for Github {
             }
             ("projects", None) => {
                 warn_if_provided(pull_request_specific_params, "projects", &component);
+                warn_if_search_mode_unsupported(&query_mode, "projects", &component);
                 let table_args = Arc::new(ProjectsTableArgs {
                     owner: parsed.owner.to_string(),
                     repo: None,
@@ -1369,6 +1583,7 @@ impl DataConnector for Github {
             }
             ("members", None) => {
                 warn_if_provided(pull_request_specific_params, "members", &component);
+                warn_if_search_mode_unsupported(&query_mode, "members", &component);
                 let table_args = Arc::new(MembersTableArgs {
                     org: parsed.owner.to_string(),
                     component,
@@ -1903,7 +2118,9 @@ mod tests {
         // remaining super:: in test is correct
         Github,
         GithubFactory,
+        ORG_LEVEL_RESOURCES,
         PARAMETERS,
+        REPO_LEVEL_RESOURCES,
         parse_github_path,
         sanitize_github_validation_body,
     };
@@ -2034,6 +2251,88 @@ mod tests {
         assert_eq!(parsed.repo, Some("spiceai"));
         assert_eq!(parsed.resource_type, "files");
         assert!(parsed.remaining.is_none());
+    }
+
+    #[test]
+    fn test_parse_github_path_resolves_the_review_tables() {
+        for resource_type in ["reviews", "review_threads"] {
+            let path = format!("github.com/spiceai/spiceai/{resource_type}");
+            let parsed = parse_github_path(&path).expect("path should parse");
+
+            assert_eq!(parsed.owner, "spiceai");
+            assert_eq!(parsed.repo, Some("spiceai"));
+            assert_eq!(parsed.resource_type, resource_type);
+            assert!(parsed.remaining.is_none());
+        }
+    }
+
+    #[test]
+    fn test_parse_github_path_resolves_the_release_and_milestone_tables() {
+        for resource_type in ["releases", "milestones"] {
+            let path = format!("github.com/spiceai/spiceai/{resource_type}");
+            let parsed = parse_github_path(&path).expect("path should parse");
+
+            assert_eq!(parsed.repo, Some("spiceai"));
+            assert_eq!(parsed.resource_type, resource_type);
+        }
+    }
+
+    /// The singular `repo` and `user` shapes return one row; the plural `repos`
+    /// shape pages over an owner. Keeping the two apart is what lets a
+    /// repository literally named `repos` still be addressed.
+    #[test]
+    fn test_parse_github_path_separates_the_singular_and_plural_repo_shapes() {
+        let single = parse_github_path("github.com/spiceai/repos/repo").expect("path should parse");
+        assert_eq!(single.owner, "spiceai");
+        assert_eq!(single.repo, Some("repos"));
+        assert_eq!(single.resource_type, "repo");
+
+        let all = parse_github_path("github.com/spiceai/repos").expect("path should parse");
+        assert_eq!(all.owner, "spiceai");
+        assert_eq!(all.repo, None);
+        assert_eq!(all.resource_type, "repos");
+    }
+
+    #[test]
+    fn test_parse_github_path_resolves_a_single_user() {
+        let parsed = parse_github_path("github.com/lukekim/user").expect("path should parse");
+
+        assert_eq!(parsed.owner, "lukekim");
+        assert_eq!(parsed.repo, None);
+        assert_eq!(parsed.resource_type, "user");
+    }
+
+    #[test]
+    fn every_dispatched_resource_is_reachable_from_a_path() {
+        // A resource missing from these lists parses as an invalid path and can
+        // never reach its match arm, so the two must be kept in step.
+        for resource_type in [
+            "pulls",
+            "issues",
+            "commits",
+            "stargazers",
+            "files",
+            "workflows",
+            "projects",
+            "reviews",
+            "review_threads",
+            "releases",
+            "release_assets",
+            "milestones",
+            "repo",
+        ] {
+            assert!(
+                REPO_LEVEL_RESOURCES.contains(&resource_type),
+                "'{resource_type}' has a repository-level match arm but no path entry"
+            );
+        }
+
+        for resource_type in ["members", "projects", "repos", "user"] {
+            assert!(
+                ORG_LEVEL_RESOURCES.contains(&resource_type),
+                "'{resource_type}' has an owner-level match arm but no path entry"
+            );
+        }
     }
 
     #[tokio::test]
