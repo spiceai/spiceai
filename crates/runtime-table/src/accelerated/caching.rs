@@ -220,21 +220,23 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 ///
 /// At [`CACHE_WRITE_FLUSH_INTERVAL_MS`] this is a few seconds of a cache that is accepting
 /// work and storing none of it. One failed flush can be a transient write conflict; a run of
-/// them is a configuration the accelerator cannot serve.
+/// them is a configuration the accelerator cannot write to.
 const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 
 /// The `error!` and dataset status a caching accelerator gets when it can accept writes but
 /// cannot store any of them.
 ///
 /// A write failure here is on a degrade-and-continue path that does not degrade: the flush
-/// warns, the runtime keeps reporting itself healthy, queries return no accelerated data and
-/// no error, and memory use looks excellent because nothing is being stored. Everything an
-/// operator would normally check points the wrong way, so the accelerator has to say so
-/// itself (spiceai/spiceai#13524).
+/// warns, the runtime keeps reporting itself healthy, and queries return no error. What the
+/// operator sees next depends on what the accelerator already held - one that never stored a
+/// row serves nothing and uses almost no memory, one that stored rows before the writes
+/// started failing keeps serving those and never updates them - so the message states the
+/// failure and what stops happening rather than guessing which case it is
+/// (spiceai/spiceai#13524).
 fn accelerator_unwritable_message(dataset_name: &str, failures: u32, cause: &str) -> String {
     format!(
         "Dataset '{dataset_name}' failed to write to its accelerator {failures} times in a row, \
-         so nothing is being cached and queries against the accelerated table return no rows. \
+         so no new result is being cached and anything already cached will not be updated. \
          Cause: {cause}. \
          See: https://spiceai.org/docs/components/data-accelerators"
     )
@@ -2364,11 +2366,17 @@ mod tests {
     fn unwritable_message_names_the_dataset_the_consequence_and_the_docs() {
         let message = accelerator_unwritable_message("api_data", 3, "no encoding for Map");
         assert!(message.contains("'api_data'"), "message: {message}");
+        // The impact has to hold whether or not the accelerator already stored rows: a
+        // populated cache goes stale rather than empty, so the message must not claim the
+        // table returns nothing.
         assert!(
-            message.contains("nothing is being cached"),
+            message.contains("no new result is being cached"),
             "message: {message}"
         );
-        assert!(message.contains("return no rows"), "message: {message}");
+        assert!(
+            message.contains("already cached will not be updated"),
+            "message: {message}"
+        );
         assert!(
             message.contains("no encoding for Map"),
             "message: {message}"
