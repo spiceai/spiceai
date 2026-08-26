@@ -397,7 +397,7 @@ impl MapEntriesGuard {
         )
         .map_err(|e| {
             let message = format!(
-                "Failed to read the Arrow data sent for dataset {path} ({e}), so the write was not applied. \
+                "Failed to read the Arrow data sent for dataset '{path}' ({e}), so the write was not applied. \
                 Send each message as an Arrow IPC record batch matching the schema the stream declared. \
                 See: https://spiceai.org/docs/api/arrow-flight-sql"
             );
@@ -515,8 +515,18 @@ fn create_response_stream(
                             let new_batch = match guard.decode(&message, &dictionaries_by_id, &path) {
                                 Ok(Some(new_batch)) => new_batch,
                                 Ok(None) => {
-                                    tracing::error!("Failed to convert flight data to batches");
-                                    yield Err(Status::internal("Failed to convert flight data to batches"));
+                                    // Only an empty body reaches here now: a body that will
+                                    // not decode is refused by `decode` with the decoder's own
+                                    // error. Mid-stream, an empty body is not the schema-only
+                                    // first message, so it carries no rows and the stream has
+                                    // gone out of step with what it declared.
+                                    let message = format!(
+                                        "Received an empty Arrow message partway through the write to dataset '{path}', so the rest of the stream was not applied and any batch already accepted may have been. \
+                                        Send every message after the schema as a record batch. \
+                                        See: https://spiceai.org/docs/api/arrow-flight-sql"
+                                    );
+                                    tracing::error!(dataset = %path, "{message}");
+                                    yield Err(Status::invalid_argument(message));
                                     break;
                                 }
                                 Err(status) => {
