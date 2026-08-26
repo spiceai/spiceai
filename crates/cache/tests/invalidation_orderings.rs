@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// The value/cache constructors below are shared helpers outside `#[test]`
-// functions, where clippy's `allow-expect-in-tests` cannot see them.
-#![allow(clippy::expect_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "the value/cache constructors below are shared helpers outside `#[test]` functions, where clippy's `allow-expect-in-tests` cannot see them"
+)]
 
 //! Both-orderings invalidation tests for every table-scoped cache.
 //!
