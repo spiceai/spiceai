@@ -227,7 +227,7 @@ impl FlightTable {
         // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
         // layout forbids. Correcting it here keeps the schema this table reports to the planner
         // in step with the batches `execute` hands back, which are normalized to the same shape.
-        let schema = map_entries::conforming_schema(&schema);
+        let schema = map_entries::conforming_schema(schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =
@@ -254,7 +254,7 @@ impl FlightTable {
     ) -> Self {
         let table_reference = table_reference.into();
         tracing::debug!("table_reference={:?}", table_reference);
-        let schema = map_entries::conforming_schema(&schema);
+        let schema = map_entries::conforming_schema(schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =

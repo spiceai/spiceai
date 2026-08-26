@@ -43,7 +43,7 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_tools::map_entries::{MapEntriesNormalizer, conforming_schema};
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
@@ -1990,7 +1990,7 @@ mod tests {
     #[test]
     fn a_nullable_entries_map_returned_by_a_module_is_decoded_and_accepted() {
         let batch = nullable_entries_map_batch();
-        let declared = conforming_schema(&batch.schema());
+        let declared = arrow_tools::map_entries::conforming_schema(batch.schema());
 
         let decoded = decode_ipc("m_fn", &ipc_stream(&batch), Arc::clone(&declared))
             .expect("a nullable entries declaration is relabelled, not refused");

@@ -84,7 +84,7 @@ impl MapEntriesNormalizer {
             .any(|field| contains(field.data_type(), &is_map));
 
         let target = holds_map
-            .then(|| conforming_schema(schema))
+            .then(|| conforming_schema(Arc::clone(schema)))
             .filter(|target| !Arc::ptr_eq(target, schema));
 
         Self {
@@ -174,18 +174,18 @@ impl MapEntriesNormalizer {
 /// The Arrow-conforming form of `schema`: every `Map` field, nested ones included, declares
 /// its `entries` non-nullable.
 ///
-/// A schema that already conforms is returned as the same `Arc`, so a caller can test whether
+/// A schema that already conforms is handed back untouched, so a caller can test whether
 /// anything changed with [`Arc::ptr_eq`] and pay nothing when nothing did.
 #[must_use]
-pub fn conforming_schema(schema: &SchemaRef) -> SchemaRef {
+pub fn conforming_schema(schema: SchemaRef) -> SchemaRef {
     if schema
         .fields()
         .iter()
         .any(|field| contains(field.data_type(), &declares_nullable_entries))
     {
-        Arc::new(apply_rules(schema, &[&MapEntriesNonNullable]))
+        Arc::new(apply_rules(&schema, &[&MapEntriesNonNullable]))
     } else {
-        Arc::clone(schema)
+        schema
     }
 }
 
@@ -228,9 +228,9 @@ impl StreamNormalizer {
                 )
             });
 
-        let normalized = normalizer.normalize(batch);
+        let outcome = normalizer.normalize(batch);
         self.resolved = Some((schema, normalizer));
-        normalized
+        outcome
     }
 }
 
@@ -759,8 +759,8 @@ mod tests {
             vec!["k0"],
             vec![Some("v0")],
         )) as ArrayRef);
-        let normalized = normalizer.normalize(batch).expect("normalization");
-        assert_eq!(&normalized.schema(), normalizer.schema());
+        let relabelled = normalizer.normalize(batch).expect("normalization");
+        assert_eq!(&relabelled.schema(), normalizer.schema());
     }
 
     /// A stream whose declarations already conform is reported under its own schema, by
@@ -785,14 +785,17 @@ mod tests {
             map_type(false),
             true,
         )]));
-        assert!(Arc::ptr_eq(&conforming_schema(&conforming), &conforming));
+        assert!(Arc::ptr_eq(
+            &conforming_schema(Arc::clone(&conforming)),
+            &conforming
+        ));
 
         let nullable_entries = Arc::new(Schema::new(vec![Field::new(
             "col_map",
             map_type(true),
             true,
         )]));
-        let corrected = conforming_schema(&nullable_entries);
+        let corrected = conforming_schema(Arc::clone(&nullable_entries));
         assert!(!Arc::ptr_eq(&corrected, &nullable_entries));
         assert_eq!(corrected.field(0).data_type(), &map_type(false));
     }
@@ -801,7 +804,10 @@ mod tests {
     #[test]
     fn conforming_schema_shares_a_schema_holding_no_map() {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
-        assert!(Arc::ptr_eq(&conforming_schema(&schema), &schema));
+        assert!(Arc::ptr_eq(
+            &conforming_schema(Arc::clone(&schema)),
+            &schema
+        ));
     }
 
     /// A stream that only learns its schema from its batches resolves one normalizer and reuses

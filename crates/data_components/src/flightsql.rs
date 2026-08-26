@@ -248,7 +248,7 @@ impl FlightSQLTable {
         // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
         // layout forbids. Correcting it here keeps the schema this table reports to the planner
         // in step with the batches `execute` hands back, which are normalized to the same shape.
-        let schema = map_entries::conforming_schema(&schema);
+        let schema = map_entries::conforming_schema(schema);
         Ok(Self {
             name,
             client,
@@ -271,7 +271,7 @@ impl FlightSQLTable {
         cookie_store: Arc<CookieStore>,
     ) -> Self {
         let table_reference: TableReference = table_reference.into();
-        let schema = map_entries::conforming_schema(&schema);
+        let schema = map_entries::conforming_schema(schema);
         Self {
             name,
             client,
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn a_normalized_map_batch_needs_no_coercion_against_the_conformed_table_schema() {
         let wire_batch = map_batch(true);
-        let table_schema = arrow_tools::map_entries::conforming_schema(&wire_batch.schema());
+        let table_schema = arrow_tools::map_entries::conforming_schema(wire_batch.schema());
 
         let normalized = arrow_tools::map_entries::StreamNormalizer::new()
             .normalize(wire_batch)
