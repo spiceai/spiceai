@@ -22,6 +22,7 @@ use datafusion_table_providers::{
 };
 use rand::RngExt;
 use secrecy::SecretString;
+use tokio_postgres::NoTls;
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
@@ -69,6 +70,20 @@ pub fn get_random_port() -> Result<usize, anyhow::Error> {
         }
     }
     Err(anyhow::anyhow!("No available port found"))
+}
+
+pub async fn connect(port: u16) -> Result<tokio_postgres::Client, anyhow::Error> {
+    let mut cfg = tokio_postgres::Config::new();
+    cfg.host("localhost")
+        .port(port)
+        .user("postgres")
+        .password(PG_PASSWORD)
+        .dbname("postgres");
+    let (client, connection) = cfg.connect(NoTls).await?;
+    tokio::spawn(async move {
+        let _: Result<(), tokio_postgres::Error> = connection.await;
+    });
+    Ok(client)
 }
 
 #[instrument]
