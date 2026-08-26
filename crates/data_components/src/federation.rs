@@ -1234,6 +1234,23 @@ mod tests {
         &list[..end]
     }
 
+    /// Everything the enclosing `SELECT` list draws from — the derived table and the
+    /// alias it is attached to.
+    ///
+    /// Deliberately wider than `derived_select_list`: the repair for the remaining
+    /// half of #12751 names the *relation's* columns on the alias it attaches
+    /// (`) AS s ("t.a + t.b")`), which lands after the derived table closes and so
+    /// falls outside the derived `SELECT` list entirely. A guard that reads only that
+    /// list cannot see that repair land. Searching for a specific column is what makes
+    /// the wider region safe here — the reason `derived_select_list` is narrow is that
+    /// a bare `AS` matches the relation aliases too.
+    fn from_clause(sql: &str) -> &str {
+        let Some(start) = sql.find(" FROM ") else {
+            panic!("expected a FROM clause after the SELECT list: {sql}");
+        };
+        &sql[start..]
+    }
+
     /// The column half of a reference the enclosing scope qualifies by `relation`.
     ///
     /// Spelled as the three ways a dialect writes the relation name rather than by
@@ -1423,10 +1440,19 @@ mod tests {
 
             // `column_of` panics unless the enclosing reference is qualified by `s`,
             // which is what makes the requalification the subject of this guard.
+            //
+            // Asked of the whole `FROM` clause rather than of the derived `SELECT`
+            // list, because the two ways a pin bump can close this gap land in
+            // different places: naming the derived output puts the name inside the
+            // list, while naming the relation's columns on the alias — the repair the
+            // comment above says this shape actually needs — puts it after the derived
+            // table closes. Reading only the list would leave this sentinel green
+            // through exactly the fix it exists to catch. Today the enclosing scope is
+            // the one place the name appears at all.
             let column = column_of(outer_reference(&sql), Some("s"));
             assert!(
-                !list.contains(&format!("AS {column}")),
-                "{dialect_name}: the derived table now names {column}, so this shape binds and \
+                !from_clause(&sql).contains(column),
+                "{dialect_name}: the derived table now exposes {column}, so this shape binds and \
                  the remaining half of #12751 is repaired — move it into \
                  `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
             );
