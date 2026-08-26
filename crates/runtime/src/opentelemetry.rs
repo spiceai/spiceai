@@ -441,7 +441,7 @@ impl Service {
 /// being invisible in a mixed export (#12188).
 ///
 /// `resource_attrs` are the resource-level attributes of the export the metric arrived in; they
-/// are merged into every data point's attributes (see `merge_resource_attributes`).
+/// are merged into every data point's attributes (see `row_attributes`).
 pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
@@ -557,30 +557,6 @@ macro_rules! append_value {
     };
 }
 
-/// A data point's attributes with the export's resource attributes merged in.
-///
-/// A key present on both wins for the data point: the point's own attribute is the more specific
-/// description of that measurement, and a resource attribute must never overwrite it.
-fn merge_resource_attributes(
-    resource_attrs: &[KeyValue],
-    data_point_attrs: &[KeyValue],
-) -> Vec<KeyValue> {
-    if resource_attrs.is_empty() {
-        return data_point_attrs.to_vec();
-    }
-    let mut merged: Vec<KeyValue> = resource_attrs
-        .iter()
-        .filter(|resource_attr| {
-            !data_point_attrs
-                .iter()
-                .any(|attr| attr.key == resource_attr.key)
-        })
-        .cloned()
-        .collect();
-    merged.extend(data_point_attrs.iter().cloned());
-    merged
-}
-
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
@@ -660,10 +636,7 @@ fn number_data_points_to_record_batch(
         } else {
             return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
         }
-        attributes.push(merge_resource_attributes(
-            resource_attrs,
-            &data_point.attributes,
-        ));
+        attributes.push(data_point.attributes.as_slice());
         time_unix_nano_builder.append_value(data_point.time_unix_nano);
         start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
@@ -695,7 +668,8 @@ fn number_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        resource_attrs,
+        attributes.as_slice(),
         existing_schema,
         NUMBER_VALUE_COLUMN_NAMES,
     );
@@ -766,10 +740,7 @@ fn histogram_data_points_to_record_batch(
             .append_slice(&data_point.explicit_bounds);
         explicit_bounds_builder.append(true);
 
-        attributes.push(merge_resource_attributes(
-            resource_attrs,
-            &data_point.attributes,
-        ));
+        attributes.push(data_point.attributes.as_slice());
         time_unix_nano_builder.append_value(data_point.time_unix_nano);
         start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
@@ -808,7 +779,8 @@ fn histogram_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        resource_attrs,
+        attributes.as_slice(),
         existing_schema,
         HISTOGRAM_VALUE_COLUMN_NAMES,
     );
@@ -860,9 +832,30 @@ macro_rules! append_attribute {
     }};
 }
 
+/// One row's attributes: the export's resource attributes that the data point does not override,
+/// followed by the data point's own. Both slices are borrowed from the request, so merging them
+/// copies no attribute.
+///
+/// A key carried by both wins for the data point: its attribute is the more specific description
+/// of that measurement, and a resource attribute must never overwrite it.
+fn row_attributes<'a>(
+    resource_attrs: &'a [KeyValue],
+    data_point_attrs: &'a [KeyValue],
+) -> impl Iterator<Item = &'a KeyValue> {
+    resource_attrs
+        .iter()
+        .filter(move |resource_attr| {
+            !data_point_attrs
+                .iter()
+                .any(|attr| attr.key == resource_attr.key)
+        })
+        .chain(data_point_attrs.iter())
+}
+
 #[expect(clippy::type_complexity)]
 fn attributes_to_fields_and_columns(
     metric: &str,
+    resource_attrs: &[KeyValue],
     attributes: &[&[KeyValue]],
     existing_schema: Option<&Schema>,
     value_columns: &[&str],
@@ -886,7 +879,7 @@ fn attributes_to_fields_and_columns(
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         row_keys.clear();
-        for attribute in *inner_attributes {
+        for attribute in row_attributes(resource_attrs, inner_attributes) {
             let key_str = attribute.key.as_str();
             // An attribute whose key is one of this metric's value columns cannot be
             // represented alongside it: emitting it as an attribute would put two columns of
