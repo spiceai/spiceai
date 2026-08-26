@@ -119,9 +119,19 @@ pub struct InternerStats {
     /// vectors, measured from capacity rather than from live rows so that
     /// capacity left behind by a past burst is visible.
     pub self_bytes: usize,
-    /// Interned schemas served from an existing row.
-    pub hits: u64,
-    /// Interned schemas that created a new row.
+    /// Interns that collapsed a *distinct* allocation onto the shared one.
+    ///
+    /// This is the only counter that evidences the pool doing its job: each one
+    /// is a duplicate `Schema` that existed a moment ago and does not now.
+    pub collapsed: u64,
+    /// Interns whose caller already held the shared allocation.
+    ///
+    /// Content-equal *and* pointer-equal, so there was no duplicate to remove.
+    /// Counted apart from [`Self::collapsed`] because lumping the two together
+    /// would let a pool that collapses nothing look busy: a caller re-interning
+    /// a schema it already had would register as a hit.
+    pub already_shared: u64,
+    /// Interns that adopted a schema the pool had not seen.
     pub misses: u64,
 }
 
@@ -190,9 +200,11 @@ impl Shard {
 
     /// Rows this shard holds, live and dead alike.
     ///
-    /// [`Self::live_counts`] answers what the pool *shares*; this answers what
-    /// it is *holding on to*, which is what tells a test whether a sweep
-    /// actually reclaimed anything rather than merely reporting no live rows.
+    /// Test-only: production reads what the pool *shares*, via
+    /// [`Self::live_counts`]. This is the figure that distinguishes a sweep
+    /// which reclaimed from one which merely found nothing live.
+    #[cfg(test)]
+    ///
     fn retained_rows(&self) -> usize {
         self.buckets.values().map(Vec::len).sum()
     }
@@ -241,7 +253,8 @@ impl Shard {
 pub struct SchemaInterner<S = ahash::RandomState> {
     shards: Box<[Mutex<Shard>]>,
     hasher: S,
-    hits: AtomicU64,
+    collapsed: AtomicU64,
+    already_shared: AtomicU64,
     misses: AtomicU64,
 }
 
@@ -277,7 +290,8 @@ impl<S: BuildHasher> SchemaInterner<S> {
         Self {
             shards: shards.into_boxed_slice(),
             hasher,
-            hits: AtomicU64::new(0),
+            collapsed: AtomicU64::new(0),
+            already_shared: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
@@ -312,7 +326,15 @@ impl<S: BuildHasher> SchemaInterner<S> {
                     // schemas that collide must never be conflated, and
                     // `Schema`'s `Eq` covers its metadata as well as its fields.
                     if existing.as_ref() == schema.as_ref() {
-                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        // Pointer equality separates "a duplicate was collapsed"
+                        // from "the caller already had the shared copy". Only
+                        // the former is a saving; counting both as one number
+                        // would make a pool that dedupes nothing look effective.
+                        if Arc::ptr_eq(&existing, &schema) {
+                            self.already_shared.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.collapsed.fetch_add(1, Ordering::Relaxed);
+                        }
                         return existing;
                     }
                 }
@@ -393,6 +415,35 @@ impl<S: BuildHasher> SchemaInterner<S> {
         }
     }
 
+    /// Interns that collapsed a distinct allocation onto the shared one,
+    /// cumulative. See [`InternerStats::collapsed`].
+    ///
+    /// Read straight from the counter rather than through [`Self::stats`],
+    /// which walks every shard: a reporter sampling these should not pay for a
+    /// full traversal to read three atomics.
+    #[must_use]
+    pub fn collapsed(&self) -> u64 {
+        self.collapsed.load(Ordering::Relaxed)
+    }
+
+    /// Interns whose caller already held the shared allocation, cumulative.
+    /// See [`InternerStats::already_shared`].
+    #[must_use]
+    pub fn already_shared(&self) -> u64 {
+        self.already_shared.load(Ordering::Relaxed)
+    }
+
+    /// Interns that adopted a schema the pool had not seen, cumulative.
+    ///
+    /// Read against [`Self::collapsed`], this is what says whether interning is
+    /// earning its place: misses without collapses means schemas are arriving
+    /// distinct and nothing is being shared — the case in which per-item
+    /// accounting has stopped charging for memory that is not in fact shared.
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
     /// A snapshot of what the pool holds, excluding rows whose holders are gone.
     ///
     /// Read-only. It does not sweep, so observing the pool never changes it:
@@ -416,7 +467,8 @@ impl<S: BuildHasher> SchemaInterner<S> {
             rows,
             schema_bytes,
             self_bytes,
-            hits: self.hits.load(Ordering::Relaxed),
+            collapsed: self.collapsed.load(Ordering::Relaxed),
+            already_shared: self.already_shared.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
@@ -755,15 +807,53 @@ mod tests {
     }
 
     #[test]
-    fn repeated_interning_reports_hits_not_new_rows() {
+    fn repeated_interning_collapses_duplicates_into_one_row() {
         let interner = SchemaInterner::new();
         let held: Vec<SchemaRef> = (0..64).map(|_| interner.intern(schema_of(8))).collect();
 
         let stats = interner.stats();
         assert_eq!(stats.rows, 1, "64 equal schemas occupy one row");
-        assert_eq!(stats.misses, 1);
-        assert_eq!(stats.hits, 63);
+        assert_eq!(stats.misses, 1, "only the first was unseen");
+        assert_eq!(
+            stats.collapsed, 63,
+            "each of the other 63 was a distinct allocation that got collapsed"
+        );
+        assert_eq!(
+            stats.already_shared, 0,
+            "every caller arrived with its own allocation, none pre-shared"
+        );
         assert!(held.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
+    }
+
+    /// The two kinds of hit must not be conflated: re-interning the allocation
+    /// the pool already handed back saves nothing, while interning a distinct
+    /// but equal allocation is the duplicate this pool exists to remove. A
+    /// single "hit" counter would let a pool that collapses nothing look busy.
+    #[test]
+    fn a_re_intern_of_the_shared_copy_is_not_counted_as_a_collapse() {
+        let interner = SchemaInterner::new();
+        let shared = interner.intern(schema_of(8));
+        assert_eq!(interner.stats().misses, 1);
+
+        // Hand back the very allocation the pool returned.
+        let again = interner.intern(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&again, &shared));
+
+        let stats = interner.stats();
+        assert_eq!(
+            stats.already_shared, 1,
+            "the caller already held the shared copy"
+        );
+        assert_eq!(
+            stats.collapsed, 0,
+            "nothing was collapsed — no duplicate existed"
+        );
+
+        // A separately-built equal schema *is* a collapse.
+        drop(interner.intern(schema_of(8)));
+        let stats = interner.stats();
+        assert_eq!(stats.collapsed, 1, "a distinct allocation was collapsed");
+        assert_eq!(stats.already_shared, 1, "unchanged by the collapse");
     }
 
     /// Every schema lands in one bucket, so `intern` must resolve candidates by
@@ -822,7 +912,7 @@ mod tests {
 
         // Re-interning still finds the right candidate within the bucket.
         assert!(Arc::ptr_eq(&interner.intern(schema_of(9)), &i_wide));
-        assert_eq!(interner.stats().hits, 1);
+        assert_eq!(interner.stats().collapsed, 1);
     }
 
     #[test]

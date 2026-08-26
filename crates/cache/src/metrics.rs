@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 
 use opentelemetry::{
     KeyValue, global,
-    metrics::{Counter, Gauge, Meter, ObservableGauge},
+    metrics::{Counter, Gauge, Meter, ObservableCounter, ObservableGauge},
 };
 
 use crate::result::{
@@ -73,10 +73,13 @@ impl EvictionReason {
 /// by the runtime's cache-maintenance loop, which runs whether or not metrics
 /// are enabled — tying it to collection would have made the pool's memory
 /// depend on `--metrics`, which is off by default.
-pub struct SchemaInternerMetrics {
+struct SchemaInternerMetrics {
     _rows: ObservableGauge<u64>,
     _schema_bytes: ObservableGauge<u64>,
     _self_bytes: ObservableGauge<u64>,
+    _collapsed: ObservableCounter<u64>,
+    _already_shared: ObservableCounter<u64>,
+    _misses: ObservableCounter<u64>,
 }
 
 static SCHEMA_INTERNER_METRICS: LazyLock<SchemaInternerMetrics> = LazyLock::new(|| {
@@ -112,6 +115,36 @@ static SCHEMA_INTERNER_METRICS: LazyLock<SchemaInternerMetrics> = LazyLock::new(
                     arrow_tools::schema_intern::global().stats().self_bytes as u64,
                     &[],
                 );
+            })
+            .build(),
+        // Cumulative, so counters rather than gauges — and read through the
+        // dedicated accessors, which load one atomic instead of walking every
+        // shard the way `stats()` does.
+        _collapsed: meter
+            .u64_observable_counter("schema_interner_collapsed")
+            .with_description(
+                "Distinct Arrow schema allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates.",
+            )
+            .with_callback(|observer| {
+                observer.observe(arrow_tools::schema_intern::global().collapsed(), &[]);
+            })
+            .build(),
+        _already_shared: meter
+            .u64_observable_counter("schema_interner_already_shared")
+            .with_description(
+                "Interns whose caller already held the shared allocation. Counted apart from collapsed schemas because no duplicate was removed.",
+            )
+            .with_callback(|observer| {
+                observer.observe(arrow_tools::schema_intern::global().already_shared(), &[]);
+            })
+            .build(),
+        _misses: meter
+            .u64_observable_counter("schema_interner_misses")
+            .with_description(
+                "Interns that adopted a schema the pool had not seen. Misses without collapses means schemas are arriving distinct and nothing is being shared.",
+            )
+            .with_callback(|observer| {
+                observer.observe(arrow_tools::schema_intern::global().misses(), &[]);
             })
             .build(),
     }
