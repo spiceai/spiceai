@@ -40,9 +40,13 @@
 #   SIGNOFF_REMOTE_RUN  Set by .github/workflows/signoff.yml — pending/failure
 #                     statuses, "via remote" description, GitHub step summary
 #   SIGNOFF_DEBUG     Set to any value for verbose debug logging
-#   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped pre-lint
+#   SIGNOFF_SKIP_TARGETED_LINT  Set to any value to skip the branch-scoped
+#                     pre-lint. Note this skips the targeted unit tests too:
+#                     package discovery is gated on this variable, so the tests
+#                     phase has no packages to run against.
 #   SIGNOFF_SKIP_TARGETED_TESTS Set to any value to skip the branch-scoped unit
-#                     tests that run after the pre-lint
+#                     tests that run after the pre-lint. This one does skip only
+#                     the tests; the pre-lint still runs.
 #   SIGNOFF_MIN_FREE_GIB  Free space (GiB) the work volume must have before a
 #                     remote run starts its Rust checks (default: 25). Checked
 #                     twice: by the `preflight-disk` step before the toolchain
@@ -1654,6 +1658,16 @@ cmd_signoff() {
     case "$1" in
       -f|--force)     force=true;  shift ;;
       --no-verify)    verify=false; shift ;;
+      # The two targeted phases are one decision in practice — they are the
+      # fail-fast pass, and skipping one while keeping the other rarely makes
+      # sense. Setting both is also the only combination that means what it
+      # says: SIGNOFF_SKIP_TARGETED_TESTS alone does skip only the tests, but
+      # SIGNOFF_SKIP_TARGETED_LINT alone skips both, because package discovery
+      # is gated on it and the tests phase has nothing to run against. This flag
+      # asks for both explicitly rather than relying on that side effect.
+      --skip-targeted)
+        export SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
+        shift ;;
       -h|--help)      cmd_help; exit 0 ;;
       *)              fail "unknown option: $1 (see: scripts/signoff --help)" ;;
     esac
@@ -2381,6 +2395,9 @@ Developers:
   scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
+  scripts/signoff --skip-targeted
+                               Skip the branch-scoped pre-lint and unit tests
+                               (steps 1-2); the full gate still runs
   scripts/signoff status       Show the sign-off status of HEAD
   scripts/signoff mine         Show attestation status for all your open PRs
   scripts/signoff clear-pending [reason]
@@ -2423,8 +2440,10 @@ Checks (when verify is on):
   the crate's own defaults — a scoped build of a crate that declares no
   'default' (runtime) would otherwise compile with no features at all.
 
-  Set SIGNOFF_SKIP_TARGETED_LINT=1 to skip step 1, SIGNOFF_SKIP_TARGETED_TESTS=1
-  to skip step 2 (both trade an extra compile of those crates for early failure).
+  --skip-targeted skips both of steps 1-2, which trade an extra compile of those
+  crates for early failure. SIGNOFF_SKIP_TARGETED_TESTS=1 skips step 2 alone;
+  SIGNOFF_SKIP_TARGETED_LINT=1 skips both, because step 2 runs against the
+  packages step 1 discovers.
   Remote runs (.github/workflows/signoff.yml) set SIGNOFF_REMOTE_RUN and use
   the GitHub compare API when the clone is too shallow for merge-base.
 
@@ -2442,7 +2461,7 @@ EOF
 main() {
   case "${1:-}" in
     ""|signoff) shift || true; cmd_signoff "$@" ;;
-    -f|--force|--no-verify) cmd_signoff "$@" ;;
+    -f|--force|--no-verify|--skip-targeted) cmd_signoff "$@" ;;
     remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
