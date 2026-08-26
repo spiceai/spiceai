@@ -252,8 +252,11 @@ struct CacheWriteHealth {
     runtime_status: Arc<RuntimeStatus>,
     dataset: TableReference,
     consecutive_failures: u32,
-    /// The message behind the current `Error` status, so recovery only clears the status this
-    /// tracker set and never a refresh failure reported by another path.
+    /// Whether this run of failures has been escalated, so the `error!` is logged once per
+    /// run rather than once per flush.
+    escalated: bool,
+    /// The message this tracker last wrote to the dataset status. It re-asserts only once
+    /// that has been replaced, and clears only what it set.
     reported: Option<String>,
 }
 
@@ -263,22 +266,45 @@ impl CacheWriteHealth {
             runtime_status,
             dataset,
             consecutive_failures: 0,
+            escalated: false,
             reported: None,
         }
     }
 
     fn record_failure(&mut self, cause: &dyn fmt::Display) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        // Act on the crossing and nothing after it. The per-flush `warn!` already carries
-        // every occurrence, so re-reporting would rewrite the status registry twice a second
-        // for a state that has not changed. `cause` is only formatted past this point.
-        if self.consecutive_failures != CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+        if self.consecutive_failures < CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
             return;
         }
 
+        let current = self.runtime_status.get_dataset_status(&self.dataset);
+        let current_message = current.as_ref().and_then(ComponentStatus::error_message);
+        if current_message.is_some() && current_message == self.reported.as_deref() {
+            // The status this tracker set still stands. Rewriting it on every flush would
+            // churn the registry twice a second for a state that has not changed.
+            return;
+        }
+
+        // Reached on the first crossing, and again whenever something else has replaced this
+        // tracker's status - a periodic refresh reporting `Refreshing`, say - while the
+        // accelerator is still unwritable. Without the second case the write outage would
+        // disappear from the dataset's status for good the first time that happened.
         let message =
             accelerator_unwritable_message(&self.dataset, self.consecutive_failures, cause);
-        tracing::error!("{message}");
+        if !self.escalated {
+            tracing::error!("{message}");
+            self.escalated = true;
+        }
+
+        if current.as_ref().is_some_and(ComponentStatus::is_error) {
+            // Someone else's failure is standing. It is no less real than this one and this
+            // tracker does not own it, so leave it be: overwriting it would lose their
+            // diagnostic, and would then let this tracker's own recovery clear a fault that
+            // is still unresolved. The `error!` above and the per-flush `warn!` carry the
+            // write outage until a dataset can report both at once (spiceai/spiceai#13572).
+            return;
+        }
+
         self.runtime_status.update_dataset(
             &self.dataset,
             ComponentStatus::error_with_message(message.clone()),
@@ -288,6 +314,7 @@ impl CacheWriteHealth {
 
     fn record_success(&mut self) {
         self.consecutive_failures = 0;
+        self.escalated = false;
         let Some(reported) = self.reported.take() else {
             return;
         };
@@ -2438,6 +2465,64 @@ mod tests {
             status.get_dataset_status(&dataset),
             Some(ComponentStatus::Ready)
         );
+    }
+
+    /// The status a tracker sets can be replaced by any other writer - a periodic refresh
+    /// reporting `Refreshing` while the accelerator is still unwritable, say. If the tracker
+    /// only ever reported the threshold crossing, the write outage would vanish from the
+    /// dataset's status for good the first time that happened.
+    #[test]
+    fn an_unhealthy_dataset_is_reported_again_after_another_writer_replaces_the_status() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("api_data");
+        let mut health = CacheWriteHealth::new(Arc::clone(&status), dataset.clone());
+        fail_until_unhealthy(&mut health);
+
+        // A refresh cycle takes the dataset through a non-error state.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+
+        health.record_failure(&"write failed");
+        assert_eq!(
+            status
+                .get_dataset_status(&dataset)
+                .as_ref()
+                .and_then(ComponentStatus::error_message)
+                .is_some(),
+            true,
+            "a still-failing accelerator must report itself again once its status is replaced"
+        );
+    }
+
+    /// Two faults, one status cell. Until a dataset can carry both (spiceai/spiceai#13572),
+    /// the tracker must not overwrite an error it did not set - doing so would lose the other
+    /// diagnostic, and would then let this tracker's own recovery clear a fault that is still
+    /// unresolved.
+    #[test]
+    fn an_error_reported_by_another_path_is_not_overwritten_or_later_cleared() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("api_data");
+        let mut health = CacheWriteHealth::new(Arc::clone(&status), dataset.clone());
+
+        status.update_dataset(
+            &dataset,
+            ComponentStatus::error_with_message("refresh failed"),
+        );
+        fail_until_unhealthy(&mut health);
+
+        let refresh_error_stands = |step: &str| {
+            assert_eq!(
+                status
+                    .get_dataset_status(&dataset)
+                    .as_ref()
+                    .and_then(ComponentStatus::error_message),
+                Some("refresh failed"),
+                "the refresh failure must survive {step}"
+            );
+        };
+        refresh_error_stands("a run of failed cache writes");
+
+        health.record_success();
+        refresh_error_stands("the cache writes recovering");
     }
 
     #[test]
