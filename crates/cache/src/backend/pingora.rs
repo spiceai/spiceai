@@ -61,9 +61,11 @@ struct KeyMetadata {
 
 /// A cached value together with the key it was admitted under.
 ///
-/// pingora-lru reports only values and weights when it evicts, so the key travels with
-/// the value. Without it an eviction could not name the metadata entry it has to drop,
-/// and `len()`/`iter_keys()` would keep reporting keys whose values are gone.
+/// pingora-lru reports only values and weights, both when it evicts and when it hands
+/// entries to an in-place scan ([`Lru::iter_for_each`]), so the key travels with the
+/// value. Without it an eviction could not name the metadata entry it has to drop,
+/// `len()`/`iter_keys()` would keep reporting keys whose values are gone, and
+/// [`PingoraBackend::keys_matching`] could not name what it matched.
 struct KeyedValue<V> {
     key: u64,
     value: V,
@@ -150,15 +152,33 @@ where
             .map(|meta| Instant::now() >= meta.expires_at)
     }
 
+    /// Drops `key`'s metadata and its value under the caller's hold of `key`'s shard,
+    /// returning the value if one came out.
+    ///
+    /// Both drops belong to one hold: a concurrent `insert` of this key that landed
+    /// between them would have its fresh metadata left behind while this call removed the
+    /// value it names — a key `len()`/`iter_keys()` still report but `get()` can never
+    /// serve — and its value would be discarded even though the write reported success.
+    /// Taking the guard as an argument is what keeps that pairing checkable: every caller
+    /// holds the shard across both, and each keeps its own acquisition, which
+    /// [`Self::remove_if_expired`] needs because its expiry re-check has to be under the
+    /// same non-reentrant hold.
+    ///
+    /// The value is handed back rather than dropped here so its destructor runs after the
+    /// caller releases the shard. Dropping a large value inside the hold would block every
+    /// reader and writer mapped to that shard, and a destructor that re-entered the cache
+    /// would deadlock on the non-reentrant lock.
+    fn drop_entry_locked(
+        cache: &Lru<KeyedValue<V>, NUM_KEY_SHARDS>,
+        shard: &mut HashMap<u64, KeyMetadata>,
+        key: u64,
+    ) -> Option<KeyedValue<V>> {
+        shard.remove(&key);
+        cache.remove(key).map(|(entry, _)| entry)
+    }
+
     /// Drop an entry that was observed expired, provided it is still expired once the
     /// shard is held. Returns whether the entry was removed.
-    ///
-    /// The metadata and the value go under one hold of the shard, for the same reason
-    /// `insert`, `remove` and `evict_to_weight_limit` publish or drop them together: a
-    /// concurrent `insert` of this key that landed between the two would have its fresh
-    /// metadata left behind while this call removed the value it names — a key
-    /// `len()`/`iter_keys()` still report but `get()` can never serve — and its value
-    /// would be discarded even though the write reported success.
     ///
     /// The expiry is re-checked here because the caller observed it under a read lock it
     /// has since released. An `insert` in that gap has already published a live entry, so
@@ -175,12 +195,7 @@ where
             return false;
         }
 
-        shard.remove(&key);
-        let removed = self.cache.remove(key);
-        // Both removals happened under the hold; only the value's destructor is
-        // deferred past it. Dropping a large value inside the hold would block
-        // every reader and writer mapped to this shard, and a destructor that
-        // re-entered the cache would deadlock on the non-reentrant lock.
+        let removed = Self::drop_entry_locked(&self.cache, &mut shard, key);
         drop(shard);
 
         // As in `evict_to_weight_limit`, no listener reports this engine's own
@@ -229,6 +244,125 @@ where
                 self.cache.remove(entry.key);
             }
         }
+    }
+
+    /// The keys whose values satisfy `predicate`, most-recently-used first within each
+    /// shard.
+    ///
+    /// Each shard is read in place, under that shard's read lock: the values are inspected
+    /// where they sit, so the walk leaves both LRU recency and every entry's visibility to
+    /// a concurrent reader untouched. pingora-lru's only by-key read is destructive
+    /// (`remove` + re-`admit`), which is why matching goes through the in-place scan and
+    /// [`KeyedValue`] carries the key the scan needs to name what it matched.
+    ///
+    /// What it costs instead is one contiguous hold of the shard being walked, so a hit or
+    /// an insert mapping to that shard waits for the rest of its walk: `predicate` runs
+    /// once per entry, and one shard holds about a sixteenth of the cache. That is why
+    /// callers run this off the runtime worker, and why `predicate` should stay cheap —
+    /// the two value types that reach it, `CachedQueryResult` and `CachedSearchResult`,
+    /// answer `AsTableRefs` with an `Arc` clone.
+    ///
+    /// The shard's *metadata* read lock is held across its walk, and that is what makes the
+    /// first half of the guarantee below true rather than aspirational. `get` expresses a
+    /// read as `remove` + re-`admit`, so a scan holding no metadata lock can land between
+    /// the two, see a matching key as absent, and leave the entry for the re-admit to
+    /// restore — after which any lookup with no invalidation-clock check of its own serves
+    /// it.
+    ///
+    /// A *read* hold is what excluding that needs, and all it needs: `get` takes the shard
+    /// for **writing** across its pair, as does every other mutator of an entry (`insert`,
+    /// `remove`, `remove_if_expired`, `evict_to_weight_limit`, `clear`), so holding it
+    /// shared excludes all of them while leaving this shard's metadata-only readers —
+    /// `len()`, `iter_keys()` — running as they did before. Taking it exclusively would
+    /// exclude those too, for nothing: they cannot move an entry behind the walk.
+    ///
+    /// It introduces no new lock ordering: metadata shard first, then the pingora-lru shard
+    /// beneath `iter_for_each`, the order `insert` and `get` already take, and eviction
+    /// materialises its victims before taking either.
+    ///
+    /// So: an entry resident when its shard is reached is always seen; one admitted into a
+    /// shard after that shard has been walked is not.
+    fn keys_matching<F>(&self, predicate: F) -> Vec<u64>
+    where
+        F: Fn(&V) -> bool,
+    {
+        let mut matched: Vec<u64> = Vec::new();
+        // Both shard arrays are `NUM_KEY_SHARDS` long and both place a key at
+        // `key % NUM_KEY_SHARDS`, so metadata shard `i` guards exactly the entries
+        // `iter_for_each(i, ..)` walks. Enumerating the metadata shards rather than
+        // `0..self.cache.shards()` is what keeps that pairing an index the compiler
+        // checks instead of an assumption.
+        for (shard, metadata) in self.metadata_shards.iter().enumerate() {
+            let _metadata = metadata.read();
+            self.cache.iter_for_each(shard, |(entry, _weight)| {
+                if predicate(&entry.value) {
+                    matched.push(entry.key);
+                }
+            });
+        }
+        matched
+    }
+
+    /// Removes every entry whose value satisfies `predicate`, returning how many entries
+    /// were removed.
+    ///
+    /// The matching entries are found by [`Self::keys_matching`], which documents what the
+    /// in-place scan does and does not see. Removal runs after the scan rather than inside
+    /// it, because `iter_for_each` holds the shard being walked and removing from it would
+    /// deadlock.
+    ///
+    /// The window `keys_matching` leaves — an entry admitted after its shard was walked —
+    /// is the same one moka's predicate-based invalidation leaves, since a moka predicate
+    /// only matches entries last modified before it was registered. For served results it
+    /// is closed on the write side by `TableInvalidationClock`, which refuses a cache write
+    /// whose read began before the invalidation. In the other direction, a key matched by
+    /// the scan and then rewritten by a concurrent `insert` is removed on the strength of
+    /// the value the scan saw, so a fresh entry can be dropped — a cache miss, never a
+    /// stale hit.
+    pub(crate) fn invalidate_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
+        let mut removed = 0;
+        for key in self.keys_matching(predicate) {
+            let shard_idx = Self::get_shard_index(key);
+            let mut shard = self.metadata_shards[shard_idx].write();
+            let dropped = Self::drop_entry_locked(&self.cache, &mut shard, key);
+            drop(shard);
+
+            // As with expiry and size eviction, no listener reports this engine's own
+            // removals, so an invalidation only reaches the counter if it is recorded
+            // here. Counted once per value that actually came out of the cache: a key
+            // whose value a concurrent size eviction already took (and counted) leaves
+            // nothing to count here.
+            if dropped.is_some() {
+                removed += 1;
+                V::record_eviction(EvictionReason::Invalidated);
+            }
+            drop(dropped);
+        }
+        removed
+    }
+
+    /// The keys held in the pingora-lru shards, most-recently-used first within
+    /// each shard.
+    ///
+    /// Only the shards themselves record recency, so this is the only way a test can assert
+    /// that an operation left LRU ordering alone.
+    ///
+    /// It walks the shards itself rather than calling [`Self::keys_matching`] with a
+    /// match-everything predicate, even though that is the same loop. Sharing the walk would
+    /// make the observation run through the code under test: a `keys_matching` that promoted
+    /// the entries it visited would promote them for this helper too, and the test asserting
+    /// that recency survived an invalidation would pass on a scan that destroyed it.
+    #[cfg(test)]
+    fn keys_in_lru_order(&self) -> Vec<u64> {
+        let mut keys = Vec::new();
+        for shard in 0..self.cache.shards() {
+            self.cache
+                .iter_for_each(shard, |(entry, _weight)| keys.push(entry.key));
+        }
+        keys
     }
 }
 
@@ -337,17 +471,10 @@ where
 
     async fn remove(&self, key: &u64) -> Option<V> {
         let shard_idx = Self::get_shard_index(*key);
-
-        // Drop the metadata and the value under one hold of the shard, for the same reason
-        // `insert` publishes them under one hold: a concurrent `insert` of this key that
-        // landed between the two would leave its metadata behind while this call removed
-        // the value it names — a key `len()`/`iter_keys()` still report but `get()` can
-        // never serve. The shard is taken here rather than through a helper because both
-        // drops share one hold, and the lock is not reentrant.
         let mut shard = self.metadata_shards[shard_idx].write();
-        shard.remove(key);
-
-        self.cache.remove(*key).map(|(entry, _)| entry.value)
+        let removed = Self::drop_entry_locked(&self.cache, &mut shard, *key);
+        drop(shard);
+        removed.map(|entry| entry.value)
     }
 
     async fn clear(&self) {
@@ -1606,5 +1733,182 @@ mod tests {
             evicted,
             "every entry the cache no longer holds must be accounted for exactly once"
         );
+    }
+
+    // ===================
+    // invalidate_matching() tests
+    // ===================
+
+    /// Keys that all land in shard 0 (`key % 16`), so their relative LRU order
+    /// is observable through `keys_in_lru_order`.
+    const SHARD_ZERO_KEYS: [u64; 5] = [16, 32, 48, 64, 80];
+
+    async fn backend_with_shard_zero_keys() -> PingoraBackend<TestValue> {
+        let backend = create_backend(1024, 60);
+        for key in SHARD_ZERO_KEYS {
+            backend
+                .insert(key, TestValue::new(&format!("v{key}")))
+                .await;
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_matching_removes_only_matching_entries() {
+        let backend = backend_with_shard_zero_keys().await;
+
+        let removed = backend.invalidate_matching(|value| value.data == "v48");
+
+        assert_eq!(removed, 1);
+        assert_eq!(backend.get(&48).await, None);
+        for key in SHARD_ZERO_KEYS.into_iter().filter(|key| *key != 48) {
+            assert_eq!(
+                backend.get(&key).await,
+                Some(TestValue::new(&format!("v{key}"))),
+                "key {key} should have survived an invalidation that did not match it"
+            );
+        }
+    }
+
+    /// A predicate matching nothing must leave the cache exactly as it found it.
+    #[tokio::test]
+    async fn test_invalidate_matching_with_no_matches_removes_nothing() {
+        let backend = backend_with_shard_zero_keys().await;
+        let before = backend.keys_in_lru_order();
+
+        let removed = backend.invalidate_matching(|value| value.data == "absent");
+
+        assert_eq!(removed, 0);
+        assert_eq!(backend.len().await, SHARD_ZERO_KEYS.len());
+        assert_eq!(backend.keys_in_lru_order(), before);
+    }
+
+    /// Regression test for #12674: invalidation must not perturb LRU recency.
+    ///
+    /// Reading a value out of pingora-lru removes and re-admits it, so an
+    /// invalidation that inspects entries with `get` promotes every key it
+    /// visits and replaces recency with scan order across the whole cache.
+    #[tokio::test]
+    async fn test_invalidate_matching_preserves_lru_order() {
+        let backend = backend_with_shard_zero_keys().await;
+
+        // Read the oldest key so recency no longer matches insertion order —
+        // otherwise a scan that rebuilt the order could coincidentally match.
+        assert_eq!(backend.get(&16).await, Some(TestValue::new("v16")));
+        assert_eq!(
+            backend.keys_in_lru_order(),
+            vec![16, 80, 64, 48, 32],
+            "most-recently-used first"
+        );
+
+        let removed = backend.invalidate_matching(|value| value.data == "v48");
+        assert_eq!(removed, 1);
+
+        assert_eq!(
+            backend.keys_in_lru_order(),
+            vec![16, 80, 64, 32],
+            "the surviving entries must keep the recency they had before the invalidation"
+        );
+    }
+
+    /// Every removal must clear the metadata shard too, or the key keeps being
+    /// reported by `len`/`iter_keys` after it is gone from the LRU.
+    #[tokio::test]
+    async fn test_invalidate_matching_clears_metadata() {
+        let backend = backend_with_shard_zero_keys().await;
+
+        let removed = backend.invalidate_matching(|value| value.data != "v16");
+
+        assert_eq!(removed, 4);
+        assert_eq!(backend.len().await, 1);
+        assert_eq!(backend.iter_keys().await, vec![16]);
+    }
+
+    /// An entry past its TTL is still holding memory, so a matching invalidation
+    /// must drop it rather than leave it for a read that may never come.
+    #[tokio::test]
+    async fn test_invalidate_matching_removes_expired_entries() {
+        let backend = create_backend(1024, 60);
+        backend.insert(1, TestValue::new("expiring")).await;
+        expire_now(&backend, 1);
+
+        let removed = backend.invalidate_matching(|value| value.data == "expiring");
+
+        assert_eq!(removed, 1);
+        assert_eq!(backend.len().await, 0);
+    }
+
+    /// `get` expresses a read as `remove` + re-`admit` under the key's metadata shard lock,
+    /// so a scan holding no metadata lock can land between the two, see the key as absent,
+    /// and leave a matching entry behind for the re-admit to restore.
+    ///
+    /// Both halves of the hold are pinned, because together they are what a *shared* hold
+    /// is: while the scan is inside the shard holding the entry, that shard cannot be taken
+    /// for **writing** — which is what `get` and every other mutator need before they can
+    /// open the window — and it can still be taken for **reading**, which is what keeps
+    /// `len()` and `iter_keys()` running rather than waiting out the walk for nothing.
+    #[tokio::test]
+    async fn a_shard_scan_excludes_a_concurrent_get_on_that_shard() {
+        let backend = create_backend(1024, 60);
+        // 48 % 16 == 0, so this entry lives in shard 0 and `get(&48)` takes metadata
+        // shard 0 across its `remove`/re-`admit` pair.
+        let key = 48u64;
+        backend.insert(key, TestValue::new("v48")).await;
+
+        let shard_idx = PingoraBackend::<TestValue>::get_shard_index(key);
+        let shards = Arc::clone(&backend.metadata_shards);
+        let writer_got_in = std::sync::atomic::AtomicBool::new(false);
+        let reader_shut_out = std::sync::atomic::AtomicBool::new(false);
+
+        // The predicate runs inside the walk of the shard holding the entry, which is the
+        // instant a concurrent `get` would have to be excluded from. `try_*` rather than the
+        // blocking forms: a blocking probe from inside the walk would deadlock on success
+        // and hang the test instead of failing it.
+        let removed = backend.invalidate_matching(|value| {
+            if shards[shard_idx].try_write().is_some() {
+                writer_got_in.store(true, Ordering::Relaxed);
+            }
+            if shards[shard_idx].try_read().is_none() {
+                reader_shut_out.store(true, Ordering::Relaxed);
+            }
+            value.data == "v48"
+        });
+
+        assert!(
+            !writer_got_in.load(Ordering::Relaxed),
+            "the scan left this shard's metadata writable, so a `get` could take it and hide \
+             the entry behind its remove/re-admit pair for the rest of the walk"
+        );
+        assert!(
+            !reader_shut_out.load(Ordering::Relaxed),
+            "the scan held this shard exclusively, which makes `len()` and `iter_keys()` wait \
+             out the walk without excluding anything a shared hold does not already exclude"
+        );
+        assert_eq!(removed, 1, "the matching entry must still be invalidated");
+        assert_eq!(backend.get(&key).await, None);
+    }
+
+    /// The scan has to reach every shard, not just the one a small fixture
+    /// happens to populate.
+    #[tokio::test]
+    async fn test_invalidate_matching_spans_all_shards() {
+        let backend = create_backend(4096, 60);
+        for key in 0..64u64 {
+            backend
+                .insert(
+                    key,
+                    TestValue::new(if key % 2 == 0 { "even" } else { "odd" }),
+                )
+                .await;
+        }
+
+        let removed = backend.invalidate_matching(|value| value.data == "even");
+
+        assert_eq!(removed, 32);
+        assert_eq!(backend.len().await, 32);
+        for key in 0..64u64 {
+            let expected = (key % 2 == 1).then(|| TestValue::new("odd"));
+            assert_eq!(backend.get(&key).await, expected, "key {key}");
+        }
     }
 }

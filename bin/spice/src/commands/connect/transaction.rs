@@ -977,20 +977,23 @@ async fn stored_user_login(
     endpoint: &str,
     org_hint: Option<&str>,
 ) -> Result<Option<LoginCredential>> {
-    // Share the preflight's candidates and policy rather than restating them:
-    // `spice cloud link` chooses a credential before this transaction runs, and
-    // a list or a rule that differed would strand a link half-done.
     let candidates = crate::commands::cloud::client::user_credential_candidates(org_hint);
     // Share the preflight's policy rather than restating it: `spice cloud link`
     // chooses a credential before this transaction runs, and a rule that
     // accepted one here but not there would strand a link half-done.
-    Ok(
-        crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
-            .await?
-            .map(|token| LoginCredential {
+    match crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
+        .await?
+    {
+        crate::commands::cloud::client::UserCredentialSearch::Found(token) => {
+            Ok(Some(LoginCredential {
                 token: SessionToken::new(token),
-            }),
-    )
+            }))
+        }
+        crate::commands::cloud::client::UserCredentialSearch::NoneStored => Ok(None),
+        crate::commands::cloud::client::UserCredentialSearch::AllRejected => Err(
+            crate::commands::cloud::rejected_user_credential_error(Some("link"), org_hint),
+        ),
+    }
 }
 
 fn org_credential_missing(org: &str) -> Error {
