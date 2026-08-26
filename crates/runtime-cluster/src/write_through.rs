@@ -1073,9 +1073,7 @@ async fn forward_batches_to_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StructArray,
-    };
+    use arrow::array::{ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StructArray};
     use arrow::buffer::{Buffer, NullBuffer};
     use arrow::datatypes::{Field, Fields, Schema};
     use arrow_flight::utils::batches_to_flight_data;
@@ -1250,10 +1248,9 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded =
-            maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
-                .expect("decode should succeed")
-                .expect("data message should carry a batch");
+        let decoded = maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
+            .expect("decode should succeed")
+            .expect("data message should carry a batch");
 
         let normalizer = MapEntriesNormalizer::for_schema(&declared);
 
@@ -1267,7 +1264,9 @@ mod tests {
             "routing schema must declare entries non-nullable"
         );
 
-        let normalized = normalizer.normalize(decoded).expect("normalize should succeed");
+        let normalized = normalizer
+            .normalize(decoded)
+            .expect("normalize should succeed");
         let normalized_schema = normalized.schema();
         let DataType::Map(entries, _) = normalized_schema.field(0).data_type() else {
             panic!("column should still be a MAP");
@@ -1294,10 +1293,9 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded =
-            maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
-                .expect("decode should succeed")
-                .expect("data message should carry a batch");
+        let decoded = maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
+            .expect("decode should succeed")
+            .expect("data message should carry a batch");
 
         let err = MapEntriesNormalizer::for_schema(&declared)
             .normalize(decoded)
