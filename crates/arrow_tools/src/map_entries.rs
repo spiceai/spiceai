@@ -200,7 +200,7 @@ pub fn conforming_schema(schema: SchemaRef) -> SchemaRef {
 /// target.
 #[derive(Default)]
 pub struct StreamNormalizer {
-    resolved: Option<(SchemaRef, MapEntriesNormalizer)>,
+    resolved: Option<MapEntriesNormalizer>,
 }
 
 impl StreamNormalizer {
@@ -217,19 +217,14 @@ impl StreamNormalizer {
     /// [`MapEntriesNormalizer::normalize`], which this delegates to.
     pub fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
         let schema = batch.schema();
-        let (schema, normalizer) = self
+        let normalizer = self
             .resolved
             .take()
-            .filter(|(resolved_for, _)| Arc::ptr_eq(resolved_for, &schema))
-            .unwrap_or_else(|| {
-                (
-                    Arc::clone(&schema),
-                    MapEntriesNormalizer::for_schema(&schema),
-                )
-            });
+            .filter(|resolved| Arc::ptr_eq(&resolved.declared, &schema))
+            .unwrap_or_else(|| MapEntriesNormalizer::for_schema(&schema));
 
         let outcome = normalizer.normalize(batch);
-        self.resolved = Some((schema, normalizer));
+        self.resolved = Some(normalizer);
         outcome
     }
 }
