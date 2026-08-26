@@ -76,9 +76,12 @@ impl Chat for Anthropic {
         // `transform_stream`, which rewrites the error type its own way.
         let model = self.model.clone();
         let model_from_default = self.model_from_default;
+        let endpoint_from_default = self.endpoint_from_default;
 
         Ok(transform_stream(Box::pin(stream.map(move |item| {
-            item.map_err(|e| explain_model_not_found(&model, model_from_default, e))
+            item.map_err(|e| {
+                explain_model_not_found(&model, model_from_default, endpoint_from_default, e)
+            })
         }))))
     }
 
@@ -95,7 +98,14 @@ impl Chat for Anthropic {
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
             .create_byot(anth_req)
             .await
-            .map_err(|e| explain_model_not_found(&self.model, self.model_from_default, e))?;
+            .map_err(|e| {
+                explain_model_not_found(
+                    &self.model,
+                    self.model_from_default,
+                    self.endpoint_from_default,
+                    e,
+                )
+            })?;
 
         CreateChatCompletionResponse::try_from(inner_resp)
     }

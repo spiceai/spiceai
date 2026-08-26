@@ -560,43 +560,40 @@ async fn test_tool_use(
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }
 
-/// TEMPORARY PROBE — not for merge. Asks the live Anthropic API, for each candidate default
-/// model, whether it resolves at all and whether it still accepts the sampling controls this
-/// adapter forwards.
+/// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic still
+/// serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's newest
+/// generation answers ``temperature` is deprecated for this model.` and rejects the request
+/// outright (#13564), so a default bumped onto such a model would turn every configuration that
+/// sets `temperature` into a guaranteed 400 — while every test that sets none of these stays green.
+/// This is the guard for that, and it is why the default trails Anthropic's newest model.
+///
+/// No JSON-path checks: the assertion is that the request was accepted at all, which `run_test`
+/// makes by panicking on the error. `get_or_create_model("anthropic")` builds the model with no id,
+/// so this exercises whatever the default currently is rather than a pinned one.
 #[rstest]
-#[case("claude-sonnet-5")]
-#[case("claude-sonnet-4-6")]
-#[case("claude-sonnet-4-5")]
-#[case("claude-haiku-4-5")]
-#[case("claude-opus-4-6")]
+#[case::temperature(json!({"temperature": 0.5}))]
+#[case::top_p(json!({"top_p": 0.9}))]
+#[case::top_logprobs(json!({"top_logprobs": 5}))]
 #[tokio::test]
-async fn probe_candidate_default_models(#[case] candidate: &str) {
-    let _guard = init_tracing(None);
-    let model = create::create_anthropic(Some(candidate)).expect("failed to create model");
-
-    for (label, extra) in [
-        ("plain", json!({})),
-        ("temperature", json!({"temperature": 0.5})),
-        ("top_p", json!({"top_p": 0.9})),
-        ("top_logprobs", json!({"top_logprobs": 5})),
-    ] {
-        let mut body = json!({
-            "model": "not_needed",
-            "messages": [{"role": "user", "content": "pong"}],
-            "max_completion_tokens": 16,
-        });
-        let (Some(body_map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) else {
-            panic!("probe bodies are objects");
-        };
-        for (key, value) in extra_map {
-            body_map.insert(key.clone(), value.clone());
-        }
-        let req: CreateChatCompletionRequest =
-            serde_json::from_value(body).expect("failed to create request");
-
-        match model.chat_request(req).await {
-            Ok(_) => eprintln!("PROBE_RESULT {candidate} {label} ACCEPTED"),
-            Err(e) => eprintln!("PROBE_RESULT {candidate} {label} REJECTED -> {e:?}"),
-        }
+async fn default_anthropic_model_accepts_forwarded_sampling_controls(
+    #[case] control: serde_json::Value,
+) {
+    let mut body = json!({
+        "model": "not_needed",
+        "messages": [{"role": "user", "content": "Say Hello"}],
+        "max_completion_tokens": 16,
+    });
+    let (Some(body_map), Some(control_map)) = (body.as_object_mut(), control.as_object()) else {
+        panic!("the request body and the control are both JSON objects");
+    };
+    for (key, value) in control_map {
+        body_map.insert(key.clone(), value.clone());
     }
+
+    let req: CreateChatCompletionRequest =
+        serde_json::from_value(body).expect("failed to create request");
+
+    run_test("anthropic", "default_sampling_controls", req, false, vec![])
+        .await
+        .expect("test failed");
 }

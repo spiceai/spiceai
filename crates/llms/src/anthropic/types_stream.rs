@@ -582,10 +582,11 @@ mod tests {
     #[test]
     fn an_explained_model_not_found_passes_through_unchanged() {
         let explained = crate::anthropic::explain_model_not_found(
-            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            true,
             true,
             OpenAIError::ApiError(ApiError {
-                message: "model: claude-sonnet-5".to_string(),
+                message: "model: claude-sonnet-4-6".to_string(),
                 r#type: Some("not_found_error".to_string()),
                 param: None,
                 code: None,
@@ -612,6 +613,7 @@ mod tests {
         let explained = crate::anthropic::explain_model_not_found(
             "claude-3-5-sonnet-20240403",
             false,
+            true,
             OpenAIError::ApiError(ApiError {
                 message: "model: claude-3-5-sonnet-20240403".to_string(),
                 r#type: Some("not_found_error".to_string()),

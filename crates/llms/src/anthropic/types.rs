@@ -628,9 +628,11 @@ pub(crate) fn validate_model_variant(model: &str) -> Result<AnthropicModelVarian
 /// Output-token ceiling of Claude 3 and the Claude 1/2/instant generations before it.
 const LEGACY_MAX_TOKENS: u32 = 4096;
 
-/// Output tokens every model from Claude 3.5 onward accepts. Deliberately not each model's own
-/// maximum, which reaches 64000: Anthropic requires a request above roughly 21000 output tokens to
-/// stream, so a per-model maximum here would make every non-streaming request fail.
+/// Output tokens every model from Claude 3.5 onward accepts. Deliberately a floor rather than each
+/// model's own maximum, which is far higher and differs per model: Anthropic requires a request
+/// above roughly 21000 output tokens to stream, so a per-model maximum here would make every
+/// non-streaming request fail. Tracking those maxima would also put this constant back in the
+/// business of going stale, which is the defect that brought us here.
 const MODERN_MAX_TOKENS: u32 = 8192;
 
 /// Model families capped at [`LEGACY_MAX_TOKENS`], as the fragment of the model id that identifies
