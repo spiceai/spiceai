@@ -20,8 +20,10 @@ use crate::HashBuilder;
 use crate::HashProvider;
 #[cfg(feature = "pingora")]
 use crate::InvalidationDidNotFinishSnafu;
+use crate::ReadStartedAt;
 use crate::Result;
 use crate::Sizeable;
+use crate::TableInvalidationClock;
 use crate::TabledCacheProvider;
 use crate::backend::{CacheBackend, MokaBackend};
 use crate::key::PassthroughHashBuilder;
@@ -194,6 +196,10 @@ pub struct LruCache<
     initial_instant: Instant,
     hits: AtomicU64,
     total_requests: AtomicU64,
+    /// Closes the write-after-invalidation race for values served through
+    /// [`TabledCacheProvider::get_raw_key_if_fresh`] — see
+    /// [`TableInvalidationClock`].
+    table_invalidations: TableInvalidationClock,
 }
 
 impl<
@@ -391,6 +397,7 @@ impl<
             initial_instant: Instant::now(),
             hits: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
+            table_invalidations: TableInvalidationClock::default(),
         }
     }
 
@@ -415,7 +422,7 @@ impl<
 }
 
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + ReadStartedAt + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > LruCache<V, T, H>
@@ -519,6 +526,12 @@ impl<
     }
 
     async fn invalidate_all(&self) {
+        // Stamped before clearing, never after: a value whose read straddles
+        // this clear is stored later and must be rejected by
+        // `get_raw_key_if_fresh`, and stamping afterwards leaves exactly that
+        // gap one step earlier.
+        self.table_invalidations
+            .mark_all_invalidated(Instant::now());
         self.backend.clear().await;
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
@@ -563,12 +576,19 @@ impl<
 
 #[async_trait]
 impl<
-    V: Sizeable + AsTableRefs + CacheMetrics + Clone + Send + Sync + 'static,
+    V: Sizeable + AsTableRefs + ReadStartedAt + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for LruCache<V, T, H>
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        // Stamped before removing entries, never after: neither the moka
+        // predicate nor the Pingora scan can reach a value stored later by a
+        // read that straddled this invalidation, so `get_raw_key_if_fresh`
+        // must see the stamp first.
+        self.table_invalidations
+            .mark_invalidated(&table_ref, Instant::now());
+
         match &self.backend {
             CacheBackendEnum::Moka(backend) => {
                 // Moka carries an invalidation predicate that it also applies lazily on
@@ -609,6 +629,33 @@ impl<
                 Ok(())
             }
         }
+    }
+
+    async fn get_raw_key_if_fresh(&self, key: &u64) -> Option<V> {
+        // `Fn`, not `FnMut`, so the outcome comes back through a flag —
+        // mirroring `QueryResultsCacheProvider::get_raw_key`, which records the
+        // same stale-rejection metric for the results cache.
+        let rejected_as_stale = std::sync::atomic::AtomicBool::new(false);
+        // Bound to a local rather than passed as `&|…|`: the borrow has to
+        // outlive the await, and an inline temporary leaves that to how the
+        // async body happens to be lowered.
+        let is_fresh = |value: &V| {
+            if self
+                .table_invalidations
+                .invalidated_since(value.as_table_refs().as_ref(), value.read_started_at())
+            {
+                rejected_as_stale.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
+        };
+        let result = self.get_raw_key_validated(key, &is_fresh).await;
+
+        if rejected_as_stale.load(Ordering::Relaxed) {
+            V::record_stale_rejection();
+        }
+
+        result
     }
 }
 
@@ -680,6 +727,7 @@ mod tests {
             input_tables: Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
+            read_started_at: Instant::now(),
         }
     }
 
@@ -1389,6 +1437,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pingora")]
+    impl ReadStartedAt for ThreadRecordingValue {
+        fn read_started_at(&self) -> Instant {
+            // Freshness is not under test here — only where the scan runs.
+            Instant::now()
+        }
+    }
+
     /// The Pingora invalidation scan must not run on the runtime worker that called it.
     ///
     /// Asserted by observing the thread the scan reads values on rather than by racing a
@@ -1681,6 +1737,12 @@ mod tests {
             impl AsTableRefs for $name {
                 fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
                     self.0.as_table_refs()
+                }
+            }
+
+            impl ReadStartedAt for $name {
+                fn read_started_at(&self) -> Instant {
+                    self.0.read_started_at()
                 }
             }
 

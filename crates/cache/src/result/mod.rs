@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod embeddings;
+pub mod plan;
 pub mod query;
 pub mod search;
 

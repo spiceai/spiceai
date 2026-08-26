@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::key::PassthroughHashBuilder;
 use crate::{
-    AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result,
-    TabledCacheProvider,
+    AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, ReadStartedAt, Result,
+    TableInvalidationClock, TabledCacheProvider,
 };
 use async_trait::async_trait;
 use byte_unit::Byte;
@@ -39,6 +39,10 @@ pub struct SimpleCache<
     hasher: T,
     max_size: u64,
     ttl: Duration,
+    /// Closes the write-after-invalidation race for values served through
+    /// [`TabledCacheProvider::get_raw_key_if_fresh`] — see
+    /// [`TableInvalidationClock`].
+    table_invalidations: TableInvalidationClock,
 }
 
 impl<
@@ -89,12 +93,13 @@ impl<
             hasher,
             ttl,
             max_size: cache_max_size,
+            table_invalidations: TableInvalidationClock::default(),
         }
     }
 }
 
 impl<
-    V: AsTableRefs + Clone + Send + Sync + 'static,
+    V: AsTableRefs + ReadStartedAt + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > SimpleCache<V, T, H>
@@ -142,6 +147,12 @@ impl<
     }
 
     async fn invalidate_all(&self) {
+        // Stamped before clearing, never after: a value whose read straddles
+        // this clear is stored later and must be rejected by
+        // `get_raw_key_if_fresh`, and stamping afterwards leaves exactly that
+        // gap one step earlier.
+        self.table_invalidations
+            .mark_all_invalidated(std::time::Instant::now());
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
     }
@@ -167,12 +178,18 @@ impl<
 
 #[async_trait]
 impl<
-    V: AsTableRefs + Clone + Send + Sync + 'static,
+    V: AsTableRefs + ReadStartedAt + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        // Stamped before registering the predicate, never after: the predicate
+        // misses a value stored later by a read that straddled this
+        // invalidation, so `get_raw_key_if_fresh` must see the stamp first.
+        self.table_invalidations
+            .mark_invalidated(&table_ref, std::time::Instant::now());
+
         let table_name = crate::invalidated_table_name(&table_ref);
         self.cache
             .invalidate_entries_if(move |_key, value| {
@@ -181,6 +198,18 @@ impl<
             .context(FailedToInvalidateCacheSnafu { table_name })?;
 
         Ok(())
+    }
+
+    async fn get_raw_key_if_fresh(&self, key: &u64) -> Option<V> {
+        // Bound to a local rather than passed as `&|…|`: the borrow has to
+        // outlive the await, and an inline temporary leaves that to how the
+        // async body happens to be lowered.
+        let is_fresh = |value: &V| {
+            !self
+                .table_invalidations
+                .invalidated_since(value.as_table_refs().as_ref(), value.read_started_at())
+        };
+        self.get_raw_key_validated(key, &is_fresh).await
     }
 }
 
