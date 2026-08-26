@@ -973,6 +973,44 @@ mod tests {
         }
     }
 
+    /// The base schema must stay accelerable. `gql_schema` declares single-field
+    /// struct lists, but `github_gql_raw_schema_cast` collapses those to lists of
+    /// scalars before the table schema is derived — a genuine `List(Struct)`
+    /// column would not survive a `DuckDB` or `SQLite` refresh.
+    #[test]
+    fn the_table_schema_never_exposes_a_struct_list_when_comments_are_off() {
+        use arrow::array::RecordBatch;
+        use arrow_schema::DataType;
+
+        let gql = gql_schema(&PullRequestCommentType::None);
+        let table_schema = crate::github_gql_raw_schema_cast(&RecordBatch::new_empty(gql))
+            .expect("the schema transform to apply")
+            .schema();
+
+        for field in table_schema.fields() {
+            if let DataType::List(item) = field.data_type() {
+                assert!(
+                    !matches!(item.data_type(), DataType::Struct(_)),
+                    "'{}' is a List(Struct), which cannot survive an acceleration refresh",
+                    field.name()
+                );
+            }
+        }
+
+        // The linked-issue list in particular collapses to a list of numbers.
+        assert_eq!(
+            table_schema
+                .field_with_name("closing_issues_references")
+                .expect("closing_issues_references to exist")
+                .data_type(),
+            &DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                "number",
+                DataType::Int64,
+                true
+            )))
+        );
+    }
+
     #[test]
     fn query_cost_stays_within_the_github_secondary_rate_limit_burst() {
         // The rate controller's weighted quota is 2000 points per minute; a cost

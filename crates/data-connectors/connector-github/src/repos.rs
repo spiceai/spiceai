@@ -76,7 +76,7 @@ impl ReposTableArgs {
         format!(
             r"
             id
-            {REPO_COLUMN}: name
+            name
             name_with_owner: nameWithOwner
             description
             url
@@ -93,7 +93,6 @@ impl ReposTableArgs {
             disk_usage: diskUsage
             stargazers_count: stargazerCount
             forks_count: forkCount
-            {OWNER_COLUMN}: owner {{ {OWNER_COLUMN}: login }}
             default_branch: defaultBranchRef {{ default_branch: name }}
             license: licenseInfo {{ license: key }}
             primary_language: primaryLanguage {{ primary_language: name }}
@@ -116,6 +115,8 @@ impl GitHubTableArgs for ReposTableArgs {
 
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
         let nodes = Self::requested_nodes();
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
 
         let (query, json_pointer) = match self.repo.as_deref() {
             Some(repo) => (
@@ -168,6 +169,7 @@ impl GitHubTableArgs for ReposTableArgs {
                 for row in &mut rows {
                     if let Value::Object(row) = row {
                         flatten_topics(row);
+                        stamp_identity(row, &owner, repo.as_deref());
                     }
                 }
 
@@ -176,6 +178,29 @@ impl GitHubTableArgs for ReposTableArgs {
             Some(gql_schema()),
         )
     }
+}
+
+/// Stamps the identity columns from the dataset path rather than the response.
+///
+/// GitHub treats owner and repository names as case-insensitive and answers in
+/// its own canonical casing, but SQL string equality is not case-insensitive.
+/// Taking `owner` from the response would make `github.com/SpiceAI/spiceai/repo`
+/// carry a different `owner` than every path-stamped table, and a join between
+/// them would silently match nothing. `name_with_owner` still carries GitHub's
+/// canonical spelling for anyone who wants it.
+///
+/// The owner-level shape has one row per repository, so only `repo` comes from
+/// the response there — as `name`, which is the row's own identity rather than
+/// the dataset's.
+fn stamp_identity(row: &mut Map<String, Value>, owner: &str, repo: Option<&str>) {
+    row.insert(OWNER_COLUMN.to_string(), Value::String(owner.to_string()));
+
+    let repo = match repo {
+        Some(repo) => Value::String(repo.to_string()),
+        None => row.get("name").cloned().unwrap_or(Value::Null),
+    };
+    row.insert(REPO_COLUMN.to_string(), repo);
+    row.remove("name");
 }
 
 /// Rewrites `topics`, which GitHub returns as `[{"topic": {"name": "sql"}}]`,
@@ -197,13 +222,9 @@ fn flatten_topics(repo: &mut Map<String, Value>) {
 }
 
 fn gql_schema() -> SchemaRef {
-    // Unlike every other table, `owner` and `repo` here are read from the
-    // response rather than stamped from the dataset path, so they are declared
-    // nullable: a partial GitHub response must degrade to a null rather than
-    // fail the whole batch.
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, true),
-        Field::new(OWNER_COLUMN, DataType::Utf8, true),
+        Field::new(OWNER_COLUMN, DataType::Utf8, false),
         Field::new(REPO_COLUMN, DataType::Utf8, true),
         Field::new("name_with_owner", DataType::Utf8, true),
         Field::new("description", DataType::Utf8, true),
@@ -275,7 +296,7 @@ mod tests {
     fn repository_node() -> Value {
         json!({
             "id": "MDEwOlJlcG9zaXRvcnkz",
-            "repo": "spicetrade",
+            "name": "spicetrade",
             "name_with_owner": "spiceai/spicetrade",
             "description": "Example",
             "url": "https://github.com/spiceai/spicetrade",
@@ -292,7 +313,6 @@ mod tests {
             "disk_usage": 4355,
             "stargazers_count": 1,
             "forks_count": 0,
-            "owner": {"owner": "spiceai"},
             "default_branch": {"default_branch": "trunk"},
             "license": null,
             "primary_language": {"primary_language": "Python"},
@@ -347,8 +367,14 @@ mod tests {
     fn unnest_flattens_owner_repo_and_topics() {
         let row = unnest_one(&owner_level_args(), &repository_node());
 
+        // `owner` comes from the dataset path so it matches every other table
+        // exactly; `repo` is the row's own name, since one row is one repository.
         assert_eq!(row["owner"], json!("spiceai"));
         assert_eq!(row["repo"], json!("spicetrade"));
+        assert!(
+            row.as_object().expect("row object").get("name").is_none(),
+            "`name` is replaced by `repo`, not carried alongside it"
+        );
         assert_eq!(row["default_branch"], json!("trunk"));
         assert_eq!(row["primary_language"], json!("Python"));
         assert_eq!(row["watchers_count"], json!(1));
@@ -358,6 +384,24 @@ mod tests {
         assert_eq!(row["topics_count"], json!(2));
         // A repository with no license keeps a null rather than an empty string.
         assert_eq!(row["license"], Value::Null);
+    }
+
+    /// GitHub answers in its own canonical casing, so reading identity out of the
+    /// response would make a join against a path-stamped table miss on casing.
+    #[test]
+    fn the_repo_level_shape_stamps_identity_from_the_path_not_the_response() {
+        let args = ReposTableArgs {
+            owner: "SpiceAI".to_string(),
+            repo: Some("SpiceAI".to_string()),
+            component: shared_component("test.repo_casing"),
+        };
+
+        let row = unnest_one(&args, &repository_node());
+
+        assert_eq!(row["owner"], json!("SpiceAI"));
+        assert_eq!(row["repo"], json!("SpiceAI"));
+        // GitHub's canonical spelling is still available.
+        assert_eq!(row["name_with_owner"], json!("spiceai/spicetrade"));
     }
 
     #[test]

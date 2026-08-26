@@ -173,7 +173,7 @@ fn ensure_complete(
     let child_label = spec.child_label;
     Err(Error::InvalidObjectAccess {
         message: format!(
-            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): GitHub returned {returned_count} of {total_count}, and a nested connection cannot be paginated, so the rest are unreachable. Returning the {returned_count} would leave every count over that {parent_label} short with no way to tell. Exclude it from the dataset, or follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
+            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): GitHub returned {returned_count} of {total_count} and caps a nested connection at one page, so the rest are unreachable. Returning the {returned_count} would leave every count over that {parent_label} short with no way to tell. This is a limit of GitHub's API, not of the dataset's configuration; follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
         ),
     })
 }
