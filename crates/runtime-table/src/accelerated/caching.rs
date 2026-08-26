@@ -2482,13 +2482,12 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
 
         health.record_failure(&"write failed");
-        assert_eq!(
+        assert!(
             status
                 .get_dataset_status(&dataset)
                 .as_ref()
                 .and_then(ComponentStatus::error_message)
                 .is_some(),
-            true,
             "a still-failing accelerator must report itself again once its status is replaced"
         );
     }
