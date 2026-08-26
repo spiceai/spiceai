@@ -55,17 +55,18 @@ pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
 
 /// The Arrow types Vortex has no array encoding for.
 ///
-/// This must stay equal to what `vortex-arrow` actually converts, and it is a list rather
-/// than a question asked of Vortex per column because the caller needs to walk into a
-/// container and name the nested field that is at fault - a whole-container probe would
-/// report the container and, under `unsupported_type_action: string`, would silently
-/// stringify a struct because one of its fields is unrepresentable.
+/// Deliberately a frozen list rather than a question put to Vortex during the walk. Probing
+/// per node would track Vortex exactly and, done bottom-up, would still attribute a failure
+/// to the nested field at fault - so accuracy is not the argument. The argument is that which
+/// columns a table will accept stays reviewable and moves only when someone edits this line,
+/// and that a Vortex-side regression then costs a red test rather than a table that will not
+/// create.
 ///
-/// A hand-maintained list drifts. This one did: `Map` support was lost across a Vortex
-/// fork re-cut, the list went on claiming Vortex could store it, and every write to an
+/// What freezing costs is drift, and this list has drifted: `Map` support was lost across a
+/// Vortex fork re-cut, the list went on claiming Vortex could store it, and every write to an
 /// accelerated table with a `Map` column failed after the table had been created
-/// (spiceai/spiceai#13524). `vortex_encodes_exactly_the_types_not_listed_as_unsupported`
-/// pins the list to Vortex's real behaviour so the next drift fails a test instead.
+/// (spiceai/spiceai#13524). `vortex_encodes_exactly_the_types_not_listed_as_unsupported` is
+/// the tripwire: it probes Vortex per type family and fails when the two disagree.
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
         data_type,
@@ -330,128 +331,76 @@ mod tests {
         CAYENNE_CREATION_REWRITE_RULES, is_vortex_supported_type, transform_schema_for_vortex,
     };
 
-    /// Ask Vortex, for one representative of every Arrow type family, whether it can
-    /// actually store a column of that type, and require the answer to match
-    /// [`is_vortex_supported_type`] exactly.
-    ///
-    /// The probe is the write and read a real flush performs, on an empty array: import the
-    /// Arrow array into Vortex, then execute it back to the same Arrow type. Both encodings
-    /// are type-level, so an empty array answers the same question a full batch does.
-    ///
-    /// This exists because the list is the only thing standing between a user and a table
-    /// that is created successfully and can then never be written to. Vortex's `Map`
-    /// support lives in the `spiceai/vortex` fork and has already been lost once across a
-    /// re-cut, silently, leaving the list claiming support Vortex no longer had
-    /// (spiceai/spiceai#13524). If that happens again this test goes red before a release
-    /// does.
-    #[test]
-    fn vortex_encodes_exactly_the_types_not_listed_as_unsupported() {
-        let item = Arc::new(Field::new("item", DataType::Int32, true));
-        let entries = Arc::new(Field::new_struct(
-            "entries",
-            vec![
-                Arc::new(Field::new("keys", DataType::Utf8, false)),
-                Arc::new(Field::new("values", DataType::Utf8, true)),
-            ],
-            false,
-        ));
-        let union_fields = UnionFields::try_new(
+    fn union_fields() -> UnionFields {
+        UnionFields::try_new(
             vec![0, 1],
             vec![
                 Arc::new(Field::new("text", DataType::Utf8, true)),
                 Arc::new(Field::new("n", DataType::Int32, true)),
             ],
         )
-        .expect("valid union fields");
+        .expect("valid union fields")
+    }
 
-        let types = vec![
-            DataType::Null,
-            DataType::Boolean,
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::UInt8,
-            DataType::UInt16,
-            DataType::UInt32,
-            DataType::UInt64,
-            DataType::Float16,
-            DataType::Float32,
-            DataType::Float64,
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-            DataType::Date32,
-            DataType::Date64,
-            DataType::Time32(TimeUnit::Second),
-            DataType::Time64(TimeUnit::Nanosecond),
-            DataType::Duration(TimeUnit::Second),
-            DataType::Interval(IntervalUnit::DayTime),
-            DataType::Binary,
-            DataType::LargeBinary,
-            DataType::BinaryView,
-            DataType::FixedSizeBinary(4),
-            DataType::Utf8,
-            DataType::LargeUtf8,
-            DataType::Utf8View,
-            DataType::List(Arc::clone(&item)),
-            DataType::LargeList(Arc::clone(&item)),
-            DataType::ListView(Arc::clone(&item)),
-            DataType::LargeListView(Arc::clone(&item)),
-            DataType::FixedSizeList(Arc::clone(&item), 2),
-            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
-            DataType::Union(union_fields, UnionMode::Sparse),
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            DataType::Decimal32(5, 2),
-            DataType::Decimal64(10, 2),
-            DataType::Decimal128(20, 2),
-            DataType::Decimal256(40, 2),
-            DataType::Map(entries, false),
-            DataType::RunEndEncoded(
-                Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                Arc::new(Field::new("values", DataType::Int32, true)),
-            ),
-        ];
-
-        let mut disagreements = Vec::new();
-        for data_type in types {
-            let claimed = is_vortex_supported_type(&data_type);
-            match (claimed, vortex_can_encode(&data_type)) {
-                (true, Err(why)) => disagreements.push(format!(
-                    "{data_type} is listed as supported but Vortex cannot encode it: {why}"
-                )),
-                (false, Ok(())) => disagreements.push(format!(
-                    "{data_type} is listed as unsupported but Vortex encodes it, so Cayenne \
-                     rejects a column it could store"
-                )),
-                _ => {}
-            }
+    /// Names every Arrow `DataType` variant, with no `_` arm.
+    ///
+    /// A variant added to `arrow-rs` stops this compiling, which is the moment to add a
+    /// representative of it to [`arrow_type_families`]. Without this, a new variant escapes
+    /// both that fixture and the list it pins, and the drift the tests exist to catch
+    /// happens silently again - the way `Map` did.
+    fn every_variant_is_named(data_type: &DataType) {
+        match data_type {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(..)
+            | DataType::Time64(..)
+            | DataType::Duration(..)
+            | DataType::Interval(..)
+            | DataType::Binary
+            | DataType::FixedSizeBinary(..)
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::List(..)
+            | DataType::ListView(..)
+            | DataType::FixedSizeList(..)
+            | DataType::LargeList(..)
+            | DataType::LargeListView(..)
+            | DataType::Struct(..)
+            | DataType::Union(..)
+            | DataType::Dictionary(..)
+            | DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Map(..)
+            | DataType::RunEndEncoded(..) => {}
         }
-
-        assert!(
-            disagreements.is_empty(),
-            "`is_vortex_supported_type` no longer matches Vortex:\n  {}",
-            disagreements.join("\n  ")
-        );
     }
 
-    /// Round-trip an empty array of `data_type` through Vortex the way a flush does.
-    fn vortex_can_encode(data_type: &DataType) -> Result<(), String> {
-        let session = VortexSession::default();
-        let empty = new_empty_array(data_type);
-        let array = VortexArrayRef::from_arrow(empty.as_ref(), true)
-            .map_err(|e| format!("writing it fails: {e}"))?;
-        session
-            .arrow()
-            .execute_arrow(
-                array,
-                Some(&Field::new("probe", data_type.clone(), true)),
-                &mut session.create_execution_ctx(),
-            )
-            .map_err(|e| format!("reading it back fails: {e}"))?;
-        Ok(())
-    }
-
-    #[test]
-    fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
+    /// One representative of every Arrow type family.
+    ///
+    /// Container types carry rewrite-sensitive payloads - a `Float16`, a nanosecond
+    /// timestamp - so the creation rewrite rules are exercised where they apply, and the
+    /// four timestamp units appear so unit preservation is covered. Shared by the two tests
+    /// that pin Cayenne's type handling: one list cannot drift from itself.
+    fn arrow_type_families() -> Vec<DataType> {
         let list_item = Arc::new(Field::new(
             "item",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -465,7 +414,7 @@ mod tests {
             ],
             false,
         ));
-        let types = vec![
+        let families = vec![
             DataType::Null,
             DataType::Boolean,
             DataType::Int8,
@@ -489,7 +438,10 @@ mod tests {
             DataType::Time32(TimeUnit::Millisecond),
             DataType::Time64(TimeUnit::Microsecond),
             DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Duration(TimeUnit::Second),
+            DataType::Interval(IntervalUnit::DayTime),
             DataType::Binary,
+            DataType::FixedSizeBinary(4),
             DataType::LargeBinary,
             DataType::BinaryView,
             DataType::Utf8,
@@ -511,13 +463,96 @@ mod tests {
                 ]
                 .into(),
             ),
+            DataType::Union(union_fields(), UnionMode::Sparse),
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float16)),
             DataType::Decimal32(5, 2),
             DataType::Decimal64(10, 2),
             DataType::Decimal128(20, 2),
             DataType::Decimal256(40, 2),
             DataType::Map(map_entries, false),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                )),
+            ),
         ];
+        for family in &families {
+            every_variant_is_named(family);
+        }
+        families
+    }
+
+    /// Ask Vortex, for one representative of every Arrow type family, whether it can
+    /// actually store a column of that type, and require the answer to match
+    /// [`is_vortex_supported_type`] exactly.
+    ///
+    /// The probe is the pair of conversions a write and a read go through - import the Arrow
+    /// array into Vortex, then execute it back to the same Arrow type - run on an empty
+    /// array. Both conversions are type-level, so an empty array answers the same question a
+    /// full batch does. It stops short of the file writer, so it answers "can Vortex encode
+    /// this type", not "does a flush succeed"; `map_column_roundtrips_through_a_vortex_file`
+    /// in `vortex-datafusion` covers the whole path.
+    ///
+    /// This exists because the list is the only thing standing between a user and a table
+    /// that is created successfully and can then never be written to. Vortex's `Map` support
+    /// lives in the `spiceai/vortex` fork and has already been lost once across a re-cut,
+    /// silently, leaving the list claiming support Vortex no longer had
+    /// (spiceai/spiceai#13524). If that happens again this test goes red before a release
+    /// does.
+    #[test]
+    fn vortex_encodes_exactly_the_types_not_listed_as_unsupported() {
+        // One session for the whole sweep: building it registers nine session components and
+        // a file cache, none of which vary by type.
+        let session = VortexSession::default();
+
+        let mut disagreements = Vec::new();
+        for data_type in arrow_type_families() {
+            let claimed = is_vortex_supported_type(&data_type);
+            match (claimed, vortex_can_encode(&session, &data_type)) {
+                (true, Err(why)) => disagreements.push(format!(
+                    "{data_type} is listed as supported but Vortex cannot encode it: {why}"
+                )),
+                (false, Ok(())) => disagreements.push(format!(
+                    "{data_type} is listed as unsupported but Vortex encodes it, so Cayenne \
+                     rejects a column it could store"
+                )),
+                _ => {}
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "`is_vortex_supported_type` no longer matches Vortex:\n  {}",
+            disagreements.join("\n  ")
+        );
+    }
+
+    /// Round-trip an empty array of `data_type` through Vortex's Arrow conversions.
+    fn vortex_can_encode(session: &VortexSession, data_type: &DataType) -> Result<(), String> {
+        let empty = new_empty_array(data_type);
+        let array = VortexArrayRef::from_arrow(empty.as_ref(), true)
+            .map_err(|e| format!("writing it fails: {e}"))?;
+        session
+            .arrow()
+            .execute_arrow(
+                array,
+                Some(&Field::new("probe", data_type.clone(), true)),
+                &mut session.create_execution_ctx(),
+            )
+            .map_err(|e| format!("reading it back fails: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
+        // Only the families Cayenne accepts: the rest are refused before any rewrite runs.
+        let types: Vec<DataType> = arrow_type_families()
+            .into_iter()
+            .filter(is_vortex_supported_type)
+            .collect();
         let schema = Schema::new(
             types
                 .into_iter()
@@ -795,17 +830,7 @@ mod tests {
                 Arc::new(Field::new("run_ends", DataType::Int32, false)),
                 Arc::new(Field::new("values", DataType::Utf8, true)),
             ),
-            DataType::Union(
-                UnionFields::try_new(
-                    vec![0, 1],
-                    vec![
-                        Arc::new(Field::new("text", DataType::Utf8, true)),
-                        Arc::new(Field::new("n", DataType::Int32, true)),
-                    ],
-                )
-                .expect("valid union fields"),
-                UnionMode::Sparse,
-            ),
+            DataType::Union(union_fields(), UnionMode::Sparse),
         ] {
             let schema = Schema::new(vec![Field::new("encoded", data_type.clone(), true)]);
             let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
@@ -814,6 +839,10 @@ mod tests {
             assert!(
                 message.contains("'encoded'"),
                 "error should name the column, got: {message}"
+            );
+            assert!(
+                message.contains(&format!("{data_type:?}")),
+                "error should name the type that cannot be stored, got: {message}"
             );
         }
     }

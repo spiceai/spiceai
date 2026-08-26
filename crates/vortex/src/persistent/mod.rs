@@ -111,7 +111,6 @@ mod tests {
     async fn map_column_roundtrips_through_a_vortex_file() -> anyhow::Result<()> {
         use std::sync::Arc;
 
-        use datafusion::arrow::array::Array as _;
         use datafusion::arrow::array::Int32Array;
         use datafusion::arrow::array::RecordBatch;
         use datafusion::arrow::array::builder::MapBuilder;
@@ -157,9 +156,9 @@ mod tests {
         builder.append(true)?;
         let maps = builder.finish();
 
-        // `MapBuilder` names the entries and its fields `entries`/`keys`/`values`, which is
-        // what the schema above declares; assert it rather than trusting the default.
-        assert_eq!(maps.data_type(), &map_type);
+        // `RecordBatch::try_new` rejects a column whose type differs from the schema, which
+        // is what checks that `MapBuilder` still names the entries and its fields
+        // `entries`/`keys`/`values` the way the schema above declares.
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(maps)],
@@ -173,7 +172,7 @@ mod tests {
             .register_table("maps", Arc::new(ListingTable::try_new(config)?))?;
 
         ctx.session
-            .read_batch(batch.clone())?
+            .read_batch(batch)?
             .write_table("maps", DataFrameWriteOptions::new())
             .await?;
 
@@ -187,9 +186,8 @@ mod tests {
             "a map column must not read back as its List<Struct> storage"
         );
 
+        // The snapshot pins every row, the null map included.
         let batches = read_back.collect().await?;
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(rows, 3, "every row must be stored, including the null map");
         assert_snapshot!(
             "map_column_roundtrip_result",
             pretty_format_batches(&batches)?

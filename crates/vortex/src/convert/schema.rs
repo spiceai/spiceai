@@ -18,6 +18,7 @@ use vortex::dtype::DType;
 /// - Utf8/LargeUtf8 become `Utf8View`
 /// - Binary/LargeBinary become `BinaryView`
 /// - `RunEndEncoded` loses its encoding
+/// - `Map` has no `DType` and is stored as `List<Struct<keys, values>>`
 /// - Lists are even more complex, with various sizes and physical layouts that are lost
 ///
 /// For these types, we use the logical schema's type instead of the `DType`'s natural Arrow
@@ -176,10 +177,9 @@ fn calculate_physical_field_type(
             }
         }
 
-        // Arrow's `Map` has no Vortex `DType`; it is aliased to `List<Struct<keys, values>>`
-        // on the way in, so the map identity - the entries field name, the key and value
-        // names, and the `ordered` flag - survives only in the logical schema and has to be
-        // re-applied here for the file to read back as a map.
+        // The map identity - the entries field name, the key and value names, and the
+        // `ordered` flag - survives only in the logical schema, so it is re-applied here or
+        // the column reads back as the list it is stored as.
         DataType::Map(logical_entries, ordered) => {
             if let DType::List(entries_dtype, _) = dtype {
                 let physical_entries_type = calculate_physical_field_type(

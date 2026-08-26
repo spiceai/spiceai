@@ -233,9 +233,13 @@ const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 /// started failing keeps serving those and never updates them - so the message states the
 /// failure and what stops happening rather than guessing which case it is
 /// (spiceai/spiceai#13524).
-fn accelerator_unwritable_message(dataset_name: &str, failures: u32, cause: &str) -> String {
+fn accelerator_unwritable_message(
+    dataset: &TableReference,
+    failures: u32,
+    cause: &dyn fmt::Display,
+) -> String {
     format!(
-        "Dataset '{dataset_name}' failed to write to its accelerator {failures} times in a row, \
+        "Dataset '{dataset}' failed to write to its accelerator {failures} times in a row, \
          so no new result is being cached and anything already cached will not be updated. \
          Cause: {cause}. \
          See: https://spiceai.org/docs/components/data-accelerators"
@@ -263,25 +267,26 @@ impl CacheWriteHealth {
         }
     }
 
-    fn record_failure(&mut self, dataset_name: &str, cause: &str) {
+    fn record_failure(&mut self, cause: &dyn fmt::Display) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if self.consecutive_failures < CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+        // Act on the crossing and nothing after it. The per-flush `warn!` already carries
+        // every occurrence, so re-reporting would rewrite the status registry twice a second
+        // for a state that has not changed. `cause` is only formatted past this point.
+        if self.consecutive_failures != CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
             return;
         }
 
         let message =
-            accelerator_unwritable_message(dataset_name, self.consecutive_failures, cause);
-        // Report the first crossing, then stay quiet: the per-flush `warn!` already carries
-        // every occurrence, and this line is the one an operator is meant to act on.
-        if self.reported.is_none() {
-            tracing::error!("{message}");
-        }
-        self.runtime_status
-            .update_dataset(&self.dataset, ComponentStatus::Error(Some(message.clone())));
+            accelerator_unwritable_message(&self.dataset, self.consecutive_failures, cause);
+        tracing::error!("{message}");
+        self.runtime_status.update_dataset(
+            &self.dataset,
+            ComponentStatus::error_with_message(message.clone()),
+        );
         self.reported = Some(message);
     }
 
-    fn record_success(&mut self, dataset_name: &str) {
+    fn record_success(&mut self) {
         self.consecutive_failures = 0;
         let Some(reported) = self.reported.take() else {
             return;
@@ -289,18 +294,22 @@ impl CacheWriteHealth {
 
         // Only clear the status this tracker set. A refresh failure reported since then is a
         // separate problem and must not be masked by a cache write starting to succeed.
-        // `ComponentStatus` compares by variant alone, so the message has to be matched
-        // rather than the status equated.
-        let current = self
+        // `ComponentStatus` compares by variant alone, so the message identifies the reporter
+        // where the status cannot.
+        if self
             .runtime_status
-            .get_component_status(&format!("dataset:{}", self.dataset));
-        let still_ours =
-            matches!(&current, Some(ComponentStatus::Error(Some(message))) if *message == reported);
-        if still_ours {
+            .get_dataset_status(&self.dataset)
+            .as_ref()
+            .and_then(ComponentStatus::error_message)
+            == Some(reported.as_str())
+        {
             self.runtime_status
                 .update_dataset(&self.dataset, ComponentStatus::Ready);
         }
-        tracing::info!("Dataset '{dataset_name}' is writing to its accelerator again.");
+        tracing::info!(
+            "Dataset '{}' is writing to its accelerator again.",
+            self.dataset
+        );
     }
 }
 
@@ -498,9 +507,9 @@ async fn flush_cache_writes(
     let write_ms = write_start.elapsed().as_millis();
     if let Err(e) = result {
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
-        health.record_failure(dataset_name, &e.to_string());
+        health.record_failure(&e);
     } else if insert_rows > 0 || upsert_rows > 0 {
-        health.record_success(dataset_name);
+        health.record_success();
 
         // Update last_updated_at for snapshots_creation_policy: on_change support
         super::AcceleratedTable::set_timestamp_to_now(last_updated_at);
@@ -2364,7 +2373,11 @@ mod tests {
     /// nothing while the runtime reports itself healthy.
     #[test]
     fn unwritable_message_names_the_dataset_the_consequence_and_the_docs() {
-        let message = accelerator_unwritable_message("api_data", 3, "no encoding for Map");
+        let message = accelerator_unwritable_message(
+            &TableReference::bare("api_data"),
+            3,
+            &"no encoding for Map",
+        );
         assert!(message.contains("'api_data'"), "message: {message}");
         // The impact has to hold whether or not the accelerator already stored rows: a
         // populated cache goes stale rather than empty, so the message must not claim the
@@ -2387,36 +2400,42 @@ mod tests {
         );
     }
 
-    fn dataset_status(status: &Arc<RuntimeStatus>, dataset: &str) -> Option<ComponentStatus> {
-        status.get_component_status(&format!("dataset:{dataset}"))
+    /// Drive the tracker to the point where it reports the dataset unhealthy.
+    fn fail_until_unhealthy(health: &mut CacheWriteHealth) {
+        for _ in 0..CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+            health.record_failure(&"write failed");
+        }
     }
 
     #[test]
     fn a_run_of_failed_flushes_reports_the_dataset_unhealthy() {
         let status = RuntimeStatus::new();
-        let mut health =
-            CacheWriteHealth::new(Arc::clone(&status), TableReference::bare("api_data"));
+        let dataset = TableReference::bare("api_data");
+        let mut health = CacheWriteHealth::new(Arc::clone(&status), dataset.clone());
 
         for _ in 1..CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
-            health.record_failure("api_data", "write failed");
+            health.record_failure(&"write failed");
             assert_eq!(
-                dataset_status(&status, "api_data"),
+                status.get_dataset_status(&dataset),
                 None,
-                "a single failed flush can be transient and must not report the dataset unhealthy"
+                "a failed flush short of the threshold can be transient and must not report the \
+                 dataset unhealthy"
             );
         }
 
-        health.record_failure("api_data", "write failed");
-        let Some(ComponentStatus::Error(Some(message))) = dataset_status(&status, "api_data")
-        else {
-            panic!("dataset should be reported unhealthy once the accelerator stops storing rows");
-        };
+        health.record_failure(&"write failed");
+        let message = status
+            .get_dataset_status(&dataset)
+            .as_ref()
+            .and_then(ComponentStatus::error_message)
+            .map(str::to_owned)
+            .expect("dataset should be unhealthy once the accelerator stops storing rows");
         assert!(message.contains("'api_data'"), "message: {message}");
 
         // A flush that stores rows is the accelerator working again.
-        health.record_success("api_data");
+        health.record_success();
         assert_eq!(
-            dataset_status(&status, "api_data"),
+            status.get_dataset_status(&dataset),
             Some(ComponentStatus::Ready)
         );
     }
@@ -2426,10 +2445,7 @@ mod tests {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("api_data");
         let mut health = CacheWriteHealth::new(Arc::clone(&status), dataset.clone());
-
-        for _ in 0..CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
-            health.record_failure("api_data", "write failed");
-        }
+        fail_until_unhealthy(&mut health);
 
         // The refresh path reports its own failure after this tracker reported its.
         status.update_dataset(
@@ -2437,13 +2453,14 @@ mod tests {
             ComponentStatus::Error(Some("refresh failed".to_string())),
         );
 
-        health.record_success("api_data");
+        health.record_success();
         // `ComponentStatus` equates every `Error` regardless of message, so assert on the
         // message: comparing the statuses would pass even if the refresh error were replaced.
-        let current = dataset_status(&status, "api_data");
-        assert!(
-            matches!(&current, Some(ComponentStatus::Error(Some(message))) if message == "refresh failed"),
-            "cache writes succeeding again says nothing about a refresh that is still failing, got: {current:?}"
+        let current = status.get_dataset_status(&dataset);
+        assert_eq!(
+            current.as_ref().and_then(ComponentStatus::error_message),
+            Some("refresh failed"),
+            "cache writes succeeding again says nothing about a refresh that is still failing"
         );
     }
 
