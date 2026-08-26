@@ -384,17 +384,17 @@ fn ensure_narrowing_is_backed_by_the_data(
     // on every child-bearing shape and this can pair fields with children positionally. `zip`
     // truncates rather than indexing: a child count that still disagrees is a layout disagreement,
     // and `build` refuses it with a better message than a panic here would give.
-    for (source_field, target_field) in relabel_field_pairs(data.data_type(), target_type) {
-        let Some(child) = data.child_data().get(source_field.index) else {
+    for (index, (source_field, target_field)) in relabel_field_pairs(data.data_type(), target_type)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(child) = data.child_data().get(index) else {
             continue;
         };
 
-        if source_field.field.is_nullable()
-            && !target_field.is_nullable()
-            && holds_logical_nulls(child)
-        {
+        if source_field.is_nullable() && !target_field.is_nullable() && holds_logical_nulls(child) {
             return Err(relabel_narrows_a_field_that_holds_nulls(
-                source_field.field,
+                source_field,
                 target_field,
             ));
         }
@@ -415,30 +415,20 @@ fn ensure_narrowing_is_backed_by_the_data(
     Ok(())
 }
 
-/// One nested field of a type, together with the index of the child data it describes.
-struct IndexedField<'a> {
-    field: &'a Field,
-    index: usize,
-}
-
 /// The nested fields of `source` paired with `target`'s, in `ArrayData::child_data` order.
 ///
-/// Mirrors [`target_child_types`], which is what makes the index usable against `child_data`, but
-/// yields the `Field`s rather than their types because nullability lives on the field. `Dictionary`
-/// is absent for the same reason: its value type carries no field, so its child is walked by the
-/// caller instead.
+/// Mirrors [`target_child_types`], which is what lets the caller read each pair's position as the
+/// index of the child it describes — every shape here lays its children out in field order, so a
+/// single-field type owns child 0 and `Struct`/`Union`/`RunEndEncoded` pair field *i* with child
+/// *i*. Yields the `Field`s rather than their types because nullability lives on the field.
+/// `Dictionary` is absent for the same reason: its value type carries no field, so its child is
+/// walked by the caller instead.
 fn relabel_field_pairs<'a>(
     source: &'a DataType,
     target: &'a DataType,
-) -> Vec<(IndexedField<'a>, &'a Field)> {
-    let single = |source_field: &'a FieldRef, target_field: &'a FieldRef| {
-        vec![(
-            IndexedField {
-                field: source_field,
-                index: 0,
-            },
-            target_field.as_ref(),
-        )]
+) -> Vec<(&'a Field, &'a Field)> {
+    let pair = |source_field: &'a FieldRef, target_field: &'a FieldRef| {
+        vec![(source_field.as_ref(), target_field.as_ref())]
     };
 
     match (source, target) {
@@ -448,54 +438,24 @@ fn relabel_field_pairs<'a>(
         | (DataType::LargeListView(source_item), DataType::LargeListView(target_item))
         | (DataType::FixedSizeList(source_item, _), DataType::FixedSizeList(target_item, _))
         | (DataType::Map(source_item, _), DataType::Map(target_item, _)) => {
-            single(source_item, target_item)
+            pair(source_item, target_item)
         }
         (DataType::Struct(source_fields), DataType::Struct(target_fields)) => source_fields
             .iter()
-            .enumerate()
-            .zip(target_fields)
-            .map(|((index, source_field), target_field)| {
-                (
-                    IndexedField {
-                        field: source_field,
-                        index,
-                    },
-                    target_field.as_ref(),
-                )
-            })
+            .map(Arc::as_ref)
+            .zip(target_fields.iter().map(Arc::as_ref))
             .collect(),
         (DataType::Union(source_fields, _), DataType::Union(target_fields, _)) => source_fields
             .iter()
-            .enumerate()
-            .zip(target_fields.iter())
-            .map(|((index, (_, source_field)), (_, target_field))| {
-                (
-                    IndexedField {
-                        field: source_field,
-                        index,
-                    },
-                    target_field.as_ref(),
-                )
-            })
+            .map(|(_, f)| f.as_ref())
+            .zip(target_fields.iter().map(|(_, f)| f.as_ref()))
             .collect(),
         (
             DataType::RunEndEncoded(source_run_ends, source_values),
             DataType::RunEndEncoded(target_run_ends, target_values),
         ) => vec![
-            (
-                IndexedField {
-                    field: source_run_ends,
-                    index: 0,
-                },
-                target_run_ends.as_ref(),
-            ),
-            (
-                IndexedField {
-                    field: source_values,
-                    index: 1,
-                },
-                target_values.as_ref(),
-            ),
+            (source_run_ends.as_ref(), target_run_ends.as_ref()),
+            (source_values.as_ref(), target_values.as_ref()),
         ],
         _ => Vec::new(),
     }
