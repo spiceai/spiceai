@@ -30,7 +30,6 @@ use async_openai::{
 };
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use google_genai::types::UsageMetadata;
-use secrecy::{ExposeSecret, SecretString};
 
 use crate::google::embed::EmbedGoogle;
 
@@ -41,28 +40,8 @@ pub struct Google {
 }
 
 impl Google {
-    pub fn new(api_key: &SecretString, model: &str) -> Result<Self, google_genai::Error> {
-        Ok(Self {
-            client: google_genai::Client::new(api_key.expose_secret().to_string())?,
-            model: model.to_string(),
-        })
-    }
-
-    pub fn new_embeddings(
-        api_key: &SecretString,
-        model: &str,
-        dimensions: Option<u32>,
-        embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
-    ) -> Result<EmbedGoogle, google_genai::Error> {
-        Ok(EmbedGoogle {
-            g: Self::new(api_key, model)?,
-            dimensions,
-            embeddings_cache,
-        })
-    }
-
-    /// Wraps an already-built [`google_genai::Client`] (Google AI Studio or Vertex AI — see
-    /// [`auth::build_client`]) for the given model.
+    /// Wraps an already-built Vertex AI [`google_genai::Client`] — see [`auth::build_client`] —
+    /// for the given model.
     #[must_use]
     pub fn from_client(client: google_genai::Client, model: impl Into<String>) -> Self {
         Self {

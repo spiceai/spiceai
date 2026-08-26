@@ -23,42 +23,12 @@ use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// One text to embed. The model is named in the request URL, not the body.
+#[derive(Debug, Clone)]
 pub struct EmbedContentRequest {
-    /// Required. The model's resource name. Format: models/{model}
-    pub model: String,
     pub content: Content,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub task_type: Option<TaskType>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dimensionality: Option<u32>,
-}
-
-impl EmbedContentRequest {
-    #[must_use]
-    pub fn new(model: String, content: Content) -> Self {
-        Self {
-            model,
-            content,
-            task_type: None,
-            output_dimensionality: None,
-        }
-    }
-
-    #[must_use]
-    pub fn with_task_type(mut self, task_type: TaskType) -> Self {
-        self.task_type = Some(task_type);
-        self
-    }
-
-    #[must_use]
-    pub fn with_output_dimensionality(mut self, dimensionality: u32) -> Self {
-        self.output_dimensionality = Some(dimensionality);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,93 +44,16 @@ pub enum TaskType {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EmbedContentResponse {
-    pub embedding: Embedding,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Embedding {
     pub values: Vec<f32>,
 }
 
 impl Client {
-    pub async fn embed_content(
-        &self,
-        model: &str,
-        request: EmbedContentRequest,
-    ) -> Result<EmbedContentResponse> {
-        if self.is_vertex() {
-            let mut embeddings = self.vertex_predict_embed(model, &[request]).await?;
-            return Ok(EmbedContentResponse {
-                embedding: embeddings.remove(0),
-            });
-        }
-
-        let url = self.build_url(&format!("/models/{model}:embedContent"));
-
-        let headers = self.auth_headers(HeaderMap::new());
-
-        let response = self
-            .http_client()
-            .post(&url)
-            .headers(headers)
-            .json(&request)
-            .send()
-            .await
-            .context(HttpSnafu)?;
-
-        if !response.status().is_success() {
-            return Err(handle_unsuccessful_response(response).await);
-        }
-
-        response
-            .json::<EmbedContentResponse>()
-            .await
-            .context(HttpSnafu)
-    }
-
+    /// Embeds `requests` with `model`. Vertex AI's publisher text-embedding models (e.g.
+    /// `text-embedding-004`) are served by the `PredictionService` `:predict` RPC, whose
+    /// request/response shape this translates to and from. The embeddings are returned in the
+    /// order Vertex produced them; this does not check that it returned one per request.
     pub async fn batch_embed_content(
-        &self,
-        model: &str,
-        requests: Vec<EmbedContentRequest>,
-    ) -> Result<BatchEmbedContentResponse> {
-        if self.is_vertex() {
-            let embeddings = self.vertex_predict_embed(model, &requests).await?;
-            return Ok(BatchEmbedContentResponse { embeddings });
-        }
-
-        let url = self.build_url(&format!("/models/{model}:batchEmbedContents"));
-
-        let headers = self.auth_headers(HeaderMap::new());
-
-        let batch_request = BatchEmbedContentRequest { requests };
-
-        let response = self
-            .http_client()
-            .post(&url)
-            .headers(headers)
-            .json(&batch_request)
-            .send()
-            .await
-            .context(HttpSnafu)?;
-
-        if !response.status().is_success() {
-            return Err(handle_unsuccessful_response(response).await);
-        }
-
-        response
-            .json::<BatchEmbedContentResponse>()
-            .await
-            .context(HttpSnafu)
-    }
-
-    /// Vertex AI's publisher text-embedding models (e.g. `text-embedding-004`) don't expose
-    /// the Gemini Developer API's `:embedContent`/`:batchEmbedContents` actions — they use the
-    /// older Vertex `PredictionService` `:predict` RPC instead, with a different request/response
-    /// shape. This translates to/from that shape so callers see the same [`Embedding`] type
-    /// regardless of backend.
-    async fn vertex_predict_embed(
         &self,
         model: &str,
         requests: &[EmbedContentRequest],
@@ -266,18 +159,6 @@ struct VertexPrediction {
 #[serde(rename_all = "camelCase")]
 struct VertexPredictEmbedding {
     values: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchEmbedContentRequest {
-    requests: Vec<EmbedContentRequest>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BatchEmbedContentResponse {
-    pub embeddings: Vec<Embedding>,
 }
 
 #[cfg(test)]
