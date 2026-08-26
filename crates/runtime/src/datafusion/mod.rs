@@ -259,6 +259,9 @@ pub enum Error {
     #[snafu(display("Unable to resolve table provider: {source}"))]
     UnableToResolveTableProvider { source: DataConnectorError },
 
+    #[snafu(display("Unable to set up durable write-back delivery: {source}"))]
+    UnableToGetWriteBackDeliverer { source: DataConnectorError },
+
     #[snafu(display(
         "Table {table_name} was marked as read_write, but the underlying provider only supports reads."
     ))]
@@ -3195,6 +3198,20 @@ impl DataFusion {
             }
             AcceleratedWriteMode::WriteBack => {
                 accelerated_table_builder.write_back();
+                // Give the delivery worker a connector-owned deliverer when the
+                // source provides one (Postgres owns each delivery transaction so
+                // it can stamp its id for the CDC echo filter). `None` keeps the
+                // worker's `TableProvider` delivery unchanged. A non-durable or
+                // non-Postgres source returns `None` here without connecting.
+                // `Some(Err(_))` means the dataset needs one but it could not be
+                // set up — that fails dataset setup rather than silently falling
+                // back to unsuppressed delivery.
+                let write_back_deliverer = source
+                    .write_back_deliverer(&RuntimeConnectorContext::for_dataset(dataset), dataset)
+                    .await
+                    .transpose()
+                    .context(UnableToGetWriteBackDelivererSnafu)?;
+                accelerated_table_builder.write_back_deliverer(write_back_deliverer);
             }
             AcceleratedWriteMode::WriteThrough => {
                 // Source-sync write; the accelerator catches up through the refresh

@@ -122,6 +122,18 @@ pub struct SharedMemberSetup {
     /// us between the two reads is reported as the unfillable gap it is rather
     /// than silently compared against a fabricated position.
     pub slot_restart_lsn: Option<u64>,
+    /// The source's current WAL insert position (`pg_current_wal_lsn()`), read
+    /// in the same setup session and before the slot is ensured. An applied
+    /// position a previous process recorded can never legitimately be ahead of
+    /// this — positions only ever come from commits the server itself streamed —
+    /// so a recorded watermark above it identifies a source restored or rewound
+    /// since the watermark was written (see
+    /// [`super::recorded_position_is_ahead_of_source`]).
+    ///
+    /// Reading it before the slot is ensured keeps it at or below the resulting
+    /// `consistent_lsn`, so that check and the reachability check leave no band
+    /// of watermarks between them.
+    pub current_wal_lsn: u64,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -157,6 +169,15 @@ pub async fn setup_shared_member(
                 // root, which is the name members subscribe with.
                 let publication_tables =
                     list_publication_tables(&client, &params.publication_name).await?;
+                // Read before the slot is ensured, so this position is at or
+                // below the `consistent_lsn` that call produces. The ordering is
+                // what makes the two rebuild conditions overlap instead of
+                // leaving a band between them: read afterwards, WAL written
+                // between slot creation and this read is above `consistent_lsn`
+                // and at or below this position, so a watermark landing in it is
+                // neither ahead of the source nor behind what the slot can
+                // stream, and is resumed on.
+                let current_wal_lsn = current_wal_lsn(&client).await?;
                 let slot = ensure_slot(&client, params).await?;
                 let slot_restart_lsn = read_slot_restart_lsn(&client, &params.slot_name).await?;
                 Ok(SharedMemberSetup {
@@ -165,6 +186,7 @@ pub async fn setup_shared_member(
                     generated_columns,
                     publication_tables,
                     slot_restart_lsn,
+                    current_wal_lsn,
                 })
             }
             .await;

@@ -4866,6 +4866,9 @@ dependencies = [
 name = "connector-postgres"
 version = "2.2.0"
 dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "data-connector-api",
@@ -17917,6 +17920,7 @@ dependencies = [
  "spice-table",
  "spicepod",
  "telemetry",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
