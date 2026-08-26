@@ -592,7 +592,16 @@ impl TableInvalidationClock {
             state.invalidated_at.clear();
         }
 
-        state.invalidated_at.insert(key, at);
+        // Merge with the existing stamp rather than overwrite: concurrent
+        // invalidations of the same table capture their instants *before*
+        // taking this lock, so the older capture can acquire it last, and a
+        // plain insert would move the clock backward — letting a read that
+        // began between the two stamps be served stale.
+        state
+            .invalidated_at
+            .entry(key)
+            .and_modify(|existing| *existing = (*existing).max(at))
+            .or_insert(at);
     }
 
     /// Records that *every* table was invalidated at `at`, folding the map into
@@ -1150,6 +1159,28 @@ mod tests {
         assert!(
             !clock.invalidated_since(&discarded, later),
             "a read beginning after every recorded invalidation must still be cacheable"
+        );
+    }
+
+    /// The per-table stamp is monotonic: concurrent invalidations of the same
+    /// table capture their instants before acquiring the clock's lock, so the
+    /// older capture can be recorded *after* the newer one. It must not move
+    /// the clock backward — a read that began between the two stamps would
+    /// otherwise pass the freshness check and be served stale.
+    #[test]
+    fn table_invalidation_clock_keeps_the_newest_stamp_under_reversed_recording() {
+        let clock = TableInvalidationClock::default();
+        let base = std::time::Instant::now();
+        let newer = base + std::time::Duration::from_millis(2);
+
+        // Recorded newest-first, as when the older caller loses the lock race.
+        clock.mark_invalidated(&TableReference::bare("customer"), newer);
+        clock.mark_invalidated(&TableReference::bare("customer"), base);
+
+        let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        assert!(
+            clock.invalidated_since(&tables, base + std::time::Duration::from_millis(1)),
+            "a read that began before the newest invalidation must be rejected"
         );
     }
 
