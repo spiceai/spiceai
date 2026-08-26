@@ -926,7 +926,20 @@ async fn runtime_with_github_dataset_params(
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
+            // A dataset load has no deadline — the runtime retries a failing one
+            // for as long as it takes — so this timeout is how a load failure
+            // surfaces. Report each dataset's status, or the timeout says only
+            // that something did not finish.
+            let statuses = rt
+                .status()
+                .get_dataset_statuses()
+                .into_iter()
+                .map(|(dataset, status)| format!("{dataset}={status:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Timed out waiting for datasets to load. Dataset status: [{statuses}]"
+            ));
         }
         () = cloned_rt.load_components() => {}
     }

@@ -21,10 +21,12 @@ limitations under the License.
 //! resolved at all. The table holds a single row, the profile of the login the
 //! dataset names.
 //!
-//! `email` is deliberately absent: GitHub gates it behind the `read:user` or
-//! `user:email` token scope and fails the whole query with `INSUFFICIENT_SCOPES`
-//! when the token lacks it, which would make the table unusable for the
-//! `repo`-scoped tokens the rest of the connector runs on.
+//! `email` and `public_gists` are deliberately absent. GitHub gates a `User`
+//! field on the token's scopes — `email` on `read:user` or `user:email`, the
+//! `gists` connection on `gist` — and fails the *whole* query with
+//! `INSUFFICIENT_SCOPES` when the token lacks one. Selecting either would make
+//! the table unusable for the `repo`-scoped tokens the rest of the connector
+//! runs on, and neither is among the columns this table exists to provide.
 
 use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -83,7 +85,6 @@ impl GitHubTableArgs for UsersTableArgs {
                     followers: followers {{ followers: totalCount }}
                     following: following {{ following: totalCount }}
                     public_repos: repositories(privacy: PUBLIC) {{ public_repos: totalCount }}
-                    public_gists: gists(privacy: PUBLIC) {{ public_gists: totalCount }}
                 }}
             }}"#,
             login = self.login,
@@ -116,7 +117,6 @@ fn gql_schema() -> SchemaRef {
         Field::new("followers", DataType::Int64, true),
         Field::new("following", DataType::Int64, true),
         Field::new("public_repos", DataType::Int64, true),
-        Field::new("public_gists", DataType::Int64, true),
         Field::new(
             "created_at",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -194,8 +194,7 @@ mod tests {
             "is_hireable": false,
             "followers": {"followers": 113},
             "following": {"following": 42},
-            "public_repos": {"public_repos": 44},
-            "public_gists": {"public_gists": 6}
+            "public_repos": {"public_repos": 44}
         }))
         .expect("unnest to succeed");
 
@@ -203,7 +202,6 @@ mod tests {
         assert_eq!(rows[0]["followers"], json!(113));
         assert_eq!(rows[0]["following"], json!(42));
         assert_eq!(rows[0]["public_repos"], json!(44));
-        assert_eq!(rows[0]["public_gists"], json!(6));
         // The login the dataset names is this table's `owner`.
         assert_eq!(rows[0]["owner"], json!("lukekim"));
         assert!(rows[0].get("repo").is_none());
