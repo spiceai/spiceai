@@ -6407,6 +6407,7 @@ dependencies = [
  "indexmap 2.14.0",
  "insta",
  "logos",
+ "moka",
  "mysql_async",
  "mysql_common",
  "native-tls",
