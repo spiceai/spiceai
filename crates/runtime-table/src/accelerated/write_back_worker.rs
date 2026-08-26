@@ -51,9 +51,9 @@ limitations under the License.
 //! worker does no compare-and-set against the source. Durable write-back is
 //! safe only when the accelerator is the sole writer of the rows it delivers.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Weak};
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
@@ -64,6 +64,9 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
+use opentelemetry::KeyValue;
+use parking_lot::Mutex;
+use runtime_metrics::acceleration as metrics;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
@@ -75,6 +78,56 @@ const CLAIM_BATCH: usize = 1024;
 /// Idle poll interval when the dirty set is empty (not a failure — the error
 /// backoff must not grow on empty polls).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A generation token for workers that publish the same dataset-labelled gauge.
+struct WriteBackGaugeOwner;
+
+/// Live write-back workers in spawn order for each dataset.
+///
+/// Hot reload starts a successor before aborting its predecessor. Both workers
+/// use the same metric labels, so only the newest live generation may publish;
+/// otherwise a delayed predecessor teardown can overwrite the successor's
+/// backlog with zero. Keeping the predecessor in the stack lets it resume
+/// ownership if a candidate replacement fails before installation.
+#[derive(Default)]
+struct WriteBackGaugeOwners {
+    by_dataset: HashMap<String, Vec<Weak<WriteBackGaugeOwner>>>,
+}
+
+impl WriteBackGaugeOwners {
+    fn register(&mut self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) {
+        let owners = self.by_dataset.entry(dataset_name.to_string()).or_default();
+        owners.retain(|candidate| candidate.strong_count() > 0);
+        owners.push(Arc::downgrade(owner));
+    }
+
+    fn is_current(&self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) -> bool {
+        self.by_dataset
+            .get(dataset_name)
+            .and_then(|owners| owners.last())
+            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner))
+    }
+
+    /// Remove `owner`; return whether its teardown should zero the gauge.
+    fn unregister(&mut self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) -> bool {
+        let owner_ptr = Arc::as_ptr(owner);
+        let Some(owners) = self.by_dataset.get_mut(dataset_name) else {
+            return false;
+        };
+        let was_current = owners
+            .last()
+            .is_some_and(|current| current.as_ptr() == owner_ptr);
+        owners.retain(|candidate| candidate.as_ptr() != owner_ptr && candidate.strong_count() > 0);
+        let no_owner_remains = owners.is_empty();
+        if no_owner_remains {
+            self.by_dataset.remove(dataset_name);
+        }
+        was_current && no_owner_remains
+    }
+}
+
+static WRITE_BACK_GAUGE_OWNERS: LazyLock<Mutex<WriteBackGaugeOwners>> =
+    LazyLock::new(|| Mutex::new(WriteBackGaugeOwners::default()));
 
 pub(crate) struct WriteBackWorker {
     /// A write-clone of the durable-write-back Cayenne provider — shares the
@@ -89,6 +142,9 @@ pub(crate) struct WriteBackWorker {
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
+    /// The backlog gauge's label set, built once.
+    dataset_labels: [KeyValue; 1],
+    gauge_owner: Arc<WriteBackGaugeOwner>,
 }
 
 impl WriteBackWorker {
@@ -101,12 +157,18 @@ impl WriteBackWorker {
         deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     ) -> JoinHandle<()> {
         let pk_columns = provider.pk_column_names();
+        let gauge_owner = Arc::new(WriteBackGaugeOwner);
+        WRITE_BACK_GAUGE_OWNERS
+            .lock()
+            .register(&dataset_name, &gauge_owner);
         let worker = Self {
             provider: Arc::new(provider),
             federated,
             deliverer,
             pk_columns,
+            dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
             dataset_name,
+            gauge_owner,
         };
         tokio::spawn(async move { worker.run().await })
     }
@@ -131,8 +193,17 @@ impl WriteBackWorker {
         // transient failure never leaves us stuck at a long delay, and never
         // advanced by an empty poll (an empty dirty set is not a failure).
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+        let mut last_backlog_sample = None;
         loop {
             match self.deliver_batch().await {
+                Ok(0) => {
+                    // Nothing was claimed, which proves the dirty set is empty —
+                    // publish that without paying for a count.
+                    backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+                    self.publish_backlog(0);
+                    last_backlog_sample = Some(Instant::now());
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
                 Ok(delivered) => {
                     // Success — reset the error backoff.
                     backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
@@ -140,10 +211,19 @@ impl WriteBackWorker {
                         // Dirty set drained (fewer than a full batch remained);
                         // idle-poll for the next commit — NOT an error, so the
                         // backoff stays reset.
+                        if self.count_and_publish_backlog().await {
+                            last_backlog_sample = Some(Instant::now());
+                        }
                         tokio::time::sleep(POLL_INTERVAL).await;
+                    } else if last_backlog_sample
+                        .is_none_or(|sampled_at| sampled_at.elapsed() >= POLL_INTERVAL)
+                    {
+                        // A count scans the remaining dirty set, so sample at
+                        // most once per poll interval while full batches drain.
+                        if self.count_and_publish_backlog().await {
+                            last_backlog_sample = Some(Instant::now());
+                        }
                     }
-                    // Else a full batch was claimed — more may remain; loop
-                    // immediately to keep draining.
                 }
                 Err(e) => {
                     let delay = backoff.next_duration().unwrap_or(POLL_INTERVAL);
@@ -152,8 +232,42 @@ impl WriteBackWorker {
                         error = %e,
                         "durable write-back delivery failed; retrying in {delay:?}"
                     );
+                    if self.count_and_publish_backlog().await {
+                        last_backlog_sample = Some(Instant::now());
+                    }
                     tokio::time::sleep(delay).await;
                 }
+            }
+        }
+    }
+
+    /// Publish an already-known undelivered-marker backlog for this dataset.
+    fn publish_backlog(&self, pending: i64) {
+        let owners = WRITE_BACK_GAUGE_OWNERS.lock();
+        if !owners.is_current(&self.dataset_name, &self.gauge_owner) {
+            return;
+        }
+        metrics::WRITE_BACK_PENDING_KEYS.record(pending, &self.dataset_labels);
+    }
+
+    /// Count this dataset's undelivered markers and publish them.
+    ///
+    /// A delivery that can never succeed surfaces only as a backlog that never
+    /// falls, so the failing pass has to publish it too — that is the state the
+    /// gauge exists to make visible.
+    async fn count_and_publish_backlog(&self) -> bool {
+        match self.provider.dirty_key_count().await {
+            Ok(pending) => {
+                self.publish_backlog(pending);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    dataset = %self.dataset_name,
+                    error = %e,
+                    "durable write-back: could not read the undelivered-marker backlog for the gauge"
+                );
+                false
             }
         }
     }
@@ -172,9 +286,11 @@ impl WriteBackWorker {
 
         let pk_bytes: Vec<Vec<u8>> = claimed.iter().map(|(bytes, _)| bytes.clone()).collect();
         let pk_arrays = self.provider.decode_pk_keys(&pk_bytes).map_err(to_df_err)?;
-        let Some(pk_values) = pk_arrays.into_iter().next() else {
-            return Ok(0);
-        };
+        let pk_values = pk_arrays.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal(
+                "durable write-back marker decode returned no primary-key column".to_string(),
+            )
+        })?;
         let filter = pk_in_filter(&self.pk_columns[0], &pk_values)?;
 
         // Read the claimed keys' current committed values from the accelerator,
@@ -294,6 +410,17 @@ impl WriteBackWorker {
     }
 }
 
+impl Drop for WriteBackWorker {
+    fn drop(&mut self) {
+        let mut owners = WRITE_BACK_GAUGE_OWNERS.lock();
+        if owners.unregister(&self.dataset_name, &self.gauge_owner) {
+            // No live worker owns these labels. Synchronous gauges retain their
+            // last value, so clear the removed dataset's stale backlog.
+            metrics::WRITE_BACK_PENDING_KEYS.record(0, &self.dataset_labels);
+        }
+    }
+}
+
 /// Build `pk_col IN (values…)` from a decoded primary-key array.
 fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
     let mut list: Vec<Expr> = Vec::with_capacity(values.len());
@@ -367,7 +494,9 @@ fn keys_to_array(keys: Vec<ScalarValue>) -> DataFusionResult<ArrayRef> {
 
 #[cfg(test)]
 mod tests {
-    use super::{absent_claimed_keys, keys_to_array, pk_in_filter};
+    use super::{
+        WriteBackGaugeOwner, WriteBackGaugeOwners, absent_claimed_keys, keys_to_array, pk_in_filter,
+    };
     use arrow::array::{Int32Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -458,6 +587,36 @@ mod tests {
             "lists the keys: {rendered}"
         );
     }
+
+    #[test]
+    fn gauge_ownership_returns_to_a_live_predecessor() {
+        let mut owners = WriteBackGaugeOwners::default();
+        let predecessor = Arc::new(WriteBackGaugeOwner);
+        let successor = Arc::new(WriteBackGaugeOwner);
+
+        owners.register("orders", &predecessor);
+        owners.register("orders", &successor);
+        assert!(!owners.is_current("orders", &predecessor));
+        assert!(owners.is_current("orders", &successor));
+
+        assert!(!owners.unregister("orders", &successor));
+        assert!(owners.is_current("orders", &predecessor));
+        assert!(owners.unregister("orders", &predecessor));
+    }
+
+    #[test]
+    fn stale_predecessor_teardown_cannot_zero_the_current_gauge() {
+        let mut owners = WriteBackGaugeOwners::default();
+        let predecessor = Arc::new(WriteBackGaugeOwner);
+        let successor = Arc::new(WriteBackGaugeOwner);
+
+        owners.register("orders", &predecessor);
+        owners.register("orders", &successor);
+
+        assert!(!owners.unregister("orders", &predecessor));
+        assert!(owners.is_current("orders", &successor));
+        assert!(owners.unregister("orders", &successor));
+    }
 }
 
 /// End-to-end coverage of [`WriteBackWorker::deliver_batch`] against a real
@@ -476,19 +635,21 @@ mod deliverer_tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use cayenne::metadata::{CreateTableOptions, VortexConfig};
     use cayenne::{
-        CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+        CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction,
+        MetadataCatalog,
     };
     use data_connector_api::write_back::{DeliveryError, DeliveryResult};
     use datafusion::datasource::{MemTable, TableProvider};
-    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::execution::SendableRecordBatchStream;
     use datafusion::logical_expr::{col, lit};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionContext;
-    use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::on_conflict::OnConflict;
+    use opentelemetry::KeyValue;
     use parking_lot::Mutex;
 
-    use super::{CLAIM_BATCH, WriteBackDeliverer, WriteBackWorker};
+    use super::{CLAIM_BATCH, WriteBackDeliverer, WriteBackGaugeOwner, WriteBackWorker};
     use crate::federated::FederatedTable;
 
     /// Records every call it receives; `arm_failure` makes the next call
@@ -573,8 +734,13 @@ mod deliverer_tests {
             .expect("table created")
     }
 
+    /// Commit one row through a Cayenne transaction.
+    ///
+    /// A transaction commit is the only writer of `cayenne_pending_write_back`
+    /// markers, so it is the only write the delivery worker can observe. A bare
+    /// `insert_into` marks nothing, leaving every test below with an empty
+    /// dirty set.
     async fn insert_row(provider: &CayenneTableProvider, id: i32, name: &str) {
-        let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             orders_schema(),
             vec![
@@ -583,17 +749,35 @@ mod deliverer_tests {
             ],
         )
         .expect("batch builds");
-        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], orders_schema(), None)
-            .expect("mem exec");
-        let plan = provider
-            .insert_into(&ctx.state(), input, InsertOp::Append)
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+
+        let table_id = provider.table_id().to_string();
+        let txn = CayenneTransaction::new();
+        txn.register(
+            table_id.clone(),
+            provider.transaction_write_token().await,
+            provider.clone_for_write_operations(),
+        );
+        let token = txn
+            .take_token(&table_id)
+            .expect("the registered participant's write token");
+        let staged = provider
+            .begin_staged_upsert_occ(token, stream, 1)
             .await
-            .expect("insert plan");
-        datafusion::physical_plan::collect(plan, ctx.task_ctx())
-            .await
-            .expect("insert executes");
+            .expect("stage the upsert");
+        txn.set_staged(&table_id, staged);
+        txn.commit().await.expect("commit the transaction");
     }
 
+    /// Physically remove a row WITHOUT marking it.
+    ///
+    /// The counterpart to `insert_row`: the delete path records no write-back
+    /// marker, so the absent-key test keeps the marker its insert produced
+    /// while the row itself is gone — the "claimed key the post-claim read
+    /// cannot find" case. Routing this through `insert_row` would destroy it.
     async fn delete_row(provider: &CayenneTableProvider, id: i32) {
         let ctx = SessionContext::new();
         let plan = provider
@@ -616,12 +800,19 @@ mod deliverer_tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
             MemTable::try_new(orders_schema(), vec![vec![]]).expect("mem table"),
         )));
+        let dataset_name = "orders".to_string();
+        // These tests drive `deliver_batch` directly and never `run`, so nothing
+        // here publishes the backlog gauge. The owner is left unregistered
+        // rather than mutating the process-wide owner stack from a test; `Drop`
+        // treats an unregistered owner as owning nothing.
         WriteBackWorker {
             provider: Arc::new(provider),
             federated,
             deliverer,
             pk_columns,
-            dataset_name: "orders".to_string(),
+            dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
+            dataset_name,
+            gauge_owner: Arc::new(WriteBackGaugeOwner),
         }
     }
 

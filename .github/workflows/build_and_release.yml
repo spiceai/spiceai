@@ -456,16 +456,19 @@ jobs:
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             ${RELEASE_ARTIFACT[*]}
+          # Pass the notes by path, not by value: a release body over 128 KiB
+          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
+          # after every build has already succeeded.
           if [ "$LATEST_RELEASE" = "true" ]; then
-            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
-            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
           fi
           echo "Uploading Spice.ai Binaries to GitHub Release"
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "v${{ env.REL_VERSION }}" \
-            --body "${RELEASE_BODY}" \
+            "${BODY_ARGS[@]}" \
             --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}
