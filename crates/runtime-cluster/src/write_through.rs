@@ -1264,18 +1264,18 @@ mod tests {
             "routing schema must declare entries non-nullable"
         );
 
-        let normalized = normalizer
+        let conformed = normalizer
             .normalize(decoded)
             .expect("normalize should succeed");
-        let normalized_schema = normalized.schema();
-        let DataType::Map(entries, _) = normalized_schema.field(0).data_type() else {
+        let conformed_schema = conformed.schema();
+        let DataType::Map(entries, _) = conformed_schema.field(0).data_type() else {
             panic!("column should still be a MAP");
         };
         assert!(
             !entries.is_nullable(),
             "normalized batch must carry the conformed type"
         );
-        assert_eq!(normalized.num_rows(), 2);
+        assert_eq!(conformed.num_rows(), 2);
     }
 
     /// Entry nulls are the one shape relabelling cannot fix. The scheduler path must refuse
