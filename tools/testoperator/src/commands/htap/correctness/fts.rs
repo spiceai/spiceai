@@ -306,13 +306,19 @@ async fn verify_customer_hits(
 /// A customer's TPC-C primary key: `(c_w_id, c_d_id, c_id)`.
 type CustomerKey = (i64, i64, i64);
 
-/// Rows whose `c_data` (4th column) contains `token` as an exact
-/// whitespace-delimited word — matching the space-padded integer fields the
-/// payment transaction prepends, not a substring match.
+/// Rows whose `c_data` (4th column) contains `token` as a distinct token under
+/// the same tokenization the full-text index applies. The `c_data` column is
+/// indexed with the `en_stem` analyzer, whose `SimpleTokenizer` splits on every
+/// non-alphanumeric character and lower-cases each token — so this splits on
+/// `!char::is_alphanumeric()` (not whitespace) and compares case-insensitively.
+/// Splitting on whitespace alone would miss a token the index does produce: the
+/// payment amount `$   5.43` tokenizes to `5` and `43`, so it is a real hit for
+/// the term `5`, but whitespace-splitting keeps `5.43` whole and drops it.
 fn customer_keys_matching_token(
     batches: &[RecordBatch],
     token: &str,
 ) -> anyhow::Result<BTreeSet<CustomerKey>> {
+    let needle = token.to_lowercase();
     let mut keys = BTreeSet::new();
     for batch in batches {
         anyhow::ensure!(
@@ -330,7 +336,12 @@ fn customer_keys_matching_token(
             .ok_or_else(|| anyhow::anyhow!("c_data column is not Utf8"))?;
 
         for row in 0..batch.num_rows() {
-            if data.is_valid(row) && data.value(row).split_whitespace().any(|t| t == token) {
+            if data.is_valid(row)
+                && data
+                    .value(row)
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|t| t.eq_ignore_ascii_case(&needle))
+            {
                 keys.insert((w.value(row), d.value(row), c.value(row)));
             }
         }
@@ -413,17 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn matches_exact_whitespace_token_only() {
+    fn matches_simple_tokenizer_token() {
         let batch = customer_batch(&[
-            // Payment-mutated: "5" appears as its own token (c_d_id field).
+            // Payment-mutated: "5" is its own token via the c_d_id field.
             (
                 1,
                 5,
                 10,
                 "|   10    5    1  2    1 $   5.00 1700000000abc123",
             ),
-            // No isolated "5" token: "45" and "$5.00" (embedded, not bare "5").
+            // No "5" token: "abc45def" is a single alphanumeric run, so the
+            // SimpleTokenizer never splits out a bare "5".
             (2, 6, 11, "abc45def"),
+            // No standalone "5" id field, but the amount "$   5.00" tokenizes
+            // to "5" and "00" under the index's SimpleTokenizer, so this is a
+            // real hit — whitespace splitting would wrongly drop it.
             (
                 3,
                 7,
@@ -433,13 +448,14 @@ mod tests {
         ]);
 
         let matched = customer_keys_matching_token(&[batch], "5").expect("matches");
-        assert_eq!(matched, BTreeSet::from([(1, 5, 10)]));
+        assert_eq!(matched, BTreeSet::from([(1, 5, 10), (3, 7, 12)]));
     }
 
     #[test]
     fn random_seed_data_never_spuriously_matches() {
-        // Random seed data (chbench_driver::rand::rand_chars) has no whitespace,
-        // so a digit "5" anywhere inside it can never form an isolated token.
+        // Random seed data (chbench_driver::rand::rand_chars) is a single
+        // alphanumeric run with no separators, so the SimpleTokenizer keeps it
+        // whole and a digit "5" inside it never forms an isolated token.
         let batch = customer_batch(&[(9, 9, 99, "aZ5bQ9012345abcXYZ")]);
         let matched = customer_keys_matching_token(&[batch], "5").expect("matches");
         assert!(matched.is_empty());
