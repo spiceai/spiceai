@@ -1274,6 +1274,9 @@ mod tests {
     enum DoGetMode {
         Empty,
         Error,
+        /// Serves one batch holding a `MAP` column whose `entries` field the server declares
+        /// nullable — the shape the Arrow map layout forbids and the IPC reader lets through.
+        NullableMapEntries,
     }
 
     struct TestServer {
@@ -1342,7 +1345,8 @@ mod tests {
     impl FlightService for CookieFlightSqlService {
         type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
         type ListFlightsStream = EmptyResponseStream<FlightInfo>;
-        type DoGetStream = EmptyResponseStream<FlightData>;
+        type DoGetStream =
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
         type DoPutStream = EmptyResponseStream<PutResult>;
         type DoExchangeStream = EmptyResponseStream<FlightData>;
         type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
@@ -1426,8 +1430,19 @@ mod tests {
             }
             self.cookie_seen.store(true, Ordering::SeqCst);
             match self.do_get_mode {
-                DoGetMode::Empty => Ok(Response::new(tokio_stream::empty())),
+                DoGetMode::Empty => Ok(Response::new(Box::pin(tokio_stream::empty()))),
                 DoGetMode::Error => Err(Status::internal("do_get failed")),
+                DoGetMode::NullableMapEntries => {
+                    let batch = map_batch(true);
+                    let data = arrow_flight::utils::batches_to_flight_data(
+                        batch.schema().as_ref(),
+                        vec![batch],
+                    )
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
             }
         }
 
@@ -1893,6 +1908,58 @@ mod tests {
             sql.contains("ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST"),
             "expected ORDER BY clause in SQL, got: {sql}"
         );
+
+        server.shutdown().await;
+    }
+
+    /// Regression test for #13495 over the whole connector read path: a Flight SQL server that
+    /// declares a `MAP`'s `entries` field nullable — which the Arrow map layout forbids and the
+    /// IPC reader lets through — yields a column that no kernel can rebuild. `query_to_stream`
+    /// corrects the declaration as each batch is decoded, so the column that reaches the plan is
+    /// one a kernel can touch.
+    #[tokio::test]
+    async fn query_to_stream_corrects_a_servers_nullable_map_entries_declaration() {
+        use arrow::array::MapArray;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server =
+            TestServer::start(Arc::clone(&cookie_seen), DoGetMode::NullableMapEntries).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(client, "SELECT m FROM t".to_string(), cookie_store)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        match batch.schema().field(0).data_type() {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "the decoded batch still carries the server's non-conforming declaration"
+            ),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+
+        // The property the declaration controls: every kernel that touches a map column rebuilds
+        // it through this constructor, and a nullable `entries` field is refused there outright.
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("a Map column");
+        let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
+        MapArray::try_new(field, offsets, entries, nulls, ordered)
+            .expect("the corrected column can be rebuilt by a kernel");
 
         server.shutdown().await;
     }

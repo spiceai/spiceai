@@ -674,4 +674,24 @@ mod tests {
         let mut stream = futures::stream::iter(messages);
         assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
     }
+
+    /// The failure a client sees when its `MAP` column cannot be brought in line with the Arrow
+    /// map layout has to name the dataset it was writing to, say that nothing was written, and
+    /// point at the docs — a reword must not quietly drop any of the three.
+    #[test]
+    fn the_map_entries_refusal_names_the_dataset_the_impact_and_the_docs() {
+        let source = arrow_tools::map_entries::Error::MapEntriesContainNulls {
+            column: "attributes".to_string(),
+        };
+        let message =
+            super::map_entries_message(&TableReference::partial("sales", "orders"), &source);
+
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(message.contains("no rows were written"), "{message}");
+        assert!(message.contains("attributes"), "{message}");
+        assert!(
+            message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+            "{message}"
+        );
+    }
 }
