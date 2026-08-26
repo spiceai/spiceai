@@ -153,8 +153,8 @@ fn has_vortex_file(dir: &std::path::Path) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[cfg(not(target_os = "windows"))]
-async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
--> Result<(), anyhow::Error> {
+async fn cayenne_append_refresh_advances_a_timezone_aware_time_column() -> Result<(), anyhow::Error>
+{
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -172,10 +172,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
             // would decide what this one opens.
             let data_path = temp_dir.path().join("accelerator");
 
-            let mut dataset = Dataset::new(
-                format!("file://{}", source.display()),
-                TABLE,
-            );
+            let mut dataset = Dataset::new(format!("file://{}", source.display()), TABLE);
             dataset.time_column = Some("event_time".to_string());
             dataset.time_format = Some(TimeFormat::Timestamptz);
             dataset.acceleration = Some(Acceleration {

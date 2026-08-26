@@ -2695,7 +2695,9 @@ fn temporal_scalar_as_nanos(array: &dyn Array) -> Result<Option<i64>, ArrowError
         .as_any()
         .downcast_ref::<TimestampNanosecondArray>()
         .ok_or_else(|| {
-            ArrowError::CastError("cast to Timestamp(ns) did not yield a nanosecond timestamp".into())
+            ArrowError::CastError(
+                "cast to Timestamp(ns) did not yield a nanosecond timestamp".into(),
+            )
         })?;
 
     if nanos.is_empty() || nanos.is_null(0) {
@@ -3654,8 +3656,7 @@ mod tests {
                         .with_timezone_opt(tz),
                 ),
                 Arc::new(
-                    TimestampNanosecondArray::from(vec![FIXED_INSTANT_NANOS])
-                        .with_timezone_opt(tz),
+                    TimestampNanosecondArray::from(vec![FIXED_INSTANT_NANOS]).with_timezone_opt(tz),
                 ),
             ];
 
@@ -3708,7 +3709,10 @@ mod tests {
             "Date32 must normalize to midnight of that day"
         );
         assert_eq!(
-            max_as_nanos(Arc::new(Date64Array::from(vec![i64::from(DAYS) * 86_400_000]))).await,
+            max_as_nanos(Arc::new(Date64Array::from(vec![
+                i64::from(DAYS) * 86_400_000
+            ])))
+            .await,
             MIDNIGHT_NANOS,
             "Date64 must normalize to midnight of that day"
         );
