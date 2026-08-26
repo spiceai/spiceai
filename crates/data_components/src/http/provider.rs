@@ -116,31 +116,27 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The part of a *configured* endpoint that is safe to put in an error or a log line:
-/// scheme, host, port and path.
+/// scheme, host and port, and nothing else.
 ///
 /// **Pass the dataset's `base_url`, never a built request URL.** Everything a query
 /// contributes to a request is out of bounds: `request_query_filters` puts a query's own
 /// values in the query string, and `build_request_url` appends a `request_path` the query
 /// chose — which `allowed_request_paths` admits by glob, so a wildcard allowlist lets a
-/// filter name any path under the endpoint. Either can carry an API key, a signed
-/// parameter, a webhook secret or a cursor.
+/// filter name any path under the endpoint.
 ///
-/// What remains is what the operator wrote in the spicepod, minus a query, userinfo or
-/// fragment they may have configured there. That is enough for an error to name which
-/// dataset endpoint failed, which is what makes it worth reading;
-/// [`CacheKey::redacted_label`] hashes even that, but it labels a debug line rather than
-/// telling an operator what to fix.
+/// **The path is dropped even though the operator wrote it**, because a path is a place
+/// credentials are routinely kept rather than a merely descriptive part of a URL: a
+/// webhook endpoint carries its whole secret there, and so do the "unguessable URL"
+/// designs several APIs use in place of a header. The reader of these messages is whoever
+/// ran the query, who need not be the operator who can see the spicepod, so the path is
+/// theirs to keep. Nothing is lost that the reader needs: every message built from this
+/// also names the dataset, which identifies the endpoint uniquely and is what an operator
+/// looks up to fix it.
 fn endpoint_label(url: &Url) -> String {
-    let mut label = url.clone();
-    label.set_query(None);
-    label.set_fragment(None);
-    // Both setters only fail on a cannot-be-a-base URL, which cannot reach here: this is
-    // an http(s) URL the client just fetched. Ignoring the result would leave credentials
-    // in the label, so fall back to the origin, which never carries them.
-    if label.set_username("").is_err() || label.set_password(None).is_err() {
-        return url.origin().ascii_serialization();
-    }
-    label.to_string()
+    // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
+    // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
+    // property of the type rather than of remembering to clear each field.
+    url.origin().ascii_serialization()
 }
 
 /// What the connector does with a response the origin did not mark as successful.
@@ -7970,14 +7966,22 @@ mod tests {
             );
         }
 
-        // Still has to say which fetch failed, or the error is not worth reading.
+        // Still has to say which host was fetched, or the error is not worth reading.
         assert!(
-            label.contains("api.example.com") && label.contains("/v1/items"),
-            "the label must still name the endpoint and path: {label}"
+            label.contains("api.example.com"),
+            "the label must still name the host: {label}"
         );
         assert!(
             label.contains("8443"),
             "a non-default port is part of the endpoint: {label}"
+        );
+        // The path goes too. An operator keeps credentials there — a webhook's secret is
+        // the path — and the reader of this message is whoever ran the query, not
+        // necessarily someone entitled to see the spicepod. The dataset named alongside it
+        // is what identifies the endpoint.
+        assert!(
+            !label.contains("/v1/items"),
+            "the configured path is not the reader's to see: {label}"
         );
 
         // And the message built from it inherits that, on both the error and the row-keeping
@@ -7991,6 +7995,40 @@ mod tests {
         assert!(
             !message.contains("SECRET") && !message.contains("hunter2"),
             "the rendered error must not carry the query or userinfo: {message}"
+        );
+    }
+
+    /// The secret-in-the-path shape specifically: a webhook endpoint keeps its whole
+    /// credential in the path the operator configured, so a label that renders the path
+    /// hands it to anyone who can provoke a non-2xx.
+    #[test]
+    fn an_error_never_prints_a_secret_the_configured_path_carries() {
+        let url = Url::parse("https://hooks.example.com/services/T0000/B0000/tOkEnSeCrEt")
+            .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["tOkEnSeCrEt", "B0000", "T0000", "services"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}' from the path: {label}"
+            );
+        }
+        assert_eq!(label, "https://hooks.example.com");
+
+        let message = Error::ErrorResponse {
+            status: 401,
+            endpoint: label,
+            dataset: "dataset 'alerts'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("tOkEnSeCrEt"),
+            "the rendered error must not carry the path secret: {message}"
+        );
+        // The message is still actionable: it names the dataset to look up.
+        assert!(
+            message.contains("dataset 'alerts'"),
+            "the error must still name the dataset: {message}"
         );
     }
 
