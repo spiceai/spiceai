@@ -170,7 +170,7 @@ fn add_total_download_count(release: &mut Map<String, Value>, owner: &str, repo:
             .unwrap_or("unknown");
         let assets_count = assets_count.unwrap_or_default();
         tracing::warn!(
-            "GitHub returned only {returned} of {assets_count} assets for release '{tag}' of '{owner}/{repo}', so `total_download_count` is null for it rather than a total that is knowably too small. GitHub caps a nested connection at one page and cannot paginate it. Read the per-asset rows from the `release_assets` table instead. See: https://spiceai.org/docs/components/data-connectors/github"
+            "GitHub returned only {returned} of {assets_count} assets for release '{tag}' of '{owner}/{repo}', so `total_download_count` is null for it rather than a total that is knowably too small. GitHub caps a nested connection at one page and cannot paginate it, which is a limit of GitHub's API rather than of the dataset's configuration; follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
         );
     }
 

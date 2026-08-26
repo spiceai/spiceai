@@ -956,6 +956,26 @@ fn repo_dataset(query_type: &str) -> GithubDatasetType {
     }
 }
 
+/// Asserts a batch column is present and never null, by column name.
+fn assert_column_is_populated(batches: &[RecordBatch], column: &str) {
+    let mut checked = 0;
+    for batch in batches {
+        let index = batch
+            .schema()
+            .index_of(column)
+            .unwrap_or_else(|_| panic!("result should carry a '{column}' column"));
+        let values = batch.column(index);
+        assert_eq!(
+            values.null_count(),
+            0,
+            "'{column}' must be populated for every row"
+        );
+        checked += values.len();
+    }
+
+    assert!(checked > 0, "expected at least one row to check '{column}'");
+}
+
 /// Asserts a batch column holds only the given value, by column name.
 fn assert_column_is_constant(batches: &[RecordBatch], column: &str, expected: &str) {
     let mut checked = 0;
@@ -1157,6 +1177,31 @@ async fn test_github_releases() -> Result<(), String> {
             )
             .await?;
 
+            // Unfiltered and unordered, so it settles on the first page: this is
+            // about the values a release row carries, not about finding a
+            // particular release.
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_releases_rows",
+                "SELECT tag_name, total_download_count, assets_count, owner, repo \
+                 FROM spiceai_releases_auto LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    assert!(row_count > 0, "expected release rows, got {row_count}");
+
+                    // A release always has a tag; a null here means the unnest lost
+                    // the field rather than that GitHub had nothing to give.
+                    assert_column_is_populated(&result_batches, "tag_name");
+                    assert_column_is_constant(&result_batches, "owner", "spiceai");
+                    assert_column_is_constant(&result_batches, "repo", "spiceai");
+                })),
+            )
+            .await?;
+
             Ok(())
         })
         .await
@@ -1235,6 +1280,30 @@ async fn test_github_milestones() -> Result<(), String> {
                         "milestones_schema",
                         batches_to_string(&result_batches)
                     );
+                })),
+            )
+            .await?;
+
+            // One unfiltered page: milestones are small rows, and this is about
+            // the values one carries rather than about locating a milestone.
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_milestones_rows",
+                "SELECT title, state, open_issues_count, closed_issues_count, owner, repo \
+                 FROM spiceai_milestones_auto LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    assert!(row_count > 0, "expected milestone rows, got {row_count}");
+
+                    // Every milestone has a title and a state.
+                    assert_column_is_populated(&result_batches, "title");
+                    assert_column_is_populated(&result_batches, "state");
+                    assert_column_is_constant(&result_batches, "owner", "spiceai");
+                    assert_column_is_constant(&result_batches, "repo", "spiceai");
                 })),
             )
             .await?;
