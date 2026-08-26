@@ -118,6 +118,16 @@ pub static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static WRITE_BACK_PENDING_KEYS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
+    METER
+        .i64_gauge("dataset_acceleration_write_back_pending_keys")
+        .with_description(
+            "Undelivered durable write-back markers: primary keys marked by a committed transaction whose values have not yet reached the federated source.",
+        )
+        .with_unit("keys")
+        .build()
+});
+
 pub static CDC_REPLICATION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
         .i64_gauge("dataset_acceleration_cdc_replication_lag_ms")
