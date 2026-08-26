@@ -1217,6 +1217,7 @@ impl Https {
         .with_headers(custom_headers)
         .with_max_request_partitions(max_request_partitions)
         .with_error_response_action(error_response_action)
+        .with_dataset_name(dataset.name.to_string())
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),

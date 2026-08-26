@@ -100,13 +100,17 @@ pub enum Error {
     JsonNesting { source: super::json_nest::Error },
 
     #[snafu(display(
-        "Failed to fetch {endpoint}: the origin answered {status}, which `on_error_response` \
-        is set to treat as a failed request rather than as data. \
+        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, which \
+        `on_error_response` is set to treat as a failed request rather than as data. \
         Fix the origin, or set `on_error_response: store` on this dataset to keep recording \
         the response body as a row. \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
-    ErrorResponse { status: u16, endpoint: String },
+    ErrorResponse {
+        status: u16,
+        endpoint: String,
+        dataset: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -549,6 +553,9 @@ pub struct HttpTableProvider {
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
     error_response_action: ErrorResponseAction,
+    /// The dataset this provider serves, for messages that have to name it. Absent when
+    /// the provider is built outside a dataset (tests, the optimizer's fixtures).
+    dataset_name: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -598,7 +605,26 @@ impl HttpTableProvider {
             rate_controller: None,
             json_nesting: None,
             error_response_action: ErrorResponseAction::default(),
+            dataset_name: None,
         }
+    }
+
+    /// Name the dataset this provider serves, so a failure can say which one it was.
+    /// Several datasets can share one endpoint with different request filters, so the
+    /// endpoint alone does not identify the failure for an operator.
+    #[must_use]
+    pub fn with_dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
+        self.dataset_name = Some(dataset_name.into());
+        self
+    }
+
+    /// How a message refers to the dataset: by name when there is one, and by a phrase
+    /// that still reads as a sentence when there is not.
+    fn dataset_subject(&self) -> String {
+        self.dataset_name.as_ref().map_or_else(
+            || "this dataset".to_string(),
+            |name| format!("dataset '{name}'"),
+        )
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
@@ -1369,6 +1395,7 @@ impl HttpTableProvider {
             return Err(RetryError::transient(Error::ErrorResponse {
                 status: status_code,
                 endpoint: endpoint_label(&self.base_url),
+                dataset: self.dataset_subject(),
             }));
         }
 
@@ -1385,6 +1412,7 @@ impl HttpTableProvider {
             return Err(RetryError::Permanent(Error::ErrorResponse {
                 status: status_code,
                 endpoint: endpoint_label(&self.base_url),
+                dataset: self.dataset_subject(),
             }));
         }
 
@@ -1395,8 +1423,9 @@ impl HttpTableProvider {
         // every attempt, including the ones that never produce one.
         if is_error_response && self.error_response_action == ErrorResponseAction::Warn {
             tracing::warn!(
-                "The request to {} answered {status_code}, and that response body is being recorded as a row; on a full refresh that row replaces this dataset's previous contents. Set `on_error_response: error` to fail the refresh and keep them instead. See: https://spiceai.org/docs/components/data-connectors/https",
-                endpoint_label(&self.base_url)
+                "The request to {} for {} answered {status_code}. If that response body parses, it is recorded as a row, and on a full refresh that row replaces the dataset's previous contents. Set `on_error_response: error` to fail the request instead, so a refresh keeps what it had. See: https://spiceai.org/docs/components/data-connectors/https",
+                endpoint_label(&self.base_url),
+                self.dataset_subject()
             );
         }
 
@@ -6246,11 +6275,14 @@ mod tests {
         )
     }
 
+    const TEST_DATASET: &str = "http_items";
+
     fn status_provider(base_url: Url, action: ErrorResponseAction) -> HttpTableProvider {
         HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
             // The ladder is not what these assert, and every retry is a real sleep.
             .with_max_retries(0)
             .with_error_response_action(action)
+            .with_dataset_name(TEST_DATASET)
     }
 
     /// Run `SELECT content, response_status` against a provider serving one status.
@@ -6281,6 +6313,7 @@ mod tests {
             let df: DataFusionError = Error::ErrorResponse {
                 status,
                 endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
             }
             .into();
             assert!(
@@ -6295,6 +6328,7 @@ mod tests {
             let df: DataFusionError = Error::ErrorResponse {
                 status,
                 endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
             }
             .into();
             assert!(
@@ -6340,6 +6374,7 @@ mod tests {
         let message = Error::ErrorResponse {
             status: 503,
             endpoint: label,
+            dataset: "dataset 'items'".to_string(),
         }
         .to_string();
         assert!(
@@ -6447,6 +6482,12 @@ mod tests {
         assert!(
             message.contains("spiceai.org/docs/components/data-connectors/https"),
             "the failure must link the connector's docs: {message}"
+        );
+        // Several datasets can share one endpoint with different request filters, so the
+        // endpoint alone does not say which one failed.
+        assert!(
+            message.contains(TEST_DATASET),
+            "the failure must name the dataset: {message}"
         );
 
         // The extra request that existed only to turn an exhausted retry into a row is
