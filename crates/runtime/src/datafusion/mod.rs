@@ -788,12 +788,25 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
-    /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
-    /// metric-dimension path). Keyed by table reference so concurrent exports for the
-    /// same metric can't race the `ALTER … ADD COLUMN` + re-registration; distinct
-    /// metrics evolve concurrently. Get-or-inserted lazily on first evolution.
-    schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::Mutex<()>>>>,
-    pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
+    /// Per-dataset locks excluding write-time schema evolution + provider rebind (the
+    /// `OTel` metric-dimension path) against in-flight writes. Evolution takes the lock
+    /// exclusively across the `ALTER … ADD COLUMN` + re-registration, so concurrent
+    /// exports for the same metric can't race it; writers hold it shared from provider
+    /// lookup through insert completion, because a batch inserted through a provider
+    /// instance that is concurrently being replaced publishes into table state the
+    /// replacement was not opened on — the write reports success but its rows are
+    /// invisible to the newly bound provider. Keyed by table reference (distinct
+    /// datasets evolve and write independently); get-or-inserted lazily.
+    schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
+    /// `sink` datasets parked until their first write (a sink's schema is only known then),
+    /// keyed by dataset name. The per-entry mutex serializes the first-write registration:
+    /// exactly one writer claims the slot (`Some` → `None`) and registers, while concurrent
+    /// writers wait on the mutex until the provider is installed — instead of racing ahead
+    /// to a table lookup that fails with a missing-table error mid-registration. The entry
+    /// is removed only after the provider is installed, so a writer that still sees it
+    /// waits, and one that no longer sees it finds the table registered.
+    pending_sink_tables:
+        TokioRwLock<HashMap<TableReference, Arc<Mutex<Option<PendingSinkRegistration>>>>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
@@ -1265,13 +1278,13 @@ impl DataFusion {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
                         .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
-                    self.pending_sink_tables
-                        .write()
-                        .await
-                        .push(PendingSinkRegistration {
+                    self.pending_sink_tables.write().await.insert(
+                        dataset_table_ref.clone(),
+                        Arc::new(Mutex::new(Some(PendingSinkRegistration {
                             dataset: Arc::clone(&dataset),
                             secrets: Arc::clone(&secrets),
-                        });
+                        }))),
+                    );
                     None
                 } else {
                     self.register_accelerated_table(
@@ -2195,23 +2208,28 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        // Claim the pending registration by removing it under the write lock, so exactly one
-        // caller registers a given pending sink. Concurrent OpenTelemetry exports for the same
-        // metric would otherwise both find it under a shared read lock and both register it;
-        // worse, the second caller's removal pass — no longer finding the entry the first
-        // already removed — used to fall back to index 0 and evict an unrelated pending
-        // dataset, leaving it permanently unregistered ("Table ... not registered" on every
-        // later write). A caller that finds nothing to claim was beaten to it (or the dataset
-        // is not a pending sink) and has nothing to do.
-        let pending_registration = {
-            let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-            let Some(idx) = pending_sink_registrations
-                .iter()
-                .position(|registration| registration.dataset.name == table_reference)
-            else {
-                return Ok(());
-            };
-            pending_sink_registrations.remove(idx)
+        // Look up the pending entry without claiming it; a writer to a table that is not a
+        // pending sink (the common case) returns immediately. The guard is dropped before the
+        // entry mutex is taken so no writer ever waits on that mutex while holding the map.
+        let Some(entry) = self
+            .pending_sink_tables
+            .read()
+            .await
+            .get(&table_reference)
+            .map(Arc::clone)
+        else {
+            return Ok(());
+        };
+
+        // Serialize the first-write registration on the entry: exactly one writer claims the
+        // slot and registers, and every concurrent writer for the same table waits here until
+        // the provider is installed — then finds the slot empty and proceeds to a table
+        // lookup that succeeds, instead of failing with a missing-table error while the
+        // winner is still mid-registration.
+        let mut slot = entry.lock().await;
+        let Some(pending_registration) = slot.take() else {
+            // Another writer completed the registration while this one waited.
+            return Ok(());
         };
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
@@ -2240,17 +2258,43 @@ impl DataFusion {
         .await;
 
         match registration {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Registration failed after we claimed the entry: return it to the queue so a
-                // later write retries it, rather than leaving the dataset unregistered.
+            Ok(_) => {
+                // The provider is installed; drop the entry so later writers take the fast
+                // path. Writers already waiting on the slot see `None` and return above.
                 self.pending_sink_tables
                     .write()
                     .await
-                    .push(pending_registration);
+                    .remove(&table_reference);
+                Ok(())
+            }
+            Err(e) => {
+                // Registration failed after we claimed the slot: return the claim so a later
+                // write (or a writer waiting on this slot) retries it, rather than leaving
+                // the dataset unregistered.
+                *slot = Some(pending_registration);
                 Err(e)
             }
         }
+    }
+
+    /// The per-dataset lock excluding write-time schema evolution + provider rebind
+    /// against in-flight writes (see `schema_evolve_locks`), get-or-created lazily.
+    async fn schema_evolve_lock(
+        &self,
+        table_reference: &TableReference,
+    ) -> Arc<tokio::sync::RwLock<()>> {
+        {
+            let locks = self.schema_evolve_locks.read().await;
+            if let Some(lock) = locks.get(table_reference) {
+                return Arc::clone(lock);
+            }
+        }
+        let mut locks = self.schema_evolve_locks.write().await;
+        Arc::clone(
+            locks
+                .entry(table_reference.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
+        )
     }
 
     pub async fn write_data(
@@ -2267,6 +2311,13 @@ impl DataFusion {
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
             .await?;
+
+        // Hold the rebind lock (shared) from provider lookup through insert completion: a
+        // batch inserted through a provider that write-time schema evolution concurrently
+        // replaces publishes into table state the replacement was not opened on, so the
+        // write reports success but its rows are invisible to the newly bound provider.
+        let rebind_lock = self.schema_evolve_lock(table_reference).await;
+        let rebind_guard = rebind_lock.read().await;
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
@@ -2323,6 +2374,9 @@ impl DataFusion {
                     table_name: table_reference.to_string(),
                 })?;
         }
+
+        // The write is published; evolution may rebind the provider from here on.
+        drop(rebind_guard);
 
         // Queue the committed write for Drasi, when `runtime.drasi` names this
         // table. After the write, so Drasi only sees rows the runtime kept; and
@@ -2405,6 +2459,14 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
 
+        // Hold the rebind lock (shared) from provider lookup through insert completion, as
+        // in `write_data`: rows published through a provider that write-time schema
+        // evolution concurrently replaces are invisible to the newly bound provider. A
+        // long-lived stream holds this for its whole duration, deferring evolution of this
+        // one dataset until the stream ends.
+        let rebind_lock = self.schema_evolve_lock(table_reference).await;
+        let rebind_guard = rebind_lock.read().await;
+
         let table_provider = self.get_table_provider(table_reference).await?;
 
         verify_schema(table_provider.schema().fields(), update_schema.fields())
@@ -2462,6 +2524,9 @@ impl DataFusion {
             .context(UnableToExecuteTableInsertSnafu {
                 table_name: table_reference.to_string(),
             })?;
+
+        // The write is published; evolution may rebind the provider from here on.
+        drop(rebind_guard);
 
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
@@ -3731,20 +3796,32 @@ impl DataFusion {
         }
 
         // Serialize evolution + rebind for this dataset so concurrent writes can't race
-        // the ALTER and re-registration. Distinct datasets keep independent locks.
-        let lock = {
-            let mut locks = self.schema_evolve_locks.write().await;
-            Arc::clone(
-                locks
-                    .entry(dataset.name.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _guard = lock.lock().await;
+        // the ALTER and re-registration: exclusive here, shared in `write_data`/
+        // `write_streaming_data` (see `schema_evolve_locks`). Distinct datasets keep
+        // independent locks.
+        let lock = self.schema_evolve_lock(&dataset.name).await;
+        let _guard = lock.write().await;
 
         // Re-read the live provider schema *under the lock* so a serialized second export
         // classifies against the first's already-applied evolution.
-        let provider = self.get_table_provider(&dataset.name).await?;
+        //
+        // A parked sink (a restart before the dataset's first write) has no registered
+        // provider yet; register it from the acceleration checkpoint so evolution runs
+        // against the live provider. Without this, the first export after a restart that
+        // also carries a new dimension fails this lookup and its data points are rejected.
+        let provider = match self.get_table_provider(&dataset.name).await {
+            Ok(provider) => provider,
+            Err(lookup_error) => {
+                let Some(checkpoint_schema) =
+                    crate::dataconnector::sink::accelerated_checkpoint_schema(dataset).await
+                else {
+                    return Err(lookup_error);
+                };
+                self.ensure_sink_dataset(dataset.name.clone(), checkpoint_schema)
+                    .await?;
+                self.get_table_provider(&dataset.name).await?
+            }
+        };
         let current = provider.schema();
         let constraint_columns =
             dataset_constraint_columns(dataset, provider.constraints(), &current);
