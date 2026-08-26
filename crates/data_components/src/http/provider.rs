@@ -1276,7 +1276,8 @@ impl HttpTableProvider {
             Err(err) if self.error_response_action == ErrorResponseAction::Error => Err(err),
             Err(_) => {
                 tracing::debug!(
-                    "Retries exhausted for {url}, making final attempt accepting any status"
+                    "Retries exhausted for {}, making final attempt accepting any status",
+                    endpoint_label(&self.base_url)
                 );
                 self.perform_single_request(&url, body, request_headers, path_label, true)
                     .await
