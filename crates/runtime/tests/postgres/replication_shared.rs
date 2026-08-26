@@ -1602,6 +1602,85 @@ async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result
     Ok(())
 }
 
+/// An acceleration that comes back **empty while its recorded position survived**
+/// must be loaded, not resumed — the shape a `mode: file_update` recreate leaves
+/// behind (#13546).
+///
+/// The recreate drops the accelerated table because the source schema changed
+/// incompatibly, while the watermark sidecar lives in the same accelerator and is
+/// not dropped with it. So the next start finds no rows and a position the slot
+/// can still stream from, and every arm of the resume decision is individually
+/// satisfied: the slot is valid, retention is intact, the position is this
+/// source's. Resuming on it succeeds and the rows committed before that position
+/// are never loaded by anything.
+///
+/// Distinct from [`an_empty_acceleration_is_still_loaded_when_no_snapshot_runs`],
+/// which reaches the same "must be loaded" conclusion from a *missing* record. Here
+/// the record is present and usable, which is the reason a resume looks safe.
+///
+/// The two rows written before the first start are what the assertion is about:
+/// they precede the recorded position, so no reachable WAL carries them and only a
+/// rebuild or a snapshot can put them back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "recreated", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and publication, and commits so a real
+    // position is recorded in the store.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "recreated",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The recorded position is the whole point of this case: without it the
+    // rejoin below is the already-covered missing-record case.
+    anyhow::ensure!(
+        matches!(store.load().await, Ok(RecordedPosition::At(_))),
+        "the first start recorded no position, so this case would not exercise a surviving one"
+    );
+
+    // Rejoin on the SAME store — the position survived — while the acceleration
+    // is observed empty, which is what the recreate left behind.
+    let input = input_with_contents(port, "recreated", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the recreate").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an emptied acceleration resumed from the position it recorded before it was emptied, so \
+         every row committed below that position is missing from it for good. A recorded position \
+         means those changes will never be resent — it does not mean the rows are here"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
 /// an acceleration that holds rows it cannot place must still be rebuilt.
 ///
