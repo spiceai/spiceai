@@ -306,10 +306,13 @@ impl<S: BuildHasher> SchemaInterner<S> {
 
     /// Replaces every batch's schema with the pool's shared copy, in place.
     ///
-    /// Interning hashes a schema's full contents, so this runs once per
-    /// *distinct* schema rather than once per batch. Batches of one result
-    /// almost always share a schema pointer, making this a single hash for the
-    /// whole slice.
+    /// Interning hashes a schema's full contents, so a batch whose schema is
+    /// the *same allocation* as the previous batch's reuses that lookup rather
+    /// than hashing again. Only the previous batch is remembered, so a slice
+    /// that alternates between two schemas hashes at every change — correct,
+    /// but not free. The case this is for is the common one: batches of a
+    /// single result almost always share one pointer, making it one hash for
+    /// the whole slice.
     ///
     /// Each batch is interned by its *own* content, never coerced onto a
     /// neighbour's schema: two batches that genuinely differ stay different.
