@@ -1018,10 +1018,11 @@ impl Builder {
             let consumer_handle = caching::spawn_batched_cache_write_task(
                 rx,
                 Arc::clone(&self.accelerator),
-                self.dataset_name.to_string(),
+                self.dataset_name.clone(),
                 Arc::clone(&self.accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
+                Arc::clone(&self.runtime_status),
             );
             // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
             handlers.push(consumer_handle);
