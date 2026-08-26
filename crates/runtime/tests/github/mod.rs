@@ -668,7 +668,7 @@ async fn test_github_commits() -> Result<(), String> {
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
-                    assert_eq!(total_rows, 17, "expected 17 columns in schema, got {total_rows}");
+                    assert_eq!(total_rows, 19, "expected 19 columns in schema, got {total_rows}");
                 })),
             )
             .await?;
@@ -907,8 +907,17 @@ async fn test_github_stargazers() -> Result<(), String> {
 
 /// Builds a runtime holding one GitHub dataset and waits for it to be ready.
 async fn runtime_with_github_dataset(kind: GithubDatasetType) -> Result<Runtime, String> {
+    runtime_with_github_dataset_params(kind, None).await
+}
+
+/// [`runtime_with_github_dataset`], with extra dataset parameters — most often
+/// to name a token other than the one the path shape defaults to.
+async fn runtime_with_github_dataset_params(
+    kind: GithubDatasetType,
+    additional_params: Option<HashMap<String, String>>,
+) -> Result<Runtime, String> {
     let app = AppBuilder::new("github_integration_test")
-        .with_dataset(make_github_dataset(&kind, "auto", None))
+        .with_dataset(make_github_dataset(&kind, "auto", additional_params))
         .build();
 
     configure_test_datafusion();
@@ -1286,18 +1295,27 @@ async fn test_github_owner_repos() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_user() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    // An owner-level dataset reads its token from GITHUB_ORG_TOKEN.
-    if !org_github_secret_available("test_github_user").await {
+    if !repo_github_secret_available("test_github_user").await {
         return Ok(());
     }
     register_test_connectors().await;
 
     test_request_context()
         .scope(async {
-            let mut rt = runtime_with_github_dataset(GithubDatasetType::OrgSpecific {
-                org: "lukekim".to_string(),
-                query_type: "user".to_string(),
-            })
+            // `user` takes the owner-level path shape, which defaults to the
+            // organization token — but the login it resolves is a person, which an
+            // organization-scoped token need not have access to. Name the
+            // repository token explicitly instead.
+            let mut rt = runtime_with_github_dataset_params(
+                GithubDatasetType::OrgSpecific {
+                    org: "lukekim".to_string(),
+                    query_type: "user".to_string(),
+                },
+                Some(HashMap::from([(
+                    "github_token".to_string(),
+                    github_secret_reference("GITHUB_TOKEN"),
+                )])),
+            )
             .await?;
 
             run_query_and_check_results(
