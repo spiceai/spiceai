@@ -48,10 +48,16 @@ static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 ///
 /// 1. Anthropic still serves it. A retired default fails every request from a configuration that
 ///    names no model, which is what happened to `claude-3-5-sonnet-latest`.
-/// 2. It still accepts the sampling controls [`chat`] forwards. Anthropic answers
+/// 2. It still accepts the sampling controls [`chat`] forwards *individually*. Anthropic answers
 ///    ``temperature` is deprecated for this model.`` on its newest generation, so a default there
 ///    would break any configuration that sets `temperature`, `top_p`, or `top_logprobs` — see
 ///    <https://github.com/spiceai/spiceai/issues/13564>. This is the newest Sonnet that does not.
+///
+/// It is not a model on which every request this adapter can build succeeds, and no served model
+/// is: every Claude 4 and later model rejects `temperature` and `top_p` set *together*, and rejects
+/// a trailing assistant turn, both of which the converter still forwards
+/// (<https://github.com/spiceai/spiceai/issues/13579>). Those shapes fail here where they used to
+/// fail as `not_found_error`, because the id this replaced was retired and served nothing at all.
 pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 

@@ -560,40 +560,52 @@ async fn test_tool_use(
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }
 
-/// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic still
-/// serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's newest
-/// generation answers ``temperature` is deprecated for this model.` and rejects the request
+/// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic
+/// still serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's
+/// newest generation answers ``temperature` is deprecated for this model.` and rejects the request
 /// outright (#13564), so a default bumped onto such a model would turn every configuration that
 /// sets `temperature` into a guaranteed 400 — while every test that sets none of these stays green.
 /// This is the guard for that, and it is why the default trails Anthropic's newest model.
 ///
-/// No JSON-path checks: the assertion is that the request was accepted at all, which `run_test`
+/// One control per request, and all of them from a single test. Both halves are load-bearing:
+///
+/// - **One control per request.** Every Claude 4+ model rejects `temperature` and `top_p` set
+///   together, so a request carrying both asserts nothing about the default — it 400s on any model
+///   this constant may name. #13579 tracks the adapter forwarding that combination.
+/// - **One test, sequential requests.** Each `#[tokio::test]` owns its own runtime while
+///   `get_or_create_model` caches one client per provider across tests, so a cached client whose
+///   hyper dispatch task was spawned on an already-dropped runtime cannot send and fails with
+///   `User(DispatchGone)` (#13575). Driving every request from one runtime keeps this guard out of
+///   that race instead of adding a case to it.
+///
+/// No JSON-path checks: the assertion is that each request was accepted at all, which `run_test`
 /// makes by panicking on the error. `get_or_create_model("anthropic")` builds the model with no id,
 /// so this exercises whatever the default currently is rather than a pinned one.
-#[rstest]
-#[case::temperature(json!({"temperature": 0.5}))]
-#[case::top_p(json!({"top_p": 0.9}))]
-#[case::top_logprobs(json!({"top_logprobs": 5}))]
 #[tokio::test]
-async fn default_anthropic_model_accepts_forwarded_sampling_controls(
-    #[case] control: serde_json::Value,
-) {
-    let mut body = json!({
-        "model": "not_needed",
-        "messages": [{"role": "user", "content": "Say Hello"}],
-        "max_completion_tokens": 16,
-    });
-    let (Some(body_map), Some(control_map)) = (body.as_object_mut(), control.as_object()) else {
-        panic!("the request body and the control are both JSON objects");
-    };
-    for (key, value) in control_map {
-        body_map.insert(key.clone(), value.clone());
-    }
+async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
+    // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic: `temperature` and
+    // `top_p` pass through, and `top_logprobs` becomes Anthropic's `top_k`.
+    for (control, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("top_logprobs", json!(5)),
+    ] {
+        let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "not_needed",
+            "messages": [{"role": "user", "content": "Say Hello"}],
+            "max_completion_tokens": 16,
+            control: value,
+        }))
+        .unwrap_or_else(|e| panic!("failed to create the {control} request: {e}"));
 
-    let req: CreateChatCompletionRequest =
-        serde_json::from_value(body).expect("failed to create request");
-
-    run_test("anthropic", "default_sampling_controls", req, false, vec![])
+        run_test(
+            "anthropic",
+            &format!("default_sampling_control_{control}"),
+            req,
+            false,
+            vec![],
+        )
         .await
-        .expect("test failed");
+        .unwrap_or_else(|e| panic!("the default model rejected {control}: {e}"));
+    }
 }
