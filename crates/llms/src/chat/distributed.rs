@@ -114,6 +114,34 @@ impl DistributedConfig {
     }
 }
 
+/// Every environment variable the distributed backends set, so a single-node load can
+/// clear the lot.
+const DISTRIBUTED_ENV_VARS: &[&str] = &[
+    "RING_CONFIG",
+    "MISTRALRS_MN_GLOBAL_WORLD_SIZE",
+    "MISTRALRS_MN_LOCAL_WORLD_SIZE",
+    "MISTRALRS_MN_HEAD_NUM_WORKERS",
+    "MISTRALRS_MN_HEAD_PORT",
+    "MISTRALRS_MN_WORKER_SERVER_ADDR",
+    "MISTRALRS_MN_WORKER_ID",
+];
+
+/// Clear the topology left by any previous distributed load.
+///
+/// Models load sequentially into one process, so a single-node model that follows a
+/// distributed one would otherwise inherit its rank and world size and try to join a
+/// communicator that is not there. Clearing only `RING_CONFIG` was enough while ring was
+/// the only backend; NCCL reads a different set, so both have to go.
+pub(crate) fn clear_distributed_env() {
+    // SAFETY: same constraint as the writes in `configure_nccl_distributed` -- done during
+    // model initialization, which is serialized, and before the engine reads the topology.
+    unsafe {
+        for var in DISTRIBUTED_ENV_VARS {
+            std::env::remove_var(var);
+        }
+    }
+}
+
 /// Apply `cfg` to the environment mistral.rs reads while it builds the pipeline, picking
 /// the wiring that matches the requested backend. Returns the ring's temp-file guard when
 /// the ring backend is in use (it must outlive the model); NCCL needs no such file.
@@ -154,10 +182,19 @@ pub(crate) fn configure_nccl_distributed(cfg: &DistributedConfig) -> Result<(), 
     let rank = cfg.node_rank;
     let head = cfg.nodes[0].trim().to_string();
 
-    // SAFETY: set once during model initialization, before mistral.rs reads these while
-    // constructing the pipeline. Loading is not concurrent with other environment access
-    // here, so no other thread races these writes. Each branch clears the other role's
-    // variables so a re-load in this process cannot inherit a stale role.
+    // SAFETY: mistral.rs reads the topology from the environment while it constructs the
+    // pipeline and exposes no builder API for rank/world size, so the environment is the
+    // only channel available -- `configure_ring_distributed` writes `RING_CONFIG` the same
+    // way. Model loading is serialized, so these writes do not race each other.
+    //
+    // What that does NOT establish is that no other thread in an already-running process
+    // reads the environment concurrently, which is what Rust 2024 made `set_var` unsafe
+    // for. A model-local lock cannot protect an external `getenv`. The exposure is bounded
+    // by doing this once per load, before the engine spawns its own threads, and it goes
+    // away entirely once the engine takes the topology as an argument.
+    //
+    // Each branch clears the other role's variables so a re-load cannot inherit a stale
+    // role; `clear_distributed_env` clears the whole set for a single-node load.
     unsafe {
         std::env::set_var("MISTRALRS_MN_GLOBAL_WORLD_SIZE", world_size.to_string());
         std::env::set_var("MISTRALRS_MN_LOCAL_WORLD_SIZE", "1");

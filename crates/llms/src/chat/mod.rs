@@ -43,7 +43,7 @@ use async_openai::types::chat::{
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::configure_distributed;
+use crate::chat::distributed::{clear_distributed_env, configure_distributed};
 #[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 #[cfg(feature = "local_llm")]
@@ -372,11 +372,10 @@ pub async fn create_hf_model(
     let ring_config = if let Some(cfg) = distributed {
         configure_distributed(&cfg)?
     } else {
-        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-        // load in this process, so this single-node load can't accidentally
-        // run distributed.
-        // SAFETY: touched only during model init, before mistral.rs reads it.
-        unsafe { std::env::remove_var("RING_CONFIG") };
+        // Clear any topology left by a prior distributed load in this process, so this
+        // single-node load cannot inherit a rank and world size and try to join a
+        // communicator that is not there.
+        clear_distributed_env();
         None
     };
     mistral::MistralLlama::from_hf(
@@ -423,11 +422,10 @@ pub async fn create_local_model(
     let ring_config = if let Some(cfg) = distributed {
         configure_distributed(&cfg)?
     } else {
-        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-        // load in this process, so this single-node load can't accidentally
-        // run distributed.
-        // SAFETY: touched only during model init, before mistral.rs reads it.
-        unsafe { std::env::remove_var("RING_CONFIG") };
+        // Clear any topology left by a prior distributed load in this process, so this
+        // single-node load cannot inherit a rank and world size and try to join a
+        // communicator that is not there.
+        clear_distributed_env();
         None
     };
     mistral::MistralLlama::from(
