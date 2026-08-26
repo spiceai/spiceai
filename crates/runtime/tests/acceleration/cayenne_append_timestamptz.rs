@@ -38,7 +38,10 @@ use spicepod::{
     param::Params,
 };
 
-use crate::utils::{run_query, runtime_ready_check, test_request_context};
+use crate::utils::{run_query, runtime_ready_check, test_request_context, wait_until_true};
+
+/// The accelerated table under test.
+const TABLE: &str = "cayenne_append_tz_it";
 
 /// The timezone a `PostgreSQL` `timestamptz` arrives with.
 const TZ: &str = "UTC";
@@ -101,17 +104,21 @@ async fn write_source(path: &std::path::Path, ids: &[i64]) -> Result<(), anyhow:
     Ok(())
 }
 
-async fn refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
-    let notifier = rt
-        .datafusion()
+/// Queue an append refresh. The caller polls for the result rather than waiting on
+/// the returned notifier: completion signals with `notify_waiters`, which stores no
+/// permit, so a refresh that finishes first would leave a later waiter hanging.
+async fn trigger_refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    rt.datafusion()
         .refresh_table(&TableReference::from(table), None)
         .await
-        .map_err(|e| anyhow::anyhow!("refresh_table failed: {e}"))?;
-    notifier
-        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?
-        .notified()
-        .await;
+        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
     Ok(())
+}
+
+/// Rows currently in the accelerated table.
+async fn row_count(rt: &Arc<Runtime>) -> Result<i64, anyhow::Error> {
+    count(rt, &format!("SELECT COUNT(*) AS cnt FROM {TABLE}")).await
 }
 
 /// Run a `COUNT(*)` query and read back its single value.
@@ -167,7 +174,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
 
             let mut dataset = Dataset::new(
                 format!("file://{}", source.display()),
-                "cayenne_append_tz_it",
+                TABLE,
             );
             dataset.time_column = Some("event_time".to_string());
             dataset.time_format = Some(TimeFormat::Timestamptz);
@@ -209,7 +216,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
             runtime_ready_check(&rt).await;
 
             assert_eq!(
-                count(&rt, "SELECT COUNT(*) AS cnt FROM cayenne_append_tz_it").await?,
+                row_count(&rt).await?,
                 ROWS_PER_ROUND,
                 "row count after the initial load"
             );
@@ -227,24 +234,25 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
             for round in 1..=ROUNDS {
                 let rows = ROWS_PER_ROUND * (round + 1);
                 write_source(&source, &(1..=rows).collect::<Vec<i64>>()).await?;
-                tokio::time::timeout(
-                    std::time::Duration::from_mins(1),
-                    refresh(&rt, "cayenne_append_tz_it"),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("append refresh round {round} did not settle"))??;
+                trigger_refresh(&rt, TABLE).await?;
 
-                assert_eq!(
-                    count(&rt, "SELECT COUNT(*) AS cnt FROM cayenne_append_tz_it").await?,
-                    rows,
-                    "row count after append round {round}"
-                );
+                let reached = wait_until_true(std::time::Duration::from_mins(1), || async {
+                    row_count(&rt).await.is_ok_and(|c| c == rows)
+                })
+                .await;
+
+                if !reached {
+                    let last = row_count(&rt).await?;
+                    return Err(anyhow::anyhow!(
+                        "append refresh round {round} stalled at {last} rows, expected {rows}"
+                    ));
+                }
             }
 
             // The counts above check how many rows landed; this checks which ones.
-            // The mark is the last round's first instant, so exactly that round's
-            // rows sit above it. Arrow holds a timezone-aware timestamp as
-            // epoch-relative, so dropping the zone re-labels the instant without
+            // The mark is the last instant written before the final round, so exactly
+            // that round's rows sit above it. Arrow holds a timezone-aware timestamp
+            // as epoch-relative, so dropping the zone re-labels the instant without
             // moving it.
             let mark = chrono::DateTime::from_timestamp_nanos(
                 BASE_NANOS + ROWS_PER_ROUND * ROUNDS * STEP_NANOS,
@@ -254,7 +262,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
                 count(
                     &rt,
                     &format!(
-                        "SELECT COUNT(*) AS cnt FROM cayenne_append_tz_it \
+                        "SELECT COUNT(*) AS cnt FROM {TABLE} \
                          WHERE CAST(event_time AS TIMESTAMP) > TIMESTAMP '{mark}'"
                     ),
                 )
