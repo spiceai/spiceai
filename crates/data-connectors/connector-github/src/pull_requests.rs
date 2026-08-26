@@ -157,7 +157,7 @@ impl PullRequestTableArgs {
             commits(first: 25) {{ commits_count: totalCount, hashes: nodes {{ id }} }}
             assignees(first: 100) {{ assignees: nodes {{ login }} }}
             comments_count_wrapper: comments {{ comments_count: totalCount }}
-            closing_issues_wrapper: closingIssuesReferences(first: {closing_issues}) {{
+            {CLOSING_ISSUES_WRAPPER_KEY}: closingIssuesReferences(first: {closing_issues}) {{
                 closing_issues_count: totalCount
                 closing_issues_references: nodes {{ number }}
             }}
@@ -447,6 +447,10 @@ const STATUS_CHECK_ROLLUP_SOURCE_KEY: &str = "status_check_rollup_source";
 /// The connection is removed before unnesting, so it never reaches a row.
 const CLOSED_BY_SOURCE_KEY: &str = "closed_by_source";
 
+/// Response key wrapping the linked-issue connection. The unnest hoists its two
+/// members — `closing_issues_count` and `closing_issues_references` — to the row.
+const CLOSING_ISSUES_WRAPPER_KEY: &str = "closing_issues_wrapper";
+
 fn custom_unnestter(object: &Value, owner: &str, repo: &str) -> Result<Vec<Value>> {
     // Flatten the fields nested deeper than the unnest reaches first: both hang
     // their payload under a `nodes` key, which would collide once hoisted.
@@ -480,6 +484,8 @@ fn custom_unnestter(object: &Value, owner: &str, repo: &str) -> Result<Vec<Value
 /// reaches: the head commit's check rollup, and the actor who closed the pull
 /// request.
 fn flatten_deeply_nested_fields(pull_request: &mut Map<String, Value>) {
+    null_truncated_closing_issues(pull_request);
+
     let rollup = pull_request
         .remove(STATUS_CHECK_ROLLUP_SOURCE_KEY)
         .and_then(|commits| {
@@ -508,6 +514,34 @@ fn flatten_deeply_nested_fields(pull_request: &mut Map<String, Value>) {
     };
 
     pull_request.insert("closed_by".to_string(), closed_by);
+}
+
+/// Nulls `closing_issues_references` when GitHub reported more linked issues
+/// than the one page the query can ask for.
+///
+/// A short list is indistinguishable from a complete one, so a query that
+/// unnests it would quietly miss valid linked issues. A null says the set is
+/// unknown; `closing_issues_count` still records how many there really are.
+fn null_truncated_closing_issues(pull_request: &mut Map<String, Value>) {
+    let Some(wrapper) = pull_request
+        .get_mut(CLOSING_ISSUES_WRAPPER_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    let returned = wrapper
+        .get("closing_issues_references")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let total = wrapper
+        .get("closing_issues_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+
+    if total > i64::try_from(returned).unwrap_or(i64::MAX) {
+        wrapper.insert("closing_issues_references".to_string(), Value::Null);
+    }
 }
 
 // Flattens the `thread_comments` field match the schema expected by the table
@@ -861,6 +895,22 @@ mod tests {
         // A pull request not in a merge queue keeps nulls, not zeroes.
         assert_eq!(row["merge_queue_state"], Value::Null);
         assert_eq!(row["merge_queue_position"], Value::Null);
+    }
+
+    #[test]
+    fn a_truncated_closing_issues_list_is_nulled_rather_than_left_short() {
+        // A short list is indistinguishable from a complete one, so a query that
+        // unnests it would quietly miss valid linked issues.
+        let mut node = pull_request_node(&json!("2026-08-25T00:00:00Z"));
+        node["closing_issues_wrapper"] = json!({
+            "closing_issues_count": 40,
+            "closing_issues_references": [{"number": 1}, {"number": 2}]
+        });
+
+        let row = unnest_one(&args(PullRequestCommentType::None, 25), &node);
+
+        assert_eq!(row["closing_issues_count"], json!(40));
+        assert_eq!(row["closing_issues_references"], Value::Null);
     }
 
     #[test]

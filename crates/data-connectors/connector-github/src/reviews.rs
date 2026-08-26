@@ -71,6 +71,12 @@ impl GraphQLContext for ReviewsTableArgs {
         Some(Arc::new(error_checker))
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        // One pull request fans out into many review rows, so a row limit cannot
+        // bound the number of pull requests to fetch.
+        false
+    }
+
     fn query_cost(&self) -> Option<u32> {
         // 1 (pullRequests) + 100 (reviews per pull request)
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
@@ -131,16 +137,10 @@ impl GitHubTableArgs for ReviewsTableArgs {
             query.into(),
             None,
             UnnestBehavior::Custom(Box::new(move |object: &Value| -> Result<Vec<Value>> {
-                Ok(fan_out(
-                    object,
-                    &REVIEWS_CONNECTION,
-                    &owner,
-                    &repo,
-                    |review| {
-                        flatten_login(review, "author");
-                        flatten_member(review, "commit", "oid", "commit_sha");
-                    },
-                ))
+                fan_out(object, &REVIEWS_CONNECTION, &owner, &repo, |review| {
+                    flatten_login(review, "author");
+                    flatten_member(review, "commit", "oid", "commit_sha");
+                })
             })),
             Some(gql_schema()),
         )

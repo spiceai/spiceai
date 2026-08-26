@@ -915,7 +915,7 @@ mod tests {
     fn test_commits_schema_includes_ref_and_new_metadata() {
         let schema = gql_schema();
 
-        assert_eq!(schema.fields().len(), 17);
+        assert_eq!(schema.fields().len(), 19);
         assert_eq!(schema.field(2).name(), "ref");
         assert_eq!(schema.field(5).name(), "committer_name");
         assert_eq!(schema.field(6).name(), "committer_email");
@@ -923,6 +923,8 @@ mod tests {
         assert_eq!(schema.field(14).name(), "changed_files");
         assert_eq!(schema.field(15).name(), "associated_pull_request_number");
         assert_eq!(schema.field(16).name(), "status");
+        assert_eq!(schema.field(17).name(), "owner");
+        assert_eq!(schema.field(18).name(), "repo");
     }
 
     #[test]

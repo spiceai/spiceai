@@ -22,11 +22,15 @@ limitations under the License.
 //! out into one row per child node.
 //!
 //! GitHub caps a connection page at 100 nodes and a query cannot paginate a
-//! nested connection, so a parent with more children than the page size is
-//! truncated. Every fan-out reads the connection's `totalCount` and warns by
-//! name when that happens, so a short `COUNT(*)` is visible rather than silent.
+//! nested connection, so a parent with more children than the page size would
+//! be truncated. Truncation would drop whole rows, and a dropped row is
+//! invisible: `COUNT(*)` comes back short with nothing to say it is short, and
+//! an accelerated refresh persists that answer. Every fan-out therefore reads
+//! the connection's `totalCount` and fails the scan by name rather than
+//! returning a partial set.
 
 use crate::identity::insert_identity;
+use connector_graphql::graphql::{Error, Result};
 use serde_json::{Map, Value};
 
 /// How to fan one nested connection out into rows.
@@ -78,22 +82,28 @@ pub(crate) fn flatten_member(object: &mut Map<String, Value>, key: &str, field: 
 ///
 /// `transform` runs on each child row after those keys are added, and is where
 /// a caller flattens its own nested members.
+///
+/// # Errors
+///
+/// Returns an error when GitHub reports more children than the single
+/// un-paginated page returned. The alternative is emitting a partial row set,
+/// which no query could tell apart from a complete one.
 pub(crate) fn fan_out<F>(
     parent: &Value,
     spec: &NestedConnection<'_>,
     owner: &str,
     repo: &str,
     mut transform: F,
-) -> Vec<Value>
+) -> Result<Vec<Value>>
 where
     F: FnMut(&mut Map<String, Value>),
 {
     let Some(parent) = parent.as_object() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let Some(connection) = parent.get(spec.connection_key) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let nodes = connection
@@ -101,14 +111,14 @@ where
         .and_then(Value::as_array)
         .map_or_else(Vec::new, Clone::clone);
 
-    warn_if_truncated(
+    ensure_complete(
         connection.get("totalCount").and_then(Value::as_i64),
         nodes.len(),
         spec,
         owner,
         repo,
         parent.get(spec.parent_id_key),
-    );
+    )?;
 
     let mut rows = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -128,26 +138,27 @@ where
         rows.push(Value::Object(row));
     }
 
-    rows
+    Ok(rows)
 }
 
-/// Warns, naming the parent, when GitHub reported more children than the single
-/// un-paginated page returned.
-fn warn_if_truncated(
+/// Fails, naming the parent, when GitHub reported more children than the single
+/// un-paginated page returned. Emitting the partial set instead would make every
+/// aggregate over it quietly wrong.
+fn ensure_complete(
     total_count: Option<i64>,
     returned: usize,
     spec: &NestedConnection<'_>,
     owner: &str,
     repo: &str,
     parent_id: Option<&Value>,
-) {
+) -> Result<()> {
     let Some(total_count) = total_count else {
-        return;
+        return Ok(());
     };
 
     let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
     if total_count <= returned_count {
-        return;
+        return Ok(());
     }
 
     let parent_id = parent_id.map_or_else(
@@ -160,9 +171,11 @@ fn warn_if_truncated(
 
     let parent_label = spec.parent_label;
     let child_label = spec.child_label;
-    tracing::warn!(
-        "GitHub returned only {returned_count} of {total_count} {child_label} for {parent_label} '{parent_id}' of '{owner}/{repo}', so rows for it are incomplete and counts over it will be short. GitHub caps a nested connection at one page and cannot paginate it. See: https://spiceai.org/docs/components/data-connectors/github"
-    );
+    Err(Error::InvalidObjectAccess {
+        message: format!(
+            "Failed to read the {child_label} of {parent_label} '{parent_id}' ({owner}/{repo}): GitHub returned {returned_count} of {total_count}, and a nested connection cannot be paginated, so the rest are unreachable. Returning the {returned_count} would leave every count over that {parent_label} short with no way to tell. Exclude it from the dataset, or follow https://github.com/spiceai/spiceai/issues/13458 for nested pagination. See: https://spiceai.org/docs/components/data-connectors/github"
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -196,7 +209,8 @@ mod tests {
     fn fan_out_emits_one_row_per_child_with_full_identity() {
         let rows = fan_out(&pull_request(), &REVIEWS, "spiceai", "spiceai", |row| {
             flatten_login(row, "author");
-        });
+        })
+        .expect("a complete page fans out");
 
         assert_eq!(rows.len(), 2);
         for row in &rows {
@@ -218,25 +232,35 @@ mod tests {
             "spiceai",
             "spiceai",
             |_| {},
-        );
+        )
+        .expect("an absent connection yields no rows");
 
         assert!(rows.is_empty());
     }
 
     #[test]
-    fn fan_out_keeps_the_rows_it_did_get_when_a_page_is_truncated() {
-        // A short page is reported through a warning, never by dropping the
-        // rows that did arrive.
+    fn fan_out_fails_rather_than_emitting_a_truncated_page() {
+        // A dropped row is invisible: `COUNT(*)` comes back short with nothing to
+        // say it is short, and an accelerated refresh persists that answer. The
+        // scan has to fail instead.
         let truncated = json!({
             "pull_request_id": "PR_1",
             "pull_request_number": 42,
             "reviews": {"totalCount": 500, "nodes": [{"id": "R_1"}]}
         });
 
-        let rows = fan_out(&truncated, &REVIEWS, "spiceai", "spiceai", |_| {});
+        let error = fan_out(&truncated, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect_err("a truncated page must fail the scan");
+        let message = error.to_string();
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["id"], json!("R_1"));
+        assert!(
+            message.contains("500") && message.contains("reviews"),
+            "the error must say how many were unreachable, got: {message}"
+        );
+        assert!(
+            message.contains("42") && message.contains("spiceai/spiceai"),
+            "the error must name the pull request it came from, got: {message}"
+        );
     }
 
     #[test]
@@ -247,7 +271,8 @@ mod tests {
             "spiceai",
             "spiceai",
             |_| {},
-        );
+        )
+        .expect("a complete page fans out");
 
         assert_eq!(rows[0]["pull_request_id"], Value::Null);
         assert_eq!(rows[0]["pull_request_number"], Value::Null);

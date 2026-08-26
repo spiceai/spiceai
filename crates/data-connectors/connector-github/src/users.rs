@@ -26,8 +26,9 @@ limitations under the License.
 //! when the token lacks it, which would make the table unusable for the
 //! `repo`-scoped tokens the rest of the connector runs on.
 
+use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext};
 use data_connector_api::ConnectorComponent;
 use std::sync::Arc;
 
@@ -91,14 +92,16 @@ impl GitHubTableArgs for UsersTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             Some(USER_JSON_POINTER),
-            UnnestBehavior::Depth(1),
+            // The login the dataset names is this table's `owner`, so a user row
+            // joins and unions against every other GitHub table on the same key.
+            identity_unnest(1, self.login.clone(), None),
             Some(gql_schema()),
         )
     }
 }
 
 fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+    let mut fields = vec![
         Field::new("id", DataType::Utf8, true),
         Field::new("login", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
@@ -124,7 +127,13 @@ fn gql_schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Millisecond, None),
             true,
         ),
-    ]))
+    ];
+
+    // A user row is not repository-scoped, so it carries `owner` — the login the
+    // dataset names — without a `repo`.
+    push_identity_fields(&mut fields, false);
+
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -132,9 +141,7 @@ mod tests {
     use super::{USER_JSON_POINTER, UsersTableArgs, gql_schema};
     use crate::GitHubTableArgs;
     use crate::test_util::shared_component;
-    use connector_graphql::graphql::client::{
-        DuplicateBehavior, UnnestBehavior, unnest_json_object_to_depth,
-    };
+    use connector_graphql::graphql::client::UnnestBehavior;
     use serde_json::json;
 
     fn args() -> UsersTableArgs {
@@ -167,33 +174,29 @@ mod tests {
     #[test]
     fn unnest_flattens_every_count_connection_into_a_scalar() {
         let params = args().get_graphql_values();
-        let UnnestBehavior::Depth(depth) = params.unnest_behavior else {
-            panic!("users must use a depth unnest");
+        let UnnestBehavior::Custom(unnest) = &params.unnest_behavior else {
+            panic!("users must stamp its identity with a custom unnest");
         };
 
-        let rows = unnest_json_object_to_depth(
-            json!({
-                "id": "MDQ6VXNlcjgwMTc0",
-                "login": "lukekim",
-                "name": "Luke Kim",
-                "company": "@SpiceAI",
-                "bio": "Founder",
-                "location": "Seattle, Washington",
-                "url": "https://github.com/lukekim",
-                "blog": "spice.ai",
-                "twitter_username": "lukekim",
-                "avatar_url": "https://avatars.githubusercontent.com/u/80174",
-                "created_at": "2009-05-02T09:21:56Z",
-                "updated_at": "2026-08-25T16:58:22Z",
-                "is_hireable": false,
-                "followers": {"followers": 113},
-                "following": {"following": 42},
-                "public_repos": {"public_repos": 44},
-                "public_gists": {"public_gists": 6}
-            }),
-            depth,
-            &DuplicateBehavior::Error,
-        )
+        let rows = unnest(&json!({
+            "id": "MDQ6VXNlcjgwMTc0",
+            "login": "lukekim",
+            "name": "Luke Kim",
+            "company": "@SpiceAI",
+            "bio": "Founder",
+            "location": "Seattle, Washington",
+            "url": "https://github.com/lukekim",
+            "blog": "spice.ai",
+            "twitter_username": "lukekim",
+            "avatar_url": "https://avatars.githubusercontent.com/u/80174",
+            "created_at": "2009-05-02T09:21:56Z",
+            "updated_at": "2026-08-25T16:58:22Z",
+            "is_hireable": false,
+            "followers": {"followers": 113},
+            "following": {"following": 42},
+            "public_repos": {"public_repos": 44},
+            "public_gists": {"public_gists": 6}
+        }))
         .expect("unnest to succeed");
 
         assert_eq!(rows.len(), 1);
@@ -201,6 +204,9 @@ mod tests {
         assert_eq!(rows[0]["following"], json!(42));
         assert_eq!(rows[0]["public_repos"], json!(44));
         assert_eq!(rows[0]["public_gists"], json!(6));
+        // The login the dataset names is this table's `owner`.
+        assert_eq!(rows[0]["owner"], json!("lukekim"));
+        assert!(rows[0].get("repo").is_none());
 
         let schema = gql_schema();
         for key in rows[0].as_object().expect("row object").keys() {

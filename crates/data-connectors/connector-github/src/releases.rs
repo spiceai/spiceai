@@ -142,10 +142,11 @@ impl GitHubTableArgs for ReleasesTableArgs {
 /// headline adoption metric is a scalar rather than something a caller has to
 /// join `release_assets` to compute.
 ///
-/// GitHub caps the nested asset connection at one page, so a release with more
-/// assets than that page returns a sum over only the assets that arrived. That
-/// is reported through a warning; `assets_count` records what GitHub said the
-/// true total was.
+/// GitHub caps the nested asset connection at one page. When a release has more
+/// assets than one page, the sum can only cover the assets that arrived, so the
+/// total is left NULL rather than published as a number that is knowably too
+/// small — a null reads as "unknown", a short total reads as fact.
+/// `assets_count` still records what GitHub said the true total was.
 fn add_total_download_count(release: &mut Map<String, Value>, owner: &str, repo: &str) {
     let assets = release.remove("assets");
     let assets = assets.as_ref().and_then(Value::as_array);
@@ -159,19 +160,28 @@ fn add_total_download_count(release: &mut Map<String, Value>, owner: &str, repo:
     });
 
     let assets_count = release.get("assets_count").and_then(Value::as_i64);
-    if let Some(assets_count) = assets_count
-        && assets_count > i64::try_from(returned).unwrap_or(i64::MAX)
-    {
+    let truncated =
+        assets_count.is_some_and(|count| count > i64::try_from(returned).unwrap_or(i64::MAX));
+
+    if truncated {
         let tag = release
             .get("tag_name")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let assets_count = assets_count.unwrap_or_default();
         tracing::warn!(
-            "GitHub returned only {returned} of {assets_count} assets for release '{tag}' of '{owner}/{repo}', so its `total_download_count` is short. GitHub caps a nested connection at one page and cannot paginate it. Compare `total_download_count` against `assets_count` to find affected rows. See: https://spiceai.org/docs/components/data-connectors/github"
+            "GitHub returned only {returned} of {assets_count} assets for release '{tag}' of '{owner}/{repo}', so `total_download_count` is null for it rather than a total that is knowably too small. GitHub caps a nested connection at one page and cannot paginate it. Read the per-asset rows from the `release_assets` table instead. See: https://spiceai.org/docs/components/data-connectors/github"
         );
     }
 
-    release.insert("total_download_count".to_string(), Value::from(total));
+    release.insert(
+        "total_download_count".to_string(),
+        if truncated {
+            Value::Null
+        } else {
+            Value::from(total)
+        },
+    );
 }
 
 fn gql_schema() -> SchemaRef {
@@ -296,13 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_asset_page_leaves_assets_count_above_the_summed_downloads() {
-        // The sum can only cover the assets that arrived, so `assets_count`
-        // stays authoritative and lets a query find the short rows.
+    fn a_truncated_asset_page_nulls_the_total_rather_than_under_reporting_it() {
+        // A sum over only the assets that arrived is knowably too small, and a
+        // number reads as fact where a null reads as unknown.
         let row = unnest_one(&release(150, &[1, 2]));
 
         assert_eq!(row["assets_count"], json!(150));
-        assert_eq!(row["total_download_count"], json!(3));
+        assert_eq!(row["total_download_count"], Value::Null);
     }
 
     #[test]

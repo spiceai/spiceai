@@ -64,6 +64,12 @@ impl GraphQLContext for ReleaseAssetsTableArgs {
         Some(Arc::new(error_checker))
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        // One release fans out into many asset rows, so a row limit cannot bound
+        // the number of releases to fetch.
+        false
+    }
+
     fn query_cost(&self) -> Option<u32> {
         // 1 (releases) + 100 (releaseAssets per release)
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
@@ -124,13 +130,7 @@ impl GitHubTableArgs for ReleaseAssetsTableArgs {
             query.into(),
             None,
             UnnestBehavior::Custom(Box::new(move |object: &Value| -> Result<Vec<Value>> {
-                Ok(fan_out(
-                    object,
-                    &RELEASE_ASSETS_CONNECTION,
-                    &owner,
-                    &repo,
-                    |_| {},
-                ))
+                fan_out(object, &RELEASE_ASSETS_CONNECTION, &owner, &repo, |_| {})
             })),
             Some(gql_schema()),
         )

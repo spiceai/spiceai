@@ -247,18 +247,27 @@ impl TableProvider for GraphQLTableProvider {
         let mut query = GraphQLQuery::try_from(Arc::clone(&self.base_query))
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-        let (error_checker, query_cost) = if let Some(context) = &self.context {
-            let parameters = filters
-                .iter()
-                .map(|f| context.filter_pushdown(f))
-                .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
+        let (error_checker, query_cost, supports_limit_pushdown) =
+            if let Some(context) = &self.context {
+                let parameters = filters
+                    .iter()
+                    .map(|f| context.filter_pushdown(f))
+                    .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
 
-            context.inject_parameters(&parameters, &mut query)?;
+                context.inject_parameters(&parameters, &mut query)?;
 
-            (context.error_checker(), context.query_cost())
-        } else {
-            (None, None)
-        };
+                (
+                    context.error_checker(),
+                    context.query_cost(),
+                    context.supports_limit_pushdown(),
+                )
+            } else {
+                (None, None, true)
+            };
+
+        // A table whose rows do not map one-to-one onto the paginated connection
+        // cannot bound its scan by a row limit — see `supports_limit_pushdown`.
+        let limit = if supports_limit_pushdown { limit } else { None };
 
         apply_client_json_pointer(self.client.as_ref(), &mut query);
 
