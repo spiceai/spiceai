@@ -174,6 +174,11 @@ const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
 const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
 
+/// Entry count at which `schema_evolve_locks` drops the locks nobody is holding. Well above
+/// the number of datasets a runtime serves, so real datasets keep their lock between writes
+/// and only a flood of unknown table names triggers a cleanup.
+const MAX_SCHEMA_EVOLVE_LOCKS: usize = 1024;
+
 #[derive(Default)]
 struct StreamingBroadcastBuffer {
     batches: Vec<RecordBatch>,
@@ -748,6 +753,24 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
+/// Removes `key` only while it still holds `claimed`.
+///
+/// Reloading a dataset replaces its map entry with a new one. A caller that finished working
+/// on the old entry must not delete the replacement, or the reloaded dataset loses whatever
+/// the entry was tracking for it.
+fn remove_if_same<V>(
+    map: &mut HashMap<TableReference, Arc<V>>,
+    key: &TableReference,
+    claimed: &Arc<V>,
+) {
+    if map
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, claimed))
+    {
+        map.remove(key);
+    }
+}
+
 struct DeferredTableRegistration {
     dataset: Arc<Dataset>,
     connector: Arc<dyn DataConnector>,
@@ -792,7 +815,8 @@ pub struct DataFusion {
     /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
     /// write can complete through the provider being replaced, and its rows are then
     /// invisible to the new one. Keyed by the bare table name so every way of naming a
-    /// dataset shares one lock (see `schema_evolve_lock`); created on first use.
+    /// dataset shares one lock (see `schema_evolve_lock`); created on first use and dropped
+    /// again once unused, so unknown table names cannot grow the map without bound.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
@@ -2268,7 +2292,11 @@ impl DataFusion {
                 // The table exists now: empty the slot for the writers waiting on it, and
                 // drop the entry so later writers skip this path.
                 *slot = None;
-                self.pending_sink_tables.write().await.remove(&pending_key);
+                remove_if_same(
+                    &mut *self.pending_sink_tables.write().await,
+                    &pending_key,
+                    &entry,
+                );
                 Ok(())
             }
             // Registration failed. The entry is still in the slot, so the next write
@@ -2298,6 +2326,14 @@ impl DataFusion {
             }
         }
         let mut locks = self.schema_evolve_locks.write().await;
+        // A write is admitted for any name a writable catalog accepts, including one that
+        // resolves to no table and fails right after this. Those names would otherwise stay
+        // here forever, so once the map grows past its bound, drop the locks nobody holds.
+        // A lock with one reference is held only by the map, so no write or evolution is
+        // using it and re-creating it later is equivalent.
+        if locks.len() >= MAX_SCHEMA_EVOLVE_LOCKS {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         Arc::clone(
             locks
                 .entry(key)
@@ -5662,6 +5698,75 @@ mod tests {
             !Arc::ptr_eq(&bare, &other),
             "distinct datasets must keep independent locks"
         );
+    }
+
+    /// A write is admitted for any table name a writable catalog accepts, so writes to names
+    /// that resolve to nothing must not grow the lock map for the life of the process.
+    #[tokio::test]
+    async fn schema_evolve_locks_drop_the_locks_nobody_holds() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        // Ask for far more locks than the bound, keeping none of them.
+        for i in 0..MAX_SCHEMA_EVOLVE_LOCKS * 3 {
+            let _ = df
+                .schema_evolve_lock(&TableReference::bare(format!("unknown_{i}")))
+                .await;
+        }
+
+        let held = df.schema_evolve_locks.read().await.len();
+        assert!(
+            held <= MAX_SCHEMA_EVOLVE_LOCKS,
+            "the lock map must stay bounded, holds {held} entries"
+        );
+    }
+
+    /// A lock in use must survive the cleanup, or two writers to the same dataset would take
+    /// different locks and stop excluding each other.
+    #[tokio::test]
+    async fn schema_evolve_locks_keep_the_locks_still_in_use() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        let held_lock = df.schema_evolve_lock(&TableReference::bare("in_use")).await;
+
+        // Fill the map past its bound so the next call cleans up.
+        for i in 0..=MAX_SCHEMA_EVOLVE_LOCKS {
+            let _ = df
+                .schema_evolve_lock(&TableReference::bare(format!("unknown_{i}")))
+                .await;
+        }
+
+        let same_lock = df.schema_evolve_lock(&TableReference::bare("in_use")).await;
+        assert!(
+            Arc::ptr_eq(&held_lock, &same_lock),
+            "a lock someone still holds must not be replaced"
+        );
+    }
+
+    /// Reloading a dataset replaces its pending-registration entry. A registration finishing
+    /// against the old entry must leave the replacement alone, or the reloaded dataset can
+    /// never register on its first write.
+    #[test]
+    fn remove_if_same_leaves_a_replacement_entry_in_place() {
+        let key = TableReference::bare("metric");
+        let mut map: HashMap<TableReference, Arc<u8>> = HashMap::new();
+
+        // The entry a caller claimed, then replaced by a reload.
+        let claimed = Arc::new(1_u8);
+        let replacement = Arc::new(2_u8);
+        map.insert(key.clone(), Arc::clone(&replacement));
+
+        remove_if_same(&mut map, &key, &claimed);
+        assert!(
+            map.get(&key).is_some_and(|v| Arc::ptr_eq(v, &replacement)),
+            "the replacement entry must survive"
+        );
+
+        // The unreplaced case still removes.
+        map.insert(key.clone(), Arc::clone(&claimed));
+        remove_if_same(&mut map, &key, &claimed);
+        assert!(!map.contains_key(&key), "the claimed entry must be removed");
     }
 
     #[test]
