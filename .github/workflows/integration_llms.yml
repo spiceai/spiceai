@@ -165,6 +165,10 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     strategy:
+      # The two arms cover disjoint model sets — self-hosted local models and the hosted
+      # providers — so one arm's result says nothing about the other's, and cancelling the
+      # sibling on the first failure throws away half the signal this suite exists to give.
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     permissions: read-all
@@ -242,8 +246,37 @@ jobs:
               exit 1
             fi
           fi
-          # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- llms::tests --test-threads=2
+          test_binary=./integration_test/llms_integration_test
+          # Every test in this binary lives under `integration.rs`'s only module, `llms`.
+          filter='llms::'
+
+          # A filter that matches nothing makes libtest print `ok. 0 passed` and exit 0, so the
+          # suite reports success having tested nothing. The filter names test-code structure,
+          # which a refactor is free to move, so count the selection and refuse an empty one
+          # rather than trusting a green result. `--list` only enumerates — it runs no test body,
+          # so it costs no model call and needs none of the snapshot environment below. Its exit
+          # status is checked separately from the count, because a harness that cannot run also
+          # produces no output, and reporting that as a stale filter sends the reader to the
+          # wrong file.
+          if ! listed=$("$test_binary" --list "$filter"); then
+            echo "::error::The LLM integration test binary failed to list its tests, so the suite could not run. Check the build and download steps above."
+            exit 1
+          fi
+          # `grep -c` exits 1 on no match, which `-e` would otherwise turn into an abort before
+          # the branch below can report the real problem.
+          selected=$(printf '%s\n' "$listed" | grep -c ': test$' || true)
+          echo "Filter '$filter' selects ${selected} test(s)."
+          if [ "$selected" -eq 0 ]; then
+            echo "::error::The LLM integration filter '$filter' selected no tests, so this suite would report success without exercising any model. Point it at the current test module path under crates/llms/tests/."
+            exit 1
+          fi
+
+          # The binary is itself the libtest harness, so its options are passed directly. A `--`
+          # here would end option parsing, and libtest would read `--test-threads=2` as a second
+          # filter and silently keep its default thread count. `--test-threads` holds concurrent
+          # requests low enough to stay under the hosted providers' rate limits.
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" \
+            "$test_binary" --nocapture --test-threads=2 "$filter"
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
