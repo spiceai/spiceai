@@ -24,7 +24,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
+use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
 /// Type alias for tracking in-flight revalidation requests.
@@ -215,6 +216,92 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
     mpsc::channel(CACHE_WRITE_CHANNEL_CAPACITY)
 }
 
+/// Consecutive failed flushes after which a caching accelerator is reported unhealthy.
+///
+/// At [`CACHE_WRITE_FLUSH_INTERVAL_MS`] this is a few seconds of a cache that is accepting
+/// work and storing none of it. One failed flush can be a transient write conflict; a run of
+/// them is a configuration the accelerator cannot serve.
+const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
+
+/// The `error!` and dataset status a caching accelerator gets when it can accept writes but
+/// cannot store any of them.
+///
+/// A write failure here is on a degrade-and-continue path that does not degrade: the flush
+/// warns, the runtime keeps reporting itself healthy, queries return no accelerated data and
+/// no error, and memory use looks excellent because nothing is being stored. Everything an
+/// operator would normally check points the wrong way, so the accelerator has to say so
+/// itself (spiceai/spiceai#13524).
+fn accelerator_unwritable_message(dataset_name: &str, failures: u32, cause: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' failed to write to its accelerator {failures} times in a row, \
+         so nothing is being cached and queries against the accelerated table return no rows. \
+         Cause: {cause}. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    )
+}
+
+/// Tracks whether a caching accelerator is storing what it is given, and reports the dataset
+/// unhealthy once it clearly is not.
+struct CacheWriteHealth {
+    runtime_status: Arc<RuntimeStatus>,
+    dataset: TableReference,
+    consecutive_failures: u32,
+    /// The message behind the current `Error` status, so recovery only clears the status this
+    /// tracker set and never a refresh failure reported by another path.
+    reported: Option<String>,
+}
+
+impl CacheWriteHealth {
+    fn new(runtime_status: Arc<RuntimeStatus>, dataset: TableReference) -> Self {
+        Self {
+            runtime_status,
+            dataset,
+            consecutive_failures: 0,
+            reported: None,
+        }
+    }
+
+    fn record_failure(&mut self, dataset_name: &str, cause: &str) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures < CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+            return;
+        }
+
+        let message =
+            accelerator_unwritable_message(dataset_name, self.consecutive_failures, cause);
+        // Report the first crossing, then stay quiet: the per-flush `warn!` already carries
+        // every occurrence, and this line is the one an operator is meant to act on.
+        if self.reported.is_none() {
+            tracing::error!("{message}");
+        }
+        self.runtime_status
+            .update_dataset(&self.dataset, ComponentStatus::Error(Some(message.clone())));
+        self.reported = Some(message);
+    }
+
+    fn record_success(&mut self, dataset_name: &str) {
+        self.consecutive_failures = 0;
+        let Some(reported) = self.reported.take() else {
+            return;
+        };
+
+        // Only clear the status this tracker set. A refresh failure reported since then is a
+        // separate problem and must not be masked by a cache write starting to succeed.
+        // `ComponentStatus` compares by variant alone, so the message has to be matched
+        // rather than the status equated.
+        let current = self
+            .runtime_status
+            .get_component_status(&format!("dataset:{}", self.dataset));
+        let still_ours =
+            matches!(&current, Some(ComponentStatus::Error(Some(message))) if *message == reported);
+        if still_ours {
+            self.runtime_status
+                .update_dataset(&self.dataset, ComponentStatus::Ready);
+        }
+        tracing::info!("Dataset '{dataset_name}' is writing to its accelerator again.");
+    }
+}
+
 /// Spawns a background task that batches cache writes on interval basis.
 ///
 /// Removes cache keys from `in_flight_revalidations` after writes complete.
@@ -222,12 +309,15 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 pub fn spawn_batched_cache_write_task(
     mut rx: CacheWriteReceiver,
     accelerator: Arc<dyn TableProvider>,
-    dataset_name: String,
+    dataset: TableReference,
     accelerator_write_mutex: Arc<Mutex<()>>,
     in_flight_revalidations: InFlightRevalidations,
     last_updated_at: Arc<AtomicI64>,
+    runtime_status: Arc<RuntimeStatus>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let dataset_name = dataset.to_string();
+        let mut health = CacheWriteHealth::new(runtime_status, dataset);
         let mut batch_buffer: Vec<CacheWriteRequest> = Vec::new();
         let mut flush_ticker =
             tokio::time::interval(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS));
@@ -259,6 +349,7 @@ pub fn spawn_batched_cache_write_task(
                                 &accelerator_write_mutex,
                                 &in_flight_revalidations,
                                 &last_updated_at,
+                                &mut health,
                             ).await;
                         }
                         break;
@@ -275,6 +366,7 @@ pub fn spawn_batched_cache_write_task(
                             &accelerator_write_mutex,
                             &in_flight_revalidations,
                             &last_updated_at,
+                            &mut health,
                         ).await;
                     }
                 }
@@ -293,6 +385,7 @@ async fn flush_cache_writes(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     in_flight_revalidations: &InFlightRevalidations,
     last_updated_at: &Arc<AtomicI64>,
+    health: &mut CacheWriteHealth,
 ) {
     if buffer.is_empty() {
         return;
@@ -403,7 +496,10 @@ async fn flush_cache_writes(
     let write_ms = write_start.elapsed().as_millis();
     if let Err(e) = result {
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
+        health.record_failure(dataset_name, &e.to_string());
     } else if insert_rows > 0 || upsert_rows > 0 {
+        health.record_success(dataset_name);
+
         // Update last_updated_at for snapshots_creation_policy: on_change support
         super::AcceleratedTable::set_timestamp_to_now(last_updated_at);
 
@@ -2261,6 +2357,88 @@ mod tests {
         }
     }
 
+    /// The line an operator acts on has to carry the dataset, what they will observe, and
+    /// where to go next; it is the only explanation they get for an accelerator serving
+    /// nothing while the runtime reports itself healthy.
+    #[test]
+    fn unwritable_message_names_the_dataset_the_consequence_and_the_docs() {
+        let message = accelerator_unwritable_message("api_data", 3, "no encoding for Map");
+        assert!(message.contains("'api_data'"), "message: {message}");
+        assert!(
+            message.contains("nothing is being cached"),
+            "message: {message}"
+        );
+        assert!(message.contains("return no rows"), "message: {message}");
+        assert!(
+            message.contains("no encoding for Map"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-accelerators"),
+            "message: {message}"
+        );
+    }
+
+    fn dataset_status(status: &Arc<RuntimeStatus>, dataset: &str) -> Option<ComponentStatus> {
+        status.get_component_status(&format!("dataset:{dataset}"))
+    }
+
+    #[test]
+    fn a_run_of_failed_flushes_reports_the_dataset_unhealthy() {
+        let status = RuntimeStatus::new();
+        let mut health =
+            CacheWriteHealth::new(Arc::clone(&status), TableReference::bare("api_data"));
+
+        for _ in 1..CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+            health.record_failure("api_data", "write failed");
+            assert_eq!(
+                dataset_status(&status, "api_data"),
+                None,
+                "a single failed flush can be transient and must not report the dataset unhealthy"
+            );
+        }
+
+        health.record_failure("api_data", "write failed");
+        let Some(ComponentStatus::Error(Some(message))) = dataset_status(&status, "api_data")
+        else {
+            panic!("dataset should be reported unhealthy once the accelerator stops storing rows");
+        };
+        assert!(message.contains("'api_data'"), "message: {message}");
+
+        // A flush that stores rows is the accelerator working again.
+        health.record_success("api_data");
+        assert_eq!(
+            dataset_status(&status, "api_data"),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_clear_an_error_reported_by_another_path() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("api_data");
+        let mut health = CacheWriteHealth::new(Arc::clone(&status), dataset.clone());
+
+        for _ in 0..CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY {
+            health.record_failure("api_data", "write failed");
+        }
+
+        // The refresh path reports its own failure after this tracker reported its.
+        status.update_dataset(
+            &dataset,
+            ComponentStatus::Error(Some("refresh failed".to_string())),
+        );
+
+        health.record_success("api_data");
+        // `ComponentStatus` equates every `Error` regardless of message, so assert on the
+        // message: comparing the statuses would pass even if the refresh error were replaced.
+        let current = dataset_status(&status, "api_data");
+        assert!(
+            matches!(&current, Some(ComponentStatus::Error(Some(message))) if message == "refresh failed"),
+            "cache writes succeeding again says nothing about a refresh that is still failing, got: {current:?}"
+        );
+    }
+
     /// Helper to create a test cache write channel and spawn a consumer that writes to an accelerator.
     ///
     /// Uses the real `spawn_batched_cache_write_task` for realistic testing.
@@ -2275,10 +2453,11 @@ mod tests {
         let handle = spawn_batched_cache_write_task(
             rx,
             Arc::clone(accelerator) as Arc<dyn TableProvider>,
-            "test_dataset".to_string(),
+            TableReference::bare("test_dataset"),
             accelerator_write_mutex,
             Arc::clone(in_flight_revalidations),
             last_updated_at,
+            RuntimeStatus::new(),
         );
         (tx, handle)
     }

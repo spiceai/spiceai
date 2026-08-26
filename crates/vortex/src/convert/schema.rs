@@ -176,6 +176,29 @@ fn calculate_physical_field_type(
             }
         }
 
+        // Arrow's `Map` has no Vortex `DType`; it is aliased to `List<Struct<keys, values>>`
+        // on the way in, so the map identity - the entries field name, the key and value
+        // names, and the `ordered` flag - survives only in the logical schema and has to be
+        // re-applied here for the file to read back as a map.
+        DataType::Map(logical_entries, ordered) => {
+            if let DType::List(entries_dtype, _) = dtype {
+                let physical_entries_type = calculate_physical_field_type(
+                    entries_dtype,
+                    logical_entries.data_type(),
+                    arrow_session,
+                )?;
+                let physical_entries = logical_entries
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_entries_type);
+                DataType::Map(physical_entries.into(), *ordered)
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
         // For fixed-size list types, recursively check the element type
         DataType::FixedSizeList(logical_elem, size) => {
             if let DType::FixedSizeList(elem_dtype, ..) = dtype {
@@ -265,6 +288,48 @@ mod tests {
             physical_schema.field(0).data_type(),
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
         );
+    }
+
+    /// Arrow's `Map` is stored as `List<Struct<keys, values>>`, so the file's `DType` alone
+    /// reads back as a list. The reference schema is the only place the map identity
+    /// survives, and reconciliation has to re-apply it or a map column comes back as a list
+    /// and no longer matches the table it was written from.
+    #[test]
+    fn test_map_type_is_restored_from_the_reference_schema() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let logical_schema = Schema::new(vec![Field::new("headers", map_type.clone(), true)]);
+
+        // What the file actually holds: a nullable list of non-nullable key/value structs.
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "headers",
+                DType::List(
+                    Arc::new(DType::Struct(
+                        StructFields::from_iter([
+                            ("keys", DType::Utf8(Nullability::NonNullable)),
+                            ("values", DType::Utf8(Nullability::Nullable)),
+                        ]),
+                        Nullability::NonNullable,
+                    )),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("map physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &map_type);
     }
 
     #[test]

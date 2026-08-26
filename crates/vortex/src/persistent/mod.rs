@@ -98,6 +98,106 @@ mod tests {
         Ok(())
     }
 
+    /// A `Map` column has to survive a full write/read cycle through a Vortex file.
+    ///
+    /// Vortex has no `Map` dtype: it aliases the type to `List<Struct<keys, values>>` on
+    /// write and rebuilds the map on read from the table's declared schema. Both halves of
+    /// that alias live in the `spiceai/vortex` fork, and half of it has been lost across a
+    /// fork re-cut once already (spiceai/spiceai#13524), which is only observable at
+    /// runtime: the dtype conversion still accepts `Map`, so a table is created happily and
+    /// then every write fails with "Array encoding not implemented for Arrow data type
+    /// Map(...)". This test fails in Spice if either half goes missing again.
+    #[tokio::test]
+    async fn map_column_roundtrips_through_a_vortex_file() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::Array as _;
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion::arrow::array::builder::MapBuilder;
+        use datafusion::arrow::array::builder::StringBuilder;
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::arrow::datatypes::Fields;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::dataframe::DataFrameWriteOptions;
+        use datafusion::datasource::listing::ListingOptions;
+        use datafusion::datasource::listing::ListingTable;
+        use datafusion::datasource::listing::ListingTableConfig;
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        use crate::VortexFormat;
+
+        let ctx = TestSessionContext::default();
+
+        // The shape the HTTP connector produces for `response_headers`.
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("headers", map_type.clone(), true),
+        ]));
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("content-type");
+        builder.values().append_value("application/json");
+        builder.keys().append_value("etag");
+        builder.values().append_value("\"abc\"");
+        builder.append(true)?;
+        builder.append(false)?;
+        builder.keys().append_value("content-type");
+        builder.values().append_value("text/plain");
+        builder.append(true)?;
+        let maps = builder.finish();
+
+        // `MapBuilder` names the entries and its fields `entries`/`keys`/`values`, which is
+        // what the schema above declares; assert it rather than trusting the default.
+        assert_eq!(maps.data_type(), &map_type);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(maps)],
+        )?;
+
+        let format = Arc::new(VortexFormat::new(VortexSession::default()));
+        let config = ListingTableConfig::new(ListingTableUrl::parse("file:///maps/")?)
+            .with_listing_options(ListingOptions::new(format))
+            .with_schema(Arc::clone(&schema));
+        ctx.session
+            .register_table("maps", Arc::new(ListingTable::try_new(config)?))?;
+
+        ctx.session
+            .read_batch(batch.clone())?
+            .write_table("maps", DataFrameWriteOptions::new())
+            .await?;
+
+        let read_back = ctx
+            .session
+            .sql("SELECT id, headers FROM maps ORDER BY id")
+            .await?;
+        assert_eq!(
+            read_back.schema().field(1).data_type(),
+            &map_type,
+            "a map column must not read back as its List<Struct> storage"
+        );
+
+        let batches = read_back.collect().await?;
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3, "every row must be stored, including the null map");
+        assert_snapshot!(
+            "map_column_roundtrip_result",
+            pretty_format_batches(&batches)?
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_addition_pushdown() -> anyhow::Result<()> {
         let ctx = TestSessionContext::default();
