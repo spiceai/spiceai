@@ -24,7 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::google::auth::{VertexAuthParams, VertexCredentials, resolve_credentials, vertex_host};
+use crate::google::auth::{VertexAuthParams, VertexCredentials, resolve_credentials};
 use crate::provider::{
     ListModels, ListModelsError, ListModelsResult, create_http_client, get_required_param,
     map_status_to_error,
@@ -134,7 +134,7 @@ impl GoogleModelLister {
 fn publisher_models_url(credentials: &VertexCredentials) -> String {
     format!(
         "{}{PUBLISHER_MODELS_PATH}?pageSize={PAGE_SIZE}",
-        vertex_host(&credentials.location)
+        credentials.location.host()
     )
 }
 
@@ -214,6 +214,7 @@ impl ListModels for GoogleModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::google::auth::VertexLocation;
 
     fn vertex_params() -> HashMap<String, SecretString> {
         HashMap::from([
@@ -289,10 +290,10 @@ mod tests {
         ));
     }
 
-    fn credentials_for(location: &str) -> VertexCredentials {
+    fn credentials_for(location: VertexLocation) -> VertexCredentials {
         VertexCredentials {
             project: "my-project".to_string(),
-            location: location.to_string(),
+            location,
             token_provider: std::sync::Arc::new(token_provider::StaticTokenProvider::new(
                 SecretString::from("test-token"),
             )),
@@ -302,7 +303,9 @@ mod tests {
     #[test]
     fn publisher_models_url_uses_the_regional_host() {
         assert_eq!(
-            publisher_models_url(&credentials_for("us-central1")),
+            publisher_models_url(&credentials_for(VertexLocation::Region(
+                "us-central1".to_string()
+            ))),
             "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=200"
         );
     }
@@ -310,7 +313,7 @@ mod tests {
     #[test]
     fn publisher_models_url_uses_the_non_regional_host_for_global() {
         assert_eq!(
-            publisher_models_url(&credentials_for("global")),
+            publisher_models_url(&credentials_for(VertexLocation::Global)),
             "https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=200"
         );
     }

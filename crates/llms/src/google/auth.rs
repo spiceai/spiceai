@@ -113,12 +113,13 @@ pub async fn build_client(
 }
 
 /// A validated project/location pair and the token provider that authenticates requests against
-/// them. `project` and `location` have passed [`is_safe_gcp_identifier`], so callers may
-/// interpolate them into a request URL — build every Vertex AI URL from these fields rather than
-/// from the raw params, or [`resolve_credentials`]'s URL-injection check is bypassed.
+/// them. `project` has passed [`is_safe_gcp_identifier`] and `location` parsed into a
+/// [`VertexLocation`], so callers may interpolate them into a request URL — build every Vertex AI
+/// URL from these fields rather than from the raw params, or [`resolve_credentials`]'s
+/// URL-injection check is bypassed.
 pub(super) struct VertexCredentials {
     pub project: String,
-    pub location: String,
+    pub location: VertexLocation,
     pub token_provider: Arc<dyn TokenProvider>,
 }
 
@@ -148,13 +149,10 @@ pub(super) async fn resolve_credentials(
             project: project.to_string(),
         }
     );
-    ensure!(
-        location.eq_ignore_ascii_case("global") || is_safe_gcp_identifier(location),
-        InvalidLocationSnafu {
-            params_prefix: params_prefix.to_string(),
-            location: location.to_string(),
-        }
-    );
+    let location = VertexLocation::parse(location).context(InvalidLocationSnafu {
+        params_prefix: params_prefix.to_string(),
+        location: location.to_string(),
+    })?;
 
     let service_account_json = resolve_service_account_json(&vertex, params_prefix).await?;
 
@@ -165,7 +163,7 @@ pub(super) async fn resolve_credentials(
 
     Ok(VertexCredentials {
         project: project.to_string(),
-        location: location.to_string(),
+        location,
         token_provider: Arc::new(token_provider) as Arc<dyn TokenProvider>,
     })
 }
@@ -233,22 +231,51 @@ fn is_safe_gcp_identifier(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// The Vertex AI service endpoint for `location`: the regional host, except `location: global`,
-/// which is served by the non-regionalized `aiplatform.googleapis.com`.
-pub(super) fn vertex_host(location: &str) -> String {
-    if location.eq_ignore_ascii_case("global") {
-        "https://aiplatform.googleapis.com".to_string()
-    } else {
-        format!("https://{location}-aiplatform.googleapis.com")
+/// Where a Vertex AI request is served from. `global` is not just another region name — it is
+/// reached over a different, non-regionalized host — so the two cases are distinct variants
+/// rather than a string every call site has to remember to special-case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VertexLocation {
+    Global,
+    Region(String),
+}
+
+impl VertexLocation {
+    /// Parses a user-supplied `google_location`, returning `None` for a value that is neither
+    /// `global` nor a syntactically valid region — see [`is_safe_gcp_identifier`].
+    fn parse(location: &str) -> Option<Self> {
+        if location.eq_ignore_ascii_case("global") {
+            return Some(Self::Global);
+        }
+        is_safe_gcp_identifier(location).then(|| Self::Region(location.to_string()))
+    }
+
+    /// The `locations/{...}` URL path segment. `global` is emitted canonically, so a
+    /// `google_location: GLOBAL` reaches Vertex as the `global` it was accepted as.
+    fn path_segment(&self) -> &str {
+        match self {
+            Self::Global => "global",
+            Self::Region(region) => region,
+        }
+    }
+
+    /// The Vertex AI service endpoint: each region has its own host, while `global` is served
+    /// by the non-regionalized `aiplatform.googleapis.com`.
+    pub(super) fn host(&self) -> String {
+        match self {
+            Self::Global => "https://aiplatform.googleapis.com".to_string(),
+            Self::Region(region) => format!("https://{region}-aiplatform.googleapis.com"),
+        }
     }
 }
 
 /// Builds the Vertex AI base URL for the Gemini publisher-model API:
 /// `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google`.
-fn vertex_base_url(project: &str, location: &str) -> String {
+fn vertex_base_url(project: &str, location: &VertexLocation) -> String {
     format!(
-        "{}/v1/projects/{project}/locations/{location}/publishers/google",
-        vertex_host(location)
+        "{}/v1/projects/{project}/locations/{}/publishers/google",
+        location.host(),
+        location.path_segment()
     )
 }
 
@@ -259,7 +286,10 @@ mod tests {
     #[test]
     fn vertex_base_url_uses_regional_host() {
         assert_eq!(
-            vertex_base_url("my-project", "us-central1"),
+            vertex_base_url(
+                "my-project",
+                &VertexLocation::Region("us-central1".to_string())
+            ),
             "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google"
         );
     }
@@ -267,9 +297,39 @@ mod tests {
     #[test]
     fn vertex_base_url_uses_non_regional_host_for_global() {
         assert_eq!(
-            vertex_base_url("my-project", "global"),
+            vertex_base_url("my-project", &VertexLocation::Global),
             "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/publishers/google"
         );
+    }
+
+    #[test]
+    fn vertex_location_parses_a_region_and_global() {
+        assert_eq!(
+            VertexLocation::parse("us-central1"),
+            Some(VertexLocation::Region("us-central1".to_string()))
+        );
+        assert_eq!(
+            VertexLocation::parse("global"),
+            Some(VertexLocation::Global)
+        );
+    }
+
+    #[test]
+    fn vertex_location_accepts_global_in_any_case_and_canonicalizes_it() {
+        // `global` is matched case-insensitively, so the URL must not echo back whatever
+        // casing was configured — Vertex is addressed with the canonical `global`.
+        let location = VertexLocation::parse("GLOBAL").expect("GLOBAL should parse as global");
+        assert_eq!(location, VertexLocation::Global);
+        assert_eq!(location.path_segment(), "global");
+    }
+
+    #[test]
+    fn vertex_location_rejects_anything_that_is_neither() {
+        // A region is held to `is_safe_gcp_identifier`, so nothing that could escape the URL
+        // segment ever becomes a `Region`.
+        assert_eq!(VertexLocation::parse("evil.example/"), None);
+        assert_eq!(VertexLocation::parse("US-CENTRAL1"), None);
+        assert_eq!(VertexLocation::parse(""), None);
     }
 
     #[tokio::test]
