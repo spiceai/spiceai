@@ -383,7 +383,7 @@ impl MetricsService for Service {
 /// being invisible in a mixed export (#12188).
 ///
 /// `resource_attrs` are the resource-level attributes of the export the metric arrived in; they
-/// are merged into every data point's attributes (see `row_attributes`).
+/// are merged into every data point's attributes (see `ResourceAttributeMerger`).
 pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
@@ -774,24 +774,46 @@ macro_rules! append_attribute {
     }};
 }
 
-/// One row's attributes: the export's resource attributes that the data point does not override,
-/// followed by the data point's own. Both slices are borrowed from the request, so merging them
-/// copies no attribute.
+/// Merges the export's resource attributes into each data point's own attributes.
 ///
-/// A key carried by both wins for the data point: its attribute is the more specific description
-/// of that measurement, and a resource attribute must never overwrite it.
-fn row_attributes<'a>(
+/// Both slices stay borrowed from the request, so merging copies no attribute. A key carried by
+/// both wins for the data point: its attribute is the more specific description of that
+/// measurement, and a resource attribute must never overwrite it.
+///
+/// The overridden keys are found through a set of the data point's keys rather than by scanning
+/// its attributes once per resource attribute, which would make a batch cost the product of the
+/// two attribute-list lengths — an OTLP request may carry long ones, and this conversion runs
+/// inline in `export`. The set is reused across rows, so a batch allocates one however many data
+/// points it carries.
+struct ResourceAttributeMerger<'a> {
     resource_attrs: &'a [KeyValue],
-    data_point_attrs: &'a [KeyValue],
-) -> impl Iterator<Item = &'a KeyValue> {
-    resource_attrs
-        .iter()
-        .filter(move |resource_attr| {
-            !data_point_attrs
-                .iter()
-                .any(|attr| attr.key == resource_attr.key)
-        })
-        .chain(data_point_attrs.iter())
+    data_point_keys: HashSet<&'a str>,
+}
+
+impl<'a> ResourceAttributeMerger<'a> {
+    fn new(resource_attrs: &'a [KeyValue]) -> Self {
+        Self {
+            resource_attrs,
+            data_point_keys: HashSet::new(),
+        }
+    }
+
+    /// One row's attributes: the resource attributes the data point does not override, followed
+    /// by the data point's own.
+    fn row(&mut self, data_point_attrs: &'a [KeyValue]) -> impl Iterator<Item = &'a KeyValue> {
+        self.data_point_keys.clear();
+        // With no resource attributes nothing can be overridden, so the keys are not collected.
+        if !self.resource_attrs.is_empty() {
+            self.data_point_keys
+                .extend(data_point_attrs.iter().map(|attr| attr.key.as_str()));
+        }
+
+        let data_point_keys = &self.data_point_keys;
+        self.resource_attrs
+            .iter()
+            .filter(move |resource_attr| !data_point_keys.contains(resource_attr.key.as_str()))
+            .chain(data_point_attrs.iter())
+    }
 }
 
 #[expect(clippy::type_complexity)]
@@ -817,8 +839,9 @@ fn attributes_to_fields_and_columns(
         value_columns,
     );
 
-    for (i, inner_attributes) in attributes.iter().enumerate() {
-        for attribute in row_attributes(resource_attrs, inner_attributes) {
+    let mut merger = ResourceAttributeMerger::new(resource_attrs);
+    for (i, inner_attributes) in attributes.iter().copied().enumerate() {
+        for attribute in merger.row(inner_attributes) {
             let key_str = attribute.key.as_str();
             // An attribute whose key is one of this metric's value columns cannot be
             // represented alongside it: emitting it as an attribute would put two columns of
@@ -2269,6 +2292,26 @@ mod tests {
             "the colliding key must produce exactly one column"
         );
         assert_eq!(column(&batch, "region").as_string::<i32>().value(0), "eu");
+    }
+
+    /// The override is per data point: a point that does not carry the key keeps the resource
+    /// attribute's value, even when another point of the same batch overrode it.
+    #[test]
+    fn resource_attribute_is_overridden_only_on_the_data_point_carrying_the_key() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![
+                number_data_point(1.0, vec![string_attribute("region", "eu")]),
+                number_data_point(2.0, vec![string_attribute("host", "a")]),
+            ],
+        });
+        let resource_attrs = vec![string_attribute("region", "us")];
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, &resource_attrs, None);
+        let batch = result.expect("record batch should build");
+
+        let regions = column(&batch, "region").as_string::<i32>();
+        assert_eq!(regions.value(0), "eu");
+        assert_eq!(regions.value(1), "us");
     }
 
     /// The export handler must thread the resource attributes of each resource metric group into
