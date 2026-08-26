@@ -788,27 +788,18 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
-    /// Per-dataset locks excluding write-time schema evolution + provider rebind (the
-    /// `OTel` metric-dimension path) against in-flight writes. Evolution takes the lock
-    /// exclusively across the `ALTER … ADD COLUMN` + re-registration, so concurrent
-    /// exports for the same metric can't race it; writers hold it shared from provider
-    /// lookup through insert completion, because a batch inserted through a provider
-    /// instance that is concurrently being replaced publishes into table state the
-    /// replacement was not opened on — the write reports success but its rows are
-    /// invisible to the newly bound provider. Keyed by the bare table name so every alias
-    /// of a dataset (bare, partial, fully-qualified) shares one lock — see
-    /// `schema_evolve_lock`; get-or-inserted lazily.
+    /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
+    /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
+    /// write can complete through the provider being replaced, and its rows are then
+    /// invisible to the new one. Keyed by the bare table name so every way of naming a
+    /// dataset shares one lock (see `schema_evolve_lock`); created on first use.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
-    /// `sink` datasets parked until their first write (a sink's schema is only known then),
-    /// keyed by dataset name — matched against a writer's reference by `resolved_eq`, so any
-    /// alias of the dataset finds it (see `ensure_sink_dataset`). The per-entry mutex
-    /// serializes the first-write registration:
-    /// one writer registers while concurrent writers wait on the mutex until the provider is
-    /// installed — instead of racing ahead to a table lookup that fails with a missing-table
-    /// error mid-registration. The slot is emptied, and the entry removed, only after the
-    /// provider is installed: a writer that still sees the entry waits, one that no longer
-    /// sees it finds the table registered, and a registering writer that is cancelled
-    /// mid-registration leaves the slot occupied so the next writer retries.
+    /// `sink` datasets waiting for their first write, which is when their schema becomes
+    /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
+    /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
+    /// registers while the others wait on the mutex, so no writer looks the table up before
+    /// it exists. The slot is emptied only once the provider is installed, so a registration
+    /// that is cancelled part-way leaves the entry for the next writer to retry.
     pending_sink_tables:
         TokioRwLock<HashMap<TableReference, Arc<Mutex<Option<PendingSinkRegistration>>>>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
@@ -2212,25 +2203,18 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        // Look up the pending entry without claiming it; a writer to a table that is not a
-        // pending sink (the common case) returns immediately.
+        // A writer can name the dataset in more than one way: a Flight `DoPut` turns `foo`
+        // into `spice.public.foo`, and `is_writable` accepts that through `resolved_eq`.
+        // Match the entry the same way, or a write that was just accepted finds nothing to
+        // register and then fails against the unregistered table. The removal below reuses
+        // the matched key, since that is what the entry is stored under.
         //
-        // The entry is keyed by the dataset's own name, but a writer may address that
-        // dataset through any alias of it — a Flight `DoPut` normalizes `foo` to
-        // `spice.public.foo` — so the entry is matched the way `is_writable` matches its
-        // writers, by `resolved_eq` against the stored name rather than by exact key. An
-        // exact lookup misses every alias: it would report nothing to register for a write
-        // `is_writable` had just admitted, and the write would then fail against the still
-        // parked table. The matched key is carried to the removal below, since that (not the
-        // caller's alias) is the key the entry is stored under.
+        // A scan is fine: the map only holds sink datasets waiting for their first write.
+        // Keying by bare name would be faster, but would put two same-named sinks from
+        // different schemas in one entry and leave one of them unregistered forever.
         //
-        // Scanning suits the map's size and cannot merge two datasets: it only ever holds
-        // sink datasets awaiting their first write, and shrinks as they register. Keying it
-        // by bare name instead would be O(1) but would collide two same-named sinks in
-        // different schemas onto one entry, leaving one of them permanently unregistered.
-        //
-        // The guard is dropped before the entry mutex is taken so no writer ever waits on
-        // that mutex while holding the map.
+        // Release the map guard before taking the entry mutex, so no writer holds the map
+        // while waiting.
         let Some((pending_key, entry)) = self
             .pending_sink_tables
             .read()
@@ -2242,17 +2226,13 @@ impl DataFusion {
             return Ok(());
         };
 
-        // Serialize the first-write registration on the entry: exactly one writer registers
-        // at a time, and every concurrent writer for the same table waits here until the
-        // provider is installed — then finds the slot empty and proceeds to a table lookup
-        // that succeeds, instead of failing with a missing-table error while the winner is
-        // still mid-registration.
+        // One writer registers at a time; the rest wait here and find the slot empty once
+        // the table exists, rather than looking it up mid-registration and failing.
         //
-        // The registration is borrowed from the slot, never moved out of it: the slot must
-        // stay occupied until the provider is actually installed, so that a registering
-        // writer cancelled mid-await (its request future dropped) leaves the claim in place
-        // for the next writer to retry — an emptied slot would read as "registration
-        // completed" and strand the dataset behind failing table lookups until a restart.
+        // Borrow the registration instead of taking it, so the slot stays filled until the
+        // provider is installed. If this writer is cancelled before that, the next writer
+        // still finds the entry and retries. An empty slot would instead look like a
+        // finished registration, and the dataset would stay unregistered until a restart.
         let mut slot = entry.lock().await;
         let Some(pending_registration) = slot.as_ref() else {
             // Another writer completed the registration while this one waited.
@@ -2285,29 +2265,27 @@ impl DataFusion {
 
         match registration {
             Ok(_) => {
-                // The provider is installed: empty the slot for the writers already waiting
-                // on it, and drop the entry so later writers take the fast path.
+                // The table exists now: empty the slot for the writers waiting on it, and
+                // drop the entry so later writers skip this path.
                 *slot = None;
                 self.pending_sink_tables.write().await.remove(&pending_key);
                 Ok(())
             }
-            // Registration failed; the claim never left the slot, so a later write (or a
-            // writer waiting on this slot) retries it rather than leaving the dataset
-            // unregistered.
+            // Registration failed. The entry is still in the slot, so the next write
+            // retries it.
             Err(e) => Err(e),
         }
     }
 
-    /// The per-dataset lock excluding write-time schema evolution + provider rebind
-    /// against in-flight writes (see `schema_evolve_locks`), get-or-created lazily.
+    /// The lock that keeps this dataset's writes from overlapping a schema evolution's
+    /// provider swap (see `schema_evolve_locks`), created on first use.
     ///
-    /// The map is keyed by the bare table name so every alias of a dataset shares one lock:
-    /// the OpenTelemetry ingest and the evolution path write to the bare name while a Flight
-    /// `DoPut` normalizes the same table to its fully-qualified path, and distinct keys
-    /// would let those writes overlap the rebind this lock exists to exclude. The bare name
-    /// is also stable before and after the dataset registers, unlike a normalized reference
-    /// (a bare name only resolves once the table exists). Two datasets sharing a table name
-    /// across schemas merely share a lock, which can only over-serialize, never under-lock.
+    /// Keyed by the bare table name, because the same dataset is written under different
+    /// names: the OpenTelemetry ingest and the evolution path use the bare name, a Flight
+    /// `DoPut` uses the fully-qualified one. Separate keys would give them separate locks
+    /// and let a write overlap the swap. The bare name also stays the same before and after
+    /// the dataset registers, which a qualified name does not. Two datasets with the same
+    /// table name in different schemas share a lock, which only costs some parallelism.
     async fn schema_evolve_lock(
         &self,
         table_reference: &TableReference,
@@ -2342,10 +2320,9 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
             .await?;
 
-        // Hold the rebind lock (shared) from provider lookup through insert completion: a
-        // batch inserted through a provider that write-time schema evolution concurrently
-        // replaces publishes into table state the replacement was not opened on, so the
-        // write reports success but its rows are invisible to the newly bound provider.
+        // Hold the lock (shared) from the provider lookup until the insert finishes. A write
+        // that completes through a provider being replaced by a schema evolution succeeds,
+        // but its rows are invisible to the new provider.
         let rebind_lock = self.schema_evolve_lock(table_reference).await;
         let rebind_guard = rebind_lock.read().await;
 
@@ -2405,7 +2382,7 @@ impl DataFusion {
                 })?;
         }
 
-        // The write is published; evolution may rebind the provider from here on.
+        // The write is done, so evolution is free to swap the provider now.
         drop(rebind_guard);
 
         // Queue the committed write for Drasi, when `runtime.drasi` names this
@@ -2489,11 +2466,8 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
 
-        // Hold the rebind lock (shared) from provider lookup through insert completion, as
-        // in `write_data`: rows published through a provider that write-time schema
-        // evolution concurrently replaces are invisible to the newly bound provider. A
-        // long-lived stream holds this for its whole duration, deferring evolution of this
-        // one dataset until the stream ends.
+        // Same lock as `write_data`, for the same reason. Note a long-running stream holds
+        // it until the stream ends, which delays schema evolution for this dataset.
         let rebind_lock = self.schema_evolve_lock(table_reference).await;
         let rebind_guard = rebind_lock.read().await;
 
@@ -2555,7 +2529,7 @@ impl DataFusion {
                 table_name: table_reference.to_string(),
             })?;
 
-        // The write is published; evolution may rebind the provider from here on.
+        // The write is done, so evolution is free to swap the provider now.
         drop(rebind_guard);
 
         // Invalidate cached query state for this table.
@@ -3825,20 +3799,18 @@ impl DataFusion {
             return Ok(None);
         }
 
-        // Serialize evolution + rebind for this dataset so concurrent writes can't race
-        // the ALTER and re-registration: exclusive here, shared in `write_data`/
-        // `write_streaming_data` (see `schema_evolve_locks`). Distinct datasets keep
-        // independent locks.
+        // Take the lock exclusively over the column add and the provider swap, so no write
+        // and no other evolution can overlap them. `write_data` and `write_streaming_data`
+        // take the same lock shared (see `schema_evolve_locks`).
         let lock = self.schema_evolve_lock(&dataset.name).await;
         let _guard = lock.write().await;
 
-        // Re-read the live provider schema *under the lock* so a serialized second export
-        // classifies against the first's already-applied evolution.
+        // Read the schema under the lock, so a second export that waited here sees the
+        // first export's new column.
         //
-        // A parked sink (a restart before the dataset's first write) has no registered
-        // provider yet; register it from the acceleration checkpoint so evolution runs
-        // against the live provider. Without this, the first export after a restart that
-        // also carries a new dimension fails this lookup and its data points are rejected.
+        // After a restart a sink dataset has no provider until its first write. Register it
+        // from the acceleration checkpoint first, or this lookup fails and an export that
+        // carries a new column is rejected.
         let provider = match self.get_table_provider(&dataset.name).await {
             Ok(provider) => provider,
             Err(lookup_error) => {
@@ -5660,11 +5632,9 @@ mod tests {
 
     use super::*;
 
-    /// Every alias of a dataset must resolve to the same rebind lock. The OpenTelemetry
-    /// ingest and the evolution path use the dataset's bare name, while a Flight `DoPut`
-    /// normalizes the same table to its fully-qualified path; separate locks would let those
-    /// writes overlap the provider rebind the lock exists to exclude, reproducing the
-    /// invisible-row race.
+    /// Every way of naming a dataset must give the same lock. The OpenTelemetry ingest uses
+    /// the bare name and a Flight `DoPut` uses the fully-qualified one; separate locks would
+    /// let one of those writes overlap a provider swap and lose its rows.
     #[tokio::test]
     async fn schema_evolve_lock_is_shared_across_table_reference_aliases() {
         let rt = RuntimeBuilder::new().build().await;

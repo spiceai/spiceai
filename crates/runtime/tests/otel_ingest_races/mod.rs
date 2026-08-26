@@ -21,24 +21,18 @@ limitations under the License.
 //!
 //! Four flows are covered:
 //!
-//! - **Concurrent first writes to a parked sink.** A sink dataset is registered on its first
-//!   write; exactly one concurrent writer claims that registration and every other writer
-//!   must wait for it to finish — not race ahead to a table lookup that fails with a
-//!   missing-table error while the winner is still mid-registration.
-//! - **Concurrent exports adding distinct new dimensions.** Each export evolves the table
-//!   and rebinds the provider; an export whose batch was built before another's rebind is
-//!   refused by the pre-insert schema check and must rebuild against the live schema and
-//!   retry, not drop its data points to the race.
-//! - **A restart whose first export carries a new dimension.** The sink is parked until its
-//!   first write, so write-time evolution must register it from the acceleration checkpoint
-//!   before it can widen the live provider.
-//! - **A first write addressing the sink through an alias of its name.** Registration must
-//!   resolve the parked dataset by the same alias rule that admitted the write, so a
-//!   qualified reference (as a Flight `DoPut` produces) registers it rather than leaving the
-//!   write to fail against the parked table.
+//! - **Concurrent first writes.** A sink dataset is registered by its first write. One
+//!   writer does that while the rest wait, instead of looking the table up before it exists
+//!   and failing.
+//! - **Concurrent exports adding different columns.** Adding a column replaces the table's
+//!   provider. An export whose batch predates that is rejected by the schema check, and must
+//!   rebuild and retry rather than lose its data points.
+//! - **A restart whose first export adds a column.** The dataset has no table until its
+//!   first write, so it must be registered from the acceleration checkpoint first.
+//! - **A first write that names the dataset differently.** A qualified name, as a Flight
+//!   `DoPut` produces, must still find and register the dataset.
 //!
-//! Every concurrent phase runs under a timeout so a deadlock on ingestion or registration
-//! fails the test instead of hanging it.
+//! Each concurrent phase has a timeout, so a deadlock fails the test instead of hanging it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,8 +61,8 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check},
 };
 
-/// The production OTLP metric dataset shape: a `sink` source with file-based Cayenne
-/// acceleration keyed on the data point time, evolving on new dimension columns.
+/// The dataset shape production OTLP metrics use: a `sink` source with Cayenne file
+/// acceleration, keyed on the data point time, that accepts new columns.
 fn make_dataset(metric: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
     let mut ds = Dataset::new(format!("sink:{metric}"), metric.to_string());
     ds.access = AccessMode::ReadWrite;
@@ -184,10 +178,9 @@ async fn row_count(rt: &Arc<Runtime>, metric: &str) -> Result<usize, anyhow::Err
     Ok(rows.iter().map(RecordBatch::num_rows).sum())
 }
 
-/// A sink dataset is parked until its first write registers the provider. Concurrent first
-/// writes race that registration: exactly one claims it, and each of the others must wait
-/// for the installed provider — a raced writer failing with a missing-table error rejects
-/// its data points. Also serves as a deadlock probe on the registration path (timeout).
+/// A sink dataset has no table until its first write creates one. Concurrent first writes
+/// race that: one does the work and the others must wait for it, or they fail with a
+/// missing-table error and lose their data points. The timeout also catches a deadlock here.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyhow::Error> {
@@ -242,9 +235,9 @@ async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyho
     Ok(())
 }
 
-/// Two exports racing to add distinct new dimensions: the loser's batch was built before the
-/// winner's provider rebind, so its write is refused by the pre-insert schema check. The
-/// ingest must rebuild against the live schema and retry so the data points land.
+/// Two exports each add a different column at once. The slower one built its batch before
+/// the other changed the table, so the schema check refuses it. It must rebuild against the
+/// current schema and retry so its data points still land.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), anyhow::Error> {
@@ -330,10 +323,9 @@ async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), 
     Ok(())
 }
 
-/// After a restart the sink dataset is parked until its first write. When that first write
-/// itself carries a new dimension, write-time evolution needs the live provider — so the
-/// parked sink must be registered from the acceleration checkpoint, not fail the lookup and
-/// reject the export.
+/// After a restart the dataset has no table until its first write. When that write also adds
+/// a column, the dataset must first be registered from the acceleration checkpoint, or the
+/// export is rejected.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow::Error> {
@@ -412,11 +404,9 @@ async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow:
     Ok(())
 }
 
-/// A writer may address a parked sink through any alias of its name — a Flight `DoPut`
-/// normalizes `foo` to `spice.public.foo` before writing, and the runtime admits that alias
-/// as writable. The first-write registration must resolve the parked dataset through the
-/// same alias rule, otherwise the write reports nothing to register and then fails against
-/// the still-unregistered table.
+/// A writer can name the dataset differently: a Flight `DoPut` turns `foo` into
+/// `spice.public.foo`, and the runtime accepts that as writable. Registration has to find the
+/// dataset by that name too, or the write fails against a table that was never registered.
 #[cfg(not(windows))]
 #[tokio::test]
 async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyhow::Error> {

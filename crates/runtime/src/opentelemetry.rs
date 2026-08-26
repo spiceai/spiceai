@@ -229,31 +229,26 @@ impl MetricsService for Service {
 
 /// Outcome of one attempt to build and write a metric's batch.
 enum MetricWriteOutcome {
-    /// The batch was written. `rejected` counts the metric's data points that could not be
-    /// represented in the batch (e.g. a data point whose value type conflicts with the
-    /// metric's established value column) and were therefore not written.
+    /// The batch was written. `rejected` counts data points the batch could not hold, such
+    /// as one whose value type differs from the metric's existing `value` column.
     Written { rejected: u64 },
     /// Nothing was written; every data point of the metric is rejected.
     Rejected,
-    /// The write was refused by the pre-insert schema check: the table schema changed
-    /// between the batch build and the write (a concurrent export evolved the table). No
-    /// rows were inserted, so rebuilding against the live schema and retrying is safe.
-    /// `built_against` is the stored schema the rejected batch was built from, so the retry
-    /// loop can tell a schema that evolved again (retry makes progress) from one that did
-    /// not (a rebuild would produce the same rejected batch).
+    /// The write was refused because the batch no longer matches the table: another export
+    /// added a column between this batch being built and written. Nothing was inserted, so
+    /// rebuilding and retrying is safe. `built_against` is the schema the rejected batch was
+    /// built from, which the retry loop compares to tell whether retrying can help.
     SchemaMismatch { built_against: Option<Schema> },
 }
 
-/// Backstop cap on write attempts for one metric of one export. Each retry after a
-/// pre-insert schema mismatch must observe a schema different from the one the failed
-/// attempt built against, so retries are naturally bounded by how many times concurrent
-/// exports evolve the table while this one is in flight; the cap only guards against a
-/// pathological writer evolving the schema on every attempt.
+/// Cap on write attempts for one metric of one export. Retries already stop as soon as the
+/// table schema stops changing, so this only bounds the rare case of a table that changes on
+/// every attempt.
 const MAX_METRIC_WRITE_ATTEMPTS: usize = 5;
 
-/// Whether a write error is [`verify_schema`](arrow_tools::schema::verify_schema) refusing
-/// the batch. That check runs before any row is inserted, so a caller may rebuild the batch
-/// against the live schema and retry the write without risking duplicate rows.
+/// Whether the write failed the schema check the runtime runs before inserting anything. No
+/// rows were written, so the caller can rebuild the batch and retry without duplicating
+/// rows.
 fn is_schema_mismatch_error(error: &QueryEngineError) -> bool {
     let QueryEngineError::WriteData { source, .. } = error else {
         return false;
@@ -269,16 +264,12 @@ fn is_schema_mismatch_error(error: &QueryEngineError) -> bool {
 impl Service {
     /// Ingests one metric of an export, returning how many of its data points were rejected.
     ///
-    /// A write refused by the pre-insert schema check is retried: the mismatch means the
-    /// table schema changed between this metric's batch build and its write (a concurrent
-    /// export for the same metric evolved the table with a new dimension), and since the
-    /// check rejects before any row is inserted, rebuilding the batch against the re-read
-    /// live schema and retrying is safe. Any number of concurrent exports can evolve the
-    /// table while this one is in flight, so a single retry is not enough — each retry
-    /// instead requires the schema to differ from the one the failed attempt built against.
-    /// Widening evolution only ever adds columns, so every such retry makes progress and the
-    /// loop terminates; a mismatch against an unchanged schema would rebuild the identical
-    /// rejected batch and gives up instead.
+    /// A write rejected by the schema check is retried, because another export adding a
+    /// column between this batch being built and written is a race, not bad data. Any number
+    /// of exports can add columns while this one is in flight, so one retry is not enough.
+    /// Instead, retry for as long as the schema keeps changing: evolution only adds columns,
+    /// so each retry gets closer, while an unchanged schema means a rebuild would produce
+    /// the same rejected batch and the export gives up.
     async fn ingest_metric(
         &self,
         metric: &str,
@@ -296,8 +287,7 @@ impl Service {
                 MetricWriteOutcome::Rejected => return data_points_count,
                 MetricWriteOutcome::SchemaMismatch { built_against } => {
                     if previous_schema.as_ref() == Some(&built_against) {
-                        // The schema did not change since the failed attempt, so a rebuild
-                        // would produce the same rejected batch.
+                        // Same schema as the last attempt, so a rebuild changes nothing.
                         tracing::warn!(
                             "Failed to write OpenTelemetry data for metric {metric}: the batch no longer matches the table, so its data points were rejected"
                         );
@@ -319,9 +309,8 @@ impl Service {
         data_points_count
     }
 
-    /// One attempt at ingesting a metric: build its batch against the current stored schema,
-    /// apply write-time schema evolution when the batch carries new dimension columns, and
-    /// write it.
+    /// One attempt at ingesting a metric: build its batch against the stored schema, add any
+    /// new columns the batch carries to the table, then write it.
     async fn try_write_metric(
         &self,
         metric: &str,
@@ -332,11 +321,10 @@ impl Service {
         let table_ref = TableReference::bare(metric.to_string());
         let existing_schema = match self.datafusion.get_arrow_schema(table_ref.clone()).await {
             Ok(schema) => Some(schema),
-            // The dataset is not yet registered (e.g. a `sink` dataset parked until its
-            // first write after a restart). Fall back to the acceleration checkpoint so a
-            // data point that omits a NULL dimension is still built against the stored
-            // (wide) schema, rather than a narrower batch the write rejects as a removed
-            // column.
+            // The dataset is not registered yet: a `sink` dataset has no table until its
+            // first write. Use the acceleration checkpoint instead, so the batch still gets
+            // every stored column. Building it without them makes it narrower than the
+            // table, and the write rejects it as having dropped columns.
             Err(_) => match self.runtime.as_ref().and_then(Weak::upgrade) {
                 Some(runtime) => runtime
                     .accelerated_checkpoint_schema(&table_ref)
@@ -369,11 +357,9 @@ impl Service {
             return MetricWriteOutcome::Rejected;
         }
 
-        // Pre-flight schema evolution: when this batch introduces new dimension columns
-        // beyond the stored schema, evolve the accelerator (per `on_schema_change`) BEFORE
-        // writing so the rebound provider accepts the wider batch. On `block`/`fail`, an
-        // unsupported engine, or an incompatible change this is a no-op and the write below
-        // rejects the batch as it does today.
+        // If this batch carries columns the table does not have, add them before writing, so
+        // the write accepts the wider batch. `on_schema_change` decides whether that is
+        // allowed; when it is not, this does nothing and the write rejects the batch.
         if let Some(existing) = existing_schema.as_ref() {
             let added = detect_added_columns(existing, record_batch.schema().as_ref());
             if !added.is_empty()
@@ -388,9 +374,8 @@ impl Service {
                             "OpenTelemetry export: evolved schema for metric {metric} (added dimension(s): {})",
                             added.join(", ")
                         );
-                        // Rebuild against the evolved schema so the batch matches the
-                        // rebound provider exactly by column set AND order (verify_schema
-                        // is exact-positional).
+                        // Rebuild against the new schema. The write compares columns by
+                        // position, so the batch must match it in order as well as by name.
                         match metric_data_to_record_batch(
                             metric,
                             data,
@@ -409,8 +394,7 @@ impl Service {
                         }
                     }
                     Ok(None) => {
-                        // Not evolved (block/fail/incompatible/unsupported); fall through
-                        // to the write, which rejects as today.
+                        // The columns were not added, so let the write reject the batch.
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -422,10 +406,9 @@ impl Service {
             }
         }
 
-        // A data point can be unrepresentable in the batch (e.g. its value type conflicts
-        // with the metric's established value column): the build skips it, so the batch is
-        // shorter than the metric's data-point count and the difference must be reported as
-        // rejected rather than silently counted as written.
+        // The build skips any data point the batch cannot hold, such as one whose value type
+        // differs from the metric's `value` column. Those points are missing from the batch,
+        // so count them as rejected instead of reporting them as written.
         let batch_rows = u64::try_from(record_batch.num_rows()).unwrap_or(u64::MAX);
         let skipped = data_points_count.saturating_sub(batch_rows);
         if skipped > 0 {
@@ -445,9 +428,8 @@ impl Service {
                     built_against: existing_schema,
                 };
             }
-            // Surface at warn: a failed write silently rejects data points, and the
-            // underlying accelerator/connector error is the only signal for why (e.g. a
-            // schema or type mismatch).
+            // Warn, not debug: this drops data points, and the underlying error is the only
+            // explanation the operator gets.
             tracing::warn!("Failed to write OpenTelemetry data for metric {metric}: {e}");
             return MetricWriteOutcome::Rejected;
         }
@@ -858,17 +840,15 @@ macro_rules! append_attribute {
     }};
 }
 
-/// Merges the export's resource attributes into each data point's own attributes.
+/// Merges the export's resource attributes into each data point's own attributes. Nothing is
+/// copied; both slices stay borrowed from the request.
 ///
-/// Both slices stay borrowed from the request, so merging copies no attribute. A key carried by
-/// both wins for the data point: its attribute is the more specific description of that
-/// measurement, and a resource attribute must never overwrite it.
+/// When a key appears in both, the data point's value wins, because it describes that one
+/// measurement rather than the whole process.
 ///
-/// The overridden keys are found through a set of the data point's keys rather than by scanning
-/// its attributes once per resource attribute, which would make a batch cost the product of the
-/// two attribute-list lengths — an OTLP request may carry long ones, and this conversion runs
-/// inline in `export`. The set is reused across rows, so a batch allocates one however many data
-/// points it carries.
+/// The data point's keys go into a set first, so a row costs the two attribute counts added
+/// rather than multiplied. Attribute lists can be long and this runs inline in `export`. The
+/// set is reused, so a batch allocates one no matter how many data points it has.
 struct ResourceAttributeMerger<'a> {
     resource_attrs: &'a [KeyValue],
     data_point_keys: HashSet<&'a str>,
@@ -941,10 +921,9 @@ fn attributes_to_fields_and_columns(
                 }
                 continue;
             }
-            // The OTLP spec requires attribute keys to be unique within one data point, but
-            // a client can still send duplicates. A duplicated key would append two values
-            // to that key's column for this row, desyncing the column lengths and failing
-            // the whole batch — keep the first occurrence, drop the rest.
+            // OTLP requires attribute keys to be unique within a data point, but a client can
+            // still send duplicates. Appending both values would give that column one row
+            // more than the others and fail the whole batch, so keep only the first.
             if !row_keys.insert(key_str) {
                 if warned_duplicates.insert(key_str) {
                     tracing::warn!(
@@ -2393,10 +2372,8 @@ mod tests {
         assert_eq!(column(&batch, "region").as_string::<i32>().value(0), "eu");
     }
 
-    /// The OTLP spec requires attribute keys to be unique within one data point, but a client
-    /// can still send duplicates. A duplicated key must not append two values to one row —
-    /// which desyncs the column lengths and fails the whole batch, dropping every data point
-    /// of the export — the first value wins and the rest are dropped.
+    /// A client can send the same attribute key twice on one data point. Appending both
+    /// values would fail the batch and drop the whole export, so the first value wins.
     #[test]
     fn duplicate_attribute_keys_on_one_data_point_keep_the_first_value() {
         let data = Data::Gauge(Gauge {
@@ -2493,8 +2470,8 @@ mod tests {
         assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "a");
     }
 
-    /// The override is per data point: a point that does not carry the key keeps the resource
-    /// attribute's value, even when another point of the same batch overrode it.
+    /// Each data point is handled on its own: one point overriding a resource attribute must
+    /// not change the value the other points in the batch get.
     #[test]
     fn resource_attribute_is_overridden_only_on_the_data_point_carrying_the_key() {
         let data = Data::Gauge(Gauge {
@@ -2513,8 +2490,8 @@ mod tests {
         assert_eq!(regions.value(1), "us");
     }
 
-    /// The export handler must thread the resource attributes of each resource metric group into
-    /// the batch it writes; without that, `service.instance.id` never reaches the metric table.
+    /// The export handler must pass each group's resource attributes through to the batch it
+    /// writes, or a column like `service.instance.id` never reaches the table.
     #[tokio::test]
     async fn export_writes_resource_attributes_as_columns() {
         let engine = Arc::new(WriteRecordingQueryEngine::new());
@@ -2541,17 +2518,16 @@ mod tests {
         assert_eq!(column(batch, "region").as_string::<i32>().value(0), "us");
     }
 
-    /// A data point whose value type conflicts with the metric's established value column is
-    /// skipped during the batch build. The client must see it in
-    /// `ExportMetricsPartialSuccess.rejected_data_points` — not be told the whole export was
-    /// written when part of it was silently dropped.
+    /// A data point whose value type differs from the metric's `value` column is skipped
+    /// while building the batch. The client must be told it was rejected, not that the whole
+    /// export was written.
     #[tokio::test]
     async fn data_points_skipped_during_the_batch_build_are_reported_as_rejected() {
         let engine = Arc::new(WriteRecordingQueryEngine::new());
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
-        // The first data point establishes Float64; the second's Int64 value conflicts with
-        // that and is skipped by the build.
+        // The first data point makes the column Float64, so the second one's Int64 value
+        // does not fit and is skipped.
         let data = Data::Gauge(Gauge {
             data_points: vec![
                 number_data_point(1.0, vec![string_attribute("region", "us")]),
@@ -2582,15 +2558,15 @@ mod tests {
 
     /// How a simulated write should fail (see [`SchemaEvolvingQueryEngine`]).
     enum WriteFailureMode {
-        /// The pre-insert schema check refused the batch: the error the runtime raises when a
-        /// concurrent export evolved the table between this export's build and its write.
+        /// The schema check refused the batch, as it does when another export added a column
+        /// while this one was in flight.
         SchemaMismatch,
         /// Any other write failure (no retry must happen for these).
         Generic,
     }
 
-    /// The exact error shape `DataFusion::write_data` produces when `verify_schema` refuses
-    /// the batch before inserting, as it crosses the [`QueryEngine`] boundary.
+    /// The error `write_data` returns when the schema check refuses a batch, in the exact
+    /// shape it reaches this module in.
     fn schema_mismatch_write_error(table_ref: &TableReference) -> QueryEngineError {
         let expected = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
         let actual = Schema::new(vec![
@@ -2607,10 +2583,9 @@ mod tests {
         }
     }
 
-    /// A [`QueryEngine`] that simulates a table evolving concurrently with an export: each
-    /// `get_arrow_schema` call serves the next schema of `schemas` (the last one repeats
-    /// once the sequence is exhausted), while the first `failing_writes` writes fail per
-    /// `failure_mode`.
+    /// A [`QueryEngine`] that acts like a table being changed by other exports. Each schema
+    /// read returns the next entry of `schemas`, repeating the last one, and the first
+    /// `failing_writes` writes fail as `failure_mode` says.
     struct SchemaEvolvingQueryEngine {
         session: Arc<SessionContext>,
         schemas: Vec<Schema>,
@@ -2742,11 +2717,9 @@ mod tests {
         Schema::new(fields)
     }
 
-    /// A write refused by the pre-insert schema check means the table evolved between this
-    /// export's batch build and its write (a concurrent export added a dimension). Nothing
-    /// was inserted, so the export must rebuild against the re-read live schema and retry —
-    /// landing the data points instead of dropping them to the race (regression test for the
-    /// concurrent-dimension-evolution write race).
+    /// A batch refused by the schema check means another export added a column while this
+    /// one was in flight. Nothing was inserted, so the export rebuilds against the current
+    /// schema and retries, rather than dropping its data points.
     #[tokio::test]
     async fn write_rejected_by_a_concurrent_evolution_is_retried_and_lands() {
         let engine = Arc::new(SchemaEvolvingQueryEngine::new(
@@ -2784,9 +2757,8 @@ mod tests {
         assert_eq!(column(batch, "region").as_string::<i32>().value(0), "us");
     }
 
-    /// Several concurrent exports can each add a dimension while this one is in flight, so a
-    /// single retry is not enough: each mismatch retry rebuilds against the re-read live
-    /// schema until the write lands (regression test for the multi-export evolution race).
+    /// Several exports can each add a column while this one is in flight, so one retry is
+    /// not enough. Each retry rebuilds against the current schema until the write lands.
     #[tokio::test]
     async fn writes_racing_repeated_evolutions_retry_until_they_land() {
         let engine = Arc::new(SchemaEvolvingQueryEngine::new(
@@ -2828,8 +2800,8 @@ mod tests {
         }
     }
 
-    /// A mismatch against a schema that did not change since the failed attempt would
-    /// rebuild the identical rejected batch, so the export gives up instead of spinning.
+    /// Once the schema stops changing, a rebuild would produce the same rejected batch, so
+    /// the export gives up rather than spinning.
     #[tokio::test]
     async fn write_schema_mismatch_gives_up_when_the_schema_stops_changing() {
         let engine = Arc::new(SchemaEvolvingQueryEngine::new(
@@ -2852,8 +2824,7 @@ mod tests {
         );
     }
 
-    /// A pathological writer that evolves the schema on every attempt must not retry
-    /// forever: the attempt cap bounds the loop.
+    /// A table whose schema changes on every attempt must still stop retrying, at the cap.
     #[tokio::test]
     async fn runaway_schema_churn_is_bounded_by_the_attempt_cap() {
         let dimensions = ["d1", "d2", "d3", "d4", "d5"];
@@ -2883,8 +2854,8 @@ mod tests {
         );
     }
 
-    /// Only the pre-insert schema check is safe to retry (it rejects before inserting any
-    /// row); any other write failure could have landed rows, so it must not be retried.
+    /// Only the schema check is safe to retry, because it rejects before inserting anything.
+    /// Any other failure may have written rows already, so retrying could duplicate them.
     #[tokio::test]
     async fn non_schema_write_failures_are_not_retried() {
         let engine = Arc::new(SchemaEvolvingQueryEngine::new(
