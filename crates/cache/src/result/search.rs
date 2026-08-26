@@ -49,8 +49,9 @@ impl CachedAggregationResult {
         matches: HashMap<String, Vec<String>>,
         schema: SchemaRef,
     ) -> Self {
+        let prepared = crate::result::prepare_for_storage(records, Arc::clone(&schema));
         Self {
-            records: Arc::new(crate::result::compact_for_storage(records)),
+            records: Arc::new(prepared.batches),
             primary_keys,
             data_columns,
             matches,

@@ -69,6 +69,11 @@ pub struct CachedQueryResult {
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
+    /// Whether this entry is the one holding [`Self::schema`] alive.
+    ///
+    /// Set by [`crate::result::prepare_for_storage`]; drives whether
+    /// [`Self::memory_size`] charges the schema. See that method.
+    schema_owned: bool,
 }
 
 impl CachedQueryResult {
@@ -84,13 +89,15 @@ impl CachedQueryResult {
         cached_at: Instant,
         read_started_at: Instant,
     ) -> Self {
+        let prepared = super::prepare_for_storage(batches, schema);
         Self {
-            data: CachedData::Raw(Arc::new(super::compact_for_storage(batches))),
-            schema,
+            data: CachedData::Raw(Arc::new(prepared.batches)),
+            schema: prepared.schema,
             input_tables,
             cached_at,
             read_started_at,
             encoder: None,
+            schema_owned: prepared.schema_owned,
         }
     }
 
@@ -104,13 +111,16 @@ impl CachedQueryResult {
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
+        // No batches to compact, but the entry's own schema is still shared.
+        let prepared = super::prepare_schema(schema);
         Self {
             data: CachedData::Encoded(encoded_data),
-            schema,
+            schema: prepared.schema,
             input_tables,
             cached_at,
             read_started_at,
             encoder,
+            schema_owned: prepared.schema_owned,
         }
     }
 
@@ -131,21 +141,35 @@ impl CachedQueryResult {
         read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
-        // Only store encoded data if an encoder is provided
-        let data = if let Some(encoder) = encoder.as_ref() {
+        // Only store encoded data if an encoder is provided. Compaction is
+        // skipped on that path: serialization writes only the rows a batch
+        // holds, so there is nothing for it to reclaim.
+        let (data, prepared) = if let Some(encoder) = encoder.as_ref() {
             let encoded_data = encoder.encode(&records).await?;
-            CachedData::Encoded(Bytes::from(encoded_data))
+            (
+                CachedData::Encoded(Bytes::from(encoded_data)),
+                super::prepare_schema(schema),
+            )
         } else {
-            CachedData::Raw(Arc::new(super::compact_for_storage(records)))
+            let prepared = super::prepare_for_storage(records, schema);
+            (
+                CachedData::Raw(Arc::new(prepared.batches)),
+                super::Prepared {
+                    batches: Vec::new(),
+                    schema: prepared.schema,
+                    schema_owned: prepared.schema_owned,
+                },
+            )
         };
 
         Ok(Self {
             data,
-            schema,
+            schema: prepared.schema,
             input_tables,
             cached_at,
             read_started_at,
             encoder,
+            schema_owned: prepared.schema_owned,
         })
     }
 
@@ -204,7 +228,20 @@ impl CachedQueryResult {
             }
         }
 
-        size += ARC_HEADER_BYTES + schema_size(&self.schema);
+        // Charged only by the entry that holds this schema alive. Interning
+        // gives every entry of a shape one shared allocation, so charging each
+        // of them would bill a 200-column schema once per entry pointing at it
+        // — which is what made a 0-row result over a wide table weigh ~26 KB of
+        // schema against 644 bytes of everything else, and what spent the
+        // budget on duplicate schemas instead of on results.
+        //
+        // Charging the owner keeps the total honest either way: one charge per
+        // *distinct* schema however many entries share it, and — when nothing
+        // shares, because every shape is different — a charge for every entry,
+        // exactly as before interning existed.
+        if self.schema_owned {
+            size += ARC_HEADER_BYTES + schema_size(&self.schema);
+        }
         size += ARC_HEADER_BYTES + table_refs_size(&self.input_tables);
         size += ENTRY_OVERHEAD_BYTES;
 
@@ -309,6 +346,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use std::collections::HashMap;
 
     #[test]
     fn test_memory_size_raw_batches() {
@@ -360,7 +398,14 @@ mod tests {
             + 2 * std::mem::size_of::<RecordBatch>() as u64
             + batch1.get_array_memory_size() as u64
             + batch2.get_array_memory_size() as u64
-            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&schema)) as u64
+            + if cached_result.schema_owned {
+                (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&schema)) as u64
+            } else {
+                // Another entry of this shape already owns the schema; see
+                // `memory_size`. Kept conditional so the assertion does not
+                // depend on what the process-wide pool has already seen.
+                0
+            }
             + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::table_refs_size(&input_tables))
                 as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
@@ -399,8 +444,12 @@ mod tests {
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
             + encoded_data.len() as u64
-            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&cached_result.schema))
-                as u64
+            + if cached_result.schema_owned {
+                (crate::sizing::ARC_HEADER_BYTES
+                    + crate::sizing::schema_size(&cached_result.schema)) as u64
+            } else {
+                0
+            }
             + (crate::sizing::ARC_HEADER_BYTES
                 + crate::sizing::table_refs_size(&cached_result.input_tables)) as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
@@ -412,12 +461,22 @@ mod tests {
         );
     }
 
-    fn empty_result_of_width(columns: usize) -> CachedQueryResult {
-        let schema = Arc::new(Schema::new(
-            (0..columns)
-                .map(|i| Field::new(format!("column_{i}"), DataType::Int64, true))
-                .collect::<Vec<_>>(),
-        ));
+    /// A 0-row entry over a `columns`-wide schema.
+    ///
+    /// `shape` is stamped into the schema's metadata so each test gets a schema
+    /// of its own. The pool is process-wide, and only the *first* entry of a
+    /// shape is charged for it, so two tests sharing a shape would race for
+    /// that charge and whichever ran second would see a 644-byte entry where it
+    /// expected a wide one. Distinct shapes make each test deterministic.
+    fn empty_result_of_width(columns: usize, shape: &str) -> CachedQueryResult {
+        let schema = Arc::new(
+            Schema::new(
+                (0..columns)
+                    .map(|i| Field::new(format!("column_{i}"), DataType::Int64, true))
+                    .collect::<Vec<_>>(),
+            )
+            .with_metadata(HashMap::from([("shape".to_string(), shape.to_string())])),
+        );
         let cached_at = Instant::now();
 
         CachedQueryResult::new_raw(
@@ -437,8 +496,8 @@ mod tests {
     /// with what the entry actually holds.
     #[test]
     fn an_empty_result_is_billed_more_than_its_struct() {
-        let narrow = empty_result_of_width(4);
-        let wide = empty_result_of_width(200);
+        let narrow = empty_result_of_width(4, "billed-more-narrow");
+        let wide = empty_result_of_width(200, "billed-more-wide");
         let struct_only = std::mem::size_of::<CachedQueryResult>() as u64;
 
         assert!(
@@ -454,12 +513,71 @@ mod tests {
         );
     }
 
+    /// Interning gives every entry of a shape one schema, so only the entry
+    /// that put it there is charged. Charging all of them is what made a 0-row
+    /// result over a wide table weigh tens of KB of schema against a few
+    /// hundred bytes of everything else.
+    #[test]
+    fn only_the_first_entry_of_a_shape_is_charged_for_its_schema() {
+        let first = empty_result_of_width(200, "one-charge");
+        let second = empty_result_of_width(200, "one-charge");
+        let third = empty_result_of_width(200, "one-charge");
+
+        assert!(
+            Arc::ptr_eq(&first.schema, &second.schema),
+            "entries of one shape must share a schema allocation"
+        );
+        assert!(first.schema_owned, "the first entry holds the schema alive");
+        assert!(!second.schema_owned, "later entries only point at it");
+
+        let schema_charge =
+            (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&first.schema)) as u64;
+        assert!(
+            schema_charge > 10_000,
+            "precondition: a 200-column schema is a large charge, got {schema_charge}"
+        );
+        assert_eq!(
+            first.memory_size() - second.memory_size(),
+            schema_charge,
+            "the difference between owner and sharer is exactly the schema"
+        );
+        assert_eq!(
+            second.memory_size(),
+            third.memory_size(),
+            "every sharer is billed alike"
+        );
+    }
+
+    /// The counterpart, and the case that keeps `max_size` meaningful: when
+    /// every entry has a shape of its own, nothing is shared and every entry is
+    /// charged — exactly as it was before interning existed.
+    #[test]
+    fn an_entry_with_a_shape_of_its_own_is_charged_in_full() {
+        let entries: Vec<CachedQueryResult> = (0..4)
+            .map(|i| empty_result_of_width(200, &format!("own-shape-{i}")))
+            .collect();
+
+        for (i, entry) in entries.iter().enumerate() {
+            assert!(
+                entry.schema_owned,
+                "entry {i} has a shape no other entry holds, so it owns it"
+            );
+            let schema_charge = (crate::sizing::ARC_HEADER_BYTES
+                + crate::sizing::schema_size(&entry.schema)) as u64;
+            assert!(
+                entry.memory_size() > schema_charge,
+                "entry {i} must be billed its schema, got {} against a {schema_charge}-byte schema",
+                entry.memory_size()
+            );
+        }
+    }
+
     /// The bound `max_size` is meant to be: N entries of a known weight must not
     /// fit in a budget smaller than N times that weight. Before the fix a
     /// 1 MiB budget admitted 12,840 wide 0-row entries — ~500 MiB of real memory.
     #[test]
     fn a_byte_budget_bounds_a_stream_of_empty_results() {
-        let entry_weight = empty_result_of_width(200).memory_size();
+        let entry_weight = empty_result_of_width(200, "budget-bound").memory_size();
         let budget = 1024 * 1024_u64;
 
         let admissible = budget / entry_weight;

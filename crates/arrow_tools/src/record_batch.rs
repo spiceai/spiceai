@@ -743,10 +743,39 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
 /// *before* paying for it.
 #[must_use]
 pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
+    compact_retained_buffers_as(batch, batch.schema())
+}
+
+/// [`compact_retained_buffers`], writing the compacted batch under `schema`
+/// rather than the one `batch` arrived with.
+///
+/// For a caller that is about to retain the batch *and* wants it to share a
+/// schema allocation with its neighbours — see [`crate::schema_intern`] — this
+/// is strictly cheaper than doing the two separately: compaction already
+/// rebuilds the batch, so the shared schema goes into that rebuild instead of
+/// costing a second pass and another `RecordBatch` to carry it.
+///
+/// `schema` must describe the same columns `batch` holds; it is intended for a
+/// schema that is equal to the batch's own and differs only in identity. A
+/// schema the batch cannot be read under is rejected by the rebuild, and the
+/// batch is returned untouched rather than lost.
+#[must_use]
+pub fn compact_retained_buffers_as(batch: &RecordBatch, schema: SchemaRef) -> RecordBatch {
     let (plan, total_reclaimable) = compaction_plan(batch);
 
     if total_reclaimable == 0 {
-        return batch.clone();
+        if Arc::ptr_eq(batch.schema_ref(), &schema) {
+            return batch.clone();
+        }
+        // Nothing to reclaim, but the caller still wants the batch under
+        // `schema`; `with_schema` re-labels without touching a column.
+        return match batch.clone().with_schema(schema) {
+            Ok(relabelled) => relabelled,
+            Err(e) => {
+                tracing::warn!("Failed to re-label a record batch, keeping it as read: {e}");
+                batch.clone()
+            }
+        };
     }
 
     tracing::trace!(
@@ -770,7 +799,7 @@ pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
 
     // The row count is carried explicitly so a batch with no columns keeps it.
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    match RecordBatch::try_new_with_options(batch.schema(), columns, &options) {
+    match RecordBatch::try_new_with_options(schema, columns, &options) {
         Ok(compacted) => compacted,
         Err(e) => {
             // Compaction preserves every column's type and length, so this is

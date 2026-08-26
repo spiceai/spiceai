@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 arrow-cast.workspace = true
 # `serde` for the schema JSON encoding in `schema::schema_to_json`, which is a
@@ -17,6 +18,7 @@ arrow-cast.workspace = true
 # elsewhere in the graph.
 arrow-schema = { workspace = true, features = ["serde"] }
 base64 = "0.22.1"
+parking_lot.workspace = true
 snafu.workspace = true
 datafusion.workspace = true
 serde_json.workspace = true
