@@ -321,7 +321,7 @@ async fn install(
                 &ctx.spiced_path(),
             ),
         })?
-        .path;
+        .into_path();
     // Propagated, not defaulted: the manifest records the version installed, so
     // a lookup that failed has to fail the install rather than publish a
     // manifest that claims no version at all.

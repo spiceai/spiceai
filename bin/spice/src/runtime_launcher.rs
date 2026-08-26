@@ -124,7 +124,7 @@ pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()>
 /// symptoms surface much later as unexplained behaviour. The expected default
 /// stays at `debug` rather than adding a line to every ordinary `spice run`.
 fn report_resolved_runtime(resolved: &ResolvedSpiced) {
-    let path = resolved.path.display();
+    let path = resolved.path().display();
     let source = resolved.source.describe();
     if resolved.source.is_expected_default() {
         tracing::debug!("Using the Spice.ai runtime at '{path}' ({source}).");

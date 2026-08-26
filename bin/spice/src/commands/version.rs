@@ -191,7 +191,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     // install when what they have is a broken one.
     let runtime = resolved
         .as_ref()
-        .map(|found| crate::context::runtime_version_at(&found.path));
+        .map(|found| crate::context::runtime_version_at(found.path()));
 
     match args.output {
         OutputFormat::Table => {
@@ -207,7 +207,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
                 if let Some(resolved) = &resolved {
                     println!(
                         "Runtime path:    {} ({})",
-                        resolved.path.display(),
+                        resolved.path().display(),
                         resolved.source.describe()
                     );
                 }
@@ -220,7 +220,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
                 // located runtime that could not be asked reports null here and
                 // is told apart by `runtime_path`, which is populated.
                 "runtime": runtime.as_ref().and_then(|version| version.as_deref().ok()),
-                "runtime_path": resolved.as_ref().map(|found| found.path.display().to_string()),
+                "runtime_path": resolved.as_ref().map(|found| found.path().display().to_string()),
                 // The enum, not `describe()`: that phrasing is prose for a
                 // human, and rewording it must not change a machine schema.
                 "runtime_source": resolved.as_ref().map(|found| found.source),
