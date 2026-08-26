@@ -241,12 +241,11 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
                 );
             }
 
-            // The same timezone-dropping cast in a user query, over the same
-            // Vortex files. The mark is the last round's first instant, so
-            // exactly that round's rows sit above it. Arrow holds a
-            // timezone-aware timestamp as epoch-relative, so dropping the zone
-            // re-labels the instant without moving it and the comparison is
-            // unchanged.
+            // The counts above check how many rows landed; this checks which ones.
+            // The mark is the last round's first instant, so exactly that round's
+            // rows sit above it. Arrow holds a timezone-aware timestamp as
+            // epoch-relative, so dropping the zone re-labels the instant without
+            // moving it.
             let mark = chrono::DateTime::from_timestamp_nanos(
                 BASE_NANOS + ROWS_PER_ROUND * ROUNDS * STEP_NANOS,
             )
@@ -261,7 +260,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column()
                 )
                 .await?,
                 ROWS_PER_ROUND,
-                "rows past the last round's first instant, read through a timezone-dropping cast"
+                "the last round's rows must be the ones above the mark"
             );
 
             Ok(())
