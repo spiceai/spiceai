@@ -1273,7 +1273,17 @@ impl HttpTableProvider {
             // That final attempt exists only to turn an exhausted retry into a row. Under
             // `error` there is no row to make, so it would spend one more request on an
             // origin that has already failed and arrive at this same error regardless.
-            Err(err) if self.error_response_action == ErrorResponseAction::Error => Err(err),
+            //
+            // Only when the ladder ended on a *status*, though. A ladder exhausted by a
+            // network error, a rate-control acquisition failure or a body read that broke
+            // mid-stream is a different case: the extra attempt is a real recovery chance
+            // that has nothing to do with this action, and if it does answer non-2xx the
+            // check in `perform_single_request` refuses it there.
+            Err(err @ Error::ErrorResponse { .. })
+                if self.error_response_action == ErrorResponseAction::Error =>
+            {
+                Err(err)
+            }
             Err(_) => {
                 tracing::debug!(
                     "Retries exhausted for {}, making final attempt accepting any status",
@@ -6442,6 +6452,58 @@ mod tests {
             request_count.load(Ordering::SeqCst),
             1,
             "refusing must not cost a second request"
+        );
+    }
+
+    /// Accept, count, and drop the connection without answering — a transient failure
+    /// that is not a status, which is what separates the two arms of the shortcut.
+    async fn start_hangup_server() -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn refusing_a_status_does_not_cost_a_network_failure_its_last_attempt() {
+        use std::sync::atomic::Ordering;
+
+        // The shortcut that skips the post-ladder attempt is about there being no row to
+        // make. A ladder exhausted by a network error is not that case, and it kept its
+        // extra attempt before `on_error_response` existed.
+        let (base_url, request_count) = start_hangup_server().await;
+
+        let _ = scan_status_dataset(base_url, ErrorResponseAction::Error).await;
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "a ladder exhausted by a network error keeps its post-ladder attempt"
         );
     }
 
