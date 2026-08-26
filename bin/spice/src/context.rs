@@ -480,8 +480,8 @@ impl RuntimeContext {
     ///
     /// Deliberately *not* "is a runtime available": `spice install` and
     /// `spice upgrade` own [`Self::spiced_path`] and nothing else, so asking
-    /// the whole ladder would let a `spiced` on `PATH` convince them their own
-    /// directory is already up to date. What will *run* is
+    /// the whole ladder would let a pinned `spiced`, or one beside the CLI,
+    /// convince them their own directory is already up to date. What will *run* is
     /// [`Self::resolve_spiced`]; the two are different questions and this is
     /// the one a writer of the managed install must ask.
     #[must_use]
@@ -807,7 +807,7 @@ impl RuntimeContext {
 /// [`RuntimeContext::resolve_spiced`] will start.
 ///
 /// `spice install` and `spice upgrade` only ever write to `$HOME/.spice/bin`,
-/// but a `spiced` beside the CLI, on `PATH`, or pinned outranks it — so an
+/// but a `spiced` beside the CLI or pinned by `SPICED_PATH` outranks it — so an
 /// upgrade can report success while every later `spice run` keeps starting the
 /// old binary. The same silence hides the other two ways the install fails to
 /// take effect: resolution erroring, and the written file failing the runnable
@@ -1060,8 +1060,9 @@ impl ResolvedSpiced {
 /// The host facts [`resolve_spiced`] reads.
 ///
 /// Injected rather than read inline so the ladder is testable: a developer
-/// machine with `spiced` on `PATH`, or a suite running under `sudo`, would
-/// otherwise decide the outcome of every test of the ordering.
+/// machine with a `SPICED_PATH` pin, a `spiced` beside the test binary, or a
+/// suite running under `sudo` would otherwise decide the outcome of every test
+/// of the ordering.
 struct SpicedLookup<'a> {
     /// `$SPICED_PATH`, as read from the environment.
     pinned: Option<OsString>,
@@ -1688,8 +1689,9 @@ mod tests {
     /// paths that name a binary, and nothing else exists.
     ///
     /// Every rung is injected, so these tests describe the ladder and not the
-    /// machine they run on — a developer with `spiced` on `PATH`, or a suite
-    /// running under `sudo`, would otherwise decide the outcome.
+    /// machine they run on — a `SPICED_PATH` pin, a `spiced` beside the test
+    /// binary, or a suite running under `sudo` would otherwise decide the
+    /// outcome.
     fn ladder(
         env: &[(&str, &str)],
         current_exe: Option<&str>,

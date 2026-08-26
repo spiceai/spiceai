@@ -63,8 +63,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
 
     // Get current runtime version if installed
     // The managed install specifically: `spice upgrade` replaces that one file,
-    // so a `spiced` beside the CLI or on `PATH` must not decide whether it has
-    // work to do — see `RuntimeContext::managed_runtime_version`.
+    // so a `spiced` beside the CLI, or one pinned by `SPICED_PATH`, must not
+    // decide whether it has work to do — see
+    // `RuntimeContext::managed_runtime_version`.
     let current_runtime_version = ctx.managed_runtime_version().ok();
     if let Some(ref runtime_version) = current_runtime_version {
         tracing::info!("Current runtime version: {runtime_version}");

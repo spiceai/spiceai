@@ -37,8 +37,10 @@ const VERSION_CACHE_DURATION: Duration = Duration::from_hours(24); // 24 hours
 whether a newer release is available on GitHub.
 
 The runtime reported is the one that will run, which need not be the one
-'spice install' wrote: a 'SPICED_PATH' pin, a 'spiced' beside the CLI, and a
-'spiced' on 'PATH' all take precedence over the managed install.
+'spice install' wrote: a 'SPICED_PATH' pin and a 'spiced' beside the CLI both
+take precedence over the managed install. 'PATH' is never searched for a
+runtime, because the environment that supplies it is not always the account
+the runtime would run as.
 
 The latest-version check is cached for 24 hours. Use `--cli-only` to skip the
 runtime version lookup, and `-o json` for machine-readable output.

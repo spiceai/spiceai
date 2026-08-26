@@ -490,10 +490,10 @@ mod tests {
         ///
         /// Handing back the resolution is what keeps these tests hermetic: the
         /// stub only ever occupies the context's managed install directory, and
-        /// the ladder ranks a `SPICED_PATH` pin, a `spiced` beside the test
-        /// executable, and a `spiced` on `PATH` above it. Any of those on the
-        /// machine running the suite would otherwise be launched instead — and
-        /// a real runtime does not exit, so the failure is a hang.
+        /// the ladder ranks a `SPICED_PATH` pin and a `spiced` beside the test
+        /// executable above it. Either of those on the machine running the
+        /// suite would otherwise be launched instead — and a real runtime does
+        /// not exit, so the failure is a hang.
         fn context_with_stub_runtime(
             bin_dir: &std::path::Path,
             script: &str,
