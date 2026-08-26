@@ -1354,10 +1354,16 @@ impl<'a> AppendMutationWriter<'a> {
                 let live_rows_delta = i64::try_from(buffer.total_rows())
                     .unwrap_or(i64::MAX)
                     .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+                // `write_cdc_pipelined` reaches this inline commit without consulting
+                // `InlineMutationPolicy`, so unlike the staged path it can land here on
+                // a table that has retention delete filters — and an inlined outcome
+                // returns `CayenneCdcWrite::completed`, whose `finish` schedules
+                // nothing. This is the only place on that route that can arm the
+                // retention the header comment above promises the scheduler picks up.
                 self.table.schedule_post_write_maintenance(
                     Some(Arc::new(stats_acc)),
                     false,
-                    false,
+                    self.table.has_retention_delete_filters(),
                     live_rows_delta,
                 );
 

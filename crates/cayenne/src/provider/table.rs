@@ -21097,22 +21097,51 @@ impl CayenneTableProvider {
     /// scan — same exclusion guarantee the inline-retention path used to
     /// provide, just held inside the sink rather than the writer.
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
-        use data_components::delete::DeletionSink;
-
         if self.retention_filters.is_empty() {
             return Ok(0);
         }
 
-        // The sink below scans this table's Vortex files, so rows still sitting in the
-        // metastore's inline tier are invisible to it: an overwrite admits its whole
-        // payload there whenever it fits (`try_admit_overwrite_inline`), which would
-        // otherwise leave a small full-refresh table with nothing for retention to
-        // match. Materialize them first, the same way `delete_from` does for a user
-        // DELETE. The guard is scoped so it is released before the sink takes the same
-        // (non-reentrant) lock, and `cached_inlined_row_count` makes this a no-op for a
-        // table with nothing inlined.
-        {
-            let _guard = self.write_lock.lock().await;
+        // The sink below scans this table's Vortex files, so rows in the metastore's
+        // inline tier are invisible to it. Most producers cannot leave any on a
+        // retention table — `inline_overwrite_admissible` and
+        // `InlineMutationPolicy::from_blocking_conditions` both refuse outright — but
+        // the pipelined CDC path inlines without consulting either, and a corpus can
+        // also predate the `retention_sql` added to an existing dataset. Materialize
+        // whatever is there, the same way `delete_from` does for a user DELETE. The row
+        // count is a relaxed atomic, so the common case of nothing inlined costs a load
+        // and never queues for the exclusive lock the sink is about to take.
+        if self.cached_inlined_row_count() > 0 {
+            let guard = self.write_lock.lock().await;
+            // Defer while a staged inline-conflict tombstone is unpublished (Option D)
+            // or a staged append is mid-finalization, exactly as `sort_and_rewrite_data`
+            // and `checkpoint_inlined_data_if_memtable_pressure_exceeded` do. The
+            // checkpoint below flushes inline rows to a file WITHOUT applying an inert
+            // (`published = false`) tombstone and then clears every tombstone, so
+            // running it inside that window writes the old row to a file AND drops the
+            // tombstone — resurfacing that row as a duplicate once the replacement
+            // publishes. Those two guard the same counter because they can reach a table
+            // holding one; retention can now too, since the pipelined CDC path inlines
+            // without consulting `InlineMutationPolicy`. A mem-tier seal shadow is
+            // refused for a different reason — it is a durable inline row deliberately
+            // held above the watermark while its rows are still live in RAM, so
+            // materializing it would serve them twice, which is why
+            // `inline_overwrite_admissible` refuses on the same flag. The flags are set
+            // under this lock, so taking it first makes the check race-free rather than
+            // advisory.
+            // Deferring costs only latency: the in-flight finalize publishes within
+            // milliseconds, and re-arming brings the loop back on the next debounce.
+            if self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+                || self.mem_tier_shadow_present.load(Ordering::Acquire)
+                || self.has_inflight_staging_appends()
+            {
+                drop(guard);
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    "Deferring retention: a staged inline-conflict tombstone, a mem-tier seal shadow, or append finalization is in flight"
+                );
+                self.post_write_maintenance.state.lock().retention_requested = true;
+                return Ok(0);
+            }
             self.checkpoint_inlined_data_if_present_for_delete()
                 .await
                 .map_err(|err| CatalogError::InvalidOperation {
@@ -21124,17 +21153,6 @@ impl CayenneTableProvider {
         }
 
         self.mark_maintained_aggregates_stale();
-
-        // Nothing on this path re-derives `num_rows` from the rows retention is about
-        // to remove, and the caller may have just `Set` an authoritative count (an
-        // overwrite re-baselines one, and re-baselining restores exactness), so leaving
-        // the flag alone would let a distributed `COUNT(*)` fold a count that is high by
-        // exactly what retention deletes. Taint BEFORE the durable delete, for the same
-        // reason `RowCountExactnessTaintingDeletionSink` does on a user `DELETE`: a
-        // delete that removes nothing, errors, or is cancelled then costs only the
-        // metadata fast path, whereas tainting afterwards leaves a window in which the
-        // tombstone is durable and the flag still claims the stale count is live.
-        self.taint_persisted_row_count_exactness().await;
 
         let filters = self.retention_filters.clone();
         let sink = CayenneDeletionSink::new(
@@ -21152,6 +21170,13 @@ impl CayenneTableProvider {
             Some(Arc::clone(&self.write_lock)),
             Arc::clone(&self.seq_allocator),
         );
+        // Nothing on this path re-derives `num_rows` from the rows about to be removed,
+        // and a caller may have just `Set` an authoritative count (an overwrite
+        // re-baselines one, and that restores exactness), so an untainted flag would let
+        // a distributed `COUNT(*)` fold a count high by exactly what retention deletes.
+        // The wrapper is the same one every `delete_from` arm composes, and taints
+        // before the durable delete for the reason documented on it.
+        let sink = self.taint_row_count_exactness(Arc::new(sink));
 
         let deleted_count = sink
             .delete_from(Arc::new(datafusion_execution::TaskContext::default()))
@@ -26233,6 +26258,18 @@ impl CayenneTableProvider {
         // the runtime it may advance the source slot to cover this epoch.
         self.fire_slot_advancer(flushed_epoch).await;
 
+        // Arm retention over what this checkpoint just made durable. `cdc_durability`
+        // defaults to `memory` on the CDC profile, and those writes return from
+        // `write_cdc_in_memory` before reaching any of the durable publish paths that
+        // arm retention — so without this a `retention_sql` / `retention_period` on the
+        // common CDC configuration would never run at all. Rows still resident in RAM
+        // stay out of reach of the deletion sink, which reads this table's Vortex files,
+        // so retention applies to each epoch as it lands: the same eventual guarantee
+        // the append path gives, one checkpoint behind.
+        if self.has_retention_delete_filters() {
+            self.schedule_post_write_maintenance(None, false, true, 0);
+        }
+
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
 
@@ -27356,13 +27393,18 @@ impl CayenneTableProvider {
     /// Unlike `checkpoint_inlined_data_if_memtable_pressure_exceeded`, this does
     /// NOT defer on `pending_inline_tombstones`, and is safe to do so by MUTUAL
     /// EXCLUSIVITY rather than locking (the staged-tombstone finalize runs
-    /// WITHOUT `write_lock`, so the lock is not what protects it): both callers
-    /// — the file-based retention delete (gated by `file_based_deletes_preferred`,
-    /// which requires a `time_retention_filter_builder`, i.e.
-    /// `has_retention_delete_filters()`, which BLOCKS inline upserts in
-    /// `mutation_writer::write_all_append`) and the position-based delete (whose
-    /// tables don't support upserts) — cannot coexist with a staged inline-
-    /// conflict tombstone on the same table.
+    /// WITHOUT `write_lock`, so the lock is not what protects it): the two DELETE
+    /// callers — the file-based retention delete (gated by
+    /// `file_based_deletes_preferred`, which requires a `time_retention_filter_builder`,
+    /// i.e. `has_retention_delete_filters()`, which BLOCKS inline upserts in
+    /// `mutation_writer::write_all_append`) and the position-based delete (whose tables
+    /// don't support upserts) — cannot coexist with a staged inline-conflict tombstone
+    /// on the same table.
+    ///
+    /// That argument does NOT extend to the third caller, the background retention pass
+    /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
+    /// `InlineMutationPolicy`, so its table can hold one. That caller checks
+    /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
         let inlined_count = self.cached_inlined_row_count();
 

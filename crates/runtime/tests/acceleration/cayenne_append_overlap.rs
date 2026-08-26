@@ -33,7 +33,6 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampNanosecondArra
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -41,7 +40,8 @@ use spicepod::{
     param::Params,
 };
 
-use crate::utils::{run_query, runtime_ready_check, test_request_context, wait_until_true};
+use crate::acceleration::{count, has_vortex_file, row_count, trigger_refresh};
+use crate::utils::{runtime_ready_check, test_request_context, wait_until_true};
 
 /// The accelerated table under test.
 const TABLE: &str = "cayenne_append_overlap_it";
@@ -65,7 +65,7 @@ const OVERLAP_ROWS: i64 = 30;
 /// timestamp. `LATE_OFFSET` sits inside the overlap window but below the mark the
 /// initial load left, so only the overlap can bring it in.
 const LATE_ID: i64 = 1_000;
-const LATE_OFFSET: i64 = INITIAL_ROWS - 15;
+const LATE_OFFSET: i64 = INITIAL_ROWS - OVERLAP_ROWS / 2;
 
 fn source_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -111,39 +111,9 @@ async fn write_source(path: &std::path::Path, rows: &[(i64, i64)]) -> Result<(),
     Ok(())
 }
 
-/// Queue an append refresh. The caller polls for the result rather than waiting on the
-/// returned notifier: completion signals with `notify_waiters`, which stores no permit,
-/// so a refresh that finishes first would leave a later waiter hanging.
-async fn trigger_refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
-    rt.datafusion()
-        .refresh_table(&TableReference::from(table), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
-    Ok(())
-}
-
-/// Run a `COUNT(*)` query and read back its single value.
-async fn count(rt: &Arc<Runtime>, sql: &str) -> Result<i64, anyhow::Error> {
-    let batches = run_query(rt, sql).await?;
-    let batch = batches
-        .iter()
-        .find(|batch| batch.num_rows() > 0)
-        .ok_or_else(|| anyhow::anyhow!("count query returned no rows"))?;
-    Ok(batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("count column is not Int64"))?
-        .value(0))
-}
-
-/// Rows currently in the accelerated table.
-async fn row_count(rt: &Arc<Runtime>) -> Result<i64, anyhow::Error> {
-    count(rt, &format!("SELECT COUNT(*) AS cnt FROM {TABLE}")).await
-}
-
-/// How many ids appear more than once — the shape a leaked overlap takes.
+/// How many ids appear more than once — the shape a leaked overlap takes. The exact
+/// per-round count cannot catch this on its own: a dedupe that both dropped a new row
+/// and kept a duplicate would land on the right total with the wrong rows.
 async fn duplicate_id_count(rt: &Arc<Runtime>) -> Result<i64, anyhow::Error> {
     count(
         rt,
@@ -155,46 +125,32 @@ async fn duplicate_id_count(rt: &Arc<Runtime>) -> Result<i64, anyhow::Error> {
     .await
 }
 
-/// Refresh, then wait for the table to reach `expected` rows. Fails with the last count
-/// observed rather than a bare timeout, so an over-count is as readable as a stall.
+/// Refresh, then wait for the table to reach `expected` rows. Both failures are named
+/// from the same final count, so neither a stall nor an over-count reports as a bare
+/// timeout — and the wait deliberately admits an over-count so it can be named.
 async fn refresh_to(rt: &Arc<Runtime>, round: &str, expected: i64) -> Result<(), anyhow::Error> {
     trigger_refresh(rt, TABLE).await?;
 
-    let reached = wait_until_true(std::time::Duration::from_mins(1), || async {
-        row_count(rt).await.is_ok_and(|c| c >= expected)
+    let _ = wait_until_true(std::time::Duration::from_mins(1), || async {
+        row_count(rt, TABLE).await.is_ok_and(|c| c >= expected)
     })
     .await;
 
-    let observed = row_count(rt).await?;
-    if !reached {
+    let observed = row_count(rt, TABLE).await?;
+    if observed < expected {
         return Err(anyhow::anyhow!(
             "append refresh ({round}) stalled at {observed} rows, expected {expected}"
         ));
     }
-    // The wait admits an over-count so this can name it: every extra row here is a copy
-    // of one already stored, re-fetched by the overlap and let through the dedupe.
-    if observed != expected {
+    if observed > expected {
+        // Every extra row is a copy of one already stored, re-fetched by the overlap
+        // and let through the dedupe.
         return Err(anyhow::anyhow!(
             "append refresh ({round}) left {observed} rows, expected {expected}: \
              the overlap window was appended instead of de-duplicated"
         ));
     }
     Ok(())
-}
-
-/// Whether any `.vortex` file exists under `dir`.
-fn has_vortex_file(dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            has_vortex_file(&path)
-        } else {
-            path.extension().is_some_and(|ext| ext == "vortex")
-        }
-    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -258,7 +214,7 @@ async fn cayenne_append_refresh_honours_refresh_append_overlap() -> Result<(), a
             runtime_ready_check(&rt).await;
 
             assert_eq!(
-                row_count(&rt).await?,
+                row_count(&rt, TABLE).await?,
                 INITIAL_ROWS,
                 "row count after the initial load"
             );
@@ -290,15 +246,13 @@ async fn cayenne_append_refresh_honours_refresh_append_overlap() -> Result<(), a
                  so refresh_append_overlap is the only thing that can fetch it — exactly once"
             );
 
-            // Two more rounds, each adding a single new row. Every one of them re-fetches
-            // the whole overlap window, so a dedupe that leaked would grow the table by
-            // OVERLAP_ROWS a round instead of by one.
-            for round in 2..=3_i64 {
-                let id = INITIAL_ROWS + round;
-                rows.push((id, id));
-                write_source(&source, &rows).await?;
-                refresh_to(&rt, &format!("round {round}"), INITIAL_ROWS + 1 + round).await?;
-            }
+            // One more round, adding a single new row. It re-fetches the whole overlap
+            // window again, so a dedupe that leaked would grow the table by OVERLAP_ROWS
+            // instead of by one.
+            let steady_state_id = INITIAL_ROWS + 2;
+            rows.push((steady_state_id, steady_state_id));
+            write_source(&source, &rows).await?;
+            refresh_to(&rt, "steady state", INITIAL_ROWS + 3).await?;
 
             assert_eq!(
                 duplicate_id_count(&rt).await?,

@@ -4985,14 +4985,33 @@ mod tests {
         );
     }
 
+    /// Every ignored-setting warning owes the reader the same three things, so they are
+    /// asserted once over all of them rather than per message.
     #[test]
-    fn memory_mode_retention_warning_names_the_dataset_the_impact_and_the_fix() {
+    fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
+        for warning in [
+            memory_mode_retention_warning("events"),
+            ignored_indexes_warning("events"),
+        ] {
+            assert!(
+                warning.contains("'events'"),
+                "the warning must name the dataset: {warning}"
+            );
+            assert!(
+                warning.contains("https://spiceai.org/docs"),
+                "the warning must link the docs: {warning}"
+            );
+            assert!(
+                !warning.contains('\n'),
+                "log messages stay on one line: {warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_states_the_impact_and_the_fix() {
         let warning = memory_mode_retention_warning("events");
 
-        assert!(
-            warning.contains("'events'"),
-            "the warning must name the dataset: {warning}"
-        );
         assert!(
             warning.contains("retention_sql") && warning.contains("retention_period"),
             "the warning must name both retention settings it covers: {warning}"
@@ -5005,24 +5024,12 @@ mod tests {
             warning.contains("`mode: file`"),
             "the warning must give the actionable fix: {warning}"
         );
-        assert!(
-            warning.contains("https://spiceai.org/docs"),
-            "the warning must link the docs: {warning}"
-        );
-        assert!(
-            !warning.contains('\n'),
-            "log messages stay on one line: {warning}"
-        );
     }
 
     #[test]
-    fn ignored_indexes_warning_names_the_dataset_the_impact_and_the_fix() {
+    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
         let warning = ignored_indexes_warning("events");
 
-        assert!(
-            warning.contains("'events'"),
-            "the warning must name the dataset: {warning}"
-        );
         assert!(
             warning.contains("does not constrain writes"),
             "the warning must say what a `unique` entry will not do: {warning}"
@@ -5030,14 +5037,6 @@ mod tests {
         assert!(
             warning.contains("primary_key") && warning.contains("on_conflict"),
             "the warning must give the actionable alternative: {warning}"
-        );
-        assert!(
-            warning.contains("https://spiceai.org/docs"),
-            "the warning must link the docs: {warning}"
-        );
-        assert!(
-            !warning.contains('\n'),
-            "log messages stay on one line: {warning}"
         );
     }
 

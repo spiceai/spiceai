@@ -297,8 +297,9 @@ impl PreparedOverwrite {
             .reset_table_stats_after_overwrite(&self.write_stats_acc)
             .await;
 
-        // Drop the write guard last so all visibility-related updates happen
-        // under exclusive table access.
+        // Drop the write guard before arming retention below, and after everything
+        // above it, so all visibility-related updates happen under exclusive table
+        // access while the retention pass — which takes this same lock — can proceed.
         let _ = self.write_guard;
 
         // Arm retention, the same way an append does (see
@@ -306,9 +307,7 @@ impl PreparedOverwrite {
         // source row, so a `retention_sql` / `retention_period` predicate has to run
         // again over the new snapshot — otherwise the rows it deletes come straight
         // back on each full refresh and the acceleration keeps data the user asked to
-        // be deleted. The maintenance loop applies it once this write's guard is gone:
-        // `apply_retention_filters` takes the same write lock, so applying it inline
-        // here would deadlock.
+        // be deleted.
         if self.table.has_retention_delete_filters() {
             self.table
                 .schedule_post_write_maintenance(None, false, true, 0);

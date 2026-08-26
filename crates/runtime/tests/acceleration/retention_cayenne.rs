@@ -16,24 +16,23 @@ limitations under the License.
 
 //! `retention_sql` on a file-mode Cayenne acceleration under `refresh_mode: full`.
 //!
-//! A full refresh reloads every source row, so the retention predicate has to run
-//! again over the new snapshot on every refresh — the way the DuckDB accelerator
-//! applies it before each refresh commit. Cayenne applies it from its post-write
-//! maintenance loop, so the rows disappear shortly *after* the refresh commits rather
-//! than inside the refresh write path; the polling below is what that difference costs
-//! the test.
+//! A full refresh reloads every source row, so the retention predicate has to run again
+//! over the new snapshot on every refresh — the way the DuckDB accelerator applies it
+//! before each refresh commit. Cayenne applies it from its post-write maintenance loop,
+//! so the rows disappear shortly *after* the refresh commits rather than inside the
+//! refresh write path; the polling below is what that difference costs the test.
 //!
-//! The second refresh is the point of the test, not a repeat of the first: the rows the
-//! source still carries come back with it, so a retention that ran only on the initial
-//! load would leave them in the acceleration from then on.
+//! The second refresh is the point of the test, not a repeat of the first, and it adds a
+//! row to the source so that it has an outcome the first refresh cannot produce. Waiting
+//! on "no row violates the predicate" alone would be satisfied by the state the initial
+//! load already left, so the test would pass without the second refresh ever running —
+//! which is precisely the regression it exists to catch.
 
 use std::sync::Arc;
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
-use datafusion::common::TableReference;
-use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -41,83 +40,89 @@ use spicepod::{
     param::Params,
 };
 
-use crate::utils::{runtime_ready_check, test_request_context, wait_until_true};
+use crate::acceleration::{row_count, trigger_refresh};
+use crate::utils::{run_query, runtime_ready_check, test_request_context, wait_until_true};
 
 /// The accelerated table under test.
 const TABLE: &str = "cayenne_retention_sql_it";
 
-/// Rows scoring below this are deleted by the retention predicate; the shared CSV
-/// leaves ids 2, 6 and 10 above it and 7 rows below.
+/// Rows scoring below this are deleted by the retention predicate.
 const SCORE_FLOOR: i64 = 90;
 
-async fn run_query(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    rt.datafusion()
-        .query_builder(sql)
-        .build()
-        .run()
-        .await
-        .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?
-        .data
-        .try_collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to collect results: {e}"))
-}
+/// The source's initial rows as `(id, score)`. Seven fall below the floor, so retention
+/// has something to delete and the reload has something to bring back.
+const INITIAL_ROWS: [(i64, i64); 10] = [
+    (1, 85),
+    (2, 92),
+    (3, 78),
+    (4, 89),
+    (5, 76),
+    (6, 94),
+    (7, 81),
+    (8, 88),
+    (9, 79),
+    (10, 90),
+];
 
-async fn refresh_table(rt: &Arc<Runtime>) -> Result<(), anyhow::Error> {
-    rt.datafusion()
-        .refresh_table(&TableReference::from(TABLE), None)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {TABLE}"))?
-        .notified()
-        .await;
+/// The row added before the second refresh. It survives the predicate, so it can only
+/// appear once that refresh has reloaded the source and retention has run over it again.
+const ADDED_ROW: (i64, i64) = (11, 95);
+
+/// Write `rows` to `path` as CSV, replacing whatever is there.
+fn write_source(path: &std::path::Path, rows: &[(i64, i64)]) -> Result<(), anyhow::Error> {
+    let mut csv = String::from("id,score\n");
+    for (id, score) in rows {
+        csv.push_str(&format!("{id},{score}\n"));
+    }
+    std::fs::write(path, csv)?;
     Ok(())
 }
 
-/// Rows still violating the retention predicate.
-async fn violating_rows(rt: &Arc<Runtime>) -> Result<usize, anyhow::Error> {
-    let batches = run_query(
-        rt,
-        &format!("SELECT id FROM {TABLE} WHERE score < {SCORE_FLOOR}"),
-    )
-    .await?;
-    Ok(batches.iter().map(RecordBatch::num_rows).sum())
+async fn run_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    run_query(rt, sql).await
 }
 
-/// Wait for retention to clear the rows this refresh reloaded, then check that it
-/// deleted those rows and only those.
-async fn assert_retention_applied(rt: &Arc<Runtime>, round: &str) -> Result<(), anyhow::Error> {
-    let applied = wait_until_true(std::time::Duration::from_secs(60), || async {
-        violating_rows(rt).await.is_ok_and(|n| n == 0)
+/// Wait for the acceleration to hold exactly `expected` rows with none violating the
+/// predicate, then check that those are the rows retention was supposed to leave.
+///
+/// Both halves matter: the count is what makes the state specific to this refresh, and
+/// the predicate check is what proves retention ran rather than the reload simply
+/// landing.
+async fn assert_retention_left(
+    rt: &Arc<Runtime>,
+    round: &str,
+    expected: &[(i64, i64)],
+) -> Result<(), anyhow::Error> {
+    let want = i64::try_from(expected.len())?;
+    let settled = wait_until_true(std::time::Duration::from_secs(60), || async {
+        row_count(rt, TABLE).await.is_ok_and(|c| c == want)
     })
     .await;
-    if !applied {
+    if !settled {
         return Err(anyhow::anyhow!(
-            "after the {round} refresh, retention_sql left {} row(s) below score {SCORE_FLOOR}: \
-             the Cayenne accelerator did not apply its retention filters",
-            violating_rows(rt).await?
+            "after the {round} refresh the acceleration holds {} row(s), expected {want}: \
+             the reload or the retention that follows it did not complete",
+            row_count(rt, TABLE).await?
         ));
     }
 
-    let retained = run_query(rt, &format!("SELECT id, score FROM {TABLE} ORDER BY id")).await?;
-    let expected = [
-        "+----+-------+",
-        "| id | score |",
-        "+----+-------+",
-        "| 2  | 92    |",
-        "| 6  | 94    |",
-        "| 10 | 90    |",
-        "+----+-------+",
+    let retained = run_sql(rt, &format!("SELECT id, score FROM {TABLE} ORDER BY id")).await?;
+    let mut lines = vec![
+        "+----+-------+".to_string(),
+        "| id | score |".to_string(),
+        "+----+-------+".to_string(),
     ];
-    assert_batches_eq!(&expected, &retained);
+    for (id, score) in expected {
+        lines.push(format!("| {id: <2} | {score: <5} |"));
+    }
+    lines.push("+----+-------+".to_string());
+    let expected_table: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_batches_eq!(&expected_table, &retained);
     Ok(())
 }
 
-fn make_dataset(data_path: &std::path::Path) -> Result<Dataset, anyhow::Error> {
-    let test_file = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
-        .join("tests/acceleration/data/partition_test.csv");
-
-    let mut dataset = Dataset::new(format!("file://{}", test_file.display()), TABLE);
+fn make_dataset(source: &std::path::Path, data_path: &std::path::Path) -> Dataset {
+    let mut dataset = Dataset::new(format!("file://{}", source.display()), TABLE);
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("cayenne".to_string()),
@@ -141,7 +146,7 @@ fn make_dataset(data_path: &std::path::Path) -> Result<Dataset, anyhow::Error> {
         )),
         ..Acceleration::default()
     });
-    Ok(dataset)
+    dataset
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -155,10 +160,13 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
             crate::configure_test_datafusion();
 
             let temp_dir = tempfile::tempdir()?;
+            let source = temp_dir.path().join("scores.csv");
             let data_path = temp_dir.path().join("accelerator");
+            let mut rows = INITIAL_ROWS.to_vec();
+            write_source(&source, &rows)?;
 
             let app = AppBuilder::new("test_cayenne_retention_sql")
-                .with_dataset(make_dataset(&data_path)?)
+                .with_dataset(make_dataset(&source, &data_path))
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -171,12 +179,23 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
             }
             runtime_ready_check(&rt).await;
 
-            assert_retention_applied(&rt, "initial").await?;
+            let survivors: Vec<(i64, i64)> = INITIAL_ROWS
+                .iter()
+                .copied()
+                .filter(|(_, score)| *score >= SCORE_FLOOR)
+                .collect();
+            assert_retention_left(&rt, "initial", &survivors).await?;
 
-            // The source is unchanged, so this refresh reloads the same 10 rows —
-            // including the 7 retention deleted. Retention has to run again.
-            refresh_table(&rt).await?;
-            assert_retention_applied(&rt, "second").await?;
+            // The second refresh reloads the same 10 rows — including the 7 retention
+            // deleted — plus one more that survives the predicate. Only that reload can
+            // produce the row count below, so this cannot pass on the state above.
+            rows.push(ADDED_ROW);
+            write_source(&source, &rows)?;
+            trigger_refresh(&rt, TABLE).await?;
+
+            let mut expected = survivors;
+            expected.push(ADDED_ROW);
+            assert_retention_left(&rt, "second", &expected).await?;
 
             Ok(())
         })
