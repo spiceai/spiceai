@@ -106,10 +106,20 @@ where
         return Ok(Vec::new());
     };
 
+    // Count only the nodes that can become rows. A node that is null or not an
+    // object is skipped below, so counting the raw array would let a response
+    // like `{"totalCount": 1, "nodes": [null]}` pass the completeness check and
+    // emit nothing — losing exactly the guarantee this check exists to give.
     let nodes = connection
         .get("nodes")
         .and_then(Value::as_array)
-        .map_or_else(Vec::new, Clone::clone);
+        .map_or_else(Vec::new, |nodes| {
+            nodes
+                .iter()
+                .filter(|node| node.is_object())
+                .cloned()
+                .collect()
+        });
 
     ensure_complete(
         connection.get("totalCount").and_then(Value::as_i64),
@@ -236,6 +246,24 @@ mod tests {
         .expect("an absent connection yields no rows");
 
         assert!(rows.is_empty());
+    }
+
+    /// A node that cannot become a row must count as missing, not as delivered.
+    #[test]
+    fn fan_out_fails_when_a_node_is_present_but_unusable() {
+        let unusable = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {"totalCount": 1, "nodes": [null]}
+        });
+
+        let error = fan_out(&unusable, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect_err("a null node must not pass as a delivered row");
+
+        assert!(
+            error.to_string().contains("0 of 1"),
+            "the error must count the null node as missing, got: {error}"
+        );
     }
 
     #[test]

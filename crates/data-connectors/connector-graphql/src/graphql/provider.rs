@@ -208,6 +208,15 @@ impl GraphQLTableProvider {
     pub fn client(&self) -> Arc<GraphQLClient> {
         Arc::clone(&self.client)
     }
+
+    /// Attaches a context to an already-built provider, for tests that build
+    /// without validation and then exercise a context-dependent scan decision.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<dyn GraphQLContext>) -> Self {
+        self.context = Some(context);
+        self
+    }
 }
 
 #[async_trait]
@@ -542,6 +551,62 @@ mod tests {
         assert_eq!(
             TableProvider::schema(&provider).field(0).name(),
             "renamed_id"
+        );
+    }
+
+    /// A context that declines limit pushdown, for the scan test below.
+    #[derive(Debug)]
+    struct NoLimitPushdown;
+
+    impl GraphQLContext for NoLimitPushdown {
+        fn supports_limit_pushdown(&self) -> bool {
+            false
+        }
+    }
+
+    /// A table whose rows do not map one-to-one onto the paginated connection
+    /// must not have a SQL `LIMIT` pushed into it: pagination bounds the limit by
+    /// the connection's page size, so `LIMIT 20` would fetch 20 *parents* and stop
+    /// having emitted however many rows those carried — fewer than 20, silently.
+    #[tokio::test]
+    async fn scan_drops_the_limit_when_the_context_declines_pushdown() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let build = || {
+            let client = GraphQLClientBuilder::new(
+                Url::parse("https://example.com/graphql").expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::clone(&schema)))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            GraphQLTableProviderBuilder::new(client)
+                .build_without_validation("query { view { nodes { id } } }")
+                .expect("provider to build without validation")
+        };
+
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        // Declining pushdown drops the limit …
+        let declining = build().with_context(Arc::new(NoLimitPushdown));
+        let plan = declining
+            .scan(&ctx.state(), None, &[], Some(20))
+            .await
+            .expect("scan to plan");
+        assert!(
+            !format!("{plan:?}").contains("limit="),
+            "a fan-out table must not bound its scan by a row limit, got: {plan:?}"
+        );
+
+        // … while the default keeps it, so no other connector changes behavior.
+        let plan = build()
+            .scan(&ctx.state(), None, &[], Some(20))
+            .await
+            .expect("scan to plan");
+        assert!(
+            format!("{plan:?}").contains("limit=[20]"),
+            "the default must still push the limit down, got: {plan:?}"
         );
     }
 
