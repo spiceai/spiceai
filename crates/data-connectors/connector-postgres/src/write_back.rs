@@ -535,16 +535,20 @@ mod tests {
             sql.contains(r#"ON CONFLICT ("id") DO UPDATE SET"#),
             "conflict target is the primary key: {sql}"
         );
+        // `sea-query` renders `PostgreSQL`'s special ON CONFLICT row as the quoted
+        // lowercase `"excluded"`. That is the same pseudo-relation as the bare
+        // `EXCLUDED` in the manual: unquoted identifiers fold to lower case, and
+        // the row is a range-table entry named `excluded`, not a keyword.
         assert!(
-            sql.contains(r#""name" = EXCLUDED."name""#),
+            sql.contains(r#""name" = "excluded"."name""#),
             "non-key column `name` is updated from the excluded row: {sql}"
         );
         assert!(
-            sql.contains(r#""score" = EXCLUDED."score""#),
+            sql.contains(r#""score" = "excluded"."score""#),
             "non-key column `score` is updated from the excluded row: {sql}"
         );
         assert!(
-            !sql.contains(r#""id" = EXCLUDED."id""#),
+            !sql.contains(r#""id" = "excluded"."id""#),
             "the key column itself is not in the update set: {sql}"
         );
     }
