@@ -5037,6 +5037,9 @@ dependencies = [
 name = "connector-postgres"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "data-connector-api",
@@ -6404,6 +6407,7 @@ dependencies = [
  "indexmap 2.14.0",
  "insta",
  "logos",
+ "moka",
  "mysql_async",
  "mysql_common",
  "native-tls",
@@ -7302,7 +7306,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=d9da7cd1f100144e37bcd233296d9112a043e146#d9da7cd1f100144e37bcd233296d9112a043e146"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=896356c3f7af9db5b6da3f2379196b420eee1b2b#896356c3f7af9db5b6da3f2379196b420eee1b2b"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18243,6 +18247,7 @@ dependencies = [
  "spice-table",
  "spicepod",
  "telemetry",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
