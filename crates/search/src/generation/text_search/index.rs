@@ -1830,6 +1830,7 @@ mod tests {
             Some(vec!["title".to_string()]),
             None,
             &[],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
