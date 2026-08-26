@@ -2030,7 +2030,7 @@ jobs:
     # tolerate both variants of that specific transient.
     env:
       PARQUET_RENAME_RACE_ALLOW: |
-        WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset
+        WARN +runtime_table::accelerated::refresh_task: Failed to load data for dataset
         ^Invalid Error: TProtocolException: Invalid data$
         ^Invalid Error: don't know what type:
 
