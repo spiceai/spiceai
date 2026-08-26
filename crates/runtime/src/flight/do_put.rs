@@ -376,21 +376,34 @@ impl MapEntriesGuard {
 
     /// Decodes one `FlightData` message and brings its `MAP` columns in line with the map layout.
     ///
-    /// `Ok(None)` is a message that carries no batch — the schema message, and any other the
-    /// decoder cannot read a batch out of, which the write has always skipped.
+    /// `Ok(None)` is a message that carries no batch: an empty body, which is how a schema-only
+    /// message arrives. A message that does carry a body but will not decode is a malformed
+    /// stream, and is reported with the decoder's own error rather than skipped — the same
+    /// discriminator `maybe_read_first_batch` uses on the scheduler path.
     fn decode(
         &self,
         message: &FlightData,
         dictionaries_by_id: &HashMap<i64, arrow::array::ArrayRef>,
         path: &TableReference,
     ) -> Result<Option<RecordBatch>, Status> {
-        let Ok(batch) = arrow_flight::utils::flight_data_to_arrow_batch(
+        if message.data_body.is_empty() {
+            return Ok(None);
+        }
+
+        let batch = arrow_flight::utils::flight_data_to_arrow_batch(
             message,
             Arc::clone(&self.declared),
             dictionaries_by_id,
-        ) else {
-            return Ok(None);
-        };
+        )
+        .map_err(|e| {
+            let message = format!(
+                "Failed to read the Arrow data sent for dataset {path} ({e}), so the write was not applied. \
+                Send each message as an Arrow IPC record batch matching the schema the stream declared. \
+                See: https://spiceai.org/docs/api/arrow-flight-sql"
+            );
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })?;
 
         self.normalizer.normalize(batch).map(Some).map_err(|e| {
             let message = map_entries_message(path, &e);

@@ -172,6 +172,13 @@ impl From<Error> for tonic::Status {
     fn from(err: Error) -> Self {
         match &err {
             Error::NoClient { .. } => tonic::Status::not_found(err.to_string()),
+            // The client sent a MAP the Arrow layout does not allow. That is malformed input,
+            // not a server fault, and the local DoPut path already reports it as such — routing
+            // it through `internal` here would tell the caller to retry a write that can never
+            // succeed.
+            Error::MapEntriesNotNormalizable { .. } => {
+                tonic::Status::invalid_argument(err.to_string())
+            }
             _ => tonic::Status::internal(err.to_string()),
         }
     }
@@ -1066,12 +1073,72 @@ async fn forward_batches_to_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{
+        ArrayData, ArrayRef, Int32Array, MapArray, StringArray, StructArray,
+    };
+    use arrow::buffer::{Buffer, NullBuffer};
+    use arrow::datatypes::{Field, Fields, Schema};
     use arrow_flight::utils::batches_to_flight_data;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    fn entry_fields() -> Fields {
+        vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into()
+    }
+
+    /// A `MAP` declaring its `entries` field nullable — what a client that did not read the
+    /// Arrow map layout sends, and the declaration this seam has to relabel.
+    fn map_type(entries_nullable: bool) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields()),
+                entries_nullable,
+            )),
+            false,
+        )
+    }
+
+    fn map_schema(entries_nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "m",
+            map_type(entries_nullable),
+            true,
+        )]))
+    }
+
+    /// Builds a `MapArray` through `ArrayData` rather than `MapArray::try_new`, the way the IPC
+    /// reader does: neither `entries` check runs there, which is how a non-conforming map
+    /// reaches this seam at all.
+    fn map_batch(entries_nullable: bool, entry_nulls: Option<NullBuffer>) -> RecordBatch {
+        let entries = StructArray::try_new(
+            entry_fields(),
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0"), Some("v1")])) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(map_type(entries_nullable))
+            .len(2)
+            .add_buffer(Buffer::from_slice_ref([0i32, 1, 2]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            map_schema(entries_nullable),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
     }
 
     fn encode_batch_to_flight_data(schema: &SchemaRef, batch: &RecordBatch) -> Vec<FlightData> {
@@ -1166,5 +1233,93 @@ mod tests {
 
         let decoded = result.expect("should return Some for single row");
         assert_eq!(decoded.num_rows(), 1);
+    }
+
+    /// The scheduler `DoPut` path decodes and normalizes on its own seam, which is how the
+    /// original runtime-side fix missed it. This drives that seam end to end: a stream that
+    /// declares `entries` nullable must reach partition routing under a conformed schema.
+    #[test]
+    fn scheduler_seam_conforms_a_nullable_entries_declaration() {
+        let declared = map_schema(true);
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        let batch = map_batch(true, None);
+        let flight_data = encode_batch_to_flight_data(&declared, &batch);
+        let data_fd = flight_data
+            .into_iter()
+            .nth(1)
+            .expect("should have a data message");
+
+        let decoded =
+            maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
+
+        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+
+        // What partition routing is handed must declare `entries` non-nullable, or it
+        // describes the batches with a type they no longer carry.
+        let DataType::Map(entries, _) = normalizer.schema().field(0).data_type() else {
+            panic!("column should still be a MAP");
+        };
+        assert!(
+            !entries.is_nullable(),
+            "routing schema must declare entries non-nullable"
+        );
+
+        let normalized = normalizer.normalize(decoded).expect("normalize should succeed");
+        let DataType::Map(entries, _) = normalized.schema().field(0).data_type() else {
+            panic!("column should still be a MAP");
+        };
+        assert!(
+            !entries.is_nullable(),
+            "normalized batch must carry the conformed type"
+        );
+        assert_eq!(normalized.num_rows(), 2);
+    }
+
+    /// Entry nulls are the one shape relabelling cannot fix. The scheduler path must refuse
+    /// them, and must present the refusal as malformed input rather than a server fault —
+    /// `internal` would tell the client to retry a write that can never succeed.
+    #[test]
+    fn scheduler_seam_refuses_entry_nulls_as_invalid_argument() {
+        let declared = map_schema(true);
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        let batch = map_batch(true, Some(NullBuffer::from(vec![true, false])));
+        let flight_data = encode_batch_to_flight_data(&declared, &batch);
+        let data_fd = flight_data
+            .into_iter()
+            .nth(1)
+            .expect("should have a data message");
+
+        let decoded =
+            maybe_read_first_batch(&data_fd, Arc::clone(&declared), &dictionaries_by_id)
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
+
+        let err = MapEntriesNormalizer::for_schema(&declared)
+            .normalize(decoded)
+            .context(MapEntriesNotNormalizableSnafu {
+                table: "sales.orders".to_string(),
+            })
+            .expect_err("entry nulls must be refused");
+
+        assert!(
+            matches!(err, Error::MapEntriesNotNormalizable { .. }),
+            "expected MapEntriesNotNormalizable, got {err:?}"
+        );
+
+        let status = tonic::Status::from(err);
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "malformed client input must not be reported as an internal error"
+        );
+        assert!(
+            status.message().contains("sales.orders"),
+            "message must name the table: {}",
+            status.message()
+        );
     }
 }
