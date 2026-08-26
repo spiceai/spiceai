@@ -374,14 +374,22 @@ impl Display for OnConflictBehavior {
     }
 }
 
-/// Behavior when a stale-if-error condition occurs in caching mode.
-/// When enabled, serves expired cached data if the upstream source returns an error.
+/// What happens to a cached entry in `refresh_mode: caching` when the source
+/// will not confirm it - the revalidation triggered once the entry passes
+/// `caching_ttl` errors, or answers with a transient status after the
+/// connector's own retries are exhausted.
+///
+/// This does not change how long an entry may be served. `caching_ttl` +
+/// `caching_stale_while_revalidate_ttl` is the upper bound either way; the
+/// choice is only whether a failed revalidation ends the entry's life early.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum StaleIfError {
-    /// Do not serve stale data on error - propagate the error to the client.
+    /// Drop the entry as soon as a revalidation fails, so the next query reads
+    /// from the source and sees its error rather than an unconfirmed response.
     #[default]
     Disabled,
-    /// Serve expired data if the upstream source returns an error.
+    /// Keep serving the last successful response for the remainder of the
+    /// stale-while-revalidate window.
     Enabled,
 }
 
@@ -418,8 +426,13 @@ pub struct Acceleration {
 
     pub refresh_check_interval: Option<Duration>,
 
+    /// How long a cached response stays fresh. Past this age the next query is
+    /// served from cache and triggers a background revalidation.
     pub caching_ttl: Option<Duration>,
 
+    /// How much longer past `caching_ttl` a response may be served while it is
+    /// revalidated. Together the two are the upper bound on an entry's life:
+    /// beyond their sum it is neither served nor retained.
     pub caching_stale_while_revalidate_ttl: Option<Duration>,
 
     pub caching_stale_if_error: StaleIfError,

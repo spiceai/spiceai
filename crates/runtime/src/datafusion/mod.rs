@@ -721,6 +721,48 @@ const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
 /// snapshot is picked up promptly without aggressive object-store load.
 const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
+/// `caching_ttl` applied when a caching dataset does not set one. Shared by the
+/// retention derivation and the scan-time freshness check so both agree on when
+/// an entry stops being fresh.
+pub(crate) const DEFAULT_CACHING_TTL: Duration = Duration::from_secs(30);
+
+/// How often to sweep expired rows out of a caching accelerator, for a cache
+/// whose entries live `retention_period`.
+///
+/// Cadence is a fraction of the horizon rather than the horizon itself: sweeping
+/// only once per lifetime lets a cache hold up to twice the rows it is allowed,
+/// and with a long `caching_stale_while_revalidate_ttl` the second sweep may
+/// never arrive within the life of the process. Clamped at both ends so a
+/// one-second TTL does not spin the accelerator and a one-year window still gets
+/// swept regularly.
+fn cache_retention_check_interval(retention_period: Duration) -> Duration {
+    const MIN: Duration = Duration::from_secs(30);
+    const MAX: Duration = Duration::from_mins(5);
+
+    (retention_period / 10).clamp(MIN, MAX)
+}
+
+/// The age at which a caching accelerator's rows are evicted, and how often to
+/// check for them.
+///
+/// Takes the whole [`Acceleration`] rather than the two durations so the
+/// property that matters is testable: retention is a function of `caching_ttl`
+/// and `caching_stale_while_revalidate_ttl` *only*. `caching_stale_if_error`
+/// governs what a failed revalidation does to an entry inside that window, and
+/// must not be able to lengthen or remove the window itself.
+fn caching_retention_window(acceleration: &Acceleration) -> (Duration, Duration) {
+    let max_age = acceleration.caching_ttl.unwrap_or(DEFAULT_CACHING_TTL);
+    let swr = acceleration
+        .caching_stale_while_revalidate_ttl
+        .unwrap_or_default();
+    let retention_period = max_age + swr;
+
+    (
+        retention_period,
+        cache_retention_check_interval(retention_period),
+    )
+}
+
 pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
@@ -3002,36 +3044,40 @@ impl DataFusion {
                 );
             }
 
-            // Auto-configure cache retention when stale_if_error is disabled.
-            // Expired cache entries (past max_age + SWR) are never served and waste storage.
-            if !acceleration_settings.caching_stale_if_error.is_enabled() {
-                if dataset.retention_period().is_some() {
-                    tracing::warn!(
-                        dataset = %dataset.name,
-                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
-                    );
-                }
-
-                let max_age = acceleration_settings
-                    .caching_ttl
-                    .unwrap_or(Duration::from_secs(30));
-                let swr = acceleration_settings
-                    .caching_stale_while_revalidate_ttl
-                    .unwrap_or_default();
-                let retention_period = max_age + swr;
-                let check_interval = retention_period.max(Duration::from_secs(30));
-
-                let cache_retention = Retention::builder()
-                    .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
-                    .time_period(Some(retention_period))
-                    .check_interval(Some(check_interval))
-                    .enabled(true)
-                    .build();
-
-                accelerated_table_builder.retention(cache_retention);
+            // `caching_ttl` + SWR is the upper bound on how long a cached
+            // response survives, so retention is derived from it for every
+            // caching dataset. `caching_stale_if_error` does not extend that
+            // bound - it only decides whether an entry whose revalidation
+            // failed spends the rest of its stale window servable or is
+            // dropped at once - so it has no say in how long rows are kept.
+            if dataset.retention_period().is_some() {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                );
             }
 
-            accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
+            let (retention_period, check_interval) =
+                caching_retention_window(&acceleration_settings);
+
+            let cache_retention = Retention::builder()
+                .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
+                .time_period(Some(retention_period))
+                .check_interval(Some(check_interval))
+                .enabled(true)
+                .build();
+
+            accelerated_table_builder.retention(cache_retention);
+
+            // Hand the resolved TTL - not the raw option - to the scan path, so
+            // an unset `caching_ttl` expires entries there at the same age
+            // retention removes them at. Left as `None`, the freshness check is
+            // skipped entirely and rows are served for as long as they exist.
+            accelerated_table_builder.caching_ttl(Some(
+                acceleration_settings
+                    .caching_ttl
+                    .unwrap_or(DEFAULT_CACHING_TTL),
+            ));
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
             );
@@ -5550,8 +5596,88 @@ mod tests {
     use spicepod::semantic::Column;
 
     use crate::builder::RuntimeBuilder;
+    use runtime_acceleration::acceleration::StaleIfError;
 
     use super::*;
+
+    /// Regression for spiceai/spiceai#13525: enabling `caching_stale_if_error`
+    /// skipped the retention derivation outright, so nothing was ever evicted
+    /// from a caching accelerator and `caching_ttl` stopped bounding anything.
+    /// The two settings answer different questions and the horizon must be
+    /// identical for both.
+    #[test]
+    fn caching_retention_ignores_stale_if_error() {
+        let with_stale_if_error = |stale_if_error| Acceleration {
+            refresh_mode: Some(RefreshMode::Caching),
+            caching_ttl: Some(Duration::from_secs(1)),
+            caching_stale_while_revalidate_ttl: Some(Duration::from_hours(8760)),
+            caching_stale_if_error: stale_if_error,
+            ..Acceleration::default()
+        };
+
+        let disabled = caching_retention_window(&with_stale_if_error(StaleIfError::Disabled));
+        let enabled = caching_retention_window(&with_stale_if_error(StaleIfError::Enabled));
+
+        assert_eq!(
+            disabled, enabled,
+            "caching_stale_if_error must not change how long cached rows are kept"
+        );
+        assert_eq!(
+            disabled.0,
+            Duration::from_secs(1) + Duration::from_hours(8760),
+            "the horizon is caching_ttl + stale-while-revalidate"
+        );
+    }
+
+    /// An unset `caching_ttl` must resolve to the same age on both paths that
+    /// consume it, or rows are evicted at one age and considered fresh until
+    /// another.
+    #[test]
+    fn caching_retention_defaults_match_the_freshness_default() {
+        let (horizon, _) = caching_retention_window(&Acceleration {
+            refresh_mode: Some(RefreshMode::Caching),
+            ..Acceleration::default()
+        });
+
+        assert_eq!(horizon, DEFAULT_CACHING_TTL);
+    }
+
+    /// The sweep cadence must not scale with the retention horizon. A long
+    /// `caching_stale_while_revalidate_ttl` used to make the interval as long
+    /// as the horizon itself, so a cache configured to keep entries for a year
+    /// was swept once at startup and then not again.
+    #[test]
+    fn cache_retention_sweeps_far_more_often_than_the_horizon() {
+        assert_eq!(
+            cache_retention_check_interval(Duration::from_hours(8760)),
+            Duration::from_mins(5),
+            "a year-long horizon is capped at the maximum sweep interval, not swept once"
+        );
+
+        assert_eq!(
+            cache_retention_check_interval(Duration::from_secs(1)),
+            Duration::from_secs(30),
+            "a very short horizon is floored so the accelerator is not swept continuously"
+        );
+
+        assert_eq!(
+            cache_retention_check_interval(Duration::from_mins(10)),
+            Duration::from_mins(1),
+            "between the bounds the interval is a fraction of the horizon"
+        );
+
+        for horizon in [
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_mins(10),
+            Duration::from_hours(24),
+        ] {
+            assert!(
+                cache_retention_check_interval(horizon) <= Duration::from_mins(5),
+                "horizon {horizon:?} must still be swept on a bounded cadence"
+            );
+        }
+    }
 
     #[test]
     fn accelerated_sink_dataset_writes_to_accelerator_only() {
