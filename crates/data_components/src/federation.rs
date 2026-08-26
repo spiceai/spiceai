@@ -337,13 +337,12 @@ mod tests {
     /// The seam every guard below unparses through, fallible so a guard can pin
     /// a refusal as well as a rendering.
     ///
-    /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
-    /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
-    /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
-    /// it; these stay. Extend them whenever a pin bump carries another unparser
-    /// fix — #13081 tracks the three the `edd8861e` → `b5cb7bb3` bump left
-    /// unguarded, the two below arrived with `b5cb7bb3` → `8e881090`, and
-    /// #12751's derived-table output names arrived with `8e881090` → `859621d`.
+    /// Each guard below is a canary for one unparser correctness fix that only a
+    /// Spice patch to the `spiceai/datafusion` fork carries: without the fix the
+    /// plan renders as SQL that means something other than the plan, so a
+    /// federated query returns wrong rows or fails to bind. Nothing else in this
+    /// repository notices if such a fix is lost, so every one of them wants a
+    /// guard here — #13081 tracks the ones still unguarded.
     ///
     /// This unparses through the federation executor, which supplies no dialect
     /// here, so the SQL is the default dialect's rather than any one connector's.
@@ -685,9 +684,9 @@ mod tests {
 
     /// Regression test for the sort-key hoist carried by fork PR #191: a `Sort`
     /// between two `Projection`s is hoisted so the statement itself carries the
-    /// ORDER BY. The hoist used to be gated on the sort key *being* one of the inner
-    /// projection's outputs, so a key computed from one bailed out and the ORDER BY
-    /// was emitted inside a derived table.
+    /// ORDER BY. Unpatched, the hoist is gated on the sort key *being* one of the
+    /// inner projection's outputs, so a key computed from one bails out and the
+    /// ORDER BY is emitted inside a derived table.
     ///
     /// SQL does not require an enclosing query to preserve a derived table's
     /// ordering, so a buried ORDER BY lets the remote engine return the rows in any
@@ -756,8 +755,8 @@ mod tests {
 
     /// Regression test for the stacked-aggregate fix carried by fork PR #192: a
     /// `SELECT` expresses one grouping, so a second `Aggregate` underneath one
-    /// already folded into the select list needs a scope of its own. It used to be
-    /// skipped instead, and its GROUP BY never reached the emitted SQL.
+    /// already folded into the select list needs a scope of its own. Unpatched, that
+    /// scope is skipped and the inner GROUP BY never reaches the emitted SQL.
     ///
     /// The optimizer builds exactly this shape for `count(DISTINCT c)` — an outer
     /// `count` over an inner grouping by `c` — and a federating consumer unparses the
@@ -874,10 +873,10 @@ mod tests {
 
     /// Regression test for the bounded-`EXISTS` scoping carried by fork PR #201: a
     /// semi, anti or mark join unparses its build side as a correlated `EXISTS`, and
-    /// a row bound on that side used to be emitted beside the correlation predicate.
-    /// SQL applies the bound after the `WHERE`, so it chose among the rows the
-    /// correlation had already matched instead of choosing which rows the correlation
-    /// could see, and the subquery searched the whole relation.
+    /// unpatched, a row bound on that side is emitted beside the correlation
+    /// predicate. SQL applies the bound after the `WHERE`, so it chooses among the
+    /// rows the correlation has already matched instead of choosing which rows the
+    /// correlation can see, and the subquery searches the whole relation.
     ///
     /// That is a wrong-rows defect rather than a too-many-rows one: a semi or mark
     /// join reports a match on a row the plan never read, and an anti join is the
@@ -1359,9 +1358,10 @@ mod tests {
     /// point of use would also make the statement bind, while answering the query
     /// with rows the `SELECT` list never saw.
     ///
-    /// This holds on both sides of the pin bump that carried #206 — it is the
-    /// property the repair had to keep, not one it introduced. What it refuses is a
-    /// later repair that binds the reference by inlining instead of naming.
+    /// Naming the output is only a correct repair while the output is still
+    /// evaluated once, so this pins the property the naming fix has to preserve
+    /// rather than one it introduces: what it refuses is a repair that binds the
+    /// reference by inlining the expression instead of naming it.
     #[test]
     fn a_derived_volatile_output_is_evaluated_once() {
         let volatile =
@@ -1386,8 +1386,8 @@ mod tests {
         }
     }
 
-    /// The half of #12751 that survives fork PR #206, pinned so a later pin bump that
-    /// repairs it is noticed rather than quietly leaving this shape unguarded.
+    /// The half of #12751 that fork PR #206 does not fix, pinned so the repair is
+    /// noticed rather than quietly leaving this shape unguarded.
     ///
     /// A scan projection pushed down under a relation alias is requalified onto the
     /// alias before the derived table is built, so the only name the derived table can
@@ -1402,12 +1402,11 @@ mod tests {
     /// try: both names are right for their own scope, and the repair is for the
     /// enclosing scope to name the relation's columns on the alias it attaches. The
     /// fork pins the same rendering in `test_subquery_alias_over_pushed_down_scan_
-    /// still_unbindable`; this guard is the repo-side half, because the fork's branch
-    /// is re-cut per `DataFusion` major and takes its own tests with it.
+    /// still_unbindable`; this is the repo-side canary for it.
     ///
     /// Projection pushdown is an ordinary optimized shape, so this is a live defect on
-    /// the federated pushdown path, and it is what keeps #12751 open. When a pin bump
-    /// repairs it this test fails: move the shape into `derived_scope_shapes` and close
+    /// the federated pushdown path, and it is what keeps #12751 open. This test fails
+    /// once the gap is repaired: move the shape into `derived_scope_shapes` and close
     /// #12751, rather than re-pinning the rendering below.
     #[test]
     fn a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references() {
