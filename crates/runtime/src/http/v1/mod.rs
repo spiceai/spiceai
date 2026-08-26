@@ -486,35 +486,6 @@ fn json_array_body_stream(
     }
 }
 
-// Runs query and returns the results as a vector of `RecordBatch`.
-pub async fn run_sql(
-    df: Arc<DataFusion>,
-    sql: &str,
-    parameters: Option<ParamValues>,
-) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    run_sql_with_read_only(df, sql, parameters, false).await
-}
-
-// Runs query and returns the results as a vector of `RecordBatch`, enforcing read-only mode when requested.
-pub async fn run_sql_with_read_only(
-    df: Arc<DataFusion>,
-    sql: &str,
-    parameters: Option<ParamValues>,
-    read_only: bool,
-) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let query_res = QueryBuilder::new(sql, df)
-        .parameters(parameters)
-        .read_only(read_only)
-        .build()
-        .run()
-        .await?;
-
-    Ok((
-        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
-        query_res.cache_status,
-    ))
-}
-
 // Converts a buffered query result to an HTTP response.
 pub async fn to_http_response(
     data: Vec<RecordBatch>,

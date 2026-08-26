@@ -25,7 +25,7 @@ use tonic::async_trait;
 use tracing_futures::Instrument;
 
 use crate::Runtime;
-use crate::http::v1::run_sql;
+use crate::datafusion::query::run_sql;
 
 pub struct WorkerPromptTask {
     runtime: Arc<Runtime>,
