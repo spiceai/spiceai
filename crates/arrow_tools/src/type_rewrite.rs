@@ -556,13 +556,25 @@ fn union_variant_selects_a_null(
     let Some((variant_type_id, _)) = fields.iter().nth(index) else {
         return false;
     };
+    // `ArrayData::buffer` indexes without checking, and this walk is reached from a public entry
+    // point, so the count is confirmed first rather than trusted: a union always carries its type
+    // ids, and a dense one its offsets, but a panic here would be a crash on malformed input where
+    // the whole function's job is to answer a question about it.
+    let dense_offsets = match mode {
+        UnionMode::Sparse => None,
+        UnionMode::Dense if parent.buffers().len() > 1 => Some(parent.buffer::<i32>(1)),
+        UnionMode::Dense => return false,
+    };
+    if parent.buffers().is_empty() {
+        return false;
+    }
     let type_ids = parent.buffer::<i8>(0);
 
     let selected_child_row = |row: usize| -> Option<usize> {
-        match mode {
-            UnionMode::Sparse => Some(row),
-            // The offsets buffer is only present on a dense union, so it is read only here.
-            UnionMode::Dense => usize::try_from(*parent.buffer::<i32>(1).get(row)?).ok(),
+        match dense_offsets {
+            // A sparse union gives the child the parent's length, so the row indexes it directly.
+            None => Some(row),
+            Some(offsets) => usize::try_from(*offsets.get(row)?).ok(),
         }
     };
 
