@@ -787,7 +787,7 @@
           "const": "moka"
         },
         {
-          "description": "Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation uses manual key iteration (O(n) operation).",
+          "description": "Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation scans the cache in place, so its cost is proportional to the number of cached entries.",
           "type": "string",
           "const": "pingora"
         }
