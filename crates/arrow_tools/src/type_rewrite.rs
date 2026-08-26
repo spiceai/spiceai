@@ -317,8 +317,11 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 /// timezone, signedness, width, precision or scale, an extension type, or a nested field's
 /// `dict_is_ordered` all read the same bytes as different values, so they are refused rather than
 /// reinterpreted. Field names, nullability flags, and field metadata outside the two
-/// `ARROW:extension:*` keys are permitted, since none of them changes how a value is read. Also
-/// returns an `ArrowError` when `target_type` does not describe the layout `data` holds.
+/// `ARROW:extension:*` keys are permitted, since none of them changes how a value is read — except
+/// that a nested field going nullable → non-nullable is refused unless the child it describes
+/// provably holds no logical null, since a schema that understates its nulls is read as fact by
+/// the planner. Also returns an `ArrowError` when `target_type` does not describe the layout
+/// `data` holds.
 pub fn relabel_array_data(
     data: ArrayData,
     target_type: &DataType,
@@ -338,7 +341,206 @@ pub fn relabel_array_data(
         return Ok(data);
     }
 
+    // Nullability is the one admitted difference the guard above cannot settle on its own: whether
+    // narrowing a field to non-nullable is a correction or a lie is a property of the values, not
+    // of the types. Checked only past the short-circuit — `Field`'s `PartialEq` does compare
+    // `nullable`, so equal types narrow nothing — and only where a narrowing is actually found, so
+    // the common relabel pays a walk of the type tree and no null counting at all.
+    ensure_narrowing_is_backed_by_the_data(&data, target_type)?;
+
     relabel_validated_array_data(data, target_type)
+}
+
+/// Rejects a `target_type` that declares a nested field non-nullable while the child it describes
+/// still holds nulls.
+///
+/// Widening (non-nullable → nullable) is always sound and is left alone. Narrowing is the direction
+/// that can lie: a field declared non-nullable over a child that holds nulls is published as fact,
+/// and `DataFusion` derives expression nullability from those fields — it constant-folds `IS NULL`
+/// over a non-nullable column to `false`, so rows that really are null are filtered out. That is a
+/// wrong-results shape rather than a crash, which is why it is refused here rather than left to
+/// surface downstream.
+///
+/// `ArrayData::build` catches part of this and cannot be relied on for the rest. Its
+/// `validate_nulls` checks non-nullable children only for `Struct`, `List`, `LargeList`, `Map` and
+/// `FixedSizeList`; `Union`, `ListView`, `LargeListView` and `RunEndEncoded` are not in that match
+/// at all, and every arm reads the child's *physical* null buffer, so a logical null a
+/// `RunEndEncoded` or `Dictionary` child states one level further down is invisible to it. Measured
+/// against arrow-rs: narrowing over a run-end-encoded `values` child, over a union child, and over
+/// a dictionary whose values hold a null the keys select are all accepted by `build`. This walk
+/// covers every shape uniformly and reports the shapes `build` does catch with a message that names
+/// the two fields and what the narrowing would cost, which its own does not.
+///
+/// [`MapEntriesNonNullable`] is not exempted from this and does not need to be. It narrows a
+/// `Map`'s `entries` field because the Arrow specification requires that field to be non-nullable
+/// and a well-formed map's entries genuinely carry no nulls, so it satisfies the proof the same way
+/// any other caller must. A map whose entries really do hold nulls is malformed, and refusing it
+/// here reports that at the relabel instead of leaving `MapArray::try_new` to fail later.
+fn ensure_narrowing_is_backed_by_the_data(
+    data: &ArrayData,
+    target_type: &DataType,
+) -> Result<(), ArrowError> {
+    // Only reached once `ensure_relabel_is_metadata_only` has admitted the pair, so the two agree
+    // on every child-bearing shape and this can pair fields with children positionally. `zip`
+    // truncates rather than indexing: a child count that still disagrees is a layout disagreement,
+    // and `build` refuses it with a better message than a panic here would give.
+    for (source_field, target_field) in relabel_field_pairs(data.data_type(), target_type) {
+        let Some(child) = data.child_data().get(source_field.index) else {
+            continue;
+        };
+
+        if source_field.field.is_nullable()
+            && !target_field.is_nullable()
+            && holds_logical_nulls(child)
+        {
+            return Err(relabel_narrows_a_field_that_holds_nulls(
+                source_field.field,
+                target_field,
+            ));
+        }
+
+        ensure_narrowing_is_backed_by_the_data(child, target_field.data_type())?;
+    }
+
+    // A `Dictionary`'s value type is not carried on a `Field`, so it declares no nullability of its
+    // own and contributes no pair above — but a narrowing can still sit inside it.
+    if let (DataType::Dictionary(_, source_value), DataType::Dictionary(_, target_value)) =
+        (data.data_type(), target_type)
+        && let Some(values) = data.child_data().first()
+    {
+        debug_assert_eq!(values.data_type(), source_value.as_ref());
+        ensure_narrowing_is_backed_by_the_data(values, target_value)?;
+    }
+
+    Ok(())
+}
+
+/// One nested field of a type, together with the index of the child data it describes.
+struct IndexedField<'a> {
+    field: &'a Field,
+    index: usize,
+}
+
+/// The nested fields of `source` paired with `target`'s, in `ArrayData::child_data` order.
+///
+/// Mirrors [`target_child_types`], which is what makes the index usable against `child_data`, but
+/// yields the `Field`s rather than their types because nullability lives on the field. `Dictionary`
+/// is absent for the same reason: its value type carries no field, so its child is walked by the
+/// caller instead.
+fn relabel_field_pairs<'a>(
+    source: &'a DataType,
+    target: &'a DataType,
+) -> Vec<(IndexedField<'a>, &'a Field)> {
+    let single = |source_field: &'a FieldRef, target_field: &'a FieldRef| {
+        vec![(
+            IndexedField {
+                field: source_field,
+                index: 0,
+            },
+            target_field.as_ref(),
+        )]
+    };
+
+    match (source, target) {
+        (DataType::List(source_item), DataType::List(target_item))
+        | (DataType::LargeList(source_item), DataType::LargeList(target_item))
+        | (DataType::ListView(source_item), DataType::ListView(target_item))
+        | (DataType::LargeListView(source_item), DataType::LargeListView(target_item))
+        | (DataType::FixedSizeList(source_item, _), DataType::FixedSizeList(target_item, _))
+        | (DataType::Map(source_item, _), DataType::Map(target_item, _)) => {
+            single(source_item, target_item)
+        }
+        (DataType::Struct(source_fields), DataType::Struct(target_fields)) => source_fields
+            .iter()
+            .enumerate()
+            .zip(target_fields)
+            .map(|((index, source_field), target_field)| {
+                (
+                    IndexedField {
+                        field: source_field,
+                        index,
+                    },
+                    target_field.as_ref(),
+                )
+            })
+            .collect(),
+        (DataType::Union(source_fields, _), DataType::Union(target_fields, _)) => source_fields
+            .iter()
+            .enumerate()
+            .zip(target_fields.iter())
+            .map(|((index, (_, source_field)), (_, target_field))| {
+                (
+                    IndexedField {
+                        field: source_field,
+                        index,
+                    },
+                    target_field.as_ref(),
+                )
+            })
+            .collect(),
+        (
+            DataType::RunEndEncoded(source_run_ends, source_values),
+            DataType::RunEndEncoded(target_run_ends, target_values),
+        ) => vec![
+            (
+                IndexedField {
+                    field: source_run_ends,
+                    index: 0,
+                },
+                target_run_ends.as_ref(),
+            ),
+            (
+                IndexedField {
+                    field: source_values,
+                    index: 1,
+                },
+                target_values.as_ref(),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `data` carries a null that a reader can observe.
+///
+/// For most arrays that is the null buffer this level owns. Two encodings state their nulls
+/// somewhere else and would read as null-free from that buffer alone:
+///
+/// - a **run-end-encoded** array has no null buffer of its own at all — a null run is a null in its
+///   `values` child, expanded over the run — so this is the case where a top-level null count is
+///   not merely incomplete but always zero;
+/// - a **dictionary** can hold its nulls in its values, which a key then points at.
+///
+/// Both are answered by recursing rather than by materializing the logical null buffer, which for a
+/// dictionary would mean deciding which values the keys actually reach. That makes this an
+/// over-approximation in one narrow case — a dictionary whose null value no key selects reads as
+/// null-bearing — and refusing there costs a caller an error message on a relabel that would have
+/// been sound, where accepting would publish a column whose nulls the planner has been told cannot
+/// exist.
+fn holds_logical_nulls(data: &ArrayData) -> bool {
+    if data.null_count() > 0 {
+        return true;
+    }
+
+    match data.data_type() {
+        DataType::RunEndEncoded(..) => data.child_data().get(1).is_some_and(holds_logical_nulls),
+        DataType::Dictionary(..) => data.child_data().first().is_some_and(holds_logical_nulls),
+        _ => false,
+    }
+}
+
+/// The error [`ensure_narrowing_is_backed_by_the_data`] reports for an unsupported narrowing.
+fn relabel_narrows_a_field_that_holds_nulls(source: &Field, target: &Field) -> ArrowError {
+    // Field names come from the schema, so escape them: an embedded newline would break the
+    // one-line contract this error is read under, and split one log record into two.
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel the Arrow field '{}' as '{}': the target declares it non-nullable while the \
+         column still holds nulls, so a query using `IS NULL` or `IS NOT NULL` on it would be \
+         planned against a schema that contradicts the data and drop rows that really are null. \
+         Declare the field nullable, or remove the nulls before relabelling.",
+        source.name().escape_debug(),
+        target.name().escape_debug(),
+    ))
 }
 
 /// The rebuild half of [`relabel_array_data`], called once `target_type` is known to differ from
@@ -615,7 +817,10 @@ fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, DictionaryArray, Int32Array, ListArray, StringArray};
+    use arrow::array::{
+        Array, ArrayRef, DictionaryArray, Int32Array, ListArray, RunArray, StringArray,
+        StructArray, UnionArray,
+    };
     use arrow::buffer::{Buffer, OffsetBuffer};
     use arrow::datatypes::Int32Type;
     use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, UnionFields, UnionMode};
@@ -810,6 +1015,254 @@ mod tests {
         }
     }
 
+    /// A `Struct<a: Int32>` over `values`, plus the target that differs from its type only in
+    /// narrowing `a` to non-nullable.
+    fn struct_with_nullable_child(values: Vec<Option<i32>>) -> (ArrayData, DataType) {
+        let source = StructArray::new(
+            Fields::from(vec![Field::new("a", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+            None,
+        );
+        let target = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, false)]));
+        (source.to_data(), target)
+    }
+
+    /// `ArrayData::build` already refuses this shape — `validate_nulls` covers `Struct` — so what
+    /// this pins is that the refusal now arrives from the guard, before the `O(rows)` rebuild, and
+    /// says which fields and what it would have cost. Arrow's own line reads
+    /// `non-nullable child of type Int32 contains nulls not present in parent Struct(..)`, which
+    /// names neither field and gives the reader nothing to do about it.
+    #[test]
+    fn relabel_reports_a_struct_narrowing_that_arrow_would_refuse_less_usefully() {
+        let (data, target) = struct_with_nullable_child(vec![Some(1), None]);
+
+        let message = relabel_array_data(data, &target)
+            .expect_err("narrowing a child that holds a null is refused")
+            .to_string();
+
+        assert!(
+            message.contains("non-nullable") && message.contains("IS NULL"),
+            "the guard's message must reach the caller ahead of arrow's, got: {message}"
+        );
+    }
+
+    #[test]
+    fn relabel_still_carries_a_narrowing_the_data_supports() {
+        let (data, target) = struct_with_nullable_child(vec![Some(1), Some(2)]);
+        let values_before = data.child_data()[0].clone();
+
+        let relabelled = relabel_array_data(data, &target)
+            .expect("a child with no null satisfies the proof, so the narrowing is admitted");
+
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].buffers(),
+            values_before.buffers(),
+            "the value buffer must be carried over untouched"
+        );
+    }
+
+    #[test]
+    fn relabel_still_carries_a_widening() {
+        // Widening cannot lie about the data, so it is never the guard's business.
+        let source_fields = Fields::from(vec![Field::new("a", DataType::Int32, false)]);
+        let source = StructArray::new(
+            source_fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let target = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)]));
+
+        let relabelled = relabel_array_data(source.to_data(), &target)
+            .expect("non-nullable -> nullable is always sound");
+
+        assert_eq!(relabelled.data_type(), &target);
+    }
+
+    #[test]
+    fn relabel_weighs_each_narrowing_against_its_own_child() {
+        // A null anywhere in the tree must not refuse a narrowing elsewhere: `a` keeps its nulls
+        // and stays nullable, while `b` is narrowed and holds none.
+        let source_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let source = StructArray::new(
+            source_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+            ],
+            None,
+        );
+        let target = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let relabelled = relabel_array_data(source.to_data(), &target)
+            .expect("`b` holds no null, so narrowing it stands regardless of `a`");
+
+        assert_eq!(relabelled.data_type(), &target);
+    }
+
+    /// One of the three shapes `ArrayData::build` accepts outright — `RunEndEncoded` is absent from
+    /// `validate_nulls`, and the nulls are a level below anything a physical null count would read.
+    /// Measured: without the guard this relabel returns `Ok`.
+    #[test]
+    fn relabel_refuses_narrowing_a_run_end_encoded_values_child_whose_nulls_are_logical_only() {
+        // The sharpest case: a run-end-encoded array has no null buffer of its own, so a check
+        // that only read this level's null count would see zero and admit the narrowing.
+        let run_ends = Int32Array::from(vec![2, 4]);
+        let values = Int32Array::from(vec![Some(7), None]);
+        let source = RunArray::try_new(&run_ends, &values)
+            .expect("two runs over two values is a well-formed run-end-encoded array");
+        assert_eq!(
+            source.to_data().null_count(),
+            0,
+            "the parent carries no null bitmap — that is what makes this case sharp"
+        );
+
+        let target = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Int32, false)),
+        );
+
+        let err = relabel_array_data(source.to_data(), &target).expect_err(
+            "the null run is a logical null of the whole array, so narrowing `values` must be \
+             refused",
+        );
+
+        assert!(
+            err.to_string().contains("values"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// The second shape `build` accepts: `List` *is* in `validate_nulls`, but the arm reads the
+    /// child's physical null count, and a dictionary's is zero while a key selects a null value.
+    /// Measured: without the guard this relabel returns `Ok`.
+    #[test]
+    fn relabel_refuses_narrowing_over_a_dictionary_whose_values_hold_nulls() {
+        // A dictionary states its nulls one level below the keys, so the same top-level null count
+        // reads as zero here too.
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+        )
+        .expect("two keys over two dictionary values");
+        let dictionary_type = dictionary.data_type().clone();
+        let source = ListArray::new(
+            Arc::new(Field::new("item", dictionary_type.clone(), true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(dictionary),
+            None,
+        );
+        let target = DataType::List(Arc::new(Field::new("item", dictionary_type, false)));
+
+        let err = relabel_array_data(source.to_data(), &target).expect_err(
+            "a key selecting a null dictionary value is a null of the column, so narrowing the \
+             item must be refused",
+        );
+
+        assert!(
+            err.to_string().contains("item"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// The third shape `build` accepts: `Union` is absent from `validate_nulls` altogether, so a
+    /// narrowed variant field is published unchecked. Measured: without the guard this relabel
+    /// returns `Ok`.
+    #[test]
+    fn relabel_refuses_narrowing_a_union_variant_that_holds_nulls() {
+        let source_fields =
+            UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, true)])
+                .expect("one type id for one field");
+        let source = UnionArray::try_new(
+            source_fields,
+            vec![0_i8, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+        )
+        .expect("a sparse union over one variant");
+        let target = DataType::Union(
+            UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, false)])
+                .expect("one type id for one field"),
+            UnionMode::Sparse,
+        );
+
+        let err = relabel_array_data(source.to_data(), &target)
+            .expect_err("the variant holds a null, so narrowing it must be refused");
+
+        assert!(
+            err.to_string().contains("'a'"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// `MapEntriesNonNullable` is not exempt from the proof. `build` refuses this one too (`Map` is
+    /// in `validate_nulls`), so what this pins is that a malformed map is reported as the
+    /// narrowing it is rather than reaching `MapArray::try_new` later.
+    #[test]
+    fn relabel_refuses_the_map_entries_correction_when_the_entries_hold_nulls() {
+        let (map, target) = map_with_nullable_entries();
+        let entries = map.child_data()[0].clone();
+        let nulled_entries = entries
+            .into_builder()
+            .null_bit_buffer(Some(Buffer::from([0b0000_0001])))
+            .build()
+            .expect("a struct may carry a null bitmap");
+        let malformed = map
+            .into_builder()
+            .child_data(vec![nulled_entries])
+            .build()
+            .expect("the map shape is unchanged");
+
+        let err = relabel_array_data(malformed, &target).expect_err(
+            "entries holding a null cannot be republished as the non-nullable field Arrow requires",
+        );
+
+        assert!(
+            err.to_string().contains("entries"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relabel_narrowing_refusal_names_both_fields_and_the_repair() {
+        let source_fields = Fields::from(vec![Field::new("physical", DataType::Int32, true)]);
+        let source = StructArray::new(
+            source_fields,
+            vec![Arc::new(Int32Array::from(vec![None, Some(2)])) as ArrayRef],
+            None,
+        );
+        let target = DataType::Struct(Fields::from(vec![Field::new(
+            "logical",
+            DataType::Int32,
+            false,
+        )]));
+
+        let message = relabel_array_data(source.to_data(), &target)
+            .expect_err("the child holds a null")
+            .to_string();
+
+        for expected in [
+            "'physical'",
+            "'logical'",
+            "Declare the field nullable, or remove the nulls before relabelling.",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the error must contain {expected}, got: {message}"
+            );
+        }
+        assert!(
+            !message.contains('\n'),
+            "the error must stay on one line, got: {message}"
+        );
+    }
+
     #[test]
     fn relabel_still_carries_a_map_entries_nullability_correction() {
         let (map, target) = map_with_nullable_entries();
@@ -835,8 +1288,9 @@ mod tests {
             Arc::new(values),
             None,
         );
-        // A Delta column-mapping projection renames the child and may flip its nullability; both
-        // are metadata, so both must still pass.
+        // A Delta column-mapping projection renames the child and may tighten its nullability.
+        // The rename is metadata outright; the narrowing is admitted because this child holds no
+        // null, which is the proof `ensure_narrowing_is_backed_by_the_data` asks every caller for.
         let target = DataType::List(Arc::new(Field::new("renamed", DataType::Int32, false)));
 
         let relabelled = relabel_array_data(list.to_data(), &target)
