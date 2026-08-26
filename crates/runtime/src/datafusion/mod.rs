@@ -795,16 +795,18 @@ pub struct DataFusion {
     /// lookup through insert completion, because a batch inserted through a provider
     /// instance that is concurrently being replaced publishes into table state the
     /// replacement was not opened on — the write reports success but its rows are
-    /// invisible to the newly bound provider. Keyed by table reference (distinct
-    /// datasets evolve and write independently); get-or-inserted lazily.
+    /// invisible to the newly bound provider. Keyed by the bare table name so every alias
+    /// of a dataset (bare, partial, fully-qualified) shares one lock — see
+    /// `schema_evolve_lock`; get-or-inserted lazily.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     /// `sink` datasets parked until their first write (a sink's schema is only known then),
     /// keyed by dataset name. The per-entry mutex serializes the first-write registration:
-    /// exactly one writer claims the slot (`Some` → `None`) and registers, while concurrent
-    /// writers wait on the mutex until the provider is installed — instead of racing ahead
-    /// to a table lookup that fails with a missing-table error mid-registration. The entry
-    /// is removed only after the provider is installed, so a writer that still sees it
-    /// waits, and one that no longer sees it finds the table registered.
+    /// one writer registers while concurrent writers wait on the mutex until the provider is
+    /// installed — instead of racing ahead to a table lookup that fails with a missing-table
+    /// error mid-registration. The slot is emptied, and the entry removed, only after the
+    /// provider is installed: a writer that still sees the entry waits, one that no longer
+    /// sees it finds the table registered, and a registering writer that is cancelled
+    /// mid-registration leaves the slot occupied so the next writer retries.
     pending_sink_tables:
         TokioRwLock<HashMap<TableReference, Arc<Mutex<Option<PendingSinkRegistration>>>>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
@@ -2221,35 +2223,40 @@ impl DataFusion {
             return Ok(());
         };
 
-        // Serialize the first-write registration on the entry: exactly one writer claims the
-        // slot and registers, and every concurrent writer for the same table waits here until
-        // the provider is installed — then finds the slot empty and proceeds to a table
-        // lookup that succeeds, instead of failing with a missing-table error while the
-        // winner is still mid-registration.
+        // Serialize the first-write registration on the entry: exactly one writer registers
+        // at a time, and every concurrent writer for the same table waits here until the
+        // provider is installed — then finds the slot empty and proceeds to a table lookup
+        // that succeeds, instead of failing with a missing-table error while the winner is
+        // still mid-registration.
+        //
+        // The registration is borrowed from the slot, never moved out of it: the slot must
+        // stay occupied until the provider is actually installed, so that a registering
+        // writer cancelled mid-await (its request future dropped) leaves the claim in place
+        // for the next writer to retry — an emptied slot would read as "registration
+        // completed" and strand the dataset behind failing table lookups until a restart.
         let mut slot = entry.lock().await;
-        let Some(pending_registration) = slot.take() else {
+        let Some(pending_registration) = slot.as_ref() else {
             // Another writer completed the registration while this one waited.
             return Ok(());
         };
+        let dataset = Arc::clone(&pending_registration.dataset);
+        let secrets = Arc::clone(&pending_registration.secrets);
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
         let registration = async {
-            let context = RuntimeConnectorContext::for_dataset(&pending_registration.dataset);
+            let context = RuntimeConnectorContext::for_dataset(&dataset);
             let read_provider = sink_connector
-                .read_provider(&context, &pending_registration.dataset)
+                .read_provider(&context, &dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
             let federated_table = FederatedTable::new_unchecked(read_provider);
 
-            tracing::info!(
-                "Dataset {} loading data...",
-                pending_registration.dataset.name
-            );
+            tracing::info!("Dataset {} loading data...", dataset.name);
             self.register_accelerated_table(
-                Arc::clone(&pending_registration.dataset),
+                Arc::clone(&dataset),
                 Arc::clone(&sink_connector),
                 federated_table,
-                Arc::clone(&pending_registration.secrets),
+                secrets,
                 BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
                 None,                    // Sink datasets are not partition-scoped
             )
@@ -2259,40 +2266,47 @@ impl DataFusion {
 
         match registration {
             Ok(_) => {
-                // The provider is installed; drop the entry so later writers take the fast
-                // path. Writers already waiting on the slot see `None` and return above.
+                // The provider is installed: empty the slot for the writers already waiting
+                // on it, and drop the entry so later writers take the fast path.
+                *slot = None;
                 self.pending_sink_tables
                     .write()
                     .await
                     .remove(&table_reference);
                 Ok(())
             }
-            Err(e) => {
-                // Registration failed after we claimed the slot: return the claim so a later
-                // write (or a writer waiting on this slot) retries it, rather than leaving
-                // the dataset unregistered.
-                *slot = Some(pending_registration);
-                Err(e)
-            }
+            // Registration failed; the claim never left the slot, so a later write (or a
+            // writer waiting on this slot) retries it rather than leaving the dataset
+            // unregistered.
+            Err(e) => Err(e),
         }
     }
 
     /// The per-dataset lock excluding write-time schema evolution + provider rebind
     /// against in-flight writes (see `schema_evolve_locks`), get-or-created lazily.
+    ///
+    /// The map is keyed by the bare table name so every alias of a dataset shares one lock:
+    /// the OpenTelemetry ingest and the evolution path write to the bare name while a Flight
+    /// `DoPut` normalizes the same table to its fully-qualified path, and distinct keys
+    /// would let those writes overlap the rebind this lock exists to exclude. The bare name
+    /// is also stable before and after the dataset registers, unlike a normalized reference
+    /// (a bare name only resolves once the table exists). Two datasets sharing a table name
+    /// across schemas merely share a lock, which can only over-serialize, never under-lock.
     async fn schema_evolve_lock(
         &self,
         table_reference: &TableReference,
     ) -> Arc<tokio::sync::RwLock<()>> {
+        let key = TableReference::bare(table_reference.table().to_string());
         {
             let locks = self.schema_evolve_locks.read().await;
-            if let Some(lock) = locks.get(table_reference) {
+            if let Some(lock) = locks.get(&key) {
                 return Arc::clone(lock);
             }
         }
         let mut locks = self.schema_evolve_locks.write().await;
         Arc::clone(
             locks
-                .entry(table_reference.clone())
+                .entry(key)
                 .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
         )
     }
@@ -5629,6 +5643,40 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    /// Every alias of a dataset must resolve to the same rebind lock. The OpenTelemetry
+    /// ingest and the evolution path use the dataset's bare name, while a Flight `DoPut`
+    /// normalizes the same table to its fully-qualified path; separate locks would let those
+    /// writes overlap the provider rebind the lock exists to exclude, reproducing the
+    /// invisible-row race.
+    #[tokio::test]
+    async fn schema_evolve_lock_is_shared_across_table_reference_aliases() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        let bare = df.schema_evolve_lock(&TableReference::bare("metric")).await;
+        let partial = df
+            .schema_evolve_lock(&TableReference::partial(SPICE_DEFAULT_SCHEMA, "metric"))
+            .await;
+        let full = df
+            .schema_evolve_lock(&TableReference::full(
+                SPICE_DEFAULT_CATALOG,
+                SPICE_DEFAULT_SCHEMA,
+                "metric",
+            ))
+            .await;
+
+        assert!(
+            Arc::ptr_eq(&bare, &partial) && Arc::ptr_eq(&bare, &full),
+            "every alias of a dataset must share one rebind lock"
+        );
+
+        let other = df.schema_evolve_lock(&TableReference::bare("other")).await;
+        assert!(
+            !Arc::ptr_eq(&bare, &other),
+            "distinct datasets must keep independent locks"
+        );
+    }
 
     #[test]
     fn accelerated_sink_dataset_writes_to_accelerator_only() {
