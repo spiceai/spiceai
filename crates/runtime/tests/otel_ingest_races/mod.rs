@@ -19,7 +19,7 @@ limitations under the License.
 //! OTLP metric dataset shape (`refresh_mode: append`, `primary_key: time_unix_nano`,
 //! `on_schema_change: append_new_columns`, `access: read_write`).
 //!
-//! Three raced flows are covered:
+//! Four flows are covered:
 //!
 //! - **Concurrent first writes to a parked sink.** A sink dataset is registered on its first
 //!   write; exactly one concurrent writer claims that registration and every other writer
@@ -32,6 +32,10 @@ limitations under the License.
 //! - **A restart whose first export carries a new dimension.** The sink is parked until its
 //!   first write, so write-time evolution must register it from the acceleration checkpoint
 //!   before it can widen the live provider.
+//! - **A first write addressing the sink through an alias of its name.** Registration must
+//!   resolve the parked dataset by the same alias rule that admitted the write, so a
+//!   qualified reference (as a Flight `DoPut` produces) registers it rather than leaving the
+//!   write to fail against the parked table.
 //!
 //! Every concurrent phase runs under a timeout so a deadlock on ingestion or registration
 //! fails the test instead of hanging it.
@@ -41,6 +45,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
+use arrow::array::{Float64Array, StringArray, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::sql::TableReference;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
@@ -49,6 +56,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     number_data_point::Value as NumberValue,
 };
 use runtime::Runtime;
+use runtime::dataupdate::{DataUpdate, UpdateType};
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::{Dataset, OnSchemaChange, TimeFormat};
@@ -401,5 +409,74 @@ async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow:
         drop(rt);
     }
 
+    Ok(())
+}
+
+/// A writer may address a parked sink through any alias of its name — a Flight `DoPut`
+/// normalizes `foo` to `spice.public.foo` before writing, and the runtime admits that alias
+/// as writable. The first-write registration must resolve the parked dataset through the
+/// same alias rule, otherwise the write reports nothing to register and then fails against
+/// the still-unregistered table.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyhow::Error> {
+    const METRIC: &str = "otel_alias_registration";
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
+    let metadata_dir = temp_dir
+        .path()
+        .join("metadata")
+        .to_string_lossy()
+        .to_string();
+    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
+
+    register_test_connectors().await;
+    let rt = start_runtime(&ds).await;
+
+    // The dataset is registered as the bare `METRIC`; write through its fully-qualified
+    // alias, exactly as a Flight `DoPut` does after normalizing the path it was given.
+    let qualified = TableReference::full("spice", "public", METRIC);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Float64, true),
+        Field::new("time_unix_nano", DataType::UInt64, true),
+        Field::new("start_time_unix_nano", DataType::UInt64, true),
+        Field::new("region", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(UInt64Array::from(vec![100_u64])),
+            Arc::new(UInt64Array::from(vec![0_u64])),
+            Arc::new(StringArray::from(vec!["us"])),
+        ],
+    )?;
+
+    rt.datafusion()
+        .write_data(
+            &qualified,
+            DataUpdate {
+                schema,
+                data: vec![batch],
+                update_type: UpdateType::Append,
+            },
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "a write through a qualified alias must register the parked sink and land: {e}"
+            )
+        })?;
+
+    assert_eq!(
+        row_count(&rt, METRIC).await?,
+        1,
+        "the aliased write must land in the now-registered dataset"
+    );
+
+    rt.shutdown().await;
     Ok(())
 }

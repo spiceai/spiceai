@@ -800,7 +800,9 @@ pub struct DataFusion {
     /// `schema_evolve_lock`; get-or-inserted lazily.
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     /// `sink` datasets parked until their first write (a sink's schema is only known then),
-    /// keyed by dataset name. The per-entry mutex serializes the first-write registration:
+    /// keyed by dataset name — matched against a writer's reference by `resolved_eq`, so any
+    /// alias of the dataset finds it (see `ensure_sink_dataset`). The per-entry mutex
+    /// serializes the first-write registration:
     /// one writer registers while concurrent writers wait on the mutex until the provider is
     /// installed — instead of racing ahead to a table lookup that fails with a missing-table
     /// error mid-registration. The slot is emptied, and the entry removed, only after the
@@ -2211,14 +2213,31 @@ impl DataFusion {
         schema: SchemaRef,
     ) -> Result<()> {
         // Look up the pending entry without claiming it; a writer to a table that is not a
-        // pending sink (the common case) returns immediately. The guard is dropped before the
-        // entry mutex is taken so no writer ever waits on that mutex while holding the map.
-        let Some(entry) = self
+        // pending sink (the common case) returns immediately.
+        //
+        // The entry is keyed by the dataset's own name, but a writer may address that
+        // dataset through any alias of it — a Flight `DoPut` normalizes `foo` to
+        // `spice.public.foo` — so the entry is matched the way `is_writable` matches its
+        // writers, by `resolved_eq` against the stored name rather than by exact key. An
+        // exact lookup misses every alias: it would report nothing to register for a write
+        // `is_writable` had just admitted, and the write would then fail against the still
+        // parked table. The matched key is carried to the removal below, since that (not the
+        // caller's alias) is the key the entry is stored under.
+        //
+        // Scanning suits the map's size and cannot merge two datasets: it only ever holds
+        // sink datasets awaiting their first write, and shrinks as they register. Keying it
+        // by bare name instead would be O(1) but would collide two same-named sinks in
+        // different schemas onto one entry, leaving one of them permanently unregistered.
+        //
+        // The guard is dropped before the entry mutex is taken so no writer ever waits on
+        // that mutex while holding the map.
+        let Some((pending_key, entry)) = self
             .pending_sink_tables
             .read()
             .await
-            .get(&table_reference)
-            .map(Arc::clone)
+            .iter()
+            .find(|(pending_name, _)| pending_name.resolved_eq(&table_reference))
+            .map(|(pending_name, entry)| (pending_name.clone(), Arc::clone(entry)))
         else {
             return Ok(());
         };
@@ -2269,10 +2288,7 @@ impl DataFusion {
                 // The provider is installed: empty the slot for the writers already waiting
                 // on it, and drop the entry so later writers take the fast path.
                 *slot = None;
-                self.pending_sink_tables
-                    .write()
-                    .await
-                    .remove(&table_reference);
+                self.pending_sink_tables.write().await.remove(&pending_key);
                 Ok(())
             }
             // Registration failed; the claim never left the slot, so a later write (or a
