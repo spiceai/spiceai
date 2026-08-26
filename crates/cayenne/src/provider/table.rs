@@ -21103,7 +21103,38 @@ impl CayenneTableProvider {
             return Ok(0);
         }
 
+        // The sink below scans this table's Vortex files, so rows still sitting in the
+        // metastore's inline tier are invisible to it: an overwrite admits its whole
+        // payload there whenever it fits (`try_admit_overwrite_inline`), which would
+        // otherwise leave a small full-refresh table with nothing for retention to
+        // match. Materialize them first, the same way `delete_from` does for a user
+        // DELETE. The guard is scoped so it is released before the sink takes the same
+        // (non-reentrant) lock, and `cached_inlined_row_count` makes this a no-op for a
+        // table with nothing inlined.
+        {
+            let _guard = self.write_lock.lock().await;
+            self.checkpoint_inlined_data_if_present_for_delete()
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message:
+                        "Failed to materialize inlined rows before applying retention filters."
+                            .to_string(),
+                    source: Box::new(err),
+                })?;
+        }
+
         self.mark_maintained_aggregates_stale();
+
+        // Nothing on this path re-derives `num_rows` from the rows retention is about
+        // to remove, and the caller may have just `Set` an authoritative count (an
+        // overwrite re-baselines one, and re-baselining restores exactness), so leaving
+        // the flag alone would let a distributed `COUNT(*)` fold a count that is high by
+        // exactly what retention deletes. Taint BEFORE the durable delete, for the same
+        // reason `RowCountExactnessTaintingDeletionSink` does on a user `DELETE`: a
+        // delete that removes nothing, errors, or is cancelled then costs only the
+        // metadata fast path, whereas tainting afterwards leaves a window in which the
+        // tombstone is durable and the flag still claims the stale count is live.
+        self.taint_persisted_row_count_exactness().await;
 
         let filters = self.retention_filters.clone();
         let sink = CayenneDeletionSink::new(

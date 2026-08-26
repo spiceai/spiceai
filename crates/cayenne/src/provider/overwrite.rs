@@ -300,6 +300,20 @@ impl PreparedOverwrite {
         // Drop the write guard last so all visibility-related updates happen
         // under exclusive table access.
         let _ = self.write_guard;
+
+        // Arm retention, the same way an append does (see
+        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // source row, so a `retention_sql` / `retention_period` predicate has to run
+        // again over the new snapshot — otherwise the rows it deletes come straight
+        // back on each full refresh and the acceleration keeps data the user asked to
+        // be deleted. The maintenance loop applies it once this write's guard is gone:
+        // `apply_retention_filters` takes the same write lock, so applying it inline
+        // here would deadlock.
+        if self.table.has_retention_delete_filters() {
+            self.table
+                .schedule_post_write_maintenance(None, false, true, 0);
+        }
+
         Ok(self.row_count)
     }
 

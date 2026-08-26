@@ -3150,6 +3150,33 @@ fn wrap_with_native_vector_indexes(
     }
 }
 
+/// The warning a `mode: memory` acceleration gets when it configures retention.
+///
+/// Retention deletes reach the rows through the deletion sink, which scans this
+/// table's Vortex files — and a memory-mode table has none: its rows live only in the
+/// RAM tier, whose tombstones address rows by primary key rather than by predicate.
+/// Saying so at registration is the point: keeping rows the operator asked to have
+/// deleted, with nothing in the log to explain it, is the worst of the outcomes here.
+fn memory_mode_retention_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_sql` and `retention_period` are not applied to a `mode: memory` acceleration, so rows matching the retention predicate stay queryable in the accelerated table. Set `mode: file` to have retention applied. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The warning an acceleration gets when it configures `indexes`.
+///
+/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
+/// none to create — it prunes from the zone maps and primary-key index it derives from
+/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
+/// the half that matters: on the other engines it constrains writes, and here it does
+/// not, which is the kind of difference an operator has to be told about rather than
+/// discover from duplicate rows.
+fn ignored_indexes_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -3577,15 +3604,6 @@ impl DataAccelerator for CayenneAccelerator {
                     ),
                 }));
             }
-
-            // Validate that refresh_append_overlap is not specified
-            if acceleration.refresh_append_overlap.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
-                    ),
-                }));
-            }
         }
 
         let dir_path = self.file_path(source)?;
@@ -3931,6 +3949,18 @@ impl DataAccelerator for CayenneAccelerator {
         } else {
             Vec::new()
         };
+
+        if memory_mode && (!retention_filters.is_empty() || time_retention_filter_builder.is_some())
+        {
+            tracing::warn!("{}", memory_mode_retention_warning(&table_name));
+        }
+
+        if source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
+        {
+            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        }
 
         // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
         // Uses explicit user config if provided, otherwise falls back to federated table constraints
@@ -4952,6 +4982,62 @@ mod tests {
         assert!(
             detail.contains("Boolean"),
             "the error must say the filter must be a Boolean predicate: {detail}"
+        );
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_names_the_dataset_the_impact_and_the_fix() {
+        let warning = memory_mode_retention_warning("events");
+
+        assert!(
+            warning.contains("'events'"),
+            "the warning must name the dataset: {warning}"
+        );
+        assert!(
+            warning.contains("retention_sql") && warning.contains("retention_period"),
+            "the warning must name both retention settings it covers: {warning}"
+        );
+        assert!(
+            warning.contains("stay queryable"),
+            "the warning must say what the user will observe, not just what was skipped: {warning}"
+        );
+        assert!(
+            warning.contains("`mode: file`"),
+            "the warning must give the actionable fix: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs"),
+            "the warning must link the docs: {warning}"
+        );
+        assert!(
+            !warning.contains('\n'),
+            "log messages stay on one line: {warning}"
+        );
+    }
+
+    #[test]
+    fn ignored_indexes_warning_names_the_dataset_the_impact_and_the_fix() {
+        let warning = ignored_indexes_warning("events");
+
+        assert!(
+            warning.contains("'events'"),
+            "the warning must name the dataset: {warning}"
+        );
+        assert!(
+            warning.contains("does not constrain writes"),
+            "the warning must say what a `unique` entry will not do: {warning}"
+        );
+        assert!(
+            warning.contains("primary_key") && warning.contains("on_conflict"),
+            "the warning must give the actionable alternative: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs"),
+            "the warning must link the docs: {warning}"
+        );
+        assert!(
+            !warning.contains('\n'),
+            "log messages stay on one line: {warning}"
         );
     }
 
