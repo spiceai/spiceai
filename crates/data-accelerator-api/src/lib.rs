@@ -91,17 +91,121 @@ pub fn make_spice_data_directory() -> std::io::Result<()> {
 pub use runtime_acceleration::BootstrapStatus;
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 
+/// The Cayenne engine's runtime-level settings.
+///
+/// Fields are named for the `runtime.params` key they come from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CayenneRuntimeConfig {
+    /// `runtime.params.cayenne_footer_cache_mb`: how much the engine may spend on its
+    /// Vortex footer-metadata cache. `None` when the operator set none, which is distinct
+    /// from `Some(0)` — no footer cache at all.
+    pub footer_cache_mb: Option<usize>,
+}
+
+/// Runtime-level (not per-dataset) settings for one engine, at construction.
+///
+/// An engine is built by its registration constructor, which the registration slice calls
+/// with no knowledge of the engine's type. Passing the resolved settings *here* is what
+/// keeps them per-`Runtime`: an engine built for one `Runtime` cannot see another's, and
+/// there is no process-global channel to publish them through — nor a window between
+/// publishing and constructing for a concurrent build to interleave in.
+///
+/// One variant per [`Engine`], carrying that engine's own settings type rather than a
+/// shared struct of engine-prefixed fields. The set is closed because [`Engine`] is
+/// already closed; a variant that carries nothing is an engine that takes no runtime-level
+/// configuration, which is all of them but Cayenne today.
+///
+/// The payload is a struct rather than inline fields so that a `&CayenneRuntimeConfig` can
+/// be passed on: the one fallible step is getting *out* of this enum, and everything after
+/// it — including each engine's own constructor — is total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceleratorRuntimeConfig {
+    Arrow,
+    PartitionedArrow,
+    DuckDB,
+    Sqlite,
+    Turso,
+    PostgreSQL,
+    Cayenne(CayenneRuntimeConfig),
+}
+
+impl AcceleratorRuntimeConfig {
+    /// The engine these settings configure.
+    #[must_use]
+    pub fn engine(&self) -> Engine {
+        match self {
+            Self::Arrow => Engine::Arrow,
+            Self::PartitionedArrow => Engine::PartitionedArrow,
+            Self::DuckDB => Engine::DuckDB,
+            Self::Sqlite => Engine::Sqlite,
+            Self::Turso => Engine::Turso,
+            Self::PostgreSQL => Engine::PostgreSQL,
+            Self::Cayenne(_) => Engine::Cayenne,
+        }
+    }
+
+    /// The unconfigured settings for `engine` — what an engine gets when the operator set
+    /// nothing, and what a caller building an engine only to ask it a question passes.
+    ///
+    /// The variant always matches `engine`, which is what makes
+    /// [`AcceleratorRegistration::build_with_defaults`] unable to fail in practice.
+    #[must_use]
+    pub fn default_for(engine: Engine) -> Self {
+        match engine {
+            Engine::Arrow => Self::Arrow,
+            Engine::PartitionedArrow => Self::PartitionedArrow,
+            Engine::DuckDB => Self::DuckDB,
+            Engine::Sqlite => Self::Sqlite,
+            Engine::Turso => Self::Turso,
+            Engine::PostgreSQL => Self::PostgreSQL,
+            Engine::Cayenne => Self::Cayenne(CayenneRuntimeConfig::default()),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
     pub engine: Engine,
-    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+    /// Builds the engine from settings that must be [`Engine`]-matched to `engine`.
+    ///
+    /// Fallible because the registration slice stores one function type for every engine,
+    /// so a mismatched variant cannot be rejected at compile time. Call it through
+    /// [`AcceleratorEngineRegistry::register_all`] or
+    /// [`AcceleratorRegistration::build_with_defaults`], both of which choose the config by
+    /// engine and so cannot mismatch.
+    pub constructor: fn(&AcceleratorRuntimeConfig) -> Result<Arc<dyn DataAccelerator>>,
 }
 
 impl AcceleratorRegistration {
-    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+    pub const fn new(
+        engine: Engine,
+        constructor: fn(&AcceleratorRuntimeConfig) -> Result<Arc<dyn DataAccelerator>>,
+    ) -> Self {
         Self {
             engine,
             constructor,
+        }
+    }
+
+    /// Builds this engine with no runtime-level settings, for a caller that only wants to
+    /// ask it a question — what it makes of an acceleration, what parameters it accepts.
+    ///
+    /// Returns `None` only if the constructor rejects
+    /// [`AcceleratorRuntimeConfig::default_for`] of its own engine, which it cannot; the
+    /// case is logged rather than propagated so that asking an engine a question needs no
+    /// error handling.
+    #[must_use]
+    pub fn build_with_defaults(&self) -> Option<Arc<dyn DataAccelerator>> {
+        match (self.constructor)(&AcceleratorRuntimeConfig::default_for(self.engine)) {
+            Ok(accelerator) => Some(accelerator),
+            Err(error) => {
+                tracing::error!(
+                    "Failed to prepare the '{}' accelerator engine, so Spice cannot determine how it handles an acceleration and datasets using `engine: {}` may not load. Cause: {error}. This is an internal error, not a configuration mistake — please report it at https://github.com/spiceai/spiceai/issues",
+                    self.engine,
+                    self.engine
+                );
+                None
+            }
         }
     }
 }
@@ -158,6 +262,20 @@ fn format_engine_list(names: &[String]) -> String {
 /// register_data_accelerator!(Engine::Foo, FooAccelerator);
 /// ```
 ///
+/// # Example (configured form)
+///
+/// For an engine that takes a runtime-level setting at construction. It must implement
+/// `from_runtime_config(&AcceleratorRuntimeConfig) -> Self`; the simple forms above call
+/// `new()` and ignore the configuration.
+///
+/// ```ignore
+/// register_data_accelerator!(configured: Engine::Foo, Foo, FooAccelerator);
+/// ```
+///
+/// The middle argument is the [`AcceleratorRuntimeConfig`] variant carrying this engine's
+/// settings; the accelerator must implement
+/// `from_runtime_config(&FooRuntimeConfig) -> Self`.
+///
 /// # Example (explicit form)
 ///
 /// ```ignore
@@ -174,8 +292,33 @@ fn format_engine_list(names: &[String]) -> String {
 #[macro_export]
 macro_rules! register_data_accelerator {
     ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
-        fn $fn_name() -> ::std::sync::Arc<dyn $crate::DataAccelerator> {
-            ::std::sync::Arc::new(<$accelerator>::new())
+        fn $fn_name(
+            _config: &$crate::AcceleratorRuntimeConfig,
+        ) -> $crate::Result<::std::sync::Arc<dyn $crate::DataAccelerator>> {
+            Ok(::std::sync::Arc::new(<$accelerator>::new()))
+        }
+
+        #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::AcceleratorRegistration =
+            $crate::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    (configured: $fn_name:ident, $static_name:ident, $engine:expr, $variant:ident, $accelerator:path) => {
+        fn $fn_name(
+            config: &$crate::AcceleratorRuntimeConfig,
+        ) -> $crate::Result<::std::sync::Arc<dyn $crate::DataAccelerator>> {
+            // The only fallible step: once the engine's own settings are in hand, building
+            // it is total, and that `&`-reference is what gets passed on.
+            match config {
+                $crate::AcceleratorRuntimeConfig::$variant(engine_config) => Ok(
+                    ::std::sync::Arc::new(<$accelerator>::from_runtime_config(engine_config)),
+                ),
+                mismatched => $crate::MismatchedEngineConfigSnafu {
+                    expected: $engine,
+                    actual: mismatched.engine(),
+                }
+                .fail(),
+            }
         }
 
         #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
@@ -189,6 +332,19 @@ macro_rules! register_data_accelerator {
                 [<__register_data_accelerator_fn_ $accelerator:snake>],
                 [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
                 $engine,
+                $accelerator
+            );
+        }
+    };
+
+    (configured: $engine:expr, $variant:ident, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                configured:
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $variant,
                 $accelerator
             );
         }
@@ -211,6 +367,12 @@ pub enum Error {
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    // Worded as the cause clause it appears as: the messages that embed it supply the
+    // impact and where to report it. Reaching this means a caller paired an engine's
+    // registration with another engine's settings, which every path here chooses by engine.
+    #[snafu(display("the {expected} engine was given {actual} configuration"))]
+    MismatchedEngineConfig { expected: Engine, actual: Engine },
 }
 
 #[derive(Debug, Snafu)]
@@ -1152,14 +1314,16 @@ fn accelerator_for_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
     DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .find(|registration| registration.engine == engine)
-        .map(|registration| (registration.constructor)())
+        // Built only to ask it about an acceleration, so it takes no runtime-level settings.
+        .and_then(AcceleratorRegistration::build_with_defaults)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none, format_engine_list,
-        get_primary_keys_from_constraints, upsert_dedup::extract_upsert_options,
+        AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
+        cayenne_pk_conflict_detection_none, format_engine_list, get_primary_keys_from_constraints,
+        upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{Constraint, Constraints, TableReference};
@@ -1397,5 +1561,31 @@ mod tests {
             format_engine_list(&[]),
             "none — this build links no accelerator engine"
         );
+    }
+
+    /// The property that keeps a mismatched configuration unreachable: the defaults for an
+    /// engine are that engine's own variant, so `register_all` and `build_with_defaults`
+    /// — which both select by engine — cannot hand a constructor another engine's settings.
+    ///
+    /// Listing the engines here is enough without an exhaustiveness guard: adding an
+    /// `Engine` variant fails to compile in `default_for`, and adding a config variant
+    /// fails to compile in `engine`.
+    #[test]
+    fn the_default_config_for_an_engine_is_that_engines_own_variant() {
+        for engine in [
+            Engine::Arrow,
+            Engine::PartitionedArrow,
+            Engine::DuckDB,
+            Engine::Sqlite,
+            Engine::Turso,
+            Engine::PostgreSQL,
+            Engine::Cayenne,
+        ] {
+            assert_eq!(
+                AcceleratorRuntimeConfig::default_for(engine).engine(),
+                engine,
+                "default_for({engine}) must produce the {engine} variant"
+            );
+        }
     }
 }
