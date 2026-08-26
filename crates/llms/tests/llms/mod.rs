@@ -584,7 +584,9 @@ async fn test_tool_use(
 #[tokio::test]
 async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
     // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic: `temperature` and
-    // `top_p` pass through, and `top_logprobs` becomes Anthropic's `top_k`.
+    // `top_p` pass through, and `top_logprobs` becomes Anthropic's `top_k`. That last translation
+    // is between unrelated parameters and is itself a defect (#13581) — this asserts only that the
+    // default model accepts what the converter currently sends, not that it should send it.
     for (control, value) in [
         ("temperature", json!(0.5)),
         ("top_p", json!(0.9)),
