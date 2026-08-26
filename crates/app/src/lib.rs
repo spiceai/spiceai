@@ -41,7 +41,6 @@ use spicepod::{
     },
     extension::Extension,
 };
-use util::in_tracing_context;
 
 pub mod runtime;
 
@@ -207,28 +206,22 @@ impl AppBuilder {
     #[must_use]
     pub fn with_spicepod_dependency(mut self, mut spicepod: Spicepod) -> AppBuilder {
         if spicepod.runtime != Runtime::default() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. runtime configuration from dependency will be ignored."
-                );
-            });
+            tracing::warn!(
+                "Spicepod dependency has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. runtime configuration from dependency will be ignored."
+            );
         }
         spicepod.runtime = self.runtime.clone();
 
         if spicepod.management.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency has 'management' field(s) defined. Management configuration must be set in primary spicepod. management configuration from dependency will be ignored."
-                );
-            });
+            tracing::warn!(
+                "Spicepod dependency has 'management' field(s) defined. Management configuration must be set in primary spicepod. management configuration from dependency will be ignored."
+            );
         }
         spicepod.management = None;
         if spicepod.snapshots.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. snapshots configuration from dependency will be ignored."
-                );
-            });
+            tracing::warn!(
+                "Spicepod dependency has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. snapshots configuration from dependency will be ignored."
+            );
         }
         spicepod.snapshots = None;
         self = self.with_spicepod(spicepod);
@@ -482,27 +475,21 @@ impl AppBuilder {
             }
 
             if dependent_spicepod.runtime != Runtime::default() {
-                in_tracing_context(|| {
-                    tracing::warn!(
-                        "Spicepod dependency '{dependency}' has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. '{dependency}' runtime configuration will be ignored."
-                    );
-                });
+                tracing::warn!(
+                    "Spicepod dependency '{dependency}' has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. '{dependency}' runtime configuration will be ignored."
+                );
             }
 
             if dependent_spicepod.management.is_some() {
-                in_tracing_context(|| {
-                    tracing::warn!(
-                        "Spicepod dependency '{dependency}' has 'management' field(s) defined. Management configuration must be set in primary spicepod. '{dependency}' management configuration will be ignored."
-                    );
-                });
+                tracing::warn!(
+                    "Spicepod dependency '{dependency}' has 'management' field(s) defined. Management configuration must be set in primary spicepod. '{dependency}' management configuration will be ignored."
+                );
             }
 
             if dependent_spicepod.snapshots.is_some() {
-                in_tracing_context(|| {
-                    tracing::warn!(
-                        "Spicepod dependency '{dependency}' has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. '{dependency}' snapshots configuration will be ignored."
-                    );
-                });
+                tracing::warn!(
+                    "Spicepod dependency '{dependency}' has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. '{dependency}' snapshots configuration will be ignored."
+                );
             }
 
             spicepods.push(dependent_spicepod);
