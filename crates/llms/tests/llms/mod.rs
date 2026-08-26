@@ -559,3 +559,37 @@ async fn test_tool_use(
 
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }
+
+/// TEMPORARY PROBE — not for merge. Asks the live Anthropic API whether the new default model
+/// accepts the sampling controls this adapter forwards, one control at a time, and reports the
+/// answer instead of asserting it.
+#[rstest]
+#[case::temperature_only(json!({"temperature": 0.5}))]
+#[case::top_p_only(json!({"top_p": 0.9}))]
+#[case::temperature_and_top_p(json!({"temperature": 0.5, "top_p": 0.9}))]
+#[case::top_logprobs_as_top_k(json!({"top_logprobs": 5}))]
+#[tokio::test]
+async fn probe_default_model_sampling_controls(#[case] extra: serde_json::Value) {
+    let _guard = init_tracing(None);
+    let mut body = json!({
+        "model": "not_needed",
+        "messages": [{"role": "user", "content": "pong"}],
+        "max_completion_tokens": 16,
+    });
+    let (Some(body_map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) else {
+        panic!("probe bodies are objects");
+    };
+    for (key, value) in extra_map {
+        body_map.insert(key.clone(), value.clone());
+    }
+    let label = extra.to_string();
+
+    let req: CreateChatCompletionRequest =
+        serde_json::from_value(body).expect("failed to create request");
+    let model = create::create_anthropic(None).expect("failed to create anthropic model");
+
+    match model.chat_request(req).await {
+        Ok(_) => eprintln!("PROBE_RESULT ACCEPTED {label}"),
+        Err(e) => eprintln!("PROBE_RESULT REJECTED {label} -> {e:?}"),
+    }
+}
