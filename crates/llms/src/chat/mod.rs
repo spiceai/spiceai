@@ -43,9 +43,9 @@ use async_openai::types::chat::{
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::{clear_distributed_env, configure_distributed};
-#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::{clear_distributed_env, configure_distributed};
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
