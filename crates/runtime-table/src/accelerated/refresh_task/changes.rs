@@ -648,12 +648,16 @@ pub struct CdcSchemaEvolution {
 /// widens under it. Pure so the wording — which is the operator's only account of why
 /// the dataset stopped — is asserted in a test rather than only read in review.
 ///
-/// `mode: file_update` is the one configuration a restart does repair, and it is named
-/// rather than detected: `recreates_on_schema_mismatch` is true for it whatever the
-/// engine or the partitioning, so registration drops the acceleration and recreates it
-/// against the new schema instead of asking the engine to evolve in place. Every other
-/// mode re-classifies on restart and refuses again, so pointing all of them at a restart
-/// would send an operator round a loop that cannot terminate.
+/// `mode: file` is the one configuration a restart does not repair: it reopens the stored
+/// table with its partition children intact, so registration re-classifies and refuses
+/// again — pointing it at a restart would send an operator round a loop that cannot
+/// terminate. The other three modes each come back rebuilt against the new schema, by
+/// different routes: `file_update` because `recreates_on_schema_mismatch` is true for it
+/// whatever the engine or the partitioning, so registration drops the acceleration and
+/// recreates it instead of asking the engine to evolve in place; `file_create` because the
+/// accelerator deletes the data directory and its metastore slice at bootstrap; and
+/// `memory` because nothing was persisted to reopen. Sending those three to the manual
+/// remedy would cost an operator a needless drop and recreate.
 // Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
 // otherwise this is dead code on Windows and `-D warnings` fails the build there.
 #[cfg(not(windows))]
@@ -664,9 +668,10 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
          rather than applied lossily. No part of the batch was applied and the source keeps its position, \
          so the acceleration still holds every row it held before it. \
-         Under `mode: file_update`, restart Spice to apply it: the acceleration is dropped and recreated against the new schema. \
-         Under any other mode a restart refuses again — drop and recreate the dataset against the new source schema, \
-         dropping `partition_by` in the same change if partitioning is no longer wanted. \
+         Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
+         rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
+         Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
+         new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
          Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
          the partition children the rows were written to, and changing that setting recreates nothing, so the acceleration \
          would come back holding none of them. \
@@ -4388,12 +4393,19 @@ mod tests {
              'the source keeps its position' a safe outcome rather than a partial mutation: {msg}"
         );
         assert!(
-            msg.contains("`mode: file_update`") && msg.contains("restart Spice to apply it"),
-            "restart is the cheapest remedy in `mode: file_update` and must be offered: {msg}"
+            msg.contains("`mode: file_update`")
+                && msg.contains("`mode: file_create`")
+                && msg.contains("`mode: memory`")
+                && msg.contains("restart Spice to apply it"),
+            "restart is the cheapest remedy in every mode that does not reopen a stored table, and \
+             all three must be offered it — `file_update` recreates, `file_create` starts from an \
+             empty directory, `memory` never persisted one: {msg}"
         );
         assert!(
-            msg.contains("Under any other mode a restart refuses again"),
-            "every other mode must be told a restart does not help, or the operator loops: {msg}"
+            msg.contains("Under `mode: file` a restart reopens the stored table and refuses again"),
+            "`mode: file` is the only mode a restart does not repair, and it must be told so or the \
+             operator loops; naming the others here instead would send them to a needless drop and \
+             recreate: {msg}"
         );
         assert!(
             msg.contains("drop and recreate the dataset"),
