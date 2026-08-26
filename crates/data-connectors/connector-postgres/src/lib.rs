@@ -30,6 +30,7 @@ use data_components::inferred_schema::{
 use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
+    write_back::WriteBackDeliverer,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -57,6 +58,50 @@ use std::sync::Arc;
 
 mod connection;
 mod replication;
+mod write_back;
+
+/// Per-dataset outstanding-write-back-transaction registries, keyed by dataset
+/// name. See [`Postgres::write_back_registries`] for why each value is its own
+/// single-flight cell.
+///
+/// The cell caches a `Result`, not just the `Arc<XidRegistry>`: a single setup
+/// attempt is made per dataset for the life of this connector instance, and
+/// its outcome — success *or* failure — is terminal. `changes_stream` and
+/// `write_back_deliverer` both resolve the registry through this same cell
+/// (see [`Postgres::write_back_xid_registry`]), so whichever of them asks
+/// first decides the outcome for both; neither can independently retry a
+/// failed attempt and observe a different result than the other.
+type WriteBackRegistries = Arc<
+    tokio::sync::Mutex<
+        HashMap<
+            String,
+            Arc<
+                tokio::sync::OnceCell<
+                    std::result::Result<
+                        Arc<data_components::postgres_replication::XidRegistry>,
+                        CachedRegistryError,
+                    >,
+                >,
+            >,
+        >,
+    >,
+>;
+
+/// A durable-write-back xid registry setup failure, cached in the dataset's
+/// single-flight cell (see [`WriteBackRegistries`]) so every caller that
+/// consults the cell after the first observes the same terminal outcome,
+/// rather than a later, independent attempt silently succeeding where the
+/// first one failed.
+#[derive(Debug, Clone)]
+struct CachedRegistryError(Arc<str>);
+
+impl std::fmt::Display for CachedRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CachedRegistryError {}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -71,6 +116,17 @@ pub struct Postgres {
     params: Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
+    /// Per-dataset outstanding-write-back-transaction registries, cached so the
+    /// delivery path (`write_back_deliverer`) and the CDC pump (`changes_stream`)
+    /// share the **same** `Arc` for a dataset — the deliverer registers each xid,
+    /// the pump drops its echo. Loaded (and startup-garbage-collected) once, on
+    /// whichever path first asks. Keyed by dataset name.
+    ///
+    /// Each value is its own single-flight cell: the outer mutex is held only
+    /// long enough to get-or-insert a dataset's cell, never across the load/GC
+    /// I/O that initializes it, so one dataset's slow or unavailable connection
+    /// cannot serialize every other dataset's setup behind this connector.
+    write_back_registries: WriteBackRegistries,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -299,6 +355,7 @@ impl DataConnectorFactory for PostgresFactory {
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
+                        write_back_registries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                     }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
@@ -1006,6 +1063,170 @@ fn durable_write_back_on_conflict(dataset: &DatasetSpec) -> Option<OnConflict> {
     Some(OnConflict::Upsert(ColumnReference::new(columns)))
 }
 
+impl Postgres {
+    /// The dataset's outstanding-write-back-transaction registry: `None` when the
+    /// dataset does not deliver durable write-back, `Some(Err(_))` when it does but
+    /// the registry could not be set up, `Some(Ok(_))` otherwise.
+    ///
+    /// Loaded once and cached, so the delivery path and the CDC pump share the
+    /// **same** `Arc`: the deliverer registers each write-back xid into it and the
+    /// pump reads it to drop the matching echo. Garbage collection runs on the
+    /// first load, before the registry is handed to either path, and then
+    /// periodically for the life of the registry (see
+    /// [`replication::spawn_write_back_registry_reconciliation`]).
+    ///
+    /// The single setup attempt's outcome is terminal for the life of this
+    /// connector instance, success or failure: the underlying `OnceCell` caches
+    /// a `Result`, not just the success value, so a call made after a failed one
+    /// observes that same failure rather than re-running setup and possibly
+    /// succeeding. Without this, `changes_stream` and `write_back_deliverer` —
+    /// which each call this independently — could disagree: one seeing the
+    /// original failure and declining to run, the other seeing a later, retried
+    /// success and wiring up delivery with a registry that the changes stream
+    /// never got to consult for echo filtering.
+    async fn write_back_xid_registry(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<Result<Arc<data_components::postgres_replication::XidRegistry>, CachedRegistryError>>
+    {
+        // Only a durable-write-back dataset registers xids; every other dataset
+        // gets no registry (and so no echo filtering).
+        durable_write_back_on_conflict(dataset)?;
+
+        // Get (or create) this dataset's single-flight cell and release the map
+        // lock immediately — the load-and-GC I/O below must not run while holding
+        // it, or one dataset's slow or unavailable connection would serialize
+        // every other dataset's initialization behind this connector.
+        let key = dataset.name.to_string();
+        let cell = {
+            let mut cache = self.write_back_registries.lock().await;
+            Arc::clone(
+                cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+
+        let result = cell
+            .get_or_init(|| async {
+                let init: std::result::Result<
+                    Arc<data_components::postgres_replication::XidRegistry>,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > = async {
+                    let registry =
+                        replication::load_write_back_xid_registry(&self.params, dataset, context)
+                            .await?;
+                    // Reconcile stale entries against the source before the registry
+                    // is shared. A failure here must not activate an unvalidated
+                    // registry for either the delivery path or the pump — it aborts
+                    // initialization. That outcome is cached below like any other,
+                    // so a later call observes the same failure rather than
+                    // retrying and possibly activating an unvalidated registry.
+                    replication::run_write_back_registry_gc(
+                        &self.pool,
+                        &self.params,
+                        dataset,
+                        context,
+                        &registry,
+                    )
+                    .await?;
+                    // Startup reconciliation alone would leave an ambiguously-failed,
+                    // actually-aborted delivery's entry unpruned for the life of the
+                    // process; repeat it periodically. Spawned only here, on the
+                    // single successful initialization of this dataset's cell.
+                    replication::spawn_write_back_registry_reconciliation(
+                        &self.pool,
+                        dataset.name.to_string(),
+                        &registry,
+                    );
+                    Ok(registry)
+                }
+                .await;
+                // Cache the outcome, not just the success: this closure runs at
+                // most once per dataset for the life of the connector, so both
+                // callers below see the same terminal result.
+                init.map_err(|e| CachedRegistryError(Arc::from(e.to_string())))
+            })
+            .await;
+        Some(result.clone())
+    }
+}
+
+/// Build the connector-owned durable write-back deliverer for a dataset already
+/// confirmed to need one (`on_conflict` resolved). Every step here opens a
+/// connection or reads source state, so a failure is surfaced rather than
+/// swallowed: silently falling back to the `TableProvider` path for a durable
+/// write-back dataset would commit writes without registering their xids and
+/// reopen the double-apply window this feature exists to close.
+///
+/// # Errors
+///
+/// Returns an error if a setup connection cannot be opened, the source server
+/// version or schema cannot be read, or the change-echo suppression registry
+/// cannot be loaded.
+async fn build_write_back_deliverer(
+    postgres: &Postgres,
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+    on_conflict: OnConflict,
+) -> DataConnectorResult<Arc<dyn WriteBackDeliverer>> {
+    let connector_component = ConnectorComponent::from(dataset);
+    let setup_error = |source: Box<dyn std::error::Error + Send + Sync>| {
+        DataConnectorError::UnableToGetWriteBackDeliverer {
+            dataconnector: "postgres".to_string(),
+            connector_component: connector_component.clone(),
+            source,
+        }
+    };
+
+    // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
+    // PG10–12 equivalent. Read the server version at setup so delivery does
+    // not re-decide per pass.
+    let conn = postgres.pool.connect_direct().await.map_err(&setup_error)?;
+    let server_version_num: i32 = conn
+        .conn
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+        .map_err(|e| setup_error(Box::new(e)))?
+        .get(0);
+    let xid_fn = write_back::XidFunction::from(server_version_num);
+
+    // The source table schema, for the upsert leg's conflict target and for
+    // casting each accelerator batch onto it. Same schema the read provider
+    // reports.
+    let schema = postgres
+        .factory
+        .table_provider(dataset.path().into())
+        .await
+        .map_err(setup_error)?
+        .schema();
+
+    // The same `Arc` the CDC pump reads for its echo filter (cached, loaded once
+    // per dataset): the deliverer registers each xid, the pump drops its echo.
+    // `on_conflict` being resolved already guarantees this dataset needs one, so
+    // `None` here would be an internal inconsistency, not a legitimate outcome.
+    let registry = postgres
+        .write_back_xid_registry(context, dataset)
+        .await
+        .ok_or_else(|| {
+            setup_error(Box::from(
+                "durable write-back xid registry unexpectedly unavailable for a dataset that requires one",
+            ))
+        })?
+        .map_err(|e| setup_error(Box::new(e)))?;
+
+    let deliverer = Arc::new(write_back::PostgresWriteBackDeliverer::new(
+        Arc::clone(&postgres.pool),
+        dataset.path().into(),
+        schema,
+        on_conflict,
+        registry,
+        xid_fn,
+    ));
+    Ok(deliverer as Arc<dyn WriteBackDeliverer>)
+}
+
 #[async_trait]
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
@@ -1027,6 +1248,18 @@ impl DataConnector for Postgres {
         // dataset is rejected with an actionable error rather than admitted here
         // and then silently never delivered.
         true
+    }
+
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<DataConnectorResult<Arc<dyn WriteBackDeliverer>>> {
+        // Only a durable-write-back dataset delivers through the connector; every
+        // other dataset keeps the worker's `TableProvider` path (returns `None`
+        // here). Checked first so a non-durable dataset never opens a connection.
+        let on_conflict = durable_write_back_on_conflict(dataset)?;
+        Some(build_write_back_deliverer(self, context, dataset, on_conflict).await)
     }
 
     async fn read_write_provider(
@@ -1139,6 +1372,30 @@ impl DataConnector for Postgres {
         dataset: &DatasetSpec,
         acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
+        // Hand the pump the same registry the delivery path registers into (only
+        // for a durable-write-back dataset), so it can drop the echo of each
+        // write-back transaction. `None` for every other dataset — nothing needs
+        // filtering. A durable-write-back dataset whose registry failed to set up
+        // must NOT fall back to an unfiltered stream — that would replay its own
+        // write-back echoes into the accelerator, the exact corruption this
+        // feature exists to prevent. No stream at all is the safe degradation:
+        // logged here. The failure is cached (see `write_back_xid_registry`), so
+        // `write_back_deliverer` sees this same outcome rather than independently
+        // retrying and wiring up delivery for a registry no changes stream ever
+        // consulted.
+        let write_back_registry = match self.write_back_xid_registry(context, dataset).await {
+            None => None,
+            Some(Ok(registry)) => Some(registry),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    error = %e,
+                    "durable write-back for dataset '{}' could not set up its change-echo suppression registry; no CDC stream is started for it this pass rather than risk replaying its own write-back echoes",
+                    dataset.name
+                );
+                return None;
+            }
+        };
         Some(
             replication::build_changes_stream(
                 &self.params,
@@ -1147,6 +1404,7 @@ impl DataConnector for Postgres {
                 federated_table,
                 Arc::clone(&self.replication_metrics),
                 acceleration,
+                write_back_registry,
             )
             .await,
         )
@@ -1749,6 +2007,87 @@ mod inferred_schema_tests {
             correlation: None,
         };
         assert_eq!(unknown.normalize(Some(10_000)).distinct_count, None);
+    }
+}
+
+#[cfg(test)]
+mod write_back_registry_cache_tests {
+    use super::CachedRegistryError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `Postgres::write_back_xid_registry` is consulted independently by
+    /// `changes_stream` and by `write_back_deliverer` (via
+    /// `build_write_back_deliverer`), through the same per-dataset
+    /// `tokio::sync::OnceCell`. This reproduces that cell's exact value type
+    /// (`Result<Arc<_>, CachedRegistryError>`) and its `get_or_init`-based
+    /// caching in isolation, to pin down the invariant the two real call
+    /// sites depend on: once the *first* attempt to set up the registry has
+    /// run, every later caller — regardless of which one asks — must observe
+    /// that same outcome.
+    ///
+    /// Before this fix, the cell was driven by `get_or_try_init`, which does
+    /// NOT cache an `Err`. A dataset whose first setup attempt failed (e.g. a
+    /// transient connection error) would have that failure re-run and
+    /// possibly succeed on the next, independent call. Concretely:
+    /// `changes_stream` could see the failure and start no CDC stream for the
+    /// dataset, while a later call from `write_back_deliverer` retried and
+    /// succeeded, wiring up write-back delivery with a registry the changes
+    /// stream never got a chance to consult — silently defeating echo
+    /// suppression. `get_or_init` over a cached `Result` closes that gap: the
+    /// closure runs at most once, so both consumers see the same terminal
+    /// result.
+    #[tokio::test]
+    async fn shared_cell_stays_consistent_across_both_consumers_after_a_failed_attempt() {
+        let cell: tokio::sync::OnceCell<Result<Arc<i32>, CachedRegistryError>> =
+            tokio::sync::OnceCell::new();
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        // The first attempt fails; a second, independent attempt (if the cell
+        // allowed one) would succeed -- standing in for a transient setup
+        // failure that would resolve on retry.
+        let init = |attempts: Arc<AtomicU32>| async move {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(CachedRegistryError(Arc::from(
+                    "simulated registry setup failure",
+                )))
+            } else {
+                Ok(Arc::new(42))
+            }
+        };
+
+        // `changes_stream`'s call resolves the cell first and observes the
+        // failure.
+        let changes_stream_view = cell
+            .get_or_init(|| init(Arc::clone(&attempts)))
+            .await
+            .clone();
+        assert!(
+            changes_stream_view.is_err(),
+            "the first attempt must fail as configured"
+        );
+
+        // `write_back_deliverer`'s call comes afterwards, against the same
+        // cell.
+        let write_back_view = cell
+            .get_or_init(|| init(Arc::clone(&attempts)))
+            .await
+            .clone();
+
+        assert_eq!(
+            changes_stream_view.is_ok(),
+            write_back_view.is_ok(),
+            "both consumers of the shared cell must observe the same terminal outcome"
+        );
+        assert!(
+            write_back_view.is_err(),
+            "a cached failure must not let a later caller observe success"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the cell must attempt setup at most once, regardless of how many callers consult it"
+        );
     }
 }
 
