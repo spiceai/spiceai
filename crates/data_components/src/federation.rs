@@ -561,6 +561,21 @@ mod tests {
         );
     }
 
+    /// The keep direction, mirroring [`assert_captured_correlation_refused`]: the
+    /// correlation is not captured, so the join still renders as a pushed-down
+    /// `EXISTS`. Named for what it pins rather than asserted inline, so the two
+    /// directions read as one pair.
+    fn assert_exists_pushdown_kept(plan: &LogicalPlan, context: &str) {
+        let sql = federated_sql(plan);
+        assert!(sql.contains("EXISTS"), "{context}, got: {sql}");
+    }
+
+    /// Scan `name` with a schema of its own, for the shapes whose relations do
+    /// not share [`exists_fetch_fields`].
+    fn scan_named(name: &str, fields: Vec<Field>) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(name, table_source(fields), None).expect("scan should build")
+    }
+
     /// Regression test for #13277 and #12840: the correlation's only qualifier is
     /// one the subquery's own `FROM` also answers to, so the reference binds
     /// inside the body instead of to the query it was written against.
@@ -605,17 +620,13 @@ mod tests {
             .expect("project probe")
             .build()
             .expect("build probe");
-        let build = LogicalPlanBuilder::scan(
+        let build = scan_named(
             "b",
-            table_source(
-                build_columns
-                    .iter()
-                    .map(|name| Field::new(*name, DataType::Int32, false))
-                    .collect(),
-            ),
-            None,
+            build_columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, false))
+                .collect(),
         )
-        .expect("scan build")
         .build()
         .expect("build build side");
 
@@ -660,10 +671,9 @@ mod tests {
     /// projected differently.
     #[test]
     fn an_exists_keeps_an_unqualified_correlation_the_body_lacks() {
-        let sql = federated_sql(&an_unqualified_correlation_semi_join(&["e", "f"]));
-        assert!(
-            sql.contains("EXISTS"),
-            "a correlation no relation in the body exposes must keep its pushdown, got: {sql}"
+        assert_exists_pushdown_kept(
+            &an_unqualified_correlation_semi_join(&["e", "f"]),
+            "a correlation no relation in the body exposes must keep its pushdown",
         );
     }
 
@@ -679,27 +689,23 @@ mod tests {
     /// about that is captured, so it has to keep rendering.
     #[test]
     fn an_exists_keeps_a_correlation_no_relation_in_the_body_answers_to() {
-        let build = LogicalPlanBuilder::scan(
+        let build = scan_named(
             "orders",
-            table_source(vec![
+            vec![
                 Field::new("o_orderkey", DataType::Int32, false),
                 Field::new("o_custkey", DataType::Int32, false),
-            ]),
-            None,
+            ],
         )
-        .expect("scan orders")
         .build()
         .expect("build orders");
 
-        let plan = LogicalPlanBuilder::scan(
+        let plan = scan_named(
             "customer",
-            table_source(vec![
+            vec![
                 Field::new("c_custkey", DataType::Int32, false),
                 Field::new("c_phone", DataType::Utf8, false),
-            ]),
-            None,
+            ],
         )
-        .expect("scan customer")
         .project(vec![col("customer.c_phone")])
         .expect("project")
         .join_on(
@@ -711,11 +717,10 @@ mod tests {
         .build()
         .expect("build plan");
 
-        let sql = federated_sql(&plan);
-        assert!(
-            sql.contains("EXISTS"),
+        assert_exists_pushdown_kept(
+            &plan,
             "a correlation the body neither answers to nor exposes a column for must keep \
-             its pushdown, got: {sql}"
+             its pushdown",
         );
     }
 }
