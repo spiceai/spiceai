@@ -47,15 +47,15 @@ use reqwest::{
 };
 use runtime_rate_control::{Permit, RateController};
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
     borrow::ToOwned,
     fmt,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::Instant,
     time::{Duration, SystemTime},
 };
-use tokio::sync::RwLock;
 use url::Url;
 use util::{
     RetryError, format_datafusion_error, retry,
@@ -329,10 +329,33 @@ impl Default for PaginationConfig {
     }
 }
 
+/// The cache directives an origin sent, kept apart from the retention decision
+/// so "the origin said nothing" is distinguishable from "the origin said zero" —
+/// only the former may fall back to a locally configured TTL.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CacheDirectives {
+    /// Whether a `Cache-Control` header was present at all.
+    present: bool,
+    max_age: Option<Duration>,
+    /// Whether anything the origin sent forbids retention. Set by `no-store`,
+    /// `no-cache` and `private`, and also where the origin's intent cannot be
+    /// read at all — an unreadable field, an unparseable or conflicting
+    /// `max-age` — because this path resolves ambiguity against caching. Named
+    /// for what it decides rather than for the one directive that most often
+    /// sets it.
+    forbid_retention: bool,
+    /// `s-maxage`, which overrides `max-age` for a shared cache and is what this
+    /// one is: entries are keyed by request shape and served to whichever query
+    /// asks next, not held per end user.
+    shared_max_age: Option<Duration>,
+}
+
 #[derive(Clone)]
 struct CachedResponse {
     content: Arc<String>,
-    cached_at: SystemTime,
+    /// How long this response may be retained, resolved at admission from the
+    /// origin's directives. The cache expires the entry against this; nothing
+    /// here re-checks it.
     max_age: Duration,
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
@@ -341,12 +364,181 @@ struct CachedResponse {
 }
 
 impl CachedResponse {
-    fn is_fresh(&self) -> bool {
-        self.cached_at
-            .elapsed()
-            .ok()
-            .is_some_and(|elapsed| elapsed < self.max_age)
+    /// Bytes this entry keeps alive, for the cache's byte budget.
+    ///
+    /// The body dominates; the rest is counted so a response with many headers
+    /// and a tiny body is not billed as free.
+    fn retained_bytes(&self) -> usize {
+        // Capacities rather than lengths, and the containers as well as their
+        // contents: a `Vec` of many short headers is dominated by the tuples
+        // themselves, not by the text, so charging only the text can understate
+        // a header-heavy response by more than half. What stays outside is the
+        // cache backend's own per-entry node, which belongs to the backend.
+        std::mem::size_of::<Self>()
+            + self.content.capacity()
+            + self.detected_format.as_ref().map_or(0, String::capacity)
+            + self.response_headers.capacity() * std::mem::size_of::<(String, String)>()
+            + self
+                .response_headers
+                .iter()
+                .map(|(name, value)| name.capacity() + value.capacity())
+                .sum::<usize>()
     }
+
+    /// Rebuilds the fetch result a caller sees, as it was served from here.
+    ///
+    /// The reported window is the entry's own retention rather than anything
+    /// re-derived: it is already the effective value the entry was admitted
+    /// under.
+    fn into_fetch_result(self) -> HttpFetchResult {
+        HttpFetchResult {
+            content: (*self.content).clone(),
+            directives: CacheDirectives {
+                present: true,
+                max_age: Some(self.max_age),
+                forbid_retention: false,
+                // The window carried here is already the effective one this
+                // entry was admitted under, so there is no shared/private split
+                // left to express.
+                shared_max_age: None,
+            },
+            // Zero rather than the origin's age: the window carried here is
+            // already what was left when the entry was admitted.
+            response_age: None,
+            age_measured_at: Instant::now(),
+            detected_format: self.detected_format.unwrap_or_default(),
+            response_date: self.response_date,
+            response_status: self.response_status,
+            response_headers: (*self.response_headers).clone(),
+        }
+    }
+}
+
+/// Default byte budget for [`ResponseCache`] when the dataset does not set one.
+///
+/// Deliberately modest: this cache exists to serve repeats of the *same* request
+/// inside its `max-age`, so its useful working set is small, while the cost of
+/// getting it wrong is memory that no other limit bounds.
+///
+/// Fixed rather than derived from the machine's memory, and the distinction
+/// matters: this budget is held **per dataset**, so what actually multiplies it
+/// is the number of HTTP datasets, which no per-provider derivation can see.
+/// Scaling it with total memory would look like memory accounting while still
+/// missing the term that matters, and would make the same pod behave
+/// differently on a larger host. A predictable default that a dataset can raise
+/// where it earns it is the honest version; bounding the *total* needs one
+/// budget shared across datasets, which is a larger change than a default.
+pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The connector's response cache: bounded in bytes and expiring per entry.
+///
+/// Concurrent misses for the same key are *not* collapsed into one origin
+/// request. Fetching through the cache is what would give that, and it cannot
+/// express this cache's admission rule — whether a response may be kept is only
+/// knowable from the response, while a fetch-through cache stores whatever the
+/// fetch returns.
+///
+/// Bounding is the point. The keys are request-shaped — path, query, body and
+/// headers — so on a request-keyed workload the number of distinct keys is
+/// unbounded by construction, and one entry holds an entire response body. An
+/// unbounded map of those grows with traffic for the life of the process, and it
+/// is invisible to `runtime.caching` limits because it is not one of those
+/// caches.
+///
+/// `moka` supplies both properties directly: a weigher for the byte budget, and
+/// per-entry expiry driven by each response's own retention window.
+///
+/// # Sharing boundary
+///
+/// This cache is shared across *queries* but not across *principals*, and the
+/// distinction is what keeps it clear of RFC 9111 §3.2 — the rule that a shared
+/// cache must not reuse a response to an authenticated request unless the origin
+/// permitted it with `public`, `s-maxage` or `must-revalidate`.
+///
+/// That rule exists to stop one user's authenticated response being served to
+/// another. Here there is only ever one: credentials belong to the provider,
+/// set once through [`HttpTableProvider::with_auth`], and a query cannot
+/// introduce different ones — a `request_headers` filter naming the
+/// authenticator's header is refused at planning time rather than merged into
+/// the request (see `request_headers_filter_rejects_configured_auth_header_name`).
+/// The cache's sharing boundary and the credential's scope are therefore the
+/// same object, so every entry can only be served to a request carrying the
+/// credentials that produced it.
+///
+/// A rotated `OAuth2Auth` token does not break this: it is the same principal
+/// re-authenticating. For a token's *value* to select a different
+/// representation the origin would have to say so with `Vary`, which is
+/// honoured separately and refuses retention when it names the auth header.
+///
+/// **This is a premise, not a property of the cache.** It holds only while
+/// credentials stay provider-scoped and query-time headers cannot reach the
+/// auth header. If either changes — per-request credentials, or that guard
+/// relaxed — admission has to start consulting `public` / `s-maxage` /
+/// `must-revalidate` before retaining an authenticated response.
+type ResponseCache = moka::future::Cache<CacheKey, CachedResponse>;
+
+/// Per-entry expiry taken from the retention resolved at admission.
+///
+/// Each response carries its own window — the origin's `max-age`, or a
+/// configured fallback where the origin said nothing — so a single cache-wide
+/// TTL cannot express it. Every admitted entry has a non-zero window, because
+/// a response that may not be retained is never admitted in the first place.
+struct RetainForItsOwnWindow;
+
+impl moka::Expiry<CacheKey, CachedResponse> for RetainForItsOwnWindow {
+    fn expire_after_create(
+        &self,
+        _key: &CacheKey,
+        value: &CachedResponse,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(value.max_age)
+    }
+
+    /// Replacing an entry replaces its window too.
+    ///
+    /// Without this the default keeps the *existing* expiry, so a key
+    /// re-admitted with a shorter window keeps the longer one it had — two
+    /// concurrent misses that both fetch and both insert would leave a
+    /// `max-age=1` response served for the ten minutes its predecessor was
+    /// granted.
+    fn expire_after_update(
+        &self,
+        _key: &CacheKey,
+        value: &CachedResponse,
+        _updated_at: std::time::Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(value.max_age)
+    }
+}
+
+/// What an entry costs the budget, or `None` when that cannot be represented.
+///
+/// `moka` weighs in `u32`, so an entry of 4 GiB or more cannot be charged what
+/// it holds. Such an entry is not admitted: on a cache configured larger than
+/// that, charging two 6 GiB responses 4 GiB each would let 12 GiB sit inside an
+/// 8 GiB budget.
+fn entry_weight(key: &CacheKey, value: &CachedResponse) -> Option<u32> {
+    u32::try_from(key.retained_bytes().saturating_add(value.retained_bytes())).ok()
+}
+
+/// Builds a response cache with `max_bytes` of headroom.
+///
+/// The weigher counts the key as well as the response: the key owns copies of
+/// the request's path, query, body and headers, which is not negligible beside a
+/// small response on a request-keyed workload.
+fn build_response_cache(max_bytes: usize) -> ResponseCache {
+    moka::future::Cache::builder()
+        .max_capacity(max_bytes as u64)
+        .weigher(|key: &CacheKey, value: &CachedResponse| {
+            // Saturating is a backstop, not the bound: an entry that does not fit
+            // a `u32` is refused at admission by `entry_weight`, because charging
+            // it less than it costs is how a budget silently stops holding.
+            entry_weight(key, value).unwrap_or(u32::MAX)
+        })
+        .expire_after(RetainForItsOwnWindow)
+        .build()
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -476,25 +668,19 @@ impl RequestFilterOptions {
 
 struct HttpFetchResult {
     content: String,
-    max_age: Duration,
+    /// What the origin's `Cache-Control` said. The retention decision is made by
+    /// the caller, which is where a configured fallback is in scope.
+    directives: CacheDirectives,
+    /// How long the response had already been alive when `age_measured_at` was
+    /// taken. A response relayed by an intermediary arrives part-spent.
+    response_age: Option<Duration>,
+    /// When [`Self::response_age`] was taken, so a caller deciding retention
+    /// later can bring it forward rather than treat a stale figure as current.
+    age_measured_at: Instant,
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
     response_headers: Vec<(String, String)>,
-}
-
-impl HttpFetchResult {
-    fn should_cache(&self) -> bool {
-        // We don't explicitly disable caching for 5xx responses because well-behaved servers
-        // should return Cache-Control: no-cache or max-age=0 for transient error responses.
-        // This keeps the caching logic simple and respects server-specified cache directives.
-        self.max_age.as_secs() > 0
-    }
-}
-
-enum CacheWriteMode {
-    Enabled,
-    Disabled,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -525,6 +711,18 @@ impl CacheKey {
         self.hash(&mut hasher);
         format!("http-cache-key:{:016x}", hasher.finish())
     }
+
+    /// Bytes this key keeps alive. Counted alongside the response because the
+    /// key holds owned copies of the request's path, query, body and headers —
+    /// on a request-keyed workload that is not negligible beside a small
+    /// response.
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.path.capacity()
+            + self.query.as_ref().map_or(0, String::capacity)
+            + self.body.as_ref().map_or(0, String::capacity)
+            + self.request_headers.as_ref().map_or(0, String::capacity)
+    }
 }
 
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
@@ -535,7 +733,15 @@ pub struct HttpTableProvider {
     file_format: String,
     schema: SchemaRef,
     constraints: Constraints,
-    cache: Arc<RwLock<HashMap<CacheKey, CachedResponse>>>,
+    cache: ResponseCache,
+    /// The cache's byte budget, kept beside it so a response too large to ever
+    /// fit can be turned away before it is copied.
+    cache_max_bytes: usize,
+    /// Occupancy counters, shared with whatever reports them per dataset.
+    cache_metrics: Arc<super::metrics::HttpCacheMetrics>,
+    /// Retention to apply when the origin sends no `Cache-Control` at all.
+    /// `None` means such responses are not cached, which is the default.
+    cache_fallback_ttl: Option<Duration>,
     acceleration_enabled: bool,
     retry_strategy: RetryBackoff,
     content_type: Option<String>,
@@ -587,7 +793,13 @@ impl HttpTableProvider {
             // with the same (request_path, request_query, request_body) but different content
             // (e.g., search API results). Caching mode uses filter values as cache keys instead.
             constraints: Constraints::new_unverified(vec![]),
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: build_response_cache(DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES),
+            cache_max_bytes: DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES,
+            cache_metrics: super::metrics::HttpCacheMetrics::new(),
+            // Off by default: an origin that sends no `Cache-Control` is not
+            // cached today, and turning that on silently at upgrade would start
+            // retaining responses nobody asked us to retain.
+            cache_fallback_ttl: None,
             acceleration_enabled,
             retry_strategy: RetryBackoffBuilder::new()
                 .method(BackoffMethod::Fibonacci)
@@ -645,6 +857,52 @@ impl HttpTableProvider {
     pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
         self.rate_controller = rate_controller;
         self
+    }
+
+    /// Sets the response cache's byte budget and, optionally, the retention to
+    /// apply to a response whose origin sent no `Cache-Control` at all.
+    ///
+    /// `max_bytes` of zero disables the cache. `ttl` is a fallback, not a
+    /// ceiling: it never shortens or overrides what an origin asked for, and an
+    /// origin that did send `Cache-Control` is always honoured instead —
+    /// including its refusals. Leaving it `None` keeps a header-less response
+    /// uncached, so the cache then stores nothing unless the origin sent a
+    /// positive `max-age`.
+    #[must_use]
+    pub fn with_cache_limits(self, max_bytes: usize, ttl: Option<Duration>) -> Self {
+        // Replaced rather than mutated: the budget governs a structure that has
+        // already been allocated, and anything cached before the limits were
+        // known was admitted under the wrong one.
+        Self {
+            cache: build_response_cache(max_bytes),
+            cache_max_bytes: max_bytes,
+            cache_fallback_ttl: ttl,
+            ..self
+        }
+    }
+
+    /// Publishes the cache's occupancy into the counters a metrics provider
+    /// reports from.
+    ///
+    /// Without this the cache is invisible: it is not one of the caches under
+    /// `runtime.caching`, so nothing else reports it and memory it holds shows
+    /// up only as unexplained process RSS.
+    fn record_cache_gauges(&self) {
+        self.cache_metrics
+            .record(self.cache.weighted_size(), self.cache.entry_count());
+    }
+
+    /// Reports this provider's cache occupancy into `metrics`.
+    ///
+    /// The counters are owned by the caller rather than handed out from here,
+    /// because the thing that publishes them is registered against the dataset
+    /// before the table provider exists.
+    #[must_use]
+    pub fn with_cache_metrics(self, metrics: Arc<super::metrics::HttpCacheMetrics>) -> Self {
+        Self {
+            cache_metrics: metrics,
+            ..self
+        }
     }
 
     /// Configure JSON schema decomposition. Replaces the provider's
@@ -1081,21 +1339,156 @@ impl HttpTableProvider {
         }
     }
 
-    fn parse_cache_control(cache_control_header: Option<&str>) -> Duration {
-        let mut max_age = Duration::from_secs(0);
+    /// The single-field form, for tests that are not about repetition.
+    ///
+    /// The fetch path reads every `Cache-Control` field the response carried, so
+    /// this exists only to keep those tests legible.
+    #[cfg(test)]
+    fn parse_cache_control(cache_control_header: Option<&str>) -> CacheDirectives {
+        Self::parse_cache_control_values(cache_control_header.map(Some).into_iter())
+    }
 
-        if let Some(header) = cache_control_header {
+    /// Reads the directives from every `Cache-Control` field the response
+    /// carried.
+    ///
+    /// HTTP allows the header to be repeated, and the repeats are as binding as
+    /// a single combined one: reading only the first would admit a response that
+    /// sent `max-age` there and `no-store` in the next field. A `None` item is a
+    /// field whose bytes are not valid text — the origin spoke and we could not
+    /// read it, which is treated as a refusal rather than as silence, because
+    /// the alternative is to fall back to a locally configured TTL on a response
+    /// that may well have said `no-store`.
+    fn parse_cache_control_values<'a>(
+        values: impl Iterator<Item = Option<&'a str>>,
+    ) -> CacheDirectives {
+        let mut directives = CacheDirectives::default();
+
+        for value in values {
+            directives.present = true;
+            let Some(header) = value else {
+                directives.forbid_retention = true;
+                continue;
+            };
             for directive in header.split(',') {
-                let directive = directive.trim();
-                if let Some(value) = directive.strip_prefix("max-age=")
-                    && let Ok(seconds) = value.parse::<u64>()
+                // Directive *names* are case-insensitive, so they are compared
+                // that way; splitting name from value also absorbs whitespace
+                // around the `=` without a second prefix to try.
+                let (name, value) = match directive.split_once('=') {
+                    Some((name, value)) => (name.trim(), Some(value.trim())),
+                    None => (directive.trim(), None),
+                };
+
+                // A freshness directive is usable only if it carries a value we
+                // can read and has not already been given. A missing value, an
+                // unreadable one, or a second one leaves the origin's intent
+                // ambiguous, and ambiguity refuses: `max-age=0, max-age=600`
+                // must not be resolved in favour of ten minutes, and leaving it
+                // simply unset would let a configured fallback stand in for a
+                // directive the origin did send.
+                if name.eq_ignore_ascii_case("max-age") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.max_age.is_none() => {
+                            directives.max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
+                            directives.max_age = None;
+                            directives.forbid_retention = true;
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("s-maxage") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.shared_max_age.is_none() => {
+                            directives.shared_max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
+                            directives.shared_max_age = None;
+                            directives.forbid_retention = true;
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
+                    // `private` marks a response as belonging to one end user.
+                    // This cache is keyed by request shape and serves whichever
+                    // query asks next, which is exactly the reuse `private`
+                    // exists to forbid.
+                    || name.eq_ignore_ascii_case("private")
                 {
-                    max_age = Duration::from_secs(seconds);
+                    directives.forbid_retention = true;
                 }
             }
         }
 
-        max_age
+        directives
+    }
+
+    /// How long a response may be retained, or `None` when it must not be
+    /// cached at all.
+    ///
+    /// The origin decides first and its refusal is absolute: `no-store` and
+    /// `no-cache` win over everything, including a `max-age` sent alongside
+    /// them, and over any locally configured fallback. Only when the origin
+    /// said nothing at all does `fallback_ttl` apply — and it is `None` by
+    /// default, so a header-less origin stays uncached unless an operator asks
+    /// for it.
+    fn effective_retention(
+        directives: &CacheDirectives,
+        fallback_ttl: Option<Duration>,
+        response_age: Option<Duration>,
+    ) -> Option<Duration> {
+        if directives.forbid_retention {
+            return None;
+        }
+        // `s-maxage` is the window addressed to shared caches, and outranks
+        // `max-age` where both were sent: an origin that says
+        // `s-maxage=0, max-age=600` is telling this cache not to reuse the
+        // response at all while allowing a private one ten minutes.
+        match directives.shared_max_age.or(directives.max_age) {
+            // `max-age` is measured from when the origin generated the response,
+            // not from when it reached us, so what may be retained is the part
+            // that has not already elapsed. A response relayed with `Age: 599`
+            // against `max-age: 600` has a second left, and keeping it for the
+            // full window would serve it stale for the rest.
+            Some(max_age) if max_age.as_secs() > 0 => {
+                let remaining = max_age.saturating_sub(response_age.unwrap_or(Duration::ZERO));
+                (!remaining.is_zero()).then_some(remaining)
+            }
+            // A `Cache-Control` that carried no usable `max-age` is still the
+            // origin having spoken, so the local fallback does not step in.
+            Some(_) => None,
+            None if directives.present => None,
+            // The fallback is not reduced by `Age`: it is how long the operator
+            // asked us to keep a response the origin said nothing about, rather
+            // than a claim about how fresh the origin considered it.
+            //
+            // A zero fallback is a configured refusal to retain, not a window
+            // of no length: returning it would admit an entry that is expired
+            // on arrival but still occupies the byte budget.
+            None => fallback_ttl.filter(|ttl| !ttl.is_zero()),
+        }
+    }
+
+    /// How old a response already was when it arrived (RFC 9111 §4.2.3).
+    ///
+    /// `Age` counts from when the origin generated the response, so the wait for
+    /// it to arrive is added to that figure — but *not* to the age its `Date`
+    /// implies, which is measured on arrival and already contains that wait.
+    /// Adding the wait to both charges it twice and turns away short-lived
+    /// responses that are still fresh. The greater of the two is taken, so an
+    /// origin that declares an `Age` smaller than its own `Date` implies does
+    /// not get the benefit of the smaller figure.
+    ///
+    /// Saturating, because `Age` is untrusted response data: a value near
+    /// `u64::MAX` would otherwise overflow the addition and panic.
+    fn age_on_arrival(
+        header_age: Option<Duration>,
+        apparent_age: Duration,
+        response_delay: Duration,
+    ) -> Duration {
+        apparent_age.max(
+            header_age
+                .unwrap_or_default()
+                .saturating_add(response_delay),
+        )
     }
 
     /// Detect file format from Content-Type header, path extension, or content
@@ -1235,29 +1628,6 @@ impl HttpTableProvider {
         }
     }
 
-    async fn cache_response(
-        &self,
-        path: &str,
-        query: Option<&str>,
-        body: Option<&str>,
-        request_headers: Option<&str>,
-        result: &HttpFetchResult,
-    ) {
-        let cache_key = Self::get_cache_key(path, query, body, request_headers);
-        let cached_response = CachedResponse {
-            content: Arc::new(result.content.clone()),
-            cached_at: SystemTime::now(),
-            max_age: result.max_age,
-            detected_format: Some(result.detected_format.clone()),
-            response_date: result.response_date,
-            response_status: result.response_status,
-            response_headers: Arc::new(result.response_headers.clone()),
-        };
-
-        let mut cache_write = self.cache.write().await;
-        cache_write.insert(cache_key, cached_response);
-    }
-
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1350,6 +1720,14 @@ impl HttpTableProvider {
             .await
             .map_err(RetryError::transient)?;
 
+        // The freshness window is spent from the moment the origin generated the
+        // response, so the round trip spends it too — waiting on the origin and
+        // downloading the body alike. A `max-age=1` response that takes two
+        // seconds to arrive is stale before it lands, and timing nothing would
+        // admit it for another second. Timed per attempt, so a retry is not
+        // charged for the attempt that failed before it.
+        let attempt_started = Instant::now();
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -1416,7 +1794,14 @@ impl HttpTableProvider {
             }));
         }
 
-        let fetched = Self::extract_response(response, status_code, path_label).await?;
+        let fetched = Self::extract_response(
+            response,
+            status_code,
+            path_label,
+            attempt_started,
+            self.auth.as_ref().map(|auth| auth.header_name()),
+        )
+        .await?;
 
         // Warned only once the body is in hand. `extract_response` treats a broken read as
         // transient and the request is retried, so warning before it would claim a row on
@@ -1437,6 +1822,8 @@ impl HttpTableProvider {
         response: reqwest::Response,
         status_code: u16,
         path_label: &str,
+        attempt_started: Instant,
+        auth_header_name: Option<&HeaderName>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -1444,11 +1831,70 @@ impl HttpTableProvider {
             detected_format
         );
 
-        let cache_control_header = response
+        let mut directives = Self::parse_cache_control_values(
+            response
+                .headers()
+                .get_all(CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().ok()),
+        );
+
+        // `Vary` names what the origin selects a representation on, so an entry
+        // may only be reused for a request that matches on every named field.
+        // Retention is refused unless that can be shown:
+        //
+        // * `*` never matches a later request, whatever the key holds.
+        // * A field whose bytes are not text leaves the selection unknown, and
+        //   unknown resolves against caching here as it does elsewhere.
+        // * A field naming the authenticator's header is refused because that
+        //   value is *not* stable: an `OAuth2Auth` token is refreshed in the
+        //   background, so a later request can carry a different credential than
+        //   the one the stored representation was selected for.
+        //
+        // Any other named field is safe here, and this is the reasoning the
+        // narrowness rests on: what differs between requests is the path, query,
+        // body and the request headers a query supplies, and all four are in the
+        // cache key. The connector's remaining headers are fixed when the
+        // provider is built.
+        let auth_header = auth_header_name;
+        for value in &response.headers().get_all(reqwest::header::VARY) {
+            let Ok(value) = value.to_str() else {
+                directives.forbid_retention = true;
+                continue;
+            };
+            for field in value.split(',') {
+                let field = field.trim();
+                if field == "*"
+                    || auth_header.is_some_and(|name| field.eq_ignore_ascii_case(name.as_str()))
+                {
+                    directives.forbid_retention = true;
+                }
+            }
+        }
+
+        // What the origin declared about how much of the response's freshness
+        // was already spent. Read beside the age its `Date` implies, further
+        // down: an intermediary is required to add `Age`, but one that does not
+        // still leaves the origin's `Date` behind, and taking only `Age` there
+        // would hand a full window to a response that is already spent.
+        let header_age = response
             .headers()
-            .get(CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok());
-        let max_age = Self::parse_cache_control(cache_control_header);
+            .get(reqwest::header::AGE)
+            .and_then(|value| {
+                let parsed = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                // An `Age` we cannot read leaves the response's remaining freshness
+                // unknown, and treating it as zero would hand back a full window to
+                // a response that may have almost none left. Unreadable resolves
+                // against caching here as it does for `Cache-Control`.
+                if parsed.is_none() {
+                    directives.forbid_retention = true;
+                }
+                parsed
+            });
 
         // Extract Date header from response
         let response_date = response
@@ -1459,6 +1905,23 @@ impl HttpTableProvider {
                 // Parse HTTP date format (RFC 2822/RFC 1123)
                 httpdate::parse_http_date(date_str).ok()
             });
+
+        // The response is now in hand, headers and all. Everything after this
+        // point is time the entry spends with us rather than time in flight.
+        let headers_received = Instant::now();
+
+        // What the response's own `Date` implies about its age, measured against
+        // the moment it arrived. Clamped at zero, so an origin clock running
+        // ahead of ours reads as "brand new" rather than as negative age; an
+        // origin clock running behind makes us cache less, which is the safe
+        // direction. This is the age an intermediary that relayed the response
+        // without adding `Age` leaves behind.
+        let apparent_age = response_date
+            .and_then(|date| SystemTime::now().duration_since(date).ok())
+            .unwrap_or_default();
+
+        let response_delay = headers_received.saturating_duration_since(attempt_started);
+        let age_on_arrival = Self::age_on_arrival(header_age, apparent_age, response_delay);
 
         // Capture response headers before consuming the response body
         let response_headers: Vec<(String, String)> = response
@@ -1491,7 +1954,14 @@ impl HttpTableProvider {
 
         Ok(HttpFetchResult {
             content,
-            max_age,
+            directives,
+            // The age on arrival plus the time spent here since — reading the
+            // body and getting to admission. Saturating throughout, because
+            // `Age` is untrusted response data and a value near `u64::MAX` would
+            // otherwise overflow the addition and panic; saturating leaves no
+            // freshness to retain, which is the right answer for an absurd age.
+            response_age: Some(age_on_arrival.saturating_add(headers_received.elapsed())),
+            age_measured_at: Instant::now(),
             detected_format,
             response_date,
             response_status: status_code,
@@ -1505,11 +1975,9 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
-        cache_write_mode: CacheWriteMode,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
-        let query_owned = query.map(ToOwned::to_owned);
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.map(ToOwned::to_owned);
         let parsed_request_headers = request_headers_owned
@@ -1526,29 +1994,10 @@ impl HttpTableProvider {
             )
             .await?;
 
-        if matches!(cache_write_mode, CacheWriteMode::Enabled) && fetch_result.should_cache() {
-            self.cache_response(
-                &path_owned,
-                query_owned.as_deref(),
-                body_owned.as_deref(),
-                request_headers_owned.as_deref(),
-                &fetch_result,
-            )
-            .await;
-        }
-
+        // Fetching only. Whether the result is worth keeping is decided by
+        // `get_response`, which is where the configured fallback is in scope;
+        // callers that bypass the cache entirely reach this directly.
         Ok(fetch_result)
-    }
-
-    async fn fetch_and_cache(
-        &self,
-        path: &str,
-        query: Option<&str>,
-        body: Option<&str>,
-        request_headers: Option<&str>,
-    ) -> Result<HttpFetchResult> {
-        self.fetch_response(path, query, body, request_headers, CacheWriteMode::Enabled)
-            .await
     }
 
     async fn get_response(
@@ -1561,46 +2010,116 @@ impl HttpTableProvider {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers, CacheWriteMode::Disabled)
+                .fetch_response(path, query, body, request_headers)
                 .await;
         }
 
         let cache_key = Self::get_cache_key(path, query, body, request_headers);
 
-        // Try to get from cache
-        let cached = {
-            let cache = self.cache.read().await;
-            cache.get(&cache_key).cloned()
-        };
+        let cached = self.cache.get(&cache_key).await;
+        // Reported here rather than only on the hit: a lookup that finds an
+        // expired entry drops it, so a miss moves occupancy too.
+        self.record_cache_gauges();
 
-        if let Some(cached_response) = cached
-            && cached_response.is_fresh()
-        {
+        if let Some(cached) = cached {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                let cache_key_label = cache_key.redacted_label();
-                if let Some(ref format) = cached_response.detected_format {
-                    tracing::debug!(
-                        "Returning fresh cached content for {} (detected format: {})",
-                        cache_key_label,
-                        format
-                    );
-                } else {
-                    tracing::debug!("Returning fresh cached content for {}", cache_key_label);
-                }
+                tracing::debug!(
+                    "Serving {} from the response cache",
+                    cache_key.redacted_label()
+                );
             }
-            return Ok(HttpFetchResult {
-                content: (*cached_response.content).clone(),
-                max_age: cached_response.max_age,
-                detected_format: cached_response.detected_format.clone().unwrap_or_default(),
-                response_date: cached_response.response_date,
-                response_status: cached_response.response_status,
-                response_headers: (*cached_response.response_headers).clone(),
-            });
+            return Ok(cached.into_fetch_result());
         }
 
-        // Fetch fresh content
-        self.fetch_and_cache(path, query, body, request_headers)
-            .await
+        let fetch_result = self
+            .fetch_response(path, query, body, request_headers)
+            .await?;
+
+        // Retention is resolved here because this is the only place both the
+        // origin's directives and the locally configured fallback are in scope.
+        // `None` means the response is not to be kept: the origin refused, or
+        // said nothing and no fallback was configured.
+        //
+        // The response is *fetched, then admitted* rather than fetched through
+        // the cache, because whether it may be retained is only knowable from
+        // the response. Admitting it with a zero window instead — letting expiry
+        // stand in for the refusal — does not hold: such an entry is not
+        // reliably discarded, and where it is kept it stays resident and counted
+        // against the byte budget until something evicts it. A `no-store`
+        // workload, which is the API-proxy shape this cache exists for, would
+        // then fill the budget with responses the origin forbade storing and
+        // evict the ones it was allowed to keep. The refusal has to be honoured
+        // here, where it is unconditional.
+        // The response's age brought forward to the moment it is asked for,
+        // rather than the figure taken when the response arrived.
+        let age_now = || {
+            fetch_result
+                .response_age
+                .map(|age| age.saturating_add(fetch_result.age_measured_at.elapsed()))
+        };
+        let retention_now = || {
+            Self::effective_retention(&fetch_result.directives, self.cache_fallback_ttl, age_now())
+        };
+
+        // Asked twice, and the first is only a gate: it decides whether copying
+        // the response is worth doing at all, so a refused response is never
+        // copied. The window actually granted is the second one, taken after the
+        // copy, because copying a large body spends real time and a window
+        // computed before it would grant freshness the response no longer has.
+        if retention_now().is_some() {
+            // A body that cannot fit the budget on its own is turned away
+            // before it is copied. Admitting it would clone the whole response
+            // only for the cache to evict it again, and on the way it would
+            // push out every entry that did fit.
+            if fetch_result.content.len() > self.cache_max_bytes {
+                tracing::debug!(
+                    "Not retaining {}: the response is larger than the whole cache budget",
+                    cache_key.redacted_label()
+                );
+                return Ok(fetch_result);
+            }
+
+            let content = Arc::new(fetch_result.content.clone());
+            let response_headers = Arc::new(fetch_result.response_headers.clone());
+
+            // After the copy: what is left now is what the entry may be granted,
+            // and a response whose freshness the copy exhausted is not admitted.
+            let Some(retain_for) = retention_now() else {
+                tracing::debug!(
+                    "Not retaining {}: no freshness left by the time it could be stored",
+                    cache_key.redacted_label()
+                );
+                return Ok(fetch_result);
+            };
+
+            let entry = CachedResponse {
+                content,
+                max_age: retain_for,
+                detected_format: Some(fetch_result.detected_format.clone()),
+                response_date: fetch_result.response_date,
+                response_status: fetch_result.response_status,
+                response_headers,
+            };
+            // An entry the budget cannot charge for is not admitted: it would be
+            // billed less than it holds, which is how a byte bound stops binding.
+            if entry_weight(&cache_key, &entry).is_some() {
+                self.cache.insert(cache_key, entry).await;
+                // Occupancy is `moka`'s own deferred bookkeeping, so it answers
+                // for the last settled state rather than for this insert.
+                // Settling here keeps the gauges from describing a cache one
+                // write out of date for as long as the dataset stays idle. Only
+                // on admission: a hit moves nothing worth the housekeeping.
+                self.cache.run_pending_tasks().await;
+            } else {
+                tracing::debug!(
+                    "Not retaining {}: the response is larger than the cache can account for",
+                    cache_key.redacted_label()
+                );
+            }
+            self.record_cache_gauges();
+        }
+
+        Ok(fetch_result)
     }
 
     fn get_projected_schema(
@@ -3564,6 +4083,1078 @@ impl HttpTableProvider {
 }
 
 #[cfg(test)]
+mod response_cache_tests {
+    use super::{
+        CacheKey, CachedResponse, HttpTableProvider, ResponseCache, build_response_cache,
+        entry_weight,
+    };
+    use reqwest::Client;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A provider pointed at `origin`, with acceleration off so the response
+    /// cache is the thing under test.
+    fn provider_for(origin: &MockServer) -> HttpTableProvider {
+        HttpTableProvider::new(
+            Url::parse(&origin.uri()).expect("the mock server's URI is a valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        )
+    }
+
+    fn entry(body_bytes: usize, retain_for: Duration) -> CachedResponse {
+        CachedResponse {
+            content: Arc::new("x".repeat(body_bytes)),
+            max_age: retain_for,
+            detected_format: Some("json".to_string()),
+            response_date: None,
+            response_status: 200,
+            response_headers: Arc::new(Vec::new()),
+        }
+    }
+
+    fn key(id: usize) -> CacheKey {
+        CacheKey {
+            path: "/v1/messages".to_string(),
+            query: Some(format!("id={id}")),
+            body: None,
+            request_headers: None,
+        }
+    }
+
+    /// Settles the cache's deferred bookkeeping, which its size and count are
+    /// reported from.
+    async fn settle(cache: &ResponseCache) {
+        cache.run_pending_tasks().await;
+    }
+
+    /// The budget is what makes this cache safe on a request-keyed workload,
+    /// where the number of distinct keys is unbounded by construction.
+    #[tokio::test]
+    async fn insertion_past_the_budget_evicts_rather_than_growing() {
+        let body = 4096;
+        // Room for roughly four entries.
+        let cache = build_response_cache(body * 4);
+
+        for id in 0..200 {
+            cache
+                .insert(key(id), entry(body, Duration::from_mins(5)))
+                .await;
+        }
+        settle(&cache).await;
+
+        let budget = (body * 4) as u64;
+        assert!(
+            cache.weighted_size() <= budget,
+            "the cache must stay inside its byte budget, but holds {} of {budget}",
+            cache.weighted_size()
+        );
+        assert!(
+            cache.entry_count() < 200,
+            "200 distinct keys must not all be retained under a four-entry budget"
+        );
+    }
+
+    /// Retention follows the window resolved at admission. Declining to *serve* a
+    /// stale entry while keeping it is what let this cache hold every response a
+    /// process ever fetched.
+    #[tokio::test]
+    async fn an_entry_past_its_window_is_not_served() {
+        let cache = build_response_cache(1024 * 1024);
+        // A zero window cannot contain any elapsed time, so this is already past
+        // it — which is also how a `no-store` response is handed to its caller
+        // without being kept.
+        cache.insert(key(1), entry(4096, Duration::ZERO)).await;
+        settle(&cache).await;
+
+        assert!(
+            cache.get(&key(1)).await.is_none(),
+            "an entry past its retention window must not be served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_entry_is_served() {
+        let cache = build_response_cache(1024 * 1024);
+        cache
+            .insert(key(1), entry(4096, Duration::from_mins(5)))
+            .await;
+        settle(&cache).await;
+        assert!(cache.get(&key(1)).await.is_some());
+    }
+
+    /// The invariant the admission path exists to hold: a response the origin
+    /// refused to have stored is served to its caller and kept by nobody.
+    ///
+    /// Driven through `get_response` rather than asserted on
+    /// `effective_retention`, because the claim is about *admission*. Deciding
+    /// correctly and storing anyway is precisely the failure this guards.
+    #[tokio::test]
+    async fn a_no_store_response_is_served_but_never_admitted() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/report"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // A `max-age` beside `no-store` is the case that used to be
+                    // cached in defiance of the directive.
+                    .insert_header("cache-control", "no-store, max-age=600")
+                    .set_body_string(r#"{"rows":1}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served to its caller");
+        assert_eq!(served.content, r#"{"rows":1}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a no-store response must not be retained"
+        );
+        assert_eq!(
+            provider.cache.weighted_size(),
+            0,
+            "and must not occupy the byte budget"
+        );
+    }
+
+    /// The regression this admission path was rebuilt for.
+    ///
+    /// Storing a refused response and expiring it immediately is not the same as
+    /// not storing it: an entry admitted with a zero window stays resident and
+    /// billed until something evicts it. A workload of nothing but `no-store`
+    /// responses — an API proxy, the shape this cache exists for — would fill
+    /// the whole budget with responses it was forbidden to keep, evicting the
+    /// ones it was allowed to.
+    #[tokio::test]
+    async fn a_no_store_workload_accumulates_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "no-store")
+                    .set_body_string("x".repeat(4096)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        for id in 0..200 {
+            provider
+                .get_response(&format!("/report/{id}"), None, None, None)
+                .await
+                .expect("each response is served");
+        }
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "200 refused responses must leave nothing behind"
+        );
+        assert_eq!(provider.cache.weighted_size(), 0);
+    }
+
+    /// A response can be stale before it lands. `max-age` is spent from when the
+    /// origin generated the response, so a round trip longer than the window
+    /// leaves nothing to retain — admitting it would serve data the origin
+    /// already considered expired.
+    ///
+    /// This is the one place a fixed delay is the subject rather than a
+    /// readiness wait: the elapsed round trip is exactly what is under test.
+    #[tokio::test]
+    async fn a_response_slower_than_its_freshness_window_is_not_admitted() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=1")
+                    .set_body_string(r#"{"rows":6}"#)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served to its caller");
+        assert_eq!(served.content, r#"{"rows":6}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response whose freshness elapsed in transit must not be retained"
+        );
+    }
+
+    /// An `Age` that cannot be read leaves the remaining freshness unknown.
+    /// Treating it as zero would hand a full window back to a response that may
+    /// have almost none left, so it refuses retention as an unreadable
+    /// `Cache-Control` does.
+    #[tokio::test]
+    async fn an_unreadable_age_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "not-a-number")
+                    .set_body_string(r#"{"rows":7}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "an unreadable Age must not yield a fresh full window"
+        );
+    }
+
+    /// `Age` is untrusted response data. A value near `u64::MAX` overflows the
+    /// addition of the elapsed round trip and panics, taking down the query
+    /// rather than declining to cache.
+    ///
+    /// The delay is load-bearing, not a readiness wait: `Duration` carries into
+    /// its seconds field only once the elapsed time reaches a second, so without
+    /// it the addition stays inside the nanosecond field and cannot overflow —
+    /// the test would then pass whether or not the addition saturates.
+    #[tokio::test]
+    async fn an_absurd_age_neither_panics_nor_is_retained() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "18446744073709551615")
+                    .set_body_string(r#"{"rows":8}"#)
+                    .set_delay(Duration::from_millis(1100)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is served rather than panicking the query");
+        assert_eq!(served.content, r#"{"rows":8}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response older than any window has no freshness left to retain"
+        );
+    }
+
+    /// Replacing an entry replaces its window. `moka`'s default keeps the
+    /// existing expiry on an update, so without an `expire_after_update` a key
+    /// re-admitted with a shorter window keeps the longer one it had — and two
+    /// concurrent misses that both fetch and both insert are exactly that.
+    #[tokio::test]
+    async fn re_admitting_a_key_takes_the_new_window_not_the_old() {
+        let cache = build_response_cache(1024 * 1024);
+        cache
+            .insert(key(1), entry(64, Duration::from_mins(10)))
+            .await;
+        cache.run_pending_tasks().await;
+        cache
+            .insert(key(1), entry(64, Duration::from_millis(200)))
+            .await;
+        cache.run_pending_tasks().await;
+
+        // Long enough for the *new* window to have elapsed, far short of the old
+        // one. Time is the subject here, so the wait is the test.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cache.run_pending_tasks().await;
+
+        assert!(
+            cache.get(&key(1)).await.is_none(),
+            "the replacement's window must govern, or a short-lived response is served for its predecessor's window"
+        );
+    }
+
+    /// This cache is shared: entries are keyed by request shape and served to
+    /// whichever query asks next. `private` is the origin forbidding exactly
+    /// that reuse.
+    #[test]
+    fn private_forbids_retention_in_a_shared_cache() {
+        let directives = HttpTableProvider::parse_cache_control(Some("private, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "a private response must not be retained by a cache that serves other queries"
+        );
+    }
+
+    /// `s-maxage` is addressed to shared caches and outranks `max-age`, so
+    /// `s-maxage=0` refuses this cache while still allowing a private one the
+    /// ten minutes `max-age` grants.
+    #[test]
+    fn s_maxage_outranks_max_age() {
+        let refused = HttpTableProvider::parse_cache_control(Some("s-maxage=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&refused, None, None),
+            None
+        );
+
+        let shortened = HttpTableProvider::parse_cache_control(Some("s-maxage=60, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&shortened, None, None),
+            Some(Duration::from_mins(1)),
+            "the shared window governs where both were sent"
+        );
+    }
+
+    /// The weigher charges for the containers, not only the text they hold. A
+    /// response of many short headers is dominated by the tuples themselves, so
+    /// charging only the text understates it badly.
+    #[test]
+    fn many_short_headers_are_charged_for_their_containers() {
+        let headers: Vec<(String, String)> = (0..64)
+            .map(|i| (format!("x-h{i}"), "v".to_string()))
+            .collect();
+        let text: usize = headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let with_headers = CachedResponse {
+            content: Arc::new(String::new()),
+            max_age: Duration::from_mins(5),
+            detected_format: None,
+            response_date: None,
+            response_status: 200,
+            response_headers: Arc::new(headers),
+        };
+        assert!(
+            with_headers.retained_bytes() > text * 2,
+            "64 header tuples cost far more than their {text} bytes of text, but were charged {}",
+            with_headers.retained_bytes()
+        );
+    }
+
+    /// A body larger than the whole budget can never fit, so it is turned away
+    /// before it is copied — admitting it would clone the response only to evict
+    /// it again, pushing out every entry that did fit on the way.
+    #[tokio::test]
+    async fn a_body_larger_than_the_budget_evicts_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string("small"),
+            )
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/huge"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string("x".repeat(8192)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(4096, None);
+        provider
+            .get_response("/small", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
+
+        provider
+            .get_response("/huge", None, None, None)
+            .await
+            .expect("the oversized response is still served to its caller");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "the oversized response must neither be retained nor displace what fit"
+        );
+    }
+
+    /// An intermediary that relays a response without adding `Age` still leaves
+    /// the origin's `Date` behind. Reading only `Age` there would hand back a
+    /// full window to a response whose freshness is already spent.
+    #[tokio::test]
+    async fn an_old_date_without_an_age_header_is_not_retained() {
+        let origin = MockServer::start().await;
+        let an_hour_ago = httpdate::fmt_http_date(SystemTime::now() - Duration::from_hours(1));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("date", an_hour_ago.as_str())
+                    .set_body_string(r#"{"rows":9}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response dated an hour ago has none of its ten-minute window left"
+        );
+    }
+
+    /// An origin clock running ahead of ours must read as "brand new" rather
+    /// than as a negative age, or a skewed clock would silently disable caching.
+    #[tokio::test]
+    async fn a_future_date_does_not_prevent_caching() {
+        let origin = MockServer::start().await;
+        let an_hour_ahead = httpdate::fmt_http_date(SystemTime::now() + Duration::from_hours(1));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("date", an_hour_ahead.as_str())
+                    .set_body_string(r#"{"rows":10}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a clock ahead of ours must not read as negative age"
+        );
+    }
+
+    /// Directive *names* are case-insensitive. Matching them exactly let
+    /// `S-MaxAge=0` slip past the shared-cache refusal and keep the response for
+    /// the ten minutes `max-age` granted.
+    #[test]
+    fn directive_names_are_matched_case_insensitively() {
+        let shouted = HttpTableProvider::parse_cache_control(Some("S-MaxAge=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&shouted, None, None),
+            None,
+            "a shared-cache refusal binds however it is spelled"
+        );
+
+        for spelling in ["NO-STORE", "No-Cache", "PRIVATE"] {
+            let directives = HttpTableProvider::parse_cache_control(Some(spelling));
+            assert_eq!(
+                HttpTableProvider::effective_retention(
+                    &directives,
+                    Some(Duration::from_mins(1)),
+                    None
+                ),
+                None,
+                "{spelling} must refuse retention"
+            );
+        }
+
+        let mixed = HttpTableProvider::parse_cache_control(Some("Max-Age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&mixed, None, None),
+            Some(Duration::from_mins(10)),
+            "a freshness directive is honoured however it is spelled"
+        );
+    }
+
+    /// A `max-age` sent with no value at all is not a usable freshness, and must
+    /// not fall through to a configured fallback as though the origin had said
+    /// nothing.
+    #[test]
+    fn a_valueless_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// The wait for a response counts against an `Age` the origin declared, but
+    /// not against the age its `Date` already implies — that one is measured on
+    /// arrival and contains the wait already. Charging both turns away
+    /// short-lived responses that are still fresh.
+    ///
+    /// Asserted on the arithmetic rather than against a live server: the window
+    /// that distinguishes the right answer from the double-counted one is only
+    /// as wide as the wait itself, so a wall-clock test of it is inherently
+    /// marginal and flakes under load. This is where the bug lived.
+    #[test]
+    fn the_wait_is_charged_to_age_but_not_to_the_date() {
+        let three_seconds = Duration::from_secs(3);
+        let two_seconds = Duration::from_secs(2);
+
+        // `Date` says three seconds; the two-second wait is already inside that.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(None, three_seconds, two_seconds),
+            three_seconds,
+            "the wait must not be added to an age measured on arrival"
+        );
+
+        // `Age` says three seconds as of when the origin sent it, so the wait is.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(Some(three_seconds), Duration::ZERO, two_seconds),
+            Duration::from_secs(5),
+            "the wait must be added to an age declared at the origin"
+        );
+
+        // Both present: the greater wins, so an origin under-declaring `Age`
+        // gains nothing by it.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(
+                Some(Duration::from_secs(1)),
+                Duration::from_hours(1),
+                two_seconds
+            ),
+            Duration::from_hours(1)
+        );
+    }
+
+    /// `Age` is untrusted, so the addition saturates rather than panicking.
+    /// Saturation lands on `Duration::MAX`, which carries the sub-second part
+    /// too — the point is that it neither panics nor wraps to something small.
+    #[test]
+    fn an_absurd_age_saturates_rather_than_overflowing() {
+        let saturated = HttpTableProvider::age_on_arrival(
+            Some(Duration::from_secs(u64::MAX)),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        assert_eq!(saturated, Duration::MAX);
+        assert!(
+            saturated > Duration::from_secs(u64::MAX / 2),
+            "an absurd age must stay absurd rather than wrapping to something servable"
+        );
+    }
+
+    /// `Vary: *` says the response must never satisfy a later request. No
+    /// freshness window makes it reusable, so it is refused outright — otherwise
+    /// an endpoint returning changing data behind `max-age` would have its first
+    /// body served to every query for the rest of the window.
+    #[tokio::test]
+    async fn vary_star_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "*")
+                    .set_body_string(r#"{"rows":12}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response that may never be reused must not be retained"
+        );
+    }
+
+    /// A named `Vary` is not treated the same way, and that is the point of
+    /// matching only `*`: what varies between requests here — path, query, body
+    /// and the headers a query supplies — is already the cache key, so a named
+    /// field cannot make one request's response answer a different request.
+    #[tokio::test]
+    async fn a_named_vary_field_still_caches() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "accept-encoding, accept")
+                    .set_body_string(r#"{"rows":13}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a named Vary must not be read as a blanket refusal"
+        );
+    }
+
+    /// `Vary` naming the authenticator's header is refused, because that value
+    /// is the one connector header that is *not* stable: an OAuth token is
+    /// refreshed in the background, so a later request can carry a different
+    /// credential than the stored representation was selected for.
+    #[tokio::test]
+    async fn vary_on_the_auth_header_refuses_retention() {
+        #[derive(Debug)]
+        struct RotatingAuth;
+        impl super::super::auth::HttpAuthenticator for RotatingAuth {
+            fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+                builder.header(reqwest::header::AUTHORIZATION, "Bearer whatever")
+            }
+            fn header_name(&self) -> &reqwest::header::HeaderName {
+                &reqwest::header::AUTHORIZATION
+            }
+        }
+
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "authorization")
+                    .set_body_string(r#"{"rows":14}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        // Without the authenticator the same response is cacheable, which is
+        // what makes this about the rotating credential rather than about
+        // `Vary` naming anything at all.
+        let unauthenticated = provider_for(&origin);
+        unauthenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&unauthenticated.cache).await;
+        assert_eq!(unauthenticated.cache.entry_count(), 1);
+
+        let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
+        authenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&authenticated.cache).await;
+        assert_eq!(
+            authenticated.cache.entry_count(),
+            0,
+            "a representation selected on a credential that rotates must not be retained"
+        );
+    }
+
+    /// An unreadable `Vary` leaves the selection unknown, and unknown resolves
+    /// against caching here as it does for `Cache-Control` and `Age`.
+    #[tokio::test]
+    async fn an_unreadable_vary_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header(
+                        "vary",
+                        reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe])
+                            .expect("bytes are a legal header value even though they are not text"),
+                    )
+                    .set_body_string(r#"{"rows":15}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a Vary we cannot read must not be treated as no Vary at all"
+        );
+    }
+
+    /// The positive control: a response the origin *does* allow to be cached is
+    /// admitted, and the next identical request is served without reaching the
+    /// origin again. Without this, a cache that admitted nothing at all would
+    /// pass every test above.
+    #[tokio::test]
+    async fn a_cacheable_response_is_admitted_and_then_served_without_the_origin() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/report"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string(r#"{"rows":2}"#),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        for _ in 0..3 {
+            let served = provider
+                .get_response("/report", None, None, None)
+                .await
+                .expect("the response is served");
+            assert_eq!(served.content, r#"{"rows":2}"#);
+        }
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "the cacheable response is retained"
+        );
+        // `expect(1)` on the mock is verified on drop: three calls, one origin
+        // request.
+        drop(origin);
+    }
+
+    /// An origin that says nothing is not cached unless a fallback was
+    /// configured for exactly that case.
+    #[tokio::test]
+    async fn a_silent_origin_is_admitted_only_under_a_configured_fallback() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"rows":3}"#))
+            .mount(&origin)
+            .await;
+
+        let without_fallback = provider_for(&origin);
+        without_fallback
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&without_fallback.cache).await;
+        assert_eq!(
+            without_fallback.cache.entry_count(),
+            0,
+            "with no fallback configured, a silent origin is not retained"
+        );
+
+        let with_fallback =
+            provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
+        with_fallback
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&with_fallback.cache).await;
+        assert_eq!(
+            with_fallback.cache.entry_count(),
+            1,
+            "the fallback applies where the origin said nothing"
+        );
+    }
+
+    /// A zero fallback is a configured refusal, not a window of no length —
+    /// otherwise it would admit entries that are expired on arrival and still
+    /// occupy the budget.
+    #[tokio::test]
+    async fn a_zero_fallback_retains_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"rows":4}"#))
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 0);
+    }
+
+    /// A zero budget disables the cache rather than admitting an entry and
+    /// immediately evicting it.
+    #[tokio::test]
+    async fn a_zero_budget_retains_nothing() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .set_body_string(r#"{"rows":5}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin).with_cache_limits(0, None);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(provider.cache.entry_count(), 0);
+        assert_eq!(provider.cache.weighted_size(), 0);
+    }
+
+    /// An error body is not served back from the cache afterwards.
+    ///
+    /// A 5xx that outlives its retries is accepted as content rather than
+    /// raised — a choice of the fetch path, not of this cache — so what keeps it
+    /// out is that the origin never marked it retainable. Worth pinning because
+    /// retaining an outage response would serve it for the whole of its window,
+    /// long after the origin recovered.
+    #[tokio::test]
+    async fn an_unmarked_error_body_is_not_retained() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let _ = provider.get_response("/report", None, None, None).await;
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "an error response the origin did not mark retainable must leave nothing behind"
+        );
+    }
+
+    /// A second `max-age` makes the response's freshness ambiguous. Letting the
+    /// later value win would retain `max-age=0, max-age=600` for ten minutes
+    /// when the origin also said not to reuse it at all.
+    #[test]
+    fn conflicting_max_age_directives_refuse_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an ambiguous freshness must not be resolved in favour of caching"
+        );
+
+        // Also across repeated fields, which is the same ambiguity.
+        let split = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=0"), Some("max-age=600")].into_iter(),
+        );
+        assert_eq!(
+            HttpTableProvider::effective_retention(&split, None, None),
+            None
+        );
+    }
+
+    /// The byte budget only binds while every entry can be charged what it
+    /// holds, and `moka` weighs in `u32`, so an entry of 4 GiB or more cannot
+    /// be. Admission refuses those rather than storing them at a discount.
+    ///
+    /// Only the chargeable side is asserted here: the refusal branch needs a
+    /// 4 GiB body to reach, which is not worth allocating in a unit test. What
+    /// this does guard is the inversion that would actually bite — a guard that
+    /// rejects ordinary responses and silently empties the cache. That an
+    /// ordinary response is still admitted end to end is covered by
+    /// `a_cacheable_response_is_admitted_and_then_served_without_the_origin`.
+    #[test]
+    fn an_ordinary_entry_is_chargeable() {
+        assert!(
+            entry_weight(&key(1), &entry(4096, Duration::from_mins(5))).is_some(),
+            "an ordinary response must be chargeable, or nothing would ever be cached"
+        );
+    }
+
+    /// A repeated `Cache-Control` field binds as much as a single combined one.
+    /// Reading only the first would admit a response that put `max-age` there
+    /// and `no-store` in the next field.
+    #[test]
+    fn a_refusal_in_a_later_cache_control_field_still_binds() {
+        let directives = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=600"), Some("no-store")].into_iter(),
+        );
+        assert!(directives.forbid_retention);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "a no-store in any field refuses retention"
+        );
+    }
+
+    /// A header we cannot read is the origin having spoken, not silence. Treating
+    /// it as absent would let a configured fallback retain a response that may
+    /// well have refused retention.
+    #[test]
+    fn an_unreadable_cache_control_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control_values([None].into_iter());
+        assert!(directives.present, "the origin did send a header");
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an unreadable directive must not fall through to the fallback"
+        );
+    }
+
+    /// Likewise a `max-age` whose value will not parse.
+    #[test]
+    fn an_unreadable_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control("max-age=soon".into());
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// `max-age` runs from when the origin generated the response, so a response
+    /// relayed by an intermediary arrives part-spent and may only be kept for
+    /// what is left. Keeping it for the full window would serve it stale.
+    #[test]
+    fn an_aged_response_is_retained_only_for_what_is_left() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_secs(599))
+            ),
+            Some(Duration::from_secs(1)),
+            "600s of freshness minus 599s already spent leaves one second"
+        );
+    }
+
+    #[test]
+    fn a_response_whose_freshness_is_spent_is_not_retained() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_mins(10))
+            ),
+            None,
+            "a response that arrives already stale must not be admitted"
+        );
+    }
+
+    /// The fallback is how long the operator asked us to keep a response the
+    /// origin said nothing about, so an `Age` from an intermediary does not eat
+    /// into it.
+    #[test]
+    fn age_does_not_shorten_the_configured_fallback() {
+        let silent = HttpTableProvider::parse_cache_control(None);
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &silent,
+                Some(Duration::from_mins(5)),
+                Some(Duration::from_hours(1))
+            ),
+            Some(Duration::from_mins(5))
+        );
+    }
+
+    /// `no-store` is the origin refusing retention, and it wins over a `max-age`
+    /// sent beside it. Parsing only `max-age` meant such a response was cached in
+    /// defiance of the directive.
+    #[test]
+    fn no_store_beats_a_max_age_sent_with_it() {
+        let directives = HttpTableProvider::parse_cache_control(Some("no-store, max-age=600"));
+        assert!(directives.forbid_retention);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an origin that says no-store must not be retained, fallback or not"
+        );
+    }
+
+    #[test]
+    fn no_cache_is_also_a_refusal() {
+        let directives = HttpTableProvider::parse_cache_control(Some("no-cache"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// The origin's own window is honoured exactly when it sends one.
+    #[test]
+    fn the_origins_max_age_is_used_when_present() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=300"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            Some(Duration::from_mins(5)),
+            "the origin decides its own freshness, not the local fallback"
+        );
+    }
+
+    /// The fallback applies only where the origin said nothing at all — and with
+    /// none configured, such a response stays uncached, which is the behaviour
+    /// before this option existed.
+    #[test]
+    fn the_fallback_applies_only_when_the_origin_was_silent() {
+        let silent = HttpTableProvider::parse_cache_control(None);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&silent, Some(Duration::from_mins(1)), None),
+            Some(Duration::from_mins(1)),
+            "a header-less origin may use the configured fallback"
+        );
+        assert_eq!(
+            HttpTableProvider::effective_retention(&silent, None, None),
+            None,
+            "and with no fallback it is not cached, as before"
+        );
+    }
+
+    /// A `Cache-Control` that carried no usable `max-age` is still the origin
+    /// having spoken, so the local fallback must not override it.
+    #[test]
+    fn a_zero_max_age_is_not_overridden_by_the_fallback() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=0"));
+        assert_eq!(directives.max_age, Some(Duration::ZERO));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "max-age=0 means do not reuse this response"
+        );
+    }
+
+    /// The key is weighed alongside the response: it owns copies of the
+    /// request's path, query, body and headers, which is not negligible beside a
+    /// small response on a request-keyed workload.
+    #[tokio::test]
+    async fn the_key_is_weighed_alongside_the_response() {
+        let cache = build_response_cache(1024 * 1024);
+        cache.insert(key(1), entry(0, Duration::from_mins(5))).await;
+        settle(&cache).await;
+        assert!(
+            cache.weighted_size() > 0,
+            "an empty response still costs its key"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::array::Array;
@@ -4560,7 +6151,14 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
-            max_age: Duration::from_mins(1),
+            directives: CacheDirectives {
+                present: true,
+                max_age: Some(Duration::from_mins(1)),
+                forbid_retention: false,
+                shared_max_age: None,
+            },
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -4569,8 +6167,21 @@ mod tests {
                 ("x-request-id".to_string(), "req-123".to_string()),
             ],
         };
+        // Seeded directly, because admission is part of `get_response` rather
+        // than a write path a test can call on its own.
         provider
-            .cache_response("/posts", None, None, Some(&request_headers), &fetch_result)
+            .cache
+            .insert(
+                HttpTableProvider::get_cache_key("/posts", None, None, Some(&request_headers)),
+                CachedResponse {
+                    content: Arc::new(fetch_result.content.clone()),
+                    max_age: Duration::from_mins(1),
+                    detected_format: Some(fetch_result.detected_format.clone()),
+                    response_date: fetch_result.response_date,
+                    response_status: fetch_result.response_status,
+                    response_headers: Arc::new(fetch_result.response_headers.clone()),
+                },
+            )
             .await;
 
         let exec = HttpExec::new(
@@ -7492,7 +9103,9 @@ mod tests {
     fn empty_fetch_result() -> HttpFetchResult {
         HttpFetchResult {
             content: String::new(),
-            max_age: std::time::Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "application/json".to_string(),
             response_date: None,
             response_status: 200,
@@ -7939,7 +9552,9 @@ mod tests {
         );
         let fetch_result = HttpFetchResult {
             content: String::new(),
-            max_age: Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 201,
@@ -8012,7 +9627,9 @@ mod tests {
         ];
         let fetch_result = HttpFetchResult {
             content: String::new(),
-            max_age: Duration::from_secs(0),
+            directives: CacheDirectives::default(),
+            response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,

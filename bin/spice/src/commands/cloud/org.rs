@@ -49,6 +49,7 @@ pub const DEFAULT_API_KEY_VAR: &str = "SPICE_SPICEAI_API_KEY";
 /// Environment variable that overrides the persisted active org for one process.
 pub const ACTIVE_ORG_VAR: &str = "SPICE_CLOUD_ORG";
 
+#[cfg(not(test))]
 const DOT_SPICE: &str = ".spice";
 const CONTEXT_FILE: &str = "cloud-context.json";
 const MAX_ORG_NAME_LEN: usize = 64;
@@ -118,9 +119,48 @@ pub fn validate_org_name(org: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the home directory cannot be determined.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the fallible production context-path contract"
+    )
+)]
 fn context_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| crate::error::HomeDirectoryNotFoundSnafu.build())?;
-    Ok(home.join(DOT_SPICE).join(CONTEXT_FILE))
+    #[cfg(test)]
+    {
+        Ok(test_context_file::path())
+    }
+
+    #[cfg(not(test))]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| crate::error::HomeDirectoryNotFoundSnafu.build())?;
+        Ok(home.join(DOT_SPICE).join(CONTEXT_FILE))
+    }
+}
+
+/// Redirects cloud-context helpers to a temporary file in tests.
+#[cfg(test)]
+pub(crate) mod test_context_file {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn path() -> PathBuf {
+        DIR.with_borrow_mut(|dir| {
+            dir.get_or_insert_with(|| tempfile::tempdir().expect("create test context directory"))
+                .path()
+                .join(super::CONTEXT_FILE)
+        })
+    }
+
+    pub(crate) fn reset() {
+        DIR.with_borrow_mut(|dir| *dir = None);
+    }
 }
 
 /// Load the persisted cloud context, or the default when none has been written.
@@ -348,10 +388,7 @@ pub fn read_credential(var: &str) -> Option<String> {
         return Some(value);
     }
 
-    if let Ok(entry) = keyring::Entry::new(var, "spice")
-        && let Ok(value) = entry.get_password()
-        && !value.is_empty()
-    {
+    if let Some(value) = crate::commands::login::keychain::read(var) {
         return Some(value);
     }
 
