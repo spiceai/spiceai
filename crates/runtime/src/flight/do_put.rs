@@ -25,6 +25,7 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
@@ -275,12 +276,19 @@ pub(crate) async fn handle(
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds the
+    // column, so it is brought into line at the boundary rather than carried into the write. One
+    // stream carries one schema, so what its batches need is resolved once, and the dataset is
+    // checked against the shape that will actually be written.
+    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+
     let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
 
-    if let Err(e) = verify_schema(target_schema.fields(), schema.fields()) {
+    if let Err(e) = verify_schema(target_schema.fields(), normalizer.schema().fields()) {
         return Err(Status::invalid_argument(format!(
             "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
         )));
@@ -291,6 +299,7 @@ pub(crate) async fn handle(
         path,
         path_label,
         schema,
+        normalizer,
         Arc::clone(&datafusion),
         streaming_flight,
         &first_message,
@@ -344,6 +353,7 @@ fn create_response_stream(
     path: TableReference,
     path_label: Arc<str>,
     schema: SchemaRef,
+    normalizer: MapEntriesNormalizer,
     df: Arc<DataFusion>,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     first_message: &FlightData,
@@ -358,18 +368,29 @@ fn create_response_stream(
         &dictionaries_by_id,
     )
     .ok();
+    // Every batch is decoded under the client's own declarations and relabelled afterwards, so
+    // that an entries array carrying nulls — the one shape relabelling cannot fix — is refused
+    // rather than written under a declaration that says it holds none.
+    let write_schema = Arc::clone(normalizer.schema());
 
     stream! {
         // channel to propagate new record batches to the data writing stream
         let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
 
-        let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
+        let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(write_schema, Box::new(ReceiverStream::new(batch_rx))));
         let streaming_update = StreamingDataUpdate::new(write_stream, UpdateType::Append);
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
-            yield handle_record_batch(first_batch, &batch_tx, &path_label).await;
+            match normalizer.normalize(first_batch) {
+                Ok(first_batch) => yield handle_record_batch(first_batch, &batch_tx, &path_label).await,
+                Err(e) => {
+                    tracing::error!(dataset = %path, "{}", map_entries_message(&path, &e));
+                    yield Err(Status::invalid_argument(map_entries_message(&path, &e)));
+                    return;
+                }
+            }
         }
 
         // Use a single pinned Sleep future that is reset on each received message,
@@ -447,6 +468,15 @@ fn create_response_stream(
                                 Err(e) => {
                                     tracing::error!("Failed to convert flight data to batches: {e}");
                                     yield Err(Status::internal(format!("Failed to convert flight data to batches: {e}")));
+                                    break;
+                                }
+                            };
+
+                            let new_batch = match normalizer.normalize(new_batch) {
+                                Ok(new_batch) => new_batch,
+                                Err(e) => {
+                                    tracing::error!(dataset = %path, "{}", map_entries_message(&path, &e));
+                                    yield Err(Status::invalid_argument(map_entries_message(&path, &e)));
                                     break;
                                 }
                             };
@@ -557,6 +587,16 @@ fn create_response_stream(
 
         tracing::debug!("Finished writing data into dataset: {path}");
     }
+}
+
+/// The failure a client sees when the Arrow data it streamed holds a `MAP` column that cannot be
+/// brought in line with the Arrow map layout.
+fn map_entries_message(path: &TableReference, source: &map_entries::Error) -> String {
+    format!(
+        "Failed to write to dataset '{path}' ({source}), so no rows were written. \
+         Send the MAP column with a non-nullable `entries` field, as the Arrow map layout requires. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
 }
 
 async fn handle_record_batch(

@@ -26,6 +26,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{Any, Command},
 };
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
@@ -166,7 +167,25 @@ async fn decode_flight_batches(
         Status::invalid_argument("DoPut stream must include at least one schema message")
     })?;
 
-    Ok((schema, batches))
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds the
+    // column, so it is brought into line at the boundary rather than carried into the insert
+    // plan. One stream carries one schema, so what its batches need is resolved once.
+    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            normalizer.normalize(batch).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "Failed to read the Arrow data sent to the Flight SQL server ({e}), so no rows were written. \
+                     Send the MAP column with a non-nullable `entries` field, as the Arrow map layout requires. \
+                     See: https://spiceai.org/docs/api/arrow-flight-sql"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok((Arc::clone(normalizer.schema()), batches))
 }
 
 /// Cast columns in `batches` to match `target_schema` where the types differ

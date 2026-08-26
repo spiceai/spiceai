@@ -26,6 +26,7 @@ use arrow_flight::{
     sql::{self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, ProstMessageExt},
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use arrow_tools::record_batch::record_to_param_values;
 use bytes::Bytes;
 use datafusion::common::ParamValues;
@@ -533,8 +534,26 @@ pub(super) fn decode_param_values(
     } else {
         let decoder = StreamReader::try_new(parameters, None)?;
         let schema = decoder.schema();
-        let batches = decoder.into_iter().collect::<Result<Vec<_>, _>>()?;
-        let batch = concat_batches(&schema, batches.iter())?;
+        // A client is free to declare a MAP's `entries` field nullable, which the Arrow map
+        // layout forbids. `concat_batches` below rebuilds every column, so such a parameter would
+        // fail there reporting nulls it does not hold; it is brought into line first, where the
+        // column is named.
+        let normalizer = MapEntriesNormalizer::for_schema(&schema);
+        let batches = decoder
+            .into_iter()
+            .map(|batch| {
+                normalizer
+                    .normalize(batch?)
+                    .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "Failed to read the query parameters sent to the Flight SQL server ({e}), so the query cannot run. \
+                         Send the MAP parameter with a non-nullable `entries` field, as the Arrow map layout requires. \
+                         See: https://spiceai.org/docs/api/arrow-flight-sql"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
+        let batch = concat_batches(normalizer.schema(), batches.iter())?;
         Ok(Some(record_to_param_values(&batch)?))
     }
 }
@@ -1833,6 +1852,149 @@ mod tests {
         assert!(
             rewritten.contains("CAST($3 AS DOUBLE)"),
             "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+    }
+
+    /// Builds a `MapArray` the way an Arrow IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a producer's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> arrow::array::RecordBatch {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// Serializes `batch` as an Arrow IPC stream, byte for byte what a client sends.
+    fn ipc_stream(batch: &arrow::array::RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                .expect("ipc writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP` parameter's `entries` nullable —
+    /// which the Arrow map layout forbids — is brought into line at the decode point instead of
+    /// failing later in whichever kernel first rebuilds the column.
+    #[test]
+    fn a_nullable_entries_map_parameter_decodes() {
+        use arrow::array::Array;
+
+        let bytes = ipc_stream(&nullable_entries_map_batch());
+        let values = decode_param_values(&bytes)
+            .expect("a nullable entries declaration is relabelled, not refused")
+            .expect("parameters were sent");
+
+        let datafusion::common::ParamValues::Map(named) = values else {
+            panic!("a named parameter batch decodes to a map of parameters");
+        };
+        let value = named.get("m").expect("the map parameter is present");
+        match &value.value {
+            datafusion::scalar::ScalarValue::Map(map) => match map.data_type() {
+                arrow::datatypes::DataType::Map(entries, _) => assert!(
+                    !entries.is_nullable(),
+                    "the decoded parameter must carry the corrected declaration"
+                ),
+                other => panic!("expected a Map parameter, got {other:?}"),
+            },
+            other => panic!("expected a Map parameter, got {other:?}"),
+        }
+    }
+
+    /// The one shape relabelling cannot fix is refused where the column can still be named,
+    /// rather than surfacing as `MapArray entries cannot contain nulls` from an unrelated kernel.
+    #[test]
+    fn a_map_parameter_whose_entries_carry_nulls_is_refused_by_name() {
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+        };
+        use arrow::buffer::{Buffer, NullBuffer};
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        use std::sync::Arc;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0"), Some("v1")])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .expect("entries struct");
+        let data = ArrayData::builder(data_type.clone())
+            .len(2)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch");
+
+        let err = decode_param_values(&ipc_stream(&batch))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let message = err.to_string();
+        assert!(
+            message.contains("'m'") && message.contains("arrow-flight-sql"),
+            "the refusal must name the column and point at the docs: {message}"
         );
     }
 }

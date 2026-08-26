@@ -21,6 +21,7 @@ use arrow::{
     compute::cast,
     datatypes::Schema,
 };
+use arrow_tools::map_entries::{self, StreamNormalizer};
 use async_stream::stream;
 use async_trait::async_trait;
 use flight_client::{
@@ -123,6 +124,13 @@ pub enum Error {
 
     #[snafu(display("Invalid sort expression in sort pushdown: expected Column, got {expr}"))]
     InvalidSortExpression { expr: String },
+
+    #[snafu(display(
+        "Failed to read query results from the Flight SQL server ({source}), so the query cannot return rows. \
+        Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
+        See: https://spiceai.org/docs/components/data-connectors/flightsql"
+    ))]
+    MapEntriesNotNormalizable { source: map_entries::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -237,6 +245,10 @@ impl FlightSQLTable {
     ) -> Result<Self> {
         let table_reference: TableReference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
+        // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
+        // layout forbids. Correcting it here keeps the schema this table reports to the planner
+        // in step with the batches `execute` hands back, which are normalized to the same shape.
+        let schema = map_entries::conforming_schema(&schema);
         Ok(Self {
             name,
             client,
@@ -259,6 +271,7 @@ impl FlightSQLTable {
         cookie_store: Arc<CookieStore>,
     ) -> Self {
         let table_reference: TableReference = table_reference.into();
+        let schema = map_entries::conforming_schema(&schema);
         Self {
             name,
             client,
@@ -1054,6 +1067,9 @@ pub fn query_to_stream(
     cookie_store: Arc<CookieStore>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
+        // The stream's schema is whatever its batches carry, so the normalizer is resolved from
+        // the first one and reused for the rest.
+        let mut normalizer = StreamNormalizer::new();
         let flight_info = client
             .execute(sql, None)
             .await
@@ -1072,7 +1088,9 @@ pub fn query_to_stream(
                         Ok(mut flight_stream) => {
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
-                                    Ok(batch) => yield Ok(batch),
+                                    Ok(batch) => yield normalizer
+                                        .normalize(batch)
+                                        .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { source })),
                                     Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
@@ -1148,6 +1166,109 @@ mod tests {
     use tonic::{Request, Response, Status, async_trait};
 
     const COOKIE_VALUE: &str = "AWSALB=abc123";
+
+    /// Builds a `MapArray` the way the Flight IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a server's non-conforming
+    /// declaration survives the decode.
+    fn map_column(entries_nullable: bool) -> (DataType, arrow::array::ArrayRef) {
+        use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+
+        let entry_fields: arrow::datatypes::Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                entries_nullable,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as arrow::array::ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as arrow::array::ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        (data_type, Arc::new(MapArray::from(data)))
+    }
+
+    fn map_batch(entries_nullable: bool) -> arrow::array::RecordBatch {
+        let (data_type, column) = map_column(entries_nullable);
+        arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![column],
+        )
+        .expect("map batch")
+    }
+
+    /// Regression test for #13495: a server declaring a `MAP`'s `entries` nullable hands us a
+    /// column no kernel can rebuild. The table reports the corrected declaration, so the batch
+    /// this connector coerces against it is passed straight through — the same arrays, not a
+    /// per-batch cast of every column.
+    #[test]
+    fn a_normalized_map_batch_needs_no_coercion_against_the_conformed_table_schema() {
+        let wire_batch = map_batch(true);
+        let table_schema = arrow_tools::map_entries::conforming_schema(&wire_batch.schema());
+
+        let normalized = arrow_tools::map_entries::StreamNormalizer::new()
+            .normalize(wire_batch)
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let coerced = super::coerce_batch_to_schema(&normalized, &table_schema)
+            .expect("the normalized batch already matches the conformed table schema");
+        assert_eq!(coerced.schema(), table_schema);
+        assert!(
+            Arc::ptr_eq(coerced.column(0), normalized.column(0)),
+            "a batch that already matches must be handed on as-is, not cast column by column"
+        );
+    }
+
+    /// The declaration this table reports to the planner is the corrected one, so it describes
+    /// the batches `execute` hands back rather than the shape the server named.
+    #[tokio::test]
+    async fn a_servers_nullable_map_entries_declaration_is_corrected_on_the_table_it_builds() {
+        use arrow_flight::sql::client::FlightSqlServiceClient;
+        use datafusion::catalog::TableProvider;
+
+        let (declared_type, _) = map_column(true);
+        let (conforming_type, _) = map_column(false);
+        let declared: SchemaRef = Arc::new(Schema::new(vec![Field::new("m", declared_type, true)]));
+
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let client =
+            FlightSqlServiceClient::new(CookieService::new(channel, Arc::clone(&cookie_store)));
+
+        let table = super::FlightSQLTable::create_with_schema(
+            "flightsql",
+            "http://127.0.0.1:1",
+            client,
+            TableReference::bare("t"),
+            declared,
+            cookie_store,
+        );
+
+        assert_eq!(
+            TableProvider::schema(&table).field(0).data_type(),
+            &conforming_type
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum DoGetMode {

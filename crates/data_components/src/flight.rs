@@ -21,6 +21,7 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
 };
 use arrow_flight::error::FlightError;
+use arrow_tools::map_entries::{self, StreamNormalizer};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -73,6 +74,13 @@ pub enum Error {
     ArrowFlight {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to read query results from Arrow Flight ({source}), so the query cannot return rows. \
+        Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
+        See: https://spiceai.org/docs/components/data-connectors"
+    ))]
+    MapEntriesNotNormalizable { source: map_entries::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -216,6 +224,10 @@ impl FlightTable {
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
+        // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
+        // layout forbids. Correcting it here keeps the schema this table reports to the planner
+        // in step with the batches `execute` hands back, which are normalized to the same shape.
+        let schema = map_entries::conforming_schema(&schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =
@@ -242,6 +254,7 @@ impl FlightTable {
     ) -> Self {
         let table_reference = table_reference.into();
         tracing::debug!("table_reference={:?}", table_reference);
+        let schema = map_entries::conforming_schema(&schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =
@@ -524,11 +537,16 @@ fn query_to_stream(
     sql: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
+        // The stream's schema is whatever its batches carry, so the normalizer is resolved from
+        // the first one and reused for the rest.
+        let mut normalizer = StreamNormalizer::new();
         match client.query(sql.as_str()).await {
             Ok(mut stream) => {
                 while let Some(batch) = stream.next().await {
                     match batch {
-                        Ok(batch) => yield Ok(batch),
+                        Ok(batch) => yield normalizer
+                            .normalize(batch)
+                            .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { source })),
                         Err(error) => {
                             yield Err(map_query_stream_error(error));
                         }

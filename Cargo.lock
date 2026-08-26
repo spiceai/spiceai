@@ -17768,6 +17768,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "arrow-schema",
+ "arrow_tools",
  "async-openai",
  "async-stream",
  "async-trait",
