@@ -38,6 +38,7 @@ use runtime_parameters::ParameterSpec;
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
 use crate::parameters::{ConnectorContext, ConnectorParams};
+use crate::write_back::WriteBackDeliverer;
 use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
@@ -319,6 +320,39 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// perfectly safe inner connector as unsafe and reject a valid dataset.
     fn supports_durable_write_back_delivery(&self) -> bool {
         false
+    }
+
+    /// A connector-owned durable write-back deliverer for `dataset`, or `None`
+    /// to keep the worker's `TableProvider`-driven delivery.
+    ///
+    /// A connector returns `Some` when it must own the transaction each delivery
+    /// runs in — `PostgreSQL` stamps every delivery transaction with its id so
+    /// the CDC pump can drop the echo it will later stream back, which it cannot
+    /// do from behind the `TableProvider`. See [`WriteBackDeliverer`].
+    ///
+    /// `None` means "this connector never delivers through a connector-owned
+    /// transaction for this dataset" (the common case: every dataset that does
+    /// not need echo suppression). `Some(Err(_))` means "this dataset needs one
+    /// but it could not be set up" — the caller fails dataset setup rather than
+    /// silently falling back to the `TableProvider` path, which for a durable
+    /// write-back `PostgreSQL` dataset would commit writes without registering
+    /// their xids and reopen the double-apply window this exists to close.
+    ///
+    /// Defaults to `None`: the worker drives delivery through the source's
+    /// `TableProvider` exactly as before, so a connector that does not override
+    /// this is unaffected.
+    ///
+    /// **Wrappers must forward this.** Inheriting the default would report a
+    /// connector that owns its delivery as if it did not, silently dropping back
+    /// to the `TableProvider` path and, for `PostgreSQL`, never capturing the
+    /// transaction id the echo filter needs — the defaulted-no-op wrapper bug
+    /// (#10460) applied to this capability.
+    async fn write_back_deliverer(
+        &self,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
+    ) -> Option<DataConnectorResult<Arc<dyn WriteBackDeliverer>>> {
+        None
     }
 
     async fn metadata_provider(
