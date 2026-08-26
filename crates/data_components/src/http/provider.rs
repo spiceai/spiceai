@@ -1377,27 +1377,30 @@ impl HttpTableProvider {
         // retries are exhausted. `error_response_action` decides whether such a body is
         // data. Anything but `Store` has to answer here rather than downstream of the row:
         // the row is what a full refresh writes over good data with.
-        if !(200..300).contains(&status_code) {
-            match self.error_response_action {
-                ErrorResponseAction::Error => {
-                    // Permanent: the retry ladder above already spent its attempts on the
-                    // statuses worth retrying, so retrying here would only repeat them.
-                    return Err(RetryError::Permanent(Error::ErrorResponse {
-                        status: status_code,
-                        endpoint: endpoint_label(&self.base_url),
-                    }));
-                }
-                ErrorResponseAction::Warn => {
-                    tracing::warn!(
-                        "The request to {} answered {status_code}, and that response body is being recorded as a row, so a full refresh replaces this dataset's previous contents with it. Set `on_error_response: error` to fail the refresh and keep the previous contents instead. See: https://spiceai.org/docs/components/data-connectors/https",
-                        endpoint_label(&self.base_url)
-                    );
-                }
-                ErrorResponseAction::Store => {}
-            }
+        let is_error_response = !(200..300).contains(&status_code);
+
+        if is_error_response && self.error_response_action == ErrorResponseAction::Error {
+            // Permanent: the retry ladder above already spent its attempts on the statuses
+            // worth retrying, so retrying here would only repeat them.
+            return Err(RetryError::Permanent(Error::ErrorResponse {
+                status: status_code,
+                endpoint: endpoint_label(&self.base_url),
+            }));
         }
 
-        Self::extract_response(response, status_code, path_label).await
+        let fetched = Self::extract_response(response, status_code, path_label).await?;
+
+        // Warned only once the body is in hand. `extract_response` treats a broken read as
+        // transient and the request is retried, so warning before it would claim a row on
+        // every attempt, including the ones that never produce one.
+        if is_error_response && self.error_response_action == ErrorResponseAction::Warn {
+            tracing::warn!(
+                "The request to {} answered {status_code}, and that response body is being recorded as a row; on a full refresh that row replaces this dataset's previous contents. Set `on_error_response: error` to fail the refresh and keep them instead. See: https://spiceai.org/docs/components/data-connectors/https",
+                endpoint_label(&self.base_url)
+            );
+        }
+
+        Ok(fetched)
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -6487,6 +6490,148 @@ mod tests {
             Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
             request_count,
         )
+    }
+
+    /// Serve `status` with a `Content-Length` that overstates the body, then hang up — the
+    /// read fails after a valid status line, which `extract_response` treats as transient.
+    async fn start_truncated_body_server(status: u16) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(b"{\"partial\":").await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    /// Collect the `warn`-level lines emitted while `body` runs.
+    async fn warnings_emitted_during<F>(body: F) -> Vec<String>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // `set_default` rather than `with_default`: the latter takes a closure, which would
+        // force a `block_on` inside the test's own current-thread runtime and deadlock
+        // against the mock server's spawned tasks. The guard covers the provider's
+        // emissions because `#[tokio::test]` keeps this future on one thread.
+        let guard = tracing::subscriber::set_default(subscriber);
+        body.await;
+        drop(guard);
+
+        let captured = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_only_for_a_body_it_actually_has() {
+        use std::sync::atomic::Ordering;
+
+        // The warning claims a row is being recorded. `extract_response` treats a broken
+        // read as transient and the request is retried, so a warning emitted before it
+        // would make that claim on every attempt while producing no row at all.
+        let (base_url, request_count) = start_truncated_body_server(503).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert!(
+            request_count.load(Ordering::SeqCst) >= 1,
+            "the server must have been asked at least once"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no row was produced, so nothing should have claimed one: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_once_for_the_row_it_records() {
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one recorded row is one warning: {warnings:#?}"
+        );
+        assert!(
+            warnings[0].contains("404") && warnings[0].contains("on_error_response"),
+            "the warning must name the status and the parameter: {warnings:#?}"
+        );
     }
 
     #[tokio::test]
