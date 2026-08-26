@@ -456,14 +456,14 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a", features = ["tokio"] } # branch: spiceai-54 (vortex 0.79.0)
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-io = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309", features = ["tokio"] } # branch: spiceai-54 (vortex 0.79.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
@@ -589,9 +589,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "633c1dc4ad0d4a5b38f291a391da08519068519a" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "ba043de0ab6e214e825932210cc336b7ce5e8309" } # branch: spiceai-54 (vortex 0.79.0)
