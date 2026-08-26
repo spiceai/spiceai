@@ -2254,7 +2254,7 @@ impl RefreshTask {
             let nanos = temporal_scalar_as_nanos(col_array).map_err(|e| {
                 super::Error::FailedToFindLatestTimestamp {
                     reason: format!(
-                        "Failed to read the latest value of time column '{column}' ({}) in dataset '{}', so the append refresh cannot resume: {e}. See: https://spiceai.org/docs/components/data-accelerators/data-refresh#append",
+                        "Failed to read the latest value of time column '{column}' ({}) in dataset '{}', so the append refresh cannot resume: {e}",
                         accelerated_field.data_type(),
                         self.dataset_name
                     ),
