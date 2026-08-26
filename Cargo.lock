@@ -9431,9 +9431,11 @@ dependencies = [
  "bytes",
  "futures",
  "reqwest 0.13.4",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
+ "token_provider",
  "tokio",
  "tokio-stream",
 ]
@@ -21651,11 +21653,13 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.2.0-unstable"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "jsonwebtoken 10.4.0",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "snafu",
  "tokio",
