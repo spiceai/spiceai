@@ -1268,7 +1268,8 @@ mod tests {
         );
 
         let normalized = normalizer.normalize(decoded).expect("normalize should succeed");
-        let DataType::Map(entries, _) = normalized.schema().field(0).data_type() else {
+        let normalized_schema = normalized.schema();
+        let DataType::Map(entries, _) = normalized_schema.field(0).data_type() else {
             panic!("column should still be a MAP");
         };
         assert!(
