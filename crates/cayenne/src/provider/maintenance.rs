@@ -189,6 +189,20 @@ impl PostWriteMaintenanceState {
     }
 }
 
+/// What one retention pass did.
+///
+/// `Deferred` is not a failure and not an empty delete: the pass declined to run because
+/// materializing the inline corpus while a staged inline-conflict tombstone, a mem-tier
+/// seal shadow, or an append finalization is in flight would resurrect a superseded row
+/// or serve a live one twice. Keeping it distinct from `Deleted(0)` is what lets each
+/// caller pick its own retry — the background loop has a debounce to retry after, the
+/// synchronous drain does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionPass {
+    Deleted(u64),
+    Deferred,
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,

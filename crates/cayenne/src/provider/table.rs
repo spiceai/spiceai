@@ -41,7 +41,7 @@ use super::delete::{
 use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance, PostWriteMaintenanceState,
-    RetentionFailureAction, SnapshotMaintenanceTrigger, duration_millis_saturating,
+    RetentionFailureAction, RetentionPass, SnapshotMaintenanceTrigger, duration_millis_saturating,
     protected_snapshot_maintenance_trigger,
 };
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
@@ -16037,7 +16037,7 @@ impl CayenneTableProvider {
         let mut retention_deleted = 0_u64;
         if state.retention_requested {
             match self.apply_retention_filters().await {
-                Ok(deleted) => {
+                Ok(RetentionPass::Deleted(deleted)) => {
                     retention_deleted = deleted;
                     if deleted > 0 {
                         tracing::info!(
@@ -16046,6 +16046,25 @@ impl CayenneTableProvider {
                         );
                     }
                 }
+                Ok(RetentionPass::Deferred) => match retention_failure_action {
+                    // The background loop sleeps a debounce between passes, so re-arming
+                    // retries once the in-flight write publishes — milliseconds away.
+                    RetentionFailureAction::Requeue => {
+                        self.post_write_maintenance.state.lock().retention_requested = true;
+                    }
+                    // `flush_pending_maintenance` re-drains immediately, so re-arming
+                    // would spin it. Report instead: a caller draining before shutdown
+                    // needs to know the deletion did not run, not to loop until it can.
+                    RetentionFailureAction::ReturnError => {
+                        return Err(CatalogError::InvalidOperation {
+                            message: format!(
+                                "Retention for table '{}' was deferred: a staged inline-conflict tombstone, a mem-tier seal shadow, or an append finalization is still in flight.",
+                                self.table_metadata.table_name
+                            ),
+                            source: "retention deferred".into(),
+                        });
+                    }
+                },
                 Err(e) => {
                     match retention_failure_action {
                         RetentionFailureAction::Requeue => {
@@ -21096,9 +21115,9 @@ impl CayenneTableProvider {
     /// against concurrent inserts / listing refreshes for the duration of the
     /// scan — same exclusion guarantee the inline-retention path used to
     /// provide, just held inside the sink rather than the writer.
-    pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
+    pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<RetentionPass> {
         if self.retention_filters.is_empty() {
-            return Ok(0);
+            return Ok(RetentionPass::Deleted(0));
         }
 
         // The sink below scans this table's Vortex files, so rows in the metastore's
@@ -21139,8 +21158,11 @@ impl CayenneTableProvider {
                     table = %self.table_metadata.table_name,
                     "Deferring retention: a staged inline-conflict tombstone, a mem-tier seal shadow, or append finalization is in flight"
                 );
-                self.post_write_maintenance.state.lock().retention_requested = true;
-                return Ok(0);
+                // Reported rather than re-armed here: `flush_pending_maintenance` drains
+                // with no debounce between iterations, so re-arming from inside the pass
+                // would spin it forever while the flag stayed set. Only the caller knows
+                // whether a retry is a background debounce away or has nowhere to go.
+                return Ok(RetentionPass::Deferred);
             }
             self.checkpoint_inlined_data_if_present_for_delete()
                 .await
@@ -21218,7 +21240,7 @@ impl CayenneTableProvider {
             self.refresh_deletion_cache().await?;
         }
 
-        Ok(deleted_count)
+        Ok(RetentionPass::Deleted(deleted_count))
     }
 
     /// Refresh the cached deletion vectors by reloading from the catalog.
@@ -46938,11 +46960,15 @@ mod tests {
         );
 
         // Idempotence: nothing matches any more, so a second pass must not remove rows.
-        let deleted = provider
+        let outcome = provider
             .apply_retention_filters()
             .await
             .expect("second retention pass");
-        assert_eq!(deleted, 0, "a second pass has nothing left to match");
+        assert_eq!(
+            outcome,
+            RetentionPass::Deleted(0),
+            "a second pass runs and has nothing left to match"
+        );
         assert_eq!(
             scan_id_values(&provider).await,
             vec![(5, 50), (6, 60), (7, 70), (8, 80)],
@@ -47003,13 +47029,15 @@ mod tests {
             .pending_inline_tombstones
             .fetch_add(1, Ordering::Release);
 
-        let deleted = provider
+        let outcome = provider
             .apply_retention_filters()
             .await
             .expect("retention defers rather than failing");
         assert_eq!(
-            deleted, 0,
-            "retention must delete nothing while a tombstone is unpublished"
+            outcome,
+            RetentionPass::Deferred,
+            "retention must decline the pass while a tombstone is unpublished, and say so \
+             rather than reporting an empty delete"
         );
         assert_eq!(
             provider.cached_inlined_row_count(),
@@ -47017,15 +47045,42 @@ mod tests {
             "the inline corpus must be left where it is: flushing it here would \
              materialize a superseded row and drop the tombstone that hides it"
         );
+        // Re-arming is the caller's job, not the pass's: a synchronous drain has no
+        // debounce to retry after, so re-arming there would spin it. The background
+        // loop's action must re-arm, or the deletion is dropped rather than delayed.
+        let mut queued = PostWriteMaintenanceState {
+            retention_requested: true,
+            ..PostWriteMaintenanceState::default()
+        };
+        provider
+            .run_maintenance_state(queued, RetentionFailureAction::Requeue)
+            .await
+            .expect("a deferred background pass is not an error");
         assert!(
             provider
                 .post_write_maintenance
                 .state
                 .lock()
                 .retention_requested,
-            "a deferred pass must re-arm itself, or the deletion is dropped rather than \
-             delayed"
+            "the background loop must re-arm a deferred pass so it retries after the \
+             debounce"
         );
+        provider
+            .post_write_maintenance
+            .state
+            .lock()
+            .retention_requested = false;
+
+        // The synchronous drain reports instead, so a caller draining before shutdown
+        // learns the deletion did not run rather than looping until it can.
+        queued = PostWriteMaintenanceState {
+            retention_requested: true,
+            ..PostWriteMaintenanceState::default()
+        };
+        provider
+            .run_maintenance_state(queued, RetentionFailureAction::ReturnError)
+            .await
+            .expect_err("a deferred synchronous drain must report, not spin");
 
         // Stage B publishes; the next pass must proceed and delete the matching rows.
         provider
@@ -47083,13 +47138,14 @@ mod tests {
             .mem_tier_shadow_present
             .store(true, Ordering::Release);
 
-        let deleted = provider
+        let outcome = provider
             .apply_retention_filters()
             .await
             .expect("retention defers rather than failing");
         assert_eq!(
-            deleted, 0,
-            "retention must delete nothing while a seal shadow is present"
+            outcome,
+            RetentionPass::Deferred,
+            "retention must decline the pass while a seal shadow is present"
         );
         assert_eq!(
             provider.cached_inlined_row_count(),

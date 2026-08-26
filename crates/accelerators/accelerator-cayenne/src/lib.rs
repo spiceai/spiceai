@@ -3150,16 +3150,22 @@ fn wrap_with_native_vector_indexes(
     }
 }
 
-/// The warning a `mode: memory` acceleration gets when it configures retention.
+/// The warning a `mode: memory` acceleration gets when it configures `retention_sql`.
 ///
-/// Retention deletes reach the rows through the deletion sink, which scans this
-/// table's Vortex files — and a memory-mode table has none: its rows live only in the
-/// RAM tier, whose tombstones address rows by primary key rather than by predicate.
-/// Saying so at registration is the point: keeping rows the operator asked to have
-/// deleted, with nothing in the log to explain it, is the worst of the outcomes here.
+/// A `retention_sql` predicate reaches the rows only through the deletion sink, which
+/// scans this table's Vortex files — and a memory-mode table has none: its rows live
+/// only in the RAM tier, whose tombstones address rows by primary key rather than by
+/// predicate. Saying so at registration is the point: keeping rows the operator asked
+/// to have deleted, with nothing in the log to explain it, is the worst of the outcomes.
+///
+/// Deliberately NOT extended to `retention_period`, which is a different mechanism:
+/// Cayenne injects it as a scan-time keep filter (`TimeRetentionFilterBuilder`), so
+/// expired rows are hidden from every read whether or not they were physically deleted,
+/// memory mode included. Naming it here would tell the operator their data is exposed
+/// when it is not.
 fn memory_mode_retention_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): `retention_sql` and `retention_period` are not applied to a `mode: memory` acceleration, so rows matching the retention predicate stay queryable in the accelerated table. Set `mode: file` to have retention applied. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): `retention_sql` is not applied to a `mode: memory` acceleration, so rows matching that predicate stay queryable in the accelerated table. Set `mode: file` to have it applied, or use `retention_period`, which filters expired rows out of every read in either mode. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3950,8 +3956,7 @@ impl DataAccelerator for CayenneAccelerator {
             Vec::new()
         };
 
-        if memory_mode && (!retention_filters.is_empty() || time_retention_filter_builder.is_some())
-        {
+        if memory_mode && !retention_filters.is_empty() {
             tracing::warn!("{}", memory_mode_retention_warning(&table_name));
         }
 
@@ -5013,8 +5018,13 @@ mod tests {
         let warning = memory_mode_retention_warning("events");
 
         assert!(
-            warning.contains("retention_sql") && warning.contains("retention_period"),
-            "the warning must name both retention settings it covers: {warning}"
+            warning.contains("retention_sql"),
+            "the warning must name the setting it covers: {warning}"
+        );
+        assert!(
+            warning.contains("`retention_period`, which filters expired rows out of every read"),
+            "the warning must not leave the operator thinking period retention is affected \
+             too — it is a scan-time keep filter and works in either mode: {warning}"
         );
         assert!(
             warning.contains("stay queryable"),
