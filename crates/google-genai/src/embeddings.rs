@@ -227,8 +227,8 @@ fn text_content(content: &Content) -> String {
         .collect()
 }
 
-/// Vertex's `:predict` instances are snake_case (`task_type`) even though its `parameters` are
-/// camelCase (`outputDimensionality`) — so this struct deliberately carries no `rename_all`.
+/// Vertex's `:predict` instances are `snake_case` (`task_type`) even though its `parameters` are
+/// `camelCase` (`outputDimensionality`) — so this struct deliberately carries no `rename_all`.
 /// Serializing `task_type` as `taskType` makes Vertex ignore or reject the requested task.
 #[derive(Debug, Clone, Serialize)]
 struct VertexPredictInstance {
