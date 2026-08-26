@@ -15,26 +15,27 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
-//! Integration tests for what durable write-back *delivers* to a `PostgreSQL`
-//! source, driven through a full `Runtime`.
+//! Integration tests for durable write-back against a `PostgreSQL` source,
+//! driven through a full `Runtime`: what a delivery leaves in the source, and
+//! what the echo of that delivery must not put back into the accelerator.
 //!
-//! These sit beside the echo-suppression suite and deliberately do not repeat
-//! it: the question here is not whether an echo is dropped but whether the row
-//! the source ends up holding is the row the accelerator committed. An
-//! upsert-keyed CDC apply makes a leaked echo largely idempotent for a plain
-//! value overwrite, so a row-count or sum assertion cannot itself distinguish
-//! "echo dropped" from "echo re-applied" — that guarantee is the
-//! echo-suppression suite's job (`replication_write_back_echo.rs`), not this
-//! file's.
+//! Which of the two delivery routes a write takes decides which question it can
+//! answer. A write made **outside** a Cayenne transaction publishes to the
+//! accelerator and is forwarded to the source by the write-back sink itself, in
+//! a fire-and-forget background task: no delivery transaction is opened, no
+//! transaction id is registered, and the change comes back over CDC like any
+//! other source write. A write made **inside** a transaction stages instead,
+//! and its commit marks the dirty keys that the delivery worker reconciles
+//! through the connector-owned deliverer — which stamps the delivery with its
+//! `xid8` and registers it before committing, so the pump can recognize and
+//! drop the echo. Echo suppression is therefore reachable only from a write
+//! made inside a transaction.
 //!
-//! The trigger-rewrite test below uses a WAL-ordering barrier to make its
-//! assertion deterministic rather than time-based: once a local write has
-//! demonstrably reached the source, an *external* sentinel row is written
-//! directly to the source, and the test waits for that sentinel to appear in
-//! the accelerator. Logical replication is delivered in commit order, so a
-//! visible sentinel proves the pump has already processed every earlier
-//! transaction — including the echo of our own delivery. Only then is the
-//! table asserted.
+//! Two devices make that outcome readable, defined once and shared by every
+//! test: a source-side trigger that rewrites the delivered row so the source's
+//! copy differs from the committed one ([`create_bumping_table`]), and a
+//! sentinel row that orders the assertions behind the pump
+//! ([`wait_for_sentinel`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,8 +51,9 @@ use spicepod::component::dataset::replication::Replication;
 use spicepod::component::{access::AccessMode, dataset::Dataset};
 use spicepod::param::Params;
 use tokio::time::sleep;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
+use crate::cayenne::transaction::{describe, run_txn};
 use crate::postgres::common;
 use crate::utils::{
     register_test_connectors, run_query, runtime_ready_check, test_request_context,
@@ -67,18 +69,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── source helpers ──────────────────────────────────────────────────────────
 
+/// A client on the source, from the port [`common::get_random_port`] handed the
+/// container.
 async fn connect(port: usize) -> Result<Client, anyhow::Error> {
-    let mut cfg = tokio_postgres::Config::new();
-    cfg.host("localhost")
-        .port(u16::try_from(port)?)
-        .user("postgres")
-        .password(common::PG_PASSWORD)
-        .dbname("postgres");
-    let (client, connection) = cfg.connect(NoTls).await?;
-    tokio::spawn(async move {
-        let _: Result<(), tokio_postgres::Error> = connection.await;
-    });
-    Ok(client)
+    common::connect(u16::try_from(port)?).await
 }
 
 async fn exec(client: &Client, sql: &str) -> Result<(), anyhow::Error> {
@@ -268,22 +262,128 @@ fn tracing_filter() -> &'static str {
      data_components::postgres_replication=debug,info"
 }
 
-// ── a source-side trigger inside the delivery transaction ───────────────────
+// ── the trigger fixture and the waits the tests share ───────────────────────
 
-/// A source-side trigger that rewrites the delivered row converges: the
-/// accelerator ends up holding the trigger's value, not the one it committed.
+/// The offset the source-side trigger stamps onto every `n`, so the row the
+/// source stores is never the row Spice committed. Without that difference an
+/// echo is unobservable: re-applying a row by primary key over the identical row
+/// changes nothing.
+const TRIGGER_BUMP: i64 = 1000;
+
+/// The `n` every sentinel row carries. Bound once because a sentinel's `INSERT`
+/// and the `TRIGGER_BUMP + n` the accelerator is then waited on for are written
+/// at separate call sites: a mismatch between them does not fail an assertion,
+/// it burns the whole [`PROPAGATION_TIMEOUT`] and reports as a stall.
+const SENTINEL_N: i64 = 7;
+
+/// Create `public.{table}` holding `(1, 10)`, then a `BEFORE INSERT OR UPDATE`
+/// trigger that raises `n` by [`TRIGGER_BUMP`] once.
 ///
-/// This is worth pinning because the obvious prediction is the opposite. The
-/// trigger fires *inside* the delivery transaction, so the rewritten row is
-/// written under the delivery's own transaction id — exactly what echo
-/// suppression discards — which would leave the accelerator on its own value
-/// forever. Measured, that is not what happens: the rewrite reaches the
-/// accelerator and the two sides agree on the source's value.
+/// Guarded on `n < TRIGGER_BUMP` so the rewrite is idempotent, which it has to
+/// be for the delivered value to be a stable oracle. The deliverer's upsert leg
+/// issues `INSERT ... ON CONFLICT DO UPDATE`, which fires the `BEFORE INSERT`
+/// trigger on the proposed row and then, when the row already exists, the
+/// `BEFORE UPDATE` trigger on the result. An unguarded `n := n + TRIGGER_BUMP`
+/// would stamp `n + 2 * TRIGGER_BUMP` on every delivery of an existing key, and
+/// the worker replays a whole pass on any error, so a retried delivery would
+/// leave the source on a value no wait here expects.
 ///
-/// The assertion is a bounded wait rather than an instantaneous read, so it
-/// states the outcome without depending on whether the rewrite arrives as a
-/// suppressed-then-refreshed value or an applied one. If suppression ever did
-/// keep the rewrite out, this wait would time out and say so.
+/// A trigger sees nothing of the deliverer's other leg: `deliver_deletes` issues
+/// a `DELETE`, which this fixture cannot observe and no test here reaches (the
+/// leg runs only for a key that is dirty and absent from the accelerator).
+///
+/// The seed row is written before the trigger exists, so the bootstrap snapshot
+/// carries the plain value and only rows written afterwards are rewritten.
+async fn create_bumping_table(source: &Client, table: &str) -> Result<(), anyhow::Error> {
+    exec(
+        source,
+        &format!("CREATE TABLE public.{table} (id int PRIMARY KEY, n int NOT NULL)"),
+    )
+    .await?;
+    exec(
+        source,
+        &format!("INSERT INTO public.{table} VALUES (1, 10)"),
+    )
+    .await?;
+    exec(
+        source,
+        &format!(
+            "CREATE FUNCTION bump_{table}() RETURNS trigger AS $$
+             BEGIN
+               IF NEW.n < {TRIGGER_BUMP} THEN NEW.n := NEW.n + {TRIGGER_BUMP}; END IF;
+               RETURN NEW;
+             END;
+             $$ LANGUAGE plpgsql"
+        ),
+    )
+    .await?;
+    exec(
+        source,
+        &format!(
+            "CREATE TRIGGER bump_{table}_trigger BEFORE INSERT OR UPDATE
+             ON public.{table} FOR EACH ROW EXECUTE FUNCTION bump_{table}()"
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Wait for the dataset's bootstrap snapshot — the one seed row.
+async fn wait_for_bootstrap(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    let sql = format!("SELECT count(*) FROM {table}");
+    wait_for("the bootstrap snapshot", Some(1), || accel_scalar(rt, &sql)).await
+}
+
+/// Wait for the source to hold the trigger's rewrite of `n` at `id`, which is
+/// what says a delivery of that row reached the source and committed there.
+async fn wait_for_delivery(
+    source: &Client,
+    table: &str,
+    id: i64,
+    n: i64,
+) -> Result<(), anyhow::Error> {
+    let sql = format!("SELECT n FROM public.{table} WHERE id = {id}");
+    wait_for(
+        "the delivered row at the source",
+        Some(TRIGGER_BUMP + n),
+        || source_value(source, &sql),
+    )
+    .await
+}
+
+/// Wait for a sentinel row to reach the accelerator, carrying the trigger's
+/// rewrite of [`SENTINEL_N`].
+///
+/// This is the barrier the echo assertions depend on, and the foreign-writer
+/// control at the same time. The sentinel is written directly to the source
+/// after a delivery has demonstrably committed there, so it commits later in the
+/// WAL; logical replication is delivered in commit order, so the sentinel
+/// becoming visible proves the pump has already processed the delivery's echo.
+/// Its own value must survive, since Spice did not issue it.
+async fn wait_for_sentinel(
+    rt: &Arc<Runtime>,
+    table: &str,
+    sentinel_id: i64,
+) -> Result<(), anyhow::Error> {
+    let sql = format!("SELECT n FROM {table} WHERE id = {sentinel_id}");
+    wait_for(
+        "the sentinel in the accelerator",
+        Some(TRIGGER_BUMP + SENTINEL_N),
+        || accel_scalar(rt, &sql),
+    )
+    .await
+}
+
+// ── a source-side trigger outside a transaction ─────────────────────────────
+
+/// A write made outside a transaction converges on the source's value: the
+/// accelerator ends up holding the trigger's rewrite, not the row it committed.
+///
+/// The write is an ordinary `INSERT`, so it takes the sink's fire-and-forget
+/// forward and no transaction id is registered for it (see the module docs).
+/// Its rewrite therefore comes back as an unremarkable source change and is
+/// applied — the opposite outcome to a transaction's delivery, and the reason
+/// the two are worth pinning side by side.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(tracing_filter()));
@@ -293,29 +393,7 @@ async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow
             let port = common::get_random_port()?;
             let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
             let source = connect(port).await?;
-            exec(
-                &source,
-                "CREATE TABLE public.wb_trigger (id int PRIMARY KEY, amount int NOT NULL)",
-            )
-            .await?;
-            // Seeded before the trigger exists, so the bootstrap snapshot is the
-            // plain value and only delivered rows are rewritten.
-            exec(&source, "INSERT INTO public.wb_trigger VALUES (1, 10)").await?;
-            // Doubling makes a rewrite unmistakable rather than a plausible
-            // off-by-one.
-            exec(
-                &source,
-                "CREATE FUNCTION double_amount() RETURNS trigger AS $$
-                 BEGIN NEW.amount := NEW.amount * 2; RETURN NEW; END;
-                 $$ LANGUAGE plpgsql",
-            )
-            .await?;
-            exec(
-                &source,
-                "CREATE TRIGGER double_amount_trigger BEFORE INSERT OR UPDATE
-                 ON public.wb_trigger FOR EACH ROW EXECUTE FUNCTION double_amount()",
-            )
-            .await?;
+            create_bumping_table(&source, "wb_trigger").await?;
 
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
@@ -328,48 +406,29 @@ async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow
                 )],
             )
             .await?;
-            wait_for("the bootstrap snapshot", Some(1), || {
-                accel_scalar(&rt, "SELECT count(*) FROM wb_trigger")
-            })
-            .await?;
+            wait_for_bootstrap(&rt, "wb_trigger").await?;
 
-            // Spice commits 50. The trigger stores 100.
-            run_query(&rt, "INSERT INTO wb_trigger (id, amount) VALUES (2, 50)").await?;
-            wait_for("the trigger's rewrite at the source", Some(100), || {
-                source_value(&source, "SELECT amount FROM public.wb_trigger WHERE id = 2")
-            })
-            .await?;
+            // Spice commits 50 outside a transaction; the trigger rewrites it.
+            run_query(&rt, "INSERT INTO wb_trigger (id, n) VALUES (2, 50)").await?;
+            wait_for_delivery(&source, "wb_trigger", 2, 50).await?;
 
-            // Barrier: the sentinel is an external transaction, so it is not
-            // suppressed. Its own value is doubled by the trigger too, which is
-            // why the barrier waits on the row's presence and not its value.
-            exec(&source, "INSERT INTO public.wb_trigger VALUES (100, 7)").await?;
-            wait_for("the sentinel", Some(1), || {
-                accel_scalar(&rt, "SELECT count(*) FROM wb_trigger WHERE id = 100")
-            })
-            .await?;
-
-            // The trigger's rewrite reaches the accelerator: both sides end up on
-            // the source's value, not the one Spice committed.
-            wait_for(
-                "the trigger's rewrite in the accelerator",
-                Some(100),
-                || accel_scalar(&rt, "SELECT amount FROM wb_trigger WHERE id = 2"),
+            exec(
+                &source,
+                &format!("INSERT INTO public.wb_trigger VALUES (9, {SENTINEL_N})"),
             )
             .await?;
-            // The sentinel is an external transaction, so its own rewrite is never
-            // a suppression candidate — it confirms the stream is live rather than
-            // stalled at the row above.
+            wait_for_sentinel(&rt, "wb_trigger", 9).await?;
+
             assert_accel(
                 &rt,
-                "SELECT amount FROM wb_trigger WHERE id = 100",
-                14,
-                "an external transaction's rewrite reaches the accelerator",
+                "SELECT n FROM wb_trigger WHERE id = 2",
+                TRIGGER_BUMP + 50,
+                "an unregistered delivery's rewrite reaches the accelerator",
             )
             .await?;
             assert_eq!(
-                source_value(&source, "SELECT amount FROM public.wb_trigger WHERE id = 2").await?,
-                Some(100),
+                source_value(&source, "SELECT n FROM public.wb_trigger WHERE id = 2").await?,
+                Some(TRIGGER_BUMP + 50),
                 "the source holds the trigger's value"
             );
 
@@ -419,10 +478,7 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
             )
             .await?;
 
-            wait_for("the bootstrap snapshot", Some(1), || {
-                accel_scalar(&rt, "SELECT count(*) FROM cdc_plain")
-            })
-            .await?;
+            wait_for_bootstrap(&rt, "cdc_plain").await?;
 
             // A source-side write reaches the accelerator over CDC.
             exec(&source, "INSERT INTO public.cdc_plain VALUES (2, 20)").await?;
@@ -469,9 +525,145 @@ async fn write_back_bootstraps_without_an_explicit_slot() -> Result<(), anyhow::
             )
             .await?;
 
-            wait_for("the bootstrap snapshot", Some(1), || {
-                accel_scalar(&rt, "SELECT count(*) FROM wb_noslot")
-            })
+            wait_for_bootstrap(&rt, "wb_noslot").await?;
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+// ── echo suppression: a transaction's delivery is not re-applied ────────────
+
+/// Commit `(id, n)` into `table` inside a Cayenne transaction.
+///
+/// This is the write shape whose delivery runs through the connector-owned
+/// deliverer: the write stages, the commit marks its dirty key, and the delivery
+/// worker reconciles that key in a source transaction whose `xid8` it registers
+/// before committing. A write outside `BEGIN`…`COMMIT` never marks a key and is
+/// forwarded by the sink instead, registering nothing.
+async fn commit_in_transaction(
+    rt: &Arc<Runtime>,
+    table: &str,
+    id: i64,
+    n: i64,
+) -> Result<(), anyhow::Error> {
+    let sql = format!("BEGIN; INSERT INTO {table} (id, n) VALUES ({id}, {n}); COMMIT;");
+    run_txn(rt, &sql)
+        .await
+        .map_err(|e| anyhow!("`{sql}` failed: {}", describe(&e)))?;
+    Ok(())
+}
+
+/// The echo of a transaction's own write-back delivery is dropped, while a
+/// transaction Spice did not issue is applied.
+///
+/// The pump's filter and the registry's own lifecycle are unit-tested against a
+/// synthetic stream (`postgres_replication::shared` and
+/// `postgres_replication::xid_registry`), each side against ids of its own
+/// choosing. What only a real source can exercise is that the two agree: the id
+/// the deliverer reads from a live `PostgreSQL` and registers is the id that
+/// server then reports for the same transaction in pgoutput, decoded through
+/// the real connector, worker, pool, and slot.
+///
+/// Two things it deliberately does not establish, because a live source cannot
+/// be made to show them. It cannot see the *ordering* of the registration
+/// against the delivery's `COMMIT`: replication lags a commit by milliseconds,
+/// so registering just after `COMMIT` would still beat the echo and pass here —
+/// that ordering is an argued invariant of the deliverer, not a measured one.
+/// And a container's transaction ids sit far below 2^32, so the epoch is zero
+/// and the registry's low-32 projection is the identity; a projection bug shows
+/// up only against a source that has wrapped, which
+/// `xid_registry::contains_matches_low_32_bits` covers directly.
+///
+/// The trigger is what makes the outcome readable. Spice commits 50, the source
+/// stores 1050, and the accelerator's value afterwards is the answer: 50 means
+/// the echo was recognized and dropped, 1050 means it was re-applied over the
+/// row the accelerator had committed.
+///
+/// Both branches of the deliverer's upsert are covered, because they reach the
+/// source as different statements under different transaction ids: a key the
+/// source does not hold takes the insert branch, and the second commit of the
+/// same key takes `ON CONFLICT DO UPDATE`, whose echo is an UPDATE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transactions_echo_is_dropped_while_a_foreign_write_lands() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let source = connect(port).await?;
+            create_bumping_table(&source, "wb_echo").await?;
+
+            let accel = tempfile::tempdir()?;
+            let rt = build_runtime(
+                "write_back_echo",
+                vec![write_back_dataset(
+                    port,
+                    "wb_echo",
+                    "spice_wb_echo_slot",
+                    accel.path(),
+                )],
+            )
+            .await?;
+            wait_for_bootstrap(&rt, "wb_echo").await?;
+
+            commit_in_transaction(&rt, "wb_echo", 2, 50).await?;
+            wait_for_delivery(&source, "wb_echo", 2, 50).await?;
+
+            exec(
+                &source,
+                &format!("INSERT INTO public.wb_echo VALUES (9, {SENTINEL_N})"),
+            )
+            .await?;
+            wait_for_sentinel(&rt, "wb_echo", 9).await?;
+
+            assert_accel(
+                &rt,
+                "SELECT n FROM wb_echo WHERE id = 2",
+                50,
+                "the accelerator must still hold the row it committed",
+            )
+            .await?;
+            assert_accel(
+                &rt,
+                "SELECT count(*) FROM wb_echo",
+                3,
+                "dropping an echo must not drop a row",
+            )
+            .await?;
+            assert_accel(
+                &rt,
+                "SELECT n FROM wb_echo WHERE id = 1",
+                10,
+                "a row no delivery touched must be left alone",
+            )
+            .await?;
+            assert_eq!(
+                source_value(&source, "SELECT n FROM public.wb_echo WHERE id = 2").await?,
+                Some(TRIGGER_BUMP + 50),
+                "the source must keep its own value: an echo is dropped, not rolled back"
+            );
+
+            // The same key again, so this delivery takes the upsert's conflict
+            // branch instead of its insert branch: a different statement outcome
+            // at the source, a different `xid8`, and an echo carrying an UPDATE
+            // rather than an INSERT.
+            commit_in_transaction(&rt, "wb_echo", 2, 60).await?;
+            wait_for_delivery(&source, "wb_echo", 2, 60).await?;
+            exec(
+                &source,
+                &format!("INSERT INTO public.wb_echo VALUES (11, {SENTINEL_N})"),
+            )
+            .await?;
+            wait_for_sentinel(&rt, "wb_echo", 11).await?;
+            assert_accel(
+                &rt,
+                "SELECT n FROM wb_echo WHERE id = 2",
+                60,
+                "the accelerator must still hold the row it committed over an existing key",
+            )
             .await?;
 
             rt.shutdown().await;
