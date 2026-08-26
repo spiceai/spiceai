@@ -111,15 +111,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The part of a request URL that is safe to put in an error or a log line: scheme,
-/// host, port and path.
+/// The part of a *configured* endpoint that is safe to put in an error or a log line:
+/// scheme, host, port and path.
 ///
-/// A request's query carries whatever the dataset put there — an API key, a signed
-/// parameter, a pagination cursor, a search term — and `request_query_filters` lets a
-/// query's own values reach it, so the full URL is not printable. Userinfo and the
-/// fragment go for the same reason. The path stays, because an error has to name which
-/// fetch failed to be worth reading; [`CacheKey::redacted_label`] hashes even that, but
-/// it labels a debug line rather than telling an operator what to fix.
+/// **Pass the dataset's `base_url`, never a built request URL.** Everything a query
+/// contributes to a request is out of bounds: `request_query_filters` puts a query's own
+/// values in the query string, and `build_request_url` appends a `request_path` the query
+/// chose — which `allowed_request_paths` admits by glob, so a wildcard allowlist lets a
+/// filter name any path under the endpoint. Either can carry an API key, a signed
+/// parameter, a webhook secret or a cursor.
+///
+/// What remains is what the operator wrote in the spicepod, minus a query, userinfo or
+/// fragment they may have configured there. That is enough for an error to name which
+/// dataset endpoint failed, which is what makes it worth reading;
+/// [`CacheKey::redacted_label`] hashes even that, but it labels a debug line rather than
+/// telling an operator what to fix.
 fn endpoint_label(url: &Url) -> String {
     let mut label = url.clone();
     label.set_query(None);
@@ -1351,7 +1357,7 @@ impl HttpTableProvider {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
             return Err(RetryError::transient(Error::ErrorResponse {
                 status: status_code,
-                endpoint: endpoint_label(url),
+                endpoint: endpoint_label(&self.base_url),
             }));
         }
 
@@ -1367,13 +1373,13 @@ impl HttpTableProvider {
                     // statuses worth retrying, so retrying here would only repeat them.
                     return Err(RetryError::Permanent(Error::ErrorResponse {
                         status: status_code,
-                        endpoint: endpoint_label(url),
+                        endpoint: endpoint_label(&self.base_url),
                     }));
                 }
                 ErrorResponseAction::Warn => {
                     tracing::warn!(
                         "The request to {} answered {status_code}, and that response body is being recorded as a row, so a full refresh replaces this dataset's previous contents with it. Set `on_error_response: error` to fail the refresh and keep the previous contents instead. See: https://spiceai.org/docs/components/data-connectors/https",
-                        endpoint_label(url)
+                        endpoint_label(&self.base_url)
                     );
                 }
                 ErrorResponseAction::Store => {}
@@ -6325,6 +6331,41 @@ mod tests {
         assert!(
             !message.contains("SECRET") && !message.contains("hunter2"),
             "the rendered error must not carry the query or userinfo: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_never_prints_a_path_the_query_chose() {
+        // `allowed_request_paths` admits paths by glob, so a wildcard allowlist lets a
+        // SQL filter name any path under the endpoint — and `build_request_url` appends
+        // it. A path segment can therefore be a webhook secret or an embedded token, so
+        // the label has to come from the configured endpoint rather than the request.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let provider = status_provider(base_url, ErrorResponseAction::Error)
+            .with_allowed_paths(vec!["/*".to_string()])
+            .expect("a wildcard allowlist is valid");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let error = ctx
+            .sql("SELECT content FROM items WHERE request_path = '/webhook/PATH-TOKEN'")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("PATH-TOKEN"),
+            "a path the query chose must not reach the failure: {message}"
+        );
+        assert!(
+            message.contains("404"),
+            "the failure must still name the status: {message}"
         );
     }
 
