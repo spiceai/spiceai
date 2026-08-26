@@ -68,7 +68,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     if !matches!(query_set, QuerySet::ChBench | QuerySet::ChBenchFts) {
         anyhow::bail!(
             "HTAP command requires the 'chbench' or 'chbench-fts' query set, but got '{query_set}'. \
-             Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
+             Use '--query-set chbench' or '--query-set chbench-fts', or run 'testoperator run bench' for other query sets."
         );
     }
     super::ensure_shared_client_connections(test_args, "htap")?;
