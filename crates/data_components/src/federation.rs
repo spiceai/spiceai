@@ -1218,6 +1218,22 @@ mod tests {
         &list[..end]
     }
 
+    /// The derived table's own `SELECT` list — what it exposes to the scope that
+    /// encloses it.
+    ///
+    /// Narrower than "everything after the derived table starts", because `AS`
+    /// introduces relation aliases as well as column aliases (`FROM t AS s`, `) AS s`)
+    /// and those are emitted whether or not the outputs are named. A guard that reads
+    /// the wider region cannot tell a named output from an unnamed one.
+    fn derived_select_list(sql: &str) -> &str {
+        let opens = "FROM (SELECT ";
+        let list = &sql[first_offset_of(sql, opens) + opens.len()..];
+        let Some(end) = list.find(" FROM ") else {
+            panic!("expected the derived table's own FROM clause in: {sql}");
+        };
+        &list[..end]
+    }
+
     /// The column half of a reference the enclosing scope qualifies by `relation`.
     ///
     /// Spelled as the three ways a dialect writes the relation name rather than by
@@ -1390,13 +1406,17 @@ mod tests {
             .expect("build");
         for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-            let derived_at = first_offset_of(&sql, "FROM (SELECT ");
+            let list = derived_select_list(&sql);
 
             // The derived table does name an output — this is the requalified name, not
             // the absence of naming that preceded the fix — so the pin below is about
-            // *which* name it reports, not about whether it reports one.
+            // *which* name it reports, not about whether it reports one. Read from the
+            // derived SELECT list alone: `AS` also introduces the relation aliases
+            // (`FROM t AS s`, `) AS s`), which are present either way, so a search over
+            // the whole statement would hold on the pre-#206 rendering too and this
+            // assertion would distinguish nothing.
             assert!(
-                sql[derived_at..].contains(" AS "),
+                list.contains(" AS "),
                 "{dialect_name}: the derived table names no output at all, which is the \
                  pre-#206 behaviour rather than the gap this pins: {sql}"
             );
@@ -1405,7 +1425,7 @@ mod tests {
             // which is what makes the requalification the subject of this guard.
             let column = column_of(outer_reference(&sql), Some("s"));
             assert!(
-                !sql[derived_at..].contains(&format!("AS {column}")),
+                !list.contains(&format!("AS {column}")),
                 "{dialect_name}: the derived table now names {column}, so this shape binds and \
                  the remaining half of #12751 is repaired — move it into \
                  `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
