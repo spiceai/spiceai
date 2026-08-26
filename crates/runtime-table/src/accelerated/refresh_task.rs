@@ -3669,6 +3669,32 @@ mod tests {
         }
     }
 
+    /// The append path reads `None` as "no watermark" and starts over from the beginning,
+    /// so a value that cannot be scaled to nanoseconds has to be an error instead.
+    #[test]
+    fn test_temporal_scalar_as_nanos_rejects_an_out_of_range_value() {
+        let array: ArrayRef = Arc::new(TimestampSecondArray::from(vec![i64::MAX]));
+        assert!(
+            temporal_scalar_as_nanos(&array).is_err(),
+            "a seconds value too large to hold in nanoseconds must not read as no watermark"
+        );
+    }
+
+    #[test]
+    fn test_temporal_scalar_as_nanos_reads_null_and_empty_as_no_watermark() {
+        let null: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]));
+        assert_eq!(
+            temporal_scalar_as_nanos(&null).expect("a null value is not an error"),
+            None
+        );
+
+        let empty: ArrayRef = Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()));
+        assert_eq!(
+            temporal_scalar_as_nanos(&empty).expect("an empty array is not an error"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn test_max_timestamp_normalizes_date_columns() {
         // Midnight on the day of `FIXED_INSTANT_NANOS`.
