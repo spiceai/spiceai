@@ -67,6 +67,14 @@ where
     pub(crate) fn from_cache(cache: Cache<u64, V, PassthroughHashBuilder<T>>) -> Self {
         Self { cache }
     }
+
+    /// The moka cache this backend wraps.
+    ///
+    /// Moka's predicate-based invalidation (`invalidate_entries_if`) has no equivalent on
+    /// the [`CacheBackend`] trait, so table invalidation reaches for the cache itself.
+    pub(crate) fn cache(&self) -> &Cache<u64, V, PassthroughHashBuilder<T>> {
+        &self.cache
+    }
 }
 
 #[async_trait]

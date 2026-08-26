@@ -173,12 +173,7 @@ impl<
 > TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
     async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        let table_name = match &table_ref {
-            TableReference::Bare { table }
-            | TableReference::Partial { table, .. }
-            | TableReference::Full { table, .. } => table,
-        };
-        let table_name = Arc::clone(table_name);
+        let table_name = crate::invalidated_table_name(&table_ref);
         self.cache
             .invalidate_entries_if(move |_key, value| {
                 crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
