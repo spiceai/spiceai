@@ -165,6 +165,10 @@ jobs:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     strategy:
+      # The two arms cover disjoint model sets — self-hosted local models and the hosted
+      # providers — so one arm's result says nothing about the other's, and cancelling the
+      # sibling on the first failure throws away half the signal this suite exists to give.
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     permissions: read-all
