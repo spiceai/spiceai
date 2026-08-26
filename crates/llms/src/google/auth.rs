@@ -16,7 +16,8 @@ limitations under the License.
 
 //! Vertex AI auth resolution for the Google connector: `model.params`/`embeddings.params`
 //! (GCP service-account/ADC `OAuth2`) are resolved here into a ready-to-use
-//! [`google_genai::Client`].
+//! [`google_genai::Client`], or into the [`VertexCredentials`] the model lister signs its own
+//! requests with.
 
 use std::sync::Arc;
 
@@ -101,6 +102,33 @@ pub async fn build_client(
     vertex: VertexAuthParams<'_>,
     params_prefix: &str,
 ) -> Result<google_genai::Client, GoogleAuthError> {
+    let VertexCredentials {
+        project,
+        location,
+        token_provider,
+    } = resolve_credentials(vertex, params_prefix).await?;
+
+    google_genai::Client::with_bearer_token(token_provider, vertex_base_url(&project, &location))
+        .context(BuildClientSnafu)
+}
+
+/// A validated project/location pair and the token provider that authenticates requests against
+/// them. `project` and `location` have passed [`is_safe_gcp_identifier`], so callers may
+/// interpolate them into a request URL — build every Vertex AI URL from these fields rather than
+/// from the raw params, or [`resolve_credentials`]'s URL-injection check is bypassed.
+pub(super) struct VertexCredentials {
+    pub project: String,
+    pub location: String,
+    pub token_provider: Arc<dyn TokenProvider>,
+}
+
+/// Validates `vertex` and exchanges its service-account credentials for a Vertex AI token
+/// provider. Shared by [`build_client`] and the model lister so both reach Vertex AI through
+/// the same validation and the same credential resolution.
+pub(super) async fn resolve_credentials(
+    vertex: VertexAuthParams<'_>,
+    params_prefix: &str,
+) -> Result<VertexCredentials, GoogleAuthError> {
     let (Some(project), Some(location)) = (vertex.project, vertex.location) else {
         return MissingProjectOrLocationSnafu {
             params_prefix: params_prefix.to_string(),
@@ -135,11 +163,11 @@ pub async fn build_client(
             .await
             .context(BuildTokenProviderSnafu)?;
 
-    google_genai::Client::with_bearer_token(
-        Arc::new(token_provider) as Arc<dyn TokenProvider>,
-        vertex_base_url(project, location),
-    )
-    .context(BuildClientSnafu)
+    Ok(VertexCredentials {
+        project: project.to_string(),
+        location: location.to_string(),
+        token_provider: Arc::new(token_provider) as Arc<dyn TokenProvider>,
+    })
 }
 
 async fn resolve_service_account_json(
@@ -205,17 +233,23 @@ fn is_safe_gcp_identifier(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Builds the Vertex AI base URL for the Gemini publisher-model API:
-/// `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google`,
-/// except `location: global`, which uses the non-regionalized host
-/// `https://aiplatform.googleapis.com`.
-fn vertex_base_url(project: &str, location: &str) -> String {
-    let host = if location.eq_ignore_ascii_case("global") {
+/// The Vertex AI service endpoint for `location`: the regional host, except `location: global`,
+/// which is served by the non-regionalized `aiplatform.googleapis.com`.
+pub(super) fn vertex_host(location: &str) -> String {
+    if location.eq_ignore_ascii_case("global") {
         "https://aiplatform.googleapis.com".to_string()
     } else {
         format!("https://{location}-aiplatform.googleapis.com")
-    };
-    format!("{host}/v1/projects/{project}/locations/{location}/publishers/google")
+    }
+}
+
+/// Builds the Vertex AI base URL for the Gemini publisher-model API:
+/// `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google`.
+fn vertex_base_url(project: &str, location: &str) -> String {
+    format!(
+        "{}/v1/projects/{project}/locations/{location}/publishers/google",
+        vertex_host(location)
+    )
 }
 
 #[cfg(test)]

@@ -227,8 +227,10 @@ fn text_content(content: &Content) -> String {
         .collect()
 }
 
+/// Vertex's `:predict` instances are snake_case (`task_type`) even though its `parameters` are
+/// camelCase (`outputDimensionality`) — so this struct deliberately carries no `rename_all`.
+/// Serializing `task_type` as `taskType` makes Vertex ignore or reject the requested task.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct VertexPredictInstance {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,10 +318,12 @@ mod tests {
         };
 
         let json = serde_json::to_value(&request).expect("should serialize");
+        // Note the mixed casing: Vertex takes `task_type` on an instance but
+        // `outputDimensionality` in `parameters`.
         assert_eq!(
             json,
             serde_json::json!({
-                "instances": [{"content": "hello", "taskType": "RETRIEVAL_DOCUMENT"}],
+                "instances": [{"content": "hello", "task_type": "RETRIEVAL_DOCUMENT"}],
                 "parameters": {"outputDimensionality": 256}
             })
         );
