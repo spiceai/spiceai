@@ -98,6 +98,7 @@ impl TableProvider for DuckDBVectorQueryTable {
 
         Ok(Arc::new(DuckDBVectorQueryExec {
             projected_schema,
+            table_schema: Arc::clone(&self.schema),
             projected_columns,
             filters: filters.to_vec(),
             limit,

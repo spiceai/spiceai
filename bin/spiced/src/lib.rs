@@ -1390,9 +1390,10 @@ enum DeploymentNote {
         error: String,
         local_error: String,
     },
-    /// `--pods-watcher-enabled` was passed on an instance serving a deployment.
-    /// The watcher is not installed: reconciling the local spicepod into a
-    /// deployed app would swap the deployed configuration out from under it.
+    /// `--pods-watcher-enabled` was passed on a Cloud Connect managed instance.
+    /// The watcher is not installed: reconciling the local spicepod into an app
+    /// that arrives by deployment would swap that configuration out from under
+    /// the control plane.
     PodsWatcherDeclined,
     /// A cloud-managed instance found no spicepod — neither deployed nor local —
     /// and started on an empty one.
@@ -1407,6 +1408,13 @@ enum DeploymentNote {
 }
 
 impl DeploymentNote {
+    /// Why a Cloud Connect managed instance does not watch the local spicepod.
+    ///
+    /// Names no deployment: this note also reaches an instance whose first
+    /// deployment has not landed, one whose deployment did not build, and one
+    /// with no spicepod at all.
+    const PODS_WATCHER_DECLINED_MESSAGE: &str = "Spice Cloud Connect: `--pods-watcher-enabled` was ignored because this instance is Cloud Connect managed, so it will not reload when the local `spicepod.yaml` changes. Edit the app in Spice Cloud and deploy it there instead. See: https://spiceai.org/docs";
+
     fn log(&self) {
         match self {
             Self::Loaded { path } => tracing::info!(
@@ -1425,9 +1433,12 @@ impl DeploymentNote {
                 "Spice Cloud Connect: this instance started with no configuration — the deployed spicepod at {} could not be loaded ({error}), and neither could the local one ({local_error}). It serves nothing until a deployment replaces the file; the runtime stays reachable so that deployment can land.",
                 path.display()
             ),
-            Self::PodsWatcherDeclined => tracing::warn!(
-                "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
-            ),
+            // `spice run` passes `--pods-watcher-enabled` on every runtime it
+            // launches, so reaching this arm does not mean the operator asked
+            // for the watcher.
+            Self::PodsWatcherDeclined => {
+                tracing::debug!("{}", Self::PODS_WATCHER_DECLINED_MESSAGE);
+            }
             Self::NoSpicepod => {
                 tracing::warn!("No existing spicepod was found. Starting Runtime without one.");
             }
@@ -2235,6 +2246,20 @@ mod tests {
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("will be replaced by Spice Cloud"));
         assert!(!message.contains("Copy it to the project's Spicepod in Spice Cloud"));
+        assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn the_declined_pods_watcher_note_claims_no_deployment() {
+        let message = DeploymentNote::PODS_WATCHER_DECLINED_MESSAGE;
+        assert!(message.contains("`--pods-watcher-enabled`"));
+        assert!(message.contains("Cloud Connect managed"));
+        assert!(message.contains("`spicepod.yaml`"));
+        let lowercase = message.to_lowercase();
+        assert!(!lowercase.contains("deployed"));
+        assert!(!lowercase.contains("deployment"));
+        assert!(message.contains("Edit the app in Spice Cloud and deploy it there instead"));
         assert!(message.contains("https://spiceai.org/docs"));
         assert!(!message.contains('\n'));
     }
