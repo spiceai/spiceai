@@ -75,12 +75,13 @@ use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
 };
 use crate::provider::sink::CayenneDataSink;
-use crate::provider::{Error, Result};
+use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
+use snafu::ensure;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
@@ -1564,7 +1565,12 @@ pub struct CayenneTableProvider {
     /// Contains the deletion caches specific to each strategy variant.
     pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
-    /// Only set for tables with composite or non-integer primary keys.
+    ///
+    /// `None` is load-bearing for the single-`Int64` strategy: deletion-vector
+    /// tombstone keys use raw big-endian encoding there, while every
+    /// `RowConverterBased` strategy uses `OwnedRow` encoding. Callers that need
+    /// marker encoding rather than deletion-vector decoding must construct a
+    /// separate converter.
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
@@ -4557,8 +4563,7 @@ impl CayenneTableProvider {
         // exactly the successfully absent objects after the physical sweep so
         // superseded generations cannot occupy the bounded segment cache, which
         // is process-wide: what they hold is taken from every other table too.
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -4665,7 +4670,7 @@ impl CayenneTableProvider {
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
             let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
-            let file_format = Arc::clone(self.context.file_format());
+            let context = Arc::clone(&self.context);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4686,7 +4691,7 @@ impl CayenneTableProvider {
                     current_snapshot,
                     protected_snapshot_ids,
                     catalog,
-                    file_format,
+                    context,
                 )
                 .await
                 {
@@ -4702,7 +4707,7 @@ impl CayenneTableProvider {
         current_snapshot: String,
         protected_snapshot_ids: HashSet<String>,
         catalog: Arc<dyn MetadataCatalog>,
-        file_format: Arc<VortexFormat>,
+        context: Arc<CayenneContext>,
     ) -> Result<()> {
         let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
             Ok(rows) => rows,
@@ -4739,7 +4744,10 @@ impl CayenneTableProvider {
         // The blocking cleanup has finished unlinking every reported path, so
         // no valid scan can insert another segment after this exact-key sweep.
         let paths = std::mem::take(&mut *retired_cache_paths.lock());
-        file_format.invalidate_segment_cache_paths(paths).await;
+        context
+            .file_format()
+            .invalidate_cached_paths(context.runtime_env(), &task_table, paths)
+            .await;
         cleanup_result
             .map_err(|source| Error::TaskPanicked {
                 table: task_table,
@@ -4775,7 +4783,7 @@ impl CayenneTableProvider {
             current_snapshot.to_string(),
             protected_snapshot_ids,
             Arc::clone(&self.catalog),
-            Arc::clone(self.context.file_format()),
+            Arc::clone(&self.context),
         )
         .await
     }
@@ -5177,7 +5185,9 @@ impl CayenneTableProvider {
                 // Physical cleanup is complete before exact-key invalidation;
                 // the same scan-ref gate above excludes a later cache reinsert.
                 let paths = std::mem::take(&mut *retired_cache_paths.lock());
-                file_format.invalidate_segment_cache_paths(paths).await;
+                file_format
+                    .invalidate_cached_paths(&runtime_env, &table_id, paths)
+                    .await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -5346,10 +5356,21 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
-    pub(crate) async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+    /// Releases everything the Vortex caches still hold for files this table has
+    /// retired: their decoded segments and their footers.
+    ///
+    /// Callers pass paths whose objects are confirmed absent. The footer cache
+    /// tracks the live file set only because retirement tells it to — nothing
+    /// else does, so a path that skips this call keeps its footer resident for
+    /// the life of the process.
+    pub(crate) async fn invalidate_retired_paths(&self, paths: HashSet<ObjectStorePath>) {
         self.context
             .file_format()
-            .invalidate_segment_cache_paths(paths)
+            .invalidate_cached_paths(
+                self.context.runtime_env(),
+                &self.table_metadata.table_id,
+                paths,
+            )
             .await;
     }
 
@@ -5391,8 +5412,7 @@ impl CayenneTableProvider {
                 Err(_) => {}
             }
         }
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -6471,7 +6491,7 @@ impl CayenneTableProvider {
         } else {
             cache_paths
         };
-        self.invalidate_segment_cache_paths(absent_paths).await;
+        self.invalidate_retired_paths(absent_paths).await;
         if let Some(source) = deletion_error {
             return Err(Error::IoError { source });
         }
@@ -7332,16 +7352,23 @@ impl CayenneTableProvider {
     /// point-scan filter and the source delivery key.
     ///
     /// # Errors
-    /// Returns an error if the table has no PK converter or the bytes are
+    /// Returns an error if the table has no primary key, or if the bytes are
     /// malformed for its key schema.
     pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
-        let converter = self
-            .pk_row_converter
-            .as_ref()
-            .ok_or_else(|| Error::Internal {
+        ensure!(
+            !self.pk_column_indices.is_empty(),
+            InternalSnafu {
                 table: self.table_name().to_string(),
-                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
-            })?;
+                message: "decode_pk_keys requires a primary key".to_string(),
+            }
+        );
+        let converter = self.pk_row_converter.as_ref().map_or_else(
+            || {
+                self.build_pk_converter(&self.pk_column_indices)
+                    .map(Arc::new)
+            },
+            |converter| Ok(Arc::clone(converter)),
+        )?;
         let rows = pk_bytes
             .iter()
             .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
@@ -44646,8 +44673,22 @@ mod tests {
         );
     }
 
+    /// Retirement releases both of the caches a Vortex file occupies, in one
+    /// call: its decoded segments and its footer. The footer cache has no TTL
+    /// and no invalidation of its own — an entry leaves only when another `put`
+    /// pushes it out under capacity pressure — and every Cayenne file is written
+    /// once under a fresh uuid7 directory, so a footer that outlives its file
+    /// can never be looked up again yet keeps a share of a budget that live
+    /// metadata for every other table on the same environment, Parquet
+    /// included, competes for.
+    ///
+    /// "on the same environment" is the sharing boundary, and it is narrower
+    /// than the process: the cache hangs off the `RuntimeEnv`. This test runs
+    /// against one environment, so it covers what a deployment without a
+    /// dedicated Cayenne compaction environment sees; the second cache such a
+    /// deployment has is spiceai/spiceai#13497.
     #[tokio::test]
-    async fn committed_compaction_invalidates_retired_segments_after_cleanup() {
+    async fn committed_compaction_invalidates_retired_segments_and_footers_after_cleanup() {
         use arrow::array::Int64Array;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -44663,6 +44704,18 @@ mod tests {
             ctx.runtime_env(),
         )
         .await;
+        // Footer-cache keys are the files' object-store locations, and a Cayenne
+        // file's location carries the id of the snapshot that wrote it, so the
+        // resident footers can be attributed to a snapshot by name.
+        let footers_under = |snapshot: &str| {
+            ctx.runtime_env()
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(snapshot))
+                .count()
+        };
         insert_batch(
             &provider,
             RecordBatch::try_new(
@@ -44691,6 +44744,10 @@ mod tests {
             "the source scan must populate the cache"
         );
         let old_snapshot = provider.get_current_snapshot_id();
+        assert!(
+            footers_under(&old_snapshot) > 0,
+            "the source scan must cache the written snapshot's footers"
+        );
 
         assert!(
             provider
@@ -44723,6 +44780,16 @@ mod tests {
         );
 
         let current_snapshot = provider.get_current_snapshot_id();
+        let retired_footers_before = footers_under(&old_snapshot);
+        assert!(
+            retired_footers_before > 0,
+            "the compaction inputs' footers are still resident before cleanup"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the replacement scan must cache the live snapshot's footers"
+        );
+
         provider.protected_snapshots.store(Arc::new(HashMap::new()));
         provider
             .snapshot_scan_refs
@@ -44742,6 +44809,11 @@ mod tests {
             "in-flight compaction inputs must remain cached"
         );
         assert_eq!(
+            footers_under(&old_snapshot),
+            retired_footers_before,
+            "a snapshot an in-flight scan still holds is not retired, so its footers must stay"
+        );
+        assert_eq!(
             provider.snapshot_scan_refs.lock().remove(&old_snapshot),
             Some(1),
             "the test must release the old snapshot's in-flight guard"
@@ -44759,6 +44831,15 @@ mod tests {
         assert!(
             entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
             "cleanup must remove retired compaction inputs while preserving the output cache"
+        );
+        assert_eq!(
+            footers_under(&old_snapshot),
+            0,
+            "retiring a file must drop its footer: the deleted snapshot's {retired_footers_before} footers are still pinned in the shared cache, and nothing else will ever release them"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the live snapshot's footers must survive cleanup"
         );
     }
 
@@ -44909,8 +44990,29 @@ mod tests {
         vortex_config: VortexConfig,
         on_conflict: OnConflict,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            schema,
+            vec!["id".to_string()],
+            vortex_config,
+            on_conflict,
+        )
+        .await
+    }
 
+    async fn create_cdc_table_with_schema(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        schema: SchemaRef,
+        primary_key: Vec<String>,
+        vortex_config: VortexConfig,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
         let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
@@ -44921,15 +45023,10 @@ mod tests {
             as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema,
-            primary_key: vec!["id".to_string()],
+            primary_key,
             on_conflict: Some(on_conflict),
             base_path: data_dir,
             partition_column: None,
@@ -44941,6 +45038,109 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Build an upsert table keyed by `pk_columns` (name, type), in key order.
+    async fn create_table_with_pk_columns(
+        table_name: &str,
+        pk_columns: &[(&str, DataType)],
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        let key_names: Vec<String> = pk_columns
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        let mut fields: Vec<Field> = pk_columns
+            .iter()
+            .map(|(name, data_type)| Field::new(*name, data_type.clone(), false))
+            .collect();
+        fields.push(Field::new("value", DataType::Int64, false));
+
+        let on_conflict = OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                key_names.clone(),
+            ),
+        );
+        let (provider, _catalog, temp_dir) = create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            Arc::new(Schema::new(fields)),
+            key_names,
+            VortexConfig::default(),
+            on_conflict,
+        )
+        .await;
+        (provider, temp_dir)
+    }
+
+    /// Whether `pk_row_converter` is cached is the deletion-vector key-encoding
+    /// discriminator: an `Int64Pk` table's tombstone keys are raw big-endian,
+    /// every other shape's are `RowConverter` `OwnedRow` encodings (see
+    /// `partition_cold_manifest_for_promotion`). Caching a converter for a
+    /// single-`Int64` primary key would decode those raw-BE keys through a
+    /// `RowConverter`, corrupting carry-forward classification and cold-file
+    /// partitioning — so pin which shape caches one.
+    #[tokio::test]
+    async fn pk_row_converter_is_none_exactly_for_the_int64_pk_strategy() {
+        let ctx = SessionContext::new();
+
+        let (int64_pk, _tmp_int64) = create_table_with_pk_columns(
+            "pk_guard_int64",
+            &[("id", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int64_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::Int64Pk { .. }
+            ),
+            "a single-Int64 primary key selects the Int64Pk deletion strategy"
+        );
+        assert!(
+            int64_pk.pk_row_converter.is_none(),
+            "the Int64Pk strategy must cache no RowConverter: its deletion-vector \
+             tombstone keys are raw big-endian, not OwnedRow encodings"
+        );
+
+        let (int32_pk, _tmp_int32) = create_table_with_pk_columns(
+            "pk_guard_int32",
+            &[("id", DataType::Int32)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int32_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "an Int32 primary key selects the RowConverterBased deletion strategy"
+        );
+        assert!(
+            int32_pk.pk_row_converter.is_some(),
+            "the RowConverterBased strategy must cache its RowConverter"
+        );
+
+        // `Int64Pk` is selected only for one Int64 column; a composite of two
+        // uses `RowConverterBased` and caches a converter.
+        let (composite_pk, _tmp_composite) = create_table_with_pk_columns(
+            "pk_guard_composite",
+            &[("id", DataType::Int64), ("part", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                composite_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "a composite primary key selects the RowConverterBased deletion strategy \
+             even when every column is Int64"
+        );
+        assert!(
+            composite_pk.pk_row_converter.is_some(),
+            "a composite Int64 primary key must cache its RowConverter"
+        );
     }
 
     fn id_value_batch(schema: SchemaRef, ids: &[i64], values: &[i64]) -> RecordBatch {

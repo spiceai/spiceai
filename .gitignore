@@ -98,3 +98,9 @@ cluster_logs/
 # insta writes these when a snapshot assertion fails; they are the rejected
 # candidate, reviewed with `cargo insta review` and never committed.
 *.snap.new
+
+# `connector-nfs` is its own workspace root (see its Cargo.toml), so cargo
+# writes a lockfile beside it. It is a library, and its resolution is already
+# pinned by the workspace lock it is built alongside, so committing a second one
+# would only give it something to drift from.
+/crates/data-connectors/connector-nfs/Cargo.lock
