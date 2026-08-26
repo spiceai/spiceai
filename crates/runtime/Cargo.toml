@@ -408,7 +408,7 @@ snowflake = [
     "db_connection_pool/snowflake",
     "data_components/snowflake",
 ]
-spark = ["data_components/spark_connect"]
+spark = ["data_components/spark_connect", "connector-databricks/spark"]
 # Registers the Cayenne catalog connector. Intended for benchmarking only;
 # deliberately excluded from the default feature set.
 spicebench = []
@@ -429,6 +429,11 @@ turso = [
     "runtime-acceleration/turso",
 ]
 vortex = []
+[target.'cfg(not(windows))'.dev-dependencies]
+# The engine itself is not built on Windows, so neither is the test code that
+# exercises it or force-links its registration.
+accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
+
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true

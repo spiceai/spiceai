@@ -33,7 +33,7 @@ limitations under the License.
 //!
 //! * **CPU.** The aggregate Vortex encode concurrency across *all* tables is
 //!   bounded by a process-global semaphore sized to the CPU budget (see
-//!   [`crate::dataaccelerator::cayenne`] startup wiring and
+//!   [`crate`] startup wiring and
 //!   `cayenne::provider::write_budget`). Per-table `write_concurrency` is then a
 //!   request against that shared budget rather than an independent core grab, so
 //!   a fleet of tables receiving CDC at once cannot oversubscribe the cores.
@@ -51,12 +51,12 @@ limitations under the License.
 
 use data_components::inferred_schema::InferredSchema;
 
-use crate::component::dataset::acceleration::{Acceleration, StorageProfile};
-use crate::dataaccelerator::imds;
-use crate::dataaccelerator::storage::{
+use crate::imds;
+use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, StoragePerf, probe_storage_perf_async,
     resolve_acceleration_storage_async,
 };
+use runtime_acceleration::acceleration::{Acceleration, StorageProfile};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -133,7 +133,7 @@ impl MemTierCaps {
 /// Static host signals known at table-registration time.
 ///
 /// All are cheap to read and container-aware where the OS exposes it:
-/// [`crate::resource_monitor::get_total_memory`] honors cgroup v1/v2 memory
+/// [`runtime_resources::get_total_memory`] honors cgroup v1/v2 memory
 /// limits, and the core count comes from [`cpu_budget::cpu_budget`], which
 /// honors a cgroup CPU quota, a Kubernetes CPU request, and `runtime.cpu.cores`.
 /// Construct via [`HardwareProfile::detect`] in production or
@@ -207,7 +207,7 @@ impl HardwareProfile {
         metastore_path: &str,
     ) -> Self {
         let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
-        let total_mem_bytes = crate::resource_monitor::get_total_memory();
+        let total_mem_bytes = runtime_resources::get_total_memory();
         // The two storage classifications, the two calibration probes (cloud-agnostic,
         // memoized per volume — the only storage signal for a memory-tier table that
         // never spills), and the best-effort EC2 instance probe are all independent

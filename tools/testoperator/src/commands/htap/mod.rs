@@ -265,7 +265,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_results_snapshot(|_| false) // No snapshots for HTAP — results change under OLTP
+        .with_results_snapshot(|_, _| test_framework::snapshot::SnapshotMode::Skip) // No snapshots for HTAP — results change under OLTP
         .with_progress_bars(!test_args.common.disable_progress_bars)
         // Concurrent OLTP mutations make row counts non-deterministic; 0 rows is expected.
         .with_validate_row_count(false)

@@ -1210,10 +1210,6 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             queries.extend(generate_tpch_queries_override!("bigquery", q1, q6));
             queries
         }
-        Some(QueryOverrides::ScyllaDB) => remove_tpch_query!(
-            queries,
-            simple_q3 // ORDER BY is only supported when the partition key is restricted by an EQ or an IN; https://github.com/spiceai/spiceai/issues/10775
-        ),
         _ => queries,
     }
 }

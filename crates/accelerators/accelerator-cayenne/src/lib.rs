@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 // `pub(crate)` (not private) so the Cayenne *catalog* connector
-// (`crate::catalogconnector::cayenne`) can seed the adaptive-tuning knobs from
+// (the runtime's Cayenne catalog connector) can seed the adaptive-tuning knobs from
 // the same hardware-derived profile this accelerator path uses.
 pub(crate) mod autotune;
+mod imds;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
@@ -44,23 +45,23 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use util::concat_arrays;
 
-use super::{
+use crate::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
+use data_accelerator_api::FilePathError;
+use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use data_accelerator_api::spice_data_base_path;
+use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
     get_primary_keys_from_constraints, upsert_dedup,
 };
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
-use crate::dataaccelerator::FilePathError;
-use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::parameters::ParameterSpec;
-use crate::spice_data_base_path;
-use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
+use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_checkpoint_api::CheckpointError;
-#[cfg(feature = "sqlite")]
 use runtime_checkpoint_sqlite::SqliteSidecar;
+use runtime_parameters::ParameterSpec;
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
@@ -550,10 +551,10 @@ pub(crate) const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Durat
 /// depends on `cayenne`). The continuous slow-tier bias is refined further by the
 /// measured throughput threaded alongside it.
 fn to_cayenne_storage_class(
-    storage: crate::dataaccelerator::storage::ResolvedAccelerationStorage,
+    storage: data_accelerator_api::storage::ResolvedAccelerationStorage,
 ) -> cayenne::metadata::StorageClass {
-    use crate::dataaccelerator::storage::ResolvedAccelerationStorage as Resolved;
     use cayenne::metadata::StorageClass as Class;
+    use data_accelerator_api::storage::ResolvedAccelerationStorage as Resolved;
     match storage {
         Resolved::LocalSsd => Class::LocalSsd,
         Resolved::Ebs => Class::Ebs,
@@ -597,7 +598,7 @@ fn warn_if_low_disk_blocking(label: &str, path: &str) {
     {
         return;
     }
-    let Some((available, total)) = crate::dataaccelerator::storage::disk_space_bytes(path) else {
+    let Some((available, total)) = data_accelerator_api::storage::disk_space_bytes(path) else {
         return;
     };
     if total == 0
@@ -1148,9 +1149,15 @@ static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl CayenneAccelerator {
+    /// Builds the engine with the footer-cache size the runtime published.
+    ///
+    /// This is the constructor the registration slice calls, and it takes no arguments,
+    /// which is why the setting arrives through
+    /// [`runtime_acceleration::memory_budget::publish_cayenne_footer_cache_mb`] rather
+    /// than as a parameter.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_footer_cache_mb(None)
+        Self::with_footer_cache_mb(runtime_acceleration::memory_budget::cayenne_footer_cache_mb())
     }
 
     #[must_use]
@@ -1179,6 +1186,11 @@ impl CayenneAccelerator {
     /// 1. `cayenne_file_path` - Custom path (local or S3 Express One Zone)
     /// 2. Auto-generated S3 Express path if `cayenne_s3_zone_ids` is specified (uses first zone)
     /// 3. Default: `spice_data_base_path()/{dataset_name}/`
+    /// # Errors
+    ///
+    /// Returns [`Error::AccelerationNotEnabled`] when the source declares no acceleration,
+    /// and [`Error::InvalidConfiguration`] when it is not file-accelerated — a memory-mode
+    /// table has no data directory to name.
     pub fn cayenne_data_dir(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             return Err(Error::InvalidConfiguration {
@@ -3040,6 +3052,80 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
 
 #[async_trait]
 impl DataAccelerator for CayenneAccelerator {
+    async fn adaptive_tuning_seeds(
+        &self,
+        tuning: Option<&str>,
+        data_path: &str,
+        metastore_path: &str,
+    ) -> data_accelerator_api::AdaptiveTuningOutcome {
+        let (tuning_mode, tuning_value_invalid) = autotune::TuningMode::parse(tuning);
+        if tuning_mode != autotune::TuningMode::Adaptive {
+            return data_accelerator_api::AdaptiveTuningOutcome {
+                tuning_value_invalid,
+                seeds: None,
+            };
+        }
+
+        // No `StorageProfile` override is plumbed on the catalog path, and a catalog has
+        // no schema inference, so the seed comes from the detected hardware alone.
+        let hardware = autotune::HardwareProfile::detect(
+            runtime_acceleration::acceleration::StorageProfile::Auto,
+            data_path,
+            metastore_path,
+        )
+        .await;
+        let caps = hardware.inline_flush_caps(&autotune::WorkloadProfile::default());
+
+        data_accelerator_api::AdaptiveTuningOutcome {
+            tuning_value_invalid,
+            seeds: Some(data_accelerator_api::AdaptiveTuningSeeds {
+                // A small-write cadence, so the controller has a tick to ride.
+                compaction_background_interval_ms: 10_000,
+                compaction_trigger_files: 4,
+                inline_flush_max_rows: caps.max_rows,
+                inline_flush_max_segments: caps.max_segments,
+                inline_flush_max_bytes: caps.max_bytes,
+                // The CPU entitlement, so the controller's [1, cores] window matches it.
+                write_concurrency: hardware.cores,
+            }),
+        }
+    }
+
+    fn shared_store_key(
+        &self,
+        acceleration: &runtime_acceleration::acceleration::Acceleration,
+    ) -> Option<String> {
+        // Every Cayenne dataset in one metadata directory shares its SQLite catalog, so
+        // the directory is the identity `validate_snapshot_consistency` groups by. Absent
+        // this, that validation silently passes for every Cayenne dataset.
+        Some(Self::resolve_metadata_dir(Some(acceleration)))
+    }
+
+    fn spicepod_write_profile(
+        &self,
+        acceleration: &spicepod::acceleration::Acceleration,
+        unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
+    ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
+        // The contract is `None` unless the acceleration names this engine. The runtime
+        // enumerates Cayenne accelerations before asking, so this is the implementation
+        // holding up its own end: another consumer would otherwise get a confident
+        // Cayenne classification for a DuckDB or Arrow acceleration.
+        if !acceleration
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+        {
+            return None;
+        }
+
+        let profile = RefreshWriteProfile::from_spicepod(acceleration, unset_refresh_mode);
+        Some(data_accelerator_api::SpicepodWriteProfile {
+            uses_cdc_tier: profile.uses_cdc_tier(),
+            needs_compaction: profile.needs_compaction(),
+            inlines_small_writes: profile.inlines_small_writes(),
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -3121,7 +3207,6 @@ impl DataAccelerator for CayenneAccelerator {
         registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        #[cfg(feature = "sqlite")]
         {
             use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
 
@@ -3154,7 +3239,6 @@ impl DataAccelerator for CayenneAccelerator {
                 })?;
             }
 
-            #[cfg(feature = "turso")]
             {
                 let metastore_type = source
                     .acceleration()
@@ -3192,16 +3276,6 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::new(pool),
                 source.name().to_string(),
             )))
-        }
-
-        // The Cayenne metastore is a SQLite (or Turso) database, so without the
-        // `sqlite` engine compiled in there is nothing to open it with.
-        #[cfg(not(feature = "sqlite"))]
-        {
-            let _ = (source, registry, open_option);
-            Err(runtime_acceleration::sidecar::unsupported_sidecar(
-                "cayenne", "sidecar",
-            ))
         }
     }
 
@@ -3466,13 +3540,11 @@ impl DataAccelerator for CayenneAccelerator {
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
                 .await
             {
-                Ok(catalog) => Some(Arc::new(
-                    crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
-                        catalog,
-                        source.name().to_string(),
-                        path_buf.clone(),
-                    ),
-                )
+                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+                    catalog,
+                    source.name().to_string(),
+                    path_buf.clone(),
+                ))
                     as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
                 Err(err) => {
                     tracing::warn!(
@@ -3883,7 +3955,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
         };
         Some(Arc::new(
-            crate::dataaccelerator::cayenne::snapshot_engine::CayenneSnapshotEngine::new(
+            crate::snapshot_engine::CayenneSnapshotEngine::new(
                 catalog,
                 source.name().to_string(),
                 PathBuf::from(dir_path),
@@ -3901,7 +3973,7 @@ impl DataAccelerator for CayenneAccelerator {
         &self,
         _source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         drop(previous_provider);
         provider_factory().await
@@ -4137,6 +4209,8 @@ data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAcceler
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_acceleration::OnSchemaChange;
+    use runtime_acceleration::testing::TestAccelerationSource;
 
     /// A timestamp column compared against a string literal is how such a filter
     /// is normally written, and it must survive all the way to *evaluation*.
@@ -4256,11 +4330,10 @@ mod tests {
             "a value too large for the config field is not an explicit limit"
         );
     }
-    use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
-    use crate::component::dataset::builder::DatasetBuilder;
     use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion_table_providers::UnsupportedTypeAction;
+    use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
     use search::index::{SearchIndex, VectorIndex};
     use std::sync::Arc;
 
@@ -4696,141 +4769,58 @@ mod tests {
         assert!(dims.contains(&1536));
     }
 
-    /// `DataConnector::resolve_refresh_mode` fills in an unset `refresh_mode`
-    /// (`debezium`/`cdc` → `changes`, `sink` → `disabled`, everything else → `full`)
-    /// and its result is never written back into the `Acceleration`. So the
-    /// accelerator must resolve the connector default itself: classifying from the
-    /// raw field would read a genuine `debezium:` stream as a whole-table replace and
-    /// switch its background compactor off.
-    ///
-    /// Every case is also checked against the runtime builder's pre-init
-    /// classification, which sizes host memory for the same pod from the raw `from:`
-    /// string. The two reach the connector name by different routes — the builder
-    /// parses the Spicepod value, the accelerator asks the initialized component —
-    /// so agreeing on every case is what proves the pod cannot be budgeted as one
-    /// shape and configured as another.
-    #[tokio::test]
-    async fn accelerator_resolves_connector_unset_refresh_mode() {
-        use spicepod::acceleration::RefreshMode as SpicepodRefreshMode;
-
-        let app = Arc::new(AppBuilder::new("connector-unset-refresh-mode").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
-
-        // The profile the ACCELERATOR configures the table with, through a real
-        // `Dataset` — so `Dataset::connector_name` and `DatasetSpec::source()` are
-        // the code under test, not a hand-rolled parse.
-        let accelerator_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
-            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("build dataset");
-            dataset.acceleration = Some(Acceleration {
-                engine: Engine::Cayenne,
-                mode: Mode::File,
-                refresh_mode: refresh_mode.cloned().map(RefreshMode::from),
-                ..Default::default()
-            });
-            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
-            refresh_write_profile(&dataset, acceleration)
+    /// The write profile is the engine's answer about its *own* acceleration, so an
+    /// acceleration naming another engine must get `None` rather than a Cayenne
+    /// classification. The runtime filters by engine before asking, so only this test
+    /// stands between a second consumer and a silently wrong budget.
+    #[test]
+    fn the_write_profile_is_answered_only_for_a_cayenne_acceleration() {
+        let accelerator = CayenneAccelerator::new();
+        let named = |engine: Option<&str>| spicepod::acceleration::Acceleration {
+            engine: engine.map(ToString::to_string),
+            mode: spicepod::acceleration::Mode::File,
+            ..Default::default()
         };
 
-        // The profile the runtime BUILDER classifies the same pod with, pre-init.
-        let builder_profile = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
-            let accel = spicepod::acceleration::Acceleration {
-                refresh_mode: refresh_mode.cloned(),
-                ..Default::default()
-            };
-            RefreshWriteProfile::from_spicepod(
-                &accel,
-                crate::builder::connector_unset_refresh_mode(from),
-            )
-        };
-
-        let both_agree = |from: &str, refresh_mode: Option<&SpicepodRefreshMode>| {
-            let accelerator = accelerator_profile(from, refresh_mode);
-            assert_eq!(
-                accelerator,
-                builder_profile(from, refresh_mode),
-                "the accelerator and the runtime builder must classify `from: {from}` identically"
-            );
+        assert!(
             accelerator
-        };
+                .spicepod_write_profile(&named(Some("cayenne")), RefreshMode::Full)
+                .is_some(),
+            "the engine must classify its own acceleration"
+        );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(Some("CAYENNE")), RefreshMode::Full)
+                .is_some(),
+            "the engine name is matched the way the runtime matches it: case-insensitively"
+        );
 
-        // A CDC stream with no `refresh_mode:` line. `debezium/topic` is the case a
-        // `split_once(':')` would miss: `DatasetSpec::source()` treats `/` as a
-        // delimiter too.
-        for from in [
-            "debezium:my.topic",
-            "debezium/topic",
-            "cdc:stream",
-            "cdc/stream",
-        ] {
-            assert_eq!(
-                both_agree(from, None),
-                RefreshWriteProfile::SmallWrite,
-                "`{from}` with no refresh_mode is a CDC stream"
+        // `None` is the default Arrow engine, not an unspecified Cayenne one.
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+            assert!(
+                accelerator
+                    .spicepod_write_profile(&named(other), RefreshMode::Full)
+                    .is_none(),
+                "engine {other:?} is not Cayenne, so this engine must not classify it"
             );
         }
-
-        // `sink` resolves to `disabled`: no refresh runs, but `INSERT INTO` rows
-        // accumulate, so files still need consolidating.
-        assert_eq!(
-            both_agree("sink", None),
-            RefreshWriteProfile::BulkAppend,
-            "`sink` resolves to refresh_mode: disabled"
-        );
-
-        // Every other connector takes `resolve_refresh_mode`'s `full` default.
-        for from in ["s3://bucket/path", "postgres:public.orders"] {
-            assert_eq!(
-                both_agree(from, None),
-                RefreshWriteProfile::BulkOverwrite,
-                "`{from}` with no refresh_mode is a whole-table replace"
-            );
-        }
-
-        // An explicit `refresh_mode` always wins over the connector default, in both
-        // directions.
-        assert_eq!(
-            both_agree("debezium:my.topic", Some(&SpicepodRefreshMode::Full)),
-            RefreshWriteProfile::BulkOverwrite,
-            "an explicit refresh_mode: full overrides debezium's changes default"
-        );
-        assert_eq!(
-            both_agree(
-                "postgres:public.orders",
-                Some(&SpicepodRefreshMode::Changes)
-            ),
-            RefreshWriteProfile::SmallWrite,
-            "an explicit refresh_mode: changes overrides the full default"
-        );
     }
 
-    /// The consequence of the classification above: an unannotated `debezium:`
-    /// dataset must keep a background compactor. Reading `refresh_mode` raw makes it
-    /// bulk-overwrite, whose defaults set `compaction_background_interval_ms = 0` —
-    /// the compactor is then never spawned, and its small files never consolidate.
     #[tokio::test]
     async fn unset_cdc_refresh_mode_keeps_background_compaction() {
-        let app = Arc::new(AppBuilder::new("connector-unset-compaction").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
-
-        let interval_for = |from: &str| {
-            let mut dataset = DatasetBuilder::try_new(from.to_string(), "ds")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("build dataset");
-            dataset.acceleration = Some(Acceleration {
+        // Keyed by CONNECTOR NAME rather than a raw `from:` value: parsing one is
+        // `DatasetSpec::source`'s job, and that the two agree is asserted by
+        // `the_two_routes_to_an_unset_refresh_mode_agree`, which lives with the runtime
+        // because it needs both sides.
+        let interval_for = |connector: &str| {
+            let mut dataset = TestAccelerationSource::new("ds").with_connector_name(connector);
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 // No `refresh_mode`: the connector fills it in.
                 ..Default::default()
             });
-            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            let acceleration = dataset.acceleration().expect("acceleration set");
             let mut config = cayenne::metadata::VortexConfig::default();
             apply_refresh_mode_defaults(
                 &mut config,
@@ -4842,17 +4832,17 @@ mod tests {
         };
 
         assert_eq!(
-            interval_for("debezium:my.topic"),
+            interval_for("debezium"),
             SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS,
             "an unannotated debezium dataset is a CDC stream and keeps the tight compaction cadence"
         );
         assert_ne!(
-            interval_for("cdc:stream"),
+            interval_for("cdc"),
             0,
             "an unannotated cdc dataset must keep a background compactor"
         );
         assert_eq!(
-            interval_for("s3://bucket/path"),
+            interval_for("s3"),
             0,
             "a whole-table replace has nothing to consolidate, so the compactor stays off"
         );
@@ -4861,19 +4851,11 @@ mod tests {
     #[tokio::test]
     async fn test_cayenne_file_path_generation() {
         let app = AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
 
-        let mut dataset = DatasetBuilder::try_new(
-            "cayenne_data_accelerator_test".to_string(),
-            "cayenne_data_accelerator_test",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
+        let mut dataset =
+            TestAccelerationSource::new("cayenne_data_accelerator_test").with_app(app);
 
-        dataset.acceleration = Some(Acceleration {
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             ..Default::default()
@@ -4893,16 +4875,10 @@ mod tests {
     #[tokio::test]
     async fn test_cayenne_multi_zone_primary_path_generation() {
         let app = AppBuilder::new("test-app").build();
-        let rt = crate::Runtime::builder().build().await;
 
-        let mut dataset = DatasetBuilder::try_new("orders.dataset".to_string(), "orders.dataset")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let mut dataset = TestAccelerationSource::new("orders.dataset").with_app(app);
 
-        dataset.acceleration = Some(Acceleration {
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             params: [(
@@ -5339,17 +5315,11 @@ mod tests {
     #[tokio::test]
     async fn init_refuses_a_file_create_recreate_that_would_delete_the_metastore() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         // Named `metadata`, so the default data path resolves onto the default
         // metastore directory with no explicit parameter involved.
-        let mut dataset = DatasetBuilder::try_new("metadata".to_string(), "metadata")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("metadata").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::FileCreate,
             ..Default::default()
@@ -5377,20 +5347,14 @@ mod tests {
     #[tokio::test]
     async fn drop_table_leaves_a_metastore_nested_in_the_data_directory_intact() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
         let base = tempfile::tempdir().expect("temp dir");
 
-        let mut dataset = DatasetBuilder::try_new("orders".to_string(), "orders")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
         // `cayenne_file_path` puts the data directory at `{base}/orders/`; the
         // metastore is configured inside it.
         let data_dir = base.path().join("orders");
         let metadata_dir = data_dir.join("catalog");
-        dataset.acceleration = Some(Acceleration {
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::FileUpdate,
             params: [
@@ -5430,15 +5394,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_concurrency_is_resolved_per_dataset() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        let mut hot_dataset = DatasetBuilder::try_new("hot".to_string(), "hot")
-            .expect("hot dataset builder")
-            .with_app(Arc::clone(&app))
-            .with_runtime(Arc::clone(&rt))
-            .build()
-            .expect("hot dataset");
-        hot_dataset.acceleration = Some(Acceleration {
+        let mut hot_dataset = TestAccelerationSource::new("hot").with_app(Arc::clone(&app));
+        hot_dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             params: [("cayenne_write_concurrency".to_string(), "16".to_string())]
@@ -5447,13 +5405,8 @@ mod tests {
             ..Default::default()
         });
 
-        let mut quiet_dataset = DatasetBuilder::try_new("quiet".to_string(), "quiet")
-            .expect("quiet dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("quiet dataset");
-        quiet_dataset.acceleration = Some(Acceleration {
+        let mut quiet_dataset = TestAccelerationSource::new("quiet");
+        quiet_dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             params: [("cayenne_write_concurrency".to_string(), "2".to_string())]
@@ -5502,11 +5455,83 @@ mod tests {
         }
     }
 
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+    thread_local! {
+        static CAPTURE_SINK: std::cell::RefCell<Option<CapturedLogs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writer that routes each event to the buffer registered for the emitting thread,
+    /// and discards events from threads that registered none.
+    #[derive(Clone, Default)]
+    struct ThreadCapture;
+
+    impl std::io::Write for ThreadCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURE_SINK.with(|sink| {
+                if let Some(logs) = sink.borrow().as_ref() {
+                    logs.0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for ThreadCapture {
         type Writer = Self;
 
         fn make_writer(&self) -> Self::Writer {
-            self.clone()
+            Self
+        }
+    }
+
+    /// Captures this thread's log lines until the guard drops.
+    ///
+    /// The subscriber is installed **globally**, once per test binary, rather than
+    /// scoped to the calling thread with `tracing::subscriber::set_default`. A scoped
+    /// subscriber cannot observe a callsite that other threads also reach: `tracing`
+    /// caches each callsite's interest process-wide, so whichever thread evaluates it
+    /// first decides for every thread — and a sibling test reaching it without a
+    /// subscriber caches it as "never", after which the event is dropped before any
+    /// subscriber sees it. That is invisible under `nextest` (one process per test) and
+    /// when the test runs alone, and shows up as a zero count under a parallel
+    /// `cargo test`. Installing globally keeps every callsite enabled; the thread-local
+    /// sink is what keeps concurrent tests from reading each other's lines.
+    fn capture_logs() -> CaptureGuard {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(ThreadCapture)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            )
+            .expect("no other global subscriber is installed in this test binary");
+        });
+
+        let logs = CapturedLogs::default();
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(logs.clone()));
+        CaptureGuard(logs)
+    }
+
+    struct CaptureGuard(CapturedLogs);
+
+    impl CaptureGuard {
+        fn occurrences_of(&self, needle: &str) -> usize {
+            self.0.occurrences_of(needle)
+        }
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
         }
     }
 
@@ -5536,7 +5561,7 @@ mod tests {
 
     #[test]
     fn auto_tuned_config_fingerprint_covers_the_logged_values_only() {
-        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+        use data_accelerator_api::storage::ResolvedAccelerationStorage;
 
         let hw = autotune::HardwareProfile::new(
             8,
@@ -5625,15 +5650,9 @@ mod tests {
         };
 
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
         let build = |params: Vec<(String, String)>| {
-            let mut dataset = DatasetBuilder::try_new(TABLE.to_string(), TABLE)
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new(TABLE).with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 params: params.into_iter().collect(),
@@ -5642,17 +5661,10 @@ mod tests {
             dataset
         };
 
-        // Capture only the emits below: `#[tokio::test]` runs the whole test body on
-        // one thread, and `set_default` installs the subscriber on that thread only,
-        // so concurrent tests cannot contribute to the count.
-        let captured = CapturedLogs::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(captured.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .finish(),
-        );
+        // Capture only the emits below: `#[tokio::test]` runs the whole test body on one
+        // thread, and the sink is registered for that thread alone, so concurrent tests
+        // cannot contribute to the count.
+        let captured = capture_logs();
 
         let dataset = build(misconfigured());
         for _ in 0..3 {
@@ -5694,19 +5706,13 @@ mod tests {
     #[tokio::test]
     async fn test_vortex_config_defaults_use_small_write_refresh_profile() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         for (table_name, refresh_mode) in [
             ("cached_hot", RefreshMode::Caching),
             ("cdc_hot", RefreshMode::Changes),
         ] {
-            let mut dataset = DatasetBuilder::try_new(table_name.to_string(), table_name)
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new(table_name).with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 refresh_mode: Some(refresh_mode),
@@ -5747,13 +5753,8 @@ mod tests {
             assert!((16..=256).contains(&config.inline_flush_max_segments));
         }
 
-        let mut dataset = DatasetBuilder::try_new("append_hot".to_string(), "append_hot")
-            .expect("dataset builder")
-            .with_app(Arc::clone(&app))
-            .with_runtime(Arc::clone(&rt))
-            .build()
-            .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("append_hot");
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
@@ -5781,7 +5782,6 @@ mod tests {
     #[tokio::test]
     async fn test_vortex_config_defaults_use_large_write_refresh_profile() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         // The bulk-APPEND profile only. `full` (and an unset mode, which the
         // connector default resolves to `full`) is the bulk-OVERWRITE profile and
@@ -5791,13 +5791,8 @@ mod tests {
             ("snapshot_load", Some(RefreshMode::Snapshot)),
             ("disabled_load", Some(RefreshMode::Disabled)),
         ] {
-            let mut dataset = DatasetBuilder::try_new(table_name.to_string(), table_name)
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new(table_name).with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 refresh_mode,
@@ -5825,14 +5820,8 @@ mod tests {
             );
         }
 
-        let mut dataset =
-            DatasetBuilder::try_new("append_batch_load".to_string(), "append_batch_load")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("append_batch_load");
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Append),
@@ -5866,15 +5855,9 @@ mod tests {
     #[tokio::test]
     async fn test_inline_thresholds_are_resolved_from_acceleration_params() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("cdc_hot").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
@@ -5937,16 +5920,10 @@ mod tests {
                 )
                 .build(),
         );
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         let cdc_dataset = |name: &str, params: Vec<(String, String)>| {
-            let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new(name).with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 refresh_mode: Some(RefreshMode::Changes),
@@ -6000,15 +5977,9 @@ mod tests {
     #[tokio::test]
     async fn test_documented_cdc_mem_tier_params_are_resolved() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("cdc_hot").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
@@ -6036,15 +6007,9 @@ mod tests {
     async fn test_cdc_mem_tier_caps_auto_derived_for_small_write() {
         const MIB: i64 = 1024 * 1024;
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        let mut cdc = DatasetBuilder::try_new("cdc_auto_tier".to_string(), "cdc_auto_tier")
-            .expect("dataset builder")
-            .with_app(Arc::clone(&app))
-            .with_runtime(Arc::clone(&rt))
-            .build()
-            .expect("dataset");
-        cdc.acceleration = Some(Acceleration {
+        let mut cdc = TestAccelerationSource::new("cdc_auto_tier").with_app(Arc::clone(&app));
+        cdc.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
@@ -6071,13 +6036,8 @@ mod tests {
         assert_eq!(config.cdc_mem_tier_max_age_ms, 10_000);
         assert_eq!(config.cdc_mem_tier_checkpoint_interval_ms, 1_000);
 
-        let mut full = DatasetBuilder::try_new("full_tier".to_string(), "full_tier")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        full.acceleration = Some(Acceleration {
+        let mut full = TestAccelerationSource::new("full_tier");
+        full.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
@@ -6099,16 +6059,10 @@ mod tests {
     #[tokio::test]
     async fn test_full_refresh_disables_background_compaction() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         let build = |name: &str, refresh_mode: RefreshMode, params: Vec<(String, String)>| {
-            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            ds.acceleration = Some(Acceleration {
+            let mut ds = TestAccelerationSource::new(name).with_app(Arc::clone(&app));
+            ds.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 refresh_mode: Some(refresh_mode),
@@ -6188,21 +6142,9 @@ mod tests {
     /// resolution) untouched.
     #[tokio::test]
     async fn test_deletion_mode_auto_resolves_to_key_for_cdc_pk_tables() {
-        let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
-
-        let build = |name: &str,
-                     refresh_mode: RefreshMode,
-                     params: Vec<(String, String)>,
-                     app: &Arc<app::App>,
-                     rt: &Arc<crate::Runtime>| {
-            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
-                .expect("dataset builder")
-                .with_app(Arc::clone(app))
-                .with_runtime(Arc::clone(rt))
-                .build()
-                .expect("dataset");
-            ds.acceleration = Some(Acceleration {
+        let build = |name: &str, refresh_mode: RefreshMode, params: Vec<(String, String)>| {
+            let mut ds = TestAccelerationSource::new(name);
+            ds.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 refresh_mode: Some(refresh_mode),
@@ -6220,7 +6162,7 @@ mod tests {
         };
 
         // CDC (changes) + PK + unset mode → auto-resolves to Key.
-        let ds = build("cdc_pk", RefreshMode::Changes, vec![], &app, &rt);
+        let ds = build("cdc_pk", RefreshMode::Changes, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "cdc_pk",
             &ds,
@@ -6236,8 +6178,6 @@ mod tests {
             "cdc_pk_pos",
             RefreshMode::Changes,
             vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
-            &app,
-            &rt,
         );
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "cdc_pk_pos",
@@ -6254,7 +6194,7 @@ mod tests {
 
         // CDC without a PK stays Auto (downstream resolution: position — the
         // only mechanism a PK-less table has).
-        let ds = build("cdc_nopk", RefreshMode::Changes, vec![], &app, &rt);
+        let ds = build("cdc_nopk", RefreshMode::Changes, vec![]);
         let nopk_workload = autotune::WorkloadProfile {
             small_write: true,
             ..Default::default()
@@ -6270,7 +6210,7 @@ mod tests {
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
         // A non-CDC profile with a PK stays Auto (position downstream).
-        let ds = build("full_pk", RefreshMode::Full, vec![], &app, &rt);
+        let ds = build("full_pk", RefreshMode::Full, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",
             &ds,
@@ -6401,16 +6341,10 @@ mod tests {
     #[tokio::test]
     async fn test_inline_partial_override_preserves_refresh_profile_defaults() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
         let mut small_write_dataset =
-            DatasetBuilder::try_new("cdc_partial_override".to_string(), "cdc_partial_override")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-        small_write_dataset.acceleration = Some(Acceleration {
+            TestAccelerationSource::new("cdc_partial_override").with_app(Arc::clone(&app));
+        small_write_dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Changes),
@@ -6435,14 +6369,8 @@ mod tests {
             SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
         );
 
-        let mut large_write_dataset =
-            DatasetBuilder::try_new("full_partial_override".to_string(), "full_partial_override")
-                .expect("dataset builder")
-                .with_app(app)
-                .with_runtime(rt)
-                .build()
-                .expect("dataset");
-        large_write_dataset.acceleration = Some(Acceleration {
+        let mut large_write_dataset = TestAccelerationSource::new("full_partial_override");
+        large_write_dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             refresh_mode: Some(RefreshMode::Full),
@@ -6474,15 +6402,9 @@ mod tests {
     #[tokio::test]
     async fn test_compaction_thresholds_are_resolved_from_acceleration_params() {
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
 
-        let mut dataset = DatasetBuilder::try_new("compact".to_string(), "compact")
-            .expect("dataset builder")
-            .with_app(app)
-            .with_runtime(rt)
-            .build()
-            .expect("dataset");
-        dataset.acceleration = Some(Acceleration {
+        let mut dataset = TestAccelerationSource::new("compact").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
             params: [
@@ -6556,18 +6478,12 @@ mod tests {
         use spicepod::partitioning::PartitionedBy;
 
         let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
         // Keep the metastore this test may open inside a temp dir rather than the
         // process-wide Spice data path.
         let metadata_dir = tempfile::TempDir::new().expect("tempdir");
         let build = |partition_by: Vec<PartitionedBy>| {
-            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new("users").with_app(Arc::clone(&app));
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::FileUpdate,
                 refresh_mode: Some(RefreshMode::Full),
@@ -6635,17 +6551,10 @@ mod tests {
     async fn a_partitioned_dataset_never_carries_a_schema_evolution_mode() {
         use spicepod::partitioning::PartitionedBy;
 
-        let app = Arc::new(AppBuilder::new("test").build());
-        let rt = Arc::new(crate::Runtime::builder().build().await);
         let build = |partition_by: Vec<PartitionedBy>, policy| {
-            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
-                .expect("dataset builder")
-                .with_app(Arc::clone(&app))
-                .with_runtime(Arc::clone(&rt))
-                .build()
-                .expect("dataset");
-            dataset.on_schema_change = policy;
-            dataset.acceleration = Some(Acceleration {
+            let mut dataset = TestAccelerationSource::new("users");
+            dataset.set_on_schema_change(policy);
+            dataset.set_acceleration(Acceleration {
                 engine: Engine::Cayenne,
                 mode: Mode::File,
                 partition_by,
@@ -6660,7 +6569,7 @@ mod tests {
             }]
         };
         let workload = autotune::WorkloadProfile::default();
-        let evolution_mode = async |dataset: &crate::component::dataset::Dataset| {
+        let evolution_mode = async |dataset: &TestAccelerationSource| {
             CayenneAccelerator::get_vortex_config_with_footer_cache(
                 "users", dataset, None, &workload,
             )
@@ -6672,7 +6581,7 @@ mod tests {
         assert!(
             evolution_mode(&build(
                 partitioned_by_bucket(),
-                crate::component::dataset::OnSchemaChange::SyncAllColumns
+                OnSchemaChange::SyncAllColumns
             ))
             .await
             .is_disabled(),
@@ -6682,13 +6591,77 @@ mod tests {
         // The same policy on an unpartitioned dataset still evolves: the guard
         // above must key on partitioning, not disable evolution outright.
         assert!(
-            !evolution_mode(&build(
-                Vec::new(),
-                crate::component::dataset::OnSchemaChange::SyncAllColumns
-            ))
-            .await
-            .is_disabled(),
+            !evolution_mode(&build(Vec::new(), OnSchemaChange::SyncAllColumns))
+                .await
+                .is_disabled(),
             "an unpartitioned dataset keeps in-place evolution"
+        );
+    }
+    /// Datasets sharing one metadata directory share its `SQLite` catalog, so a pod where
+    /// some snapshot and others do not cannot be restored consistently and must be refused
+    /// up front. That check is generic — it groups by
+    /// [`DataAccelerator::shared_store_key`] — so it silently passes for every Cayenne
+    /// dataset if this engine does not answer that question. Regression test for exactly
+    /// that: the validation moved out of `runtime` when the engine did, and an unimplemented
+    /// `shared_store_key` would leave it looking green while checking nothing.
+    #[tokio::test]
+    async fn mixed_snapshot_settings_in_one_metadata_dir_are_refused() {
+        use data_accelerator_api::validate_snapshot_consistency;
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_acceleration::testing::TestAccelerationSource;
+        use spicepod::acceleration::SnapshotsCompaction;
+        use spicepod::component::snapshot::Snapshots;
+        use std::sync::Weak;
+
+        let dir = std::env::temp_dir()
+            .join("spice_cayenne_shared_metastore")
+            .to_string_lossy()
+            .to_string();
+        let acceleration = |snapshots: bool| {
+            let mut acceleration = Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: [("cayenne_metadata_dir".to_string(), dir.clone())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            // `Disabled` is the default, so the *enabled* side is what has to be built
+            // explicitly — a test that left both at the default would compare nothing.
+            if snapshots {
+                acceleration.snapshot_behavior = SnapshotBehavior::Enabled(
+                    Arc::new(Snapshots::default()),
+                    Weak::new(),
+                    tokio::runtime::Handle::current(),
+                    SnapshotsCompaction::Disabled,
+                );
+            }
+            acceleration
+        };
+
+        // Both sides of the disagreement, in the same directory.
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(
+                TestAccelerationSource::new("snapshotting").with_acceleration(acceleration(true)),
+            ),
+            Arc::new(
+                TestAccelerationSource::new("not_snapshotting")
+                    .with_acceleration(acceleration(false)),
+            ),
+        ];
+        assert!(
+            validate_snapshot_consistency(&sources).is_err(),
+            "a metadata directory with both snapshotting and non-snapshotting datasets must be refused"
+        );
+
+        // Agreeing datasets in the same directory are supported.
+        let agreeing: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(TestAccelerationSource::new("a").with_acceleration(acceleration(true))),
+            Arc::new(TestAccelerationSource::new("b").with_acceleration(acceleration(true))),
+        ];
+        assert!(
+            validate_snapshot_consistency(&agreeing).is_ok(),
+            "datasets that agree may share a metadata directory"
         );
     }
 }
