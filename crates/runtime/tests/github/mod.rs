@@ -992,23 +992,51 @@ async fn test_github_reviews() -> Result<(), String> {
 
             // The state and the reviewer are what `pulls.reviews_count` could not
             // answer: an approval left without an inline comment is a row here.
+            //
+            // Unfiltered, because `state` cannot be pushed down: a `WHERE` would
+            // page through pull requests until it found ten matches, and this table
+            // costs 101 rate-limit points per page. Which states appear for which
+            // payload is asserted in the connector's unit tests instead.
             run_query_and_check_results(
                 &mut rt,
-                "test_github_reviews_approved",
-                "SELECT author, state, pull_request_number, owner, repo FROM spiceai_reviews_auto \
-                 WHERE state = 'APPROVED' LIMIT 10",
+                "test_github_reviews_rows",
+                "SELECT author, state, pull_request_number, owner, repo \
+                 FROM spiceai_reviews_auto LIMIT 10",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
                         .iter()
                         .map(RecordBatch::num_rows)
                         .sum::<usize>();
-                    assert!(
-                        row_count > 0,
-                        "expected at least one approval, got {row_count}"
-                    );
+                    assert!(row_count > 0, "expected review rows, got {row_count}");
 
-                    assert_column_is_constant(&result_batches, "state", "APPROVED");
+                    // Every row must carry a state GitHub actually defines.
+                    for batch in &result_batches {
+                        let index = batch
+                            .schema()
+                            .index_of("state")
+                            .expect("result should carry a 'state' column");
+                        let states = batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .expect("'state' should be a StringArray");
+                        for row in 0..states.len() {
+                            assert!(
+                                matches!(
+                                    states.value(row),
+                                    "APPROVED"
+                                        | "CHANGES_REQUESTED"
+                                        | "COMMENTED"
+                                        | "DISMISSED"
+                                        | "PENDING"
+                                ),
+                                "unexpected review state {:?}",
+                                states.value(row)
+                            );
+                        }
+                    }
+
                     assert_column_is_constant(&result_batches, "owner", "spiceai");
                     assert_column_is_constant(&result_batches, "repo", "spiceai");
                 })),
