@@ -188,6 +188,19 @@ pub fn resolved_table_match<S: std::hash::BuildHasher>(
     })
 }
 
+/// The table name an invalidation error reports, shared by the `Snafu` contexts every
+/// engine's invalidation path builds.
+///
+/// `TableReference::table()` yields a `&str`, so matching the variants is what lets the
+/// name be an `Arc` clone rather than a fresh allocation per invalidation.
+pub(crate) fn invalidated_table_name(table_ref: &TableReference) -> Arc<str> {
+    match table_ref {
+        TableReference::Bare { table }
+        | TableReference::Partial { table, .. }
+        | TableReference::Full { table, .. } => Arc::clone(table),
+    }
+}
+
 #[async_trait]
 pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
     HashProvider + std::fmt::Debug + std::fmt::Display
