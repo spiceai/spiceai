@@ -40,6 +40,37 @@ limitations under the License.
 //! holder remains, staying interned is always the better outcome. The pool
 //! shrinks on its own as schemas fall out of use.
 //!
+//! # Why not an existing cache or interner
+//!
+//! **A cache is the wrong shape, not merely heavier.** A cache exists to evict
+//! under pressure, and eviction is precisely what must not happen here:
+//! dropping a live row frees nothing, because its holders keep the schema
+//! alive, and only makes the next caller for that schema allocate a duplicate.
+//! What this needs is weak values and no eviction at all, which is close to the
+//! inverse of what a cache provides.
+//!
+//! **An interner crate cannot return what Arrow requires.** The established
+//! ones hand back their own smart pointer over the interned value. Arrow's API
+//! is `SchemaRef = Arc<Schema>`: `RecordBatch::with_schema`,
+//! `TableProvider::schema`, and every batch rewritten here take a real
+//! `Arc<Schema>`, so a foreign pointer type cannot be passed to any of them.
+//! That rules them out on the type, not on preference.
+//!
+//! **A concurrent map would replace the shard array, not the difficulty.** The
+//! intricate parts — weak rows, resolving a bucket by content rather than by
+//! hash, and sweeping tombstones — all follow from holding values weakly, and
+//! would remain over any map. Sharding a `HashMap` behind mutexes is the small
+//! part, so it is kept here rather than taking a dependency in a crate this low
+//! in the graph.
+//!
+//! # Why the pool is sharded
+//!
+//! The content-equality check runs while the shard's lock is held, and it is a
+//! deep comparison: every field, its type, its nullability, and its metadata
+//! map. Hashing happens before the lock is taken, but that comparison cannot.
+//! A single lock would therefore serialise 200-column comparisons across every
+//! unrelated table in the process.
+//!
 //! # Accounting
 //!
 //! Holders do not charge interned schemas to their own per-item memory
@@ -60,9 +91,10 @@ use parking_lot::Mutex;
 
 /// Number of independently-locked shards.
 ///
-/// Fixed rather than CPU-derived: the pool is touched once per retained item,
-/// not per row of data, so the shard count only needs to keep unrelated tables
-/// off a single lock.
+/// Sharded because the content-equality check is a deep comparison held under
+/// the lock; see the module docs. Fixed rather than CPU-derived because the
+/// pool is touched once per retained item, not per row of data, so the count
+/// only needs to keep unrelated tables off a single lock.
 const SHARDS: usize = 16;
 
 /// Attempts a shard tolerates before sweeping its tombstones.
@@ -125,8 +157,6 @@ struct Shard {
     /// Content hash -> candidate rows. A bucket holds more than one row only on
     /// a hash collision, which content equality then resolves.
     buckets: HashMap<u64, Vec<Row>>,
-    rows: usize,
-    schema_bytes: usize,
     /// Interning attempts since this shard was last swept.
     since_sweep: usize,
 }
@@ -145,18 +175,8 @@ impl Shard {
     /// Drops rows whose last holder is gone, and any bucket left empty, then
     /// returns the capacity the survivors no longer need.
     fn sweep(&mut self) {
-        // Tallied locally so the closure does not alias the fields it updates.
-        let (mut rows, mut schema_bytes) = (self.rows, self.schema_bytes);
         self.buckets.retain(|_, candidates| {
-            candidates.retain(|row| {
-                if row.schema.strong_count() > 0 {
-                    true
-                } else {
-                    rows -= 1;
-                    schema_bytes -= row.schema_size;
-                    false
-                }
-            });
+            candidates.retain(|row| row.schema.strong_count() > 0);
             if candidates.capacity() > candidates.len().saturating_mul(CAPACITY_SLACK) {
                 candidates.shrink_to_fit();
             }
@@ -165,9 +185,16 @@ impl Shard {
         if self.buckets.capacity() > self.buckets.len().saturating_mul(CAPACITY_SLACK) {
             self.buckets.shrink_to_fit();
         }
-        self.rows = rows;
-        self.schema_bytes = schema_bytes;
         self.since_sweep = 0;
+    }
+
+    /// Rows this shard holds, live and dead alike.
+    ///
+    /// [`Self::live_counts`] answers what the pool *shares*; this answers what
+    /// it is *holding on to*, which is what tells a test whether a sweep
+    /// actually reclaimed anything rather than merely reporting no live rows.
+    fn retained_rows(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
     }
 
     /// Live rows and the bytes of the schemas they point at, counted without
@@ -297,8 +324,6 @@ impl<S: BuildHasher> SchemaInterner<S> {
             schema: Arc::downgrade(&schema),
             schema_size,
         });
-        shard.rows += 1;
-        shard.schema_bytes += schema_size;
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         schema
@@ -594,7 +619,11 @@ mod tests {
 
         // Raw retained rows, not `stats()`: that counts only *live* rows and so
         // reads zero whether or not the tombstones were ever reclaimed.
-        let retained: usize = interner.shards.iter().map(|shard| shard.lock().rows).sum();
+        let retained: usize = interner
+            .shards
+            .iter()
+            .map(|shard| shard.lock().retained_rows())
+            .sum();
         assert!(
             retained < attempts / 4,
             "tombstones must be reclaimed as interning proceeds, {retained} retained of {attempts} attempts"
@@ -613,7 +642,13 @@ mod tests {
             drop(interner.intern(schema_of(width)));
         }
 
-        let retained = || -> usize { interner.shards.iter().map(|s| s.lock().rows).sum() };
+        let retained = || -> usize {
+            interner
+                .shards
+                .iter()
+                .map(|s| s.lock().retained_rows())
+                .sum()
+        };
         let before = retained();
         assert!(before > 0, "the dropped schemas must leave rows to reclaim");
 
@@ -687,7 +722,11 @@ mod tests {
 
         // Counted without `stats()`, which reports only live rows and so would
         // read zero even if `sweep()` had reclaimed nothing.
-        let live: usize = interner.shards.iter().map(|shard| shard.lock().rows).sum();
+        let live: usize = interner
+            .shards
+            .iter()
+            .map(|shard| shard.lock().retained_rows())
+            .sum();
         assert_eq!(
             live, 0,
             "a sweep must reclaim dead rows with no new traffic"
