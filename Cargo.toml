@@ -111,6 +111,7 @@ members = [
     "tools/testoperator",
     "tools/chbench-driver",
     "tools/parsley",
+    "tools/pdf-parse",
     "tools/pdf-split",
     "tools/pr-builds",
     "crates/vendor/ttf-parser",
@@ -270,7 +271,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "beeecde18a72d2b6cad9d75aa44279398f084bce" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "d9da7cd1f100144e37bcd233296d9112a043e146" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -498,7 +499,7 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c89b332084d893ee5feeae19974f37a4427558d6" } # branch: spiceai-54 (merged PR #207)
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c89b332084d893ee5feeae19974f37a4427558d6" } # branch: spiceai-54 (merged PR #207, on top of #208)
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "c89b332084d893ee5feeae19974f37a4427558d6" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "c89b332084d893ee5feeae19974f37a4427558d6" }
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "c89b332084d893ee5feeae19974f37a4427558d6" }
