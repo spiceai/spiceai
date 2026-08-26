@@ -585,6 +585,25 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                         error_messages.push(format!("HTAP analytical-query error: {e}"));
                     }
                 }
+
+                // The analytical gate above compares against the source engine,
+                // which has no `text_search` UDTF — the FTS queries are checked
+                // separately against a deterministic expectation instead. Gated
+                // the same way (row-count convergence + not skipped), since a
+                // diverged source/Spice row set makes this check meaningless too.
+                if matches!(query_set, QuerySet::ChBenchFts) {
+                    match correctness::verify_fts_results(&driver, &spice_clients).await {
+                        Ok(fts_report) => {
+                            fts_report.emit();
+                            if let Some(message) = fts_report.failure_message() {
+                                error_messages.push(message);
+                            }
+                        }
+                        Err(e) => {
+                            error_messages.push(format!("HTAP full-text-search gate error: {e}"));
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
