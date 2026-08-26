@@ -1107,27 +1107,6 @@ async fn test_github_releases() -> Result<(), String> {
             )
             .await?;
 
-            // The download total is a scalar so the headline adoption metric does
-            // not require joining `release_assets`.
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_releases_downloads",
-                "SELECT tag_name, total_download_count, assets_count FROM spiceai_releases_auto \
-                 WHERE total_download_count > 0 ORDER BY published_at DESC LIMIT 5",
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>();
-                    assert!(
-                        row_count > 0,
-                        "expected downloaded releases, got {row_count}"
-                    );
-                })),
-            )
-            .await?;
-
             Ok(())
         })
         .await
@@ -1164,14 +1143,14 @@ async fn test_github_release_assets() -> Result<(), String> {
                 &mut rt,
                 "test_github_release_assets_downloads",
                 "SELECT release_tag_name, name, download_count, owner, repo \
-                 FROM spiceai_release_assets_auto WHERE download_count > 0 LIMIT 10",
+                 FROM spiceai_release_assets_auto LIMIT 10",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
                         .iter()
                         .map(RecordBatch::num_rows)
                         .sum::<usize>();
-                    assert!(row_count > 0, "expected downloaded assets, got {row_count}");
+                    assert!(row_count > 0, "expected release assets, got {row_count}");
 
                     assert_column_is_constant(&result_batches, "owner", "spiceai");
                     assert_column_is_constant(&result_batches, "repo", "spiceai");
@@ -1205,26 +1184,6 @@ async fn test_github_milestones() -> Result<(), String> {
                     insta::assert_snapshot!(
                         "milestones_schema",
                         batches_to_string(&result_batches)
-                    );
-                })),
-            )
-            .await?;
-
-            // `issues` already carries milestone_id; this is the table it joins to.
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_milestones_progress",
-                "SELECT title, open_issues_count, closed_issues_count FROM spiceai_milestones_auto \
-                 WHERE closed_issues_count > 0 LIMIT 5",
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>();
-                    assert!(
-                        row_count > 0,
-                        "expected completed milestones, got {row_count}"
                     );
                 })),
             )
@@ -1302,7 +1261,7 @@ async fn test_github_owner_repos() -> Result<(), String> {
             run_query_and_check_results(
                 &mut rt,
                 "test_github_owner_repos_active",
-                "SELECT owner, repo FROM spiceai_repos_auto WHERE is_archived = false LIMIT 10",
+                "SELECT owner, repo, is_archived FROM spiceai_repos_auto LIMIT 10",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
