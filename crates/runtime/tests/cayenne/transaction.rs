@@ -135,7 +135,7 @@ async fn build_ready_runtime(app: app::App) -> Result<Arc<Runtime>, String> {
 /// `RequestContext::current` is the exact context the write path's sink reads
 /// back (source 1 of `resolve_request_context`). This is the single most
 /// important detail for actually exercising atomicity — see the module docs.
-async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, TransactionError> {
+pub(crate) async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, TransactionError> {
     let statements = transaction_statements(sql)
         .expect("test SQL must be a well-formed BEGIN…COMMIT transaction body");
     let context = Arc::new(
@@ -157,7 +157,7 @@ async fn run_txn(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Transactio
 
 /// Human-readable rendering of a [`TransactionError`] (the type derives neither
 /// `Debug` nor `Display`) for assertion messages.
-fn describe(err: &TransactionError) -> String {
+pub(crate) fn describe(err: &TransactionError) -> String {
     match err {
         TransactionError::Rejected(m) => format!("Rejected({m})"),
         TransactionError::Plan(e) => format!("Plan({e})"),

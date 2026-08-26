@@ -27,6 +27,8 @@ use arrow::record_batch::RecordBatch;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
@@ -106,6 +108,15 @@ impl TestFixture {
             BackendType::Turso => format!("libsql://{}", db_path.to_string_lossy()),
         }
     }
+}
+
+/// Wrap one record batch in a [`SendableRecordBatchStream`].
+pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
+    let schema = batch.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter([Ok(batch)]),
+    ))
 }
 
 /// Stack size for the thread a backend-parameterized test body runs on.
