@@ -39,9 +39,6 @@ pub struct SimpleCache<
     hasher: T,
     max_size: u64,
     ttl: Duration,
-    /// Closes the write-after-invalidation race for values served through
-    /// [`TabledCacheProvider::get_raw_key_if_fresh`] — see
-    /// [`TableInvalidationClock`].
     table_invalidations: TableInvalidationClock,
 }
 

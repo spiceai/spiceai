@@ -196,9 +196,6 @@ pub struct LruCache<
     initial_instant: Instant,
     hits: AtomicU64,
     total_requests: AtomicU64,
-    /// Closes the write-after-invalidation race for values served through
-    /// [`TabledCacheProvider::get_raw_key_if_fresh`] — see
-    /// [`TableInvalidationClock`].
     table_invalidations: TableInvalidationClock,
 }
 
