@@ -21,7 +21,6 @@ use arrow_flight::{
     FlightData, PutResult,
     flight_service_server::FlightService,
     sql::{Any, Command},
-    utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
@@ -276,19 +275,16 @@ pub(crate) async fn handle(
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
-    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
-    // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds the
-    // column, so it is brought into line at the boundary rather than carried into the write. One
-    // stream carries one schema, so what its batches need is resolved once, and the dataset is
-    // checked against the shape that will actually be written.
-    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+    // One stream carries one schema, so what its batches need is resolved once — and the dataset is
+    // checked against the shape that will actually be written. See [`MapEntriesGuard`].
+    let guard = MapEntriesGuard::for_declared(schema);
 
     let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
 
-    if let Err(e) = verify_schema(target_schema.fields(), normalizer.schema().fields()) {
+    if let Err(e) = verify_schema(target_schema.fields(), guard.write_schema().fields()) {
         return Err(Status::invalid_argument(format!(
             "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
         )));
@@ -298,8 +294,7 @@ pub(crate) async fn handle(
     let response_stream = create_response_stream(
         path,
         path_label,
-        schema,
-        normalizer,
+        guard,
         Arc::clone(&datafusion),
         streaming_flight,
         &first_message,
@@ -349,11 +344,66 @@ where
     discarded
 }
 
+/// What a `DoPut` stream's `MAP` columns need, resolved once from the client's schema message.
+///
+/// A client is free to declare a `MAP`'s `entries` field nullable, which the Arrow map layout
+/// forbids. Every batch is therefore decoded under the client's own declarations and relabelled
+/// afterwards, so that an entries array carrying nulls — the one shape relabelling cannot fix — is
+/// refused rather than written under a declaration that says it holds none.
+///
+/// The two decisions the write makes about that live together here because they have to agree: the
+/// schema the write stream advertises, and the shape of the batches pushed into it.
+struct MapEntriesGuard {
+    /// The client's own declaration. Batches are decoded under it — the IPC buffers are laid out
+    /// the way it describes.
+    declared: SchemaRef,
+    normalizer: MapEntriesNormalizer,
+}
+
+impl MapEntriesGuard {
+    fn for_declared(declared: SchemaRef) -> Self {
+        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+        Self {
+            declared,
+            normalizer,
+        }
+    }
+
+    /// The schema the write stream advertises: the one its batches carry once corrected.
+    fn write_schema(&self) -> &SchemaRef {
+        self.normalizer.schema()
+    }
+
+    /// Decodes one `FlightData` message and brings its `MAP` columns in line with the map layout.
+    ///
+    /// `Ok(None)` is a message that carries no batch — the schema message, and any other the
+    /// decoder cannot read a batch out of, which the write has always skipped.
+    fn decode(
+        &self,
+        message: &FlightData,
+        dictionaries_by_id: &HashMap<i64, arrow::array::ArrayRef>,
+        path: &TableReference,
+    ) -> Result<Option<RecordBatch>, Status> {
+        let Ok(batch) = arrow_flight::utils::flight_data_to_arrow_batch(
+            message,
+            Arc::clone(&self.declared),
+            dictionaries_by_id,
+        ) else {
+            return Ok(None);
+        };
+
+        self.normalizer.normalize(batch).map(Some).map_err(|e| {
+            let message = map_entries_message(path, &e);
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })
+    }
+}
+
 fn create_response_stream(
     path: TableReference,
     path_label: Arc<str>,
-    schema: SchemaRef,
-    normalizer: MapEntriesNormalizer,
+    guard: MapEntriesGuard,
     df: Arc<DataFusion>,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     first_message: &FlightData,
@@ -362,16 +412,8 @@ fn create_response_stream(
     tracing::debug!("Starting writing data into dataset: {path}");
 
     // Sometimes the first message only contains the schema and no data
-    let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
-        first_message,
-        Arc::clone(&schema),
-        &dictionaries_by_id,
-    )
-    .ok();
-    // Every batch is decoded under the client's own declarations and relabelled afterwards, so
-    // that an entries array carrying nulls — the one shape relabelling cannot fix — is refused
-    // rather than written under a declaration that says it holds none.
-    let write_schema = Arc::clone(normalizer.schema());
+    let first_batch = guard.decode(first_message, &dictionaries_by_id, &path);
+    let write_schema = Arc::clone(guard.write_schema());
 
     stream! {
         // channel to propagate new record batches to the data writing stream
@@ -382,14 +424,12 @@ fn create_response_stream(
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
-        if let Some(first_batch) = first_batch {
-            match normalizer.normalize(first_batch) {
-                Ok(first_batch) => yield handle_record_batch(first_batch, &batch_tx, &path_label).await,
-                Err(e) => {
-                    tracing::error!(dataset = %path, "{}", map_entries_message(&path, &e));
-                    yield Err(Status::invalid_argument(map_entries_message(&path, &e)));
-                    return;
-                }
+        match first_batch {
+            Ok(Some(first_batch)) => yield handle_record_batch(first_batch, &batch_tx, &path_label).await,
+            Ok(None) => {}
+            Err(status) => {
+                yield Err(status);
+                return;
             }
         }
 
@@ -459,24 +499,15 @@ fn create_response_stream(
                                 continue;
                             }
 
-                            let new_batch = match flight_data_to_arrow_batch(
-                                &message,
-                                Arc::clone(&schema),
-                                &dictionaries_by_id,
-                            ) {
-                                Ok(batches) => batches,
-                                Err(e) => {
-                                    tracing::error!("Failed to convert flight data to batches: {e}");
-                                    yield Err(Status::internal(format!("Failed to convert flight data to batches: {e}")));
+                            let new_batch = match guard.decode(&message, &dictionaries_by_id, &path) {
+                                Ok(Some(new_batch)) => new_batch,
+                                Ok(None) => {
+                                    tracing::error!("Failed to convert flight data to batches");
+                                    yield Err(Status::internal("Failed to convert flight data to batches"));
                                     break;
                                 }
-                            };
-
-                            let new_batch = match normalizer.normalize(new_batch) {
-                                Ok(new_batch) => new_batch,
-                                Err(e) => {
-                                    tracing::error!(dataset = %path, "{}", map_entries_message(&path, &e));
-                                    yield Err(Status::invalid_argument(map_entries_message(&path, &e)));
+                                Err(status) => {
+                                    yield Err(status);
                                     break;
                                 }
                             };
@@ -591,10 +622,14 @@ fn create_response_stream(
 
 /// The failure a client sees when the Arrow data it streamed holds a `MAP` column that cannot be
 /// brought in line with the Arrow map layout.
+///
+/// This is an append that has been consuming the client's stream, so it cannot say that nothing was
+/// written: a batch accepted before the refusing one may already have reached the sink. It says what
+/// holds for every batch the refusal can land on — the rest of the stream is not applied.
 fn map_entries_message(path: &TableReference, source: &map_entries::Error) -> String {
     format!(
-        "Failed to write to dataset '{path}' ({source}), so no rows were written. \
-         Send the MAP column with a non-nullable `entries` field, as the Arrow map layout requires. \
+        "Failed to write to dataset '{path}' ({source}), so the rest of the stream was not applied and any batch already accepted may have been. \
+         Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
          See: https://spiceai.org/docs/api/arrow-flight-sql"
     )
 }
@@ -676,8 +711,9 @@ mod tests {
     }
 
     /// The failure a client sees when its `MAP` column cannot be brought in line with the Arrow
-    /// map layout has to name the dataset it was writing to, say that nothing was written, and
-    /// point at the docs — a reword must not quietly drop any of the three.
+    /// map layout has to name the dataset, state what the write did and did not apply, give a
+    /// remediation that covers the case it actually refuses, and point at the docs — a reword must
+    /// not quietly drop any of the four.
     #[test]
     fn the_map_entries_refusal_names_the_dataset_the_impact_and_the_docs() {
         let source = arrow_tools::map_entries::Error::MapEntriesContainNulls {
@@ -687,11 +723,170 @@ mod tests {
             super::map_entries_message(&TableReference::partial("sales", "orders"), &source);
 
         assert!(message.contains("'sales.orders'"), "{message}");
-        assert!(message.contains("no rows were written"), "{message}");
+        assert!(
+            message.contains("the rest of the stream was not applied"),
+            "{message}"
+        );
+        assert!(
+            message.contains("may have been"),
+            "an append cannot claim nothing was written: {message}"
+        );
         assert!(message.contains("attributes"), "{message}");
+        assert!(
+            message.contains("holds no null entries"),
+            "flipping the declaration does not fix the case this refuses: {message}"
+        );
         assert!(
             message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
             "{message}"
+        );
+    }
+
+    /// Builds a `MapArray` the way the Flight decoder does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a client's non-conforming
+    /// declaration survives the decode.
+    fn map_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
+        use arrow::array::{Array, ArrayData, ArrayRef, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow_schema::{DataType, Field, Fields, Schema};
+
+        let rows = entry_nulls
+            .as_ref()
+            .map_or(1, arrow::buffer::NullBuffer::len);
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let keys: Vec<String> = (0..rows).map(|i| format!("k{i}")).collect();
+        let values: Vec<String> = (0..rows).map(|i| format!("v{i}")).collect();
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
+        let data = ArrayData::builder(data_type.clone())
+            .len(rows)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// The schema message and the data message a client would put on the wire for `batch`.
+    fn flight_messages(batch: &RecordBatch) -> Vec<FlightData> {
+        arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch.clone()])
+            .expect("encoding the batch")
+    }
+
+    fn conforming(schema: &arrow_schema::SchemaRef) -> bool {
+        match schema.field(0).data_type() {
+            arrow_schema::DataType::Map(entries, _) => !entries.is_nullable(),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP`'s `entries` nullable — which the
+    /// Arrow map layout forbids — has the declaration corrected as each message is decoded, and
+    /// the write stream advertises the corrected schema rather than the client's. The two have to
+    /// agree: a stream that describes its batches with a type they no longer carry is a defect of
+    /// its own.
+    #[test]
+    fn a_clients_nullable_map_entries_declaration_is_corrected_before_the_sink() {
+        let batch = map_batch(None);
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        assert!(
+            conforming(guard.write_schema()),
+            "the write stream still advertises the client's non-conforming declaration"
+        );
+
+        let decoded: Vec<RecordBatch> = flight_messages(&batch)
+            .iter()
+            .filter_map(|message| {
+                guard
+                    .decode(message, &dictionaries, &path)
+                    .expect("a nullable entries declaration is relabelled, not refused")
+            })
+            .collect();
+
+        let [decoded] = decoded.as_slice() else {
+            panic!("exactly one message carries a batch, got {}", decoded.len());
+        };
+        assert!(conforming(&decoded.schema()));
+        assert_eq!(&decoded.schema(), guard.write_schema());
+        assert_eq!(decoded.num_rows(), 1);
+    }
+
+    /// The one shape relabelling cannot fix is refused at the decode, so it never reaches the
+    /// sink, and the refusal reaches the client as an argument error naming the column.
+    #[test]
+    fn a_map_whose_entries_carry_nulls_is_refused_before_the_sink() {
+        let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        let statuses: Vec<Status> = flight_messages(&batch)
+            .iter()
+            .filter_map(|message| guard.decode(message, &dictionaries, &path).err())
+            .collect();
+
+        let [status] = statuses.as_slice() else {
+            panic!(
+                "the data message must be refused, got {} refusals",
+                statuses.len()
+            );
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'orders'") && status.message().contains("'m'"),
+            "the refusal must name the dataset and the column: {}",
+            status.message()
+        );
+    }
+
+    /// A schema message carries no batch. It is skipped rather than refused, which is what the
+    /// write has always done with a first message that holds only the schema.
+    #[test]
+    fn a_message_carrying_no_batch_is_skipped() {
+        let batch = map_batch(None);
+        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let messages = flight_messages(&batch);
+        let schema_message = messages.first().expect("a schema message");
+
+        assert!(
+            guard
+                .decode(
+                    schema_message,
+                    &HashMap::new(),
+                    &TableReference::bare("orders")
+                )
+                .expect("a schema message is not a failure")
+                .is_none()
         );
     }
 }

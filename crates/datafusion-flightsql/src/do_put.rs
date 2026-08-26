@@ -188,7 +188,7 @@ fn normalize_map_entries(
             normalizer.normalize(batch).map_err(|e| {
                 Status::invalid_argument(format!(
                     "Failed to read the Arrow data sent to the Flight SQL server ({e}), so no rows were written. \
-                     Send the MAP column with a non-nullable `entries` field, as the Arrow map layout requires. \
+                     Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
                      See: https://spiceai.org/docs/api/arrow-flight-sql"
                 ))
             })

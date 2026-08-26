@@ -238,7 +238,7 @@ pub enum WasmBuildError {
 
     #[snafu(display(
         "failed to read the Arrow IPC stream returned by WASM function '{function_name}' ({source}), so the function cannot return rows. \
-        Return the MAP column with a non-nullable `entries` field, as the Arrow map layout requires. \
+        Return the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
         See: https://spiceai.org/docs/features/functions"
     ))]
     MapEntriesNotNormalizable {

@@ -28,6 +28,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::{
     common::DFSchema,
     scalar::ScalarValue,
@@ -90,6 +91,16 @@ pub enum Error {
 
     #[snafu(display("Stream error while reading FlightData: {source}"))]
     StreamRead { source: tonic::Status },
+
+    #[snafu(display(
+        "Failed to read the Arrow data sent for table {table} ({source}), so the rest of the stream was not applied and any batch already accepted may have been. \
+        Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+        See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))]
+    MapEntriesNotNormalizable {
+        table: String,
+        source: arrow_tools::map_entries::Error,
+    },
 
     #[snafu(display("Filter evaluation failed for executor {executor_id} and {filter}: {source}"))]
     FilterEval {
@@ -192,21 +203,34 @@ pub async fn forward_federated_partitioned_write(
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     raw_partition_by: &[String],
 ) -> Result<Response<DoPutStream>> {
-    let schema = Arc::new(
+    let declared: SchemaRef = Arc::new(
         try_schema_from_flatbuffer_bytes(&first_message.data_header).context(DecodeSchemaSnafu)?,
     );
+
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids. This is the scheduler's own decode of the client stream, so the correction has to
+    // happen here too: the partition expressions are evaluated against these batches before any
+    // executor sees them. Each batch is decoded under the client's own declarations and relabelled
+    // afterwards, so an entries array carrying nulls — the one shape relabelling cannot fix — is
+    // refused rather than routed under a declaration that says it holds none. One stream carries
+    // one schema, so what its batches need is resolved once.
+    let normalizer = MapEntriesNormalizer::for_schema(&declared);
+    let schema = Arc::clone(normalizer.schema());
 
     let dictionaries_by_id = Arc::new(HashMap::new());
 
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
     let first_batch =
-        maybe_read_first_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)?;
+        maybe_read_first_batch(&first_message, Arc::clone(&declared), &dictionaries_by_id)?;
 
-    let decode_schema = Arc::clone(&schema);
+    let decode_schema = declared;
+    let table_name = path.to_string();
     let batch_stream = async_stream::try_stream! {
         if let Some(batch) = first_batch {
-            yield batch;
+            yield normalizer
+                .normalize(batch)
+                .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
         }
         while let Some(result) = streaming_flight.next().await {
             let batch = flight_data_to_arrow_batch(
@@ -216,7 +240,9 @@ pub async fn forward_federated_partitioned_write(
             )
             .context(DecodeBatchSnafu)?;
             if batch.num_rows() > 0 {
-                yield batch;
+                yield normalizer
+                    .normalize(batch)
+                    .context(MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
             }
         }
     };

@@ -547,7 +547,7 @@ pub(super) fn decode_param_values(
                     .map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "Failed to read the query parameters sent to the Flight SQL server ({e}), so the query cannot run. \
-                         Send the MAP parameter with a non-nullable `entries` field, as the Arrow map layout requires. \
+                         Send the MAP parameter with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
                          See: https://spiceai.org/docs/api/arrow-flight-sql"
                     ))
                 })
