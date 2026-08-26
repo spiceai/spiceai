@@ -140,6 +140,7 @@ mod tests {
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::Column;
     use datafusion::datasource::TableProvider;
     use datafusion::functions_aggregate::expr_fn::count;
     use datafusion::logical_expr::{
@@ -147,6 +148,7 @@ mod tests {
         TableSource, Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
     use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
@@ -340,7 +342,8 @@ mod tests {
     /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
     /// it; these stay. Extend them whenever a pin bump carries another unparser
     /// fix — #13081 tracks the three the `edd8861e` → `b5cb7bb3` bump left
-    /// unguarded, and the two below arrived with `b5cb7bb3` → `8e881090`.
+    /// unguarded, the two below arrived with `b5cb7bb3` → `8e881090`, and
+    /// #12751's derived-table output names arrived with `8e881090` → `859621d`.
     ///
     /// This unparses through the federation executor, which supplies no dialect
     /// here, so the SQL is the default dialect's rather than any one connector's.
@@ -1049,6 +1052,363 @@ mod tests {
                 sql[outer_grouping..].contains("region"),
                 "{dialect_name}: the outer grouping no longer groups by the column the query asked \
                  for: {sql}"
+            );
+        }
+    }
+
+    /// A relation with two integer columns, for the derived-projection guards below.
+    fn two_column_source() -> Arc<dyn TableSource> {
+        table_source(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ])
+    }
+
+    /// A reference to a `Projection` output by the logical name the projection's
+    /// schema reports, which is what an enclosing scope holds when the projection
+    /// never named the output itself.
+    fn output_named(name: &str) -> Expr {
+        Expr::Column(Column::new_unqualified(name))
+    }
+
+    /// A volatile scalar function, which is the one output the flattened-`SELECT`
+    /// repair deliberately declines to inline.
+    fn volatile_udf(name: &str) -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![],
+            DataType::Float64,
+            Volatility::Volatile,
+            Arc::new(|_args: &[ColumnarValue]| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(0.5))))
+            }),
+        ))
+    }
+
+    /// Every enclosing shape that reaches a derived table through the projection
+    /// whose outputs it exposes, paired with the relation the enclosing scope names
+    /// the derived table by where it has one.
+    ///
+    /// These are the nodes the naming walk carries an output name out through. A
+    /// `Sort` on its own is not among them: a `Sort` between two `Projection`s is
+    /// hoisted to the statement's own ORDER BY, so no derived table is built —
+    /// `a_computed_sort_key_keeps_order_by_at_the_top_level` is the guard on that.
+    /// Bounding it is what forces the scope, which is why the sorted arm carries a
+    /// limit. Each arm is a distinct class the walk handles, so a pin that keeps one
+    /// arm and drops another fails here rather than in a federated query.
+    fn derived_scope_shapes(
+        inner: &Expr,
+        output_name: &str,
+    ) -> Vec<(&'static str, LogicalPlan, Option<&'static str>)> {
+        let scanned = || LogicalPlanBuilder::scan("t", two_column_source(), None).expect("scan t");
+        let projected = || {
+            scanned()
+                .project(vec![inner.clone()])
+                .expect("inner projection")
+        };
+        let read_out = |builder: LogicalPlanBuilder| {
+            builder
+                .project(vec![output_named(output_name)])
+                .expect("outer projection")
+                .build()
+                .expect("build")
+        };
+
+        vec![
+            (
+                "filtered",
+                read_out(
+                    projected()
+                        .filter(output_named(output_name).gt(lit(0)))
+                        .expect("filter on the projection output"),
+                ),
+                None,
+            ),
+            (
+                "limited",
+                read_out(projected().limit(0, Some(5)).expect("limit")),
+                None,
+            ),
+            (
+                // The inner ORDER BY sorts by the output, so this arm fails unless the
+                // sorted node is rebuilt around the *named* projection: an ORDER BY
+                // naming the unnamed output binds no better than the outer reference.
+                "sorted",
+                read_out(
+                    projected()
+                        .sort(vec![output_named(output_name).sort(true, false)])
+                        .expect("sort by the projection output")
+                        .limit(0, Some(3))
+                        .expect("limit"),
+                ),
+                None,
+            ),
+            (
+                "distinct",
+                read_out(projected().distinct().expect("distinct")),
+                None,
+            ),
+            (
+                // A `DISTINCT ON` emits its own SELECT list, so its outputs are the ones
+                // the enclosing scope binds — naming only the projection beneath it
+                // misses them.
+                "distinct-on",
+                read_out(
+                    scanned()
+                        .distinct_on(vec![col("t.a")], vec![inner.clone()], None)
+                        .expect("distinct on"),
+                ),
+                None,
+            ),
+            (
+                // With its own ORDER BY, which is the shape that cannot be rebuilt by
+                // round-tripping the node's reported expressions — those do not carry a
+                // `DISTINCT ON`'s sort expressions.
+                "distinct-on-sorted",
+                read_out(
+                    scanned()
+                        .distinct_on(
+                            vec![col("t.a")],
+                            vec![inner.clone()],
+                            Some(vec![col("t.a").sort(true, false)]),
+                        )
+                        .expect("distinct on, sorted"),
+                ),
+                None,
+            ),
+            (
+                // Reached through a relation alias, so the enclosing reference is
+                // qualified — and the alias carries no column list, so it names the
+                // relation without naming any of its columns. An alias that *does* carry
+                // one already names every output and must be left alone; that half is
+                // reachable only from parsed SQL, so the fork's own round-trip tests are
+                // what guard it. The scan here carries no projection, which is the half of
+                // the alias class the naming repairs — with one pushed down the output
+                // cannot be named at all, which
+                // `a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references`
+                // pins.
+                "aliased",
+                projected()
+                    .alias("x")
+                    .expect("alias")
+                    .project(vec![Expr::Column(Column::new(Some("x"), output_name))])
+                    .expect("outer projection")
+                    .build()
+                    .expect("build"),
+                Some("x"),
+            ),
+        ]
+    }
+
+    /// The identifier the enclosing scope references — the outer `SELECT` list's
+    /// single output, spelled and quoted the way this dialect spells it.
+    ///
+    /// Read out of the statement rather than written into the guard because a dialect
+    /// may rewrite the identifier: `BigQuery` renders `t.a + t.b` as `t_46a + t_46b`.
+    /// What has to hold is that the derived table exposes *whatever* name the
+    /// enclosing scope ended up using, so the guard has to ask the statement which
+    /// name that is.
+    fn outer_reference(sql: &str) -> &str {
+        let Some(list) = sql.strip_prefix("SELECT ") else {
+            panic!("expected a statement starting with a SELECT list: {sql}");
+        };
+        let Some(end) = list.find(" FROM ") else {
+            panic!("expected a FROM clause after the SELECT list: {sql}");
+        };
+        &list[..end]
+    }
+
+    /// The column half of a reference the enclosing scope qualifies by `relation`.
+    ///
+    /// Spelled as the three ways a dialect writes the relation name rather than by
+    /// splitting on the last `.`, because the identifier itself contains dots — and,
+    /// for a literal output, quote characters of its own.
+    fn column_of<'a>(reference: &'a str, relation: Option<&str>) -> &'a str {
+        let Some(relation) = relation else {
+            return reference;
+        };
+        for prefix in [
+            format!("{relation}."),
+            format!("\"{relation}\"."),
+            format!("`{relation}`."),
+        ] {
+            if let Some(column) = reference.strip_prefix(prefix.as_str()) {
+                return column;
+            }
+        }
+        panic!("expected `{reference}` to be qualified by `{relation}`");
+    }
+
+    /// Regression test for #12751, fixed upstream by fork PR #206: a `Projection`
+    /// whose output it never named becomes a derived table when the enclosing
+    /// `SELECT` list is already taken, and the enclosing scope refers to that output
+    /// by its *logical* name. Nothing named the derived table's columns, so the name
+    /// the outer scope used matched nothing the derived table exposed — the engine
+    /// named the column itself (`?column?` on `PostgreSQL`) and the emitted statement
+    /// carried a reference no engine can bind:
+    ///
+    /// ```sql
+    /// SELECT "t.a + t.b" FROM (SELECT (t.a + t.b) FROM t) WHERE ("t.a + t.b" > 0)
+    /// --     ^^^^^^^^^^^ names nothing the derived table exposes
+    /// ```
+    ///
+    /// A federated pushdown emits exactly this to the remote engine, so the failure
+    /// is the whole query, not a fallback: an unbindable identifier is a hard error
+    /// from the remote engine rather than a plan the runtime can run locally instead.
+    ///
+    /// The matrix is every output kind that reaches a derived table unnamed — a
+    /// computed expression, a literal, a literal whose logical name carries each
+    /// dialect's own quote character, and a volatile call — across every enclosing
+    /// shape the naming walk handles (`derived_scope_shapes`) — every shape it can
+    /// repair, which is not every shape #12751 reports: a projected scan under a
+    /// relation alias still cannot be named, and the test below this one pins that.
+    /// The volatile output is
+    /// the one the flattened-`SELECT` repair (#12599) cannot help: inlining a
+    /// volatile expression evaluates it a second time in a clause that can observe a
+    /// different value than the `SELECT` list did, so that repair declines it and
+    /// leaves the reference unbindable. Naming the output binds the reference *and*
+    /// keeps the single evaluation.
+    #[test]
+    fn a_derived_projection_names_the_output_its_scope_references() {
+        let volatile =
+            Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
+        for (output_kind, inner, output_name) in [
+            ("computed", col("t.a") + col("t.b"), "t.a + t.b"),
+            ("literal", lit(1), "Int32(1)"),
+            // A logical name carrying both quote characters this crate's dialects use,
+            // so the alias has to be escaped rather than merely emitted.
+            ("quoted-literal", lit("a\"b`c"), "Utf8(\"a\"b`c\")"),
+            ("volatile", volatile, "random()"),
+        ] {
+            for (scope_kind, plan, relation) in derived_scope_shapes(&inner, output_name) {
+                for (dialect_name, dialect) in federation_dialects() {
+                    let arm = format!("{dialect_name}/{output_kind}/{scope_kind}");
+                    let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+                    // The shape the issue is about only exists once the projection is a
+                    // derived table. Without this the guard would pass on a statement
+                    // that flattened into one SELECT and never had the problem.
+                    let derived_at = first_offset_of(&sql, "FROM (SELECT ");
+
+                    let reference = outer_reference(&sql);
+                    assert_eq!(
+                        paren_depth_at(&sql, first_offset_of(&sql, reference)),
+                        0,
+                        "{arm}: the enclosing scope's reference is not in the enclosing scope, so \
+                         this guard is not looking at the shape it is for: {sql}"
+                    );
+
+                    // The invariant: the derived table has to expose the name the
+                    // enclosing scope uses. `AS <column>` cannot be satisfied by the
+                    // derived table's own alias — that names the relation, not a column,
+                    // and it is a different identifier (`derived_projection`, `x`).
+                    let column = column_of(reference, relation);
+                    let binding = format!("AS {column}");
+                    let Some(binding_at) = sql.find(&binding) else {
+                        panic!(
+                            "{arm}: the derived table does not name its output {column}, which is \
+                             the identifier the enclosing scope references, so the remote engine \
+                             cannot bind the statement: {sql}"
+                        );
+                    };
+                    assert!(
+                        binding_at > derived_at && paren_depth_at(&sql, binding_at) >= 1,
+                        "{arm}: {column} is named outside the derived table, so it still does not \
+                         name one of the derived table's columns: {sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The single-evaluation half of the volatile arm above, asserted separately
+    /// because it is a different failure: inlining the producing expression at the
+    /// point of use would also make the statement bind, while answering the query
+    /// with rows the `SELECT` list never saw.
+    ///
+    /// This holds on both sides of the pin bump that carried #206 — it is the
+    /// property the repair had to keep, not one it introduced. What it refuses is a
+    /// later repair that binds the reference by inlining instead of naming.
+    #[test]
+    fn a_derived_volatile_output_is_evaluated_once() {
+        let volatile =
+            Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
+        for (scope_kind, plan, _) in derived_scope_shapes(&volatile, "random()") {
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+                // The call renders as `random()`; a reference to its output renders as
+                // a quoted identifier, so counting the unquoted call counts evaluations.
+                let quoted =
+                    sql.matches("\"random()\"").count() + sql.matches("`random()`").count();
+                // Saturating so a dialect that renders the call some other way reports 0
+                // evaluations against the SQL rather than overflowing the subtraction.
+                let evaluations = sql.matches("random()").count().saturating_sub(quoted);
+                assert_eq!(
+                    evaluations, 1,
+                    "{dialect_name}/{scope_kind}: the volatile call is evaluated {evaluations} \
+                     times, so the predicate can observe a different value than the SELECT list \
+                     did and the query answers with rows the SELECT list never saw: {sql}"
+                );
+            }
+        }
+    }
+
+    /// The half of #12751 that survives fork PR #206, pinned so a later pin bump that
+    /// repairs it is noticed rather than quietly leaving this shape unguarded.
+    ///
+    /// A scan projection pushed down under a relation alias is requalified onto the
+    /// alias before the derived table is built, so the only name the derived table can
+    /// report for the output — `s.a + s.b` — is not the one the enclosing scope holds
+    /// for it, `t.a + t.b`:
+    ///
+    /// ```sql
+    /// SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s
+    /// ```
+    ///
+    /// Naming the output cannot close that gap, which is why the fix above does not
+    /// try: both names are right for their own scope, and the repair is for the
+    /// enclosing scope to name the relation's columns on the alias it attaches. The
+    /// fork pins the same rendering in `test_subquery_alias_over_pushed_down_scan_
+    /// still_unbindable`; this guard is the repo-side half, because the fork's branch
+    /// is re-cut per `DataFusion` major and takes its own tests with it.
+    ///
+    /// Projection pushdown is an ordinary optimized shape, so this is a live defect on
+    /// the federated pushdown path, and it is what keeps #12751 open. When a pin bump
+    /// repairs it this test fails: move the shape into `derived_scope_shapes` and close
+    /// #12751, rather than re-pinning the rendering below.
+    #[test]
+    fn a_projected_scan_under_an_alias_does_not_name_the_output_its_scope_references() {
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), Some(vec![0, 1]))
+            .expect("scan t with a pushed-down projection")
+            .project(vec![col("t.a") + col("t.b")])
+            .expect("inner projection")
+            .alias("s")
+            .expect("alias")
+            .project(vec![Expr::Column(Column::new(Some("s"), "t.a + t.b"))])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let derived_at = first_offset_of(&sql, "FROM (SELECT ");
+
+            // The derived table does name an output — this is the requalified name, not
+            // the absence of naming that preceded the fix — so the pin below is about
+            // *which* name it reports, not about whether it reports one.
+            assert!(
+                sql[derived_at..].contains(" AS "),
+                "{dialect_name}: the derived table names no output at all, which is the \
+                 pre-#206 behaviour rather than the gap this pins: {sql}"
+            );
+
+            // `column_of` panics unless the enclosing reference is qualified by `s`,
+            // which is what makes the requalification the subject of this guard.
+            let column = column_of(outer_reference(&sql), Some("s"));
+            assert!(
+                !sql[derived_at..].contains(&format!("AS {column}")),
+                "{dialect_name}: the derived table now names {column}, so this shape binds and \
+                 the remaining half of #12751 is repaired — move it into \
+                 `derived_scope_shapes` and close the issue instead of re-pinning this: {sql}"
             );
         }
     }
