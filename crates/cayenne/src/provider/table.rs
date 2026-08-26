@@ -21155,6 +21155,29 @@ impl CayenneTableProvider {
         self.mark_maintained_aggregates_stale();
 
         let filters = self.retention_filters.clone();
+        // Scan the same tiers a user `DELETE` does (see `build_deletion_vector_sink`).
+        // A scan reads current ∪ protected, and a CDC upsert publishes each batch as its
+        // own protected snapshot — so a sink given only the current snapshot cannot see
+        // the rows a CDC table is made of, and retention silently matches nothing on
+        // exactly the workload Cayenne is built for. The cold tier is included for the
+        // same reason it is there: aged rows are what a retention predicate is usually
+        // written to remove.
+        let mut snapshot_tables: Vec<Arc<ListingTable>> = self
+            .build_protected_snapshot_listing_tables()
+            .map_err(|err| CatalogError::InvalidOperation {
+                message: "Failed to list protected snapshots for retention filters.".to_string(),
+                source: Box::new(err),
+            })?
+            .into_iter()
+            .map(|(_, table)| table)
+            .collect();
+        snapshot_tables.extend(self.build_cold_tier_listing_tables().await.map_err(|err| {
+            CatalogError::InvalidOperation {
+                message: "Failed to list cold-tier files for retention filters.".to_string(),
+                source: Box::new(err),
+            }
+        })?);
+
         let sink = CayenneDeletionSink::new(
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
@@ -21165,7 +21188,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_memory),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
-            Vec::new(), // Retention filters don't need to scan protected snapshots
+            snapshot_tables,
             Arc::clone(self.context.runtime_env()),
             Some(Arc::clone(&self.write_lock)),
             Arc::clone(&self.seq_allocator),
@@ -46759,6 +46782,444 @@ mod tests {
             DFPrecision::Exact(usize::try_from(FIRST + SECOND).expect("row count fits usize")),
             "every queued delta has been applied, so the maintained count must be served \
              Exact at the live row count",
+        );
+    }
+
+    /// Rows below this `value` are what the retention predicate in these tests deletes.
+    const RETENTION_FLOOR: i64 = 50;
+
+    /// A table whose engine-level retention filters delete `value < RETENTION_FLOOR`.
+    /// `inline_max_rows` is caller-chosen so a test can decide whether the rows it writes
+    /// land in a Vortex file or in the metastore's inline corpus.
+    async fn create_retention_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        inline_max_rows: usize,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .with_retention_filters(vec![retention_predicate()])
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows,
+                    // Keep the background compactor out of the assertions.
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("retention table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// A table with inlining ENABLED and no retention filters, so a test can build the
+    /// inline corpus that a `retention_sql` added later has to reason about. The
+    /// retention-table helper above cannot stand in: a table created WITH delete filters
+    /// refuses to inline on the append path.
+    async fn create_inlining_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 1024,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("inlining table created");
+        (provider, catalog, temp_dir)
+    }
+
+    fn retention_predicate() -> Expr {
+        datafusion_expr::col("value").lt(datafusion_expr::lit(RETENTION_FLOOR))
+    }
+
+    /// Every `(id, value)` pair currently visible, ordered by id.
+    async fn scan_id_values(provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
+        use arrow::array::Int64Array;
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let batches = collect(plan, ctx.task_ctx()).await.expect("scan");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column is Int64");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), values.value(row)));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Retention must delete every row its predicate matches and NOTHING else, and a
+    /// second pass over the result must be a no-op. Deleting too much is silent data
+    /// loss; deleting too little leaves rows the operator asked to have removed.
+    #[tokio::test]
+    async fn retention_deletes_the_matching_rows_and_only_those() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_retention_table("retention_exact_rows", ctx.runtime_env(), 0).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Values straddle the floor, including the boundary itself: `< 50` must keep 50.
+        let ids: Vec<i64> = (1..=8).collect();
+        let values: Vec<i64> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        insert_batch(&provider, id_value_batch(schema, &ids, &values)).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("retention pass");
+
+        let survivors = scan_id_values(&provider).await;
+        assert_eq!(
+            survivors,
+            vec![(5, 50), (6, 60), (7, 70), (8, 80)],
+            "retention must remove exactly the rows below {RETENTION_FLOOR}, keep the \
+             boundary row, and leave every surviving value intact"
+        );
+
+        // Idempotence: nothing matches any more, so a second pass must not remove rows.
+        let deleted = provider
+            .apply_retention_filters()
+            .await
+            .expect("second retention pass");
+        assert_eq!(deleted, 0, "a second pass has nothing left to match");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(5, 50), (6, 60), (7, 70), (8, 80)],
+            "a repeated retention pass must not delete rows its predicate does not match"
+        );
+    }
+
+    /// Retention must not flush the inline corpus while a staged inline-conflict
+    /// tombstone is unpublished. A checkpoint applies no inert (`published = false`)
+    /// tombstone and then clears every tombstone, so flushing inside that window writes
+    /// the superseded row to a file AND drops the deletion that hides it — leaving both
+    /// versions of the row queryable once the replacement publishes.
+    ///
+    /// The corpus here predates the retention config, which is one of the two ways a
+    /// retention table acquires inline rows (the other is the pipelined CDC path, which
+    /// inlines without consulting `InlineMutationPolicy`).
+    #[tokio::test]
+    async fn retention_defers_while_an_inline_conflict_tombstone_is_unpublished() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (plain, catalog, _tmp) =
+            create_inlining_table("retention_defers_tombstone", Arc::clone(&runtime_env)).await;
+        let table_name = plain.table_metadata.table_name.clone();
+        let schema = Arc::clone(&plain.table_metadata.schema);
+        drop(plain);
+
+        // Reopen with inlining on and no retention yet, and build an inline corpus.
+        let seeded =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen without retention");
+        insert_batch(
+            &seeded,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 60]),
+        )
+        .await;
+        drop(seeded);
+
+        // Now the operator adds `retention_sql` to the existing dataset.
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            Arc::clone(&catalog),
+            vec![retention_predicate()],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+        let inlined_before = provider.cached_inlined_row_count();
+        assert!(
+            inlined_before > 0,
+            "precondition: the rows must be in the inline corpus, or the guard under \
+             test is skipped and this proves nothing"
+        );
+
+        // Stage A of a staged upsert: a tombstone is written but not yet published.
+        provider
+            .pending_inline_tombstones
+            .fetch_add(1, Ordering::Release);
+
+        let deleted = provider
+            .apply_retention_filters()
+            .await
+            .expect("retention defers rather than failing");
+        assert_eq!(
+            deleted, 0,
+            "retention must delete nothing while a tombstone is unpublished"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            inlined_before,
+            "the inline corpus must be left where it is: flushing it here would \
+             materialize a superseded row and drop the tombstone that hides it"
+        );
+        assert!(
+            provider
+                .post_write_maintenance
+                .state
+                .lock()
+                .retention_requested,
+            "a deferred pass must re-arm itself, or the deletion is dropped rather than \
+             delayed"
+        );
+
+        // Stage B publishes; the next pass must proceed and delete the matching rows.
+        provider
+            .pending_inline_tombstones
+            .fetch_sub(1, Ordering::Release);
+        provider
+            .apply_retention_filters()
+            .await
+            .expect("retention proceeds once the tombstone is published");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(3, 60)],
+            "once the window closes retention must delete exactly the matching rows"
+        );
+    }
+
+    /// The same deferral for a mem-tier seal shadow: a durable inline row deliberately
+    /// held above the watermark while its rows are still live in RAM. Materializing one
+    /// would raise the watermark past it and serve those rows twice, which is why
+    /// `inline_overwrite_admissible` refuses on the same flag.
+    #[tokio::test]
+    async fn retention_defers_while_a_mem_tier_seal_shadow_is_present() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (plain, catalog, _tmp) =
+            create_inlining_table("retention_defers_shadow", Arc::clone(&runtime_env)).await;
+        let table_name = plain.table_metadata.table_name.clone();
+        let schema = Arc::clone(&plain.table_metadata.schema);
+        drop(plain);
+
+        let seeded =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen without retention");
+        insert_batch(&seeded, id_value_batch(schema, &[1, 2], &[10, 60])).await;
+        drop(seeded);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            catalog,
+            vec![retention_predicate()],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+        let inlined_before = provider.cached_inlined_row_count();
+        assert!(
+            inlined_before > 0,
+            "precondition: the rows must be in the inline corpus, or the guard under \
+             test is skipped and this proves nothing"
+        );
+
+        provider
+            .mem_tier_shadow_present
+            .store(true, Ordering::Release);
+
+        let deleted = provider
+            .apply_retention_filters()
+            .await
+            .expect("retention defers rather than failing");
+        assert_eq!(
+            deleted, 0,
+            "retention must delete nothing while a seal shadow is present"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            inlined_before,
+            "the seal shadow must not be materialized: its rows are still live in RAM"
+        );
+    }
+
+    /// Retention deletes rows that nothing on this path re-derives `num_rows` from, so
+    /// the maintained count must not be served `Exact` afterwards — on the distributed
+    /// path an `Exact` count is folded straight into a `COUNT(*)` ANSWER rather than
+    /// costing a scan, which would return a count high by exactly what retention removed.
+    #[tokio::test]
+    async fn retention_leaves_the_maintained_row_count_inexact() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_retention_table("retention_count_inexact", ctx.runtime_env(), 0).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch(schema, &[1, 2, 3, 4], &[10, 20, 60, 70]),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("retention pass");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(3, 60), (4, 70)],
+            "precondition: retention removed the two matching rows"
+        );
+        if let Some(stats) = provider.optimizer_table_statistics() {
+            assert!(
+                !matches!(stats.num_rows, DFPrecision::Exact(_)),
+                "a retention delete must leave the maintained count inexact, or a \
+                 distributed COUNT(*) folds {:?} as the answer",
+                stats.num_rows
+            );
+        }
+    }
+
+    /// `cdc_durability` defaults to `memory` on the CDC profile, and those writes return
+    /// from `write_cdc_in_memory` before reaching any durable publish path — so nothing
+    /// armed retention for them and a configured `retention_sql` never ran at all. The
+    /// mem-tier checkpoint arms it over the epoch it just made durable, so the rows the
+    /// predicate matches are gone once that epoch lands.
+    #[tokio::test]
+    async fn retention_runs_over_a_memory_durability_cdc_checkpoint() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_retention_filters(vec![retention_predicate()])
+            .create(CreateTableOptions {
+                table_name: "retention_mem_durability".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    cdc_durability: crate::metadata::CdcDurability::Memory,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("memory-durability CDC retention table created");
+        // The RAM path is armed by the runtime installing a slot advancer; without one
+        // the write silently takes the durable path and this test covers nothing.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert!(
+            provider.is_cdc_memory_mode() && provider.has_slot_advancer(),
+            "precondition: the write must take the in-memory CDC path this test is about"
+        );
+
+        let batch = id_value_batch(schema, &[1, 2, 3, 4], &[10, 20, 60, 70]);
+        let batch_schema = batch.schema();
+        let ctx_for_write = SessionContext::new();
+        provider
+            .write_cdc_append_stream(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch_schema,
+                    futures::stream::iter(vec![Ok(batch)]),
+                )),
+                &ctx_for_write.task_ctx(),
+            )
+            .await
+            .expect("in-memory CDC append");
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the rows must be resident in the RAM tier, which the deletion \
+             sink cannot reach"
+        );
+
+        // Only a checkpoint makes them durable — and reachable.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("mem-tier checkpoint makes the epoch durable");
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("the retention the checkpoint armed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(3, 60), (4, 70)],
+            "retention must reach rows that arrived through the default \
+             cdc_durability: memory path once their epoch is durable"
         );
     }
 
