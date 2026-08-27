@@ -162,22 +162,27 @@ fn pre_dump_session_statements(
     statements
 }
 
-/// The `net_write_timeout`, in seconds, this dump connection has inherited, or
-/// `None` when the server did not answer with one.
+/// The `net_write_timeout`, in seconds, this dump connection has inherited.
 ///
 /// Read on the connection because the floor cannot be resolved server-side: see
 /// [`pre_dump_session_statements`] for why the assignment has to be a literal.
-/// Typed as `Option<u32>` so a SQL `NULL` answer returns `None` rather than
-/// panicking in `FromRow`.
-async fn inherited_net_write_timeout(conn: &mut Conn) -> Option<u32> {
-    mysql_async::prelude::Queryable::query_first::<Option<u32>, _>(
-        conn,
-        "SELECT @@SESSION.net_write_timeout",
+///
+/// `Ok(None)` is a server that answered with SQL `NULL`, which is a different
+/// thing from a read that failed and leads to the same floor being skipped for a
+/// different reason — so the error is returned rather than flattened into the
+/// `None`, and the caller says which one happened. Typed as `Option<u32>`
+/// internally so a `NULL` answer decodes instead of panicking in `FromRow`.
+async fn inherited_net_write_timeout(
+    conn: &mut Conn,
+) -> std::result::Result<Option<u32>, mysql_async::Error> {
+    Ok(
+        mysql_async::prelude::Queryable::query_first::<Option<u32>, _>(
+            conn,
+            "SELECT @@SESSION.net_write_timeout",
+        )
+        .await?
+        .flatten(),
     )
-    .await
-    .ok()
-    .flatten()
-    .flatten()
 }
 
 pub(super) async fn open_binlog_stream(
@@ -189,13 +194,24 @@ pub(super) async fn open_binlog_stream(
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
-    let inherited_timeout = inherited_net_write_timeout(&mut conn).await;
-    if inherited_timeout.is_none() {
-        tracing::warn!(
-            dataset = %dataset_name,
-            "Could not read the MySQL binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
-        );
-    }
+    let inherited_timeout = match inherited_net_write_timeout(&mut conn).await {
+        Ok(Some(inherited)) => Some(inherited),
+        Ok(None) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                "The MySQL source answered NULL for the binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "Could not read the MySQL binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+            );
+            None
+        }
+    };
 
     for PreDumpStatement {
         sql,
