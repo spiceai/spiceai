@@ -2174,18 +2174,19 @@ pub struct CayenneTableProvider {
     /// compaction runtime drains it. Mirrors `post_write_compaction_scheduled` so a
     /// burst of retention passes spawns at most one in-flight sweep.
     orphan_dv_sweep_scheduled: Arc<AtomicBool>,
-    /// Monotonic milliseconds (since `PROCESS_START`) of the last footprint
-    /// metric sample, throttling it to [`FOOTPRINT_SAMPLE_MIN_INTERVAL`].
+    /// Admission gate for the footprint sample, throttling it to
+    /// [`FOOTPRINT_SAMPLE_MIN_INTERVAL`].
     ///
-    /// The footprint sample runs on the background compaction tick, whose
-    /// interval the adaptive controller may tighten to seconds; the sample's
-    /// aggregate queries scan the table's whole manifest, so it needs a floor of
-    /// its own rather than inheriting a cadence tuned for compaction.
-    last_footprint_sample_ms: Arc<AtomicU64>,
+    /// The sample is driven from the background compaction tick, whose interval
+    /// the adaptive controller may tighten to seconds, AND from the post-write
+    /// maintenance loop; its aggregate queries scan the table's whole manifest,
+    /// so it needs both a floor of its own and protection from overlapping
+    /// itself. See [`SampleGate`].
+    footprint_sample_gate: Arc<SampleGate>,
     /// The same, for the data-directory walk, which is throttled far harder
     /// ([`DATA_DIR_SAMPLE_MIN_INTERVAL`]) because its cost scales with the file
     /// count it measures.
-    last_data_dir_sample_ms: Arc<AtomicU64>,
+    data_dir_sample_gate: Arc<SampleGate>,
     /// Encode fan-out the most recent snapshot write resolved to, and the branch
     /// that chose it (a [`WriteShapeDecision`] discriminant). Written at the
     /// decision, published on the background tick — see
@@ -2840,14 +2841,104 @@ fn metastore_sample_clock(label: &str) -> Arc<MetastoreSampleClock> {
     )
 }
 
-/// Last-sample timestamps for one metastore's catalog-wide gauges, as
-/// millisecond offsets from [`PROCESS_START`] (`0` = never).
+/// Sample clocks for one metastore's catalog-wide gauges.
 #[derive(Debug, Default)]
 struct MetastoreSampleClock {
     /// The cheap gauges: the freelist pragma.
-    cheap_ms: AtomicU64,
+    cheap: SampleGate,
     /// The `dbstat` per-table byte attribution.
-    table_bytes_ms: AtomicU64,
+    table_bytes: SampleGate,
+}
+
+/// Admission gate for one throttled sample.
+///
+/// Three pieces of state, because a bare last-claimed timestamp gets two things
+/// wrong:
+///
+/// - **A slow sample can overlap itself.** The per-table clocks are driven from
+///   two tasks (the compaction tick and the post-write maintenance loop) and the
+///   catalog clocks are shared by every table in a dataset, so a sample that runs
+///   longer than its own interval can be claimed again while still in flight —
+///   and two concurrent aggregate scans over a large manifest amplify database
+///   load exactly when sampling is already expensive. `in_flight` is the guard a
+///   timestamp cannot be.
+/// - **A failed sample must not silence the gauges for a full interval.**
+///   Stamping the clock before collection means one error suppresses retries
+///   until the interval elapses, leaving stale values standing. `last_success`
+///   advances only after collection completes, and `last_attempt` bounds the
+///   retry so a persistently failing sample cannot run every tick.
+#[derive(Debug, Default)]
+struct SampleGate {
+    /// Set while a sample is running. The only state that prevents overlap.
+    in_flight: AtomicBool,
+    /// Milliseconds (from [`PROCESS_START`]) of the last COMPLETED sample;
+    /// `0` = never. Drives the real cadence.
+    last_success_ms: AtomicU64,
+    /// Milliseconds of the last attempt, completed or not. Bounds retries after
+    /// a failure.
+    last_attempt_ms: AtomicU64,
+}
+
+/// Ceiling on how soon a failed sample retries, so an error is corrected
+/// promptly without a persistently failing sample running every tick.
+const SAMPLE_RETRY_BACKOFF: Duration = Duration::from_mins(1);
+
+impl SampleGate {
+    /// Claim this gate if a sample is due and none is running.
+    ///
+    /// The returned guard clears `in_flight` on drop — on every exit, including
+    /// an early return or an unwind — so a panicking sample cannot wedge the gate
+    /// shut for the life of the process.
+    fn try_enter(&self, min_interval: Duration) -> Option<SampleGuard<'_>> {
+        let now = duration_millis_saturating(PROCESS_START.elapsed());
+        let since = |stamp: u64| {
+            if stamp == 0 {
+                u64::MAX
+            } else {
+                now.saturating_sub(stamp)
+            }
+        };
+        if since(self.last_success_ms.load(Ordering::Relaxed))
+            < duration_millis_saturating(min_interval)
+        {
+            return None;
+        }
+        let retry_floor = duration_millis_saturating(min_interval.min(SAMPLE_RETRY_BACKOFF));
+        if since(self.last_attempt_ms.load(Ordering::Relaxed)) < retry_floor {
+            return None;
+        }
+        // The claim itself. `swap` is the whole mutual exclusion: whichever
+        // caller observes `false` owns the sample, and the loser returns rather
+        // than running a second copy.
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        self.last_attempt_ms.store(now.max(1), Ordering::Relaxed);
+        Some(SampleGuard { gate: self })
+    }
+}
+
+/// Holds a [`SampleGate`] for the duration of one sample.
+struct SampleGuard<'a> {
+    gate: &'a SampleGate,
+}
+
+impl SampleGuard<'_> {
+    /// Record that the sample completed, starting the next full interval.
+    /// Not called on a failure, so the next tick retries once the backoff
+    /// elapses instead of waiting out the whole interval with stale gauges.
+    fn succeeded(&self) {
+        self.gate.last_success_ms.store(
+            duration_millis_saturating(PROCESS_START.elapsed()).max(1),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl Drop for SampleGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.in_flight.store(false, Ordering::Release);
+    }
 }
 
 /// How long the data-directory walk may take before it is worth saying so.
@@ -2945,15 +3036,6 @@ struct RetiredDirReclaim {
     dir_removed: bool,
 }
 
-/// KNOWN UNDER-COUNT: a hard unlink failure part-way through a directory (a
-/// permission error, a read-only mount) propagates as `Err` and discards the
-/// files this attempt had already removed, so their bytes go unreported. The
-/// direction is deliberate — under-reporting a reclaim is the safe error for a
-/// metric whose job is to reveal space that is NOT coming back, and the pass is
-/// simultaneously reported as `failed`, so the gap is never silent. Fixing it
-/// properly means letting the deletion continue past a failed file, which
-/// changes physical-cleanup control flow and belongs with that code rather than
-/// with its instrumentation.
 impl RetiredDirReclaim {
     /// A directory that was already gone: removed, with nothing for this pass to
     /// claim (whoever removed it reclaimed the space).
@@ -2978,6 +3060,39 @@ impl RetiredDirReclaim {
     /// Whether this attempt gave anything back.
     const fn reclaimed_anything(self) -> bool {
         self.files > 0 || self.dir_removed
+    }
+}
+
+/// One deletion attempt's result: what it physically removed, AND how it ended.
+///
+/// Both, because they are not exclusive. A hard unlink failure part-way through
+/// a directory (a permission error, a read-only mount) still leaves the files it
+/// already removed reclaimed, and returning a bare `Result` discards those
+/// totals with the error — under-reporting the reclaim on exactly the mixed
+/// failure an operator is investigating. Carrying the reclaim alongside the
+/// error preserves them without changing the deletion's control flow: it still
+/// stops at the first hard error, and the directory still stays in the ledger
+/// for the next sweep to retry.
+struct RetiredDirAttempt {
+    /// What this attempt physically removed before it finished or failed.
+    reclaim: RetiredDirReclaim,
+    /// The error that stopped it, if any.
+    error: Option<std::io::Error>,
+}
+
+impl RetiredDirAttempt {
+    fn ok(reclaim: RetiredDirReclaim) -> Self {
+        Self {
+            reclaim,
+            error: None,
+        }
+    }
+
+    fn failed(reclaim: RetiredDirReclaim, error: std::io::Error) -> Self {
+        Self {
+            reclaim,
+            error: Some(error),
+        }
     }
 }
 
@@ -5189,44 +5304,50 @@ impl CayenneTableProvider {
     /// When the table's manifest is unpopulated the caller takes the legacy
     /// whole-directory path instead and never reaches here.
     ///
-    /// Returns `Ok(true)` when the directory was fully removed, `Ok(false)`
-    /// when one or more referenced files (or non-data files) kept it alive, and
-    /// the directory remains. A `NotFound` directory counts as fully removed.
+    /// Returns what it physically removed together with the error that stopped
+    /// it, if any — see [`RetiredDirAttempt`] for why both. `dir_removed` is
+    /// false when one or more referenced files (or non-data files) kept the
+    /// directory alive. A `NotFound` directory counts as fully removed.
     fn delete_retired_snapshot_dir_refcounted(
         snapshot_dir: &std::path::Path,
         retiring_snapshot_id: &str,
         live_referenced: &HashSet<String>,
         invalidate: impl FnOnce(HashSet<ObjectStorePath>),
-    ) -> std::io::Result<RetiredDirReclaim> {
+    ) -> RetiredDirAttempt {
         let entries = match std::fs::read_dir(snapshot_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RetiredDirReclaim::removed_dir_only());
+                return RetiredDirAttempt::ok(RetiredDirReclaim::removed_dir_only());
             }
-            Err(e) => return Err(e),
+            Err(e) => return RetiredDirAttempt::failed(RetiredDirReclaim::default(), e),
         };
 
         let mut kept_any = false;
         let mut retired_files = Vec::new();
         for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
+            let (path, file_type) = match entry.and_then(|e| Ok((e.path(), e.file_type()?, e))) {
+                Ok((path, file_type, _)) => (path, file_type),
+                Err(e) => return RetiredDirAttempt::failed(RetiredDirReclaim::default(), e),
+            };
             // Only data files participate in ref-counting. A nested directory or
             // a non-data file (e.g. a staging WAL) is never a manifest target,
             // so leave it in place and let it keep the dir alive — a later
             // rotation-anchored cleanup or operator reclaims it. This is the
             // conservative (never-orphan) choice.
             let is_referenceable = file_type.is_file()
-                && entry
+                && path
                     .file_name()
-                    .to_str()
+                    .and_then(std::ffi::OsStr::to_str)
                     .is_some_and(Self::is_compactable_data_file);
             if !is_referenceable {
                 kept_any = true;
                 continue;
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            let Some(name) = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_string)
+            else {
                 kept_any = true;
                 continue;
             };
@@ -5250,7 +5371,7 @@ impl CayenneTableProvider {
             // Sized BEFORE the unlink, and only for the files about to be
             // removed, so the reclaim figure is the bytes actually given back
             // rather than an inference from the file count.
-            let bytes = entry.metadata().map_or(0, |m| m.len());
+            let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
             retired_files.push((path, cache_path, bytes));
         }
 
@@ -5268,8 +5389,11 @@ impl CayenneTableProvider {
                     retired_cache_paths.extend(cache_path);
                 }
                 Err(e) => {
+                    // The files removed above ARE reclaimed; carrying them out
+                    // with the error is what keeps a mixed-failure pass from
+                    // under-reporting.
                     invalidate(retired_cache_paths);
-                    return Err(e);
+                    return RetiredDirAttempt::failed(reclaim, e);
                 }
             }
         }
@@ -5280,7 +5404,7 @@ impl CayenneTableProvider {
             // but the files unlinked above ARE reclaimed, and reporting zero
             // here is what made the reclamation rate wrong on exactly the tables
             // where a live snapshot pins part of a retired directory.
-            return Ok(reclaim);
+            return RetiredDirAttempt::ok(reclaim);
         }
 
         // No entries remain: drop the now-empty directory. A concurrent removal
@@ -5291,14 +5415,16 @@ impl CayenneTableProvider {
         match std::fs::remove_dir(snapshot_dir) {
             Ok(()) => {
                 reclaim.dir_removed = true;
-                Ok(reclaim)
+                RetiredDirAttempt::ok(reclaim)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 reclaim.dir_removed = true;
-                Ok(reclaim)
+                RetiredDirAttempt::ok(reclaim)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(reclaim),
-            Err(e) => Err(e),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                RetiredDirAttempt::ok(reclaim)
+            }
+            Err(e) => RetiredDirAttempt::failed(reclaim, e),
         }
     }
 
@@ -5479,7 +5605,7 @@ impl CayenneTableProvider {
                 let referenced = live_referenced.clone();
                 let retired_cache_paths = Arc::new(ParkingMutex::new(HashSet::new()));
                 let retired_cache_paths_for_task = Arc::clone(&retired_cache_paths);
-                let removed = tokio::task::spawn_blocking(move || {
+                let attempt = tokio::task::spawn_blocking(move || {
                     if manifest_populated {
                         Self::delete_retired_snapshot_dir_refcounted(
                             &dir,
@@ -5492,7 +5618,12 @@ impl CayenneTableProvider {
                     } else {
                         // Legacy path: no manifest, so no file is referenced
                         // across snapshots — the whole dir is dead.
-                        let paths = Self::segment_cache_paths_in_dir(&dir)?;
+                        let paths = match Self::segment_cache_paths_in_dir(&dir) {
+                            Ok(paths) => paths,
+                            Err(e) => {
+                                return RetiredDirAttempt::failed(RetiredDirReclaim::default(), e);
+                            }
+                        };
                         // Sized before the tree is removed: `remove_dir_all` is
                         // one call and cannot report what it took, so without
                         // this the pre-manifest path would report a reclaim of
@@ -5506,11 +5637,11 @@ impl CayenneTableProvider {
                         match std::fs::remove_dir_all(&dir) {
                             Ok(()) => {
                                 retired_cache_paths_for_task.lock().extend(paths);
-                                Ok(reclaimed)
+                                RetiredDirAttempt::ok(reclaimed)
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 retired_cache_paths_for_task.lock().extend(paths);
-                                Ok(reclaimed)
+                                RetiredDirAttempt::ok(reclaimed)
                             }
                             Err(e) => {
                                 let remaining = Self::segment_cache_paths_in_dir(&dir)
@@ -5518,7 +5649,11 @@ impl CayenneTableProvider {
                                 retired_cache_paths_for_task
                                     .lock()
                                     .extend(paths.difference(&remaining).cloned());
-                                Err(e)
+                                // `remove_dir_all` is all-or-nothing from here:
+                                // it may have removed part of the tree, and what
+                                // survives is unknown without re-walking, so
+                                // claim nothing rather than guess.
+                                RetiredDirAttempt::failed(RetiredDirReclaim::default(), e)
                             }
                         }
                     }
@@ -5530,9 +5665,9 @@ impl CayenneTableProvider {
                 file_format
                     .invalidate_cached_paths(&runtime_env, &table_id, paths)
                     .await;
-                match removed {
-                    Ok(Ok(attempt)) if attempt.dir_removed => {
-                        reclaimed.absorb(attempt);
+                match attempt {
+                    Ok(attempt) if attempt.error.is_none() && attempt.reclaim.dir_removed => {
+                        reclaimed.absorb(attempt.reclaim);
                         // Dir fully removed. Evict the cached listing AFTER the
                         // unlink so the next plan lists fresh and sees it gone.
                         let url = Self::snapshot_dir_url(&table_path, &table_id, &id);
@@ -5544,15 +5679,15 @@ impl CayenneTableProvider {
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
-                            files = attempt.files,
-                            bytes = attempt.bytes,
+                            files = reclaimed.files,
+                            bytes = reclaimed.bytes,
                             "Deleted retired snapshot dir"
                         );
                     }
-                    Ok(Ok(attempt)) => {
+                    Ok(attempt) if attempt.error.is_none() => {
                         // The directory survived, but any files this attempt DID
                         // unlink are still reclaimed and must be counted.
-                        reclaimed.absorb(attempt);
+                        reclaimed.absorb(attempt.reclaim);
                         // A file referenced in place by a live/protected
                         // snapshot (or a non-data sidecar) kept the dir alive.
                         // KEEP it in the ledger — once the referencing snapshots
@@ -5565,21 +5700,27 @@ impl CayenneTableProvider {
                             target: "cayenne::compaction",
                             table_id = %table_id,
                             snapshot_id = %id,
-                            unlinked_files = attempt.files,
-                            unlinked_bytes = attempt.bytes,
                             "Retired snapshot dir kept: data files still referenced \
                              in place by a live snapshot (will retry once orphaned)"
                         );
                     }
-                    Ok(Err(e)) => {
-                        // Stays in the ledger; retried on the next sweep.
+                    Ok(attempt) => {
+                        // Failed, but whatever it unlinked before failing is
+                        // still reclaimed — dropping those totals is what made
+                        // the counters wrong on a mixed-success pass.
+                        reclaimed.absorb(attempt.reclaim);
                         failed_dirs = failed_dirs.saturating_add(1);
-                        tracing::warn!(
-                            target: "cayenne::compaction",
-                            table_id = %table_id,
-                            snapshot_id = %id,
-                            "Failed to delete retired snapshot dir (will retry): {e}"
-                        );
+                        // `error` is `Some` on this arm by construction.
+                        if let Some(error) = attempt.error {
+                            tracing::warn!(
+                                target: "cayenne::compaction",
+                                table_id = %table_id,
+                                snapshot_id = %id,
+                                unlinked_files = attempt.reclaim.files,
+                                unlinked_bytes = attempt.reclaim.bytes,
+                                "Failed to delete retired snapshot dir (will retry): {error}"
+                            );
+                        }
                     }
                     Err(e) => {
                         failed_dirs = failed_dirs.saturating_add(1);
@@ -7095,14 +7236,16 @@ impl CayenneTableProvider {
 
             if manifest_populated {
                 let snapshot_id = snapshot_id.to_string();
-                let reclaim = Self::delete_retired_snapshot_dir_refcounted(
+                let attempt = Self::delete_retired_snapshot_dir_refcounted(
                     &path,
                     &snapshot_id,
                     live_referenced,
                     &mut invalidate,
-                )
-                .map_err(|source| CatalogError::IoError { source })?;
-                if reclaim.dir_removed {
+                );
+                if let Some(source) = attempt.error {
+                    return Err(CatalogError::IoError { source });
+                }
+                if attempt.reclaim.dir_removed {
                     deleted_count += 1;
                 } else {
                     tracing::debug!(
@@ -7531,8 +7674,8 @@ impl CayenneTableProvider {
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
             orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
-            last_footprint_sample_ms: Arc::new(AtomicU64::new(0)),
-            last_data_dir_sample_ms: Arc::new(AtomicU64::new(0)),
+            footprint_sample_gate: Arc::new(SampleGate::default()),
+            data_dir_sample_gate: Arc::new(SampleGate::default()),
             last_write_shape_shards: Arc::new(AtomicU64::new(0)),
             last_write_shape_decision: Arc::new(AtomicU8::new(
                 WriteShapeDecision::ConcurrencyBounded as u8,
@@ -8567,48 +8710,6 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Whether `min_interval` has elapsed since the timestamp in `clock`,
-    /// claiming the slot if so.
-    ///
-    /// The background compaction tick is the only cadence available for these
-    /// samples, but the adaptive controller may tighten it to seconds and the
-    /// samples cost far more than a gauge record. So each keeps a floor of its
-    /// own instead of inheriting a cadence tuned for a different job.
-    ///
-    /// `0` means "never sampled", so the first tick always samples: an operator
-    /// starting `spiced` sees the footprint immediately rather than after a
-    /// ten-minute wait.
-    ///
-    /// The claim is a compare-and-exchange, not a load-then-store. Both a
-    /// load-check-store and the callers are genuinely concurrent: the per-table
-    /// clocks are driven from the compaction tick AND the post-write maintenance
-    /// loop, and the catalog-wide clocks are shared by every table in a dataset.
-    /// Two observers of the same expired value would both proceed, and the
-    /// cadence this exists to enforce — one manifest scan per 30 s, one `dbstat`
-    /// walk per 10 minutes — would be violated by exactly the multiplier the
-    /// clock was added to remove.
-    fn sample_is_due(clock: &AtomicU64, min_interval: Duration) -> bool {
-        let elapsed = duration_millis_saturating(PROCESS_START.elapsed());
-        let min_interval_ms = duration_millis_saturating(min_interval);
-        let mut last = clock.load(Ordering::Relaxed);
-        loop {
-            if last != 0 && elapsed.saturating_sub(last) < min_interval_ms {
-                return false;
-            }
-            match clock.compare_exchange_weak(
-                last,
-                elapsed.max(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                // Another caller claimed or advanced the slot; re-test against
-                // the value it left rather than assuming either outcome.
-                Err(observed) => last = observed,
-            }
-        }
-    }
-
     /// Publish the in-memory deletion-index gauges.
     ///
     /// These are the seq-prefix bake's trigger INPUT. Without them a
@@ -8653,23 +8754,32 @@ impl CayenneTableProvider {
 
         // Three cadences, because the three samples differ by orders of
         // magnitude in cost: per-table aggregate queries every 30 s, the
-        // metastore's own gauges once per catalog on their own clocks, and the
+        // metastore's own gauges once per catalog on their own gates, and the
         // data-directory walk — one `stat` per file — every 5 minutes.
-        if Self::sample_is_due(
-            &self.last_footprint_sample_ms,
-            FOOTPRINT_SAMPLE_MIN_INTERVAL,
-        ) {
+        if let Some(guard) = self
+            .footprint_sample_gate
+            .try_enter(FOOTPRINT_SAMPLE_MIN_INTERVAL)
+        {
             // Publish the reclamation counters at zero before anything has run,
             // so "nothing has been reclaimed" is an observation rather than an
             // empty query a consumer cannot distinguish from missing
             // instrumentation. Adding zero is idempotent, so repeating it here
             // costs nothing.
             maintenance_metrics::register_all(self.table_metadata.table_name.as_str());
-            self.sample_storage_metrics().await;
+            // `succeeded` only when the storage sample actually published: a
+            // failed metastore read leaves the gauges stale, and stamping the
+            // cadence anyway would hold them stale for the full interval.
+            if self.sample_storage_metrics().await {
+                guard.succeeded();
+            }
             self.sample_metastore_metrics().await;
         }
-        if Self::sample_is_due(&self.last_data_dir_sample_ms, DATA_DIR_SAMPLE_MIN_INTERVAL) {
-            self.sample_data_dir_metrics().await;
+        if let Some(guard) = self
+            .data_dir_sample_gate
+            .try_enter(DATA_DIR_SAMPLE_MIN_INTERVAL)
+            && self.sample_data_dir_metrics().await
+        {
+            guard.succeeded();
         }
     }
 
@@ -8858,7 +8968,7 @@ impl CayenneTableProvider {
     /// gauges at their previous values rather than failing the tick. Reporting a
     /// zero would be worse than reporting nothing — it reads as "the table
     /// shrank to nothing".
-    async fn sample_storage_metrics(&self) {
+    async fn sample_storage_metrics(&self) -> bool {
         let stats = match self
             .catalog
             .table_storage_stats(&self.table_metadata.table_id)
@@ -8871,7 +8981,7 @@ impl CayenneTableProvider {
                     %error,
                     "Failed to sample Cayenne storage footprint; leaving the gauges unchanged"
                 );
-                return;
+                return false;
             }
         };
 
@@ -8890,7 +9000,7 @@ impl CayenneTableProvider {
                 delete_files: to_gauge(stats.delete_files),
                 delete_file_bytes: to_gauge(stats.delete_file_bytes),
                 delete_file_tombstones: to_gauge(stats.delete_file_tombstones),
-                manifest_rows_reachable: to_gauge(stats.reachable_manifest_rows()),
+                manifest_rows_reachable: to_gauge(stats.reachable_manifest_rows),
                 manifest_rows_unreachable: to_gauge(stats.unreachable_manifest_rows),
                 manifest_live_files: to_gauge(stats.distinct_live_files),
                 snapshot_sequences: to_gauge(stats.snapshot_sequences),
@@ -8907,6 +9017,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+        true
     }
 
     /// Publish the metastore-wide gauges: the freelist, and the per-table byte
@@ -8920,17 +9031,14 @@ impl CayenneTableProvider {
     async fn sample_metastore_metrics(&self) {
         let label = self.catalog.metastore_label();
         let clock = metastore_sample_clock(&label);
-        let cheap_due = Self::sample_is_due(&clock.cheap_ms, FOOTPRINT_SAMPLE_MIN_INTERVAL);
-        let table_bytes_due = Self::sample_is_due(
-            &clock.table_bytes_ms,
-            METASTORE_TABLE_BYTES_SAMPLE_MIN_INTERVAL,
-        );
-
         let dimensions = [telemetry::KeyValue::new("catalog", label)];
 
-        if cheap_due {
+        if let Some(guard) = clock.cheap.try_enter(FOOTPRINT_SAMPLE_MIN_INTERVAL) {
             match self.catalog.metastore_freelist_bytes().await {
-                Ok(bytes) => telemetry::cayenne::track_metastore_freelist_bytes(bytes, &dimensions),
+                Ok(bytes) => {
+                    telemetry::cayenne::track_metastore_freelist_bytes(bytes, &dimensions);
+                    guard.succeeded();
+                }
                 Err(error) => tracing::debug!(
                     table = self.table_metadata.table_name.as_str(),
                     %error,
@@ -8939,9 +9047,12 @@ impl CayenneTableProvider {
             }
         }
 
-        if !table_bytes_due {
+        let Some(guard) = clock
+            .table_bytes
+            .try_enter(METASTORE_TABLE_BYTES_SAMPLE_MIN_INTERVAL)
+        else {
             return;
-        }
+        };
         match self.catalog.metastore_table_bytes().await {
             Ok(per_table) => {
                 for (metastore_table, bytes) in per_table {
@@ -8953,6 +9064,7 @@ impl CayenneTableProvider {
                         ],
                     );
                 }
+                guard.succeeded();
             }
             Err(error) => tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
@@ -8975,9 +9087,12 @@ impl CayenneTableProvider {
     /// would repeat; there the manifest figures stand alone. Skipped rather than
     /// approximated, so a missing series is never mistaken for an empty
     /// directory.
-    async fn sample_data_dir_metrics(&self) {
+    async fn sample_data_dir_metrics(&self) -> bool {
         if self.table_metadata.path.starts_with("s3://") {
-            return;
+            // Not a failure: there is nothing to publish here on object storage,
+            // and the gate should hold the full interval rather than retrying a
+            // walk that will never run.
+            return true;
         }
         let root =
             std::path::PathBuf::from(&self.table_metadata.path).join(&self.table_metadata.table_id);
@@ -8992,7 +9107,7 @@ impl CayenneTableProvider {
                     %error,
                     "Failed to measure the Cayenne data directory; leaving its gauges unchanged"
                 );
-                return;
+                return false;
             }
         };
 
@@ -9021,6 +9136,7 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+        true
     }
 
     /// Recursively total one table directory's files by role.
@@ -9489,8 +9605,8 @@ impl CayenneTableProvider {
             compaction_lock: Arc::clone(&self.compaction_lock),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
             orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
-            last_footprint_sample_ms: Arc::clone(&self.last_footprint_sample_ms),
-            last_data_dir_sample_ms: Arc::clone(&self.last_data_dir_sample_ms),
+            footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
+            data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
             last_write_shape_shards: Arc::clone(&self.last_write_shape_shards),
             last_write_shape_decision: Arc::clone(&self.last_write_shape_decision),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
@@ -16974,13 +17090,22 @@ impl CayenneTableProvider {
         // present) that the tolerant loader self-heals and the next sweep retries —
         // never an untracked leaked file (which the reverse order would produce).
         let mut removed_ids: Vec<String> = Vec::with_capacity(orphaned.len());
-        // Summed over the rows actually removed, so this is what the footprint
-        // gauges should be seen to drop by — not what was merely eligible.
-        let mut reclaimed_bytes = 0_u64;
+        // PHYSICAL reclaim is only what THIS pass unlinked. Two of the paths
+        // below drop a catalog row without freeing any space — an object-store
+        // key (never unlinked here) and a file some earlier actor already
+        // removed — and counting their bytes would report space recovered while
+        // object-store data remains indefinitely. The catalog row removal IS a
+        // real metastore reclaim, so tombstones are counted for every removed
+        // row and physical bytes only for a successful unlink.
+        let mut unlinked_files = 0_u64;
+        let mut unlinked_bytes = 0_u64;
         let mut reclaimed_tombstones = 0_u64;
-        let mut record_reclaimed = |df: &crate::metadata::DeleteFile| {
-            reclaimed_bytes =
-                reclaimed_bytes.saturating_add(u64::try_from(df.file_size_bytes).unwrap_or(0));
+        let mut record_unlinked = |df: &crate::metadata::DeleteFile| {
+            unlinked_files = unlinked_files.saturating_add(1);
+            unlinked_bytes =
+                unlinked_bytes.saturating_add(u64::try_from(df.file_size_bytes).unwrap_or(0));
+        };
+        let mut record_row_removed = |df: &crate::metadata::DeleteFile| {
             reclaimed_tombstones =
                 reclaimed_tombstones.saturating_add(u64::try_from(df.delete_count).unwrap_or(0));
         };
@@ -16990,18 +17115,23 @@ impl CayenneTableProvider {
                 // local unlink does not apply. Still drop the row so the loader
                 // stops referencing it (object-store GC is out of scope here).
                 removed_ids.push(df.delete_file_id.clone());
-                record_reclaimed(df);
+                // Row dropped, object NOT deleted — object-store GC is out of
+                // scope here, so claiming its bytes would be a false reclaim.
+                record_row_removed(df);
                 continue;
             }
             match tokio::fs::remove_file(&df.path).await {
                 Ok(()) => {
                     removed_ids.push(df.delete_file_id.clone());
-                    record_reclaimed(df);
+                    record_unlinked(df);
+                    record_row_removed(df);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Already gone (a prior interrupted sweep) — still drop the row.
+                    // Already gone (a prior interrupted sweep) — still drop the
+                    // row, but the space was reclaimed by whoever removed the
+                    // file, not by this pass.
                     removed_ids.push(df.delete_file_id.clone());
-                    record_reclaimed(df);
+                    record_row_removed(df);
                 }
                 Err(e) => {
                     // Leave the row so a later sweep retries the unlink.
@@ -17049,14 +17179,16 @@ impl CayenneTableProvider {
         maintenance_metrics::track_reclaimed(
             table_name,
             MaintenanceOp::OrphanDvSweep,
-            u64::try_from(removed_ids.len()).unwrap_or(u64::MAX),
-            reclaimed_bytes,
+            unlinked_files,
+            unlinked_bytes,
             reclaimed_tombstones,
         );
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             floor,
-            reclaimed_bytes,
+            catalog_rows_removed = removed_ids.len(),
+            unlinked_files,
+            unlinked_bytes,
             reclaimed_tombstones,
             "Orphaned-DV sweep: reclaimed {} orphaned key-based deletion vector(s)",
             removed_ids.len()
@@ -45907,13 +46039,17 @@ mod tests {
                 .expect("referenced path should convert before deletion");
 
         let invalidated = RefCell::new(HashSet::new());
-        let reclaim = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+        let attempt = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
             "retired-snap",
             &referenced,
             |paths| *invalidated.borrow_mut() = paths,
-        )
-        .expect("refcounted delete");
+        );
+        assert!(
+            attempt.error.is_none(),
+            "keeping a referenced file is not an error"
+        );
+        let reclaim = attempt.reclaim;
 
         assert!(
             !reclaim.dir_removed,
@@ -45969,13 +46105,14 @@ mod tests {
         // snapshot id, so nothing in `dead-snap` is protected.
         let referenced: HashSet<String> = ["other-snap/a.vortex".to_string()].into_iter().collect();
 
-        let reclaim = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+        let attempt = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
             "dead-snap",
             &referenced,
             |_| {},
-        )
-        .expect("refcounted delete");
+        );
+        assert!(attempt.error.is_none());
+        let reclaim = attempt.reclaim;
 
         assert!(reclaim.dir_removed, "a fully-orphaned dir is removed");
         assert!(
@@ -45994,13 +46131,17 @@ mod tests {
     fn delete_retired_snapshot_dir_refcounted_missing_dir_is_ok() {
         let tmp = TempDir::new().expect("temp dir");
         let missing = tmp.path().join("table-id").join("never-existed");
-        let reclaim = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+        let attempt = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &missing,
             "never-existed",
             &HashSet::new(),
             |_| {},
-        )
-        .expect("missing dir is not an error");
+        );
+        assert!(
+            attempt.error.is_none(),
+            "a missing dir is not an error — the sweep is idempotent across retries"
+        );
+        let reclaim = attempt.reclaim;
         assert!(
             reclaim.dir_removed,
             "a NotFound dir counts as fully removed"
@@ -46010,6 +46151,61 @@ mod tests {
             (0, 0),
             "an already-reaped dir gave nothing back to THIS pass; claiming its \
              bytes would double-count whoever removed it"
+        );
+    }
+
+    /// A hard unlink failure part-way through a directory must still report the
+    /// files it removed BEFORE failing. Discarding them with the error is what
+    /// made the reclaim counters wrong on a mixed-success pass, and the fix is
+    /// only real if the attempt carries both halves.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_unlink_still_reports_what_was_already_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let table_root = tmp.path().join("table-id");
+        let retired_dir = table_root.join("part-fail");
+        std::fs::create_dir_all(&retired_dir).expect("create retired dir");
+        std::fs::write(retired_dir.join("a.vortex"), vec![b'x'; 64]).expect("write a");
+        std::fs::write(retired_dir.join("b.vortex"), vec![b'x'; 64]).expect("write b");
+
+        // A read-only directory permits listing entries but refuses unlink, so
+        // the removal fails where the metric accounting happens.
+        let mut perms = std::fs::metadata(&retired_dir)
+            .expect("stat retired dir")
+            .permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&retired_dir, perms).expect("make dir read-only");
+
+        let attempt = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &retired_dir,
+            "part-fail",
+            &HashSet::new(),
+            |_| {},
+        );
+
+        // Restored before any assertion can panic, or the TempDir cannot clean up.
+        let mut perms = std::fs::metadata(&retired_dir)
+            .expect("stat retired dir")
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&retired_dir, perms).expect("restore permissions");
+
+        assert!(
+            attempt.error.is_some(),
+            "an unlink into a read-only directory must surface as a failure"
+        );
+        assert!(
+            !attempt.reclaim.dir_removed,
+            "the directory survives, so a later sweep retries it"
+        );
+        // The reclaim travels WITH the error rather than being dropped by it —
+        // whatever a partial pass frees stays countable.
+        assert_eq!(
+            retired_dir_sweep_outcome(attempt.reclaim, 1),
+            MaintenanceOutcome::Failed,
+            "a failed unlink makes the whole pass failed"
         );
     }
 

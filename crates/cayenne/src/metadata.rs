@@ -2111,13 +2111,20 @@ pub struct InlinedData {
 /// that publish these as gauges saturate to `u64` at the boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TableStorageStats {
-    /// Data files in the current snapshot.
+    /// DISTINCT physical data files the current snapshot references.
+    ///
+    /// Deduplicated by path, and a file the current snapshot shares with a
+    /// protected one is counted here only — the live pointer owns what it
+    /// references, so `current_*` and `protected_*` partition the table rather
+    /// than overlapping.
     pub current_files: i64,
     /// On-disk bytes of the current snapshot's data files.
     pub current_bytes: i64,
     /// Rows in the current snapshot's data files, before deletions apply.
     pub current_rows: i64,
-    /// Data files across the live protected snapshots (the merge-on-read runs).
+    /// DISTINCT physical data files referenced by a live protected snapshot and
+    /// NOT by the current one (see [`Self::current_files`] for the ownership
+    /// rule).
     pub protected_files: i64,
     /// On-disk bytes of the protected snapshots' data files.
     pub protected_bytes: i64,
@@ -2126,6 +2133,13 @@ pub struct TableStorageStats {
     /// Manifest rows naming a snapshot that is no longer live — dead weight in
     /// the metastore until a compaction or overwrite prunes them.
     pub unreachable_manifest_rows: i64,
+    /// Manifest rows naming a snapshot that is still live.
+    ///
+    /// A row is a `(snapshot, file)` pair, so this is at or above
+    /// [`Self::distinct_live_files`] by the in-place reference multiplicity. Kept
+    /// distinct from the file count because the unreachable remainder has to be
+    /// taken against rows, not files.
+    pub reachable_manifest_rows: i64,
     /// Distinct `file_path` values referenced by any live snapshot — the number
     /// of real files the reachable manifest rows describe.
     ///
@@ -2168,11 +2182,13 @@ pub struct TableStorageStats {
 }
 
 impl TableStorageStats {
-    /// Manifest rows naming a snapshot that is still live (the current snapshot
-    /// or a registered snapshot sequence).
+    /// Total physical bytes the live data files occupy across the warm tiers.
+    ///
+    /// Safe to add because the tiers partition the file set (see
+    /// [`Self::current_files`]); summing the raw manifest rows would not be.
     #[must_use]
-    pub const fn reachable_manifest_rows(&self) -> i64 {
-        self.current_files + self.protected_files
+    pub const fn live_data_bytes(&self) -> i64 {
+        self.current_bytes + self.protected_bytes
     }
 }
 

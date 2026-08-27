@@ -4203,28 +4203,62 @@ impl MetadataCatalog for CayenneCatalog {
         // carries a registered sequence. Rows naming anything else are
         // unreachable: no scan can reach them, and they persist until a
         // compaction or overwrite prunes the manifest.
+        //
+        // The `live` CTE collapses to one row per DISTINCT `file_path` first,
+        // which is what makes the physical figures physical. A manifest row is a
+        // `(snapshot, file)` pair and compaction references an un-baked file from
+        // a new snapshot IN PLACE rather than copying it, so summing rows counts
+        // one file on disk once per snapshot referencing it — inflating bytes on
+        // exactly the deep snapshot chains worth measuring, and invalidating the
+        // deletion-vector-versus-data comparison these gauges exist for. Size and
+        // row count are per physical file, so `MAX` over the duplicate rows is
+        // that file's own value.
+        //
+        // OWNERSHIP: a file referenced by the current snapshot AND a protected
+        // one is attributed to `current`, so the two tiers partition the table
+        // rather than overlapping. The live pointer owns what it references.
         let manifest = self
             .metastore
             .query_row_helper(
                 QueryRowParams {
                     sql: r"
+                    WITH live AS (
+                        SELECT
+                            sf.file_path,
+                            MAX(CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN 1 ELSE 0 END) AS in_current,
+                            MAX(sf.file_size_bytes) AS file_size_bytes,
+                            MAX(sf.row_count) AS row_count
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                          AND (sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL)
+                        GROUP BY sf.file_path
+                    ),
+                    rows_total AS (
+                        SELECT
+                            COUNT(*) AS all_rows,
+                            COALESCE(SUM(CASE
+                                WHEN sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL
+                                THEN 1 ELSE 0
+                            END), 0) AS reachable_rows
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                    )
                     SELECT
-                        COALESCE(SUM(CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN sf.file_size_bytes ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN sf.row_count ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN ss.snapshot_id IS NOT NULL AND sf.snapshot_id <> t.current_snapshot_id THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN ss.snapshot_id IS NOT NULL AND sf.snapshot_id <> t.current_snapshot_id THEN sf.file_size_bytes ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN ss.snapshot_id IS NOT NULL AND sf.snapshot_id <> t.current_snapshot_id THEN sf.row_count ELSE 0 END), 0),
-                        COUNT(*),
-                        COUNT(DISTINCT CASE
-                            WHEN sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL
-                            THEN sf.file_path
-                        END)
-                    FROM cayenne_snapshot_file sf
-                    JOIN cayenne_table t ON t.table_id = sf.table_id
-                    LEFT JOIN cayenne_snapshot_sequence ss
-                        ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
-                    WHERE sf.table_id = ?1
+                        COALESCE((SELECT SUM(in_current) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN row_count ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN 1 ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN row_count ELSE 0 END) FROM live), 0),
+                        (SELECT all_rows FROM rows_total),
+                        (SELECT reachable_rows FROM rows_total),
+                        COALESCE((SELECT COUNT(*) FROM live), 0)
                     ",
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
@@ -4238,6 +4272,7 @@ impl MetadataCatalog for CayenneCatalog {
                         row.get_i64(5)?,
                         row.get_i64(6)?,
                         row.get_i64(7)?,
+                        row.get_i64(8)?,
                     ))
                 },
             )
@@ -4250,6 +4285,7 @@ impl MetadataCatalog for CayenneCatalog {
             protected_bytes,
             protected_rows,
             manifest_rows,
+            reachable_manifest_rows,
             distinct_live_files,
         ) = manifest;
 
@@ -4311,7 +4347,11 @@ impl MetadataCatalog for CayenneCatalog {
             protected_files,
             protected_bytes,
             protected_rows,
-            unreachable_manifest_rows: (manifest_rows - current_files - protected_files).max(0),
+            // Rows, not files: reachable rows can exceed distinct live files by
+            // the in-place reference multiplicity, so the unreachable remainder
+            // has to be taken against the reachable ROW count.
+            unreachable_manifest_rows: (manifest_rows - reachable_manifest_rows).max(0),
+            reachable_manifest_rows,
             distinct_live_files,
             ..rest
         })
@@ -8465,18 +8505,41 @@ mod tests {
         assert_eq!(stats.current_files, 2, "current-snapshot file count");
         assert_eq!(stats.current_bytes, 300, "current-snapshot bytes");
         assert_eq!(stats.current_rows, 30, "current-snapshot rows");
-        assert_eq!(stats.protected_files, 2, "protected manifest rows");
-        assert_eq!(stats.protected_bytes, 400, "protected bytes");
-        assert_eq!(stats.protected_rows, 40, "protected rows");
+        // `c0.vortex` is referenced by BOTH the current and the protected
+        // snapshot. It belongs to `current` only — the live pointer owns what it
+        // references — so the protected tier reports just its own `p0.vortex`.
+        // Counting the shared file in both tiers is what inflated these figures
+        // and invalidated the deletion-vector-versus-data comparison.
+        assert_eq!(
+            stats.protected_files, 1,
+            "a file shared with the current snapshot is not a second protected file"
+        );
+        assert_eq!(
+            stats.protected_bytes, 300,
+            "protected bytes exclude the shared file"
+        );
+        assert_eq!(stats.protected_rows, 30);
+        // The tiers partition the file set, so the physical total is their sum
+        // and matches the distinct live file count below.
+        assert_eq!(
+            stats.current_files + stats.protected_files,
+            stats.distinct_live_files,
+            "the tiers must partition the live files, not overlap"
+        );
+        assert_eq!(
+            stats.live_data_bytes(),
+            600,
+            "100 + 200 (current) + 300 (protected) = 600; the file shared between \
+             the two tiers is counted once, not twice"
+        );
         assert_eq!(
             stats.unreachable_manifest_rows, 2,
             "the dead snapshot's rows must not be counted as live"
         );
-        assert_eq!(stats.reachable_manifest_rows(), 4);
-        // The resolving figure: four reachable ROWS describe three real files,
-        // because `c0.vortex` is referenced in place by two live snapshots. A
-        // row count read as a file count overstates the table, which is what
-        // this gauge exists to prevent.
+        // ROWS, not files: four `(snapshot, file)` pairs describe three real
+        // files. Both figures are published because reading either as the other
+        // is the mistake.
+        assert_eq!(stats.reachable_manifest_rows, 4);
         assert_eq!(
             stats.distinct_live_files, 3,
             "an in-place reference must not be counted as a second file"
