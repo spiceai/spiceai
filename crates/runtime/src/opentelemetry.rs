@@ -23,11 +23,19 @@ use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::BinaryBuilder;
 use arrow::array::BooleanBuilder;
+use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
+use arrow::array::Int8Builder;
+use arrow::array::Int16Builder;
+use arrow::array::Int32Builder;
 use arrow::array::Int64Builder;
 use arrow::array::ListBuilder;
 use arrow::array::StringBuilder;
+use arrow::array::UInt8Builder;
+use arrow::array::UInt16Builder;
+use arrow::array::UInt32Builder;
 use arrow::array::UInt64Builder;
+use arrow::array::new_null_array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -715,10 +723,13 @@ fn number_data_points_to_record_batch(
             .map(|(_, v)| v)
             .collect::<Vec<Arc<Field>>>(),
     );
+    // The value columns all have the same length, so the first gives the batch's row count,
+    // which a nulls-only dimension column is filled to.
+    let rows = columns.first().map_or(0, |column| column.len());
     columns.extend(
         attribute_columns_map
             .into_iter()
-            .map(|(_, mut v)| v.finish()),
+            .map(|(_, column)| column.finish(rows)),
     );
 
     match RecordBatch::try_new(Arc::new(Schema::new(fields)), columns) {
@@ -821,10 +832,13 @@ fn histogram_data_points_to_record_batch(
         HISTOGRAM_VALUE_COLUMN_NAMES,
     );
     fields.extend(attribute_fields_map.into_iter().map(|(_, v)| v));
+    // The value columns all have the same length, so the first gives the batch's row count,
+    // which a nulls-only dimension column is filled to.
+    let rows = columns.first().map_or(0, |column| column.len());
     columns.extend(
         attribute_columns_map
             .into_iter()
-            .map(|(_, mut v)| v.finish()),
+            .map(|(_, column)| column.finish(rows)),
     );
 
     match RecordBatch::try_new(Arc::new(Schema::new(fields)), columns) {
@@ -878,6 +892,36 @@ fn attribute_as_u64(value: &any_value::Value) -> Option<u64> {
         any_value::Value::StringValue(v) => v.parse().ok(),
         _ => None,
     }
+}
+
+/// Defines a converter for a column narrower than 64 bits. It reuses the 64-bit conversion and
+/// then narrows, so a value outside the column's range is refused rather than wrapped.
+macro_rules! narrow_int_converter {
+    ($name:ident, $narrow:ty, $wide:ident) => {
+        /// `value` as the column's integer type, when it fits.
+        fn $name(value: &any_value::Value) -> Option<$narrow> {
+            <$narrow>::try_from($wide(value)?).ok()
+        }
+    };
+}
+
+narrow_int_converter!(attribute_as_i8, i8, attribute_as_i64);
+narrow_int_converter!(attribute_as_i16, i16, attribute_as_i64);
+narrow_int_converter!(attribute_as_i32, i32, attribute_as_i64);
+narrow_int_converter!(attribute_as_u8, u8, attribute_as_u64);
+narrow_int_converter!(attribute_as_u16, u16, attribute_as_u64);
+narrow_int_converter!(attribute_as_u32, u32, attribute_as_u64);
+
+/// `value` as an `f32`, if a single-precision float holds it exactly. Comparing the bits of
+/// the round trip refuses a value that narrowing would round.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the possible loss is what the round-trip comparison detects and refuses"
+)]
+fn attribute_as_f32(value: &any_value::Value) -> Option<f32> {
+    let wide = attribute_as_f64(value)?;
+    let narrowed = wide as f32;
+    (f64::from(narrowed).to_bits() == wide.to_bits()).then_some(narrowed)
 }
 
 /// `value` as an `f64` that loses nothing. A large integer is refused when a double cannot
@@ -950,6 +994,40 @@ fn exact_f64_from_i64(i: i64) -> Option<f64> {
     (converted as i128 == i128::from(i)).then_some(converted)
 }
 
+/// Every column type an attribute value can be stored in, as
+/// `stored types => builder, the type that builder produces, converter`.
+///
+/// This one list drives seeding a stored column, appending a value to it and appending a NULL
+/// to it, so a column type cannot be supported by one of those and not the others — a mismatch
+/// there desynchronizes the batch and costs the whole export.
+///
+/// A stored type on the left may be wider than the type the builder produces: accelerators
+/// store strings and bytes in view and large layouts (Cayenne uses `Utf8View`), and
+/// `verify_schema` treats each of those families as one type, so the canonical layout writes
+/// back cleanly. Integers and floats are not interchangeable that way, so each width keeps its
+/// own builder and its own type.
+macro_rules! with_dimension_types {
+    ($apply:ident) => {
+        $apply! {
+            [DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View]
+                StringBuilder, DataType::Utf8, attribute_as_str;
+            [DataType::Boolean] BooleanBuilder, DataType::Boolean, attribute_as_bool;
+            [DataType::Int8] Int8Builder, DataType::Int8, attribute_as_i8;
+            [DataType::Int16] Int16Builder, DataType::Int16, attribute_as_i16;
+            [DataType::Int32] Int32Builder, DataType::Int32, attribute_as_i32;
+            [DataType::Int64] Int64Builder, DataType::Int64, attribute_as_i64;
+            [DataType::UInt8] UInt8Builder, DataType::UInt8, attribute_as_u8;
+            [DataType::UInt16] UInt16Builder, DataType::UInt16, attribute_as_u16;
+            [DataType::UInt32] UInt32Builder, DataType::UInt32, attribute_as_u32;
+            [DataType::UInt64] UInt64Builder, DataType::UInt64, attribute_as_u64;
+            [DataType::Float32] Float32Builder, DataType::Float32, attribute_as_f32;
+            [DataType::Float64] Float64Builder, DataType::Float64, attribute_as_f64;
+            [DataType::Binary | DataType::LargeBinary | DataType::BinaryView]
+                BinaryBuilder, DataType::Binary, attribute_as_bytes;
+        }
+    };
+}
+
 /// Appends `value` to a column that already holds `target` values, converting it when the
 /// conversion is exact. Returns `false` when the value cannot be stored without changing it,
 /// which is when the caller stores NULL instead.
@@ -962,16 +1040,17 @@ fn append_coerced_attribute(
     target: &DataType,
     value: &any_value::Value,
 ) -> bool {
-    match target {
-        DataType::Utf8 => append_converted!(builder, StringBuilder, attribute_as_str(value)),
-        DataType::Boolean => append_converted!(builder, BooleanBuilder, attribute_as_bool(value)),
-        DataType::Int64 => append_converted!(builder, Int64Builder, attribute_as_i64(value)),
-        DataType::UInt64 => append_converted!(builder, UInt64Builder, attribute_as_u64(value)),
-        DataType::Float64 => append_converted!(builder, Float64Builder, attribute_as_f64(value)),
-        DataType::Binary => append_converted!(builder, BinaryBuilder, attribute_as_bytes(value)),
-        // Lists hold a histogram's bucket arrays, which no attribute value maps onto.
-        _ => false,
+    macro_rules! append_arm {
+        ($([$($stored:pat_param)|+] $builder_type:ty, $produced:expr, $converter:ident;)+) => {
+            match target {
+                $($($stored)|+ => append_converted!(builder, $builder_type, $converter(value)),)+
+                // A list holds a histogram's bucket arrays, and the types the fallback
+                // column covers hold no attribute value either.
+                _ => false,
+            }
+        };
     }
+    with_dimension_types!(append_arm)
 }
 
 macro_rules! new_attribute_column {
@@ -1020,16 +1099,18 @@ fn new_attribute_column(
 /// report it and store NULL.
 fn append_attribute(
     fields: &mut IndexMap<String, Arc<Field>>,
-    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    columns: &mut IndexMap<String, DimensionColumn>,
     key: &String,
     value: &any_value::Value,
     row_index: usize,
 ) -> bool {
     if let Some(field) = fields.get(key) {
         let target = field.data_type().clone();
-        return columns
-            .get_mut(key)
-            .is_some_and(|builder| append_coerced_attribute(builder.as_mut(), &target, value));
+        // A nulls-only column holds no value, so the caller reports it and stores NULL.
+        let Some(DimensionColumn::Values(builder)) = columns.get_mut(key) else {
+            return false;
+        };
+        return append_coerced_attribute(builder.as_mut(), &target, value);
     }
 
     let Some((builder, data_type)) = new_attribute_column(value, row_index) else {
@@ -1039,7 +1120,7 @@ fn append_attribute(
         key.clone(),
         Arc::new(Field::new(key.as_str(), data_type, true)),
     );
-    columns.insert(key.clone(), builder);
+    columns.insert(key.clone(), DimensionColumn::Values(builder));
     true
 }
 
@@ -1112,7 +1193,6 @@ impl<'a> ResourceAttributeMerger<'a> {
     }
 }
 
-#[expect(clippy::type_complexity)]
 fn attributes_to_fields_and_columns(
     metric: &str,
     resource_attrs: &[KeyValue],
@@ -1121,10 +1201,10 @@ fn attributes_to_fields_and_columns(
     value_columns: &[&str],
 ) -> (
     IndexMap<String, Arc<Field>>,
-    IndexMap<String, Box<dyn ArrayBuilder>>,
+    IndexMap<String, DimensionColumn>,
 ) {
     let mut fields: IndexMap<String, Arc<Field>> = IndexMap::new();
-    let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
+    let mut columns: IndexMap<String, DimensionColumn> = IndexMap::new();
     let mut warned_collisions: HashSet<&str> = HashSet::new();
     let mut warned_duplicates: HashSet<&str> = HashSet::new();
     let mut warned_type_mismatch: HashSet<&str> = HashSet::new();
@@ -1204,7 +1284,10 @@ fn attributes_to_fields_and_columns(
         // If an attribute previously existed but is missing from this metric, append a null value.
         let mut needs_null = Vec::new();
         for (column_name, column_values) in columns.as_slice() {
-            if column_values.len() < i + 1 {
+            if column_values
+                .appended()
+                .is_some_and(|appended| appended < i + 1)
+            {
                 needs_null.push(column_name.clone());
             }
         }
@@ -1214,6 +1297,35 @@ fn attributes_to_fields_and_columns(
     }
 
     (fields, columns)
+}
+
+/// One dimension column of the batch being built.
+enum DimensionColumn {
+    /// A column this module can put attribute values into.
+    Values(Box<dyn ArrayBuilder>),
+    /// A stored column of a type no attribute value maps onto — a timestamp, a decimal, a
+    /// dictionary. It is emitted as all-NULL of that exact type, so the batch still has the
+    /// table's columns. Leaving it out instead makes the batch narrower than the table, and
+    /// the write then rejects every export to that metric for as long as the column exists.
+    NullsOnly(DataType),
+}
+
+impl DimensionColumn {
+    /// Rows appended so far, or `None` for a nulls-only column, which is filled to the batch's
+    /// row count at the end and so never needs a backfill.
+    fn appended(&self) -> Option<usize> {
+        match self {
+            Self::Values(builder) => Some(builder.len()),
+            Self::NullsOnly(_) => None,
+        }
+    }
+
+    fn finish(self, rows: usize) -> ArrayRef {
+        match self {
+            Self::Values(mut builder) => builder.finish(),
+            Self::NullsOnly(data_type) => new_null_array(&data_type, rows),
+        }
+    }
 }
 
 /// Builder plus the canonical Arrow type it produces for a stored dimension column, or `None`
@@ -1228,36 +1340,42 @@ fn attributes_to_fields_and_columns(
 /// ordinary stored dimensions for a data point of another shape (#12117); the list element
 /// field is taken from the stored schema so the built array's type matches the field exactly.
 fn dimension_builder_for(field: &Field) -> Option<(Box<dyn ArrayBuilder>, DataType)> {
-    match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            Some((Box::new(StringBuilder::new()), DataType::Utf8))
-        }
-        DataType::Boolean => Some((Box::new(BooleanBuilder::new()), DataType::Boolean)),
-        DataType::Int64 => Some((Box::new(Int64Builder::new()), DataType::Int64)),
-        DataType::UInt64 => Some((Box::new(UInt64Builder::new()), DataType::UInt64)),
-        DataType::Float64 => Some((Box::new(Float64Builder::new()), DataType::Float64)),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            Some((Box::new(BinaryBuilder::new()), DataType::Binary))
-        }
-        DataType::List(item) => match item.data_type() {
-            DataType::UInt64 => Some((
-                Box::new(ListBuilder::new(UInt64Builder::new()).with_field(Arc::clone(item))),
-                field.data_type().clone(),
-            )),
-            DataType::Float64 => Some((
-                Box::new(ListBuilder::new(Float64Builder::new()).with_field(Arc::clone(item))),
-                field.data_type().clone(),
-            )),
-            _ => None,
-        },
-        _ => None,
+    macro_rules! builder_arm {
+        ($([$($stored:pat_param)|+] $builder_type:ty, $produced:expr, $converter:ident;)+) => {
+            match field.data_type() {
+                $($($stored)|+ => Some((
+                    Box::new(<$builder_type>::new()) as Box<dyn ArrayBuilder>,
+                    $produced,
+                )),)+
+                // The two list types the histogram path writes: value columns on a histogram,
+                // ordinary dimensions for a data point of another shape (#12117). The element
+                // field comes from the stored schema so the built array matches it exactly.
+                DataType::List(item) => match item.data_type() {
+                    DataType::UInt64 => Some((
+                        Box::new(
+                            ListBuilder::new(UInt64Builder::new()).with_field(Arc::clone(item)),
+                        ),
+                        field.data_type().clone(),
+                    )),
+                    DataType::Float64 => Some((
+                        Box::new(
+                            ListBuilder::new(Float64Builder::new()).with_field(Arc::clone(item)),
+                        ),
+                        field.data_type().clone(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
     }
+    with_dimension_types!(builder_arm)
 }
 
 fn initialize_attribute_schema(
     metric: &str,
     fields: &mut IndexMap<String, Arc<Field>>,
-    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    columns: &mut IndexMap<String, DimensionColumn>,
     existing_schema: Option<&Schema>,
     value_columns: &[&str],
 ) {
@@ -1272,17 +1390,24 @@ fn initialize_attribute_schema(
                 continue;
             }
 
-            // `fields` and `columns` are zipped positionally into the batch, so a field seeded
-            // without a builder makes the two lists disagree and `RecordBatch::try_new` rejects
-            // the whole export. Seed the pair together, or drop the column (naming it) and let
-            // the write path report the schema mismatch it can describe.
-            let Some((builder, builder_type)) = dimension_builder_for(field) else {
-                tracing::warn!(
-                    "Metric {metric} has stored column {name} of unsupported type {data_type}, dropping it from this export",
+            // `fields` and `columns` are zipped positionally into the batch, so every stored
+            // column must be seeded as a pair. A type no attribute value maps onto still gets
+            // a column, filled with NULL and keeping its own type, because a batch missing one
+            // of the table's columns costs the whole export.
+            let (column, column_type) = if let Some((builder, produced)) =
+                dimension_builder_for(field)
+            {
+                (DimensionColumn::Values(builder), produced)
+            } else {
+                tracing::debug!(
+                    "OpenTelemetry export: metric {metric} has stored column {name} of type {data_type}, which holds no attribute value; recording it as NULL",
                     name = field.name(),
                     data_type = field.data_type(),
                 );
-                continue;
+                (
+                    DimensionColumn::NullsOnly(field.data_type().clone()),
+                    field.data_type().clone(),
+                )
             };
 
             // Force the seeded dimension column nullable: a data point that omits this
@@ -1296,48 +1421,55 @@ fn initialize_attribute_schema(
                 field
                     .as_ref()
                     .clone()
-                    .with_data_type(builder_type)
+                    .with_data_type(column_type)
                     .with_nullable(true),
             );
             fields.insert(name.clone(), nullable_field);
-            columns.insert(name, builder);
+            columns.insert(name, column);
         }
     }
 }
 
-macro_rules! append_null {
-    ($columns:expr, $key:expr, $builder_type:ty) => {
-        if let Some(column) = $columns.get_mut($key) {
-            if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
-                builder.append_null();
-            }
+macro_rules! append_null_to {
+    ($builder:expr, $builder_type:ty) => {
+        if let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() {
+            builder.append_null();
         }
     };
 }
 
+/// Appends a NULL to one dimension column, for a data point that does not carry it.
+///
+/// Driven by the same list as the seeding and the value append, so a column that can be seeded
+/// can always be nulled. One that could not would stay shorter than the other columns and
+/// `RecordBatch::try_new` would reject the export.
 fn append_null(
     fields: &mut IndexMap<String, Arc<Field>>,
-    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    columns: &mut IndexMap<String, DimensionColumn>,
     key: &str,
 ) {
-    if let Some(field) = fields.get(key) {
-        // Keep in step with `dimension_builder_for`: a column it can seed but this cannot null
-        // stays short of the other columns, and `RecordBatch::try_new` rejects the export.
-        match field.data_type() {
-            DataType::Utf8 => append_null!(columns, key, StringBuilder),
-            DataType::Boolean => append_null!(columns, key, BooleanBuilder),
-            DataType::Int64 => append_null!(columns, key, Int64Builder),
-            DataType::UInt64 => append_null!(columns, key, UInt64Builder),
-            DataType::Float64 => append_null!(columns, key, Float64Builder),
-            DataType::Binary => append_null!(columns, key, BinaryBuilder),
-            DataType::List(item) => match item.data_type() {
-                DataType::UInt64 => append_null!(columns, key, ListBuilder<UInt64Builder>),
-                DataType::Float64 => append_null!(columns, key, ListBuilder<Float64Builder>),
+    let Some(field) = fields.get(key) else {
+        return;
+    };
+    // A nulls-only column is filled at the end, so there is nothing to append here.
+    let Some(DimensionColumn::Values(builder)) = columns.get_mut(key) else {
+        return;
+    };
+
+    macro_rules! null_arm {
+        ($([$($stored:pat_param)|+] $builder_type:ty, $produced:expr, $converter:ident;)+) => {
+            match field.data_type() {
+                $($($stored)|+ => append_null_to!(builder, $builder_type),)+
+                DataType::List(item) => match item.data_type() {
+                    DataType::UInt64 => append_null_to!(builder, ListBuilder<UInt64Builder>),
+                    DataType::Float64 => append_null_to!(builder, ListBuilder<Float64Builder>),
+                    _ => {}
+                },
                 _ => {}
-            },
-            _ => {}
-        }
+            }
+        };
     }
+    with_dimension_types!(null_arm);
 }
 
 /// Builds the OpenTelemetry metrics ingest [`Service`] (the `MetricsService::export` handler).
@@ -1834,18 +1966,20 @@ mod tests {
         );
     }
 
+    /// Whatever a stored column's type, its field and its column are seeded as a pair. A
+    /// field without a column, or a column without a field, desynchronizes the two lists and
+    /// `RecordBatch::try_new` rejects the export.
     #[test]
-    fn seeded_unsupported_type_dimension_is_skipped_without_desync() {
-        // An existing-schema column with a type the attribute builders don't support must be
-        // skipped entirely (field AND column), never inserted as a field with no column —
-        // which would desync `fields`/`columns` and fail `RecordBatch::try_new`.
+    fn every_stored_dimension_is_seeded_as_a_field_and_column_pair() {
         let existing = Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
             Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
             Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
             Field::new("region", DataType::Utf8, true),
-            // Not one of the supported attribute builder types.
-            Field::new("weird", DataType::Int32, true),
+            // A column an attribute value can be converted into.
+            Field::new("port", DataType::Int32, true),
+            // A column no attribute value maps onto, which is filled with NULL.
+            Field::new("observed_at", DataType::Date64, true),
         ]);
 
         let data = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
@@ -1856,16 +1990,24 @@ mod tests {
         });
 
         let (result, _) = metric_data_to_record_batch("svc_requests", &data, &[], Some(&existing));
-        let batch = result.expect("batch must build even with an unsupported existing column");
+        let batch = result.expect("batch must build with every stored column carried over");
 
-        assert!(
-            batch.schema().field_with_name("region").is_ok(),
-            "supported dimension is still carried over"
+        assert_eq!(
+            batch.num_columns(),
+            existing.fields().len(),
+            "every stored column must be present, whatever its type"
         );
-        assert!(
-            batch.schema().field_with_name("weird").is_err(),
-            "unsupported-type column must be skipped, not partially seeded"
+        assert_eq!(
+            batch.schema().fields().len(),
+            batch.num_columns(),
+            "fields and columns must stay in step"
         );
+        for name in ["port", "observed_at"] {
+            assert!(
+                column(&batch, name).is_null(0),
+                "{name} is not carried by this data point, so it must be NULL"
+            );
+        }
     }
 
     #[test]
@@ -2256,6 +2398,197 @@ mod tests {
         assert_eq!(exact_u64_from_f64(-1.0), None);
         assert_eq!(exact_u64_from_f64(0.5), None);
         assert_eq!(exact_u64_from_f64(f64::NEG_INFINITY), None);
+    }
+
+    /// A stored dimension column of any integer or float width must still take values, not
+    /// just the 64-bit ones. The column keeps its own width, since the write compares types.
+    #[test]
+    fn narrow_numeric_dimension_columns_take_values_at_their_own_width() {
+        let cases: Vec<(DataType, any_value::Value, &str)> = vec![
+            (DataType::Int8, any_value::Value::IntValue(-8), "-8"),
+            (DataType::Int16, any_value::Value::IntValue(-300), "-300"),
+            (
+                DataType::Int32,
+                any_value::Value::IntValue(-70_000),
+                "-70000",
+            ),
+            (DataType::UInt8, any_value::Value::IntValue(200), "200"),
+            (
+                DataType::UInt16,
+                any_value::Value::IntValue(60_000),
+                "60000",
+            ),
+            (
+                DataType::UInt32,
+                any_value::Value::IntValue(4_000_000_000),
+                "4000000000",
+            ),
+            (DataType::Float32, any_value::Value::DoubleValue(1.5), "1.5"),
+            // Text and whole doubles convert into a narrow column the same way.
+            (
+                DataType::Int32,
+                any_value::Value::StringValue("123".to_string()),
+                "123",
+            ),
+            (DataType::Int16, any_value::Value::DoubleValue(7.0), "7"),
+        ];
+
+        for (stored_type, value, expected) in cases {
+            let existing = Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new("label", stored_type.clone(), true),
+            ]);
+            let data = Data::Gauge(Gauge {
+                data_points: vec![number_data_point(
+                    1.0,
+                    vec![typed_attribute("label", value.clone())],
+                )],
+            });
+
+            let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+            let batch = result.expect("the batch must build");
+            let field = batch
+                .schema()
+                .field_with_name("label")
+                .expect("the stored column must be carried over")
+                .clone();
+            assert_eq!(
+                field.data_type(),
+                &stored_type,
+                "the column must keep the stored width, or the write rejects the batch"
+            );
+            let stored = arrow::util::display::array_value_to_string(column(&batch, "label"), 0)
+                .expect("the stored value must be printable");
+            assert_eq!(stored, expected, "a {value:?} in a {stored_type} column");
+        }
+    }
+
+    /// A value outside a narrow column's range must be NULL, never wrapped into a different
+    /// number.
+    #[test]
+    fn values_outside_a_narrow_column_range_are_stored_as_null() {
+        let cases: Vec<(DataType, any_value::Value)> = vec![
+            (DataType::Int8, any_value::Value::IntValue(200)),
+            (DataType::Int16, any_value::Value::IntValue(40_000)),
+            (DataType::Int32, any_value::Value::IntValue(3_000_000_000)),
+            (DataType::UInt8, any_value::Value::IntValue(-1)),
+            (DataType::UInt16, any_value::Value::IntValue(70_000)),
+            (DataType::UInt32, any_value::Value::IntValue(-5)),
+            // 0.1 has no exact single-precision form.
+            (DataType::Float32, any_value::Value::DoubleValue(0.1)),
+        ];
+
+        for (stored_type, value) in cases {
+            let existing = Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new("label", stored_type.clone(), true),
+            ]);
+            let data = Data::Gauge(Gauge {
+                data_points: vec![number_data_point(
+                    1.0,
+                    vec![typed_attribute("label", value.clone())],
+                )],
+            });
+
+            let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+            let batch = result.expect("the batch must still build");
+            assert!(
+                column(&batch, "label").is_null(0),
+                "a {value:?} does not fit a {stored_type} column and must be NULL"
+            );
+        }
+    }
+
+    /// A stored column of a type no attribute value maps onto still has to appear in the
+    /// batch, filled with NULL. Leaving it out makes the batch narrower than the table, and
+    /// the write then rejects every export to that metric.
+    #[test]
+    fn stored_columns_no_attribute_maps_onto_are_null_filled_not_dropped() {
+        let exotic = vec![
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            DataType::Date32,
+            DataType::Decimal128(10, 2),
+            DataType::Float16,
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            DataType::FixedSizeBinary(4),
+        ];
+
+        for stored_type in exotic {
+            let existing = Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new("exotic", stored_type.clone(), true),
+                Field::new("region", DataType::Utf8, true),
+            ]);
+            let data = Data::Gauge(Gauge {
+                data_points: vec![
+                    number_data_point(1.0, vec![string_attribute("region", "us")]),
+                    number_data_point(2.0, vec![string_attribute("region", "eu")]),
+                ],
+            });
+
+            let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+            let batch =
+                result.unwrap_or_else(|e| panic!("the batch must build for {stored_type}: {e}"));
+
+            assert_eq!(
+                batch.num_columns(),
+                existing.fields().len(),
+                "every stored column must be present for {stored_type}, or the write rejects \
+                 the whole export"
+            );
+            let field = batch
+                .schema()
+                .field_with_name("exotic")
+                .unwrap_or_else(|_| panic!("{stored_type} column must be carried over"))
+                .clone();
+            assert_eq!(
+                field.data_type(),
+                &stored_type,
+                "the NULL column must keep the stored type"
+            );
+            let exotic_column = column(&batch, "exotic");
+            assert_eq!(
+                exotic_column.len(),
+                2,
+                "the NULL column must be as long as the batch"
+            );
+            assert!(exotic_column.is_null(0) && exotic_column.is_null(1));
+            // The columns around it still hold their values.
+            assert_eq!(column(&batch, "region").as_string::<i32>().value(1), "eu");
+        }
+    }
+
+    /// An attribute arriving for a column no value maps onto is recorded as NULL, and the
+    /// batch still lines up.
+    #[test]
+    fn an_attribute_for_a_nulls_only_column_is_recorded_as_null() {
+        let stored_type = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new("observed_at", stored_type, true),
+        ]);
+        let data = Data::Gauge(Gauge {
+            data_points: vec![number_data_point(
+                1.0,
+                vec![int_attribute("observed_at", 1_700_000_000_000_000_000)],
+            )],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+        let batch = result.expect("the batch must build");
+        assert_eq!(batch.num_columns(), existing.fields().len());
+        assert!(
+            column(&batch, "observed_at").is_null(0),
+            "the value cannot be stored in this column type, so it is NULL"
+        );
     }
 
     fn field_names(schema: &Schema) -> Vec<&str> {
