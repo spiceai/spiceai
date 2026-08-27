@@ -511,11 +511,28 @@ fn narrowed_child_holds_a_reachable_null(parent: &ArrayData, index: usize) -> bo
             mask => masked_by(mask.cloned()),
         },
         // Arrow's `FixedSizeList` arm: the parent's mask, expanded over the fixed element count.
+        // `ArrayData::slice` propagates an offset into the children only for `Struct`, so this
+        // child is addressed in the parent's *absolute* coordinates and has to be windowed before
+        // the two are compared — see `reachable_window`.
         DataType::FixedSizeList(_, len) => match parent.nulls() {
             None => child_holds_a_logical_null(child),
             Some(parent_nulls) => {
-                let element_len = usize::try_from(*len).unwrap_or(0);
-                masked_by(Some(parent_nulls.expand(element_len)))
+                let Ok(element_len) = usize::try_from(*len) else {
+                    return true;
+                };
+                let (Some(start), Some(window)) = (
+                    parent.offset().checked_mul(element_len),
+                    parent.len().checked_mul(element_len),
+                ) else {
+                    return true;
+                };
+                match logical_nulls_of(child).map(|nulls| reachable_window(nulls, start, window)) {
+                    None => false,
+                    // The window does not fit the child: nothing here can prove the narrowing, and
+                    // an unprovable narrowing is refused rather than waved through.
+                    Some(None) => true,
+                    Some(Some(reachable)) => !parent_nulls.expand(element_len).contains(&reachable),
+                }
             }
         },
         DataType::Union(fields, mode) => match logical_nulls_of(child) {
@@ -543,7 +560,7 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
         DataType::RunEndEncoded(..) => child
             .child_data()
             .get(1)
-            .is_some_and(|values| values.null_count() > 0),
+            .is_some_and(child_holds_a_logical_null),
         // Every value of a `Null` array is null and it carries no buffer to say so, so its length
         // is the whole answer.
         DataType::Null => !child.is_empty(),
@@ -572,6 +589,26 @@ fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
         | DataType::Null => make_array(child.clone()).logical_nulls(),
         _ => child.nulls().cloned(),
     }
+}
+
+/// The slice of `nulls` a parent with `offset`/`len` can actually reach, in child coordinates.
+///
+/// `ArrayData::slice` propagates an offset down into the children only for `Struct`; every other
+/// nested type keeps its children whole and addresses them in absolute coordinates. So a sliced
+/// parent's mask and its child's null buffer describe different windows, and `NullBuffer::contains`
+/// zips bit chunks — it would silently compare the child's *prefix* against the mask and miss a
+/// reachable null past it.
+///
+/// `None` means the window does not fit the child, which is a disagreement this cannot resolve; the
+/// caller refuses rather than admitting a narrowing it could not prove.
+fn reachable_window(nulls: NullBuffer, start: usize, len: usize) -> Option<NullBuffer> {
+    if start == 0 && nulls.len() == len {
+        return Some(nulls);
+    }
+    if start.checked_add(len)? > nulls.len() {
+        return None;
+    }
+    Some(nulls.slice(start, len))
 }
 
 /// Whether the union variant at `index` is selected at any row where its child is null.
@@ -606,8 +643,11 @@ fn union_variant_selects_a_null(
 
     let selected_child_row = |row: usize| -> Option<usize> {
         match dense_offsets {
-            // A sparse union gives the child the parent's length, so the row indexes it directly.
-            None => Some(row),
+            // A sparse union gives the child the parent's full length, and `ArrayData::slice`
+            // propagates an offset into the children only for `Struct` — so the child is indexed in
+            // absolute coordinates while `row` counts from the start of the parent's window.
+            None => parent.offset().checked_add(row),
+            // A dense union's offsets are already absolute; `buffer` has applied the parent's own.
             Some(offsets) => usize::try_from(*offsets.get(row)?).ok(),
         }
     };
@@ -1403,6 +1443,118 @@ mod tests {
 
         let err = relabel_array_data(source.to_data(), &target)
             .expect_err("the variant holds a null, so narrowing it must be refused");
+
+        assert!(
+            err.to_string().contains("'a'"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// A run-end-encoded array's `values` may themselves be an encoding that hides their nulls, so
+    /// the cheap fast path has to recurse rather than read one physical null count. The run-end
+    /// array is the *child* here — an enclosing `List` — because that is the shape in which the
+    /// fast path is consulted at all.
+    #[test]
+    fn relabel_refuses_narrowing_over_run_ends_whose_values_hide_their_nulls() {
+        let values = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![Some("a"), None])),
+        )
+        .expect("two keys over two dictionary values");
+        assert_eq!(
+            values.to_data().null_count(),
+            0,
+            "the dictionary's physical count is zero — that is what the fast path must not trust"
+        );
+        let runs = RunArray::try_new(&Int32Array::from(vec![2, 4]), &values)
+            .expect("two runs over two values");
+        let run_type = runs.data_type().clone();
+        let source = ListArray::new(
+            Arc::new(Field::new("item", run_type.clone(), true)),
+            OffsetBuffer::new(vec![0, 4].into()),
+            Arc::new(runs),
+            None,
+        );
+        let target = DataType::List(Arc::new(Field::new("item", run_type, false)));
+
+        let err = relabel_array_data(source.to_data(), &target)
+            .expect_err("the second run is a null, so narrowing the item must be refused");
+
+        assert!(
+            err.to_string().contains("item"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// `ArrayData::slice` propagates an offset into the children only for `Struct`, so a sliced
+    /// `FixedSizeList` keeps a whole child addressed in absolute coordinates. Comparing the parent's
+    /// mask against the child's *prefix* instead of the window it actually reaches admits a null
+    /// past that prefix — which is what this fixture is built to expose.
+    ///
+    /// Three lists of two over `[0, 1, 2, 3, 4, null]`, sliced to the last two. The only null sits
+    /// in the final list, at child row 5, so the un-windowed comparison — which looks at child rows
+    /// 0..4 — sees nothing and admits the narrowing. Row 0's null in the parent is what keeps Arrow
+    /// from dropping the mask as all-valid.
+    #[test]
+    fn relabel_refuses_narrowing_under_a_sliced_fixed_size_list() {
+        let child = Int32Array::from(vec![Some(0), Some(1), Some(2), Some(3), Some(4), None]);
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let source = ArrayData::builder(DataType::FixedSizeList(Arc::clone(&item), 2))
+            .len(3)
+            .nulls(Some(NullBuffer::from(vec![false, true, true])))
+            .add_child_data(child.to_data())
+            .build()
+            .expect("three fixed-size lists of two")
+            .slice(1, 2);
+        assert_eq!(
+            source.offset(),
+            1,
+            "the parent is sliced past the first list"
+        );
+        assert!(
+            source.nulls().is_some(),
+            "the mask must survive the slice, or the masked branch is never taken"
+        );
+        let target =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2);
+
+        let err = relabel_array_data(source, &target).expect_err(
+            "the last list holds a reachable null, so narrowing `item` must be refused",
+        );
+
+        assert!(
+            err.to_string().contains("item"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// The same coordinate mismatch for a sparse union: its child keeps the parent's full length,
+    /// so a sliced parent's row `0` is the child's row `offset`.
+    #[test]
+    fn relabel_refuses_narrowing_a_union_variant_under_a_sliced_parent() {
+        let fields = |nullable| {
+            UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, nullable)])
+                .expect("one type id for one field")
+        };
+        // Row 0 is non-null, row 1 is null; slicing to row 1 leaves the null reachable.
+        let source = UnionArray::try_new(
+            fields(true),
+            vec![0_i8, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+        )
+        .expect("a sparse union over one variant")
+        .to_data()
+        .slice(1, 1);
+        assert_eq!(
+            source.offset(),
+            1,
+            "the parent is sliced past the non-null row"
+        );
+        let target = DataType::Union(fields(false), UnionMode::Sparse);
+
+        let err = relabel_array_data(source, &target)
+            .expect_err("the surviving row selects `a`, which is null there");
 
         assert!(
             err.to_string().contains("'a'"),
