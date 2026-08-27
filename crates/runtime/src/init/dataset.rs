@@ -42,6 +42,7 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
+    component::{AcceleratedComponent, disabled_acceleration_warning},
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
@@ -81,6 +82,40 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Warn an operator whose dataset or view sets `acceleration.enabled: false` and leaves
+/// settings in the block that the runtime will not apply (#13514).
+///
+/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where this started.
+/// Those conversions are not the load path: `datasets_iter` runs them on every call to
+/// `get_valid_datasets`, and `GET /v1/datasets` is one of those callers — so a warning
+/// emitted there fires once per misconfigured dataset **per HTTP request**, in a caller
+/// that passes `LogErrors(false)` precisely to say "do not log from here". Emitting it
+/// here instead puts it behind the same `log_errors` gate as the load errors beside it,
+/// so it is tied to a load rather than to a read.
+pub(crate) fn warn_about_discarded_acceleration_settings(
+    component: AcceleratedComponent,
+    name: &str,
+    acceleration: Option<&spicepod::acceleration::Acceleration>,
+    log_errors: LogErrors,
+) {
+    if !log_errors.0 {
+        return;
+    }
+    let Some(acceleration) = acceleration else {
+        return;
+    };
+    let ignored = acceleration.fields_ignored_when_disabled();
+    if ignored.is_empty() {
+        return;
+    }
+    // The name is escaped inside the formatter: a *quoted* Spicepod identifier passes
+    // validation carrying a newline, and would otherwise forge a second log line.
+    tracing::warn!(
+        "{}",
+        disabled_acceleration_warning(component, name, &ignored)
+    );
+}
+
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
         let Some(app) = self.read_app().await else {
@@ -93,7 +128,12 @@ impl Runtime {
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
-        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
+        //
+        // `LogErrors(false)`: this pre-pass exists to initialize view accelerators, and
+        // `load_views` below validates the same views again with `LogErrors(true)`. Passing
+        // `true` here made every view's load error — and its discarded-acceleration
+        // warning — print twice per startup.
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
         self.initialize_views_accelerators(&valid_views).await;
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
@@ -299,7 +339,15 @@ impl Runtime {
         self.datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
-                Ok(ds) => Some(Arc::new(ds)),
+                Ok(ds) => {
+                    warn_about_discarded_acceleration_settings(
+                        AcceleratedComponent::Dataset,
+                        &spicepod_ds.name,
+                        spicepod_ds.acceleration.as_ref(),
+                        log_errors,
+                    );
+                    Some(Arc::new(ds))
+                }
                 Err(e) => {
                     if log_errors.0 {
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
