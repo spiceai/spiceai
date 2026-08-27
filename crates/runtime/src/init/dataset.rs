@@ -30,16 +30,17 @@ use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
-    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
-    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackRecreatingModeSnafu,
+    DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
+    DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
+    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
+    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, RefreshMode},
+        acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
@@ -471,23 +472,7 @@ impl Runtime {
     ) -> Result<()> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        if let Err(err) = validate_dataset(&ds) {
-            let ds_name = &ds.name;
-            metrics::datasets::LOAD_ERROR.add(1, &[]);
-            error_spaced!(spaced_tracer, "{}{err}", "");
-            self.status.update_dataset(
-                ds_name,
-                status::ComponentStatus::error_with_message(err.to_string()),
-            );
-            if is_permanent_dataset_failure(&err) {
-                return PermanentDatasetFailureSnafu {
-                    dataset: ds_name.clone(),
-                    reason: err.to_string(),
-                }
-                .fail();
-            }
-            return Err(err);
-        }
+        preflight_dataset(&ds, &self.status, &spaced_tracer)?;
 
         // Deferred path. Each connector factory decides via
         // `static_schema()` whether the dataset can be registered
@@ -886,29 +871,6 @@ impl Runtime {
             return Err(err);
         }
 
-        // The delivery worker keys each committed row on a SINGLE primary-key
-        // column (`write_back_worker.rs` returns early for `pk_columns.len() != 1`,
-        // because a composite key can't be turned into the `pk IN (...)` filter it
-        // delivers with). A composite-key dataset would otherwise register and
-        // then silently never deliver — the markers accumulate undelivered. Reject
-        // it here so the limitation surfaces as a loud, actionable error instead of
-        // silent data non-delivery.
-        if let Some(acceleration) = &ds.acceleration
-            && acceleration.resolves_to_durable_write_back()
-            && let Some(primary_key) = &acceleration.primary_key
-            && primary_key.columns.len() > 1
-        {
-            let err = DurableWriteBackCompositePrimaryKeySnafu {
-                dataset_name: ds.name.to_string(),
-                connector: source.clone(),
-                primary_key: primary_key.columns.join(", "),
-                pk_columns: primary_key.columns.len(),
-            }
-            .build();
-            warn_spaced!(spaced_tracer, "{}{err}", "");
-            return Err(err);
-        }
-
         // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
         // create_accelerated_table drops + recreates the table with the new schema instead of
         // deferring. `recreates_on_schema_mismatch` is the single source of truth for the exact
@@ -1140,6 +1102,19 @@ impl Runtime {
     }
 
     async fn update_dataset(self: Arc<Self>, ds: Arc<Dataset>) {
+        // Defense in depth. Today the only caller is `apply_dataset_diff`, which
+        // preflights through `initialize_datasets_accelerators` and skips a
+        // refused dataset before it gets here. But both branches below mutate
+        // accelerator state — `reload_accelerated_dataset` swaps it, the fallback
+        // removes the dataset outright — so a second caller that forgot the
+        // preflight would destroy the state of a dataset whose configuration
+        // cannot deliver what it has already acknowledged. Cheap to check here,
+        // and the running dataset is left as it was.
+        if preflight_dataset(&ds, &self.status, &self.spaced_tracer).is_err() {
+            // `preflight_dataset` reported it.
+            return;
+        }
+
         self.status
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
 
@@ -1907,6 +1882,14 @@ impl Runtime {
             let accelerator_engine_registry = Arc::clone(&self.accelerator_engine_registry);
 
             async move {
+                // Before anything is initialized, dropped, or replaced: `init`
+                // below is where a `mode: file_create` accelerator is dropped,
+                // and the refusals this checks exist to stop exactly that
+                // happening to a dataset that cannot afford it.
+                if let Err(err) = preflight_dataset(&ds, &status, &spaced_tracer) {
+                    return (ds.name.clone(), Err(err));
+                }
+
                 // Non-accelerated datasets or disabled acceleration are always successfully initialized
                 if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
                     return (ds.name.clone(), Ok(BootstrapStatus::None));
@@ -2091,7 +2074,13 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithOnConflict { .. }
-        | Error::AcceleratedWriteBackWithoutReplication { .. } => true,
+        | Error::AcceleratedWriteBackWithoutReplication { .. }
+        // Durable write-back configurations that would acknowledge a write the
+        // dataset cannot then deliver.
+        | Error::DurableWriteBackWithRetention { .. }
+        | Error::DurableWriteBackRecreatingMode { .. }
+        | Error::DurableWriteBackCompositePrimaryKey { .. }
+        | Error::DurableWriteBackUndeclaredPrimaryKey { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2127,6 +2116,77 @@ fn is_permanent_dataset_source(source: &(dyn std::error::Error + Send + Sync + '
     )
 }
 
+/// Every retention setting a dataset can carry, for the durable write-back gate.
+///
+/// Deliberately wider than what would actually prune: the retention worker needs
+/// more than any one of these (see `RetentionBuilder`), but a dataset that asks
+/// for retention at all is refused rather than one that happened to ask
+/// completely enough for the worker to start. `retention_check_interval` counts
+/// too — on its own it prunes nothing, but it is a retention setting on a
+/// dataset that must not have one, and silently ignoring it would leave the user
+/// believing retention is configured.
+fn configured_retention_setting(acceleration: &Acceleration) -> Option<String> {
+    if acceleration.retention_period.is_some() {
+        Some("acceleration.retention_period".to_string())
+    } else if acceleration.retention_sql.is_some() {
+        Some("acceleration.retention_sql".to_string())
+    } else if acceleration.retention_check_interval.is_some() {
+        Some("acceleration.retention_check_interval".to_string())
+    } else if acceleration.retention_check_enabled {
+        Some("acceleration.retention_check_enabled".to_string())
+    } else {
+        None
+    }
+}
+
+/// Refuse a dataset whose configuration cannot be made to work, reporting the
+/// refusal once.
+///
+/// Every lifecycle entry calls this BEFORE it initializes, drops, replaces, or
+/// mutates accelerator state, because some of these refusals exist precisely to
+/// stop that state being destroyed: a durable-write-back dataset on
+/// `mode: file_create` has its accelerator — and the markers recording what the
+/// source still owes — dropped by `DataAccelerator::init`, so a refusal that
+/// arrives afterwards reports a loss it was supposed to prevent.
+///
+/// The decision itself is [`validate_dataset`], which touches nothing.
+#[expect(clippy::result_large_err)]
+fn preflight_dataset(
+    ds: &Arc<Dataset>,
+    status: &status::RuntimeStatus,
+    spaced_tracer: &Arc<util::tracers::SpacedTracer>,
+) -> Result<()> {
+    let Err(err) = validate_dataset(ds) else {
+        return Ok(());
+    };
+
+    let ds_name = &ds.name;
+    status.update_dataset(
+        ds_name,
+        status::ComponentStatus::error_with_message(err.to_string()),
+    );
+    metrics::datasets::LOAD_ERROR.add(1, &[]);
+    // Keyed on the dataset, not on one shared slot: this runs once per dataset
+    // inside `initialize_datasets_accelerators`' fan-out, so a shared key would
+    // let the first refusal of a startup suppress every other dataset's for the
+    // tracer's whole interval, leaving them refused with no log line naming them.
+    error_spaced!(
+        spaced_tracer,
+        "Refusing to load dataset {}. {err}",
+        ds_name.table()
+    );
+
+    // Everything `validate_dataset` raises is a pure function of the Spicepod, so
+    // retrying cannot change the answer. Refuse permanently here rather than
+    // asking a second list whether this particular refusal counts, which a new
+    // refusal could be left out of — and be retried for the life of the process.
+    PermanentDatasetFailureSnafu {
+        dataset: ds_name.clone(),
+        reason: err.to_string(),
+    }
+    .fail()
+}
+
 #[expect(clippy::result_large_err)]
 fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
@@ -2135,6 +2195,75 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         }
         .build());
     }
+
+    // Durable write-back holds each committed row in the accelerator until it
+    // reaches the source, so it cannot tolerate a configuration that removes a row
+    // or discards the accelerator: the marker recording what the source still owes
+    // goes with it, and no later pass can deliver a value nothing holds.
+    if let Some(acceleration) = &ds.acceleration
+        && acceleration.resolves_to_durable_write_back()
+    {
+        let dataset_name = ds.name.to_string();
+        let connector = ds.source().to_string();
+
+        // Retention deletes accelerator rows on a schedule and marks nothing, so
+        // it can prune a row that was acknowledged to the writer and not yet
+        // delivered.
+        if let Some(retention_setting) = configured_retention_setting(acceleration) {
+            return Err(DurableWriteBackWithRetentionSnafu {
+                dataset_name,
+                connector,
+                retention_setting,
+            }
+            .build());
+        }
+
+        // The same loss in bulk. `mode: file` is the only mode that keeps the
+        // accelerator across a restart without recreating it: `memory` holds
+        // nothing across one, `file_create` recreates on every load, and
+        // `file_update` recreates whenever the source schema changes incompatibly
+        // — durable write-back always refreshes, so that recreate is live. A
+        // recreate drops the table, and `drop_table` is the one place
+        // `cayenne_pending_write_back` rows are deleted.
+        if acceleration.mode != Mode::File {
+            return Err(DurableWriteBackRecreatingModeSnafu {
+                dataset_name,
+                connector,
+                mode: acceleration.mode.to_string(),
+            }
+            .build());
+        }
+
+        // The delivery worker keys each committed row on a SINGLE primary-key
+        // column: it builds a `pk IN (...)` filter, which a composite key has no
+        // shape for and an absent one has nothing to fill. Either way the dataset
+        // would accept writes, mark them, and never deliver one — so both are
+        // refused here, over the key the Spicepod DECLARES. Schema inference can
+        // supply or widen a key, but it runs after this point, so a key it
+        // produced could only be judged once the dataset had already been
+        // accepted; requiring the declaration is what makes the answer knowable
+        // before anything is acknowledged.
+        match acceleration.durable_write_back_primary_key() {
+            DurableWriteBackKey::Single(_) => {}
+            DurableWriteBackKey::Undeclared => {
+                return Err(DurableWriteBackUndeclaredPrimaryKeySnafu {
+                    dataset_name,
+                    connector,
+                }
+                .build());
+            }
+            DurableWriteBackKey::Composite(columns) => {
+                return Err(DurableWriteBackCompositePrimaryKeySnafu {
+                    dataset_name,
+                    connector,
+                    primary_key: columns.join(", "),
+                    pk_columns: columns.len(),
+                }
+                .build());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2209,6 +2338,283 @@ fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every retention setting has to be recognised, whichever one the dataset
+    /// carries: a prune can remove a row that was acknowledged to the writer and
+    /// not yet delivered, and nothing else holds that value.
+    #[test]
+    fn every_retention_setting_is_recognised_as_configured() {
+        assert_eq!(configured_retention_setting(&Acceleration::default()), None);
+
+        for (acceleration, expected) in [
+            (
+                Acceleration {
+                    retention_period: Some("1d".to_string()),
+                    ..Acceleration::default()
+                },
+                "acceleration.retention_period",
+            ),
+            (
+                Acceleration {
+                    retention_sql: Some("where ts < now()".to_string()),
+                    ..Acceleration::default()
+                },
+                "acceleration.retention_sql",
+            ),
+            (
+                Acceleration {
+                    retention_check_interval: Some("1h".to_string()),
+                    ..Acceleration::default()
+                },
+                "acceleration.retention_check_interval",
+            ),
+            (
+                Acceleration {
+                    retention_check_enabled: true,
+                    ..Acceleration::default()
+                },
+                "acceleration.retention_check_enabled",
+            ),
+        ] {
+            assert_eq!(
+                configured_retention_setting(&acceleration).as_deref(),
+                Some(expected),
+                "a dataset carrying only {expected} still asks for retention"
+            );
+        }
+    }
+
+    /// A spicepod acceleration that `resolves_to_durable_write_back` accepts, on
+    /// the one mode that can hold an undelivered write.
+    fn durable_write_back_acceleration() -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: spicepod::acceleration::Mode::File,
+            write_mode: spicepod::acceleration::WriteMode::WriteBack,
+            refresh_mode: Some(spicepod::acceleration::RefreshMode::Changes),
+            on_conflict: HashMap::from([(
+                "id".to_string(),
+                spicepod::acceleration::OnConflictBehavior::Upsert,
+            )]),
+            // Declared, single-column: durable write-back has nothing to key a
+            // delivery on otherwise, so this is part of the valid shape.
+            primary_key: Some("id".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn dataset_with_acceleration(
+        runtime: &Arc<crate::Runtime>,
+        acceleration: spicepod::acceleration::Acceleration,
+    ) -> Arc<Dataset> {
+        let mut spec = spicepod::component::dataset::Dataset::new("postgres:orders", "orders");
+        spec.acceleration = Some(acceleration);
+        let app = app::AppBuilder::new("validate_dataset")
+            .with_dataset(spec.clone())
+            .build();
+        Arc::new(
+            DatasetBuilder::try_from(spec)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        )
+    }
+
+    /// Every configuration `validate_dataset` refuses, asserted at the decision
+    /// itself rather than at a predicate below it — including the composite-key
+    /// branch, whose `> 1` bound has no other cover.
+    #[tokio::test]
+    async fn validate_dataset_refuses_every_durable_write_back_configuration_that_cannot_deliver() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        assert!(
+            validate_dataset(&dataset_with_acceleration(
+                &runtime,
+                durable_write_back_acceleration()
+            ))
+            .is_ok(),
+            "the supported configuration must load"
+        );
+
+        let retention = spicepod::acceleration::Acceleration {
+            retention_period: Some("1d".to_string()),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            matches!(
+                validate_dataset(&dataset_with_acceleration(&runtime, retention)),
+                Err(Error::DurableWriteBackWithRetention { .. })
+            ),
+            "retention can prune a row that was acknowledged and not yet delivered"
+        );
+
+        for mode in [
+            spicepod::acceleration::Mode::Memory,
+            spicepod::acceleration::Mode::FileCreate,
+            spicepod::acceleration::Mode::FileUpdate,
+        ] {
+            let named = mode.to_string();
+            let acceleration = spicepod::acceleration::Acceleration {
+                mode,
+                ..durable_write_back_acceleration()
+            };
+            assert!(
+                matches!(
+                    validate_dataset(&dataset_with_acceleration(&runtime, acceleration)),
+                    Err(Error::DurableWriteBackRecreatingMode { .. })
+                ),
+                "{named} cannot hold an acknowledged write until it is delivered"
+            );
+        }
+
+        // Parenthesised: that is the compound-key syntax `ColumnReference` parses.
+        // Without them this is one column whose name contains a comma.
+        let composite = spicepod::acceleration::Acceleration {
+            primary_key: Some("(id, region)".to_string()),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            matches!(
+                validate_dataset(&dataset_with_acceleration(&runtime, composite)),
+                Err(Error::DurableWriteBackCompositePrimaryKey { .. })
+            ),
+            "a composite key cannot be delivered, and would accumulate markers silently"
+        );
+
+        // Unset is refused for the same reason, and refused HERE rather than left
+        // to inference: inference runs after the dataset is accepted, so a key it
+        // supplied could only be judged once writes could already be acknowledged.
+        let undeclared = spicepod::acceleration::Acceleration {
+            primary_key: None,
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            matches!(
+                validate_dataset(&dataset_with_acceleration(&runtime, undeclared)),
+                Err(Error::DurableWriteBackUndeclaredPrimaryKey { .. })
+            ),
+            "an undeclared key leaves the worker nothing to deliver on"
+        );
+
+        // A different single column than the fixture's, so this asserts the rule
+        // is about arity rather than the name `id`.
+        let single = spicepod::acceleration::Acceleration {
+            primary_key: Some("region".to_string()),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, single)).is_ok(),
+            "any single-column key is what the worker delivers with"
+        );
+    }
+
+    /// Every one of these settings is ordinary outside durable write-back, and
+    /// there are four ways to be outside it. Each case carries all four refusable
+    /// settings and leaves the regime by a different door, so the scoping is
+    /// asserted against each condition rather than against `write_mode` four times.
+    #[tokio::test]
+    async fn validate_dataset_refuses_none_of_them_outside_durable_write_back() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        // Everything the durable regime refuses, in one acceleration.
+        let refusable = spicepod::acceleration::Acceleration {
+            retention_period: Some("1d".to_string()),
+            mode: spicepod::acceleration::Mode::FileCreate,
+            primary_key: Some("(id, region)".to_string()),
+            ..durable_write_back_acceleration()
+        };
+
+        for (acceleration, door) in [
+            (
+                spicepod::acceleration::Acceleration {
+                    write_mode: spicepod::acceleration::WriteMode::default(),
+                    ..refusable.clone()
+                },
+                "write_mode is not write_back",
+            ),
+            (
+                spicepod::acceleration::Acceleration {
+                    engine: Some("duckdb".to_string()),
+                    ..refusable.clone()
+                },
+                "the engine is not cayenne",
+            ),
+            (
+                spicepod::acceleration::Acceleration {
+                    on_conflict: HashMap::new(),
+                    ..refusable.clone()
+                },
+                "no on_conflict upsert is configured",
+            ),
+            (
+                spicepod::acceleration::Acceleration {
+                    refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
+                    ..refusable
+                },
+                "refresh_mode is not changes",
+            ),
+        ] {
+            assert!(
+                validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
+                "these settings stay allowed when {door}"
+            );
+        }
+    }
+
+    /// As with retention, the mode rejection is the whole explanation the user
+    /// gets, so it names the mode that is refused and the one that works.
+    #[test]
+    fn the_mode_rejection_names_the_mode_and_the_one_that_works() {
+        let message = DurableWriteBackRecreatingModeSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            mode: "file_create".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "orders",
+            "postgres",
+            "file_create",
+            "acknowledged write would be lost",
+            "'acceleration.mode: file'",
+            "https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the rejection must contain {expected:?}: {message}"
+            );
+        }
+    }
+
+    /// The rejection is the only account a user gets of why the dataset will not
+    /// load, so it names the dataset, the setting to remove, what would go wrong,
+    /// and a way out.
+    #[test]
+    fn the_retention_rejection_names_the_setting_and_a_way_out() {
+        let message = DurableWriteBackWithRetentionSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            retention_setting: "acceleration.retention_period".to_string(),
+        }
+        .build()
+        .to_string();
+        for expected in [
+            "orders",
+            "postgres",
+            "acceleration.retention_period",
+            "the write would be lost",
+            "acceleration.write_mode",
+            "https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the rejection must contain {expected:?}: {message}"
+            );
+        }
+    }
     use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
@@ -2795,6 +3201,50 @@ mod tests {
         );
     }
 
+    /// These refusals are pure functions of the Spicepod, so retrying cannot
+    /// change the answer. Left retriable they are retried for the life of the
+    /// process — rebuilding the connector on every attempt — and the dataset
+    /// never leaves `Initializing`.
+    #[test]
+    fn a_durable_write_back_configuration_refusal_is_permanent() {
+        let with_retention = DurableWriteBackWithRetentionSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            retention_setting: "acceleration.retention_period".to_string(),
+        }
+        .build();
+        let recreating_mode = DurableWriteBackRecreatingModeSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            mode: "file_create".to_string(),
+        }
+        .build();
+        let undeclared_key = DurableWriteBackUndeclaredPrimaryKeySnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+        }
+        .build();
+        let composite_key = DurableWriteBackCompositePrimaryKeySnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            primary_key: "id, region".to_string(),
+            pk_columns: 2_usize,
+        }
+        .build();
+
+        for err in [
+            &with_retention,
+            &recreating_mode,
+            &composite_key,
+            &undeclared_key,
+        ] {
+            assert!(
+                is_permanent_dataset_failure(err),
+                "a configuration that cannot deliver an acknowledged write must not be retried: {err}"
+            );
+        }
+    }
+
     #[test]
     fn a_contradictory_dataset_configuration_is_permanent() {
         let err = FullTextSearchRequiresAccelerationSnafu {
@@ -2900,6 +3350,194 @@ mod tests {
 
     /// A dataset whose `from:` names no registered connector, so building its
     /// connector always fails.
+    /// A `DataAccelerator` that records whether the runtime ever asked it to
+    /// initialize. `init` is where a `mode: file_create` accelerator is dropped,
+    /// so "was `init` called" is the same question as "was the accelerator, and
+    /// the markers beside it, destroyed".
+    #[derive(Debug, Default)]
+    struct RecordingAccelerator {
+        initialized: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecordingAccelerator {
+        fn was_initialized(&self) -> bool {
+            self.initialized.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl data_accelerator_api::DataAccelerator for RecordingAccelerator {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn create_external_table(
+            &self,
+            _cmd: datafusion::logical_expr::CreateExternalTable,
+            _source: Option<&dyn AccelerationSource>,
+            _partition_by: Vec<runtime_table_partition::expression::PartitionedBy>,
+            _runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+        ) -> std::result::Result<
+            Arc<dyn datafusion::datasource::TableProvider>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("the test accelerator creates no table".into())
+        }
+
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn prefix(&self) -> &'static str {
+            "recording"
+        }
+
+        fn parameters(&self) -> &'static [runtime_parameters::ParameterSpec] {
+            &[]
+        }
+
+        async fn init(
+            &self,
+            _source: &dyn AccelerationSource,
+        ) -> std::result::Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(BootstrapStatus::none())
+        }
+
+        async fn sidecar(
+            &self,
+            _source: &dyn AccelerationSource,
+            _registry: Arc<data_accelerator_api::AcceleratorEngineRegistry>,
+            _open_option: runtime_acceleration::sidecar::OpenOption,
+        ) -> std::result::Result<
+            Arc<dyn runtime_acceleration::sidecar::AcceleratorSidecar>,
+            runtime_checkpoint_api::CheckpointError,
+        > {
+            Err(runtime_acceleration::sidecar::unsupported_sidecar(
+                "recording",
+                "checkpoint",
+            ))
+        }
+    }
+
+    /// A runtime whose Cayenne engine is the recording accelerator, so a test can
+    /// ask whether the runtime tried to initialize it.
+    async fn runtime_with_recording_accelerator() -> (Arc<crate::Runtime>, Arc<RecordingAccelerator>)
+    {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let accelerator = Arc::new(RecordingAccelerator::default());
+        runtime
+            .accelerator_engine_registry
+            .register_accelerator_engine(
+                runtime_acceleration::Engine::Cayenne,
+                Arc::clone(&accelerator) as Arc<dyn data_accelerator_api::DataAccelerator>,
+            )
+            .await;
+        (runtime, accelerator)
+    }
+
+    /// A durable-write-back dataset on `mode`. On `file_create` this is the
+    /// configuration whose accelerator `init` would drop, taking the undelivered
+    /// markers with it; on `file` it is the supported one, and the control that
+    /// proves `init` is reachable at all.
+    fn write_back_dataset_on_mode(
+        runtime: &Arc<crate::Runtime>,
+        mode: spicepod::acceleration::Mode,
+    ) -> Arc<Dataset> {
+        dataset_with_acceleration(
+            runtime,
+            spicepod::acceleration::Acceleration {
+                mode,
+                ..durable_write_back_acceleration()
+            },
+        )
+    }
+
+    /// The refusal has to land before `DataAccelerator::init`, not after it.
+    /// `init` is where `mode: file_create` drops the Cayenne table, and dropping
+    /// it deletes `cayenne_pending_write_back` — so a gate that runs afterwards
+    /// reports a loss it existed to prevent. This is the startup path.
+    #[tokio::test]
+    async fn a_refused_write_back_dataset_never_initializes_its_accelerator() {
+        let (runtime, accelerator) = runtime_with_recording_accelerator().await;
+
+        let refused =
+            write_back_dataset_on_mode(&runtime, spicepod::acceleration::Mode::FileCreate);
+        let results = runtime
+            .initialize_datasets_accelerators(std::slice::from_ref(&refused))
+            .await;
+
+        assert!(
+            results
+                .get(&refused.name)
+                .is_some_and(std::result::Result::is_err),
+            "the dataset must be refused rather than initialized"
+        );
+        assert!(
+            !accelerator.was_initialized(),
+            "init would have dropped the accelerator and every marker beside it"
+        );
+
+        // The control: the same dataset on the one mode that can hold an
+        // undelivered write does reach `init`. Without this the assertion above
+        // would also pass if nothing ever called `init`.
+        let allowed = write_back_dataset_on_mode(&runtime, spicepod::acceleration::Mode::File);
+        let results = runtime
+            .initialize_datasets_accelerators(std::slice::from_ref(&allowed))
+            .await;
+        assert!(
+            results
+                .get(&allowed.name)
+                .is_some_and(std::result::Result::is_ok),
+            "a supported configuration must still initialize"
+        );
+        assert!(
+            accelerator.was_initialized(),
+            "so `init` is reachable, and the refusal above is what stopped it"
+        );
+    }
+
+    /// The same guard on the reload entry, exercised directly. `apply_dataset_diff`
+    /// preflights before it reaches `update_dataset`, so this pins the
+    /// defense-in-depth check rather than a live hole: both of `update_dataset`'s
+    /// branches mutate accelerator state, so a future caller that arrives without
+    /// having preflighted must still be stopped here.
+    #[tokio::test]
+    async fn a_refused_write_back_dataset_is_not_reloaded() {
+        let (runtime, accelerator) = runtime_with_recording_accelerator().await;
+
+        let ds = write_back_dataset_on_mode(&runtime, spicepod::acceleration::Mode::FileCreate);
+        let registered_before = runtime.df.get_table(&ds.name).await.is_some();
+
+        Arc::clone(&runtime).update_dataset(Arc::clone(&ds)).await;
+
+        // The reload's own refusal, not a later failure: `update_dataset` sets
+        // `Refreshing` and starts building a connector as its first act, so the
+        // mode named in the status is what proves it stopped before that.
+        let status = runtime
+            .status
+            .get_dataset_status(&ds.name)
+            .expect("the refused reload reports a status");
+        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+            panic!("a refused reload must report an error status, got {status:?}");
+        };
+        assert!(
+            message.contains("file_create"),
+            "the status must name the refused mode rather than a downstream failure: {message}"
+        );
+        assert!(
+            !accelerator.was_initialized(),
+            "and nothing initialized the accelerator"
+        );
+        assert_eq!(
+            runtime.df.get_table(&ds.name).await.is_some(),
+            registered_before,
+            "leaving whatever was registered exactly as it was"
+        );
+    }
+
     fn unloadable_dataset(runtime: &Arc<crate::Runtime>) -> Arc<Dataset> {
         let spec =
             spicepod::component::dataset::Dataset::new("not_a_real_connector:any", "reported_once");

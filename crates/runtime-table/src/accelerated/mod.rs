@@ -253,6 +253,14 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeliverableKey {
+        dataset_name: String,
+        pk_columns: usize,
+    },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -1202,12 +1210,16 @@ impl Builder {
                 write::dual_write::extract_cayenne_write_target(&self.accelerator)
             && cayenne.is_durable_write_back()
         {
+            // Fail closed: a table whose resolved key cannot be delivered on would
+            // accept writes, mark them, and never deliver one. Registration
+            // refuses that configuration over the declared key, so this is the
+            // resolved key disagreeing — refuse to build rather than serve it.
             handlers.push(write_back_worker::WriteBackWorker::spawn(
                 *cayenne,
                 Arc::clone(&self.federated),
                 self.dataset_name.to_string(),
                 self.write_back_deliverer.clone(),
-            ));
+            )?);
         }
 
         Ok(AcceleratedTable {
@@ -2007,9 +2019,9 @@ impl TableLayer for AcceleratedTable {
                     input,
                     overwrite,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
                     Arc::clone(&self.refresher),
                     self.schema(),
+                    &self.dataset_name.to_string(),
                 )
             }
             WriteMode::DualWrite {
@@ -2039,6 +2051,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(self.write_mode, WriteMode::WriteBack) {
+            return Err(write::write_back::delete_not_supported(
+                &self.dataset_name.to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2047,15 +2067,7 @@ impl TableLayer for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.delete_from(state, filters).await
             }
-            WriteMode::WriteBack => {
-                write::write_back::delete_write_back(
-                    state,
-                    filters,
-                    Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
-                )
-                .await
-            }
+            WriteMode::WriteBack => unreachable!("refused above, before the timestamp moves"),
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
@@ -2101,7 +2113,7 @@ impl TableLayer for AcceleratedTable {
                     assignments,
                     filters,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
+                    &self.dataset_name.to_string(),
                 )
                 .await
             }
@@ -2133,6 +2145,18 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(
+            self.write_mode,
+            WriteMode::WriteBack | WriteMode::DualWrite { .. }
+        ) {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                    .to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2142,10 +2166,7 @@ impl TableLayer for AcceleratedTable {
                 federated_table.truncate(state).await
             }
             WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
-                Err(datafusion::error::DataFusionError::Plan(
-                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
-                        .to_string(),
-                ))
+                unreachable!("refused above, before the timestamp moves")
             }
         }
     }

@@ -870,6 +870,14 @@ impl SqliteMetastore {
         )
     ";
 
+    /// Index for the durable-write-back claim (#11838). The delivery worker pages
+    /// markers in commit order with a `(sequence_number, pk_bytes)` keyset cursor,
+    /// which the table's own `(table_id, pk_bytes)` primary key cannot serve: it
+    /// would sort every one of the table's markers on each claim. Ordered to match
+    /// the cursor, and covering, so a claim seeks to the resume point and reads
+    /// only its page.
+    const PENDING_WRITE_BACK_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_pending_write_back_table_seq ON cayenne_pending_write_back(table_id, sequence_number, pk_bytes)";
+
     const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
     const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
     /// Partial index over the unpublished tombstones (Option D). The only other
@@ -1199,6 +1207,7 @@ impl MetastoreBackend for SqliteMetastore {
                 conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, [])?;
+                conn.execute(Self::PENDING_WRITE_BACK_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await

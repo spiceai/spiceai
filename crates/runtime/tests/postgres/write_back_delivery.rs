@@ -19,22 +19,17 @@ limitations under the License.
 //! driven through a full `Runtime`: what a delivery leaves in the source, and
 //! what the echo of that delivery must not put back into the accelerator.
 //!
-//! Which of the two delivery routes a write takes decides which question it can
-//! answer. A write made **outside** a Cayenne transaction publishes to the
-//! accelerator and is forwarded to the source by the write-back sink itself, in
-//! a fire-and-forget background task: no delivery transaction is opened, no
-//! transaction id is registered, and the change comes back over CDC like any
-//! other source write. A write made **inside** a transaction stages instead,
-//! and its commit marks the dirty keys that the delivery worker reconciles
-//! through the connector-owned deliverer — which stamps the delivery with its
-//! `xid8` and registers it before committing, so the pump can recognize and
-//! drop the echo. Echo suppression is therefore reachable only from a write
-//! made inside a transaction.
+//! A write-back dataset accepts a write only **inside** a Cayenne transaction.
+//! The write stages, and its commit marks the dirty keys that the delivery
+//! worker reconciles through the connector-owned deliverer — which stamps the
+//! delivery with its `xid8` and registers it before committing, so the pump can
+//! recognize and drop the echo. A write **outside** a transaction is refused,
+//! because nothing would record it for delivery.
 //!
-//! Two devices make that outcome readable, defined once and shared by every
-//! test: a source-side trigger that rewrites the delivered row so the source's
-//! copy differs from the committed one ([`create_bumping_table`]), and a
-//! sentinel row that orders the assertions behind the pump
+//! Two devices make a delivery's outcome readable, and the tests that observe
+//! one share them (the refusal test observes no delivery and uses neither): a source-side trigger that rewrites the delivered row so the
+//! source's copy differs from the committed one ([`create_bumping_table`]), and
+//! a sentinel row that orders the assertions behind the pump
 //! ([`wait_for_sentinel`]).
 
 use std::collections::HashMap;
@@ -280,17 +275,13 @@ const SENTINEL_N: i64 = 7;
 /// trigger that raises `n` by [`TRIGGER_BUMP`] once.
 ///
 /// Guarded on `n < TRIGGER_BUMP` so the rewrite is idempotent, which it has to
-/// be for the delivered value to be a stable oracle. The deliverer's upsert leg
-/// issues `INSERT ... ON CONFLICT DO UPDATE`, which fires the `BEFORE INSERT`
+/// be for the delivered value to be a stable oracle. The deliverer issues
+/// `INSERT ... ON CONFLICT DO UPDATE`, which fires the `BEFORE INSERT`
 /// trigger on the proposed row and then, when the row already exists, the
 /// `BEFORE UPDATE` trigger on the result. An unguarded `n := n + TRIGGER_BUMP`
 /// would stamp `n + 2 * TRIGGER_BUMP` on every delivery of an existing key, and
 /// the worker replays a whole pass on any error, so a retried delivery would
 /// leave the source on a value no wait here expects.
-///
-/// A trigger sees nothing of the deliverer's other leg: `deliver_deletes` issues
-/// a `DELETE`, which this fixture cannot observe and no test here reaches (the
-/// leg runs only for a key that is dirty and absent from the accelerator).
 ///
 /// The seed row is written before the trigger exists, so the bootstrap snapshot
 /// carries the plain value and only rows written afterwards are rewritten.
@@ -374,18 +365,18 @@ async fn wait_for_sentinel(
     .await
 }
 
-// ── a source-side trigger outside a transaction ─────────────────────────────
+// ── a write outside a transaction ───────────────────────────────────────────
 
-/// A write made outside a transaction converges on the source's value: the
-/// accelerator ends up holding the trigger's rewrite, not the row it committed.
+/// A write-back dataset refuses a write that is not in a transaction.
 ///
-/// The write is an ordinary `INSERT`, so it takes the sink's fire-and-forget
-/// forward and no transaction id is registered for it (see the module docs).
-/// Its rewrite therefore comes back as an unremarkable source change and is
-/// applied — the opposite outcome to a transaction's delivery, and the reason
-/// the two are worth pinning side by side.
+/// Only a transaction records the write durably for delivery: it stages to the
+/// accelerator, publishes atomically at `COMMIT`, and writes the dirty-key
+/// markers in that same commit, which is the only record the delivery worker can
+/// reconcile to the source. Without one nothing records that the source owes the
+/// write, so it is refused before it reaches the accelerator rather than
+/// accepted under a durability guarantee that would not hold.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow::Error> {
+async fn a_write_outside_a_transaction_is_refused() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
@@ -393,43 +384,42 @@ async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow
             let port = common::get_random_port()?;
             let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
             let source = connect(port).await?;
-            create_bumping_table(&source, "wb_trigger").await?;
+            // A plain table: the statement is refused before it reaches the
+            // source, so there is nothing here for a trigger to observe. The seed
+            // row is what `wait_for_bootstrap` waits for.
+            exec(
+                &source,
+                "CREATE TABLE public.wb_plain_write (id int PRIMARY KEY, n int NOT NULL)",
+            )
+            .await?;
+            exec(&source, "INSERT INTO public.wb_plain_write VALUES (1, 10)").await?;
 
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
-                "write_back_source_trigger",
+                "write_back_plain_write",
                 vec![write_back_dataset(
                     port,
-                    "wb_trigger",
-                    "spice_wb_trigger_slot",
+                    "wb_plain_write",
+                    "spice_wb_plain_write_slot",
                     accel.path(),
                 )],
             )
             .await?;
-            wait_for_bootstrap(&rt, "wb_trigger").await?;
+            wait_for_bootstrap(&rt, "wb_plain_write").await?;
 
-            // Spice commits 50 outside a transaction; the trigger rewrites it.
-            run_query(&rt, "INSERT INTO wb_trigger (id, n) VALUES (2, 50)").await?;
-            wait_for_delivery(&source, "wb_trigger", 2, 50).await?;
+            let error = run_query(&rt, "INSERT INTO wb_plain_write (id, n) VALUES (2, 50)")
+                .await
+                .expect_err("a write-back dataset must refuse a write outside a transaction");
+            let message = error.to_string();
+            assert!(
+                message.contains("write_back") && message.contains("transaction"),
+                "the refusal must name the mode and what is required: {message}"
+            );
 
-            exec(
-                &source,
-                &format!("INSERT INTO public.wb_trigger VALUES (9, {SENTINEL_N})"),
-            )
-            .await?;
-            wait_for_sentinel(&rt, "wb_trigger", 9).await?;
-
-            assert_accel(
-                &rt,
-                "SELECT n FROM wb_trigger WHERE id = 2",
-                TRIGGER_BUMP + 50,
-                "an unregistered delivery's rewrite reaches the accelerator",
-            )
-            .await?;
             assert_eq!(
-                source_value(&source, "SELECT n FROM public.wb_trigger WHERE id = 2").await?,
-                Some(TRIGGER_BUMP + 50),
-                "the source holds the trigger's value"
+                source_value(&source, "SELECT n FROM public.wb_plain_write WHERE id = 2").await?,
+                None,
+                "and nothing reached the source"
             );
 
             rt.shutdown().await;

@@ -46,12 +46,16 @@ pub enum RefreshMode {
 ///   source. The local accelerator is updated via the normal refresh mechanism
 ///   (e.g. WAL replication with `refresh_mode: changes`).
 ///
-/// - `write_back`: Writes commit to the local accelerator first and return after
-///   that accelerator commit completes. The same mutation is then forwarded to
-///   the federated source asynchronously, so the source may lag and source
-///   persistence failures are logged rather than returned to the caller. This
-///   mode requires `replication.enabled: true` as an explicit opt-in to those
-///   asynchronous source durability semantics.
+/// - `write_back`: Writes commit to the local accelerator and are carried to the
+///   federated source afterwards by a delivery worker, so the source may lag.
+///   Every write must be sent as a single `BEGIN; ...; COMMIT;` body: only the
+///   transactional commit records the write for delivery, so a statement outside
+///   a transaction is refused rather than accepted with weaker durability than a
+///   caller would assume. `INSERT` and `UPDATE` only — `DELETE` is not supported;
+///   delete at the source and let the change stream carry it back. Requires a
+///   single-column `primary_key` to key each delivery on, and
+///   `replication.enabled: true` as an explicit opt-in to the source lagging the
+///   accelerator.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]

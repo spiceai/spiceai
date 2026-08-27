@@ -335,12 +335,20 @@ def main():
         print(f"  WARNING: {total_exhausted} round(s) exhausted {args.max_retries} "
               f"retries without committing — possible OCC starvation / stuck-degraded")
 
-    print("[4/5] interleaved upsert filter-DELETE (exercises P0-3 degraded-flag path)...")
-    del_status, _ = spice_sql(
+    # A write-back dataset refuses DELETE: a deletion cannot be recorded for
+    # delivery to the source, so the statement is rejected rather than applied to
+    # the accelerator alone. Assert the refusal so this step keeps covering the
+    # path rather than silently dropping it.
+    print("[4/5] interleaved filter-DELETE is refused on a write-back dataset...")
+    del_status, del_body = spice_sql(
         args.spice_url,
         f"DELETE FROM oorder WHERE o_w_id={args.w_id} AND o_id < 0",  # no-op predicate, safe
     )
-    print(f"  filter-DELETE status={del_status} (path exercised)")
+    ok_delete_refused = del_status != 200 and "DELETE is not supported" in str(del_body)
+    print(
+        f"  filter-DELETE status={del_status} "
+        f"-> {'PASS (refused)' if ok_delete_refused else 'FAIL (expected refusal)'}"
+    )
 
     print("[5/5] checking invariants...")
     ok_lost = check_no_lost_updates(args.spice_url, args.w_id, before_sum, total_applied)
@@ -358,15 +366,17 @@ def main():
     print(f"  no-lost-updates (OCC): {'PASS' if ok_lost else 'FAIL'}")
     print(f"  ivm-fresh (P1):        {'PASS' if ok_ivm else 'FAIL'}")
     print(f"  no-progress (OCC):     {'PASS' if ok_progress else 'FAIL'}")
+    print(f"  delete-refused:        {'PASS' if ok_delete_refused else 'FAIL'}")
     print(f"  write-back converge:   "
           f"{'PASS' if ok_wb else 'DIVERGED (see deferred P0 note above)'}")
 
     # OCC and IVM are what THIS PR fixes — they gate the exit code, including a
     # no-progress guard (any round that exhausted its retries without committing
-    # signals OCC starvation / stuck-degraded and fails the run). Write-back
-    # convergence is reported but does NOT fail the run (the write-back echo-loss
-    # P0 is deferred to its own PR).
-    critical_ok = ok_lost and ok_ivm and ok_progress
+    # signals OCC starvation / stuck-degraded and fails the run). The DELETE
+    # refusal gates it too: a write-back dataset that accepts one has no way to
+    # deliver it. Write-back convergence is reported but does NOT fail the run
+    # (the write-back echo-loss P0 is deferred to its own PR).
+    critical_ok = ok_lost and ok_ivm and ok_progress and ok_delete_refused
     sys.exit(0 if critical_ok else 1)
 
 

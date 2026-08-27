@@ -304,7 +304,7 @@ pub enum Error {
     AcceleratedWriteBackWithOnConflict { dataset_name: String },
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator first and persists to the federated source asynchronously, so source persistence failures are logged rather than returned to the caller. Set 'replication.enabled: true' to opt in to asynchronous source durability, or use a different write_mode."
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator and a delivery worker carries the write to the federated source afterwards, so the source lags the accelerator, and the source's own changes come back over the change stream. Set 'replication.enabled: true' to opt in, or use a different write_mode."
     ))]
     AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
@@ -325,6 +325,32 @@ pub enum Error {
         "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
+        dataset_name: String,
+        connector: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but this dataset also sets '{retention_setting}' to prune rows from the accelerator. A prune can remove a row that has been acknowledged to the writer and not yet delivered, and nothing else holds that value, so the write would be lost. Remove the retention settings from this dataset, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackWithRetention {
+        dataset_name: String,
+        connector: String,
+        retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but 'acceleration.mode: {mode}' does not keep the accelerator across a restart or a recreate. Recreating it discards both the rows that have not been delivered and the record of what still owes delivery, and nothing else holds those values, so an acknowledged write would be lost. Set 'acceleration.mode: file', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackRecreatingMode {
+        dataset_name: String,
+        connector: String,
+        mode: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, but this dataset declares no 'acceleration.primary_key'. Without one the delivery worker has nothing to key a delivery on, so this dataset would accept writes, record them, and never deliver any of them. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeclaredPrimaryKey {
         dataset_name: String,
         connector: String,
     },

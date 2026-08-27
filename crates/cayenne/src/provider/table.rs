@@ -7305,19 +7305,27 @@ impl CayenneTableProvider {
             .downcast_ref::<crate::CayenneCatalog>()
     }
 
-    /// List up to `limit` undelivered write-back markers (oldest commit first)
-    /// as `(pk_bytes, sequence_number)`. The `pk_bytes` are opaque `OwnedRow`
+    /// List up to `limit` undelivered write-back markers in delivery order
+    /// (oldest commit first, then key) starting after `after`, or at the oldest
+    /// marker when that is `None`, as `(pk_bytes, sequence_number)`.
+    ///
+    /// `after` lets a caller page past markers it could not deliver, so one
+    /// undeliverable key cannot pin the claim and starve every newer write. The `pk_bytes` are opaque `OwnedRow`
     /// encodings — feed them back to [`Self::decode_pk_keys`] /
     /// [`Self::clear_dirty_keys`].
     ///
     /// # Errors
     /// Propagates the underlying metastore error.
-    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<(Vec<u8>, i64)>> {
+    pub async fn list_dirty_keys(
+        &self,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(Vec::new());
         };
         Ok(catalog
-            .list_pending_write_back(self.table_id(), limit)
+            .list_pending_write_back(self.table_id(), limit, after)
             .await?)
     }
 
