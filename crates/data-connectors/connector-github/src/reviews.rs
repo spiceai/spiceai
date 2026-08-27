@@ -55,7 +55,8 @@ const PULL_REQUESTS_PAGE_SIZE: u32 = 25;
 
 /// Reviews fetched per pull request. 100 is GitHub's per-connection maximum and
 /// a nested connection cannot be paginated, so a pull request with more reviews
-/// than this is truncated — the fan-out warns by name when that happens.
+/// than this has reviews the scan cannot reach, so the fan-out fails by name rather
+/// than returning a partial set.
 const REVIEWS_PER_PULL_REQUEST: u32 = 100;
 
 // https://docs.github.com/en/graphql/reference/objects#pullrequestreview

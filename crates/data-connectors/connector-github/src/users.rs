@@ -84,7 +84,9 @@ impl GitHubTableArgs for UsersTableArgs {
                     is_hireable: isHireable
                     followers: followers {{ followers: totalCount }}
                     following: following {{ following: totalCount }}
-                    public_repos: repositories(privacy: PUBLIC) {{ public_repos: totalCount }}
+                    public_repos: repositories(privacy: PUBLIC, ownerAffiliations: OWNER) {{
+                        public_repos: totalCount
+                    }}
                 }}
             }}"#,
             login = self.login,

@@ -137,11 +137,17 @@ impl GitHubTableArgs for ReposTableArgs {
             //
             // `repositoryOwner` resolves both an organization and a user, so one shape
             // serves `github.com/{org}/repos` and `github.com/{user}/repos`.
+            //
+            // `ownerAffiliations: OWNER` because the connection otherwise defaults to
+            // [OWNER, COLLABORATOR] and returns repositories owned by other accounts —
+            // for `lukekim`, 86 rows rather than 68. `stamp_identity` labels every row
+            // with the login the dataset names, so those extra rows would carry an
+            // `owner` that does not own them, and any join on it would be wrong.
             None => (
                 format!(
                     r#"{{
                 repositoryOwner(login: "{owner}") {{
-                    repositories(first: {page_size}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
+                    repositories(first: {page_size}, ownerAffiliations: OWNER, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
