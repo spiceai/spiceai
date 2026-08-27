@@ -70,6 +70,22 @@ pub struct DatasetBuilder {
     pub check_availability_interval: Option<Duration>,
 }
 
+/// What to tell an operator whose dataset sets `acceleration.enabled: false` and
+/// leaves settings in the block that the runtime will not apply.
+///
+/// A function rather than an inline `tracing::warn!` so the wording — which is
+/// the whole of this feature for the person reading the log — is assertable.
+///
+/// It names only the fields it was given, and does not say "the rest of the
+/// block": `ready_state` is read out of a disabled block and applied, so a claim
+/// about everything under `enabled` would be untrue for it.
+fn disabled_acceleration_warning(dataset: &str, ignored: &[String]) -> String {
+    format!(
+        "Dataset {dataset} sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated.",
+        ignored.join(", ")
+    )
+}
+
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
@@ -103,20 +119,15 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         let metadata = dataset.metadata();
 
         // `enabled: false` turns the whole block off, so anything else set in it
-        // is read, accepted and then never applied. Say so rather than leaving a
-        // dataset that looks configured to cache serving every query from the
-        // source (#13514). Read from the Spicepod block, before the conversion
-        // below resolves its defaults and the distinction is gone.
-        if let Some(acceleration_block) = dataset.acceleration.as_ref() {
-            let ignored = acceleration_block.fields_ignored_when_disabled();
-            if !ignored.is_empty() {
-                tracing::warn!(
-                    "Dataset {} sets `acceleration.enabled: false`, so the rest of its acceleration block is ignored: {}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated.",
-                    dataset.name,
-                    ignored.join(", ")
-                );
-            }
-        }
+        // is read, accepted and then never applied. Collect that here, while the
+        // Spicepod block is still in hand and before the conversion below
+        // resolves its defaults away (#13514); it is reported after the name is
+        // validated.
+        let ignored_acceleration_fields = dataset
+            .acceleration
+            .as_ref()
+            .map(spicepod_acceleration::Acceleration::fields_ignored_when_disabled)
+            .unwrap_or_default();
 
         let acceleration = dataset
             .acceleration
@@ -124,6 +135,16 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             .transpose()?;
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
+
+        // After the name is validated, deliberately: an identifier that reaches
+        // here has passed the tokenizer, so it holds no newline or other control
+        // character that could forge a second log line out of this one.
+        if !ignored_acceleration_fields.is_empty() {
+            tracing::warn!(
+                "{}",
+                disabled_acceleration_warning(&dataset.name, &ignored_acceleration_fields)
+            );
+        }
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
 
@@ -449,4 +470,37 @@ fn fts_store_from_column_overrides(
         engine: Some(column_engine),
         params: column_params,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::disabled_acceleration_warning;
+
+    #[test]
+    fn the_warning_names_the_dataset_the_fields_and_the_remedy() {
+        // Everything a reader needs to act, in one line: which dataset, what is
+        // being dropped, and the two ways out. Asserted because the message is
+        // the entire user-visible behaviour of this path (#13514).
+        let warning = disabled_acceleration_warning(
+            "api_data",
+            &["engine".to_string(), "refresh_mode".to_string()],
+        );
+        assert!(warning.contains("api_data"), "{warning}");
+        assert!(warning.contains("engine, refresh_mode"), "{warning}");
+        assert!(warning.contains("acceleration.enabled: false"), "{warning}");
+        assert!(warning.contains("Remove `enabled: false`"), "{warning}");
+    }
+
+    #[test]
+    fn the_warning_claims_only_the_fields_it_was_given() {
+        // `ready_state` is read out of a disabled block and applied, so this
+        // message must not claim the whole block is ignored — a reader who sees
+        // that goes looking for a `ready_state` that is working correctly.
+        let warning = disabled_acceleration_warning("api_data", &["engine".to_string()]);
+        assert!(
+            !warning.contains("the rest of"),
+            "the message must scope itself to the listed fields: {warning}"
+        );
+        assert!(!warning.contains("ready_state"), "{warning}");
+    }
 }
