@@ -185,10 +185,13 @@ async fn inherited_net_write_timeout(
     )
 }
 
+/// `connection` is the shared source's `host:port` label, not a dataset: one dump
+/// serves every `refresh_mode: changes` dataset on the source, so anything this
+/// function reports is about the connection they share.
 pub(super) async fn open_binlog_stream(
     params: &ReplicationParams,
     resume: &BinlogPosition,
-    dataset_name: &str,
+    connection: &str,
     use_gtid: bool,
     gtid: &GtidSet,
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
@@ -198,16 +201,16 @@ pub(super) async fn open_binlog_stream(
         Ok(Some(inherited)) => Some(inherited),
         Ok(None) => {
             tracing::warn!(
-                dataset = %dataset_name,
-                "The MySQL source answered NULL for the binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+                connection = %connection,
+                "The MySQL source answered NULL for the binlog dump session's net_write_timeout on {connection}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
             );
             None
         }
         Err(e) => {
             tracing::warn!(
-                dataset = %dataset_name,
+                connection = %connection,
                 error = %e,
-                "Could not read the MySQL binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+                "Could not read the MySQL binlog dump session's net_write_timeout on {connection}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
             );
             None
         }
@@ -221,10 +224,10 @@ pub(super) async fn open_binlog_stream(
         if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
             match rejection_warning {
                 Some(consequence) => {
-                    tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for dataset {dataset_name}: {consequence}");
+                    tracing::warn!(connection = %connection, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session on {connection}: {consequence}");
                 }
                 None => {
-                    tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+                    tracing::debug!(connection = %connection, statement = %sql, error = %e, "failed to set a binlog dump session variable");
                 }
             }
         }
