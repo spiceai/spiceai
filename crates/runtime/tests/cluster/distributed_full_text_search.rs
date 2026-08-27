@@ -227,7 +227,7 @@ async fn distributed_full_text_search_matches_single_node_ordering() -> Result<(
             // also guarantees its full-text index is built and registered with the
             // scheduler. If not, a dedicated readiness signal (analogous to
             // `PartitionsLoaded`) should gate this instead of polling the query.
-            let indexed = wait_until_true(Duration::from_secs(60), || {
+            let indexed = wait_until_true(Duration::from_mins(1), || {
                 let harness = &harness;
                 async move {
                     distributed_search_ids(harness, RARE_TERM_SEARCH_SQL)
