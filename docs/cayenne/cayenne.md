@@ -1384,6 +1384,11 @@ The non-compaction passes use the same grammar under `cayenne_maintenance_outcom
 
 `cayenne_maintenance_reclaimed_{files,bytes,rows}_total{table, op}` is what each pass actually gave back. A footprint gauge that climbs while its reclaim counter stays flat is the signature of a reclamation path that is scheduled but doing nothing.
 
+Two properties of that family are load-bearing:
+
+- **The units are files and bytes, never directories.** The retired-directory sweep counts the files it unlinked and their real sizes, sized before the unlink — including the files it removes from a directory that *survives* because a live snapshot still references others in place. Counting a removed directory as one "file" (or reporting zero for a partial cleanup) got the rate wrong in both directions on exactly the tables worth measuring.
+- **The reclaim totals and the outcome are independent.** A pass that cleaned four directories and failed on a fifth reports `failed` — the failure is the actionable half, and the directory that will never go away is what an operator needs — while still publishing everything the pass did give back. Labelling such a pass `reclaimed` because the majority succeeded would hide the one that did not.
+
 ## The state the decisions read
 
 The bake's trigger compares two numbers, and both are exported so a `declined_below_trigger` can be read rather than guessed at:
@@ -1492,9 +1497,14 @@ All of these are lock-free atomic loads (the inline-cache figure is one `get_arr
 
 The PK existence index is what an upsert-heavy apply leans on hardest, and its failures are silent: a discarded index is rebuilt from the table, which is correct but costs a full keyset scan.
 
-A sharded (N>1) table maintains **two** live indexes with separate budgets — the table-wide keyset and the per-shard index — so every metric here carries `site` ∈ `table_keyset`, `sharded_keyset`. Reporting only their sum would hide which of the two is at its budget, and the one at its budget is the one about to change format.
+**Reported per cache, not per table.** A sharded (N>1) table keeps **two** indexes at once — the table-wide keyset and the per-shard index — each bounded by *half* the configured budget, and they transition independently. One can be an exact keyset still growing while the other has already degraded to a bloom, so every metric here carries `site` ∈ `table_keyset`, `sharded_keyset`. A per-table aggregate cannot express that mixed state, and the cache nearing its transition is the one worth knowing about.
 
-**Format and size.** The index has three shapes, and which one is live decides how its memory behaves:
+Two aggregation rules follow, and getting either wrong is easy:
+
+- **bytes sum across `site`.** Both layouts are resident simultaneously. `cayenne_memory_account_bytes{kind="keyset"}` is already that sum, as the memory account registers it against the query pool — use it rather than re-deriving one.
+- **keys must not.** The two caches are meant to cover the *same* key set in different layouts, so adding them double-counts every key. A divergence between their key counts is itself a staleness signal, which is the second reason not to aggregate them away.
+
+ The index has three shapes, and which one is live decides how its memory behaves:
 
 | `cayenne_pk_index_format` | shape | how its bytes behave |
 |---|---|---|
@@ -1504,17 +1514,19 @@ A sharded (N>1) table maintains **two** live indexes with separate budgets — t
 
 Reported as a numeric gauge rather than a label for the reason `cayenne_data_storage_class` is: the value is what changes over time, and a label would spread one index across three series with two of them stale.
 
-- `cayenne_pk_index_bytes{table, site}` — approximate resident bytes
-- `cayenne_pk_index_keys{table, site}` — exact entries, or the bloom's inserted-key count
-- `cayenne_pk_index_budget_bytes{table, site}` — the budget the index is bounded by
+- `cayenne_pk_index_bytes{table, site}` — approximate resident bytes of that cache, whichever representation it holds
+- `cayenne_pk_index_keys{table, site}` — keys that cache covers
+- `cayenne_pk_index_budget_bytes{table, site}` — the *effective* budget for that cache: half the per-table figure on a sharded table, already clamped by whatever the fleet has left (the process-global ceiling itself is `cayenne_fleet_budget_limit_bytes{budget="pk_keyset"}`)
 
 The three are only interpretable together. Bytes alone cannot distinguish an **exact keyset growing toward its budget** (which will degrade to a bloom and give most of them back) from a **bloom already at its fixed size** (which will not shrink); the budget alone says nothing about how close the table is to that transition. `bytes / budget_bytes` at `format = 1` is the countdown to a format change.
 
-The size gauges are read from the memory-accounting atomics, so they are always published. The format and key count need the cache lock, which the sample takes with `try_lock` — the keyset caches sit on the CDC apply's write path and observability must never queue a writer behind it — so those two skip a point on a tick where the lock is busy.
+`bytes` and `budget_bytes` come from the memory-accounting atomics, so they are **always** published — including on a tick where the busy table an operator is looking at cannot spare its cache lock. `format` and `keys` need that lock, taken with `try_lock` because the keyset caches sit on the CDC apply's write path and observability must never queue a writer behind it. A cache whose lock is busy publishes its size and skips its shape for that tick: reporting `absent` for a cache that was merely busy would read as a table rebuilding its index every batch.
 
 - `cayenne_pk_index_discard_total{table, site, kind, reason}` — indexes thrown away rather than cached back. `site` (`table_keyset` / `sharded_keyset`) is the load-bearing label: a discard rate concentrated at one site points at that site's guard rather than at the workload. `reason` is `overflowed` (the pending-key log's byte cap was too small for the commit rate during a validation), `invalidated` (something superseded the table state), or `over_budget` / `replay_over_budget`.
 - `cayenne_pk_index_preserved_total{table, site, kind}` — the positive control. Without it a low discard count could equally mean a healthy preserve path or that nothing ever checked an index out.
-- `cayenne_pk_bloom_bits_per_key{table, site}`, `cayenne_pk_bloom_inserted_keys{table, site}`, `cayenne_pk_bloom_bits{table, site}` — filter density, emitted only while `format = 2` so an exact index leaves no stale ratio standing. A filter resident at many times the bits-per-key the sizing code asks for is invisible in the bytes alone (they look like a large table) and in the key count alone (it looks correct); only the ratio shows it.
+- `cayenne_pk_bloom_bits{table, site}` and `cayenne_pk_bloom_bits_per_key{table, site}` — that cache's filter density. A filter resident at many times the bits-per-key the sizing code asks for is invisible in the bytes alone (they look like a large cache) and in the key count alone (it looks correct); only the ratio shows it. There is no separate bloom key count: it is the same set `cayenne_pk_index_keys` reports for that `site`, and a second series would only invite the two to be summed.
+
+  Both are emitted on **every** tick and **zeroed when that cache holds no bloom**, not skipped. A skipped gauge keeps its last value, so a cache that rebuilt an exact index would go on reporting the density of a filter that no longer exists — and a stale over-allocation reads exactly like a live one. A live bloom always allocates bits, so zero here unambiguously means "no bloom", which `cayenne_pk_index_format` states independently.
 - `cayenne_pk_bloom_split_rows_total{table, result}` — apply rows the filter split: `miss` rows skip on-conflict validation entirely, `hit` rows are validated. This is the filter's return on its resident bytes, stated directly.
 
 `cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it.

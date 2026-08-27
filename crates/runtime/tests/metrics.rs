@@ -385,6 +385,9 @@ fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// drops the call site leaves the operator back where they started — reading
 /// debug logs — with nothing failing.
 const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
+    "cayenne_compaction_outcome_total",
+    "cayenne_maintenance_outcome_total",
+    "cayenne_maintenance_reclaimed_files_total",
     "cayenne_deletion_index_len",
     "cayenne_deletion_index_reinserts",
     "cayenne_deletion_index_bytes",
@@ -687,6 +690,66 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
         EXPECTED_CAYENNE_MAINTENANCE_METRICS,
         "a loaded Cayenne dataset did not report its maintenance and footprint families",
     );
+
+    // Presence of the family is not enough for the decision telemetry: its whole
+    // value is the `outcome` label, and a call site rewritten to emit a bare
+    // counter would still satisfy the check above. This fixture's background tick
+    // deterministically declines the current-snapshot pass (one inline file, no
+    // Vortex files to compact), so assert that exact decline is what arrives.
+    let outcomes = compaction_outcomes(registry);
+    let declines = outcomes
+        .get(&(
+            "cayenne_scores".to_string(),
+            "subset_current".to_string(),
+            "declined_below_trigger".to_string(),
+        ))
+        .copied()
+        .unwrap_or(0.0);
+    assert!(
+        declines > 0.0,
+        "the background tick must report WHY it declined, not just that it ran: this fixture \
+         holds one inline file and no Vortex files, so every pass declines below trigger. \
+         Observed: {outcomes:?}"
+    );
+    // Nothing in this fixture can commit a compaction, so a `committed` sample
+    // would mean the outcome labels are being attached to the wrong exits.
+    assert!(
+        !outcomes
+            .keys()
+            .any(|(_, _, outcome)| outcome == "committed"),
+        "no compaction can commit against a single inline file. Observed: {outcomes:?}"
+    );
+}
+
+/// `cayenne_compaction_outcome_total` counts, keyed by `(table, kind, outcome)`.
+///
+/// The table label is part of the key because the registry is shared across the
+/// tests in this file, so a sibling fixture's series must not satisfy an
+/// assertion about this one.
+fn compaction_outcomes(
+    registry: &prometheus::Registry,
+) -> HashMap<(String, String, String), f64> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == "cayenne_compaction_outcome_total")
+        .flat_map(|family| {
+            family.get_metric().iter().map(|metric| {
+                let label = |name: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|l| l.name() == name)
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default()
+                };
+                (
+                    (label("table"), label("kind"), label("outcome")),
+                    metric.get_counter().value(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// `query_failures{err_code}` must name the condition that failed.

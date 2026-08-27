@@ -96,9 +96,13 @@ pub(crate) enum CompactionOutcome {
     /// A writer holds the write lock on a position-delete table, whose rewrite
     /// must serialize against writers.
     DeclinedWriterActive,
-    /// Position-delete table: out of scope for the seq-prefix bake, whose prune
-    /// is a no-op for file-scoped tombstones.
+    /// Position-delete table: out of scope for the seq-prefix bake and the
+    /// cold-tier promotion, neither of which can carry file-scoped tombstones.
     DeclinedNotKeyMode,
+    /// The pass is not configured for this table (no cold-tier location).
+    /// A permanent state rather than a transient one, so a steady count here is
+    /// the expected shape, not a problem.
+    DeclinedNotConfigured,
     /// The CDC apply is at or over capacity, so the bake yields the shared write
     /// path to the foreground writer.
     DeclinedApplyBackpressure,
@@ -131,6 +135,7 @@ impl CompactionOutcome {
             Self::DeclinedLockBusy => "declined_lock_busy",
             Self::DeclinedWriterActive => "declined_writer_active",
             Self::DeclinedNotKeyMode => "declined_not_key_mode",
+            Self::DeclinedNotConfigured => "declined_not_configured",
             Self::DeclinedApplyBackpressure => "declined_apply_backpressure",
             Self::DeclinedNoCandidates => "declined_no_candidates",
             Self::DeclinedAboveDeleteFence => "declined_above_delete_fence",
@@ -260,6 +265,27 @@ pub(crate) fn track_maintenance(table: &str, op: MaintenanceOp, outcome: Mainten
     ]);
 }
 
+/// Register every non-compaction maintenance operation's counters at zero for
+/// this table.
+///
+/// Without this, an operation that has never run emits no series, and "the
+/// deletion-vector sweep has reclaimed nothing" is indistinguishable from "the
+/// deletion-vector sweep is not instrumented" — the first being the finding and
+/// the second being a reason to disbelieve the query. Idempotent: adding zero to
+/// a counter leaves its value alone, so the registration can ride any tick.
+pub(crate) fn register_all(table: &str) {
+    for op in [
+        MaintenanceOp::OrphanDvSweep,
+        MaintenanceOp::Retention,
+        MaintenanceOp::RetiredDirSweep,
+    ] {
+        telemetry::cayenne::register_maintenance_counters(&[
+            KeyValue::new("table", table.to_string()),
+            KeyValue::new("op", op.as_str()),
+        ]);
+    }
+}
+
 /// Record what one maintenance pass physically gave back.
 pub(crate) fn track_reclaimed(table: &str, op: MaintenanceOp, files: u64, bytes: u64, rows: u64) {
     telemetry::cayenne::track_maintenance_reclaimed(
@@ -280,7 +306,7 @@ mod tests {
     };
     use std::collections::HashSet;
 
-    const COMPACTION_OUTCOMES: [CompactionOutcome; 16] = [
+    const COMPACTION_OUTCOMES: [CompactionOutcome; 17] = [
         CompactionOutcome::Committed,
         CompactionOutcome::NoOp,
         CompactionOutcome::AbortedConcurrentChange,
@@ -290,6 +316,7 @@ mod tests {
         CompactionOutcome::DeclinedLockBusy,
         CompactionOutcome::DeclinedWriterActive,
         CompactionOutcome::DeclinedNotKeyMode,
+        CompactionOutcome::DeclinedNotConfigured,
         CompactionOutcome::DeclinedApplyBackpressure,
         CompactionOutcome::DeclinedNoCandidates,
         CompactionOutcome::DeclinedAboveDeleteFence,

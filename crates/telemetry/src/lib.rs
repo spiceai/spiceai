@@ -2126,16 +2126,39 @@ pub mod cayenne {
     /// `op` beyond its kind.
     pub fn track_maintenance_outcome(dimensions: &[KeyValue]) {
         MAINTENANCE_OUTCOME
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_counter("cayenne_maintenance_outcome_total")
-                    .with_description(
-                        "Cayenne non-compaction maintenance passes (deletion-vector sweep, retention, retired-directory sweep) by operation and outcome.",
-                    )
-                    .with_unit("passes")
-                    .build()
-            })
+            .get_or_init(build_maintenance_outcome)
             .add(1, dimensions);
+    }
+
+    fn build_maintenance_outcome() -> Counter<u64> {
+        operational_meter()
+            .u64_counter("cayenne_maintenance_outcome_total")
+            .with_description(
+                "Cayenne non-compaction maintenance passes (deletion-vector sweep, retention, retired-directory sweep) by operation and outcome.",
+            )
+            .with_unit("passes")
+            .build()
+    }
+
+    /// Registers a maintenance operation's counters at zero, so they appear in
+    /// the export before anything has happened. `dimensions` carries `table`
+    /// and `op`; the outcome series is registered as `reclaimed`.
+    ///
+    /// A counter with no samples and a counter that is not implemented look
+    /// identical to a consumer — "the deletion-vector sweep has never run" and
+    /// "the deletion-vector sweep is not instrumented" are very different
+    /// conclusions to draw from an empty query, and the first is the more
+    /// alarming one. Publishing zero makes the absence of reclamation an
+    /// observation instead of a gap. (Same technique as
+    /// [`register_query_counter`], for the same reason.)
+    pub fn register_maintenance_counters(dimensions: &[KeyValue]) {
+        let mut with_outcome = Vec::with_capacity(dimensions.len() + 1);
+        with_outcome.extend_from_slice(dimensions);
+        with_outcome.push(KeyValue::new("outcome", "reclaimed"));
+        MAINTENANCE_OUTCOME
+            .get_or_init(build_maintenance_outcome)
+            .add(0, &with_outcome);
+        track_maintenance_reclaimed(0, 0, 0, dimensions);
     }
 
     static COMPACTION_TRIGGER: OnceLock<Counter<u64>> = OnceLock::new();
@@ -2872,19 +2895,27 @@ pub mod cayenne {
     static PK_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static PK_INDEX_BUDGET_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
-    /// Publishes one primary-key index's resident bytes and the budget that
+    /// Publishes one primary-key cache's resident bytes and the budget that
     /// decides when it changes shape. `dimensions` carries `table` and `site`
-    /// (`table_keyset` / `sharded_keyset`) — a table can hold both at once, and
-    /// they are sized against separate budgets.
+    /// (`table_keyset` / `sharded_keyset`).
+    ///
+    /// **Per cache, not per table.** A sharded (N>1) table keeps two of these at
+    /// once and gives each HALF the configured budget, and they transition
+    /// independently — one can be an exact keyset still growing while the other
+    /// has already degraded to a bloom. A per-table sum against a single budget
+    /// cannot express that, and the cache nearing its transition is the one worth
+    /// knowing about. Sum across `site` for a table total, or read
+    /// `cayenne_memory_account_bytes{kind="keyset"}`, which is that sum as the
+    /// memory account registers it against the query pool.
     ///
     /// Split from [`track_pk_index_shape`] because the two are available under
     /// different conditions: these come from lock-free accounting counters and
     /// can always be published, while the shape needs the cache itself.
     ///
-    /// The pair is only interpretable together with the format. Bytes alone
-    /// cannot distinguish an exact keyset growing toward its budget (which will
-    /// degrade to a bloom and give most of them back) from a bloom already at its
-    /// fixed size (which will not shrink); `bytes / budget_bytes` at
+    /// Only interpretable together with the format. Bytes alone cannot
+    /// distinguish an exact keyset growing toward its budget (which will degrade
+    /// to a bloom and give most of them back) from a bloom already at its fixed
+    /// size (which will not shrink); `bytes / budget_bytes` at
     /// `cayenne_pk_index_format = 1` is the countdown to that transition.
     pub fn track_pk_index_size(resident_bytes: u64, budget_bytes: u64, dimensions: &[KeyValue]) {
         PK_INDEX_BYTES
@@ -2892,7 +2923,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_bytes")
                     .with_description(
-                        "Approximate resident bytes of a Cayenne primary-key existence index.",
+                        "Approximate resident bytes of one Cayenne primary-key existence cache (`site`), whichever representation it holds. A sharded table keeps two, each with its own budget; sum across `site` for a table total.",
                     )
                     .with_unit("By")
                     .build()
@@ -2903,7 +2934,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_budget_bytes")
                     .with_description(
-                        "Byte budget a Cayenne primary-key existence index is bounded by: an exact keyset crossing it degrades to a bloom (upsert) or is dropped (exact-answer tables). 0 when unbounded.",
+                        "Effective byte budget THIS primary-key cache is bounded by — half the per-table figure on a sharded table, and already clamped by whatever the fleet has left. An exact keyset crossing it degrades to a bloom (upsert) or is dropped (exact-answer tables). The process-global ceiling is `cayenne_fleet_budget_limit_bytes{budget=\"pk_keyset\"}`. 0 when unbounded.",
                     )
                     .with_unit("By")
                     .build()
@@ -2911,8 +2942,15 @@ pub mod cayenne {
             .record(budget_bytes, dimensions);
     }
 
-    /// Publishes which representation a primary-key index holds and how many
-    /// keys it carries. `dimensions` carries `table` and `site`.
+    /// Publishes which representation one primary-key cache holds and how many
+    /// keys it covers. `dimensions` carries `table` and `site`.
+    ///
+    /// Reported per cache because the two caches transition independently, and
+    /// because a divergence in their key counts is itself a signal: they are
+    /// meant to cover the same key set in different layouts, so a gap between
+    /// them means one is stale. A per-table maximum would hide exactly that.
+    /// Do NOT sum `keys` across `site` — it double-counts every key. (Bytes do
+    /// sum; keys do not.)
     pub fn track_pk_index_shape(format: CayennePkIndexFormat, keys: u64, dimensions: &[KeyValue]) {
         PK_INDEX_FORMAT
             .get_or_init(|| {
@@ -2929,7 +2967,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_keys")
                     .with_description(
-                        "Live keys a Cayenne primary-key existence index holds — exact entries, or a bloom's inserted-key count.",
+                        "Keys one Cayenne primary-key existence cache covers — exact entries, or a bloom's inserted-key count. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
                     )
                     .with_unit("keys")
                     .build()
@@ -2937,49 +2975,38 @@ pub mod cayenne {
             .record(keys, dimensions);
     }
 
-    /// A table's primary-key bloom filter density, sampled on the background
+    /// One primary-key cache's bloom density, sampled on the background
     /// maintenance tick.
+    ///
+    /// No key count of its own: it is the same set `cayenne_pk_index_keys`
+    /// reports for this `site`, and a second series for it would invite the two
+    /// to be summed.
     #[derive(Debug, Clone, Copy)]
     pub struct CayennePkBloomState {
-        /// Keys inserted into the filter — the denominator for
-        /// [`Self::bits_per_key`] and the staleness ratio against the table's
-        /// live row count.
-        pub inserted_keys: u64,
-        /// Filter bits allocated per inserted key. The configured target is
-        /// single-digit; a filter sitting an order of magnitude above it is
-        /// over-allocated, and on a large table that gap is the difference
-        /// between a filter that fits in memory and one that does not.
-        pub bits_per_key: f64,
-        /// Total bits the filter allocates.
+        /// Bits allocated by this cache's filter, or summed across its per-shard
+        /// filters — every one of them is resident.
         pub bits: u64,
+        /// Allocated bits per key covered by this cache. The configured target is
+        /// single-digit; an order of magnitude above it is over-allocation, and
+        /// on a large table that gap is the difference between a filter that
+        /// fits in memory and one that does not.
+        pub bits_per_key: f64,
     }
 
-    static PK_BLOOM_INSERTED_KEYS: OnceLock<Gauge<u64>> = OnceLock::new();
     static PK_BLOOM_BITS_PER_KEY: OnceLock<Gauge<f64>> = OnceLock::new();
     static PK_BLOOM_BITS: OnceLock<Gauge<u64>> = OnceLock::new();
 
-    /// Publishes the primary-key bloom density gauges. `dimensions` carries
-    /// `table` and `site`; emit only when
-    /// [`CayennePkIndexFormat::Bloom`] is the live format, so an exact index does
-    /// not leave a stale density behind.
+    /// Publishes one cache's bloom density gauges. `dimensions` carries `table`
+    /// and `site`. Emit on every sample, ZEROED when that cache holds no bloom:
+    /// a skipped gauge keeps its last value, so a cache that rebuilt an exact
+    /// index would go on reporting a filter that no longer exists.
     pub fn track_pk_bloom(state: CayennePkBloomState, dimensions: &[KeyValue]) {
-        PK_BLOOM_INSERTED_KEYS
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_pk_bloom_inserted_keys")
-                    .with_description(
-                        "Keys inserted into a Cayenne table's primary-key bloom filter.",
-                    )
-                    .with_unit("keys")
-                    .build()
-            })
-            .record(state.inserted_keys, dimensions);
         PK_BLOOM_BITS_PER_KEY
             .get_or_init(|| {
                 operational_meter()
                     .f64_gauge("cayenne_pk_bloom_bits_per_key")
                     .with_description(
-                        "Bits a Cayenne table's primary-key bloom filter allocates per inserted key. Compare against the configured target — a filter far above it is over-allocated, and its resident bytes scale with the gap.",
+                        "Bits one Cayenne primary-key cache's bloom filters allocate per key it covers. Compare against the configured target — far above it is over-allocation, and resident bytes scale with the gap.",
                     )
                     .with_unit("bits")
                     .build()
@@ -2990,7 +3017,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_bloom_bits")
                     .with_description(
-                        "Total bits a Cayenne table's primary-key bloom filter allocates.",
+                        "Bits one Cayenne primary-key cache's bloom filters allocate (summed across its per-shard filters).",
                     )
                     .with_unit("bits")
                     .build()
