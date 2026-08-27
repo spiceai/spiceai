@@ -859,13 +859,18 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
+      # The backstop, kept behind the assertion `setup-rust` now makes before
+      # anything is compiled: this one can still catch a lock cargo rewrote during
+      # the run for a reason resolution alone would not have refused. What it
+      # cannot do is be the *first* report — reaching this step means the whole
+      # suite has already run, which is why the early check exists.
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           if git diff --exit-code Cargo.lock; then
             echo "Cargo.lock is up to date"
           else
-            echo "Update Cargo.lock"
+            echo "::error::Cargo.lock changed while this job ran, so the committed lockfile does not describe this tree. Run any cargo command on the branch, commit the regenerated Cargo.lock, and re-queue. The diff above is what cargo rewrote."
             exit 1
           fi
 

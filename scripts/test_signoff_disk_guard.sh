@@ -355,6 +355,155 @@ assert_preflight_targets "every sign-off make target resolves in the repo's own 
   "$(cd "$script_dir/.." && pwd)" 0 ""
 
 echo
+echo "preflight_lockfile"
+# The third preflight, and the third way to reach "the checks reached no
+# verdict": Cargo.lock no longer describes the manifests, so cargo has to rewrite
+# it before anything can build. A stub `cargo` stands in for the real resolution —
+# the question here is what the guard does with each answer cargo can give, and
+# resolving a 700-crate workspace for real would turn these tests into a build.
+lock_dir="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$fixture_dir" "$lock_dir"' EXIT
+
+cargo_stub_dir="$lock_dir/bin"
+mkdir -p "$cargo_stub_dir"
+# STUB_CARGO_ERR is what cargo prints on stderr; STUB_CARGO_RC is its status.
+# Both default to a clean pass, so a case only states what it changes.
+cat >"$cargo_stub_dir/cargo" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ -n "${STUB_CARGO_ERR:-}" ]]; then
+  printf '%s\n' "${STUB_CARGO_ERR}" >&2
+fi
+exit "${STUB_CARGO_RC:-0}"
+STUB
+chmod +x "$cargo_stub_dir/cargo"
+
+# $3 is the exit status preflight_lockfile should return: 0 to proceed, 72 to stop.
+assert_preflight_lock() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result rc output
+  result="$(call_subject_in "$dir" 'preflight_lockfile' \
+    "PATH=$cargo_stub_dir:$PATH" GITHUB_STEP_SUMMARY="$summary" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" ]]; then
+    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
+      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
+      return
+    fi
+  fi
+  echo "  ok: $name"
+}
+
+# Asserts an explanation is *absent*. For the "cargo broke for another reason"
+# cases the failure worth guarding against is not a wrong status but a wrong
+# story: a guard that blames the lockfile for every cargo failure sends the
+# reader to regenerate a file that was never the problem.
+assert_preflight_lock_silent_on() {
+  local name="$1" dir="$2" unwanted="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result output
+  result="$(call_subject_in "$dir" 'preflight_lockfile' \
+    "PATH=$cargo_stub_dir:$PATH" GITHUB_STEP_SUMMARY="$summary" "$@")"
+  output="${result#*|}"
+
+  if [[ "$output" == *"$unwanted"* ]] || grep -qF "$unwanted" "$summary"; then
+    fail_test "$name: did not expect '${unwanted}', got '${output}' / '$(cat "$summary")'"
+    return
+  fi
+  echo "  ok: $name"
+}
+
+with_lock_dir="$lock_dir/with-lock"
+mkdir -p "$with_lock_dir"
+printf 'version = 4\n' >"$with_lock_dir/Cargo.lock"
+no_lock_dir="$lock_dir/no-lock"
+mkdir -p "$no_lock_dir"
+
+# The wording cargo 1.96 uses, and the wording earlier releases used. The guard
+# matches on `--locked was passed` rather than either whole sentence: pinned to
+# one phrasing it would silently stop guarding on a toolchain bump, and both
+# spellings name the flag.
+readonly LOCKED_REFUSAL='error: cannot update the lock file /w/Cargo.lock because --locked was passed to prevent this'
+readonly LOCKED_REFUSAL_OLD='error: the lock file /w/Cargo.lock needs to be updated but --locked was passed to prevent this'
+
+assert_preflight_lock "proceeds when the lockfile still matches" "$with_lock_dir" 0 ""
+# A directory with no lockfile is not one this guard has an opinion about.
+assert_preflight_lock "proceeds when there is no Cargo.lock" "$no_lock_dir" 0 "" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+
+# The shape this exists for: one PR bumps the version in [workspace.package]
+# while another adds a member, git merges both cleanly because they touch
+# different regions of the lockfile, and the combination is stale. Neither author
+# can see it, because on a pull request `Attestation` is the only job that runs.
+assert_preflight_lock "stops a branch whose lockfile is stale" "$with_lock_dir" 72 \
+  "no longer matches the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+assert_preflight_lock "recognises the older cargo wording too" "$with_lock_dir" 72 \
+  "no longer matches the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_OLD"
+assert_preflight_lock "says the branch was not evaluated" "$with_lock_dir" 72 \
+  "not evaluated" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+assert_preflight_lock "names the remedy rather than only the symptom" "$with_lock_dir" 72 \
+  "commit it, and sign off again" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+# Fatal locally as well as remotely: unlike the disk floor this is not a
+# threshold someone may reasonably run under, it is a step certain to fail after
+# the whole gate has run.
+assert_preflight_lock "stops a local run as well as a remote one" "$with_lock_dir" 72 \
+  "no longer matches the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+assert_preflight_lock "annotates a remote stop for the run page" "$with_lock_dir" 72 \
+  "::error title=Sign-off cannot run on this branch::" \
+  SIGNOFF_REMOTE_RUN=1 STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+
+# The other direction, and the one that matters more. An unreachable registry, a
+# manifest cargo cannot parse, a missing rustc — the gate itself reports all of
+# those minutes later with context this step does not have.
+assert_preflight_lock "proceeds when cargo failed for another reason" "$with_lock_dir" 0 \
+  "could not check whether Cargo.lock is current" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
+assert_preflight_lock_silent_on "does not call an unrelated cargo failure a stale lockfile" \
+  "$with_lock_dir" "no longer matches the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
+# `--locked` appearing in unrelated output is not cargo refusing to rewrite the
+# lock; the refusal names the flag as *passed*.
+assert_preflight_lock "does not read a mention of --locked as a refusal" "$with_lock_dir" 0 \
+  "could not check whether Cargo.lock is current" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: unexpected argument '--locked-x' found"
+
+# No cargo at all is the same class of answer as no lockfile: the guard has
+# nothing to read, and refusing a sign-off over its own missing tool would be a
+# check deciding a verdict it never computed.
+#
+# The PATH below keeps bash reachable and drops cargo. It cannot simply be
+# emptied: call_subject_in runs the subject through `env PATH=... bash -c`, so a
+# PATH without bash fails to start the shell at all and the case would pass for
+# the wrong reason. Naming the directory bash itself came from keeps that
+# independent of where this runs, and cargo lives under ~/.cargo/bin rather than
+# beside bash.
+bash_dir="$(dirname "$(command -v bash)")"
+assert_preflight_lock "proceeds when cargo is unavailable" "$with_lock_dir" 0 "" \
+  "PATH=$bash_dir"
+
+echo
 echo "run_make_step + build_hit_disk_full"
 # The watcher has to notice the linker's death without swallowing make's own
 # exit status, and without eating the output the Actions log shows the reader.
@@ -662,6 +811,21 @@ assert_failure_kind "keeps a missing make target distinct with a cache hit recor
 # ...and it must not swallow a genuinely signalled run, which is decided first.
 assert_failure_kind "a signalled run stays signalled, not a missing target" 143 "signalled" \
   STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The fourth way, and the newest: the lockfile preflight refused to start because
+# Cargo.lock no longer describes the manifests. Same requirement as
+# missing-target — it must stay distinct from "checks", or the status reads as a
+# lint denial for a run that compiled nothing at all.
+assert_failure_kind "calls a stale lockfile its own kind, not a check failure" 72 "stale-lockfile" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+# The preflight refused before anything ran, so no later reading may overrule it.
+assert_failure_kind "keeps a stale lockfile distinct on a near-empty volume" 72 "stale-lockfile" \
+  STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a stale lockfile distinct with a cache hit recorded" 72 "stale-lockfile" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and it must not swallow a genuinely signalled run, which is decided first.
+assert_failure_kind "a signalled run stays signalled, not a stale lockfile" 72 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -877,6 +1041,20 @@ assert_describe "tells the author to merge trunk in" 71 \
 # outranks naming a cause — the missing-target wording would assert the gate
 # reached one.
 assert_describe "declines the missing-target verdict for a signalled run" 71 "" \
+  "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# A branch whose lockfile is stale has the same problem as one that predates a
+# gate target: the commit-status description is all most readers see, and worded
+# as a check failure it sends them looking for a lint denial in a log containing
+# no compilation. The remedy has to be in the description itself.
+assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
+  "Sign-off could not run after 21195s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by someone)" \
+  "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "tells the author to regenerate and commit the lockfile" 72 \
+  "Sign-off could not run after 21195s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by someone)" \
+  "regenerate and commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
+# And, as for missing-target, "no verdict" outranks naming a cause.
+assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
   "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 echo
 

@@ -793,6 +793,10 @@ readonly EXIT_DISK_EXHAUSTED=70
 # the gate invokes, so the checks could not be run at all — see
 # preflight_make_targets.
 readonly EXIT_MAKE_TARGET_MISSING=71
+# run_checks returns this when Cargo.lock no longer describes the workspace
+# manifests, so cargo would have to rewrite it before anything could be built —
+# see preflight_lockfile.
+readonly EXIT_LOCKFILE_STALE=72
 # Bash reports a foreground child killed by signal N as 128+N, and run_make_step
 # returns make's own status untouched. So a status at or above this means `make`
 # never reached a verdict of its own — the process tree was signalled. That is
@@ -1092,7 +1096,8 @@ watch_for_signals() {
 # Names what broke in a check run that did not pass, given run_checks' exit
 # status: "signalled" when nothing judged the branch at all, "disk" when the work
 # volume is the cause, "cache" when sccache could not reach its storage and so
-# nothing was compiled, "checks" for everything else, which is the branch. Three
+# nothing was compiled, "missing-target" and "stale-lockfile" when a preflight
+# refused to start, "checks" for everything else, which is the branch. Three
 # ways to reach "disk", in falling order of authority: the preflight refused to
 # start, the build said so itself, or the volume is at ~0 now. The last is a
 # backstop for a build whose output we did not record — a local run, or a remote
@@ -1130,6 +1135,13 @@ failure_kind() {
   # can describe it better than the preflight that refused to start.
   if [[ "$check_status" -eq "$EXIT_MAKE_TARGET_MISSING" ]]; then
     echo "missing-target"
+    return
+  fi
+
+  # And the third preflight, for the same reason: this run stopped before it
+  # compiled anything, so nothing a later reading could offer describes it better.
+  if [[ "$check_status" -eq "$EXIT_LOCKFILE_STALE" ]]; then
+    echo "stale-lockfile"
     return
   fi
 
@@ -1214,6 +1226,15 @@ describe_check_failure() {
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — branch predates a make target the gate needs; merge ${LINT_BASE_BRANCH} in (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — this branch's \`Makefile\` has no rule for a target the gate invokes, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Merge \`${LINT_BASE_BRANCH}\` into the branch and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: this branch's Makefile has no rule for a target the gate invokes (the checks did not run) — merge ${LINT_BASE_BRANCH} in and sign off again"
+      ;;
+    stale-lockfile)
+      # Same shape as missing-target: the runner is fine, the code was never
+      # judged, and the remedy is one command. Without its own case this reads as
+      # "Sign-off checks failed", which sends the author looking for a lint denial
+      # in a log that contains no compilation at all.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — cargo would have to rewrite \`Cargo.lock\` to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run any cargo command on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock does not match the workspace manifests (the checks did not run) — regenerate and commit it, then sign off again"
       ;;
     *)
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
@@ -1376,6 +1397,74 @@ preflight_disk() {
   return "$EXIT_DISK_EXHAUSTED"
 }
 
+# Stop before the Rust checks when Cargo.lock no longer describes the manifests.
+#
+# `pr.yml` already asks this question, in `Check if Cargo.lock is updated` — the
+# last step of `Build and Test`, after the whole suite has run. So a branch whose
+# lockfile is stale builds for the better part of an hour, passes everything, and
+# then fails on a `git diff` of a file cargo rewrote on its way past. In the merge
+# queue that ejects the batch, and the batch is where this shape of staleness is
+# born: one PR changes a manifest version while another adds or renames a member,
+# git merges both cleanly because they touch different regions, and nothing
+# regenerates the lock for the combination. Neither author can see it, because on
+# a pull request `Attestation` is the only job that runs.
+#
+# So the sign-off gate is the first place it *can* be seen, and asking cargo to
+# resolve without permission to rewrite the lock answers it in seconds.
+#
+# `--locked` rather than a hand-rolled version comparison, because the comparison
+# is cargo's resolution: members inherit versions from `[workspace.package]`,
+# dependencies resolve through `[patch]` tables, and reimplementing that would be
+# a second resolver to keep in step with the first.
+#
+# Fatal on local runs too, for preflight_make_targets' reason: this is not a
+# threshold someone may reasonably run under, it is a step certain to fail later.
+preflight_lockfile() {
+  local out rc=0
+
+  [[ -f Cargo.lock ]] || { debug "no Cargo.lock in this workspace — nothing to check"; return 0; }
+  if ! command -v cargo >/dev/null 2>&1; then
+    info "cargo not found — skipping the Cargo.lock freshness check"
+    return 0
+  fi
+
+  # Captured with `|| rc=$?` rather than read from $? on the next line: this
+  # script runs under `set -e`, and a bare failing assignment would abort the
+  # run on cargo status before the guard could decide what it meant.
+  out="$(cargo metadata --locked --format-version 1 2>&1 >/dev/null)" || rc=$?
+  if (( rc == 0 )); then
+    debug "Cargo.lock still describes the workspace manifests"
+    return 0
+  fi
+
+  # Only cargo's own refusal to rewrite the lock is a verdict about the branch.
+  # Every other failure — an unreachable registry, a manifest cargo cannot read
+  # at all, a missing rustc — is either infrastructure or something the gate
+  # itself reports with far better context a few minutes later, and calling it a
+  # stale lockfile here would send the reader to the wrong fix. The wording has
+  # changed across cargo releases ("cannot update the lock file … because
+  # --locked was passed", "the lock file … needs to be updated but --locked was
+  # passed"); both name the flag, so match on that rather than on a whole phrase.
+  if [[ "$out" != *"--locked was passed"* ]]; then
+    info "warning: could not check whether Cargo.lock is current (cargo metadata exited ${rc} for another reason) — skipping that check"
+    debug "cargo metadata --locked said: ${out}"
+    return 0
+  fi
+
+  local remedy="Run 'cargo metadata --locked' on the branch to see it, then run any cargo command to regenerate Cargo.lock, commit it, and sign off again."
+  info "${NO} Cargo.lock no longer matches the workspace manifests."
+  info "  Cargo would have to rewrite the lockfile to build this branch, so the gate would run to"
+  info "  completion and then fail on 'Check if Cargo.lock is updated'. The branch was not evaluated."
+  info "  ${remedy}"
+  if is_remote_run; then
+    # Same reasoning as the other two preflights': a failed step does not show
+    # its summary on the run page, so the annotation is what an operator reads.
+    echo "::error title=Sign-off cannot run on this branch::Cargo.lock no longer matches the workspace manifests, so cargo would have to rewrite it. The branch was not evaluated. ${remedy}"
+  fi
+  append_step_summary "### Preflight: Cargo.lock is out of date"$'\n'"Cargo would have to rewrite \`Cargo.lock\` to build this branch, so **the checks did not run and the branch was not evaluated** — this is not a statement about the code. ${remedy}"$'\n'
+  return "$EXIT_LOCKFILE_STALE"
+}
+
 # Unit tests for the packages a branch touched, run before the full workspace
 # lint. A broken test in the crate you just edited is the likeliest failure, and
 # it would otherwise surface only after the longest step in the gate.
@@ -1459,6 +1548,9 @@ run_checks() {
   # the disk floor cannot: whether this branch can run the gate at all.
   preflight_make_targets || return $?
   preflight_disk || return $?
+  # Last of the three: it is the only one that costs a cargo resolution pass
+  # (~10s warm), so the two that answer in milliseconds get to refuse first.
+  preflight_lockfile || return $?
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
