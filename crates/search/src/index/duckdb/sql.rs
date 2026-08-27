@@ -262,6 +262,16 @@ mod tests {
         ))
     }
 
+    /// A `docs` schema carrying one timezone-aware microsecond `ts` column — the resolved type
+    /// that declines the UTC normalization, so a guard on the literal sees the literal alone.
+    fn aware_ts_schema() -> SchemaRef {
+        docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )])
+    }
+
     /// A whole-second timestamp literal, whose count DuckDB has to scale to microseconds before it
     /// can hold it.
     fn seconds_literal(seconds: i64) -> Expr {
@@ -466,11 +476,7 @@ mod tests {
     /// projects `id` alone, so this also covers a filter on a column the projection drops.
     #[test]
     fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
         let sql = flat_sql(&schema, &filter).expect("SQL should build");
@@ -496,11 +502,7 @@ mod tests {
     /// below. That is the whole error, which is why this pins the literal rather than a tolerance.
     #[test]
     fn a_timestamp_past_the_f64_integer_bound_names_the_microsecond_it_holds() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let past_2255 = 9_007_199_254_740_993_i64;
         let filter = col("ts").gt(micros_literal(past_2255));
 
@@ -522,11 +524,7 @@ mod tests {
     /// applying the filter itself, which is correct and merely slower.
     #[test]
     fn a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let seconds_schema = docs_schema(vec![Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
@@ -552,16 +550,14 @@ mod tests {
         }
     }
 
-    /// The positive control for the refusal above: `i64::MIN` is not one of the sentinels, and
-    /// DuckDB round-trips it as the finite instant it is. A guard that only pinned the refusals
-    /// would be satisfied by a renderer that declined every timestamp.
+    /// The positive control for the refusal above: `i64::MIN` is not one of the sentinels — the
+    /// fork measures DuckDB round-tripping it as the finite instant it is — so it must still
+    /// render. A guard that only pinned the refusals would be satisfied by a renderer that
+    /// declined every timestamp, and the over-refusal that would cost is silent: the filter simply
+    /// stops being pushed down.
     #[test]
     fn the_smallest_microsecond_count_is_finite_and_still_renders() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let filter = col("ts").gt(micros_literal(i64::MIN));
 
         assert_eq!(
