@@ -557,54 +557,195 @@ assert_preflight_lock "quotes what cargo actually said" "$with_lock_dir" 72 \
   "cannot create the lock file" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_MISSING"
 
+
 # Drift detector. Everything above feeds the guard hand-written strings, so none of
 # it would notice cargo rewording its `--locked` diagnostic — the guard would stop
-# guarding, silently, on a toolchain bump. These cases drive the *installed* cargo
-# against fixtures that really are stale and really are missing a lockfile, so the
-# wording is checked rather than assumed. A crate with no dependencies resolves
-# with no network in well under a second, which is what keeps this affordable here.
-if command -v cargo >/dev/null 2>&1; then
+# guarding, silently, on a toolchain bump. These cases drive a real cargo against
+# fixtures that really are stale and really are missing a lockfile.
+#
+# The toolchain matters and is easy to get wrong: rustup picks a toolchain from the
+# *current directory's* rust-toolchain.toml, so a fixture under $TMPDIR gets the
+# runner's default cargo rather than the one this repository pins — measured on one
+# machine as 1.97.1 in the temp directory against the pinned 1.96.1 at the repo
+# root. Testing the wrong cargo's wording is indistinguishable from testing none,
+# so RUSTUP_TOOLCHAIN is set from rust-toolchain.toml explicitly.
+#
+# And a skip is not a pass. In CI, being unable to exercise this is fatal: the whole
+# point is that the guard cannot quietly stop working, and "the fixture did not run"
+# is exactly how it would.
+lock_repo_root="$(cd "$script_dir/.." && pwd)"
+lock_pinned_toolchain=""
+if [[ -f "$lock_repo_root/rust-toolchain.toml" ]]; then
+  lock_pinned_toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' \
+    "$lock_repo_root/rust-toolchain.toml")"
+fi
+
+# Report a fixture that could not run. Fatal under GITHUB_ACTIONS, where a silent
+# skip would retire the check; a local developer without the pinned toolchain
+# installed gets a loud notice and keeps working.
+lock_fixture_unavailable() {
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    fail_test "cargo drift fixture could not run in CI: $1"
+  else
+    skipped=$((skipped + 1))
+    echo "  SKIP: $1"
+  fi
+}
+
+if [[ -z "$lock_pinned_toolchain" ]]; then
+  lock_fixture_unavailable "no channel found in rust-toolchain.toml, so the pinned cargo cannot be selected"
+elif ! RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" cargo --version >/dev/null 2>&1; then
+  lock_fixture_unavailable "the pinned toolchain ${lock_pinned_toolchain} is not installed here"
+else
+  echo "  (cargo drift fixture pinned to ${lock_pinned_toolchain}: $(RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" cargo --version))"
   real_dir="$lock_dir/real-cargo"
   mkdir -p "$real_dir/src"
   printf 'fn main() {}\n' >"$real_dir/src/main.rs"
+  # `[workspace]` in the fixture's own manifest so it is its own workspace root
+  # wherever it sits, rather than a stray member of whatever encloses it.
   write_fixture_manifest() {
-    printf '[package]\nname = "lockdrift"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' \
+    printf '[workspace]\n\n[package]\nname = "lockdrift"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' \
       "$1" >"$real_dir/Cargo.toml"
   }
 
-  # No lockfile yet — the missing case, before one is generated.
+  # No lockfile yet — the missing case, before one is generated. Cargo words this
+  # "cannot create" rather than "cannot update", which is why the guard matches the
+  # flag and not a phrase.
   write_fixture_manifest 0.2.0
-  assert_preflight_lock_real "the installed cargo refuses a missing lockfile" \
-    "$real_dir" 72 "does not describe the workspace manifests"
+  assert_preflight_lock_real "the pinned cargo refuses a missing lockfile" \
+    "$real_dir" 72 "does not describe the workspace manifests" \
+    RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
 
-  if (cd "$real_dir" && cargo generate-lockfile --offline >/dev/null 2>&1); then
-    assert_preflight_lock_real "the installed cargo accepts a matching lockfile" \
-      "$real_dir" 0 ""
+  if (cd "$real_dir" && RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" \
+      cargo generate-lockfile --offline >/dev/null 2>&1); then
+    assert_preflight_lock_real "the pinned cargo accepts a matching lockfile" \
+      "$real_dir" 0 "" RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
     # Bump the version the lockfile just recorded, so the lock is stale in exactly
     # the way #13598's merge was.
     write_fixture_manifest 0.3.0
-    assert_preflight_lock_real "the installed cargo's stale-lock refusal is recognised" \
-      "$real_dir" 72 "does not describe the workspace manifests"
+    assert_preflight_lock_real "the pinned cargo's stale-lock refusal is recognised" \
+      "$real_dir" 72 "does not describe the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
   else
-    skipped=$((skipped + 1))
-    echo "  SKIP: cargo generate-lockfile --offline failed; the stale-lock drift cases did not run"
+    lock_fixture_unavailable "cargo generate-lockfile --offline failed, so the stale-lock fixture could not be built"
   fi
 
   # Invoked from a member directory rather than the workspace root. Cargo walks up
   # and reads the root lockfile, so the guard must not read "no lockfile beside me"
   # as "this branch has no lockfile" — that would refuse every sign-off run from a
   # subdirectory with a diagnosis that is simply false.
-  member_dir="$(cd "$script_dir/.." && pwd)/crates"
-  if [[ -f "$(cd "$script_dir/.." && pwd)/Cargo.lock" && -d "$member_dir" ]]; then
+  if [[ -f "$lock_repo_root/Cargo.lock" && -d "$lock_repo_root/crates" ]]; then
     assert_preflight_lock_real "reads the root lockfile from a member directory" \
-      "$member_dir" 0 ""
+      "$lock_repo_root/crates" 0 "" RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
   else
-    skipped=$((skipped + 1))
-    echo "  SKIP: no root Cargo.lock in this checkout; the member-directory case did not run"
+    lock_fixture_unavailable "no root Cargo.lock in this checkout, so the member-directory case could not run"
   fi
+fi
+
+# The two copies of this guard have to agree on the phrase they match, or one of
+# them stops guarding while the tests still pass. Asserted against the files
+# themselves because nothing else connects them.
+tests_run=$((tests_run + 1))
+if grep -q -- '--locked was passed' "$subject" \
+  && grep -q -- '--locked was passed' "$lock_repo_root/.github/workflows/pr.yml"; then
+  echo "  ok: scripts/signoff and pr.yml match on the same cargo phrase"
 else
-  skipped=$((skipped + 1))
-  echo "  SKIP: no cargo on PATH; the cargo-wording drift cases did not run"
+  fail_test "scripts/signoff and .github/workflows/pr.yml no longer match on '--locked was passed'"
+fi
+
+# And the preflight has to actually be wired into the gate: a function nothing
+# calls is a test suite passing over dead code.
+tests_run=$((tests_run + 1))
+if awk '/^run_checks\(\) \{/{f=1} f && /preflight_lockfile \|\| return/{found=1} f && /^\}/{exit} END{exit !found}' \
+  "$subject"; then
+  echo "  ok: run_checks invokes preflight_lockfile"
+else
+  fail_test "run_checks no longer invokes preflight_lockfile"
+fi
+tests_run=$((tests_run + 1))
+if awk '/^run_checks\(\) \{/{f=1} f && /postcheck_lockfile "\$lock_before" \|\| return/{found=1} f && /^\}/{exit} END{exit !found}' \
+  "$subject"; then
+  echo "  ok: run_checks invokes postcheck_lockfile"
+else
+  fail_test "run_checks no longer invokes postcheck_lockfile"
+fi
+
+echo
+echo "postcheck_lockfile"
+# The other half of the preflight, and the reason the preflight is allowed to fail
+# open: `lint-rust` and `nextest` invoke cargo *without* `--locked`, so on a cargo
+# error the preflight could not read, cargo quietly brings the lockfile up to date
+# while the gate runs — and the run would then post `signoff=success` for a HEAD
+# whose committed lockfile does not describe it.
+#
+# Driven against a real git repository rather than a stub `git`: the distinction
+# that matters is between git's own notions of modified, deleted and untracked,
+# which is precisely what a stub would have to reimplement to be worth anything.
+postcheck_repo=""
+if command -v git >/dev/null 2>&1; then
+  postcheck_repo="$lock_dir/postcheck-repo"
+  mkdir -p "$postcheck_repo"
+  (
+    cd "$postcheck_repo" || exit 1
+    git init -q .
+    git config user.email t@example.com
+    git config user.name Test
+    printf 'version = 4\n' >Cargo.lock
+    printf '[workspace]\n' >Cargo.toml
+    git add Cargo.lock Cargo.toml
+    git commit -qm init
+  ) >/dev/null 2>&1 || postcheck_repo=""
+fi
+
+# $3 is the exit status postcheck_lockfile should return, $4 the snapshot to
+# compare against ("" = the lockfile was clean when the checks started).
+assert_postcheck() {
+  local name="$1" dir="$2" want_rc="$3" before="$4" want_output="${5:-}"
+  shift 5
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result rc output
+  result="$(call_subject_in "$dir" "postcheck_lockfile '${before}'" \
+    GITHUB_STEP_SUMMARY="$summary" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" ]]; then
+    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
+      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
+      return
+    fi
+  fi
+  echo "  ok: $name"
+}
+
+if [[ -z "$postcheck_repo" ]]; then
+  lock_fixture_unavailable "could not create a git fixture, so postcheck_lockfile was not exercised"
+else
+  assert_postcheck "passes when the checks left the lockfile alone" "$postcheck_repo" 0 "" ""
+  printf '\n# rewritten by cargo\n' >>"$postcheck_repo/Cargo.lock"
+  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 72 "" \
+    "rewrote Cargo.lock"
+  assert_postcheck "says the committed lockfile no longer describes the tree" \
+    "$postcheck_repo" 72 "" "does not"
+  # `signoff -f` on a tree that was already carrying lockfile edits: the run is
+  # judged on what *it* changed, not on what it inherited. Without the snapshot
+  # this case would refuse every forced sign-off on a lockfile edit in progress.
+  assert_postcheck "ignores lockfile edits the tree already carried" "$postcheck_repo" 0 \
+    " M Cargo.lock" ""
+  # A lockfile deleted in the commit and recreated by cargo is untracked, not
+  # modified — the state `git diff` cannot see, which is why lockfile_status asks
+  # for --untracked-files=all.
+  (cd "$postcheck_repo" && git rm -q --cached Cargo.lock && printf 'version = 4\n' >Cargo.lock) >/dev/null 2>&1
+  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 72 "" \
+    "rewrote Cargo.lock"
 fi
 
 echo

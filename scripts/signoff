@@ -1493,6 +1493,52 @@ preflight_lockfile() {
   return "$EXIT_LOCKFILE_STALE"
 }
 
+# What `git` says about Cargo.lock right now, or the empty string when git cannot
+# answer (a JJ workspace, no repository, no git). `--untracked-files=all` because
+# the interesting states include one `git diff` cannot see: a lockfile deleted in
+# the commit and recreated by cargo is *untracked*, not modified.
+lockfile_status() {
+  # Asked of git directly rather than through $VCS: this runs before detect_vcs on
+  # some paths, and an uninitialised $VCS would silently answer "no lockfile news"
+  # — which is the one answer that must never be a guess. A colocated JJ workspace
+  # has a .git and is answered correctly; a non-colocated one has none and skips.
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+  git status --porcelain --untracked-files=all -- Cargo.lock 2>/dev/null || true
+}
+
+# Refuse a sign-off whose own checks rewrote Cargo.lock.
+#
+# preflight_lockfile fails open on a cargo error it does not recognise — an
+# unreachable registry, or a reworded `--locked` diagnostic after a toolchain bump
+# — because reporting infrastructure as a stale lockfile sends the reader to the
+# wrong fix. But failing open means the gate then runs `lint-rust` and `nextest`,
+# which invoke cargo *without* `--locked`, and cargo will quietly bring the
+# lockfile up to date on its way past. Without this the run would pass and post
+# `signoff=success` for a HEAD whose committed lockfile does not describe it, and
+# the merge queue would be the first to notice — which is the whole failure this
+# change exists to move earlier.
+#
+# Compared against a snapshot taken before the checks rather than against "clean",
+# so `scripts/signoff -f` on a tree that was already carrying lockfile edits is
+# judged on what *this run* changed.
+postcheck_lockfile() {
+  local before="$1" after
+  after="$(lockfile_status)"
+  [[ "$after" != "$before" ]] || return 0
+
+  local remedy="Commit the regenerated Cargo.lock and sign off again."
+  info "${NO} The checks rewrote Cargo.lock (git status: ${after:-clean} — was: ${before:-clean})."
+  info "  Cargo brought the lockfile up to date while the gate ran, so the committed one does not"
+  info "  describe the tree these checks passed on, and the merge queue would reject it."
+  info "  ${remedy}"
+  if is_remote_run; then
+    echo "::error title=Sign-off cannot attest this branch::The checks rewrote Cargo.lock, so the committed lockfile does not describe the tree they passed on. ${remedy}"
+  fi
+  append_step_summary "### Cargo.lock was rewritten by the checks"$'\n'"Cargo brought \`Cargo.lock\` up to date while the gate ran, so the committed one does not describe the tree these checks passed on and **the merge queue would reject it**. ${remedy}"$'\n'
+  return "$EXIT_LOCKFILE_STALE"
+}
+
 # Unit tests for the packages a branch touched, run before the full workspace
 # lint. A broken test in the crate you just edited is the likeliest failure, and
 # it would otherwise surface only after the longest step in the gate.
@@ -1568,7 +1614,7 @@ run_checks() {
     return 0
   fi
 
-  # Both preflights sit after the Rust-changes skip for the same reason: a
+  # The preflights all sit after the Rust-changes skip for the same reason: a
   # docs-only sign-off invokes no make target and compiles nothing, so neither a
   # full volume nor a Makefile predating one of them is a reason to refuse it.
   #
@@ -1579,6 +1625,11 @@ run_checks() {
   # Last of the three: it is the only one that costs a cargo resolution pass
   # (~10s warm), so the two that answer in milliseconds get to refuse first.
   preflight_lockfile || return $?
+  # Snapshot the lockfile now, while the preflight has just vouched for it, so the
+  # post-check below can tell what the checks changed from what the tree already
+  # carried under a forced run.
+  local lock_before
+  lock_before="$(lockfile_status)"
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
@@ -1630,6 +1681,11 @@ run_checks() {
   # knobs default to 1.0 (full depth) when unset, so this only affects this gate.
   CAYENNE_PROPTEST_SCALE=0.25 CAYENNE_PROPTEST_OPS_SCALE=0.25 \
     run_make_step nextest verify-cli || return $?
+
+  # The other half of the preflight: it fails open on a cargo error it cannot
+  # read, and the make steps above run cargo unlocked, so this is what stops a
+  # rewritten lockfile from being attested as if it were the committed one.
+  postcheck_lockfile "$lock_before" || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
