@@ -789,12 +789,14 @@ jobs:
       # combination is stale. Neither author can see it first, because on a pull
       # request `Attestation` is the only job that runs.
       #
-      # `--locked` is cargo's own resolution with permission to rewrite the lock
+      # `--locked` is cargo's own resolution with permission to write the lock
       # withheld, so this is the resolver answering about itself rather than a
       # hand-rolled version diff — members inherit versions from
       # `[workspace.package]` and dependencies resolve through `[patch]` tables, and
       # reimplementing that would be a second resolver to keep in step with the
-      # first. (`cargo update --workspace --locked` is a plausible cheaper oracle;
+      # first. It also covers a *missing* lockfile without a special case, which the
+      # backstop below cannot: cargo calls that a `--locked` violation in the same
+      # words. (`cargo update --workspace --locked` is a plausible cheaper oracle;
       # not adopted here because it has not been measured on this workspace.)
       #
       # This job only: the same batch left `Rust Lint` and `Build (release profile)`
@@ -812,48 +814,38 @@ jobs:
         run: |
           set -uo pipefail
 
-          # A missing lockfile is not "nothing to check" — to cargo it is itself a
-          # `--locked` violation, and treating it as a pass opens a real hole: a
-          # branch that deletes Cargo.lock skips this step, the first unlocked cargo
-          # command recreates it as an *untracked* file, and `git diff` at the bottom
-          # of this job does not look at untracked files. Keyed on Cargo.toml so the
-          # step still no-ops anywhere that is not this workspace.
-          if [ -f Cargo.toml ] && [ ! -f Cargo.lock ]; then
-            echo "::error::Cargo.toml is present but Cargo.lock is missing, so nothing pins this build's dependency versions. Restore the lockfile (git checkout trunk -- Cargo.lock, then 'cargo update --workspace' if the manifests moved) and re-queue."
-            exit 1
-          fi
-          [ -f Cargo.lock ] || exit 0
-
           # stderr only: the metadata itself is ~700 KB of JSON nobody here reads.
           # `--color never` so escape sequences cannot land inside the phrase matched
           # below.
           if err="$(cargo metadata --locked --color never --format-version 1 2>&1 >/dev/null)"; then
+            echo "Cargo.lock describes the workspace manifests"
             exit 0
           fi
 
-          # Only cargo's own refusal to rewrite the lock is a verdict about this
-          # tree. An unreachable registry or an unparseable manifest is either
+          # Only cargo's own refusal to write the lock is a verdict about this tree.
+          # An unreachable registry or an unparseable manifest is either
           # infrastructure or something the build reports minutes later with far
-          # better context, and reporting it here as a stale lockfile would send the
-          # reader to the wrong fix. Same principle as setup-rust's awk guard: a
+          # better context, and reporting it here as a lockfile problem would send
+          # the reader to the wrong fix. Same principle as setup-rust's awk guard: a
           # check that could not run must not answer the question it was asked.
           #
-          # The wording has changed across cargo releases ("cannot update the lock
-          # file … because --locked was passed", "the lock file … needs to be updated
-          # but --locked was passed"); both name the flag, so match on that. If it
-          # changes again this step stops guarding rather than misfiring — and
-          # scripts/test_signoff_disk_guard.sh drives the *pinned* cargo against a
-          # deliberately stale fixture so that drift shows up as a failing test
+          # The wording has changed across cargo releases, and differs between the
+          # stale and missing cases ("cannot update the lock file …", "cannot create
+          # the lock file …", "the lock file … needs to be updated"); all of them
+          # name the flag as passed, so match on that. If it changes again this step
+          # stops guarding rather than misfiring, and
+          # scripts/test_signoff_disk_guard.sh drives the *installed* cargo against
+          # real stale and missing fixtures so that drift shows up as a failing test
           # instead of as a check that quietly stopped working.
           case "$err" in
             *"--locked was passed"*)
-              echo "::error::Cargo.lock no longer matches the workspace manifests, so cargo has to rewrite it before anything can build — this run would spend the whole suite and then fail 'Check if Cargo.lock is updated'. Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and re-queue. In the merge queue this usually means one PR in the batch changed a manifest version while another added or renamed a member, and nothing regenerated the lock for the combination."
+              echo "::error::Cargo.lock does not describe the workspace manifests — it is missing, or cargo has to rewrite it before anything can build. This run would otherwise spend the whole suite and then fail 'Check if Cargo.lock is updated'. Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and re-queue. In the merge queue this usually means one PR in the batch changed a manifest version while another added or renamed a member, and nothing regenerated the lock for the combination. Cargo's own message follows."
               printf '%s\n' "$err" >&2
               exit 1
               ;;
           esac
 
-          echo "::warning::Could not check whether Cargo.lock is current: cargo metadata failed for a reason other than the lockfile being stale. Read this job's own build failure, not this step."
+          echo "::warning::Could not check whether Cargo.lock is current: cargo metadata failed for a reason other than the lockfile. Read this job's own build failure, not this step."
           printf '%s\n' "$err" >&2
 
       - name: Set up Nextest

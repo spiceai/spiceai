@@ -1401,7 +1401,8 @@ preflight_disk() {
   return "$EXIT_DISK_EXHAUSTED"
 }
 
-# Stop before the Rust checks when Cargo.lock no longer describes the manifests.
+# Stop before the Rust checks when Cargo.lock does not describe the manifests —
+# including when it is not there at all.
 #
 # `pr.yml` asks this question twice now: once early in `Build and Test` (cheap and
 # named) and once at the bottom of that job as a backstop. Neither runs on a pull
@@ -1419,33 +1420,26 @@ preflight_disk() {
 # `--locked` rather than a hand-rolled version comparison, because the comparison
 # is cargo's resolution: members inherit versions from `[workspace.package]`,
 # dependencies resolve through `[patch]` tables, and reimplementing that would be
-# a second resolver to keep in step with the first.
+# a second resolver to keep in step with the first. It also means a *missing*
+# lockfile is covered without a special case — cargo calls that a `--locked`
+# violation too, in the same words ("cannot create the lock file … because
+# --locked was passed"), which matters because the pr.yml backstop cannot see one:
+# `git diff` ignores untracked files, so a branch that deletes Cargo.lock and lets
+# the first cargo command recreate it would otherwise pass everything.
 #
 # Fatal on local runs too, for preflight_make_targets' reason: this is not a
 # threshold someone may reasonably run under, it is a step certain to fail later.
 preflight_lockfile() {
   local out rc=0
 
-  # A missing lockfile is not "nothing to check" — to cargo it is itself a
-  # `--locked` violation, and treating it as a pass would let a branch that
-  # deletes Cargo.lock through the gate entirely. Keyed on Cargo.toml so the
-  # preflight still no-ops wherever this script runs outside a Cargo workspace.
-  if [[ -f Cargo.toml && ! -f Cargo.lock ]]; then
-    local restore="Restore it (git checkout ${LINT_BASE_BRANCH} -- Cargo.lock, then 'cargo update --workspace' if the manifests moved), commit it, and sign off again."
-    info "${NO} Cargo.toml is present but Cargo.lock is missing."
-    info "  Nothing pins this branch's dependency versions, so the gate would resolve them"
-    info "  freshly and attest a build no one else can reproduce. The branch was not evaluated."
-    info "  ${restore}"
-    if is_remote_run; then
-      echo "::error title=Sign-off cannot run on this branch::Cargo.toml is present but Cargo.lock is missing. The branch was not evaluated. ${restore}"
-    fi
-    append_step_summary "### Preflight: Cargo.lock is missing"$'\n'"\`Cargo.toml\` is present but \`Cargo.lock\` is not, so nothing pins this branch's dependency versions and **the checks did not run**. ${restore}"$'\n'
-    return "$EXIT_LOCKFILE_STALE"
-  fi
-  [[ -f Cargo.lock ]] || { debug "no Cargo.lock in this workspace — nothing to check"; return 0; }
+  # No manifest here means nothing to resolve. Not keyed on Cargo.lock: its
+  # absence is the condition above, not an exemption from it. Running from a
+  # member directory is fine — cargo walks up to the workspace root and reads the
+  # root lockfile, so this asks the same question wherever it is invoked.
+  [[ -f Cargo.toml ]] || { debug "no Cargo.toml here — nothing to check"; return 0; }
 
   if ! command -v cargo >/dev/null 2>&1; then
-    info "cargo not found — skipping the Cargo.lock freshness check"
+    info "cargo not found — skipping the Cargo.lock check"
     return 0
   fi
 
@@ -1460,39 +1454,42 @@ preflight_lockfile() {
     return 0
   fi
 
-  # Only cargo's own refusal to rewrite the lock is a verdict about the branch.
+  # Only cargo's own refusal to write the lock is a verdict about the branch.
   # Every other failure — an unreachable registry, a manifest cargo cannot read
   # at all, a missing rustc — is either infrastructure or something the gate
   # itself reports with far better context a few minutes later, and calling it a
-  # stale lockfile here would send the reader to the wrong fix.
+  # lockfile problem here would send the reader to the wrong fix.
   #
-  # The wording has changed across cargo releases ("cannot update the lock file …
-  # because --locked was passed", "the lock file … needs to be updated but
-  # --locked was passed"); both name the flag, so match on that rather than on a
-  # whole phrase. If it changes again this guard stops guarding rather than
-  # misfiring — and scripts/test_signoff_disk_guard.sh drives the *installed*
-  # cargo against a deliberately stale fixture, so that drift surfaces as a
-  # failing test instead of as a check that quietly stopped working.
+  # The wording has changed across cargo releases, and differs between the stale
+  # and missing cases ("cannot update the lock file … because --locked was
+  # passed", "cannot create the lock file … because --locked was passed", "the
+  # lock file … needs to be updated but --locked was passed"); all of them name
+  # the flag, so match on that rather than on a whole phrase. If it changes again
+  # this guard stops guarding rather than misfiring — and
+  # scripts/test_signoff_disk_guard.sh drives the *installed* cargo against real
+  # stale and missing fixtures, so drift surfaces as a failing test instead of as
+  # a check that quietly stopped working.
   if [[ "$out" != *"--locked was passed"* ]]; then
     info "warning: could not check whether Cargo.lock is current (cargo metadata exited ${rc} for another reason) — skipping that check"
     debug "cargo metadata --locked said: ${out}"
     return 0
   fi
 
-  # Not "run any cargo command": under this repo's own `--locked` habits, and for
-  # commands like `cargo fmt` that never resolve, most of them will not regenerate
-  # anything. Name one that does.
-  local remedy="Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and sign off again ('cargo metadata --locked' shows what cargo objects to)."
-  info "${NO} Cargo.lock no longer matches the workspace manifests."
-  info "  Cargo would have to rewrite the lockfile to build this branch, so the gate would run to"
+  # Not "run any cargo command": `cargo fmt` and `cargo --version` resolve
+  # nothing, and anything run under `--locked` is refused for this very reason.
+  # Name one that regenerates the lockfile.
+  local remedy="Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and sign off again."
+  info "${NO} Cargo.lock does not describe the workspace manifests. Cargo says:"
+  printf '%s\n' "$out" | bullet "    " >&2
+  info "  Cargo would have to write the lockfile to build this branch, so the gate would run to"
   info "  completion and then fail on 'Check if Cargo.lock is updated'. The branch was not evaluated."
   info "  ${remedy}"
   if is_remote_run; then
     # Same reasoning as the other two preflights': a failed step does not show
     # its summary on the run page, so the annotation is what an operator reads.
-    echo "::error title=Sign-off cannot run on this branch::Cargo.lock no longer matches the workspace manifests, so cargo would have to rewrite it. The branch was not evaluated. ${remedy}"
+    echo "::error title=Sign-off cannot run on this branch::Cargo.lock does not describe the workspace manifests, so cargo would have to write it. The branch was not evaluated. ${remedy}"
   fi
-  append_step_summary "### Preflight: Cargo.lock is out of date"$'\n'"Cargo would have to rewrite \`Cargo.lock\` to build this branch, so **the checks did not run and the branch was not evaluated** — this is not a statement about the code. ${remedy}"$'\n'
+  append_step_summary "### Preflight: Cargo.lock does not match the manifests"$'\n'"Cargo would have to write \`Cargo.lock\` to build this branch — it is missing, or it no longer describes these manifests — so **the checks did not run and the branch was not evaluated**. This is not a statement about the code. ${remedy}"$'\n'
   return "$EXIT_LOCKFILE_STALE"
 }
 

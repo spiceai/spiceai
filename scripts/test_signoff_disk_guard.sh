@@ -461,9 +461,14 @@ assert_preflight_lock_real() {
   echo "  ok: $name"
 }
 
+# A workspace as the guard sees one: a manifest, and a lockfile beside it. Both
+# files matter — the guard keys "is this a Cargo workspace" on Cargo.toml, because
+# the absence of Cargo.lock is the condition it reports rather than an exemption.
 with_lock_dir="$lock_dir/with-lock"
 mkdir -p "$with_lock_dir"
+printf '[workspace]\n' >"$with_lock_dir/Cargo.toml"
 printf 'version = 4\n' >"$with_lock_dir/Cargo.lock"
+# Neither file: not a Cargo workspace, so the guard has no question to ask here.
 no_lock_dir="$lock_dir/no-lock"
 mkdir -p "$no_lock_dir"
 
@@ -475,8 +480,9 @@ readonly LOCKED_REFUSAL='error: cannot update the lock file /w/Cargo.lock becaus
 readonly LOCKED_REFUSAL_OLD='error: the lock file /w/Cargo.lock needs to be updated but --locked was passed to prevent this'
 
 assert_preflight_lock "proceeds when the lockfile still matches" "$with_lock_dir" 0 ""
-# A directory with no lockfile is not one this guard has an opinion about.
-assert_preflight_lock "proceeds when there is no Cargo.lock" "$no_lock_dir" 0 "" \
+# A directory with no manifest is not one this guard has an opinion about — and it
+# must not become one just because cargo would have refused had it been asked.
+assert_preflight_lock "proceeds where there is no Cargo.toml at all" "$no_lock_dir" 0 "" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 
 # The shape this exists for: one PR bumps the version in [workspace.package]
@@ -484,10 +490,10 @@ assert_preflight_lock "proceeds when there is no Cargo.lock" "$no_lock_dir" 0 ""
 # different regions of the lockfile, and the combination is stale. Neither author
 # can see it, because on a pull request `Attestation` is the only job that runs.
 assert_preflight_lock "stops a branch whose lockfile is stale" "$with_lock_dir" 72 \
-  "no longer matches the workspace manifests" \
+  "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 assert_preflight_lock "recognises the older cargo wording too" "$with_lock_dir" 72 \
-  "no longer matches the workspace manifests" \
+  "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_OLD"
 assert_preflight_lock "says the branch was not evaluated" "$with_lock_dir" 72 \
   "not evaluated" \
@@ -499,7 +505,7 @@ assert_preflight_lock "names a command that actually regenerates the lockfile" "
 # threshold someone may reasonably run under, it is a step certain to fail after
 # the whole gate has run.
 assert_preflight_lock "stops a local run as well as a remote one" "$with_lock_dir" 72 \
-  "no longer matches the workspace manifests" \
+  "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 assert_preflight_lock "annotates a remote stop for the run page" "$with_lock_dir" 72 \
   "::error title=Sign-off cannot run on this branch::" \
@@ -512,7 +518,7 @@ assert_preflight_lock "proceeds when cargo failed for another reason" "$with_loc
   "could not check whether Cargo.lock is current" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
 assert_preflight_lock_silent_on "does not call an unrelated cargo failure a stale lockfile" \
-  "$with_lock_dir" "no longer matches the workspace manifests" \
+  "$with_lock_dir" "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
 # `--locked` appearing in unrelated output is not cargo refusing to rewrite the
 # lock; the refusal names the flag as *passed*.
@@ -534,46 +540,67 @@ bash_dir="$(dirname "$(command -v bash)")"
 assert_preflight_lock "proceeds when cargo is unavailable" "$with_lock_dir" 0 "" \
   "PATH=$bash_dir"
 
-# A missing lockfile is a violation, not an absence of one. Asserted with the stub
-# reporting a clean pass, so the case proves the refusal happens before cargo is
-# consulted at all — and it closes a real hole: a branch that deletes Cargo.lock
-# would otherwise skip every check, and the `git status` backstop in pr.yml is the
-# other half of the same fix.
-toml_only_dir="$lock_dir/toml-only"
-mkdir -p "$toml_only_dir"
-printf '[workspace]\n' >"$toml_only_dir/Cargo.toml"
-assert_preflight_lock "stops a workspace whose Cargo.lock is missing" "$toml_only_dir" 72 \
-  "Cargo.lock is missing"
-assert_preflight_lock "says a missing lockfile left the branch unevaluated" "$toml_only_dir" 72 \
-  "not evaluated"
-assert_preflight_lock "names how to restore a missing lockfile" "$toml_only_dir" 72 \
-  "cargo update --workspace"
+
+# A missing lockfile is a `--locked` violation in cargo's own terms, not an absence
+# of one, and it needs to be: `git diff` cannot see it, so the pr.yml backstop
+# would pass a branch that deleted Cargo.lock and let the first cargo command
+# recreate it untracked. Cargo words it "cannot create" rather than "cannot
+# update", which is why the guard matches the flag and not a phrase.
+readonly LOCKED_REFUSAL_MISSING='error: cannot create the lock file /w/Cargo.lock because --locked was passed to prevent this'
+assert_preflight_lock "stops a workspace whose lockfile is missing" "$with_lock_dir" 72 \
+  "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_MISSING"
+
+# Cargo's own words are quoted rather than paraphrased: which of the two cases this
+# is — stale or absent — is in that text and nowhere else in the output.
+assert_preflight_lock "quotes what cargo actually said" "$with_lock_dir" 72 \
+  "cannot create the lock file" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_MISSING"
 
 # Drift detector. Everything above feeds the guard hand-written strings, so none of
 # it would notice cargo rewording its `--locked` diagnostic — the guard would stop
-# guarding, silently, on a toolchain bump. This case drives the *installed* cargo
-# against a lockfile that really is stale, so the wording is checked rather than
-# assumed. A crate with no dependencies resolves with no network and in well under
-# a second, which is what keeps this affordable here.
+# guarding, silently, on a toolchain bump. These cases drive the *installed* cargo
+# against fixtures that really are stale and really are missing a lockfile, so the
+# wording is checked rather than assumed. A crate with no dependencies resolves
+# with no network in well under a second, which is what keeps this affordable here.
 if command -v cargo >/dev/null 2>&1; then
   real_dir="$lock_dir/real-cargo"
   mkdir -p "$real_dir/src"
   printf 'fn main() {}\n' >"$real_dir/src/main.rs"
-  printf '[package]\nname = "lockdrift"\nversion = "0.2.0"\nedition = "2021"\n\n[dependencies]\n' \
-    >"$real_dir/Cargo.toml"
+  write_fixture_manifest() {
+    printf '[package]\nname = "lockdrift"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' \
+      "$1" >"$real_dir/Cargo.toml"
+  }
+
+  # No lockfile yet — the missing case, before one is generated.
+  write_fixture_manifest 0.2.0
+  assert_preflight_lock_real "the installed cargo refuses a missing lockfile" \
+    "$real_dir" 72 "does not describe the workspace manifests"
+
   if (cd "$real_dir" && cargo generate-lockfile --offline >/dev/null 2>&1); then
-    # PATH left alone: the point is the real cargo, so the stub must not shadow it.
-    assert_preflight_lock_real "the installed cargo agrees a matching lockfile is fine" \
+    assert_preflight_lock_real "the installed cargo accepts a matching lockfile" \
       "$real_dir" 0 ""
-    # Bump the package version the lockfile just recorded, so the lock is stale in
-    # exactly the way #13598's merge was.
-    printf '[package]\nname = "lockdrift"\nversion = "0.3.0"\nedition = "2021"\n\n[dependencies]\n' \
-      >"$real_dir/Cargo.toml"
-    assert_preflight_lock_real "the installed cargo's refusal is still recognised" \
-      "$real_dir" 72 "no longer matches the workspace manifests"
+    # Bump the version the lockfile just recorded, so the lock is stale in exactly
+    # the way #13598's merge was.
+    write_fixture_manifest 0.3.0
+    assert_preflight_lock_real "the installed cargo's stale-lock refusal is recognised" \
+      "$real_dir" 72 "does not describe the workspace manifests"
   else
     skipped=$((skipped + 1))
-    echo "  SKIP: cargo generate-lockfile --offline failed; cannot build the drift fixture"
+    echo "  SKIP: cargo generate-lockfile --offline failed; the stale-lock drift cases did not run"
+  fi
+
+  # Invoked from a member directory rather than the workspace root. Cargo walks up
+  # and reads the root lockfile, so the guard must not read "no lockfile beside me"
+  # as "this branch has no lockfile" — that would refuse every sign-off run from a
+  # subdirectory with a diagnosis that is simply false.
+  member_dir="$(cd "$script_dir/.." && pwd)/crates"
+  if [[ -f "$(cd "$script_dir/.." && pwd)/Cargo.lock" && -d "$member_dir" ]]; then
+    assert_preflight_lock_real "reads the root lockfile from a member directory" \
+      "$member_dir" 0 ""
+  else
+    skipped=$((skipped + 1))
+    echo "  SKIP: no root Cargo.lock in this checkout; the member-directory case did not run"
   fi
 else
   skipped=$((skipped + 1))
