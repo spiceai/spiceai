@@ -848,7 +848,8 @@ impl RuntimeBuilder {
             if let Err(err) = extension.initialize(&rt).await {
                 tracing::error!(
                     "Failed to initialize extension '{extension_name}', so the features it \
-                     provides are unavailable: {err} See: https://spiceai.org/docs"
+                     provides are unavailable: {cause} See: https://spiceai.org/docs",
+                    cause = util::single_line(&err.to_string())
                 );
             } else {
                 extensions.insert(extension_name.into(), extension.into());
@@ -870,8 +871,9 @@ impl RuntimeBuilder {
         {
             tracing::error!(
                 "Failed to load the secret stores declared in the spicepod, so components \
-                 resolving a secret reference will not start: {e} \
-                 See: https://spiceai.org/docs/components/secret-stores"
+                 resolving a secret reference will not start: {cause} \
+                 See: https://spiceai.org/docs/components/secret-stores",
+                cause = util::single_line(&e.to_string())
             );
         }
 

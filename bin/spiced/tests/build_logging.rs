@@ -14,18 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Events emitted while the runtime is built reach the installed subscriber.
+//! Events emitted while the runtime is built are not dropped.
 //!
 //! Regression test for #13537: the build ran between the temporary subscriber
 //! `main` ends and the global one `init_tracing` installs, so its warnings —
 //! the coordinated accelerator memory budget, invalid `runtime.query.*` values
 //! — were dropped at every log level.
 //!
-//! One test in this binary: `set_global_default` succeeds once per process.
+//! Two halves, one test each: that the build's events reach a subscriber
+//! already installed, and that a real `spiced` process — where none is, until
+//! after the build — still prints them.
 
-use std::sync::{Arc, Mutex};
+use std::io::{BufRead, BufReader};
+use std::net::{SocketAddr, TcpListener};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
+
+/// The warning `Runtime::build()` emits for an unparseable `runtime.query.timeout`.
+const TIMEOUT_WARNING: &str = "No query timeout will be applied.";
+
+const SPICEPOD: &str = "version: v1\nkind: Spicepod\nname: build-logging\nruntime:\n  query:\n    timeout: notaduration\n";
+
+fn unused_local_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    listener.local_addr().expect("read ephemeral address")
+}
+
+/// Writes the spicepod under `dir` and returns the directory to run against.
+fn spicepod_dir(dir: &tempfile::TempDir) -> &std::path::Path {
+    std::fs::write(dir.path().join("spicepod.yaml"), SPICEPOD).expect("writes the spicepod");
+    dir.path()
+}
 
 /// Sink for the probe subscriber, so the test can assert on what reached it.
 #[derive(Clone, Default)]
@@ -72,20 +94,14 @@ async fn build_time_warnings_reach_the_installed_subscriber() {
     .expect("installs the global subscriber");
 
     let dir = tempfile::tempdir().expect("creates the spicepod directory");
-    std::fs::write(
-        dir.path().join("spicepod.yaml"),
-        "version: v1\nkind: Spicepod\nname: build-logging\nruntime:\n  query:\n    timeout: notaduration\n",
-    )
-    .expect("writes the spicepod");
-
-    let app = app::AppBuilder::build_from_path(dir.path())
+    let app = app::AppBuilder::build_from_path(spicepod_dir(&dir))
         .await
         .expect("loads the spicepod");
     let _rt = runtime::Runtime::builder().with_app(app).build().await;
 
     let logged = probe.contents();
     assert!(
-        logged.contains("No query timeout will be applied."),
+        logged.contains(TIMEOUT_WARNING),
         "the invalid-timeout warning must reach the installed subscriber, got: {logged}"
     );
     // Emitted through `in_tracing_context`, which must defer to the subscriber
@@ -93,5 +109,62 @@ async fn build_time_warnings_reach_the_installed_subscriber() {
     assert!(
         logged.contains("Initialized sql results cache"),
         "the caching line must reach the installed subscriber, got: {logged}"
+    );
+}
+
+/// The build window itself. Nothing installs a subscriber until after
+/// `Runtime::build()` returns, so only a real process proves the build's own
+/// events still reach the console.
+#[test]
+fn a_spiced_process_prints_what_the_runtime_build_emits() {
+    let dir = tempfile::tempdir().expect("creates the spicepod directory");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spiced"))
+        .arg(spicepod_dir(&dir))
+        .args(["--http", &unused_local_addr().to_string()])
+        .args(["--flight", &unused_local_addr().to_string()])
+        .args(["--metrics", &unused_local_addr().to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start spiced");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (lines_tx, lines_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // A default-feature `spiced` binary is large enough that cold macOS
+    // loading/signature checks can take tens of seconds on a busy builder.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut printed = Vec::new();
+    let found = loop {
+        match lines_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let matched = line.contains(TIMEOUT_WARNING);
+                printed.push(line);
+                if matched {
+                    break true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+
+    child.kill().expect("stop spiced");
+    child.wait().expect("reap spiced");
+
+    assert!(
+        found,
+        "spiced printed nothing from the runtime build, got:\n{}",
+        printed.join("\n")
     );
 }
