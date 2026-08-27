@@ -19,7 +19,7 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Statistics;
+use datafusion::common::{Constraints, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -180,9 +180,17 @@ impl SchemaCastScanExec {
                 (source, targets)
             })
             .collect();
+        // `project` also carries the input's `Constraints`, and it carries them
+        // wrong for a mapping like this one: `projected_constraints` collects the
+        // *target* indices and hands them to `Constraints::project`, which reads them
+        // as input projection indices — so a reordered schema keeps `PrimaryKey([0])`
+        // while output column 0 is now a different column. A false key claim is worse
+        // than none (it feeds `ordering_satisfy_requirement` and the aggregate and
+        // join rules), and this exec has no way to state the real one, so drop them.
         input
             .equivalence_properties()
             .project(&mapping, Arc::clone(output_schema))
+            .with_constraints(Constraints::default())
     }
 }
 
@@ -435,6 +443,7 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::Constraint;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -1138,6 +1147,45 @@ mod tests {
             constant_column_indices(&schema_cast, "x").is_empty(),
             "an ambiguous name must carry no properties, or one column's constant \
              describes another column's values"
+        );
+    }
+
+    /// The input's constraints are not carried: a key claim is stated by column
+    /// index, `project` does not rewrite those indices for a mapping like this one,
+    /// and a wrong key is worse than no key — it feeds ordering satisfaction and the
+    /// aggregate and join rules.
+    #[test]
+    fn a_key_constraint_is_not_carried_across_the_schema_cast() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        // The output puts `b` where `a` used to be, so an index-stated key claim that
+        // survived unrewritten would name the wrong column.
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Int64, false),
+        ]));
+        let source = MemorySourceConfig::try_new(&[vec![]], Arc::clone(&input_schema), None)
+            .expect("memory source");
+        let keyed: Arc<dyn ExecutionPlan> =
+            Arc::new(DataSourceExec::new(Arc::new(source)).with_constraints(
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            ));
+        assert!(
+            !keyed.equivalence_properties().constraints().is_empty(),
+            "precondition: the child declares a primary key on `a`"
+        );
+
+        let schema_cast = SchemaCastScanExec::new(keyed, target_schema);
+
+        assert!(
+            schema_cast
+                .properties()
+                .eq_properties
+                .constraints()
+                .is_empty(),
+            "a key claim this exec cannot restate must not be advertised"
         );
     }
 
