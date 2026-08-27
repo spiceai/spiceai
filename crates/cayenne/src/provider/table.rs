@@ -34,9 +34,9 @@ limitations under the License.
 use super::column_stats::{ColumnStatsAccumulator, RowCountUpdate};
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
-    CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
-    DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
-    KeyBasedDeletionFilterExec,
+    CayenneDeletionSink, DeleteScanSource, DeletionIdentifier, DeletionVectorWriteResult,
+    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling,
+    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
@@ -30837,21 +30837,36 @@ impl CayenneTableProvider {
         // superseded from the row that replaced it. Dropping the sequence here is what
         // let a key-based delete match a retired version and tombstone the KEY, taking
         // the live row with it.
-        let mut snapshot_tables: Vec<(Option<i64>, Arc<ListingTable>)> = self
+        // A protected snapshot ignores re-inserts AND carries a cutoff — the pairing
+        // `apply_partial_deletion_filter` gives these same rows on the scan path.
+        let mut snapshot_tables: Vec<DeleteScanSource> = self
             .build_protected_snapshot_listing_tables()?
             .into_iter()
-            .map(|(_, max_delete_seq_at_creation, table)| (Some(max_delete_seq_at_creation), table))
+            .map(|(_, max_delete_seq_at_creation, table)| DeleteScanSource {
+                min_delete_seq: Some(max_delete_seq_at_creation),
+                insert_records: InsertRecordHandling::Ignore,
+                table,
+            })
             .collect();
         // Also scan the cold tier so a key-delete of a cold-resident row is
         // found and tombstoned (the cross-tier scan then hides it via the shared
         // key-delete filter). Cold uses key-based deletes, so this is only ever
         // non-empty for key-delete tables.
-        // Cold-tier files are a base like the current snapshot — every delete applies.
+        //
+        // Cold files hold OLD, fully superseded data, so they take `Ignore` with NO
+        // cutoff — the pairing `scan` gives them through `apply_deletion_filter`, and NOT
+        // the main listing's `Apply` despite both lacking a cutoff. Treating a re-inserted
+        // key as live here would match the stale cold value and tombstone the KEY,
+        // deleting the replacement that never matched the predicate.
         snapshot_tables.extend(
             self.build_cold_tier_listing_tables()
                 .await?
                 .into_iter()
-                .map(|table| (None, table)),
+                .map(|table| DeleteScanSource {
+                    min_delete_seq: None,
+                    insert_records: InsertRecordHandling::Ignore,
+                    table,
+                }),
         );
 
         let sink = CayenneDeletionSink::new(
@@ -30990,7 +31005,11 @@ impl CayenneTableProvider {
 
     /// Build listing tables for all protected snapshots.
     ///
-    /// Returns a vec of `(snapshot_id, listing_table)` pairs.
+    /// Returns `(snapshot_id, max_delete_seq_at_creation, listing_table)`. The middle
+    /// value is the snapshot's visibility threshold — only deletions NEWER than it apply
+    /// to its rows — and it is returned rather than looked up by the caller because a
+    /// second load of `protected_snapshots` can race a staged publish (see the comment
+    /// on the load below). A caller that does not need it drops it explicitly.
     fn build_protected_snapshot_listing_tables(
         &self,
     ) -> datafusion_common::Result<Vec<(String, i64, Arc<ListingTable>)>> {
@@ -47179,29 +47198,51 @@ mod tests {
             create_retention_table("retention_count_inexact", ctx.runtime_env(), 0).await;
         let schema = Arc::clone(&provider.table_metadata.schema);
 
-        insert_batch(
-            &provider,
-            id_value_batch(schema, &[1, 2, 3, 4], &[10, 20, 60, 70]),
-        )
-        .await;
+        // An OVERWRITE, not an append. An append persists its row-count delta with
+        // `exact: false` whenever retention is requested, so the count would read inexact
+        // whether or not the taint exists and this would assert nothing. An overwrite
+        // instead `Set`s an authoritative count and RESTORES exactness, and the retention
+        // it arms carries no stats of its own (`schedule_post_write_maintenance(None, …)`)
+        // — so after this sequence the taint is the only thing that can make the count
+        // inexact.
+        let batch = id_value_batch(schema, &[1, 2, 3, 4], &[10, 20, 60, 70]);
+        let batch_schema = batch.schema();
+        let overwrite_plan = provider
+            .insert_into(
+                &ctx.state(),
+                MemorySourceConfig::try_new_exec(&[vec![batch]], batch_schema, None)
+                    .expect("overwrite source"),
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite plan");
+        collect(overwrite_plan, ctx.task_ctx())
+            .await
+            .expect("overwrite executed");
         provider
             .flush_pending_maintenance()
             .await
-            .expect("retention pass");
+            .expect("the retention the overwrite armed");
 
         assert_eq!(
             scan_id_values(&provider).await,
             vec![(3, 60), (4, 70)],
             "precondition: retention removed the two matching rows"
         );
-        if let Some(stats) = provider.optimizer_table_statistics() {
-            assert!(
-                !matches!(stats.num_rows, DFPrecision::Exact(_)),
-                "a retention delete must leave the maintained count inexact, or a \
-                 distributed COUNT(*) folds {:?} as the answer",
-                stats.num_rows
-            );
-        }
+        // Assert the PERSISTED flag, not `optimizer_table_statistics()`. That view is
+        // masked to `Inexact` for as long as `has_pending_deletions()` holds, so it reads
+        // inexact after any retention delete whether or not the taint exists — verified:
+        // this test still passed with `taint_row_count_exactness` removed. `num_rows_exact`
+        // is the durable bit the distributed `COUNT(*)` metadata fold consults, and the
+        // one the taint is for.
+        let persisted = provider.load_persisted_table_statistics().await.expect(
+            "the overwrite re-baselined a statistics record; its absence would make this vacuous",
+        );
+        assert!(
+            !persisted.num_rows_exact,
+            "a retention delete must taint the persisted count, or a distributed COUNT(*) folds {} as the answer",
+            persisted.num_rows
+        );
     }
 
     /// A predicate `DELETE` on a key-based CDC upsert table must not hide a row whose
