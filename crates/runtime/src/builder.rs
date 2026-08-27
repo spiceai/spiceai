@@ -51,7 +51,6 @@ use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
-use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -341,27 +340,21 @@ impl RuntimeBuilder {
                 .map_or(SpicepodRuntime::default(), |app| app.runtime.clone())
         });
 
-        // Published before the engines are registered, because an engine is built by its
-        // registration constructor, which takes no arguments: a setting resolved from the
-        // Spicepod can only reach it this way. Registering a configured engine afterwards
-        // instead would mean naming the concrete accelerator from here.
-        //
-        // The publish and the registration pass are one operation: the published value is
-        // process-global while the registry it fills belongs to this `Runtime`, so two
-        // concurrent builds must not interleave between them. The guard is dropped as soon
-        // as the engines exist, each holding its own copy of the setting.
-        let engine_construction = runtime_acceleration::memory_budget::engine_construction_lock()
-            .lock()
-            .await;
+        // Resolved before the engines are registered and handed to each constructor: an
+        // engine is built by the registration slice, which knows nothing of its type, so
+        // this is how a Spicepod setting reaches one. Registering a configured engine
+        // afterwards instead would mean naming the concrete accelerator from here.
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
-        #[cfg(not(windows))]
-        runtime_acceleration::memory_budget::publish_cayenne_footer_cache_mb(
-            cayenne_footer_cache_mb,
-        );
+        let accelerator_configs = [data_accelerator_api::AcceleratorRuntimeConfig::Cayenne(
+            data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: cayenne_footer_cache_mb,
+            },
+        )];
 
-        self.accelerator_engine_registry.register_all().await;
-        drop(engine_construction);
+        self.accelerator_engine_registry
+            .register_all(&accelerator_configs)
+            .await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
         document_parse::register_all().await;
@@ -853,7 +846,11 @@ impl RuntimeBuilder {
             let mut extension = factory.create();
             let extension_name = extension.name();
             if let Err(err) = extension.initialize(&rt).await {
-                eprintln!("Failed to initialize extension {extension_name}: {err}");
+                tracing::error!(
+                    "Failed to initialize extension '{extension_name}', so the features it \
+                     provides are unavailable: {cause} See: https://spiceai.org/docs",
+                    cause = util::single_line(&err.to_string())
+                );
             } else {
                 extensions.insert(extension_name.into(), extension.into());
             }
@@ -869,18 +866,15 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app {
-            // `load_secrets` runs before `spiced::init_tracing` installs the
-            // global subscriber, so any `tracing::*` events emitted by
-            // `Secrets::load_from` and the per-store `init()` paths would
-            // otherwise be dropped on the floor. That hides actionable errors
-            // like "Vault address unreachable" or "AWS credentials missing"
-            // and leaves the operator with only the downstream
-            // "undefined store" message at lookup time. Wrap the await in a
-            // temporary subscriber so those diagnostics surface.
-            if let Err(e) = in_tracing_context_async(secrets.load_from(&app.secrets)).await {
-                eprintln!("Error loading secret stores: {e}");
-            }
+        if let Some(app) = app
+            && let Err(e) = secrets.load_from(&app.secrets).await
+        {
+            tracing::error!(
+                "Failed to load the secret stores declared in the spicepod, so components \
+                 resolving a secret reference will not start: {cause} \
+                 See: https://spiceai.org/docs/components/secret-stores",
+                cause = util::single_line(&e.to_string())
+            );
         }
 
         secrets
@@ -1009,19 +1003,15 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
-            );
-        });
+        tracing::warn!(
+            "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
+        );
     }
 
     if memory_limit == Some(0) {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
-            );
-        });
+        tracing::warn!(
+            "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
+        );
         None
     } else {
         memory_limit
@@ -1541,7 +1531,9 @@ pub(crate) fn cayenne_write_profile(
         .iter()
         .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
         .and_then(|registration| {
-            (registration.constructor)().spicepod_write_profile(acceleration, unset_refresh_mode)
+            registration
+                .build_with_defaults()?
+                .spicepod_write_profile(acceleration, unset_refresh_mode)
         })
 }
 
@@ -1745,8 +1737,9 @@ fn duckdb_budget_inputs(
     data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .find(|registration| registration.engine == runtime_acceleration::Engine::DuckDB)
-        .map_or_else(DuckDbBudgetInputs::default, |registration| {
-            (registration.constructor)().memory_budget_inputs(app)
+        .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults)
+        .map_or_else(DuckDbBudgetInputs::default, |accelerator| {
+            accelerator.memory_budget_inputs(app)
         })
 }
 
