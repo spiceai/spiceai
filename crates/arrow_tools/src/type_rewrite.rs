@@ -594,15 +594,67 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
 /// carry the child's own offset, and takes a branch that builds no array at all.
 fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
     match child.data_type() {
-        DataType::RunEndEncoded(..)
-        | DataType::Dictionary(..)
-        | DataType::Union(..)
-        | DataType::Null => Some(in_own_rows(
-            make_array(child.clone()).logical_nulls()?,
-            child,
-        )),
+        DataType::RunEndEncoded(..) | DataType::Dictionary(..) | DataType::Null => Some(
+            in_own_rows(make_array(child.clone()).logical_nulls()?, child),
+        ),
+        // Not delegated, because `UnionArray::logical_nulls` is not slice-correct. Measured against
+        // the pinned arrow-rs, a sliced sparse union reports its values' whole buffer when it has
+        // one variant and `None` — no nulls at all — when it has more, while a reachable null sits
+        // past the offset. `None` is the dangerous answer: every caller reads it as nothing to
+        // refuse, so the field is published non-nullable over data that contradicts it.
+        DataType::Union(..) => union_logical_nulls(child),
         _ => child.nulls().cloned(),
     }
+}
+
+/// A union's logical nulls, in its own rows: for each row, whether the variant its type id selects
+/// is null at the row that type id addresses.
+///
+/// Computed here rather than delegated, because `UnionArray::logical_nulls` is not slice-correct —
+/// a union rebuilt from sliced `ArrayData` carries the offset on its type ids but not on its
+/// children, and what it then reports depends on the variant count rather than on the data. Every
+/// step that cannot be read resolves to *null*, so an unreadable union refuses the narrowing
+/// instead of passing it.
+fn union_logical_nulls(union: &ArrayData) -> Option<NullBuffer> {
+    let DataType::Union(fields, mode) = union.data_type() else {
+        return None;
+    };
+    let unreadable = || Some(NullBuffer::new_null(union.len()));
+    if union.buffers().is_empty() {
+        return unreadable();
+    }
+    let dense_offsets = match mode {
+        UnionMode::Sparse => None,
+        UnionMode::Dense if union.buffers().len() > 1 => Some(union.buffer::<i32>(1)),
+        UnionMode::Dense => return unreadable(),
+    };
+    let type_ids = union.buffer::<i8>(0);
+
+    // Each variant's own logical nulls, resolved once rather than per row. A sparse union's
+    // variants stay whole and are addressed absolutely, which is what the row arithmetic assumes.
+    let variants: Vec<Option<NullBuffer>> =
+        union.child_data().iter().map(logical_nulls_of).collect();
+
+    let validity: Vec<bool> = (0..union.len())
+        .map(|row| {
+            let selected = || -> Option<bool> {
+                let type_id = *type_ids.get(row)?;
+                let index = fields.iter().position(|(id, _)| id == type_id)?;
+                let child_row = match dense_offsets {
+                    None => union.offset().checked_add(row)?,
+                    Some(offsets) => usize::try_from(*offsets.get(row)?).ok()?,
+                };
+                Some(match variants.get(index)? {
+                    Some(nulls) if child_row < nulls.len() => !nulls.is_null(child_row),
+                    Some(_) => false,
+                    None => true,
+                })
+            };
+            selected().unwrap_or(false)
+        })
+        .collect();
+
+    Some(NullBuffer::from(validity))
 }
 
 /// Re-expresses `nulls` in `child`'s own rows, so it can be compared against a parent's mask.
@@ -1651,6 +1703,60 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
         )
         .expect("a sparse union over one variant");
+        let union_type = union.data_type().clone();
+        let source = StructArray::new(
+            Fields::from(vec![Field::new("u", union_type, true)]),
+            vec![Arc::new(union) as ArrayRef],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .to_data()
+        .slice(1, 2);
+        assert_eq!(
+            source.child_data()[0].offset(),
+            1,
+            "slicing a struct slices its children — that offset is the whole hazard"
+        );
+        let target = DataType::Struct(Fields::from(vec![Field::new(
+            "u",
+            DataType::Union(variants(false), UnionMode::Sparse),
+            false,
+        )]));
+
+        let err = relabel_array_data(source, &target)
+            .expect_err("the surviving rows include a null the parent's mask does not cover");
+
+        assert!(
+            err.to_string().contains("'u'"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// The multi-variant counterpart to the one-variant case above, and the sharper of the two:
+    /// with more than one variant, `UnionArray::logical_nulls` on a sliced union reports `None` —
+    /// no nulls at all — which every caller reads as nothing to refuse.
+    #[test]
+    fn relabel_refuses_narrowing_a_sliced_multi_variant_union_child_of_a_masked_struct() {
+        let variants = |nullable| {
+            UnionFields::try_new(
+                vec![0_i8, 1],
+                vec![
+                    Field::new("a", DataType::Int32, nullable),
+                    Field::new("b", DataType::Int32, true),
+                ],
+            )
+            .expect("two type ids for two fields")
+        };
+        // Every row selects `a`, whose last value is null.
+        let union = UnionArray::try_new(
+            variants(true),
+            vec![0_i8, 0, 0].into(),
+            None,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(9), Some(9), Some(9)])) as ArrayRef,
+            ],
+        )
+        .expect("a sparse union over two variants");
         let union_type = union.data_type().clone();
         let source = StructArray::new(
             Fields::from(vec![Field::new("u", union_type, true)]),
