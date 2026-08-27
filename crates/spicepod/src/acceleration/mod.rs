@@ -646,9 +646,19 @@ const fn default_true() -> bool {
     true
 }
 
-/// Fields of an acceleration block that a disabled block does not discard: the
-/// switch itself, and the one setting the dataset reads out of the block before
-/// discarding the rest.
+/// Fields an `enabled: false` block does not discard *because it is disabled*,
+/// and so must not be named by a warning whose remedy is "remove
+/// `enabled: false`": the switch itself, and `ready_state`.
+///
+/// `ready_state` is excluded for both components that carry an acceleration
+/// block, but not for the same reason. A dataset reads
+/// `acceleration.ready_state` out of the block and applies it whether or not
+/// acceleration is enabled (deprecated, but honoured) — so it is genuinely not
+/// discarded. `ViewBuilder` never reads it at all, enabled or disabled, so for
+/// a view it *is* dropped — but unconditionally, not because of `enabled:
+/// false`, which makes "remove `enabled: false` to apply them" a false remedy
+/// for it. Either way this warning is the wrong place to raise it; the view
+/// case is #13615.
 const CONSUMED_WHEN_DISABLED: [&str; 2] = ["enabled", "ready_state"];
 
 impl Acceleration {
@@ -667,10 +677,9 @@ impl Acceleration {
     /// is what distinguishes `mode: memory` written out by hand — inert either
     /// way — from `mode: file`.
     ///
-    /// Two fields are never reported. `enabled` is the field doing the
-    /// discarding. `ready_state` is read out of this block and applied to the
-    /// dataset before the block is discarded — deprecated, but not ignored —
-    /// so calling it ignored would be untrue.
+    /// Two fields are never reported, per [`CONSUMED_WHEN_DISABLED`]: `enabled`,
+    /// which is the field doing the discarding, and `ready_state`, which no
+    /// component discards *because of* `enabled: false`.
     #[must_use]
     pub fn fields_ignored_when_disabled(&self) -> Vec<String> {
         if self.enabled {

@@ -70,35 +70,6 @@ pub struct DatasetBuilder {
     pub check_availability_interval: Option<Duration>,
 }
 
-/// What to tell an operator whose dataset sets `acceleration.enabled: false` and
-/// leaves settings in the block that the runtime will not apply.
-///
-/// A function rather than an inline `tracing::warn!` so the wording — which is
-/// the whole of this feature for the person reading the log — is assertable.
-///
-/// Single quotes around the name the operator chose, backticks around the config
-/// keys they are being told to act on, per the repo's message convention — and
-/// the name escaped, since a quoted Spicepod identifier can carry a newline
-/// through validation and would otherwise forge a second log line.
-///
-/// It names only the fields it was given, and does not say "the rest of the
-/// block": `ready_state` is read out of a disabled block and applied, so a claim
-/// about everything under `enabled` would be untrue for it.
-fn disabled_acceleration_warning(dataset: &str, ignored: &[String]) -> String {
-    let keys = ignored
-        .iter()
-        .map(|field| format!("`{field}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // `escape_debug` rather than the raw name: `validate_identifier` accepts a
-    // *quoted* identifier, and a quoted one may legally contain a newline, so a
-    // validated name can still break this line in two and forge a second one.
-    let dataset = dataset.escape_debug();
-    format!(
-        "Dataset '{dataset}' sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {keys}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
-    )
-}
-
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
@@ -131,37 +102,12 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         let metadata = dataset.metadata();
 
-        // `enabled: false` turns the whole block off, so anything else set in it
-        // is read, accepted and then never applied — with one exception, which
-        // is above: `ready_state` is pulled out of this block and applied to the
-        // dataset whether or not acceleration is enabled, and
-        // `fields_ignored_when_disabled` leaves it out for exactly that reason.
-        //
-        // Collect the rest here, while the Spicepod block is still in hand and
-        // before the conversion below resolves its defaults away (#13514); it is
-        // reported after the name is validated.
-        let ignored_acceleration_fields = dataset
-            .acceleration
-            .as_ref()
-            .map(spicepod_acceleration::Acceleration::fields_ignored_when_disabled)
-            .unwrap_or_default();
-
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
 
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
-
-        // After the name is validated, deliberately: an identifier that reaches
-        // here has passed the tokenizer, so it holds no newline or other control
-        // character that could forge a second log line out of this one.
-        if !ignored_acceleration_fields.is_empty() {
-            tracing::warn!(
-                "{}",
-                disabled_acceleration_warning(&dataset.name, &ignored_acceleration_fields)
-            );
-        }
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
 
@@ -487,58 +433,4 @@ fn fts_store_from_column_overrides(
         engine: Some(column_engine),
         params: column_params,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::disabled_acceleration_warning;
-
-    #[test]
-    fn the_warning_names_the_dataset_the_fields_and_the_remedy() {
-        // Everything a reader needs to act, in one line: which dataset, what is
-        // being dropped, and the two ways out. Asserted because the message is
-        // the entire user-visible behaviour of this path (#13514).
-        let warning = disabled_acceleration_warning(
-            "api_data",
-            &["engine".to_string(), "refresh_mode".to_string()],
-        );
-        // Quoting and backticking are the repo's convention, not decoration: an
-        // unquoted name vanishes when it is empty and reads as prose when it is
-        // a word like `orders`.
-        assert!(warning.contains("'api_data'"), "{warning}");
-        assert!(warning.contains("`engine`, `refresh_mode`"), "{warning}");
-        assert!(warning.contains("acceleration.enabled: false"), "{warning}");
-        assert!(warning.contains("Remove `enabled: false`"), "{warning}");
-        assert!(warning.contains("https://spiceai.org/docs/"), "{warning}");
-    }
-
-    #[test]
-    fn a_control_character_in_the_name_cannot_break_the_line_in_two() {
-        // `validate_identifier` accepts a quoted identifier, and a quoted one
-        // may contain a newline — so the name reaching this message is not
-        // guaranteed to be one line, and an unescaped one would let a dataset
-        // name write a second log line of its own choosing.
-        let warning = disabled_acceleration_warning("api\nWARN forged", &["engine".to_string()]);
-        assert!(
-            !warning.contains('\n'),
-            "the message must stay one line: {warning}"
-        );
-        assert!(
-            warning.contains("api\\nWARN forged"),
-            "the name must still be readable, escaped: {warning}"
-        );
-    }
-
-    #[test]
-    fn the_warning_claims_only_the_fields_it_was_given() {
-        // `ready_state` is read out of a disabled block and applied, so this
-        // message must not claim the whole block is ignored — a reader who sees
-        // that goes looking for a `ready_state` that is working correctly.
-        let warning = disabled_acceleration_warning("api_data", &["engine".to_string()]);
-        assert!(
-            !warning.contains("the rest of"),
-            "the message must scope itself to the listed fields: {warning}"
-        );
-        assert!(!warning.contains("ready_state"), "{warning}");
-    }
 }
