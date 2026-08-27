@@ -342,7 +342,15 @@ impl Runtime {
             let notifier = register_task.await;
             match notifier {
                 Ok(Some(completion)) => {
-                    completion.wait().await;
+                    if completion.wait().await.is_abandoned() {
+                        // The accelerated table was dropped before its initial
+                        // refresh landed. Creating the schedule now would
+                        // resurrect one for a view that is no longer there.
+                        tracing::debug!(
+                            "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                        );
+                        return;
+                    }
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
                         tracing::error!(
                             "Failed to create refresh schedule for accelerated view '{view_name}': {e}."

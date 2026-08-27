@@ -2022,8 +2022,11 @@ pub struct RegisterDatasetContext {
 /// spending the bound.
 ///
 /// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
-/// [`Error::HotReloadRefreshTimedOut`] when the bound expires with the table
-/// still unloaded, which drops the in-place swap in favour of a full reload.
+/// [`Error::HotReloadRefreshTimedOut`] when the table is still unloaded once
+/// there is nothing left to wait for, which drops the in-place swap in favour of
+/// a full reload. That is either the bound expiring or the new table being
+/// dropped before its first refresh: waiting out the rest of the bound on a
+/// table nobody can refresh only delays the same verdict.
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
@@ -2038,8 +2041,13 @@ async fn await_hot_reload_initial_refresh(
     tokio::select! {
         // A `RefreshCompletionWaiter` for any completion is satisfied by a
         // refresh that finished before this wait began, so the load cannot be
-        // missed by arriving here late.
-        () = completion.wait() => return Ok(()),
+        // missed by arriving here late. An abandoned wait falls through to the
+        // flag re-check below rather than returning: every recorder is gone, so
+        // no refresh is coming, but a load that landed before they went still
+        // counts.
+        outcome = completion.wait() => if outcome.is_answered() {
+            return Ok(());
+        },
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
     }

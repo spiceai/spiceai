@@ -27,8 +27,13 @@ limitations under the License.
 //! A waiter is taken up front and awaited later, so a completion landing in
 //! between resolves the wait instead of being dropped. That gap is why this is
 //! not a [`tokio::sync::Notify`]: `notify_waiters` stores no permit, so a
-//! completion that lands before the caller polls its future leaves the caller
-//! waiting for a refresh that already happened.
+//! completion that lands before the caller *creates* its `Notified` future
+//! leaves the caller waiting for a refresh that already happened. The boundary
+//! is creation, not polling — tokio guarantees a `Notified` receives
+//! `notify_waiters` wakeups as soon as it exists, so subscribing early is what
+//! closes the gap and polling early cannot. The paths this type replaced were
+//! all late *construction*: the future was built after the refresh had already
+//! been triggered, leaving nothing to poll in time.
 
 use tokio::sync::watch;
 
@@ -125,6 +130,50 @@ impl RefreshCompletion {
     }
 }
 
+/// How a wait ended, so a caller that *acts* on a completion can tell a refresh
+/// that happened from one that never will.
+///
+/// Both variants mean the caller should stop waiting; they differ in what it may
+/// do next. A caller merely gating on the initial load can proceed either way; a
+/// caller that treats the wait as proof a refresh landed — broadcasting
+/// readiness, creating a follow-on schedule — must not proceed on
+/// [`RefreshCompletionOutcome::Abandoned`].
+///
+/// `Answered` is the weaker half of that pair: it says *a* refresh completed, not
+/// that it was the one this waiter's caller triggered, nor that the table is
+/// still the live one. Binding a completion to its request and to a table
+/// generation is tracked in
+/// <https://github.com/spiceai/spiceai/issues/13603>.
+///
+/// Deliberately not `#[must_use]`: most waits are taken by a caller that acts on
+/// nothing afterwards and only wants to block, and marking the type would make
+/// every one of those state a choice it does not have. The callers that *do* act
+/// on a completion are the ones this enum exists for, and each of them reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshCompletionOutcome {
+    /// The question the waiter was taken for was answered: a refresh was
+    /// recorded, or the signal was closed to say none will run here.
+    Answered,
+    /// Every [`RefreshCompletion`] was dropped before the question was answered,
+    /// so no refresh ran and none can. The table the waiter was taken from is
+    /// gone.
+    Abandoned,
+}
+
+impl RefreshCompletionOutcome {
+    /// Whether a refresh completed, or was declared never to run here.
+    #[must_use]
+    pub fn is_answered(self) -> bool {
+        matches!(self, Self::Answered)
+    }
+
+    /// Whether the wait ended only because every recorder was dropped.
+    #[must_use]
+    pub fn is_abandoned(self) -> bool {
+        matches!(self, Self::Abandoned)
+    }
+}
+
 /// A pending wait for a refresh completion, taken from a [`RefreshCompletion`].
 #[derive(Debug)]
 pub struct RefreshCompletionWaiter {
@@ -132,14 +181,23 @@ pub struct RefreshCompletionWaiter {
 }
 
 impl RefreshCompletionWaiter {
-    /// Waits for the completion this waiter was taken for.
+    /// Waits for the completion this waiter was taken for, reporting whether one
+    /// arrived.
     ///
-    /// Returns without waiting when the question was already answered when the
-    /// waiter was taken, and returns early when the table that records
-    /// completions is gone — in both cases nothing is coming, and blocking would
-    /// strand the caller rather than inform it.
-    pub async fn wait(mut self) {
-        let _ = self.receiver.changed().await;
+    /// Returns [`RefreshCompletionOutcome::Answered`] without waiting when the
+    /// question was already answered when the waiter was taken, and
+    /// [`RefreshCompletionOutcome::Abandoned`] when every recorder is dropped
+    /// before it could be. Blocking on the latter would strand the caller rather
+    /// than inform it, but it is not a completed refresh: `changed` reports the
+    /// transition it has already observed ahead of the closed channel, so a
+    /// completion recorded before the last recorder went still reads as
+    /// `Answered`.
+    pub async fn wait(mut self) -> RefreshCompletionOutcome {
+        if self.receiver.changed().await.is_ok() {
+            RefreshCompletionOutcome::Answered
+        } else {
+            RefreshCompletionOutcome::Abandoned
+        }
     }
 }
 
@@ -149,7 +207,7 @@ mod tests {
 
     use tokio::time::timeout;
 
-    use super::RefreshCompletion;
+    use super::{RefreshCompletion, RefreshCompletionOutcome};
 
     const SHORT: Duration = Duration::from_millis(200);
 
@@ -162,9 +220,10 @@ mod tests {
 
         completion.record();
 
-        timeout(SHORT, waiter.wait())
+        let outcome = timeout(SHORT, waiter.wait())
             .await
             .expect("a completion recorded before the wait must still resolve it");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
     }
 
     #[tokio::test]
@@ -178,9 +237,10 @@ mod tests {
             recorder.record();
         });
 
-        timeout(SHORT, waiter.wait())
+        let outcome = timeout(SHORT, waiter.wait())
             .await
             .expect("a completion recorded during the wait must resolve it");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
     }
 
     /// `next` answers "the refresh I am about to trigger", so completions that
@@ -192,7 +252,7 @@ mod tests {
 
         let waiter = completion.next();
 
-        timeout(SHORT, waiter.wait())
+        let _ = timeout(SHORT, waiter.wait())
             .await
             .expect_err("an earlier completion must not satisfy a waiter taken after it");
     }
@@ -204,16 +264,17 @@ mod tests {
         let completion = RefreshCompletion::new();
         completion.record();
 
-        timeout(SHORT, completion.any().wait())
+        let outcome = timeout(SHORT, completion.any().wait())
             .await
             .expect("an earlier completion must satisfy a waiter for any completion");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
     }
 
     #[tokio::test]
     async fn any_waits_when_no_completion_has_been_recorded() {
         let completion = RefreshCompletion::new();
 
-        timeout(SHORT, completion.any().wait())
+        let _ = timeout(SHORT, completion.any().wait())
             .await
             .expect_err("no completion has been recorded, so there is nothing to observe");
     }
@@ -225,9 +286,14 @@ mod tests {
 
         completion.close();
 
-        timeout(SHORT, waiter.wait())
+        let outcome = timeout(SHORT, waiter.wait())
             .await
             .expect("closing must release a waiter already taken");
+        assert_eq!(
+            outcome,
+            RefreshCompletionOutcome::Answered,
+            "an explicit close is a deliberate answer, not an abandoned table"
+        );
     }
 
     #[tokio::test]
@@ -235,9 +301,10 @@ mod tests {
         let completion = RefreshCompletion::new();
         completion.close();
 
-        timeout(SHORT, completion.next().wait())
+        let outcome = timeout(SHORT, completion.next().wait())
             .await
             .expect("closing must release a waiter taken afterwards");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
     }
 
     /// The table that records completions can be dropped while a caller is
@@ -250,9 +317,50 @@ mod tests {
 
         drop(completion);
 
-        timeout(SHORT, waiter.wait())
+        let outcome = timeout(SHORT, waiter.wait())
             .await
             .expect("dropping the recorder must release its waiters");
+        assert_eq!(
+            outcome,
+            RefreshCompletionOutcome::Abandoned,
+            "a released waiter with no completion behind it must not read as a refresh"
+        );
+    }
+
+    /// A completion that landed before the last recorder went is still a
+    /// completion: dropping the recorder afterwards must not downgrade an
+    /// answered wait into an abandoned one.
+    #[tokio::test]
+    async fn a_completion_recorded_before_the_drop_still_reads_as_answered() {
+        let completion = RefreshCompletion::new();
+        let waiter = completion.next();
+
+        completion.record();
+        drop(completion);
+
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a recorded completion must resolve the wait");
+        assert_eq!(
+            outcome,
+            RefreshCompletionOutcome::Answered,
+            "the refresh happened; the recorder going afterwards does not unhappen it"
+        );
+    }
+
+    /// An `any` waiter taken after the last recorder is gone has no completion
+    /// behind it and must say so rather than resolving as one.
+    #[tokio::test]
+    async fn a_waiter_taken_after_the_recorder_is_dropped_is_abandoned() {
+        let completion = RefreshCompletion::new();
+        let waiter = completion.any();
+
+        drop(completion);
+
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a waiter with no live recorder must not block");
+        assert_eq!(outcome, RefreshCompletionOutcome::Abandoned);
     }
 
     /// Waiters are independent: satisfying one must not consume the completion
@@ -265,9 +373,10 @@ mod tests {
         completion.record();
 
         for waiter in waiters {
-            timeout(SHORT, waiter.wait())
+            let outcome = timeout(SHORT, waiter.wait())
                 .await
                 .expect("every waiter taken before the completion must resolve");
+            assert_eq!(outcome, RefreshCompletionOutcome::Answered);
         }
     }
 
@@ -284,8 +393,9 @@ mod tests {
         let waiter = completion.next();
         completion.record();
 
-        timeout(SHORT, waiter.wait())
+        let outcome = timeout(SHORT, waiter.wait())
             .await
             .expect("a wrapping generation must still resolve its waiter");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
     }
 }
