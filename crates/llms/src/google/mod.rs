@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+pub mod auth;
 mod chat;
 mod embed;
 mod list_models;
@@ -29,7 +30,6 @@ use async_openai::{
 };
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
 use google_genai::types::UsageMetadata;
-use secrecy::{ExposeSecret, SecretString};
 
 use crate::google::embed::EmbedGoogle;
 
@@ -40,24 +40,28 @@ pub struct Google {
 }
 
 impl Google {
-    pub fn new(api_key: &SecretString, model: &str) -> Result<Self, google_genai::Error> {
-        Ok(Self {
-            client: google_genai::Client::new(api_key.expose_secret().to_string())?,
-            model: model.to_string(),
-        })
+    /// Wraps an already-built Vertex AI [`google_genai::Client`] — see [`auth::build_client`] —
+    /// for the given model.
+    #[must_use]
+    pub fn from_client(client: google_genai::Client, model: impl Into<String>) -> Self {
+        Self {
+            client,
+            model: model.into(),
+        }
     }
 
-    pub fn new_embeddings(
-        api_key: &SecretString,
-        model: &str,
+    /// Turns this chat client into an embeddings client for the same underlying connection.
+    #[must_use]
+    pub fn into_embeddings(
+        self,
         dimensions: Option<u32>,
         embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
-    ) -> Result<EmbedGoogle, google_genai::Error> {
-        Ok(EmbedGoogle {
-            g: Self::new(api_key, model)?,
+    ) -> EmbedGoogle {
+        EmbedGoogle {
+            g: self,
             dimensions,
             embeddings_cache,
-        })
+        }
     }
 }
 

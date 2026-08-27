@@ -33,6 +33,7 @@ use data_connector_api::accelerated::{
     AcceleratorSetup, RefreshRequestError, RefreshRequester, RegisteredAcceleratedTable,
     TableGoneSnafu,
 };
+use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -404,6 +405,10 @@ pub struct Builder {
     write_to_accelerator_only: bool,
     dual_write: bool,
     write_back: bool,
+    /// Connector-owned durable write-back delivery, when the source provides it.
+    /// Threaded into the delivery worker; `None` keeps the worker's
+    /// `TableProvider` delivery path.
+    write_back_deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -464,6 +469,7 @@ impl Builder {
             write_to_accelerator_only: false,
             dual_write: false,
             write_back: false,
+            write_back_deliverer: None,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -572,6 +578,16 @@ impl Builder {
     /// then asynchronously persist to the federated source.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
+        self
+    }
+
+    /// Provide a connector-owned durable write-back deliverer for the delivery
+    /// worker. `None` (the default) keeps the worker's `TableProvider` delivery.
+    pub fn write_back_deliverer(
+        &mut self,
+        deliverer: Option<Arc<dyn WriteBackDeliverer>>,
+    ) -> &mut Self {
+        self.write_back_deliverer = deliverer;
         self
     }
 
@@ -1018,10 +1034,11 @@ impl Builder {
             let consumer_handle = caching::spawn_batched_cache_write_task(
                 rx,
                 Arc::clone(&self.accelerator),
-                self.dataset_name.to_string(),
+                self.dataset_name.clone(),
                 Arc::clone(&self.accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
+                Arc::clone(&self.runtime_status),
             );
             // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
             handlers.push(consumer_handle);
@@ -1189,6 +1206,7 @@ impl Builder {
                 *cayenne,
                 Arc::clone(&self.federated),
                 self.dataset_name.to_string(),
+                self.write_back_deliverer.clone(),
             ));
         }
 
