@@ -1713,7 +1713,7 @@ mod tests {
     /// inline. Regression test for spiceai/spiceai#12964.
     #[tokio::test(start_paused = true)]
     async fn a_stuck_put_bounds_the_retirement_drain_instead_of_holding_it() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "drain-bound");
         let path = Path::from("snapshot-a/stuck.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
@@ -1768,7 +1768,7 @@ mod tests {
             .expect("build a runtime with a one-thread blocking pool");
 
         runtime.block_on(async {
-            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let shared = SharedSegmentCache::new(1 << 20, true, "saturated-pool");
             let path = Path::from("snapshot-a/saturated.vortex");
             let file = shared.for_path(test_store(), path.clone());
             let id = SegmentId::from(1);
@@ -1824,7 +1824,7 @@ mod tests {
             .expect("build a runtime with a one-thread blocking pool");
 
         runtime.block_on(async {
-            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let shared = SharedSegmentCache::new(1 << 20, true, "scan-give-up");
             let path = Path::from("snapshot-a/stranded.vortex");
             let file = shared.for_path(test_store(), path.clone());
             file.put(SegmentId::from(1), ByteBuffer::from(vec![1u8, 2, 3, 4]))
@@ -1900,7 +1900,7 @@ mod tests {
     async fn stuck_puts_on_many_paths_share_one_drain_deadline() {
         const STUCK_PATHS: u32 = 8;
 
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "shared-deadline");
         let mut files = Vec::new();
         let mut paths = HashSet::new();
         for index in 0..STUCK_PATHS {
@@ -1951,7 +1951,7 @@ mod tests {
         // get inserted stays resident: sized under it, Moka would evict the
         // entry on weight alone and the assertion would hold with or without the
         // code it exists to check.
-        let shared = SharedSegmentCache::new(64 << 20, true, "test");
+        let shared = SharedSegmentCache::new(64 << 20, true, "coalesced-trim");
         let path = Path::from("snapshot-a/trimming.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
