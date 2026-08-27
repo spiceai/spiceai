@@ -98,7 +98,7 @@ mod tests {
 
     use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
-    use super::{in_tracing_context, single_line};
+    use super::{in_tracing_context, in_tracing_context_async, single_line};
 
     /// Sink for a probe subscriber, so a test can assert on what reached it.
     #[derive(Clone, Default)]
@@ -162,11 +162,8 @@ mod tests {
         ));
     }
 
-    /// A thread-local default outranks the global subscriber, so installing one
-    /// over a subscriber that is already listening would silently drop the event
-    /// from its sinks and apply the wrong filter.
-    #[test]
-    fn in_tracing_context_defers_to_a_subscriber_already_listening() {
+    /// Runs `emit` under a subscriber writing to the returned buffer.
+    fn logged(emit: impl FnOnce()) -> String {
         let probe = ProbeWriter::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -174,16 +171,38 @@ mod tests {
                 .with_writer(probe.clone()),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::subscriber::with_default(subscriber, emit);
+        probe.contents()
+    }
+
+    /// A thread-local default outranks the global subscriber, so installing one
+    /// over a subscriber that is already listening would silently drop the event
+    /// from its sinks and apply the wrong filter.
+    #[test]
+    fn in_tracing_context_defers_to_a_subscriber_already_listening() {
+        let logged = logged(|| {
             in_tracing_context(|| tracing::warn!("failed to initialize sql results cache"));
         });
 
         assert!(
-            probe
-                .contents()
-                .contains("failed to initialize sql results cache"),
-            "the event must reach the subscriber already installed, got: {}",
-            probe.contents()
+            logged.contains("failed to initialize sql results cache"),
+            "the event must reach the subscriber already installed, got: {logged}"
+        );
+    }
+
+    /// Same decision in the async helper, which is the one callers use to wrap
+    /// a whole window.
+    #[test]
+    fn in_tracing_context_async_defers_to_a_subscriber_already_listening() {
+        let logged = logged(|| {
+            futures::executor::block_on(in_tracing_context_async(async {
+                tracing::warn!("failed to load the secret stores");
+            }));
+        });
+
+        assert!(
+            logged.contains("failed to load the secret stores"),
+            "the event must reach the subscriber already installed, got: {logged}"
         );
     }
 }
