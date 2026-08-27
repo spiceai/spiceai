@@ -29,9 +29,7 @@ use crate::component::dataset::{
 use crate::dataconnector::DataConnector;
 use crate::make_spice_data_sub_directory;
 
-use runtime_acceleration::snapshot::{IndexSnapshotRef, SnapshotManager};
 use search::generation::text_search::index::FullTextDatabaseIndex;
-use search::generation::text_search::index::fts_snapshot_identity;
 
 /// Whether registering `dataset` on `connector` will attach a CDC change stream or an append
 /// stream to a full-text index built for it — i.e. whether that index must be constructed with
@@ -174,118 +172,6 @@ fn build_full_text_database_index_with_directory(
         stream_attached,
     )
     .boxed()
-}
-
-/// Installs a matching full-text artifact before the index is constructed during bootstrap.
-/// A failed download, archive validation, schema validation, or rename leaves the target
-/// untouched so normal index construction rebuilds it from the restored accelerator.
-pub(crate) async fn restore_bootstrapped_full_text_index(
-    manager: &SnapshotManager,
-    artifacts: &[IndexSnapshotRef],
-    inner_table_provider: Arc<dyn TableProvider>,
-    columns: &[Column],
-    tbl: &TableReference,
-    stream_attached: bool,
-    snapshot_id: u64,
-) {
-    let Some(FullTextSearchDatasetConfig {
-        index_store,
-        index_path,
-        search_fields,
-        ..
-    }) = full_text_search_config(columns, tbl)
-    else {
-        return;
-    };
-    if index_store != IndexStore::File {
-        return;
-    }
-    let identity = fts_snapshot_identity(&search_fields);
-    let Some(artifact) = artifacts.iter().find(|artifact| {
-        artifact.index_kind == identity.kind
-            && artifact.columns == identity.columns
-            && artifact.discriminator == identity.discriminator
-    }) else {
-        return;
-    };
-    let target = match index_path {
-        Some(path) => PathBuf::from_str(path.as_str()).boxed(),
-        None => make_spice_data_sub_directory(
-            [vec!["fts".to_string()], tbl.to_vec()].concat().as_slice(),
-        )
-        .boxed(),
-    };
-    let Ok(target) = target else {
-        tracing::warn!(
-            "Failed to resolve the full-text index directory for '{tbl}'; rebuilding the index from the restored dataset"
-        );
-        return;
-    };
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    let staging = match tempfile::Builder::new()
-        .prefix(".snapshot-index-")
-        .tempdir_in(parent)
-    {
-        Ok(staging) => staging,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to create staging for full-text index '{tbl}'; rebuilding the index from the restored dataset. Cause: {error}"
-            );
-            return;
-        }
-    };
-    if let Err(error) = manager
-        .download_index_artifact_to_staging(artifact, staging.path())
-        .await
-    {
-        tracing::warn!(
-            "Failed to restore full-text index '{tbl}' from its snapshot artifact; rebuilding the index from the restored dataset. Cause: {error}"
-        );
-        return;
-    }
-    if let Err(error) = build_full_text_database_index_with_directory(
-        Arc::clone(&inner_table_provider),
-        columns,
-        tbl,
-        None,
-        stream_attached,
-        Some(staging.path().to_path_buf()),
-    ) {
-        tracing::warn!(
-            "Restored full-text index '{tbl}' does not match its configured schema; rebuilding the index from the restored dataset. Cause: {error}"
-        );
-        return;
-    }
-    if let Err(error) = std::fs::write(
-        staging.path().join(".spice-snapshot"),
-        format!(
-            "snapshot_id={snapshot_id}\nkind={}\ncolumns={}\n",
-            identity.kind,
-            identity.columns.join(",")
-        ),
-    ) {
-        tracing::warn!(
-            "Failed to mark restored full-text index '{tbl}'; rebuilding the index from the restored dataset. Cause: {error}"
-        );
-        return;
-    }
-    if target.exists()
-        && let Err(error) = std::fs::remove_dir_all(&target)
-    {
-        tracing::warn!(
-            "Failed to replace stale full-text index '{tbl}'; rebuilding the index from the restored dataset. Cause: {error}"
-        );
-        return;
-    }
-    let staged = staging.keep();
-    if let Err(error) = std::fs::rename(&staged, &target) {
-        let _ = std::fs::remove_dir_all(&staged);
-        tracing::warn!(
-            "Failed to install restored full-text index '{tbl}'; rebuilding the index from the restored dataset. Cause: {error}"
-        );
-    }
 }
 
 /// Registers `index` on `inner_table_provider`, reusing an index layer already at

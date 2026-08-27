@@ -99,6 +99,7 @@ pub trait Index: Debug + Send + Sync + 'static {
     }
 
     /// Makes the index's durable state consistent and returns the directory to archive.
+    /// Can assume to be a no-op if [`Index::snapshot_identity`] is none.
     async fn freeze_for_snapshot(&self) -> Result<PathBuf> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Index {} does not support snapshots",
@@ -107,6 +108,7 @@ pub trait Index: Debug + Send + Sync + 'static {
     }
 
     /// Replaces this index's durable state from a validated extracted directory.
+    /// Can assume to be a no-op if [`Index::snapshot_identity`] is none.
     async fn restore_from(&self, _extracted_dir: &Path) -> Result<()> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Index {} does not support snapshot restore",

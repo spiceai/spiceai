@@ -995,6 +995,52 @@ impl Runtime {
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
+        // Restore any snapshotable index (today: file-backed full-text search) onto the live
+        // instance the connector above just built, before anything else can write to it. This is
+        // the same generic mechanism `refresh_mode: snapshot` already uses on every later
+        // hot-swap (`SnapshotManager::restore_indexes_from_snapshot`, matching by
+        // `Index::snapshot_identity()`) — applied once here, for the index's first
+        // (cold-bootstrap) generation. See #7557.
+        if let BootstrapStatus::Bootstrapped(info) = &bootstrap_status
+            && !info.index_snapshots.is_empty()
+            && let Some(table_provider) = federated_table.try_table_provider_sync()
+            && let Some(acceleration_settings) = ds.acceleration.as_ref()
+        {
+            let indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> =
+                spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
+                    .find(|node| !node.indexes().is_empty())
+                    .map(|node| node.indexes().to_vec())
+                    .unwrap_or_default();
+            if !indexes.is_empty()
+                && let Ok(layout) = data_accelerator_api::get_acceleration_layout(
+                    ds.as_ref(),
+                    &self.accelerator_engine_registry,
+                )
+                .await
+                && let Some(engine) =
+                    crate::datafusion::engine_to_acceleration_engine(acceleration_settings.engine)
+                && let Some(manager) = runtime_acceleration::snapshot::SnapshotManager::try_new(
+                    ds.name.to_string(),
+                    acceleration_settings.snapshot_behavior.clone(),
+                    layout,
+                    engine,
+                )
+                .await
+            {
+                manager.set_indexes(indexes).await;
+                if let Err(error) = manager
+                    .restore_indexes_from_snapshot(&info.index_snapshots)
+                    .await
+                {
+                    tracing::warn!(
+                        dataset = %ds.name,
+                        error = %error,
+                        "Failed to restore a snapshotted index; it will rebuild from the restored dataset"
+                    );
+                }
+            }
+        }
+
         // Release the load permit before registration so other datasets can
         // begin their source-facing work while this one registers.
         drop(load_guard);

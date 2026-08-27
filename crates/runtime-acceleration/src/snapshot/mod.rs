@@ -336,6 +336,10 @@ pub enum SnapshotDownloadError {
         index: String,
         source: datafusion::error::DataFusionError,
     },
+    #[snafu(display(
+        "Index {index} not found in snapshot's index artifacts. Likely the snapshot was created without this index. Partial index snapshotting is not supported."
+    ))]
+    IndexNotFound { index: String },
     #[snafu(display("Dataset checkpointer factory not set for snapshot manager"))]
     CheckpointerFactoryNotSet,
     #[snafu(display("Failed to read snapshot metadata at {path}: {source}"))]
@@ -703,9 +707,50 @@ impl std::fmt::Debug for SnapshotManager {
 
 pub struct ForceCreate(pub bool);
 
+/// The snapshot artifacts for a given [`spice_table::Index`], captured
+/// and copied locally at a given point in time.
 struct CapturedIndex {
     identity: spice_table::SnapshotIndexIdentity,
     directory: tempfile::TempDir,
+}
+
+impl CapturedIndex {
+    /// The archive object's filename: the identity's `kind`/`columns`/`discriminator`,
+    /// sanitized to safe path characters, followed by a UUID.
+    ///
+    /// The identity alone is not a collision-proof filename — sanitizing replaces every
+    /// non-alphanumeric character with `_`, so a single column named `a_b` and two columns
+    /// `a`/`b` both sanitize to `a_b` and would otherwise collide on the same object within one
+    /// snapshot's index folder, silently overwriting one index's artifact with the other's. The
+    /// UUID suffix (not a timestamp — this runs per index, not per snapshot, and the snapshot
+    /// timestamp is already the enclosing folder name) guarantees uniqueness regardless of
+    /// whether the identity portion collides.
+    fn archive_filename(&self) -> String {
+        fn sanitize(value: &str) -> String {
+            value
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect()
+        }
+
+        let mut filename = format!(
+            "{}__{}",
+            sanitize(self.identity.kind),
+            self.identity
+                .columns
+                .iter()
+                .map(|column| sanitize(column))
+                .collect::<Vec<_>>()
+                .join("_")
+        );
+        if let Some(discriminator) = &self.identity.discriminator {
+            filename.push_str("__");
+            filename.push_str(&sanitize(discriminator));
+        }
+        filename.push_str(&format!("__{}", uuid::Uuid::now_v7()));
+        filename.push_str(".tar");
+        filename
+    }
 }
 
 fn copy_index_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -893,7 +938,11 @@ impl SnapshotManager {
                     && artifact.columns == identity.columns
                     && artifact.discriminator == identity.discriminator
             }) else {
-                continue;
+                // Handle new indexes not in snapshot by hydrating from acceleration snapshot. Tracked #13608
+                IndexNotFoundSnafu {
+                    index: identity.kind.to_string(),
+                }
+                .fail()?
             };
             let staging =
                 tempfile::tempdir().map_err(|source| SnapshotDownloadError::CreateLocalDir {
@@ -1245,28 +1294,7 @@ impl SnapshotManager {
 
         let mut artifacts = Vec::new();
         for captured in captured {
-            let sanitize = |value: &str| {
-                value
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect::<String>()
-            };
-            let mut filename = format!(
-                "{}__{}",
-                sanitize(captured.identity.kind),
-                captured
-                    .identity
-                    .columns
-                    .iter()
-                    .map(|column| sanitize(column))
-                    .collect::<Vec<_>>()
-                    .join("_")
-            );
-            if let Some(discriminator) = &captured.identity.discriminator {
-                filename.push_str("__");
-                filename.push_str(&sanitize(discriminator));
-            }
-            filename.push_str(".tar");
+            let filename = captured.archive_filename();
             let object_location = layout.index_location(&self.snapshots_location, now, &filename);
             let archive = captured.directory.path().join("index.tar");
             let source = captured.directory.path().join("index");

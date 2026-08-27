@@ -319,6 +319,7 @@ impl Index for FullTextDatabaseIndex {
         };
         let extracted_dir = extracted_dir.to_path_buf();
         let reader = self.reader.clone();
+        let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
             let parent =
                 directory
@@ -346,6 +347,13 @@ impl Index for FullTextDatabaseIndex {
                 &staged.schema(),
                 &reader.searcher().schema(),
             )?;
+
+            // Hold the writer lock across the swap below so a concurrent write can never
+            // straddle it — observing either the pre-restore or post-restore generation, never
+            // a directory mid-rename or (via the writer replacement further down) a writer whose
+            // in-memory segment/opstamp state predates the files it is about to commit alongside.
+            let mut writer_guard = writer.blocking_lock();
+
             let old_directory = directory.with_extension(format!(
                 "snapshot-old-{}-{}",
                 std::process::id(),
@@ -367,6 +375,21 @@ impl Index for FullTextDatabaseIndex {
                     source: error,
                 });
             }
+
+            // The old writer's in-memory segment/opstamp state predates the swap above:
+            // committing through it would write a `meta.json` that doesn't know the installed
+            // segments exist, silently discarding them on the next write. Re-open the
+            // (now-installed) directory and take a fresh writer so the next commit builds on the
+            // restored state rather than the pre-restore one.
+            let reopened =
+                tantivy::Index::open_in_dir(&directory).context(TextSearchIndexingSnafu)?;
+            let new_writer = reopened
+                .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+                .context(IndexCreationSnafu)?;
+            new_writer.set_merge_policy(Box::new(index_merge_policy()));
+            *writer_guard = new_writer;
+            drop(writer_guard);
+
             reader.reload().boxed().context(InvalidIndexingSnafu {
                 context: "Full-text snapshot installed, but failed to reload the reader."
                     .to_string(),

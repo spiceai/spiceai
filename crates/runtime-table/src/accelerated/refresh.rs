@@ -828,6 +828,18 @@ impl Refresher {
                 .set_indexes(collect_all_indexes(&self.accelerator, &self.federated))
                 .await;
         }
+        // `refresh_mode: snapshot` readers restore indexes through a separate
+        // `SnapshotManager` (built in `build_snapshot_refresh_state`, not the
+        // create-side one above) — it needs the same index list or
+        // `restore_indexes_from_snapshot` silently restores nothing on every
+        // hot-swap poll, leaving the FTS index permanently out of sync with the
+        // reloaded accelerator.
+        if let Some(refresh_state) = &self.snapshot_refresh_state {
+            refresh_state
+                .manager
+                .set_indexes(collect_all_indexes(&self.accelerator, &self.federated))
+                .await;
+        }
 
         let checkpointer = self.checkpointer.clone();
         // Checkpoints (and snapshot metadata) persist the canonical registration
