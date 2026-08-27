@@ -111,9 +111,9 @@ impl SchemaCastScanExec {
     /// This exec casts values in place, so it reports `maintains_input_order` and
     /// `CardinalityEffect::Equal`. Both let `EnforceSorting` push an ordering
     /// requirement *through* it into the child and drop the sort once the child
-    /// satisfies the requirement — but the node `SanityCheckPlan` then validates the
-    /// surviving `SortPreservingMergeExec` against is *this* one. So whatever the
-    /// child used to discharge the requirement has to survive into what this exec
+    /// satisfies the requirement — but `SanityCheckPlan` then validates the surviving
+    /// `SortPreservingMergeExec` against *this* node. So whatever the child used to
+    /// discharge the requirement has to survive into what this exec
     /// advertises, and a property dropped here does not cost a sort: it rejects the
     /// plan. A constant (`WHERE pk = ?` satisfying `ORDER BY pk`), an equivalence
     /// class (`WHERE a = b` making an ordering on `a` satisfy `ORDER BY b`) and a
