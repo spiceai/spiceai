@@ -429,10 +429,13 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-The rows above marked **GAP** have no repo-side guard. They are not equal in
-consequence; this is the order to close them in.
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
+is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
+sentence disagree, so the list cannot quietly fall behind the tables.
 
-**Wrong data, silently.** These change query results:
+They are not equal in consequence; this is the order to close them in.
+
+**Wrong data or wrong text, silently.** These change what a user gets back:
 
 1. `datafusion` BigQuery dialect: timestamp literal format, `date_field_extract_style`
    / `interval_style`, `date_trunc`, table-alias column aliases (fork PRs #144, #146,
@@ -441,20 +444,45 @@ consequence; this is the order to close them in.
 3. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
 4. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
 5. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-6. `snowflake-rs` chunked JSON responses and record-batch ordering.
-7. `clickhouse-rs` `Date32` range.
-8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+6. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
+7. `snowflake-rs` chunked JSON responses and record-batch ordering.
+8. `clickhouse-rs` `Date32` range.
+9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-9. `mistral.rs` `tool_calls` chat-template handling.
+10. `mistral.rs` `tool_calls` chat-template handling.
+11. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
+    from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-10. `vortex` session lock re-entry in writer init (fork PR #29).
-11. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+12. `vortex` session lock re-entry in writer init (fork PR #29).
+13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-12. `async-openai` null-suppression in requests.
-13. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-14. `model2vec-rs` optional `config.json`.
+14. `async-openai` null-suppression in requests.
+15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+16. `model2vec-rs` optional `config.json`.
+17. `snowflake-rs` async query response support — long-running queries time out.
+
+**Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
+being honoured:
+
+18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+    the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
+    one file per flush regardless of size.
+19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+    cannot silently drop the limit, the single-node scan can.
+20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+    misconfigured warehouse produces an opaque error instead of an actionable one.
+21. `model2vec-rs` HF cache directory read from the environment — models are
+    re-downloaded instead of reusing the shared cache.
+22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+    installs a global subscriber and hijacks `spiced`'s logging.
+
+**Security posture.** No correctness effect, but a silent downgrade:
+
+23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+24. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -462,31 +490,27 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-15. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
     cheap one exists); `async-openai` retry-after handling.
 
-**A patch that is present but incomplete.** Found while writing the guard above,
-so it is a defect rather than a coverage gap:
+## A patch that is present but incomplete
 
-18. `vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
-    `ExtensionArray`. A scan also evaluates a pushed-down predicate against
-    *constant* arrays built from chunk statistics, and that path resolves a
-    different kernel, which the fork does not patch. A `SELECT … WHERE
-    CAST(date_col AS TIMESTAMP) > TIMESTAMP '…'` over a Vortex file therefore fails
-    the scan outright with:
+Found while writing the guard for it, so it is a defect rather than a coverage gap,
+and it is not one of the 36 above.
 
-    ```
-    No CastReduce to cast constant array from vortex.date[days](i32?) to vortex.timestamp[ns](i64?)
-    ```
+`vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
+`ExtensionArray`. A scan also evaluates a pushed-down predicate against *constant*
+arrays built from chunk statistics, and that path resolves a different kernel, which
+the fork does not patch. A `SELECT … WHERE CAST(date_col AS TIMESTAMP) > TIMESTAMP '…'`
+over a Vortex file therefore fails the scan outright with:
 
-    Reproduced on the pin above against a four-row table. The kernel guard passes,
-    so this is not caught by the row above and needs a fix on the fork, not a test
-    here.
+```
+No CastReduce to cast constant array from vortex.date[days](i32?) to vortex.timestamp[ns](i64?)
+```
 
-**Security posture.** No correctness effect, but a silent downgrade:
-
-16. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-17. `graph-rs-sdk` tower middleware application.
+Reproduced on the pin above against a four-row table. The kernel guard passes, so
+this is not caught by the row it belongs to and needs a fix on the fork, not a test
+here.

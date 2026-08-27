@@ -27,6 +27,7 @@ from check_fork_patches import (  # noqa: E402
     LEDGER,
     LOCK,
     drift,
+    gap_accounting,
     ledger_pins,
     pinned_forks,
 )
@@ -159,6 +160,37 @@ check_contains(
     "different revisions at once",
 )
 
+print("\ngap accounting")
+
+GAPS_HEAD = """
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| one | a thing | silent | **GAP** |
+| two | another | silent | some test |
+| three | a third | silent | **GAP** |
+
+## Open gaps
+
+**{count} rows above are marked GAP** — they have no repo-side guard.
+"""
+
+check("a count matching the tables is silent", gap_accounting(GAPS_HEAD.format(count=2)), [])
+check_contains(
+    "a count that has fallen behind the tables is reported",
+    gap_accounting(GAPS_HEAD.format(count=1)),
+    "2 table row(s) are marked **GAP** but the `Open gaps` section accounts for 1",
+)
+check_contains(
+    "a section that no longer states a count is reported",
+    gap_accounting("| one | x | silent | **GAP** |\n\n## Open gaps\n\nprose only.\n"),
+    "no longer states how many rows it accounts for",
+)
+check_contains(
+    "a ledger with no Open gaps section at all is reported",
+    gap_accounting("| one | x | silent | **GAP** |\n"),
+    "no `## Open gaps` section",
+)
+
 print("\nshipped tree")
 
 # The parsers have to find something in the real files: a rewrite that broke
@@ -168,6 +200,9 @@ ledger_rows = ledger_pins(LEDGER.read_text(encoding="utf-8"))
 check("the lockfile yields forks", len(lock_forks) > 20, True)
 check("the ledger yields rows", len(ledger_rows) > 20, True)
 check("the shipped tree has no drift", drift(lock_forks, ledger_rows), [])
+ledger_text = LEDGER.read_text(encoding="utf-8")
+check("the shipped tree marks at least one gap", "**GAP**" in ledger_text, True)
+check("the shipped Open gaps list accounts for every gap", gap_accounting(ledger_text), [])
 
 if failures:
     print(f"\n{failures} of {checks} checks FAILED")

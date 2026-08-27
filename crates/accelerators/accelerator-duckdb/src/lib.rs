@@ -3711,10 +3711,33 @@ mod tests {
     /// the dataset loads, and the first query touching a time zone fails, in an
     /// environment that may have no network to install the extension from.
     ///
+    /// How the bundled engine says it obtained `name`.
+    ///
+    /// `STATICALLY_LINKED` is the only answer that proves the fork patch is
+    /// present. `DuckDB` installs and loads a known extension automatically, so a
+    /// runner with a network or a warm extension cache satisfies a behavioural
+    /// query either way — which would leave the guards below green on a build that
+    /// had lost the static link, and failing only for whoever runs offline.
+    fn bundled_extension_install_mode(name: &str) -> String {
+        let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
+        db.query_row(
+            "SELECT install_mode FROM duckdb_extensions() WHERE extension_name = ?",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| panic!("the bundled DuckDB does not report an extension `{name}`: {e}"))
+    }
+
     /// New York is five hours behind UTC on this date, which is what makes this a
     /// zone-database lookup rather than a string that happened to parse.
     #[test]
     fn bundled_duckdb_resolves_a_named_time_zone_without_installing_icu() {
+        assert_eq!(
+            bundled_extension_install_mode("icu"),
+            "STATICALLY_LINKED",
+            "ICU has to be compiled in, not installed at runtime"
+        );
+
         let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
         let local: String = db
             .query_row(
@@ -3723,7 +3746,7 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("ICU is statically linked into the bundled DuckDB");
+            .expect("the statically linked ICU resolves a named zone");
         assert_eq!(local, "2025-12-31 19:00");
     }
 
@@ -3738,13 +3761,19 @@ mod tests {
     /// PR #38).
     #[test]
     fn bundled_duckdb_builds_an_hnsw_index_without_installing_vss() {
+        assert_eq!(
+            bundled_extension_install_mode("vss"),
+            "STATICALLY_LINKED",
+            "VSS has to be compiled in, not installed at runtime"
+        );
+
         let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
         db.execute_batch(
             "CREATE TABLE embeddings (v FLOAT[3]);
              INSERT INTO embeddings VALUES ([1.0, 2.0, 3.0]), ([2.0, 3.0, 4.0]);
              CREATE INDEX embeddings_hnsw ON embeddings USING HNSW (v);",
         )
-        .expect("VSS is statically linked into the bundled DuckDB");
+        .expect("the statically linked VSS supplies the HNSW index type");
 
         let nearest: f32 = db
             .query_row(

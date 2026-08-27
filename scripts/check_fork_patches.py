@@ -47,6 +47,15 @@ LOCK_SOURCE_RE = re.compile(
     re.M,
 )
 
+# The count of unguarded patches the "Open gaps" section claims to account for,
+# e.g. "**36 rows above are marked GAP**". Pinned against the tables so the
+# prioritised list cannot quietly fall behind them — a row that gets a **GAP**
+# marker and no entry in that list is a patch the ledger hides.
+GAP_CLAIM_RE = re.compile(r"^\*\*(?P<count>\d+) rows above are marked GAP\*\*", re.M)
+
+# A table row whose Guard cell reports no repo-side coverage.
+GAP_ROW_RE = re.compile(r"^\|.*\*\*GAP\*\*.*\|$", re.M)
+
 # A ledger pin row:
 #   | [vortex](#vortex) | `ba043de0ab6e214e825932210cc336b7ce5e8309` | `spiceai-54` | … |
 # The repo name is read from the link text so the row stays a working anchor.
@@ -85,6 +94,28 @@ def ledger_pins(ledger_text: str) -> dict[str, list[str]]:
     for match in LEDGER_ROW_RE.finditer(ledger_text):
         pins.setdefault(match.group("repo"), []).append(match.group("rev"))
     return pins
+
+
+def gap_accounting(ledger_text: str) -> list[str]:
+    """Whether the "Open gaps" list still accounts for every **GAP** row."""
+    body, _, gaps = ledger_text.partition("## Open gaps")
+    if not gaps:
+        return ["docs/dev/fork_patches.md has no `## Open gaps` section"]
+    marked = len(GAP_ROW_RE.findall(body))
+    claim = GAP_CLAIM_RE.search(gaps)
+    if not claim:
+        return [
+            "docs/dev/fork_patches.md: the `Open gaps` section no longer states how many "
+            "rows it accounts for, so nothing pins it to the tables"
+        ]
+    claimed = int(claim.group("count"))
+    if claimed != marked:
+        return [
+            f"docs/dev/fork_patches.md: {marked} table row(s) are marked **GAP** but the "
+            f"`Open gaps` section accounts for {claimed}. Add the missing patch(es) to that "
+            f"list and update the count, or the ledger hides an unguarded patch"
+        ]
+    return []
 
 
 def drift(pinned: dict[str, set[str]], recorded: dict[str, list[str]]) -> list[str]:
@@ -136,8 +167,9 @@ def main() -> int:
             print(f"error: {path.relative_to(REPO)} not found", file=sys.stderr)
             return 1
 
+    ledger_text = LEDGER.read_text(encoding="utf-8")
     pinned = pinned_forks(LOCK.read_text(encoding="utf-8"))
-    recorded = ledger_pins(LEDGER.read_text(encoding="utf-8"))
+    recorded = ledger_pins(ledger_text)
 
     if args.list:
         for repo in sorted(set(pinned) | set(recorded)):
@@ -146,10 +178,10 @@ def main() -> int:
             status = "ok" if lock_rev == doc_rev else "DRIFT"
             print(f"{status:6} {repo:28} lock={lock_rev[:12]:14} ledger={doc_rev[:12]}")
 
-    errors = drift(pinned, recorded)
+    errors = drift(pinned, recorded) + gap_accounting(ledger_text)
     if errors:
         print(
-            f"\n{len(errors)} fork pin(s) disagree with docs/dev/fork_patches.md:\n",
+            f"\n{len(errors)} problem(s) with docs/dev/fork_patches.md:\n",
             file=sys.stderr,
         )
         for error in errors:

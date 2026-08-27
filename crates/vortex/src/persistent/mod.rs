@@ -608,11 +608,12 @@ mod tests {
     /// rather than the patch.
     #[test]
     fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
-        use datafusion::arrow::array::Date32Array;
-        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+        use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
+        use datafusion::arrow::datatypes::{DataType, Field, TimestampMillisecondType, TimeUnit};
         use vortex::array::ArrayRef as VortexArrayRef;
         use vortex::array::builtins::ArrayBuiltins;
-        use vortex::arrow::{FromArrowArray, FromArrowType};
+        use vortex::array::VortexSessionExecute;
+        use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
         use vortex::dtype::{DType, Nullability};
 
         // 1970-01-01, 2024-01-15, and a NULL, so the cast has to carry validity as
@@ -620,18 +621,37 @@ mod tests {
         let dates = Date32Array::from(vec![Some(0), Some(19_737), None]);
         let source = VortexArrayRef::from_arrow(&dates, true)?;
 
-        let target = DType::from_arrow((
-            &DataType::Timestamp(TimeUnit::Millisecond, None),
-            Nullability::Nullable,
-        ));
+        let millis = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let target = DType::from_arrow((&millis, Nullability::Nullable));
         let cast = source.cast(target.clone())?;
-
         assert_eq!(
             cast.dtype(),
             &target,
             "the cast has to land on the target type"
         );
-        assert_eq!(cast.len(), 3, "the cast has to preserve every row");
+
+        // Read the values back rather than stopping at the type: a cast that lands
+        // on `vortex.timestamp` and puts the wrong instants in it is the failure
+        // this guard is for, and it would pass a type-and-length assertion.
+        let session = VortexSession::default();
+        let arrow = session.arrow().execute_arrow(
+            cast,
+            Some(&Field::new("event_ts", millis, true)),
+            &mut session.create_execution_ctx(),
+        )?;
+        let timestamps = arrow.as_primitive::<TimestampMillisecondType>();
+
+        assert_eq!(timestamps.len(), 3, "the cast has to preserve every row");
+        assert_eq!(timestamps.value(0), 0, "1970-01-01 is the epoch");
+        assert_eq!(
+            timestamps.value(1),
+            1_705_276_800_000,
+            "2024-01-15 is 19_737 days after the epoch, at midnight"
+        );
+        assert!(
+            timestamps.is_null(2),
+            "a NULL date has to stay NULL through the cast, not become the epoch"
+        );
 
         Ok(())
     }
