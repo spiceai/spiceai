@@ -53,6 +53,7 @@ use super::{
     ParameterSpec,
 };
 use crate::component::dataset::DatasetSpec;
+use arrow_tools::map_entries::StreamNormalizer;
 use data_components::cdc::{
     self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
     CommitError,
@@ -659,6 +660,10 @@ pub fn subscribe_to_append_stream(
     table_reference: String,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
     stream! {
+        // The subscription carries one schema per stream, so the normalizer is resolved from the
+        // first batch and reused for the rest. Without it an accelerated dataset that started on
+        // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
+        let mut normalizer = StreamNormalizer::new();
         match client.subscribe(&table_reference).await {
             Ok(mut stream) => {
                 while let Some(decoded_data) = stream.next().await {
@@ -666,6 +671,15 @@ pub fn subscribe_to_append_stream(
                         Ok(decoded_data) => match decoded_data.payload {
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
+                                let batch = match normalizer.normalize(batch) {
+                                    Ok(batch) => batch,
+                                    Err(source) => {
+                                        yield Err(cdc::StreamError::Arrow(format!(
+                                            "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
+                                        )));
+                                        continue;
+                                    }
+                                };
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {

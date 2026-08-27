@@ -692,7 +692,8 @@ mod tests {
         type DoGetStream =
             std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
         type DoPutStream = EmptyResponseStream<PutResult>;
-        type DoExchangeStream = EmptyResponseStream<FlightData>;
+        type DoExchangeStream =
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
         type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
         type ListActionsStream = EmptyResponseStream<ActionType>;
 
@@ -774,7 +775,13 @@ mod tests {
             &self,
             _request: Request<tonic::Streaming<FlightData>>,
         ) -> Result<Response<Self::DoExchangeStream>, Status> {
-            Err(Status::unimplemented("do_exchange"))
+            let batch = nullable_entries_map_batch();
+            let data =
+                arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch])
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+            Ok(Response::new(Box::pin(futures::stream::iter(
+                data.into_iter().map(Ok),
+            ))))
         }
 
         async fn do_action(
@@ -792,14 +799,14 @@ mod tests {
         }
     }
 
-    struct TestServer {
-        addr: SocketAddr,
+    pub(crate) struct TestServer {
+        pub(crate) addr: SocketAddr,
         shutdown: Option<oneshot::Sender<()>>,
         handle: JoinHandle<Result<(), tonic::transport::Error>>,
     }
 
     impl TestServer {
-        async fn start() -> Self {
+        pub(crate) async fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
@@ -820,7 +827,7 @@ mod tests {
             }
         }
 
-        async fn shutdown(mut self) {
+        pub(crate) async fn shutdown(mut self) {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
             }
