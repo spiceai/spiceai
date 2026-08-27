@@ -931,11 +931,20 @@ fn attribute_as_f64(value: &any_value::Value) -> Option<f64> {
     match value {
         any_value::Value::DoubleValue(v) => Some(*v),
         any_value::Value::IntValue(v) => exact_f64_from_i64(*v),
-        any_value::Value::StringValue(v) => {
-            v.parse().ok().filter(|parsed: &f64| parsed.is_finite())
-        }
+        any_value::Value::StringValue(v) => exact_f64_from_str(v),
         _ => None,
     }
+}
+
+/// `text` as an `f64`, if the double prints back as exactly that text.
+///
+/// Parsing alone is not enough: `"9007199254740993"` parses to `9007199254740992`, a number
+/// the client never sent. Rust prints the shortest text that parses back to the same double,
+/// so requiring the round trip refuses every value a double cannot hold. Text that is exact
+/// but written differently — `"1.50"`, `"1e3"` — is refused too, and recorded as NULL.
+fn exact_f64_from_str(text: &str) -> Option<f64> {
+    let parsed: f64 = text.parse().ok()?;
+    (parsed.is_finite() && parsed.to_string() == text).then_some(parsed)
 }
 
 /// `value` as bytes. Text is stored as its UTF-8 bytes, which loses nothing.
@@ -2195,6 +2204,12 @@ mod tests {
                 any_value::Value::StringValue(String::new()),
                 "empty text",
             ),
+            // The nearest double to this text is a different integer.
+            (
+                DataType::Float64,
+                any_value::Value::StringValue("9007199254740993".to_string()),
+                "an integer written as text that a double would round",
+            ),
             // Only the two words a boolean prints as are accepted.
             (
                 DataType::Boolean,
@@ -2393,6 +2408,21 @@ mod tests {
         assert_eq!(exact_i64_from_f64(1e30), None);
         assert_eq!(exact_i64_from_f64(f64::NAN), None);
         assert_eq!(exact_i64_from_f64(f64::INFINITY), None);
+
+        // Text is only accepted when the double prints back as exactly that text, so a value
+        // a double cannot hold is refused instead of being silently rounded.
+        assert_eq!(exact_f64_from_str("1.5"), Some(1.5));
+        assert_eq!(exact_f64_from_str("-2"), Some(-2.0));
+        assert_eq!(
+            exact_f64_from_str("9007199254740993"),
+            None,
+            "the nearest double is 9007199254740992, a number the client never sent"
+        );
+        assert_eq!(exact_f64_from_str("1e3"), None, "written differently");
+        assert_eq!(exact_f64_from_str("1.50"), None, "written differently");
+        assert_eq!(exact_f64_from_str("inf"), None);
+        assert_eq!(exact_f64_from_str("NaN"), None);
+        assert_eq!(exact_f64_from_str("twelve"), None);
 
         assert_eq!(exact_u64_from_f64(42.0), Some(42));
         assert_eq!(exact_u64_from_f64(-1.0), None);

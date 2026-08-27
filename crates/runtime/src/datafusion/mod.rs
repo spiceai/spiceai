@@ -74,7 +74,7 @@ use {
 };
 
 use crate::cluster::partition::service::PartitionService;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
@@ -751,6 +751,38 @@ pub enum Table {
 struct PendingSinkRegistration {
     dataset: Arc<Dataset>,
     secrets: Arc<TokioRwLock<Secrets>>,
+}
+
+/// `target` with every column of `live` that it does not name added back.
+///
+/// A write builds its target schema from the schema it read. By the time it evolves, another
+/// write may have added a column, and a target that omits that column reads as a request to
+/// remove it — which classifies as incompatible and refuses an addition that is perfectly
+/// compatible. Each write would then have to retry once per column added behind its back, so a
+/// burst of writes each adding a different column could exhaust its retries and lose data.
+/// Restoring the live columns leaves only this write's own additions to classify, so it
+/// evolves in one step no matter how many other writes are in flight.
+///
+/// Keeps `live`'s column order, and for a column both name keeps the target's field, so a type
+/// or nullability change is still classified.
+fn merge_live_columns(live: &SchemaRef, target: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<FieldRef> = Vec::with_capacity(live.fields().len() + target.fields().len());
+    for live_field in live.fields() {
+        let field = target
+            .fields()
+            .iter()
+            .find(|target_field| target_field.name() == live_field.name())
+            .unwrap_or(live_field);
+        fields.push(Arc::clone(field));
+    }
+    fields.extend(
+        target
+            .fields()
+            .iter()
+            .filter(|target_field| live.field_with_name(target_field.name()).is_err())
+            .map(Arc::clone),
+    );
+    Arc::new(Schema::new_with_metadata(fields, target.metadata().clone()))
 }
 
 /// Removes `key` only while it still holds `claimed`.
@@ -3867,7 +3899,11 @@ impl DataFusion {
             constraint_columns: &constraint_columns,
         };
 
-        match arrow_tools::schema_evolution::classify(&current, target_schema, &ctx) {
+        // Classify against the target with the live columns restored, so this write is judged
+        // on what it adds rather than on what it never saw. See `merge_live_columns`.
+        let target_schema = merge_live_columns(&current, target_schema);
+
+        match arrow_tools::schema_evolution::classify(&current, &target_schema, &ctx) {
             // Another export already evolved to a superset (or nothing changed): the
             // caller rebuilds against `current`, which is a no-op.
             SchemaEvolution::Identical => Ok(Some(current)),
@@ -5747,6 +5783,61 @@ mod tests {
     /// Reloading a dataset replaces its pending-registration entry. A registration finishing
     /// against the old entry must leave the replacement alone, or the reloaded dataset can
     /// never register on its first write.
+    /// A write that never saw a column another write just added must still be judged on what
+    /// it adds. Without restoring the live columns, its target reads as removing that column,
+    /// which classifies as incompatible and refuses the addition.
+    #[test]
+    fn merge_live_columns_restores_columns_the_target_never_saw() {
+        let live = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Added by a concurrent write, after this target was built.
+            Field::new("tier", DataType::Utf8, true),
+        ]));
+        let target = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // This write's own addition.
+            Field::new("zone", DataType::Utf8, true),
+        ]));
+
+        let merged = merge_live_columns(&live, &target);
+
+        assert_eq!(
+            merged
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["value", "region", "tier", "zone"],
+            "the live columns keep their order, and this write's addition goes last"
+        );
+
+        // Classifying that against the live schema is a plain addition, not a removal.
+        let constraint_columns: Vec<String> = Vec::new();
+        let ctx = EvolutionContext {
+            constraint_columns: &constraint_columns,
+        };
+        let evolution = arrow_tools::schema_evolution::classify(&live, &merged, &ctx);
+        assert!(
+            matches!(evolution, SchemaEvolution::Widening(_)),
+            "restoring the live columns must leave only the addition, got {evolution:?}"
+        );
+    }
+
+    /// A column both schemas name keeps the incoming field, so a type change is still seen.
+    #[test]
+    fn merge_live_columns_keeps_the_targets_field_for_a_shared_column() {
+        let live = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let target = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+
+        let merged = merge_live_columns(&live, &target);
+
+        let field = merged.field_with_name("n").expect("column is present");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(field.is_nullable());
+    }
+
     #[test]
     fn remove_if_same_leaves_a_replacement_entry_in_place() {
         let key = TableReference::bare("metric");

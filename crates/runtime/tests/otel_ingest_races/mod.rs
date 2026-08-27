@@ -19,7 +19,7 @@ limitations under the License.
 //! OTLP metric dataset shape (`refresh_mode: append`, `primary_key: time_unix_nano`,
 //! `on_schema_change: append_new_columns`, `access: read_write`).
 //!
-//! Four flows are covered:
+//! Five flows are covered:
 //!
 //! - **Concurrent first writes.** A sink dataset is registered by its first write. One
 //!   writer does that while the rest wait, instead of looking the table up before it exists
@@ -31,6 +31,8 @@ limitations under the License.
 //!   first write, so it must be registered from the acceleration checkpoint first.
 //! - **A first write that names the dataset differently.** A qualified name, as a Flight
 //!   `DoPut` produces, must still find and register the dataset.
+//! - **More exports adding columns at once than a write gets retries.** A write must not have
+//!   to retry once per column another write added behind its back.
 //!
 //! Each concurrent phase has a timeout, so a deadlock fails the test instead of hanging it.
 
@@ -466,6 +468,85 @@ async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyho
         1,
         "the aliased write must land in the now-registered dataset"
     );
+
+    rt.shutdown().await;
+    Ok(())
+}
+
+/// Many exports each adding a different column at once. Each one builds its batch from the
+/// schema it read, so by the time it evolves, several columns it never saw already exist. If
+/// that counted as removing them, every export would advance one column per retry and the last
+/// ones would run out of retries and lose their data points.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn many_concurrent_exports_adding_distinct_columns_all_land() -> Result<(), anyhow::Error> {
+    const METRIC: &str = "otel_race_many_dimensions";
+    // Deliberately more than the per-metric write attempt cap.
+    const WRITERS: u64 = 8;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
+    let metadata_dir = temp_dir
+        .path()
+        .join("metadata")
+        .to_string_lossy()
+        .to_string();
+    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
+
+    register_test_connectors().await;
+    let rt = start_runtime(&ds).await;
+
+    // Establish the base schema and register the sink.
+    ingest(
+        &rt,
+        gauge_export(METRIC, 0.0, 100, vec![string_attr("region", "us")]),
+    )
+    .await?;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..WRITERS {
+        let rt = Arc::clone(&rt);
+        tasks.spawn(async move {
+            ingest(
+                &rt,
+                gauge_export(
+                    METRIC,
+                    1.0,
+                    200 + i,
+                    vec![
+                        string_attr("region", "us"),
+                        string_attr(&format!("dim_{i}"), "present"),
+                    ],
+                ),
+            )
+            .await
+        });
+    }
+
+    let results = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for concurrent evolving exports — possible deadlock in the schema-evolution path"
+            )
+        })?;
+    for result in results {
+        result?;
+    }
+
+    let n = u64::try_from(row_count(&rt, METRIC).await?)?;
+    assert_eq!(
+        n,
+        1 + WRITERS,
+        "every export must land, however many columns were added behind its back"
+    );
+    for i in 0..WRITERS {
+        run_query(&rt, &format!("SELECT dim_{i} FROM {METRIC}"))
+            .await
+            .map_err(|e| anyhow::anyhow!("column dim_{i} must exist after the race: {e}"))?;
+    }
 
     rt.shutdown().await;
     Ok(())
