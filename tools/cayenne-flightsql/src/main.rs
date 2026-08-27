@@ -389,6 +389,7 @@ mod tests {
                     data_dir: None,
                     metadata_dir: None,
                     spice_data_base_path: base_path.to_string_lossy().to_string(),
+                    catalog_name: None,
                     footer_cache_mb: None,
                     segment_cache_mb: None,
                     target_file_size_mb: None,
