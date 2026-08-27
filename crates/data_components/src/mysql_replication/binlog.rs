@@ -97,6 +97,20 @@ const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
 /// that decides whether to raise it.
 const NET_WRITE_TIMEOUT_NOT_RAISED: &str = "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's `net_write_timeout`. See: https://spiceai.org/docs/components/data-connectors/mysql";
 
+/// What to tell an operator when the floor was not applied to a dump session.
+///
+/// `reason` says which way it went — the source answered `NULL`, or the read
+/// itself failed — because the remedy differs and the consequence does not.
+///
+/// A function rather than two inline `format!`s so both messages are assertable:
+/// this warning is the only account anyone gets of a floor that was skipped, and
+/// the two branches drifted apart the moment they were written separately.
+fn net_write_timeout_left_alone_warning(connection: &str, reason: &str) -> String {
+    format!(
+        "Could not raise `net_write_timeout` on the MySQL binlog dump session for '{connection}' ({reason}), so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+    )
+}
+
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
     sql: String,
@@ -202,7 +216,8 @@ pub(super) async fn open_binlog_stream(
         Ok(None) => {
             tracing::warn!(
                 connection = %connection,
-                "The MySQL source answered NULL for `net_write_timeout` on the binlog dump session for '{connection}', so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+                "{}",
+                net_write_timeout_left_alone_warning(connection, "the source answered NULL")
             );
             None
         }
@@ -210,7 +225,8 @@ pub(super) async fn open_binlog_stream(
             tracing::warn!(
                 connection = %connection,
                 error = %e,
-                "Could not read `net_write_timeout` on the MySQL binlog dump session for '{connection}', so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+                "{}",
+                net_write_timeout_left_alone_warning(connection, &format!("the read failed: {e}"))
             );
             None
         }
@@ -1202,6 +1218,41 @@ mod tests {
             None,
             "an unread net_write_timeout must not be assigned a value"
         );
+    }
+
+    #[test]
+    fn a_skipped_floor_says_which_connection_why_and_what_it_costs() {
+        // This warning is the only account anyone gets of a floor that was not
+        // applied, so both branches have to carry the same three things: the
+        // connection it is about, why the value was left alone, and what that
+        // costs. Asserted for both, because they are two call sites of one
+        // message and drifted apart when they were two messages.
+        for (reason, expected_reason) in [
+            ("the source answered NULL", "the source answered NULL"),
+            (
+                "the read failed: Access denied",
+                "the read failed: Access denied",
+            ),
+        ] {
+            let warning = net_write_timeout_left_alone_warning("db.internal:3306", reason);
+            assert!(
+                warning.contains("'db.internal:3306'"),
+                "the connection must be named, and quoted: {warning}"
+            );
+            assert!(warning.contains(expected_reason), "{warning}");
+            assert!(
+                warning.contains("`net_write_timeout`"),
+                "the setting is a system identifier: {warning}"
+            );
+            assert!(
+                warning.contains("https://spiceai.org/docs/"),
+                "the warning must point at the fix: {warning}"
+            );
+            assert!(
+                warning.contains("abort the shared binlog connection"),
+                "the warning must say what is lost: {warning}"
+            );
+        }
     }
 
     #[test]
