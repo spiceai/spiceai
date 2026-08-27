@@ -99,7 +99,11 @@ const CREDENTIALS_REJECTED_CODES: &[&str] = &[
 /// a host clock more than a few minutes out makes the signature expire, and a signature scoped
 /// to the wrong region is rejected as mismatched. Telling those operators to replace their keys
 /// is advice that cannot work, which is worse than saying nothing.
-const SIGNATURE_REJECTED_CODES: &[&str] = &["InvalidSignatureException", "IncompleteSignature"];
+const SIGNATURE_REJECTED_CODES: &[&str] = &[
+    "InvalidSignatureException",
+    "IncompleteSignature",
+    "RequestExpired",
+];
 
 /// AWS's own message distinguishes the causes behind these two codes ("Signature expired…" vs
 /// "…does not match the signature you provided"), and [`describe`] carries it through, so the
@@ -108,12 +112,16 @@ const SIGNATURE_REMEDY: &str = concat!(
     "AWS could not verify the request signature, which a valid key pair can still fail: ",
     "check that the host clock is accurate (a signature expires minutes after it is made), ",
     "that `aws_region` names the region serving this model, ",
-    "and that `aws_secret_access_key` belongs with `aws_access_key_id`."
+    "that `aws_secret_access_key` belongs with `aws_access_key_id`, ",
+    "and that nothing between this host and AWS is rewriting the request."
 );
 
-/// Codes AWS returns when the credentials are valid but the identity may not make this call —
-/// a missing IAM action, or the identity not having access to this model in this region.
-const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "UnauthorizedException"];
+/// Codes AWS returns when it knows the identity but will not let this call through — a missing
+/// IAM action, or the account or identity not having access to this model in this region.
+///
+/// `NotAuthorized` and `OptInRequired` are from AWS's common-error set rather than Bedrock's own
+/// modelled errors, so they arrive unmodelled exactly as the credential codes do.
+const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "NotAuthorized", "OptInRequired"];
 
 #[derive(Debug, Snafu)]
 #[snafu(display("Failed to call Bedrock model '{model_id}': {detail}. {remedy} See: {docs_url}"))]
@@ -122,29 +130,41 @@ pub struct BedrockAuthError {
     detail: String,
     remedy: String,
     docs_url: &'static str,
+    /// The SDK error this explains, kept as the source so nothing the replacement does not
+    /// render is lost with it: the operation error stays downcastable and its own source chain
+    /// stays walkable. Only [`Display`](std::fmt::Display) changes.
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-/// Build the operator-facing message for a rejection AWS has already labelled with `code`.
+/// Build the `(detail, remedy)` halves of the operator-facing message for a rejection AWS has
+/// already labelled with `code`.
 ///
 /// Returns `None` for any code that is not an authentication or authorization rejection, which
 /// leaves every other error rendering exactly as the SDK renders it.
 fn describe(
     code: Option<&str>,
     message: Option<&str>,
-    model_id: &str,
+    request_id: Option<&str>,
     operation: Operation,
-) -> Option<BedrockAuthError> {
+) -> Option<(String, String)> {
     let code = code?;
     let remedy = if CREDENTIALS_REJECTED_CODES.contains(&code) {
         operation.credentials_remedy().to_string()
     } else if SIGNATURE_REJECTED_CODES.contains(&code) {
         SIGNATURE_REMEDY.to_string()
     } else if ACCESS_DENIED_CODES.contains(&code) {
-        // Not "request access in the console": Bedrock grants model access automatically for
-        // most models now, and the ones that don't route through Marketplace or a provider
-        // use-case form. Point at the state to confirm, not at one console flow.
+        // Naming one action is not enough on its own: a request carrying a guardrail also needs
+        // `bedrock:ApplyGuardrail`, and an inference profile needs its own actions, so an
+        // identity that already holds the invoke action can still be denied. AWS's message
+        // names the action it actually refused, and `detail` carries it, so lead with that and
+        // give the invoke action as the floor rather than as the whole answer.
+        // Not "request access in the console" either: Bedrock grants model access automatically
+        // for most models now, and the rest route through Marketplace or a provider use-case
+        // form. Point at the state to confirm, not at one console flow.
         format!(
-            "Grant the identity the `{}` action on this model, and confirm the identity has \
+            "Grant the identity the action named in AWS's message — this call needs at \
+             least `{}`, and a request using a guardrail or an inference profile needs the \
+             further actions those require. Then confirm the account and the identity have \
              access to this model in the region set by `aws_region`.",
             operation.iam_action()
         )
@@ -153,18 +173,20 @@ fn describe(
     };
 
     // Keep whatever AWS said alongside its code: the code is what the remedy is chosen from, and
-    // the message is often the only thing distinguishing two causes behind one code.
-    let detail = match message.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(message) => format!("AWS rejected the request ({code}: {message})"),
-        None => format!("AWS rejected the request ({code})"),
+    // the message is often the only thing distinguishing two causes behind one code. The request
+    // ID goes in too — it is what AWS support and the service logs are searched by, and this
+    // rendering is all an operator sees.
+    let mut detail = match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(message) => format!("AWS rejected the request ({code}: {message}"),
+        None => format!("AWS rejected the request ({code}"),
     };
+    if let Some(request_id) = request_id.map(str::trim).filter(|id| !id.is_empty()) {
+        detail.push_str("; AWS request ID ");
+        detail.push_str(request_id);
+    }
+    detail.push(')');
 
-    Some(BedrockAuthError {
-        model_id: model_id.to_string(),
-        detail,
-        remedy,
-        docs_url: operation.docs_url(),
-    })
+    Some((detail, remedy))
 }
 
 /// Box a Bedrock service error for the caller, substituting the operator-facing explanation
@@ -178,8 +200,17 @@ pub(crate) fn explain<E>(
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    match describe(err.code(), err.message(), model_id, operation) {
-        Some(explained) => Box::new(explained),
+    // The key AWS's own SDK files the request ID under (`aws_types::request_id`); read from the
+    // metadata directly rather than taking a dependency on that crate for one accessor.
+    let request_id = err.meta().extra("aws_request_id").map(ToOwned::to_owned);
+    match describe(err.code(), err.message(), request_id.as_deref(), operation) {
+        Some((detail, remedy)) => Box::new(BedrockAuthError {
+            model_id: model_id.to_string(),
+            detail,
+            remedy,
+            docs_url: operation.docs_url(),
+            source: Box::new(err),
+        }),
         None => Box::new(err),
     }
 }
@@ -188,9 +219,13 @@ where
 mod tests {
     use super::{
         ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, Operation, SIGNATURE_REJECTED_CODES,
-        UNKNOWN_MODEL, describe, explain,
+        UNKNOWN_MODEL, explain,
     };
-    use aws_smithy_types::error::metadata::{ErrorMetadata, ProvideErrorMetadata};
+    use aws_sdk_bedrockruntime::error::ErrorMetadata;
+    use aws_sdk_bedrockruntime::operation::{
+        converse::ConverseError, converse_stream::ConverseStreamError,
+        invoke_model::InvokeModelError,
+    };
 
     const MODEL: &str = "amazon.titan-embed-text-v2:0";
     const EVERY_OPERATION: [Operation; 3] = [
@@ -199,37 +234,33 @@ mod tests {
         Operation::Embeddings,
     ];
 
-    /// Stands in for a Bedrock operation error: the SDK's own types carry both of these
-    /// impls, and `explain` needs both to box the error it was handed.
-    #[derive(Debug)]
-    struct FakeServiceError(ErrorMetadata);
-
-    impl std::fmt::Display for FakeServiceError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            // How the SDK renders a code it does not model.
-            match ProvideErrorMetadata::code(self) {
-                Some(code) => write!(f, "unhandled error ({code})"),
-                None => f.write_str("unhandled error"),
-            }
+    fn metadata(code: &str, message: Option<&str>, request_id: Option<&str>) -> ErrorMetadata {
+        let mut builder = ErrorMetadata::builder().code(code);
+        if let Some(message) = message {
+            builder = builder.message(message);
         }
-    }
-
-    impl std::error::Error for FakeServiceError {}
-
-    impl ProvideErrorMetadata for FakeServiceError {
-        fn meta(&self) -> &ErrorMetadata {
-            &self.0
+        if let Some(request_id) = request_id {
+            builder = builder.custom("aws_request_id", request_id);
         }
+        builder.build()
     }
 
-    fn service_error(code: &str, message: &str) -> FakeServiceError {
-        FakeServiceError(ErrorMetadata::builder().code(code).message(message).build())
-    }
-
+    /// Render through the real SDK error type an unmodelled code actually arrives as, so these
+    /// assertions exercise the same `ProvideErrorMetadata` path the call sites do.
     fn rendered(code: &str, message: Option<&str>, operation: Operation) -> String {
-        describe(Some(code), message, MODEL, operation)
-            .unwrap_or_else(|| panic!("{code} must be classified"))
-            .to_string()
+        let err = InvokeModelError::generic(metadata(code, message, None));
+        let out = explain(err, MODEL, operation).to_string();
+        assert!(
+            !out.contains("unhandled error"),
+            "{code} must be classified, not left to the SDK: {out}"
+        );
+        out
+    }
+
+    /// What the SDK renders for a code it does not model — the string this whole module exists
+    /// to replace, and the one every unclassified error must still get.
+    fn sdk_rendering(code: &str) -> String {
+        format!("unhandled error ({code})")
     }
 
     #[test]
@@ -257,11 +288,6 @@ mod tests {
             out.contains(Operation::Embeddings.docs_url()),
             "must link the docs: {out}"
         );
-        // The whole point of the rewrite: the SDK's own rendering said only this.
-        assert!(
-            !out.contains("unhandled error"),
-            "must not read as an unhandled error: {out}"
-        );
     }
 
     #[test]
@@ -280,6 +306,29 @@ mod tests {
             !out.contains("`aws_access_key_id`"),
             "credentials that AWS accepted must not be blamed: {out}"
         );
+    }
+
+    #[test]
+    fn access_denial_defers_to_the_action_aws_named() {
+        // Naming one action would be wrong whenever the request needs more than the invoke
+        // action — a guardrail also needs `bedrock:ApplyGuardrail`, and this chat client
+        // supports guardrails — so an identity holding only the invoke action is still denied.
+        // AWS names the action it refused; the message has to point there, not assert one.
+        for operation in EVERY_OPERATION {
+            let out = rendered("AccessDeniedException", Some("not authorized"), operation);
+            assert!(
+                out.contains("the action named in AWS's message"),
+                "{operation:?} must defer to AWS's own named action: {out}"
+            );
+            assert!(
+                out.contains("guardrail"),
+                "{operation:?} must say further actions can be required: {out}"
+            );
+            assert!(
+                out.contains("at least"),
+                "{operation:?} must give the invoke action as a floor, not the whole answer: {out}"
+            );
+        }
     }
 
     #[test]
@@ -344,6 +393,44 @@ mod tests {
     }
 
     #[test]
+    fn a_signature_failure_is_not_reported_as_a_bad_key_pair() {
+        // A signature can fail to verify with a valid key pair — a skewed host clock expires
+        // it, a signature scoped to the wrong region is rejected as mismatched, and something
+        // rewriting the request in flight breaks it. An operator told to replace their keys
+        // would rotate a working key pair and still be broken.
+        //
+        // Pin the membership, not just the wording: emptying the list would leave the loop
+        // below with nothing to iterate and this test would pass with the defect restored.
+        assert_eq!(
+            SIGNATURE_REJECTED_CODES,
+            [
+                "InvalidSignatureException",
+                "IncompleteSignature",
+                "RequestExpired"
+            ],
+            "a signature code moved out of this class silently takes the credential remedy"
+        );
+
+        for code in SIGNATURE_REJECTED_CODES {
+            for operation in EVERY_OPERATION {
+                let out = rendered(code, None, operation);
+                assert!(
+                    out.contains("clock") && out.contains("`aws_region`"),
+                    "{code} must name the causes a key rotation cannot fix: {out}"
+                );
+                assert!(
+                    !out.contains("to an active key pair"),
+                    "{code} must not be reported as a credential replacement: {out}"
+                );
+                assert!(
+                    !out.contains("bedrock:InvokeModel"),
+                    "{code} is not an authorization failure: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn chat_and_embeddings_are_sent_to_their_own_docs_page() {
         assert_ne!(Operation::Chat.docs_url(), Operation::Embeddings.docs_url());
         assert_eq!(Operation::Chat.docs_url(), Operation::ChatStream.docs_url());
@@ -358,11 +445,7 @@ mod tests {
 
     #[test]
     fn every_listed_code_is_described_and_carries_a_remedy() {
-        for code in CREDENTIALS_REJECTED_CODES
-            .iter()
-            .chain(SIGNATURE_REJECTED_CODES.iter())
-            .chain(ACCESS_DENIED_CODES.iter())
-        {
+        for code in every_code() {
             for operation in EVERY_OPERATION {
                 let out = rendered(code, None, operation);
                 assert!(out.contains(code), "{code} must appear in {out}");
@@ -372,6 +455,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn every_code() -> impl Iterator<Item = &'static str> {
+        CREDENTIALS_REJECTED_CODES
+            .iter()
+            .chain(SIGNATURE_REJECTED_CODES.iter())
+            .chain(ACCESS_DENIED_CODES.iter())
+            .copied()
     }
 
     #[test]
@@ -397,35 +488,46 @@ mod tests {
     }
 
     #[test]
-    fn a_signature_failure_is_not_reported_as_a_bad_key_pair() {
-        // A signature can fail to verify with a valid key pair — a skewed host clock expires
-        // it, and a signature scoped to the wrong region is rejected as mismatched. An operator
-        // told to replace their keys would rotate a working key pair and still be broken.
-        // Pin the membership, not just the wording: emptying the list would leave the loop
-        // below with nothing to iterate and the test would pass with the defect restored.
-        assert_eq!(
-            SIGNATURE_REJECTED_CODES,
-            ["InvalidSignatureException", "IncompleteSignature"],
-            "a signature code moved out of this class silently takes the credential remedy"
+    fn the_aws_request_id_survives_into_the_message() {
+        // It is what AWS support and the service logs are searched by, and the rendered message
+        // is all an operator sees, so losing it here loses it entirely.
+        let err = InvokeModelError::generic(metadata(
+            "UnrecognizedClientException",
+            Some("The security token included in the request is invalid."),
+            Some("11111111-2222-3333-4444-555555555555"),
+        ));
+        let out = explain(err, MODEL, Operation::Embeddings).to_string();
+        assert!(
+            out.contains("AWS request ID 11111111-2222-3333-4444-555555555555"),
+            "must carry the request ID: {out}"
         );
 
-        for code in SIGNATURE_REJECTED_CODES {
-            for operation in EVERY_OPERATION {
-                let out = rendered(code, None, operation);
-                assert!(
-                    out.contains("clock") && out.contains("`aws_region`"),
-                    "{code} must name the causes a key rotation cannot fix: {out}"
-                );
-                assert!(
-                    !out.contains("to an active key pair"),
-                    "{code} must not be reported as a credential replacement: {out}"
-                );
-                assert!(
-                    !out.contains("bedrock:InvokeModel"),
-                    "{code} is not an authorization failure: {out}"
-                );
-            }
-        }
+        // And its absence must not leave a dangling separator.
+        let without = rendered("UnrecognizedClientException", Some("nope"), Operation::Chat);
+        assert!(
+            !without.contains("request ID"),
+            "no request ID means no mention of one: {without}"
+        );
+        assert!(
+            without.contains("(UnrecognizedClientException: nope)"),
+            "the detail must still close cleanly: {without}"
+        );
+    }
+
+    #[test]
+    fn the_sdk_error_is_kept_as_the_source() {
+        // The replacement changes how the failure reads, not what is reachable behind it: the
+        // operation error must stay downcastable and its own chain walkable.
+        let err = InvokeModelError::generic(metadata("AccessDeniedException", Some("no"), None));
+        let boxed = explain(err, MODEL, Operation::Chat);
+
+        let source =
+            std::error::Error::source(boxed.as_ref()).expect("the SDK error is the source");
+        assert!(
+            source.downcast_ref::<InvokeModelError>().is_some(),
+            "the original operation error must stay downcastable: {source}"
+        );
+        assert_eq!(source.to_string(), sdk_rendering("AccessDeniedException"));
     }
 
     #[test]
@@ -437,23 +539,23 @@ mod tests {
             "ServiceUnavailableException",
             "InternalServerException",
         ] {
-            assert!(
-                describe(Some(code), Some("some detail"), MODEL, Operation::Chat).is_none(),
-                "{code} is not an auth failure and must render as the SDK renders it"
-            );
+            for operation in EVERY_OPERATION {
+                let err = InvokeModelError::generic(metadata(code, Some("some detail"), None));
+                assert_eq!(
+                    explain(err, MODEL, operation).to_string(),
+                    sdk_rendering(code),
+                    "{code} is not an auth failure and must render as the SDK renders it"
+                );
+            }
         }
     }
 
     #[test]
     fn an_error_with_no_code_is_left_to_the_sdk() {
-        assert!(
-            describe(
-                None,
-                Some("a message but no code"),
-                MODEL,
-                Operation::Embeddings
-            )
-            .is_none(),
+        let err = InvokeModelError::generic(ErrorMetadata::builder().message("no code").build());
+        assert_eq!(
+            explain(err, MODEL, Operation::Embeddings).to_string(),
+            "unhandled error",
             "a rejection AWS did not label cannot be classified"
         );
     }
@@ -461,11 +563,9 @@ mod tests {
     #[test]
     fn an_empty_aws_message_does_not_leave_a_dangling_separator() {
         for message in [Some(""), Some("   "), None] {
-            let out = rendered(
-                "UnrecognizedClientException",
-                message,
-                Operation::Embeddings,
-            );
+            let err =
+                InvokeModelError::generic(metadata("UnrecognizedClientException", message, None));
+            let out = explain(err, MODEL, Operation::Embeddings).to_string();
             assert!(
                 out.contains("(UnrecognizedClientException)"),
                 "an absent AWS message must leave the code alone: {out}"
@@ -479,14 +579,8 @@ mod tests {
 
     #[test]
     fn a_request_with_no_model_id_still_renders() {
-        let out = describe(
-            Some("ExpiredTokenException"),
-            None,
-            UNKNOWN_MODEL,
-            Operation::Chat,
-        )
-        .expect("still a credential rejection")
-        .to_string();
+        let err = InvokeModelError::generic(metadata("ExpiredTokenException", None, None));
+        let out = explain(err, UNKNOWN_MODEL, Operation::Chat).to_string();
         assert!(
             out.contains(UNKNOWN_MODEL),
             "must be explicit that the model is unknown: {out}"
@@ -494,14 +588,54 @@ mod tests {
     }
 
     #[test]
+    fn each_operations_own_sdk_error_type_is_classified() {
+        // The three call sites hand `explain` three different SDK error enums. They share a
+        // `ProvideErrorMetadata` impl, but nothing in the type system says so — assert each
+        // one, through the type that call site actually produces.
+        let code = "UnrecognizedClientException";
+        let converse = explain(
+            ConverseError::generic(metadata(code, None, None)),
+            MODEL,
+            Operation::Chat,
+        )
+        .to_string();
+        let stream = explain(
+            ConverseStreamError::generic(metadata(code, None, None)),
+            MODEL,
+            Operation::ChatStream,
+        )
+        .to_string();
+        let invoke = explain(
+            InvokeModelError::generic(metadata(code, None, None)),
+            MODEL,
+            Operation::Embeddings,
+        )
+        .to_string();
+
+        for (name, out) in [
+            ("Converse", &converse),
+            ("ConverseStream", &stream),
+            ("InvokeModel", &invoke),
+        ] {
+            assert!(
+                out.contains(code) && !out.contains("unhandled error"),
+                "{name} must be classified: {out}"
+            );
+        }
+        assert_eq!(converse, stream, "both chat calls share the chat remedy");
+        assert_ne!(converse, invoke, "embeddings has its own remedy and page");
+    }
+
+    #[test]
     fn explain_replaces_an_auth_rejection_with_the_actionable_message() {
-        let err = service_error(
+        let err = InvokeModelError::generic(metadata(
             "UnrecognizedClientException",
-            "The security token included in the request is invalid.",
-        );
+            Some("The security token included in the request is invalid."),
+            None,
+        ));
         assert_eq!(
             err.to_string(),
-            "unhandled error (UnrecognizedClientException)",
+            sdk_rendering("UnrecognizedClientException"),
             "the SDK rendering this replaces"
         );
 
@@ -526,11 +660,7 @@ mod tests {
         // These messages are assembled from wrapped source, and `rustfmt` joins a continued
         // top-level `const` onto one line while keeping the indentation the continuation was
         // meant to swallow — which put runs of spaces inside the rendered text.
-        for code in CREDENTIALS_REJECTED_CODES
-            .iter()
-            .chain(SIGNATURE_REJECTED_CODES.iter())
-            .chain(ACCESS_DENIED_CODES.iter())
-        {
+        for code in every_code() {
             for operation in EVERY_OPERATION {
                 let out = rendered(code, Some("an AWS message"), operation);
                 assert!(
@@ -542,16 +672,6 @@ mod tests {
                     "{code}/{operation:?} must stay on one line: {out}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn explain_passes_a_non_auth_error_through_unchanged() {
-        // Every other Bedrock failure must keep rendering exactly as the SDK renders it.
-        for operation in EVERY_OPERATION {
-            let err = service_error("ValidationException", "input too long");
-            let sdk_rendering = err.to_string();
-            assert_eq!(explain(err, MODEL, operation).to_string(), sdk_rendering);
         }
     }
 }
