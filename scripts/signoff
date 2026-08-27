@@ -2370,7 +2370,7 @@ cmd_remote() {
       || "$branch" == *\"* || "$branch" == *\'* || "$branch" == *\$* || "$branch" == *\`* ]]; then
     fail "refusing to dispatch Remote Sign-off for unsafe branch name: '${branch}'"
   fi
-  if [[ ! "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  if [[ ! "$branch" =~ ^[A-Za-z0-9._/#-]+$ ]]; then
     fail "refusing to dispatch Remote Sign-off for invalid branch name: '${branch}'"
   fi
 

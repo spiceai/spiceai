@@ -106,6 +106,7 @@ if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
 fi
 
 if [[ "${1:-}" == "api" && "${2:-}" == repos/*/commits/* ]]; then
+  printf '%s' "$2" >"${STUB_LOG_API_ENDPOINT:-/dev/null}"
   [[ "${STUB_API_RC:-0}" == "0" ]] || exit "${STUB_API_RC}"
   printf '%s\n' "${STUB_BRANCH_SHA:-}"
   exit 0
@@ -136,6 +137,7 @@ run_step() {
   local outfile="$stub_dir/github_output"
   : >"$outfile"
 
+  : >"$stub_dir/api_endpoint"
   out=$(
     PATH="$stub_dir:$PATH" \
     BRANCH="$branch" \
@@ -146,9 +148,11 @@ run_step() {
     STUB_PR_RC="${STUB_PR_RC:-0}" \
     STUB_BRANCH_SHA="${STUB_BRANCH_SHA:-}" \
     STUB_API_RC="${STUB_API_RC:-0}" \
+    STUB_LOG_API_ENDPOINT="$stub_dir/api_endpoint" \
     bash "$subject" 2>&1
   )
   rc=$?
+  api_endpoint="$(cat "$stub_dir/api_endpoint" 2>/dev/null || true)"
 
   local key
   for key in checkout_repo checkout_ref is_fork head_sha; do
@@ -264,6 +268,20 @@ echo "a lookup that answers with something other than a commit SHA fails"
 STUB_BRANCH_SHA="not-a-sha" run_step "fix/weird" ""
 [[ $rc -ne 0 ]] || fail_test "expected a non-zero exit, got 0: $out"
 grep -q "not a commit SHA" <<<"$out" || fail_test "expected a SHA-shape error in: $out"
+
+# `#` is a legal git ref character (e.g. the issue-#123-* branches this repo's
+# worktree convention produces) but also a URL fragment delimiter — unencoded,
+# gh's commits-API call silently truncates the ref at it and 404s on the wrong
+# thing. checkout_ref (what gets attested and checked out) must stay the raw
+# branch name; only the lookup URL needs encoding.
+tests_run=$((tests_run + 1))
+echo "a branch containing '#' is accepted and percent-encoded for the lookup"
+STUB_BRANCH_SHA="$BRANCH_SHA" run_step "issue-#13038-20260818163736" ""
+[[ $rc -eq 0 ]] || fail_test "exited $rc: $out"
+assert_eq "checkout_ref" "issue-#13038-20260818163736" "$out_checkout_ref"
+assert_eq "head_sha" "$BRANCH_SHA" "$out_head_sha"
+[[ "$api_endpoint" == *"%23"* ]] || fail_test "expected the lookup endpoint to percent-encode '#', got: $api_endpoint"
+[[ "$api_endpoint" != *"#"* ]] || fail_test "raw '#' reached gh api unencoded, would truncate as a URL fragment: $api_endpoint"
 
 # A branch name that would break the dispatch or the checkout must be rejected
 # by the step's own validation, before the stub `gh` is ever reached — the stub
