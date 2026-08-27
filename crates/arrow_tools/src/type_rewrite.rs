@@ -568,7 +568,8 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
     }
 }
 
-/// The nulls of `child` as a reader sees them, rather than as its own null buffer states them.
+/// The nulls of `child` as a reader sees them, rather than as its own null buffer states them,
+/// **in `child`'s own row space**.
 ///
 /// Four types differ from their physical null buffer, and each would otherwise read as null-free
 /// from it: a `RunEndEncoded` array has no null buffer at all (a null run is a null in `values`,
@@ -577,21 +578,41 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
 /// row selects; and every value of a `Null` array is null with no buffer to say so. All four are
 /// answered by Arrow's own [`Array::logical_nulls`] rather than by re-deriving them.
 ///
-/// Every other type reports its physical nulls, which for them *are* the logical ones, and takes a
-/// branch that builds no array at all.
+/// That answer is not always in the child's coordinates, which is why [`in_own_rows`] follows it.
+/// Measured against the pinned arrow-rs: a one-variant sparse union sliced to `len 1, offset 1`
+/// reports a **length-2** buffer — its values' whole buffer, with the offset applied to the type
+/// ids but not to this — so comparing it against a parent's mask would line up the wrong rows.
 ///
 /// Materializing here is safe even for a `Map` still awaiting the [`MapEntriesNonNullable`]
 /// correction, which is worth stating because the neighbouring doc comment invites the opposite
 /// conclusion: it is `MapArray::try_new` that refuses a nullable `entries` field, while
-/// `make_array` goes through `MapArray::from`, which does not. Measured against the pinned
-/// arrow-rs — `make_array` on such a map, and on a dictionary over one, both return normally.
+/// `make_array` goes through `MapArray::from`, which does not.
+///
+/// Every other type reports its physical nulls, which for them *are* the logical ones and already
+/// carry the child's own offset, and takes a branch that builds no array at all.
 fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
     match child.data_type() {
         DataType::RunEndEncoded(..)
         | DataType::Dictionary(..)
         | DataType::Union(..)
-        | DataType::Null => make_array(child.clone()).logical_nulls(),
+        | DataType::Null => in_own_rows(make_array(child.clone()).logical_nulls()?, child),
         _ => child.nulls().cloned(),
+    }
+}
+
+/// Re-expresses `nulls` in `child`'s own rows, so it can be compared against a parent's mask.
+///
+/// A buffer already that length is returned untouched. One that still spans the whole underlying
+/// child is windowed by `child`'s offset. Anything else is a disagreement this cannot resolve, and
+/// it resolves to *every row null* rather than to none: the callers read an absent buffer as "no
+/// nulls", so returning `None` here would admit a narrowing that nothing had actually checked.
+fn in_own_rows(nulls: NullBuffer, child: &ArrayData) -> Option<NullBuffer> {
+    if nulls.len() == child.len() {
+        return Some(nulls);
+    }
+    match child.offset().checked_add(child.len()) {
+        Some(end) if end <= nulls.len() => Some(nulls.slice(child.offset(), child.len())),
+        _ => Some(NullBuffer::new_null(child.len())),
     }
 }
 
@@ -1602,6 +1623,55 @@ mod tests {
             .expect("the dictionary holds no null, so narrowing the item is admitted");
 
         assert_eq!(relabelled.data_type(), &target);
+    }
+
+    /// `UnionArray::logical_nulls` reports its values' whole buffer rather than the union's own
+    /// rows, so a sparse union that a slice moved off zero answers in the wrong coordinates. Under
+    /// a masked `Struct` — whose children `ArrayData::slice` *does* slice, which is what gives the
+    /// union a nonzero offset — comparing that answer against the parent's mask lines up the wrong
+    /// rows and admits the reachable null.
+    ///
+    /// Three rows, the union null at the last; the struct's own null is at row 0, so slicing to the
+    /// last two leaves the union's null reachable and the mask covering nothing.
+    #[test]
+    fn relabel_refuses_narrowing_a_sliced_union_child_of_a_masked_struct() {
+        let variants = |nullable| {
+            UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, nullable)])
+                .expect("one type id for one field")
+        };
+        let union = UnionArray::try_new(
+            variants(true),
+            vec![0_i8, 0, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef],
+        )
+        .expect("a sparse union over one variant");
+        let union_type = union.data_type().clone();
+        let source = StructArray::new(
+            Fields::from(vec![Field::new("u", union_type.clone(), true)]),
+            vec![Arc::new(union) as ArrayRef],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .to_data()
+        .slice(1, 2);
+        assert_eq!(
+            source.child_data()[0].offset(),
+            1,
+            "slicing a struct slices its children — that offset is the whole hazard"
+        );
+        let target = DataType::Struct(Fields::from(vec![Field::new(
+            "u",
+            DataType::Union(variants(false), UnionMode::Sparse),
+            false,
+        )]));
+
+        let err = relabel_array_data(source, &target)
+            .expect_err("the surviving rows include a null the parent's mask does not cover");
+
+        assert!(
+            err.to_string().contains("'u'"),
+            "the error must name the field it refused, got: {err}"
+        );
     }
 
     /// `MapEntriesNonNullable` is not exempt from the proof. `build` refuses this one too (`Map` is
