@@ -26,15 +26,62 @@ limitations under the License.
 use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
 use snafu::Snafu;
 
-/// The Bedrock chat docs, which carry the credential parameters for a chat model.
-pub(crate) const CHAT_DOCS_URL: &str = "https://spiceai.org/docs/components/models/bedrock";
-
-/// The Bedrock embeddings docs, which carry the credential parameters for an embedding model.
-pub(crate) const EMBEDDINGS_DOCS_URL: &str =
-    "https://spiceai.org/docs/components/embeddings/bedrock";
-
 /// The model name to report when the request never carried one.
 pub(crate) const UNKNOWN_MODEL: &str = "<unknown>";
+
+/// Which Bedrock call the rejection came from.
+///
+/// A remedy has to get three things right, and they do not vary together: the docs page that
+/// documents the credentials, the credential parameters that component actually accepts, and
+/// the IAM action AWS checks. Carrying the operation rather than any one of them is what keeps
+/// the three consistent at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operation {
+    /// `Converse` — a chat model's non-streaming request.
+    Chat,
+    /// `ConverseStream` — a chat model's streaming request.
+    ChatStream,
+    /// `InvokeModel` — how every Bedrock embedding model is called.
+    Embeddings,
+}
+
+impl Operation {
+    /// The page documenting the credential parameters for the component that made the call.
+    fn docs_url(self) -> &'static str {
+        match self {
+            Self::Chat | Self::ChatStream => "https://spiceai.org/docs/components/models/bedrock",
+            Self::Embeddings => "https://spiceai.org/docs/components/embeddings/bedrock",
+        }
+    }
+
+    /// The IAM action AWS checks for this call. `ConverseStream` is authorized by
+    /// `bedrock:InvokeModelWithResponseStream`, so an identity granted only
+    /// `bedrock:InvokeModel` still has streaming chat denied.
+    fn iam_action(self) -> &'static str {
+        match self {
+            Self::ChatStream => "bedrock:InvokeModelWithResponseStream",
+            Self::Chat | Self::Embeddings => "bedrock:InvokeModel",
+        }
+    }
+
+    /// The credential parameters this component accepts. `aws_profile` is embeddings-only —
+    /// `BedrockModelParams` neither accepts nor forwards it — so a chat remedy that named it
+    /// would send the operator to a setting the chat path ignores.
+    fn credentials_remedy(self) -> &'static str {
+        match self {
+            Self::Chat | Self::ChatStream => {
+                "Set `aws_access_key_id` and `aws_secret_access_key` to an active key pair (and \
+                 `aws_session_token` if the credentials are temporary), or set \
+                 `aws_iam_role_source` to resolve them instead."
+            }
+            Self::Embeddings => {
+                "Set `aws_access_key_id` and `aws_secret_access_key` to an active key pair (and \
+                 `aws_session_token` if the credentials are temporary), or set \
+                 `aws_iam_role_source` or `aws_profile` to resolve them instead."
+            }
+        }
+    }
+}
 
 /// Codes AWS returns when it will not accept the request's credentials at all — the key is
 /// unknown, the signature does not match it, or the session token has expired. Retrying cannot
@@ -50,19 +97,15 @@ const CREDENTIALS_REJECTED_CODES: &[&str] = &[
 ];
 
 /// Codes AWS returns when the credentials are valid but the identity may not make this call —
-/// a missing IAM action, or model access not granted for the model in this region.
+/// a missing IAM action, or the identity not having access to this model in this region.
 const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "UnauthorizedException"];
-
-/// What the operator should change, chosen by which half of the rejection this is.
-const CREDENTIALS_REJECTED_REMEDY: &str = "Set `aws_access_key_id` and `aws_secret_access_key` to an active key pair (and `aws_session_token` if the credentials are temporary), or set `aws_iam_role_source` or `aws_profile` to resolve them instead.";
-const ACCESS_DENIED_REMEDY: &str = "Grant the identity the `bedrock:InvokeModel` action on this model, and request access to the model in the Amazon Bedrock console for the region in `aws_region`.";
 
 #[derive(Debug, Snafu)]
 #[snafu(display("Failed to call Bedrock model '{model_id}': {detail}. {remedy} See: {docs_url}"))]
 pub struct BedrockAuthError {
     model_id: String,
     detail: String,
-    remedy: &'static str,
+    remedy: String,
     docs_url: &'static str,
 }
 
@@ -74,13 +117,20 @@ fn describe(
     code: Option<&str>,
     message: Option<&str>,
     model_id: &str,
-    docs_url: &'static str,
+    operation: Operation,
 ) -> Option<BedrockAuthError> {
     let code = code?;
     let remedy = if CREDENTIALS_REJECTED_CODES.contains(&code) {
-        CREDENTIALS_REJECTED_REMEDY
+        operation.credentials_remedy().to_string()
     } else if ACCESS_DENIED_CODES.contains(&code) {
-        ACCESS_DENIED_REMEDY
+        // Not "request access in the console": Bedrock grants model access automatically for
+        // most models now, and the ones that don't route through Marketplace or a provider
+        // use-case form. Point at the state to confirm, not at one console flow.
+        format!(
+            "Grant the identity the `{}` action on this model, and confirm the identity has \
+             access to this model in the region set by `aws_region`.",
+            operation.iam_action()
+        )
     } else {
         return None;
     };
@@ -96,25 +146,22 @@ fn describe(
         model_id: model_id.to_string(),
         detail,
         remedy,
-        docs_url,
+        docs_url: operation.docs_url(),
     })
 }
 
 /// Box a Bedrock service error for the caller, substituting the operator-facing explanation
 /// when the rejection was an authentication or authorization failure and leaving every other
 /// error to render exactly as the SDK renders it.
-///
-/// `docs_url` is the page for the component that made the call: a Bedrock client serves both
-/// chat and embedding models, and each has its own configuration page.
 pub(crate) fn explain<E>(
     err: E,
     model_id: &str,
-    docs_url: &'static str,
+    operation: Operation,
 ) -> Box<dyn std::error::Error + Send + Sync>
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    match describe(err.code(), err.message(), model_id, docs_url) {
+    match describe(err.code(), err.message(), model_id, operation) {
         Some(explained) => Box::new(explained),
         None => Box::new(err),
     }
@@ -123,12 +170,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_DENIED_CODES, CHAT_DOCS_URL, CREDENTIALS_REJECTED_CODES, EMBEDDINGS_DOCS_URL,
-        UNKNOWN_MODEL, describe, explain,
+        ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, Operation, UNKNOWN_MODEL, describe,
+        explain,
     };
     use aws_smithy_types::error::metadata::{ErrorMetadata, ProvideErrorMetadata};
 
     const MODEL: &str = "amazon.titan-embed-text-v2:0";
+    const EVERY_OPERATION: [Operation; 3] = [
+        Operation::Chat,
+        Operation::ChatStream,
+        Operation::Embeddings,
+    ];
 
     /// Stands in for a Bedrock operation error: the SDK's own types carry both of these
     /// impls, and `explain` needs both to box the error it was handed.
@@ -157,61 +209,134 @@ mod tests {
         FakeServiceError(ErrorMetadata::builder().code(code).message(message).build())
     }
 
+    fn rendered(code: &str, message: Option<&str>, operation: Operation) -> String {
+        describe(Some(code), message, MODEL, operation)
+            .unwrap_or_else(|| panic!("{code} must be classified"))
+            .to_string()
+    }
+
     #[test]
     fn credential_rejection_names_the_model_the_keys_and_the_docs() {
-        let err = describe(
-            Some("UnrecognizedClientException"),
+        let out = rendered(
+            "UnrecognizedClientException",
             Some("The security token included in the request is invalid."),
-            MODEL,
-            EMBEDDINGS_DOCS_URL,
-        )
-        .expect("UnrecognizedClientException is a credential rejection");
-        let rendered = err.to_string();
+            Operation::Embeddings,
+        );
 
-        assert!(rendered.contains(MODEL), "must name the model: {rendered}");
+        assert!(out.contains(MODEL), "must name the model: {out}");
         assert!(
-            rendered.contains("UnrecognizedClientException"),
-            "must keep the AWS code: {rendered}"
+            out.contains("UnrecognizedClientException"),
+            "must keep the AWS code: {out}"
         );
         assert!(
-            rendered.contains("The security token included in the request is invalid."),
-            "must keep the AWS message: {rendered}"
+            out.contains("The security token included in the request is invalid."),
+            "must keep the AWS message: {out}"
         );
         assert!(
-            rendered.contains("`aws_access_key_id`")
-                && rendered.contains("`aws_secret_access_key`"),
-            "must name the parameters to change: {rendered}"
+            out.contains("`aws_access_key_id`") && out.contains("`aws_secret_access_key`"),
+            "must name the parameters to change: {out}"
         );
         assert!(
-            rendered.contains(EMBEDDINGS_DOCS_URL),
-            "must link the docs: {rendered}"
+            out.contains(Operation::Embeddings.docs_url()),
+            "must link the docs: {out}"
         );
         // The whole point of the rewrite: the SDK's own rendering said only this.
         assert!(
-            !rendered.contains("unhandled error"),
-            "must not read as an unhandled error: {rendered}"
+            !out.contains("unhandled error"),
+            "must not read as an unhandled error: {out}"
         );
     }
 
     #[test]
     fn access_denial_asks_for_the_grant_not_for_new_keys() {
-        let rendered = describe(
-            Some("AccessDeniedException"),
+        let out = rendered(
+            "AccessDeniedException",
             Some("You don't have access to the model with the specified model ID."),
-            MODEL,
-            EMBEDDINGS_DOCS_URL,
-        )
-        .expect("AccessDeniedException is an authorization rejection")
-        .to_string();
+            Operation::Embeddings,
+        );
 
         assert!(
-            rendered.contains("bedrock:InvokeModel"),
-            "must name the IAM action: {rendered}"
+            out.contains("bedrock:InvokeModel"),
+            "must name the IAM action: {out}"
         );
         assert!(
-            !rendered.contains("`aws_access_key_id`"),
-            "credentials that AWS accepted must not be blamed: {rendered}"
+            !out.contains("`aws_access_key_id`"),
+            "credentials that AWS accepted must not be blamed: {out}"
         );
+    }
+
+    #[test]
+    fn a_streaming_chat_denial_asks_for_the_streaming_iam_action() {
+        // AWS authorizes `ConverseStream` with `bedrock:InvokeModelWithResponseStream`. An
+        // identity granted only `bedrock:InvokeModel` still has streaming chat denied, so a
+        // shared remedy would send the operator to a grant that does not lift the denial.
+        let streaming = rendered("AccessDeniedException", None, Operation::ChatStream);
+        assert!(
+            streaming.contains("`bedrock:InvokeModelWithResponseStream`"),
+            "streaming chat must ask for the streaming action: {streaming}"
+        );
+
+        for operation in [Operation::Chat, Operation::Embeddings] {
+            let out = rendered("AccessDeniedException", None, operation);
+            assert!(
+                out.contains("`bedrock:InvokeModel`")
+                    && !out.contains("InvokeModelWithResponseStream"),
+                "{operation:?} is authorized by bedrock:InvokeModel alone: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chat_credential_remedy_names_only_parameters_chat_accepts() {
+        // `aws_profile` is an embeddings-only parameter: `BedrockModelParams` neither accepts
+        // nor forwards it, so a chat operator who followed that advice would stay
+        // unauthenticated while believing they had acted on the message.
+        for operation in [Operation::Chat, Operation::ChatStream] {
+            let out = rendered("UnrecognizedClientException", None, operation);
+            assert!(
+                !out.contains("aws_profile"),
+                "{operation:?} does not accept `aws_profile`: {out}"
+            );
+            assert!(
+                out.contains("`aws_iam_role_source`"),
+                "{operation:?} does accept `aws_iam_role_source`: {out}"
+            );
+        }
+
+        let embeddings = rendered("UnrecognizedClientException", None, Operation::Embeddings);
+        assert!(
+            embeddings.contains("`aws_profile`"),
+            "embeddings do accept `aws_profile`: {embeddings}"
+        );
+
+        // The two remedies differ only in `aws_profile`, so the rest is duplicated prose that
+        // one arm could lose in an edit without the assertions above noticing.
+        for operation in EVERY_OPERATION {
+            let out = rendered("UnrecognizedClientException", None, operation);
+            for param in [
+                "`aws_access_key_id`",
+                "`aws_secret_access_key`",
+                "`aws_session_token`",
+            ] {
+                assert!(
+                    out.contains(param),
+                    "{operation:?} must name {param}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chat_and_embeddings_are_sent_to_their_own_docs_page() {
+        assert_ne!(Operation::Chat.docs_url(), Operation::Embeddings.docs_url());
+        assert_eq!(Operation::Chat.docs_url(), Operation::ChatStream.docs_url());
+        for operation in EVERY_OPERATION {
+            let out = rendered("ExpiredTokenException", None, operation);
+            assert!(
+                out.ends_with(operation.docs_url()),
+                "{operation:?} must link its own page: {out}"
+            );
+        }
     }
 
     #[test]
@@ -220,14 +345,14 @@ mod tests {
             .iter()
             .chain(ACCESS_DENIED_CODES.iter())
         {
-            let rendered = describe(Some(code), None, MODEL, EMBEDDINGS_DOCS_URL)
-                .unwrap_or_else(|| panic!("{code} is listed, so it must be described"))
-                .to_string();
-            assert!(rendered.contains(code), "{code} must appear in {rendered}");
-            assert!(
-                rendered.contains(EMBEDDINGS_DOCS_URL),
-                "{code} must link the docs: {rendered}"
-            );
+            for operation in EVERY_OPERATION {
+                let out = rendered(code, None, operation);
+                assert!(out.contains(code), "{code} must appear in {out}");
+                assert!(
+                    out.contains(operation.docs_url()),
+                    "{code}/{operation:?} must link the docs: {out}"
+                );
+            }
         }
     }
 
@@ -253,7 +378,7 @@ mod tests {
             "InternalServerException",
         ] {
             assert!(
-                describe(Some(code), Some("some detail"), MODEL, EMBEDDINGS_DOCS_URL).is_none(),
+                describe(Some(code), Some("some detail"), MODEL, Operation::Chat).is_none(),
                 "{code} is not an auth failure and must render as the SDK renders it"
             );
         }
@@ -266,7 +391,7 @@ mod tests {
                 None,
                 Some("a message but no code"),
                 MODEL,
-                EMBEDDINGS_DOCS_URL
+                Operation::Embeddings
             )
             .is_none(),
             "a rejection AWS did not label cannot be classified"
@@ -276,38 +401,35 @@ mod tests {
     #[test]
     fn an_empty_aws_message_does_not_leave_a_dangling_separator() {
         for message in [Some(""), Some("   "), None] {
-            let rendered = describe(
-                Some("UnrecognizedClientException"),
+            let out = rendered(
+                "UnrecognizedClientException",
                 message,
-                MODEL,
-                EMBEDDINGS_DOCS_URL,
-            )
-            .expect("still a credential rejection")
-            .to_string();
-            assert!(
-                rendered.contains("(UnrecognizedClientException)"),
-                "an absent AWS message must leave the code alone: {rendered}"
+                Operation::Embeddings,
             );
             assert!(
-                !rendered.contains(": )"),
-                "must not render an empty message: {rendered}"
+                out.contains("(UnrecognizedClientException)"),
+                "an absent AWS message must leave the code alone: {out}"
+            );
+            assert!(
+                !out.contains(": )"),
+                "must not render an empty message: {out}"
             );
         }
     }
 
     #[test]
     fn a_request_with_no_model_id_still_renders() {
-        let rendered = describe(
+        let out = describe(
             Some("ExpiredTokenException"),
             None,
             UNKNOWN_MODEL,
-            EMBEDDINGS_DOCS_URL,
+            Operation::Chat,
         )
         .expect("still a credential rejection")
         .to_string();
         assert!(
-            rendered.contains(UNKNOWN_MODEL),
-            "must be explicit that the model is unknown: {rendered}"
+            out.contains(UNKNOWN_MODEL),
+            "must be explicit that the model is unknown: {out}"
         );
     }
 
@@ -323,49 +445,29 @@ mod tests {
             "the SDK rendering this replaces"
         );
 
-        let rendered = explain(err, MODEL, EMBEDDINGS_DOCS_URL).to_string();
-        assert!(rendered.contains(MODEL), "must name the model: {rendered}");
+        let out = explain(err, MODEL, Operation::Embeddings).to_string();
+        assert!(out.contains(MODEL), "must name the model: {out}");
         assert!(
-            rendered.contains("The security token included in the request is invalid."),
-            "must carry AWS's own message through: {rendered}"
+            out.contains("The security token included in the request is invalid."),
+            "must carry AWS's own message through: {out}"
         );
         assert!(
-            rendered.contains("`aws_access_key_id`"),
-            "must name the parameter to change: {rendered}"
+            out.contains("`aws_access_key_id`"),
+            "must name the parameter to change: {out}"
         );
         assert!(
-            !rendered.contains("unhandled error"),
-            "the SDK rendering must not survive: {rendered}"
+            !out.contains("unhandled error"),
+            "the SDK rendering must not survive: {out}"
         );
     }
 
     #[test]
     fn explain_passes_a_non_auth_error_through_unchanged() {
         // Every other Bedrock failure must keep rendering exactly as the SDK renders it.
-        let err = service_error("ValidationException", "input too long");
-        let sdk_rendering = err.to_string();
-        assert_eq!(
-            explain(err, MODEL, EMBEDDINGS_DOCS_URL).to_string(),
-            sdk_rendering
-        );
-    }
-
-    #[test]
-    fn explain_links_the_docs_page_of_the_calling_component() {
-        // A Bedrock client serves chat and embeddings, and the credential parameters are
-        // documented on a different page for each.
-        assert_ne!(CHAT_DOCS_URL, EMBEDDINGS_DOCS_URL);
-        for docs_url in [CHAT_DOCS_URL, EMBEDDINGS_DOCS_URL] {
-            let rendered = explain(
-                service_error("AccessDeniedException", "no access to the model"),
-                MODEL,
-                docs_url,
-            )
-            .to_string();
-            assert!(
-                rendered.ends_with(docs_url),
-                "{rendered} must end with {docs_url}"
-            );
+        for operation in EVERY_OPERATION {
+            let err = service_error("ValidationException", "input too long");
+            let sdk_rendering = err.to_string();
+            assert_eq!(explain(err, MODEL, operation).to_string(), sdk_rendering);
         }
     }
 }

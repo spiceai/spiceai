@@ -103,7 +103,7 @@ impl BedrockClient {
                         e => Err(RetryError::permanent(auth_error::explain(
                             e,
                             &model_id,
-                            auth_error::CHAT_DOCS_URL,
+                            auth_error::Operation::ChatStream,
                         ))),
                     },
                     Err(e) => Err(RetryError::permanent(
@@ -142,7 +142,7 @@ impl BedrockClient {
                         e => Err(RetryError::permanent(auth_error::explain(
                             e,
                             &model_id,
-                            auth_error::CHAT_DOCS_URL,
+                            auth_error::Operation::Chat,
                         ))),
                     },
                     Err(e) => Err(RetryError::permanent(
@@ -187,7 +187,7 @@ impl BedrockClient {
                     e => Err(RetryError::permanent(auth_error::explain(
                         e,
                         &m,
-                        auth_error::EMBEDDINGS_DOCS_URL,
+                        auth_error::Operation::Embeddings,
                     ))),
                 },
                 Err(e) => Err(RetryError::permanent(
