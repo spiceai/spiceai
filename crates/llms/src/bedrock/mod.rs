@@ -15,9 +15,12 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+mod auth_error;
 pub mod chat;
 pub mod embed;
 mod list_models;
+
+pub use auth_error::BedrockAuthError;
 
 pub use list_models::BedrockModelLister;
 
@@ -78,8 +81,13 @@ impl BedrockClient {
         &self,
         converse_build: ConverseStreamFluentBuilder,
     ) -> Result<ConverseStreamOutput, Box<dyn std::error::Error + Send + Sync>> {
+        let model_id = converse_build
+            .get_model_id()
+            .clone()
+            .unwrap_or_else(|| auth_error::UNKNOWN_MODEL.to_string());
         self.rate_limit_request_with_retry(move |_client| {
             let value = converse_build.clone();
+            let model_id = model_id.clone();
             async move {
                 match value.send().await {
                     Ok(response) => Ok(response),
@@ -92,9 +100,11 @@ impl BedrockClient {
                                 Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
                             ))
                         }
-                        e => Err(RetryError::permanent(
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        )),
+                        e => Err(RetryError::permanent(auth_error::explain(
+                            e,
+                            &model_id,
+                            auth_error::CHAT_DOCS_URL,
+                        ))),
                     },
                     Err(e) => Err(RetryError::permanent(
                         Box::new(e) as Box<dyn std::error::Error + Send + Sync>
@@ -110,8 +120,13 @@ impl BedrockClient {
         &self,
         converse_build: ConverseFluentBuilder,
     ) -> Result<ConverseOutput, Box<dyn std::error::Error + Send + Sync>> {
+        let model_id = converse_build
+            .get_model_id()
+            .clone()
+            .unwrap_or_else(|| auth_error::UNKNOWN_MODEL.to_string());
         self.rate_limit_request_with_retry(move |_client| {
             let value = converse_build.clone();
+            let model_id = model_id.clone();
             async move {
                 match value.send().await {
                     Ok(response) => Ok(response),
@@ -124,9 +139,11 @@ impl BedrockClient {
                                 Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
                             ))
                         }
-                        e => Err(RetryError::permanent(
-                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                        )),
+                        e => Err(RetryError::permanent(auth_error::explain(
+                            e,
+                            &model_id,
+                            auth_error::CHAT_DOCS_URL,
+                        ))),
                     },
                     Err(e) => Err(RetryError::permanent(
                         Box::new(e) as Box<dyn std::error::Error + Send + Sync>
@@ -151,7 +168,7 @@ impl BedrockClient {
             async move {
             match client
                 .invoke_model()
-                .model_id(m)
+                .model_id(m.clone())
                 .body(Blob::new(b))
                 .content_type("application/json")
                 .send()
@@ -167,9 +184,11 @@ impl BedrockClient {
                             Box::new(throttle_e) as Box<dyn std::error::Error + Send + Sync>
                         ))
                     }
-                    e => Err(RetryError::permanent(
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    )),
+                    e => Err(RetryError::permanent(auth_error::explain(
+                        e,
+                        &m,
+                        auth_error::EMBEDDINGS_DOCS_URL,
+                    ))),
                 },
                 Err(e) => Err(RetryError::permanent(
                     Box::new(e) as Box<dyn std::error::Error + Send + Sync>
