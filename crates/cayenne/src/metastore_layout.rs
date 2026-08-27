@@ -78,14 +78,36 @@ pub fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// How a configured directory string becomes the filesystem path it names.
+///
+/// This is not a formatting preference — it decides *which directory* the overlap
+/// question is asked about, so a caller that picks the wrong one gets a confident answer
+/// about a path it never touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathSpelling {
+    /// The value may be a `file:` / `file://` URI naming a filesystem path, and an
+    /// object-store value names no local directory at all. What the dataset-level
+    /// accelerator accepts, because its own resolution hands those spellings on.
+    Uri,
+    /// The value *is* the filesystem path, character for character. What a caller that
+    /// passes the string straight to `create_dir_all` must use: it will create
+    /// `file:data` as a directory literally named `file:data`, so interpreting the
+    /// prefix here would compare a directory that does not exist against a metastore
+    /// sitting inside the one that does.
+    Verbatim,
+}
+
 /// Make a configured Cayenne directory absolute without resolving it, treating it as a
-/// filesystem path unconditionally.
+/// filesystem path.
 ///
 /// `Err` when the path cannot be placed — a relative path whose `current_dir()` lookup
 /// fails. A path this cannot place is a path whose overlap with the metastore is
 /// unknown, and every caller must refuse rather than assume.
-fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
-    let raw = Path::new(fs_probe_path(path));
+fn absolute_dir(path: &str, spelling: PathSpelling) -> std::io::Result<PathBuf> {
+    let raw = Path::new(match spelling {
+        PathSpelling::Uri => fs_probe_path(path),
+        PathSpelling::Verbatim => path,
+    });
     if raw.is_absolute() {
         Ok(raw.to_path_buf())
     } else {
@@ -114,7 +136,7 @@ pub fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
     if !is_local_path(path) {
         return Ok(None);
     }
-    absolute_dir(path).map(Some)
+    absolute_dir(path, PathSpelling::Uri).map(Some)
 }
 
 /// Resolve `absolute` component by component, in the order the filesystem would.
@@ -169,8 +191,8 @@ async fn resolve_in_filesystem_order(absolute: &Path) -> std::io::Result<PathBuf
 ///    directory whose own last component is a symlink pointing out of the tree still
 ///    loses its link — the catalog file survives with nothing naming it, and the
 ///    connection pool keeps writing through handles nothing can reopen.
-async fn overlap_candidates(path: &str) -> std::io::Result<Vec<PathBuf>> {
-    let absolute = absolute_dir(path)?;
+async fn overlap_candidates(path: &str, spelling: PathSpelling) -> std::io::Result<Vec<PathBuf>> {
+    let absolute = absolute_dir(path, spelling)?;
 
     let mut candidates = vec![resolve_in_filesystem_order(&absolute).await?];
     if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
@@ -226,19 +248,28 @@ pub async fn overlapping_metastore_dir(
     let Some(absolute_data) = absolute_data_dir(data_dir)? else {
         return Ok(None);
     };
-    compare_against(absolute_data, metadata_dir).await
+    compare_against(absolute_data, metadata_dir, PathSpelling::Uri).await
 }
 
 /// As [`overlapping_metastore_dir`], but for a caller that treats *every* `data_dir` as a
 /// filesystem path.
 ///
-/// The object-store exemption is not merely unnecessary for such a caller, it is unsound:
-/// [`is_local_path`] is a substring test, so a local directory whose name merely contains
-/// `://` — `/tmp/q://data` — is exempted while the caller goes on to create it, and a
-/// metastore configured inside it is then never compared. The accelerator can afford the
-/// exemption because its data directory really may be on object storage and because its
-/// delete is additionally gated on an exemption-free scan of what is on disk; a caller
-/// with neither of those properties must use this instead.
+/// Both of the URI accommodations are not merely unnecessary for such a caller, they are
+/// unsound, and they fail the same way — the comparison describes a directory the caller
+/// never creates:
+///
+/// - The **object-store exemption** rests on [`is_local_path`], a substring test, so a
+///   local directory whose name merely contains `://` — `/tmp/q://data` — is exempted
+///   outright while the caller goes on to create it.
+/// - The **`file:` stripping** in [`fs_probe_path`] turns `file:data` into `data`, so the
+///   check compares `{cwd}/data` while `create_dir_all` makes a directory literally named
+///   `file:data`; a metastore configured inside *that* is never compared.
+///
+/// Both sides are read [`PathSpelling::Verbatim`] here for that reason, not just the data
+/// side: this provider creates the metadata directory from its string too. The accelerator
+/// can afford the URI reading because its own resolution genuinely produces those
+/// spellings and because its delete is additionally gated on an exemption-free scan of
+/// what is on disk; a caller with neither property must use this instead.
 ///
 /// # Errors
 ///
@@ -248,7 +279,12 @@ pub async fn overlapping_metastore_dir_local(
     data_dir: &str,
     metadata_dir: &str,
 ) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
-    compare_against(absolute_dir(data_dir)?, metadata_dir).await
+    compare_against(
+        absolute_dir(data_dir, PathSpelling::Verbatim)?,
+        metadata_dir,
+        PathSpelling::Verbatim,
+    )
+    .await
 }
 
 /// Resolve `absolute_data`, then report the first location a recursive delete of it would
@@ -256,9 +292,10 @@ pub async fn overlapping_metastore_dir_local(
 async fn compare_against(
     absolute_data: PathBuf,
     metadata_dir: &str,
+    spelling: PathSpelling,
 ) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
     let data = resolve_in_filesystem_order(&absolute_data).await?;
-    Ok(overlap_candidates(metadata_dir)
+    Ok(overlap_candidates(metadata_dir, spelling)
         .await?
         .into_iter()
         .find(|candidate| dir_contains(&data, candidate))

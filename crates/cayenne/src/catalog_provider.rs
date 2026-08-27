@@ -209,11 +209,14 @@ impl CayenneCatalogProvider {
         data_dir: &str,
         metadata_dir: &str,
     ) -> Result<()> {
-        // The local variant, not the exempting one: this provider creates `data_dir` with
-        // `create_dir_all` whatever it says, so every value here is a filesystem path. The
-        // object-store exemption is a substring test for `://`, which would wave through a
-        // local directory whose name merely contains it — and unlike the accelerator, this
-        // path has no second, exemption-free scan behind it to catch that.
+        // The local variant, not the exempting one: this provider creates both directories
+        // with `create_dir_all` exactly as configured, so every value here is a filesystem
+        // path and neither URI accommodation applies. The object-store exemption is a
+        // substring test for `://`, which would wave through a local directory whose name
+        // merely contains it; and the `file:` stripping would compare `{cwd}/data` while
+        // the directory actually created is named `file:data`. Unlike the accelerator,
+        // this path has no second, exemption-free scan of the disk behind it to catch
+        // either.
         let overlap =
             crate::metastore_layout::overlapping_metastore_dir_local(data_dir, metadata_dir)
                 .await
@@ -953,6 +956,32 @@ mod tests {
         )
         .await
         .expect("a data directory that does not contain the metastore is accepted");
+    }
+
+    /// Regression test for the sibling of the exemption hole, and the same root cause: the
+    /// URI reading strips a `file:` prefix, so `file:data` was compared as `{cwd}/data`
+    /// while `create_dir_all` creates a directory literally named `file:data`. A metastore
+    /// configured inside the directory that actually gets created was therefore never
+    /// compared — the guard answering confidently about a path that does not exist.
+    #[tokio::test]
+    async fn a_data_dir_spelled_as_a_file_uri_is_compared_where_it_is_created() {
+        let cwd = std::env::current_dir().expect("a working directory");
+
+        // What `create_dir_all("file:data")` actually makes, and a metastore inside it.
+        let created = cwd.join("file:data");
+        let metadata_dir = created.join("catalog").to_string_lossy().into_owned();
+
+        let error = CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "trades",
+            "file:data",
+            &metadata_dir,
+        )
+        .await
+        .expect_err("the directory that gets created is the one that must be compared");
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
     }
 
     /// Regression test for the exemption hole: `is_local_path` is a substring test for
