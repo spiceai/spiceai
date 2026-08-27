@@ -677,7 +677,12 @@ pub fn subscribe_to_append_stream(
                                         yield Err(cdc::StreamError::Arrow(format!(
                                             "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
                                         )));
-                                        continue;
+                                        // End the subscription rather than resuming it. The CDC
+                                        // apply loop keeps running after a fatal stream error, so
+                                        // a resumed subscription would apply every later envelope
+                                        // on top of the change this one dropped and leave the
+                                        // acceleration permanently diverged from its source.
+                                        break;
                                     }
                                 };
                                 match ChangeBatch::try_new(batch).map(|rb| {
