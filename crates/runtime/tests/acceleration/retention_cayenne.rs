@@ -17,7 +17,7 @@ limitations under the License.
 //! `retention_sql` on a file-mode Cayenne acceleration under `refresh_mode: full`.
 //!
 //! A full refresh reloads every source row, so the retention predicate has to run again
-//! over the new snapshot on every refresh — the way the DuckDB accelerator applies it
+//! over the new snapshot on every refresh — the way the `DuckDB` accelerator applies it
 //! before each refresh commit. Cayenne applies it from its post-write maintenance loop,
 //! so the rows disappear shortly *after* the refresh commits rather than inside the
 //! refresh write path; the polling below is what that difference costs the test.
@@ -70,9 +70,11 @@ const ADDED_ROW: (i64, i64) = (11, 95);
 
 /// Write `rows` to `path` as CSV, replacing whatever is there.
 fn write_source(path: &std::path::Path, rows: &[(i64, i64)]) -> Result<(), anyhow::Error> {
+    use std::fmt::Write as _;
+
     let mut csv = String::from("id,score\n");
     for (id, score) in rows {
-        csv.push_str(&format!("{id},{score}\n"));
+        writeln!(csv, "{id},{score}")?;
     }
     std::fs::write(path, csv)?;
     Ok(())
@@ -94,7 +96,7 @@ async fn assert_retention_left(
     expected: &[(i64, i64)],
 ) -> Result<(), anyhow::Error> {
     let want = i64::try_from(expected.len())?;
-    let settled = wait_until_true(std::time::Duration::from_secs(60), || async {
+    let settled = wait_until_true(std::time::Duration::from_mins(1), || async {
         row_count(rt, TABLE).await.is_ok_and(|c| c == want)
     })
     .await;
@@ -172,7 +174,7 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

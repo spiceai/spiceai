@@ -73,7 +73,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-use datafusion::physical_plan::{ExecutionPlan, execute_stream};
+use datafusion::physical_plan::execute_stream;
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
@@ -411,20 +411,17 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Extra listing tables to also scan for deletion keys, beyond the main
-    /// listing table — the protected snapshots and (for cold-tier tables) the
-    /// cold-tier files. The sink treats every entry uniformly.
-    additional_scan_tables: Vec<Arc<ListingTable>>,
-    /// Visibility-filtered source for a KEY-based filtered delete, replacing the raw
-    /// per-listing scans below.
+    /// Extra listing tables to also scan for deletion keys, beyond the main listing
+    /// table — the protected snapshots and (for cold-tier tables) the cold-tier files —
+    /// each paired with the delete sequence its rows are visible above.
     ///
-    /// Those listings are files, not a view: scanning them reaches row versions an
-    /// upsert has already superseded. A key-based tombstone names the KEY, so matching
-    /// a superseded value whose live replacement does NOT match the predicate deletes
-    /// the live row — the caller asked to remove rows the table no longer contains and
-    /// lost one it does. A position-based tombstone names a file and row position and
-    /// cannot alias like that, which is why it keeps the raw path.
-    live_scan_plan: Option<Arc<dyn ExecutionPlan>>,
+    /// A protected snapshot carries `max_delete_seq_at_creation`: only deletes NEWER than
+    /// that apply to its rows, which is precisely what tells a superseded version from
+    /// the row that replaced it. Without it, a key-based delete can match a version an
+    /// upsert already retired and tombstone the KEY, taking the live row with it. `None`
+    /// is the base case — the current snapshot and cold-tier files, where every delete
+    /// applies.
+    additional_scan_tables: Vec<(Option<i64>, Arc<ListingTable>)>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -462,7 +459,7 @@ impl CayenneDeletionSink {
         table_memory: Arc<CayenneMemoryAccount>,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        additional_scan_tables: Vec<Arc<ListingTable>>,
+        additional_scan_tables: Vec<(Option<i64>, Arc<ListingTable>)>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -478,20 +475,11 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             additional_scan_tables,
-            live_scan_plan: None,
             runtime_env,
             write_lock,
             seq_allocator,
             count_exact: false,
         }
-    }
-
-    /// Supply the visibility-filtered plan a key-based filtered delete must match
-    /// against instead of the raw listings. See [`Self::live_scan_plan`].
-    #[must_use]
-    pub(crate) fn with_live_scan_plan(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
-        self.live_scan_plan = Some(plan);
-        self
     }
 
     /// Set whether this sink must return an exact, verified deleted-row count.
@@ -698,6 +686,37 @@ impl CayenneDeletionSink {
     }
 
     /// Extract row keys from a batch using the `RowConverter`.
+    /// Whether an Int64-keyed row from a snapshot whose rows are visible above
+    /// `min_delete_seq` is still live — i.e. no tombstone NEWER than that threshold
+    /// covers it. `None` is the base case (current snapshot, cold tier): every delete
+    /// applies. This is the read path's own rule, applied per row instead of per plan.
+    fn is_live_int64_pk(&self, pk: i64, min_delete_seq: Option<i64>) -> bool {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => deletion_snapshot
+                .load()
+                .tombstones
+                .get_with_min_seq(pk, min_delete_seq)
+                .is_none(),
+            _ => true,
+        }
+    }
+
+    /// [`Self::is_live_int64_pk`] for composite / non-integer primary keys.
+    fn is_live_row_key(&self, key: &[u8], min_delete_seq: Option<i64>) -> bool {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => deletion_snapshot
+                .load()
+                .tombstones
+                .get_with_min_seq(key, min_delete_seq)
+                .is_none(),
+            _ => true,
+        }
+    }
+
     fn extract_row_keys(
         &self,
         batch: &arrow::array::RecordBatch,
@@ -719,7 +738,7 @@ impl CayenneDeletionSink {
     async fn prepare_delete_filtered_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        tables: &[Arc<ListingTable>],
+        tables: &[(Option<i64>, Arc<ListingTable>)],
     ) -> super::super::Result<Option<PreparedDeletionPublish>> {
         let table_name = &self.table_metadata.table_name;
 
@@ -733,18 +752,6 @@ impl CayenneDeletionSink {
         }
 
         let coerced_filters = self.coerce_filters_for_schema()?;
-
-        // One source for the whole key-based path: the visibility-filtered plan when the
-        // caller supplied one, else the raw listings. See `live_scan_plan`.
-        let scan_plans: Vec<Arc<dyn ExecutionPlan>> = if let Some(plan) = &self.live_scan_plan {
-            vec![Arc::clone(plan)]
-        } else {
-            let mut plans = Vec::with_capacity(tables.len());
-            for table in tables {
-                plans.push(table.scan(&ctx.state(), None, &[], None).await?);
-            }
-            plans
-        };
 
         // PK-IN-list fast path: when the filter encodes the PK deletion values
         // directly (`pk IN (...)`), extract them and write deletion vectors
@@ -822,8 +829,9 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for scan_plan in &scan_plans {
-                    let mut stream = execute_stream(Arc::clone(scan_plan), ctx.task_ctx())?;
+                for (min_delete_seq, table) in tables {
+                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
@@ -832,7 +840,17 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_pk_values.extend(self.extract_int64_pk_values(&batch)?);
+                        // Drop rows this snapshot's own visibility already retires. A
+                        // tombstone newer than the snapshot's threshold means an upsert
+                        // superseded this version; tombstoning its KEY would take the row
+                        // that replaced it — which never matched the predicate — with it.
+                        // One bloom-prefiltered probe per row: no second scan, and nothing
+                        // held that the raw scan did not already hold.
+                        pending_pk_values.extend(
+                            self.extract_int64_pk_values(&batch)?
+                                .into_iter()
+                                .filter(|pk| self.is_live_int64_pk(*pk, *min_delete_seq)),
+                        );
 
                         if pending_pk_values.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_values = std::mem::take(&mut pending_pk_values);
@@ -883,8 +901,9 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for scan_plan in &scan_plans {
-                    let mut stream = execute_stream(Arc::clone(scan_plan), ctx.task_ctx())?;
+                for (min_delete_seq, table) in tables {
+                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
@@ -893,7 +912,13 @@ impl CayenneDeletionSink {
                             continue;
                         }
 
-                        pending_row_keys.extend(self.extract_row_keys(&batch, row_converter)?);
+                        // See the Int64 branch: this snapshot's threshold is what tells
+                        // a superseded version from the row that replaced it.
+                        pending_row_keys.extend(
+                            self.extract_row_keys(&batch, row_converter)?
+                                .into_iter()
+                                .filter(|key| self.is_live_row_key(key, *min_delete_seq)),
+                        );
 
                         if pending_row_keys.len() >= PK_DELETE_FLUSH_BATCH_SIZE {
                             let chunk_keys = std::mem::take(&mut pending_row_keys);
@@ -954,11 +979,16 @@ impl CayenneDeletionSink {
             Arc::clone(&self.runtime_env),
         );
         let listing_table = self.listing_table.load_full();
-        let mut all_tables = vec![Arc::clone(&listing_table)];
+        let mut all_tables = vec![(None, Arc::clone(&listing_table))];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
         if self.filters.is_empty() {
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
-                .await
+            // Delete-all removes every row, so no version is preferred over another and
+            // the thresholds carry no information.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|(_, table)| Arc::clone(table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else {
             self.prepare_delete_filtered_rows_from_tables(&ctx, &all_tables)
                 .await
@@ -1196,17 +1226,28 @@ impl DeletionSink for CayenneDeletionSink {
 
         // Collect all tables to scan: main listing table + the extra tables
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
-        let mut all_tables = vec![Arc::clone(&listing_table)];
-        for extra_table in &self.additional_scan_tables {
-            all_tables.push(Arc::clone(extra_table));
+        let mut all_tables = vec![(None, Arc::clone(&listing_table))];
+        for (min_delete_seq, extra_table) in &self.additional_scan_tables {
+            all_tables.push((*min_delete_seq, Arc::clone(extra_table)));
         }
 
         let prepared = if self.filters.is_empty() {
-            self.prepare_delete_all_rows_from_tables(&ctx, &all_tables)
-                .await
+            // See above: delete-all needs no per-snapshot visibility.
+            let plain: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|(_, table)| Arc::clone(table))
+                .collect();
+            self.prepare_delete_all_rows_from_tables(&ctx, &plain).await
         } else if self.pk_deletion_strategy.is_position_based() {
+            // A position tombstone names a file and row position, so it can only ever
+            // hide the version it matched — the per-snapshot thresholds that keep a key
+            // tombstone off a live row carry nothing for it.
+            let position_tables: Vec<Arc<ListingTable>> = all_tables
+                .iter()
+                .map(|(_, table)| Arc::clone(table))
+                .collect();
             return self
-                .delete_filtered_rows_position_based(&ctx, &all_tables)
+                .delete_filtered_rows_position_based(&ctx, &position_tables)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         } else {

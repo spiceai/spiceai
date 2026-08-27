@@ -30827,16 +30827,28 @@ impl CayenneTableProvider {
         write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
         source: DeletionRequestSource,
     ) -> datafusion_common::Result<CayenneDeletionSink> {
-        let mut snapshot_tables: Vec<Arc<ListingTable>> = self
+        // Each protected snapshot keeps its `max_delete_seq_at_creation`: only deletes
+        // NEWER than that apply to its rows, which is what tells a version an upsert has
+        // superseded from the row that replaced it. Dropping the sequence here is what
+        // let a key-based delete match a retired version and tombstone the KEY, taking
+        // the live row with it.
+        let protected = self.protected_snapshots.load();
+        let mut snapshot_tables: Vec<(Option<i64>, Arc<ListingTable>)> = self
             .build_protected_snapshot_listing_tables()?
             .into_iter()
-            .map(|(_, table)| table)
+            .map(|(snapshot_id, table)| (protected.get(&snapshot_id).copied(), table))
             .collect();
         // Also scan the cold tier so a key-delete of a cold-resident row is
         // found and tombstoned (the cross-tier scan then hides it via the shared
         // key-delete filter). Cold uses key-based deletes, so this is only ever
         // non-empty for key-delete tables.
-        snapshot_tables.extend(self.build_cold_tier_listing_tables().await?);
+        // Cold-tier files are a base like the current snapshot — every delete applies.
+        snapshot_tables.extend(
+            self.build_cold_tier_listing_tables()
+                .await?
+                .into_iter()
+                .map(|table| (None, table)),
+        );
 
         let sink = CayenneDeletionSink::new(
             self.table_metadata.clone(),
@@ -30855,28 +30867,7 @@ impl CayenneTableProvider {
         )
         .with_exact_count(source.requires_exact_count());
 
-        // A key-based tombstone names the KEY, so the rows this delete matches against
-        // have to be the LIVE ones. The listings above are files: they still hold the
-        // versions an upsert superseded, and matching one of those deletes a live row
-        // that never matched the predicate. Hand the sink this table's own scan — the
-        // same view a query sees, protected-snapshot sequence thresholds and deletion
-        // index applied — and let it re-apply the predicate per batch as before. A
-        // position-based tombstone names a file and row position, cannot alias a key,
-        // and needs that file identity, so it keeps the raw path.
-        if self.pk_deletion_strategy.is_position_based() {
-            return Ok(sink);
-        }
-        let scan_ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
-            Arc::clone(self.context.runtime_env()),
-        );
-        // Unfiltered, exactly as the raw listing scans were: the sink applies the
-        // predicate itself, so pushing it here would only change which rows arrive, not
-        // which are deleted.
-        let live_scan_plan =
-            TableProvider::scan(&self.clone_for_write(), &scan_ctx.state(), None, &[], None)
-                .await?;
-        Ok(sink.with_live_scan_plan(live_scan_plan))
+        Ok(sink)
     }
 
     /// Durable CDC key-delete path that avoids exact row-count work when possible.
@@ -47322,7 +47313,7 @@ mod tests {
         let batch = id_value_batch(schema, &[1, 2, 3, 4], &[10, 20, 60, 70]);
         let batch_schema = batch.schema();
         let ctx_for_write = SessionContext::new();
-        provider
+        let _cdc_write = provider
             .write_cdc_append_stream(
                 Box::pin(RecordBatchStreamAdapter::new(
                     batch_schema,
@@ -47353,6 +47344,91 @@ mod tests {
             vec![(3, 60), (4, 70)],
             "retention must reach rows that arrived through the default \
              cdc_durability: memory path once their epoch is durable"
+        );
+    }
+
+    /// The pipelined CDC path reaches its inline commit without consulting
+    /// `InlineMutationPolicy`, so unlike the staged path it can inline on a table that
+    /// has retention delete filters — and that commit is the only place on the route
+    /// that can arm retention, because an inlined outcome returns
+    /// `CayenneCdcWrite::completed`, whose `finish` schedules nothing.
+    ///
+    /// Drives that outcome for real rather than seeding a corpus, so the branch cannot
+    /// quietly return to `false` and stay green: the write must inline, and the pass it
+    /// schedules must remove the matching row.
+    #[tokio::test]
+    async fn pipelined_inline_cdc_write_arms_the_retention_it_schedules() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_retention_filters(vec![retention_predicate()])
+            .create(CreateTableOptions {
+                table_name: "pipelined_inline_retention".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    // Room to inline: the batch must be absorbed into the metastore
+                    // corpus rather than spilling to a Vortex file.
+                    inline_max_rows: 1024,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("pipelined inline retention table created");
+
+        let batch = id_value_batch(schema, &[1, 2], &[10, 60]);
+        let batch_schema = batch.schema();
+        let write = provider
+            .write_cdc_append_stream(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch_schema,
+                    futures::stream::iter(vec![Ok(batch)]),
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("pipelined CDC append");
+        assert!(
+            !write.has_pending_finalize(),
+            "precondition: the write must have INLINED — a staged outcome would arm \
+             retention through a different path and this would prove nothing"
+        );
+        assert!(
+            provider.cached_inlined_row_count() > 0,
+            "precondition: the rows must be in the metastore inline corpus"
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("the retention the inline commit armed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(2, 60)],
+            "the inline commit must arm retention, and that pass must remove the row \
+             below the floor"
         );
     }
 
