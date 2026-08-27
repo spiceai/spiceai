@@ -170,6 +170,7 @@ async fn main() -> Result<()> {
                 data_dir: args.cayenne_data_dir.clone(),
                 metadata_dir: args.cayenne_metadata_dir.clone(),
                 spice_data_base_path: args.spice_data_base_path.clone(),
+                catalog_name: None,
                 footer_cache_mb: args.cayenne_footer_cache_mb,
                 segment_cache_mb: args.cayenne_segment_cache_mb,
                 target_file_size_mb: args.cayenne_target_file_size_mb,

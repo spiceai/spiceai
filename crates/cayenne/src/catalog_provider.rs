@@ -49,6 +49,13 @@ pub struct CayenneCatalogProviderConfig {
     pub metadata_dir: Option<String>,
     /// Base path used when data/metadata directories are not explicitly set.
     pub spice_data_base_path: String,
+    /// The catalog's configured name, for diagnostics only.
+    ///
+    /// Deliberately *not* used to build the default storage paths: those are keyed on
+    /// [`DEFAULT_CATALOG_NAME`] so that renaming a catalog in the spicepod does not move
+    /// its data on disk. `None` falls back to that constant, which is all a caller with
+    /// no separate name to give — a single-catalog tool — can say.
+    pub catalog_name: Option<String>,
     /// Runtime-global footer cache size in MB, when explicitly configured by a caller.
     pub footer_cache_mb: Option<usize>,
     /// Segment cache size in MB.
@@ -258,6 +265,13 @@ impl CayenneCatalogProvider {
         table_selector: TableSelector,
     ) -> Result<Self> {
         let catalog_name = DEFAULT_CATALOG_NAME;
+        // Storage paths stay keyed on the constant above; only diagnostics use the
+        // configured name, so an operator with several Cayenne catalogs is told which one
+        // was refused without a rename relocating anybody's data.
+        let reported_name = config
+            .catalog_name
+            .as_deref()
+            .unwrap_or(DEFAULT_CATALOG_NAME);
         let spice_data_base_path = config.spice_data_base_path.as_str();
 
         // Resolve metadata directory
@@ -273,7 +287,7 @@ impl CayenneCatalogProvider {
             .clone()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
 
-        Self::ensure_metastore_outside_data_dir(catalog_name, &data_dir, &metadata_dir).await?;
+        Self::ensure_metastore_outside_data_dir(reported_name, &data_dir, &metadata_dir).await?;
 
         // Ensure metadata directory exists
         tokio::fs::create_dir_all(&metadata_dir)
@@ -795,6 +809,7 @@ mod tests {
             data_dir: None,
             metadata_dir: None,
             spice_data_base_path: base.to_string(),
+            catalog_name: None,
             footer_cache_mb: None,
             segment_cache_mb: None,
             target_file_size_mb: None,
