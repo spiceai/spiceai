@@ -77,7 +77,9 @@ pub struct DatasetBuilder {
 /// the whole of this feature for the person reading the log — is assertable.
 ///
 /// Single quotes around the name the operator chose, backticks around the config
-/// keys they are being told to act on, per the repo's message convention.
+/// keys they are being told to act on, per the repo's message convention — and
+/// the name escaped, since a quoted Spicepod identifier can carry a newline
+/// through validation and would otherwise forge a second log line.
 ///
 /// It names only the fields it was given, and does not say "the rest of the
 /// block": `ready_state` is read out of a disabled block and applied, so a claim
@@ -88,6 +90,10 @@ fn disabled_acceleration_warning(dataset: &str, ignored: &[String]) -> String {
         .map(|field| format!("`{field}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    // `escape_debug` rather than the raw name: `validate_identifier` accepts a
+    // *quoted* identifier, and a quoted one may legally contain a newline, so a
+    // validated name can still break this line in two and forge a second one.
+    let dataset = dataset.escape_debug();
     format!(
         "Dataset '{dataset}' sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {keys}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     )
@@ -500,6 +506,23 @@ mod tests {
         assert!(warning.contains("acceleration.enabled: false"), "{warning}");
         assert!(warning.contains("Remove `enabled: false`"), "{warning}");
         assert!(warning.contains("https://spiceai.org/docs/"), "{warning}");
+    }
+
+    #[test]
+    fn a_control_character_in_the_name_cannot_break_the_line_in_two() {
+        // `validate_identifier` accepts a quoted identifier, and a quoted one
+        // may contain a newline — so the name reaching this message is not
+        // guaranteed to be one line, and an unescaped one would let a dataset
+        // name write a second log line of its own choosing.
+        let warning = disabled_acceleration_warning("api\nWARN forged", &["engine".to_string()]);
+        assert!(
+            !warning.contains('\n'),
+            "the message must stay one line: {warning}"
+        );
+        assert!(
+            warning.contains("api\\nWARN forged"),
+            "the name must still be readable, escaped: {warning}"
+        );
     }
 
     #[test]
