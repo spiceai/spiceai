@@ -121,7 +121,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
+use util::{in_tracing_context, in_tracing_context_async};
 use yaml::Value;
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -833,7 +833,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         }
     }
 
-    let rt = builder.build().await;
+    // The global subscriber cannot be installed before this call: its
+    // task-history layer is built from the `DataFusion` the runtime returns.
+    // Without a window subscriber the build's own warnings — the coordinated
+    // accelerator memory budget, invalid `runtime.query.*` values — are dropped.
+    let rt = in_tracing_context_async(builder.build()).await;
 
     spiced_tracing::init_tracing(
         app.as_ref(),
