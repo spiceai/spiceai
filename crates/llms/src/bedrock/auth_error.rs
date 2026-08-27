@@ -105,7 +105,7 @@ const SIGNATURE_REJECTED_CODES: &[&str] = &[
     "RequestExpired",
 ];
 
-/// AWS's own message distinguishes the causes behind these two codes ("Signature expired…" vs
+/// AWS's own message distinguishes the causes behind these codes ("Signature expired…" vs
 /// "…does not match the signature you provided"), and [`describe`] carries it through, so the
 /// remedy names every cause rather than guessing at one.
 const SIGNATURE_REMEDY: &str = concat!(
@@ -136,6 +136,21 @@ pub struct BedrockAuthError {
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
+/// Squeeze every run of whitespace — including the newlines AWS's own message may carry — down
+/// to a single space, so an error stays on one line as the repository requires.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether AWS's message names the action it refused.
+///
+/// This is IAM's standard denial phrasing across services ("User: arn:… is not authorized to
+/// perform: bedrock:ApplyGuardrail on resource: …"), and it is the only thing that makes
+/// "the action named in AWS's message" refer to anything.
+fn names_a_denied_action(message: Option<&str>) -> bool {
+    message.is_some_and(|m| m.contains("not authorized to perform"))
+}
+
 /// Build the `(detail, remedy)` halves of the operator-facing message for a rejection AWS has
 /// already labelled with `code`.
 ///
@@ -155,18 +170,29 @@ fn describe(
     } else if ACCESS_DENIED_CODES.contains(&code) {
         // Naming one action is not enough on its own: a request carrying a guardrail also needs
         // `bedrock:ApplyGuardrail`, and an inference profile needs its own actions, so an
-        // identity that already holds the invoke action can still be denied. AWS's message
-        // names the action it actually refused, and `detail` carries it, so lead with that and
-        // give the invoke action as the floor rather than as the whole answer.
+        // identity that already holds the invoke action can still be denied. When AWS names the
+        // action it refused, `detail` carries it and the remedy points there.
+        //
+        // But it does not always name one — `OptInRequired`, and an `AccessDeniedException`
+        // about model access rather than IAM, name none. Referring the operator to an action
+        // that is not in the message points them at nothing, so ask for the invoke action
+        // outright in that case.
+        //
         // Not "request access in the console" either: Bedrock grants model access automatically
         // for most models now, and the rest route through Marketplace or a provider use-case
         // form. Point at the state to confirm, not at one console flow.
+        let action = operation.iam_action();
+        let grant = if names_a_denied_action(message) {
+            format!(
+                "Grant the identity the action named in AWS's message — this call needs at least `{action}`"
+            )
+        } else {
+            format!("Grant the identity `{action}` on this model")
+        };
         format!(
-            "Grant the identity the action named in AWS's message — this call needs at \
-             least `{}`, and a request using a guardrail or an inference profile needs the \
-             further actions those require. Then confirm the account and the identity have \
-             access to this model in the region set by `aws_region`.",
-            operation.iam_action()
+            "{grant}, and a request using a guardrail or an inference profile needs the further \
+             actions those require. Then confirm the account and the identity have access to \
+             this model in the region set by `aws_region`."
         )
     } else {
         return None;
@@ -176,7 +202,7 @@ fn describe(
     // the message is often the only thing distinguishing two causes behind one code. The request
     // ID goes in too — it is what AWS support and the service logs are searched by, and this
     // rendering is all an operator sees.
-    let mut detail = match message.map(str::trim).filter(|m| !m.is_empty()) {
+    let mut detail = match message.map(collapse_whitespace).filter(|m| !m.is_empty()) {
         Some(message) => format!("AWS rejected the request ({code}: {message}"),
         None => format!("AWS rejected the request ({code}"),
     };
@@ -314,8 +340,10 @@ mod tests {
         // action — a guardrail also needs `bedrock:ApplyGuardrail`, and this chat client
         // supports guardrails — so an identity holding only the invoke action is still denied.
         // AWS names the action it refused; the message has to point there, not assert one.
+        const IAM_DENIAL: &str = "User: arn:aws:iam::123456789012:user/svc is not authorized to \
+                                  perform: bedrock:ApplyGuardrail on resource: *";
         for operation in EVERY_OPERATION {
-            let out = rendered("AccessDeniedException", Some("not authorized"), operation);
+            let out = rendered("AccessDeniedException", Some(IAM_DENIAL), operation);
             assert!(
                 out.contains("the action named in AWS's message"),
                 "{operation:?} must defer to AWS's own named action: {out}"
@@ -328,6 +356,37 @@ mod tests {
                 out.contains("at least"),
                 "{operation:?} must give the invoke action as a floor, not the whole answer: {out}"
             );
+        }
+    }
+
+    #[test]
+    fn access_denial_asks_outright_when_aws_named_no_action() {
+        // `OptInRequired`, and a model-access denial rather than an IAM one, name no action.
+        // Referring the operator to "the action named in AWS's message" then points them at
+        // something that is not there, so the remedy has to ask for the action outright.
+        for (code, message) in [
+            (
+                "AccessDeniedException",
+                Some("You don't have access to the model with the specified model ID."),
+            ),
+            ("OptInRequired", None),
+            ("NotAuthorized", None),
+        ] {
+            for operation in EVERY_OPERATION {
+                let out = rendered(code, message, operation);
+                assert!(
+                    !out.contains("named in AWS's message"),
+                    "{code}/{operation:?} names no action, so must not point at one: {out}"
+                );
+                assert!(
+                    out.contains(&format!("Grant the identity `{}`", operation.iam_action())),
+                    "{code}/{operation:?} must ask for the action outright: {out}"
+                );
+                assert!(
+                    out.contains("`aws_region`"),
+                    "{code}/{operation:?} must still ask for the access check: {out}"
+                );
+            }
         }
     }
 
@@ -660,17 +719,26 @@ mod tests {
         // These messages are assembled from wrapped source, and `rustfmt` joins a continued
         // top-level `const` onto one line while keeping the indentation the continuation was
         // meant to swallow — which put runs of spaces inside the rendered text.
-        for code in every_code() {
-            for operation in EVERY_OPERATION {
-                let out = rendered(code, Some("an AWS message"), operation);
-                assert!(
-                    !out.contains("  "),
-                    "{code}/{operation:?} renders a run of spaces: {out}"
-                );
-                assert!(
-                    !out.contains('\n'),
-                    "{code}/{operation:?} must stay on one line: {out}"
-                );
+        // AWS's message is service text, and `trim` only reaches the ends: a message with an
+        // embedded newline or an internal run of spaces would pass straight through into the
+        // rendered line. Feed one that has both.
+        for message in [
+            "an AWS message",
+            "first line\nsecond line",
+            "  padded  and\t\ttabbed \r\n wrapped  ",
+        ] {
+            for code in every_code() {
+                for operation in EVERY_OPERATION {
+                    let out = rendered(code, Some(message), operation);
+                    assert!(
+                        !out.contains("  "),
+                        "{code}/{operation:?} renders a run of spaces: {out}"
+                    );
+                    assert!(
+                        !out.chars().any(|c| c == '\n' || c == '\r' || c == '\t'),
+                        "{code}/{operation:?} must stay on one line: {out}"
+                    );
+                }
             }
         }
     }
