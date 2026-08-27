@@ -129,11 +129,13 @@ impl Runtime {
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
         //
-        // `LogErrors(false)`: this pre-pass exists to initialize view accelerators, and
-        // `load_views` below validates the same views again with `LogErrors(true)`. Passing
-        // `true` here made every view's load error — and its discarded-acceleration
-        // warning — print twice per startup.
-        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
+        // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
+        // the two validate the same views and only one of them may report: this pre-pass
+        // is the one that always runs. The snapshot validations between here and
+        // `load_views` return early on failure, so reporting from `load_views` instead
+        // loses every view's load error, its status update, and its
+        // discarded-acceleration warning on exactly the startups that already went wrong.
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));

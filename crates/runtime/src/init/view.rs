@@ -98,7 +98,11 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
+        // already validated the same views with `LogErrors(true)` before its snapshot
+        // checks, so reporting again here only prints each view's load error, and each
+        // view's discarded-acceleration warning, twice per startup.
+        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
 
         // Determine the dependency order for views based on their SQL dependencies
         let views_in_dependency_order = order_views_by_dependencies(&validated_views)
