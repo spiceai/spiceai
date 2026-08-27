@@ -659,13 +659,16 @@ pub struct CdcSchemaEvolution {
 /// `memory` because nothing was persisted to reopen. Sending those three to the manual
 /// remedy would cost an operator a needless drop and recreate.
 ///
-/// That rebuild restores the *schema* under all three, but only `file_update` also restores
-/// the *rows* on its own — its recreate runs through registration, which refreshes from the
-/// source. `file_create` and `memory` are ephemeral to replication
-/// (`accelerator_is_ephemeral`), and their resume snapshot is forced only when the source's
-/// initial snapshot is already enabled, so under `pg_replication_initial_snapshot: disabled`
-/// they come back empty. The message has to name that cost, because the sentence two
-/// earlier promises the acceleration still holds every row it held before.
+/// That rebuild restores the *schema* under all three, but none of them restores the *rows*
+/// unconditionally, and the two reasons differ. `file_create` and `memory` are ephemeral to
+/// replication (`accelerator_is_ephemeral` matches Cayenne on `Memory | FileCreate`), so their
+/// resume snapshot is forced only when the connector's initial snapshot is already enabled —
+/// `disabled` is preserved as an explicit opt-out. `file_update` is classified *persistent*, so
+/// no resume snapshot is forced for it at all, while its recreate still empties the table: under
+/// `auto` it comes back holding only later changes (#13546). `always` is therefore the one
+/// setting that makes the restart row-safe in every mode, which is why the message names it
+/// rather than a mode carve-out. Saying this is load-bearing because the sentence two earlier
+/// promises the acceleration still holds every row it held before.
 // Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
 // otherwise this is dead code on Windows and `-D warnings` fails the build there.
 #[cfg(not(windows))]
@@ -678,9 +681,11 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          so the acceleration still holds every row it held before it. \
          Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
          rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
-         Under `mode: file_create` and `mode: memory` that restart reloads the rows only if the source's initial snapshot is enabled; \
-         with it disabled (`pg_replication_initial_snapshot: disabled`) the acceleration comes back empty and holds only what the \
-         change stream delivers from its resume position onward. \
+         Under all three that restart rebuilds the schema, but it reloads the rows only when the connector's initial snapshot \
+         runs on resume, which `<connector>_replication_initial_snapshot` governs (for example `pg_replication_initial_snapshot`): \
+         set it to `always` before restarting if the acceleration has to come back with its history, since `auto` skips the \
+         snapshot under `mode: file_update` and `disabled` skips it under every mode. Otherwise the acceleration comes back \
+         holding only what the change stream delivers from its resume position onward. \
          Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
          new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
          Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
@@ -4418,13 +4423,25 @@ mod tests {
         // empty and no snapshot replays the history. Naming the cost is what keeps the
         // reassurance honest, so it is asserted rather than left to review.
         assert!(
-            msg.contains(
-                "`mode: file_create` and `mode: memory` that restart reloads the rows only if"
-            ) && msg.contains("`pg_replication_initial_snapshot: disabled`")
-                && msg.contains("comes back empty"),
-            "a restart repopulates `file_create` / `memory` only when the source's initial \
-             snapshot is enabled, so the message must name that cost rather than let the \
-             'still holds every row' reassurance imply the rows return unconditionally: {msg}"
+            msg.contains("reloads the rows only when the connector's initial snapshot")
+                && msg.contains("set it to `always` before restarting"),
+            "a restart rebuilds the schema but not necessarily the rows, so the message must name \
+             that cost and the setting that fixes it rather than let the 'still holds every row' \
+             reassurance imply the rows return unconditionally: {msg}"
+        );
+        // Connector-neutral on purpose: this formatter serves the generic `refresh_mode: changes`
+        // apply path, and MySQL and DynamoDB expose `mysql_`/`dynamodb_`-prefixed keys, so naming
+        // only the PostgreSQL one would send those operators to a setting that does not exist.
+        assert!(
+            msg.contains("`<connector>_replication_initial_snapshot`"),
+            "the remediation must use the connector-neutral parameter vocabulary: {msg}"
+        );
+        // No mode may be advertised as row-safe without the snapshot: `file_update` is classified
+        // persistent, so `auto` forces no resume snapshot for it while its recreate still empties
+        // the table (#13546).
+        assert!(
+            msg.contains("`auto` skips the snapshot under `mode: file_update`"),
+            "`file_update` is not row-safe under `auto`, so the message must not carve it out: {msg}"
         );
         assert!(
             msg.contains("Under `mode: file` a restart reopens the stored table and refuses again"),
