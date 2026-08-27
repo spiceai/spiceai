@@ -22,24 +22,28 @@ limitations under the License.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::write_back::PG13_SERVER_VERSION_NUM;
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream,
+    SchemaEvolutionPolicy, UnusableReason, XactStatus, XidRegistry, config,
+    start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -63,15 +67,15 @@ const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
 
 /// Resolve the applied-LSN watermark store over the dataset's own accelerator.
 ///
-/// `None` means nothing durable can record a position — no runtime attached, or no
-/// usable accelerator connection. The caller treats that as "never loaded", which is
-/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
-/// for one to describe.
+/// `None` means nothing durable can record a position — there is no usable accelerator
+/// connection. The caller treats that as "never loaded", which is correct: an
+/// acceleration that cannot persist a watermark cannot have persisted rows for one to
+/// describe.
 async fn resolve_watermark_store(
-    context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
-    context?
+    context
         .blob_checkpoint_store(dataset, WATERMARK_TABLE)
         .await
 }
@@ -140,7 +144,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
                 streaming_from = %self.identity,
                 "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
             );
-            return Ok(RecordedPosition::ForeignSource);
+            return Ok(RecordedPosition::Unusable(UnusableReason::ForeignSource));
         }
         Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
     }
@@ -166,12 +170,280 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
     }
 }
 
-pub fn build_changes_stream(
+/// Load the outstanding-write-back-transaction registry for a dataset.
+///
+/// The registry persists into `spice_sys_postgres_write_back_xids`, a sibling of
+/// the applied-LSN watermark in the dataset's own accelerator, keyed by the same
+/// [`source_identity`] so a repointed accelerator discards a foreign set. This is
+/// the single construction site: the deliverer takes the returned `Arc`, and a
+/// follow-up can hand the *same* `Arc` to the replication member registration for
+/// the pump's echo filter.
+///
+/// Garbage collection runs separately — startup reconciliation in the caller's
+/// cache-miss path (see
+/// [`Postgres::write_back_xid_registry`](crate::Postgres::write_back_xid_registry)),
+/// repeated periodically by [`spawn_write_back_registry_reconciliation`] — never
+/// here, so a cached hit never repeats it.
+///
+/// # Errors
+///
+/// Returns an error if the connection params cannot be resolved, there is no
+/// usable accelerator connection to persist into, or the persisted registry
+/// cannot be loaded. Any of these means change-echo suppression cannot be set
+/// up for this dataset — the caller must fail dataset setup rather than fall
+/// back to unsuppressed delivery.
+pub(crate) async fn load_write_back_xid_registry(
     params: &Parameters,
-    dataset: &Dataset,
-    context: Option<Arc<dyn ConnectorContext>>,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
+    let dataset_name = dataset.name.to_string();
+    let repl_params = replication_params_from_connector_params(params, &dataset_name)?;
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let identity = source_identity(&repl_params, &schema_name, &table_name);
+
+    let store = context
+        .blob_checkpoint_store(dataset, crate::write_back::WRITE_BACK_XID_TABLE)
+        .await
+        .ok_or(
+            "no usable accelerator connection to persist the change-echo suppression registry into",
+        )?;
+
+    Ok(XidRegistry::load(store, identity, dataset_name).await?)
+}
+
+/// Startup garbage collection for a freshly-loaded write-back registry.
+///
+/// Runs before the registry is shared with the delivery path or the pump;
+/// [`spawn_write_back_registry_reconciliation`] then repeats the reconciliation
+/// periodically for the life of the process. Resolves what the registry cannot
+/// on its own — each outstanding entry's `pg_xact_status` and the server's
+/// current transaction id — and hands them to [`XidRegistry::gc`] together with
+/// the dataset's durably-applied LSN, so an aborted delivery, a lost unregister,
+/// an entry from a rewound source, or an entry stranded far behind the server is
+/// dropped rather than lingering into a 32-bit xid wraparound.
+///
+/// # Errors
+///
+/// Returns an error if a connection cannot be opened, the server version cannot
+/// be read, or the current transaction id cannot be resolved. Each of these is
+/// an input `gc` needs to be sound, so the caller must not cache or activate an
+/// unvalidated registry on failure — running unreconciled would risk suppressing
+/// a genuine, unrelated transaction via a stale entry. A single entry's own
+/// `pg_xact_status` lookup failing is not one of these inputs: it degrades that
+/// one entry to [`XactStatus::Unknown`] and continues, since the epoch-distance
+/// safety valve still bounds it.
+pub(crate) async fn run_write_back_registry_gc(
+    pool: &Arc<PostgresConnectionPool>,
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+    registry: &Arc<XidRegistry>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if registry.outstanding_xid8s().await.is_empty() {
+        // Nothing to reconcile, so skip the server and sidecar round trips.
+        return Ok(());
+    }
+
+    // The durably-applied LSN, so garbage collection can drop an entry whose echo
+    // the applied floor has provably consumed. An unresolvable watermark reads as
+    // 0, which only makes that one rule conservative (the aborted, rewind, and
+    // epoch-distance rules still apply).
+    let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
+    reconcile_registry(pool, &dataset.name.to_string(), registry, applied_lsn).await
+}
+
+/// How often [`spawn_write_back_registry_reconciliation`]'s task re-runs
+/// reconciliation. The wraparound safety valve needs a pass to run well within
+/// the time the source takes to assign 2^31 transaction ids; at one hour the
+/// source would have to sustain ~600k write transactions per second to cross
+/// that between passes. A pass with nothing outstanding skips the server round
+/// trip entirely, so the steady-state cost of the cadence is a map lookup.
+const WRITE_BACK_REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Spawn the periodic re-run of write-back registry reconciliation for one
+/// dataset.
+///
+/// Startup reconciliation alone leaves a hole on a long-lived process: an entry
+/// whose delivery `COMMIT` failed ambiguously and actually aborted server-side
+/// has no observed commit LSN and no upper bound, so no steady-state prune ever
+/// removes it — only reconciliation against `pg_xact_status` does, and a process
+/// that never restarts would otherwise never repeat that. Left alone past ~2^31
+/// source transactions, the entry's low 32 bits collide with a fresh xid and
+/// suppress a genuine, unrelated change. The same cadence re-applies the rewind
+/// and epoch-distance rules.
+///
+/// The task holds only weak references, so it exits at its next tick once the
+/// connector (pool) or registry is gone, and keeps neither alive. The
+/// applied-LSN floor is passed as 0: resolving it needs the setup-time
+/// `ConnectorContext`, which cannot outlive setup, and 0 only makes the
+/// consumed rule conservative — consumed entries are already removed in steady
+/// state by `prune_acked`, while the rules this task exists for (aborted,
+/// rewind, epoch-distance) do not use the floor.
+pub(crate) fn spawn_write_back_registry_reconciliation(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: String,
+    registry: &Arc<XidRegistry>,
+) {
+    let pool = Arc::downgrade(pool);
+    let registry = Arc::downgrade(registry);
+    drop(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(WRITE_BACK_REGISTRY_RECONCILE_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick resolves immediately, and startup reconciliation
+        // already ran; consume it so the first re-run is one interval out.
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let (Some(pool), Some(registry)) = (pool.upgrade(), registry.upgrade()) else {
+                return;
+            };
+            if let Err(e) = reconcile_registry(&pool, &dataset_name, &registry, 0).await {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "Durable write-back for dataset '{dataset_name}' failed a periodic reconciliation of its change-echo suppression registry, so a stale entry may linger until the next pass or restart. Cause: {e}"
+                );
+            }
+        }
+    }));
+}
+
+/// One reconciliation pass: resolve every outstanding entry's `pg_xact_status`
+/// and the server's current transaction id, and hand them to
+/// [`XidRegistry::gc`] with the given durably-applied floor. Shared by startup
+/// ([`run_write_back_registry_gc`], which resolves the real floor) and the
+/// periodic task (which passes 0).
+async fn reconcile_registry(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: &str,
+    registry: &Arc<XidRegistry>,
+    applied_lsn: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let outstanding = registry.outstanding_xid8s().await;
+    if outstanding.is_empty() {
+        // Nothing to reconcile, so skip the server round trip entirely.
+        return Ok(());
+    }
+
+    let db = pool.connect_direct().await?;
+
+    let server_version_num: i32 = db
+        .conn
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get(0);
+    // `pg_xact_status`/`pg_snapshot_xmax` are PG13+; PG10-12 use the `txid_*`
+    // equivalents (same semantics). `pg_snapshot_xmax` reads the current xid8
+    // without assigning one, so garbage collection never consumes an xid.
+    let pg13_plus = server_version_num >= PG13_SERVER_VERSION_NUM;
+    let (current_xid_sql, status_sql) = if pg13_plus {
+        (
+            "SELECT pg_snapshot_xmax(pg_current_snapshot())::text",
+            "SELECT pg_xact_status($1::text::xid8)::text",
+        )
+    } else {
+        (
+            "SELECT txid_snapshot_xmax(txid_current_snapshot())::text",
+            "SELECT txid_status($1::text::bigint)::text",
+        )
+    };
+
+    let current_xid8 = read_u64_text(&db.conn, current_xid_sql).await?;
+
+    let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
+    for xid8 in outstanding {
+        // Bind the id as its decimal text. The inner `::text` keeps the inferred
+        // parameter type `text` — the driver can encode a `String` as `text` but
+        // has no `xid8` (or, for the bound `String`, `bigint`) pairing, so an
+        // `xid8`/`bigint` parameter would be rejected client-side before the
+        // query ran — and the SQL side casts onward. The status likewise comes
+        // back as text.
+        let param = xid8.to_string();
+        let status = match db.conn.query_one(status_sql, &[&param]).await {
+            Ok(row) => {
+                let raw: Option<String> = row.get(0);
+                xact_status_from_text(raw.as_deref())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    xid8,
+                    error = %e,
+                    "durable write-back for dataset '{dataset_name}' could not read a transaction's status while garbage-collecting its change-echo suppression registry; that entry is left to the epoch-distance safety valve"
+                );
+                XactStatus::Unknown
+            }
+        };
+        statuses.insert(xid8, status);
+    }
+
+    registry.gc(&statuses, current_xid8, applied_lsn).await;
+    Ok(())
+}
+
+/// Read a single decimal `u64` returned as text (used for xid8 values, whose
+/// `FromSql` the driver does not provide).
+async fn read_u64_text(
+    conn: &tokio_postgres::Client,
+    sql: &str,
+) -> std::result::Result<u64, String> {
+    let row = conn.query_one(sql, &[]).await.map_err(|e| e.to_string())?;
+    let raw: String = row.get(0);
+    raw.trim().parse::<u64>().map_err(|e| e.to_string())
+}
+
+/// Map `pg_xact_status`/`txid_status` text to the registry's [`XactStatus`]. A
+/// NULL result (too old to resolve) is [`XactStatus::Unknown`], handled by the
+/// epoch-distance safety valve rather than the aborted rule.
+fn xact_status_from_text(status: Option<&str>) -> XactStatus {
+    match status {
+        Some("committed") => XactStatus::Committed,
+        Some("aborted") => XactStatus::Aborted,
+        Some("in progress") => XactStatus::InProgress,
+        _ => XactStatus::Unknown,
+    }
+}
+
+/// The dataset's durably-applied LSN, read from the same sidecar watermark the
+/// pump resumes from. Returns 0 when nothing durable is recorded (ephemeral
+/// accelerator, unreachable store, foreign source) — the conservative input for
+/// the applied-floor garbage-collection rule.
+async fn resolve_applied_lsn(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> u64 {
+    let Ok(repl_params) =
+        replication_params_from_connector_params(params, &dataset.name.to_string())
+    else {
+        return 0;
+    };
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let Some(blobs) = resolve_watermark_store(context, dataset).await else {
+        return 0;
+    };
+    let store = SidecarAppliedLsnStore {
+        blobs,
+        identity: source_identity(&repl_params, &schema_name, &table_name),
+    };
+    match store.load().await {
+        Ok(RecordedPosition::At(applied)) => applied.lsn,
+        _ => 0,
+    }
+}
+
+/// `async` so the watermark store is resolved here, before the stream is built: the
+/// generator then holds only the resolved store, which owns a connection pool and no
+/// runtime and so cannot pin the runtime for as long as the stream lives.
+pub async fn build_changes_stream(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
+    write_back_registry: Option<Arc<XidRegistry>>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -202,6 +474,9 @@ pub fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -211,10 +486,25 @@ pub fn build_changes_stream(
         );
     }
 
-    // Resolving the watermark store needs to await, so it happens inside the
-    // stream below; clone the dataset handle it needs (cheap — `Dataset` is an
-    // `Arc`-bound wrapper over its spec).
-    let dataset_for_watermark = dataset.clone();
+    // Where this dataset's applied-LSN watermark lives. An ephemeral acceleration
+    // gets the no-op store: it boots empty and re-snapshots every start, so a
+    // recorded position would describe rows the restart already threw away, and
+    // resuming on it would skip everything before it.
+    //
+    // A durable acceleration with no reachable store also records nothing, which
+    // reads as "never loaded" — correct, since an acceleration that cannot persist a
+    // watermark cannot have persisted the rows one would describe.
+    let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+        Arc::new(NoopAppliedLsnStore)
+    } else {
+        match resolve_watermark_store(context, dataset).await {
+            Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                blobs,
+                identity: source_identity(&params_for_stream, &schema_name, &table_name),
+            }),
+            None => Arc::new(NoopAppliedLsnStore),
+        }
+    };
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -241,8 +531,8 @@ pub fn build_changes_stream(
         .unwrap_or_default();
     let engine_supports_upsert = !matches!(
         engine,
-        runtime::component::dataset::acceleration::Engine::Arrow
-            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+        runtime_component::dataset::acceleration::Engine::Arrow
+            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
@@ -253,7 +543,7 @@ pub fn build_changes_stream(
         a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
                 a.on_conflict.get(pk),
-                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
@@ -264,17 +554,17 @@ pub fn build_changes_stream(
     // mid-stream (the runtime apply loop still enforces the per-policy
     // evolution set). `OnSchemaChange` is `Copy`, so capture it by value.
     let schema_evolution_policy = match dataset.on_schema_change {
-        runtime::component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
-        runtime::component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
-        runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
+        runtime_component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
+        runtime_component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
+        runtime_component::dataset::OnSchemaChange::AppendNewColumns => {
             SchemaEvolutionPolicy::AppendNewColumns
         }
         // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
         // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
         // incompatible changes mid-stream. The accelerated table is recreated only on a
         // `refresh_mode: full` registration, not from the replication stream.
-        runtime::component::dataset::OnSchemaChange::SyncAllColumns
-        | runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
+        runtime_component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime_component::dataset::OnSchemaChange::DropAndRecreate => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
     };
@@ -345,31 +635,6 @@ pub fn build_changes_stream(
             Err(StreamError::External(msg))?;
         }
 
-        // Where this dataset's applied-LSN watermark lives. An ephemeral
-        // acceleration gets the no-op store: it boots empty and re-snapshots
-        // every start, so a recorded position would describe rows the restart
-        // already threw away, and resuming on it would skip everything before it.
-        //
-        // A durable acceleration with no reachable store also records nothing,
-        // which reads as "never loaded" — correct, since an acceleration that
-        // cannot persist a watermark cannot have persisted the rows one would
-        // describe.
-        let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
-            Arc::new(NoopAppliedLsnStore)
-        } else {
-            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
-                Some(blobs) => Arc::new(SidecarAppliedLsnStore {
-                    blobs,
-                    identity: source_identity(&params_for_stream, &schema_name, &table_name),
-                }),
-                None => Arc::new(NoopAppliedLsnStore),
-            }
-        };
-
-        // See the note in the MySQL connector: the store is what the stream needs, and
-        // the context has served its purpose once the store is resolved.
-        drop(context);
-
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
             params: params_for_stream,
@@ -380,6 +645,7 @@ pub fn build_changes_stream(
             metrics,
             policy: schema_evolution_policy,
             applied_lsn_store,
+            write_back_registry,
         };
 
         let mut inner = start_replication_stream(input);
@@ -574,6 +840,24 @@ const METRICS: &[MetricSpec] = &[
          lag metric grows on the surviving slot-mates instead). Only reported for \
          datasets on a shared (explicitly-named) slot; a dedicated slot reports no series. \
          Carries a `slot` label for shared-slot grouping.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_acceleration_rebuilt",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset's acceleration was rebuilt from the source on its last \
+         attach instead of resuming from the position it had recorded. A rebuild re-reads \
+         the whole table without anyone asking for it, and the `cause` label says where to \
+         look: `rewound_source` means the source was restored or rewound (check whether \
+         other datasets on it resumed when they should not have), `foreign_source` means \
+         it is streaming from a different server, database, or table than it recorded, \
+         `unreadable` means its recorded position could not be read, `acknowledged_past` \
+         means the slot acknowledged past that position (NOT a WAL retention problem — the \
+         WAL may still be on disk), `retention_lost` means the source discarded the WAL \
+         after it, and `no_record` means it had never recorded one. Datasets that resumed \
+         report no series.",
     )
     .auto_register(),
     MetricSpec::new(
@@ -792,6 +1076,18 @@ impl MetricsProvider for PostgresMetricsProvider {
                     }
                 })))
             }
+            "replication_acceleration_rebuilt" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for a dataset that actually rebuilt (`Some`), so a
+                    // resumed one reports no series rather than a constant 0 that would
+                    // need a `cause` label it does not have.
+                    if let Some(cause) = m.rebuild_cause() {
+                        let mut attrs = attributes.clone();
+                        attrs.push(KeyValue::new("cause", cause));
+                        instrument.observe(1, &attrs);
+                    }
+                })))
+            }
             "replication_member_send_stalled_seconds_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.member_send_stalled_seconds_total(), &attributes);
@@ -831,9 +1127,9 @@ impl MetricsProvider for PostgresMetricsProvider {
 /// accelerators must re-snapshot on every start — WAL replay from the slot's
 /// checkpoint can never reconstruct an accelerator that booted empty.
 fn accelerator_is_ephemeral(
-    acceleration: &runtime::component::dataset::acceleration::Acceleration,
+    acceleration: &runtime_component::dataset::acceleration::Acceleration,
 ) -> bool {
-    use runtime::component::dataset::acceleration::{Engine, Mode};
+    use runtime_component::dataset::acceleration::{Engine, Mode};
     // Matched exhaustively (no `_` arm) so a newly added engine has to make an
     // explicit durability claim here: defaulting a non-persistent engine to
     // "persistent" silently skips its resume snapshot and leaves the accelerator
@@ -942,6 +1238,7 @@ fn replication_params_from_connector_params(
         // Derived from the dataset's accelerator, which this function does not
         // see; `build_changes_stream` sets it right after.
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -1246,7 +1543,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     /// than in production.
     #[test]
     fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
-        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+        use runtime_component::dataset::acceleration::{Acceleration, Engine, Mode};
 
         let ephemeral = |engine: Engine, mode: Mode| {
             accelerator_is_ephemeral(&Acceleration {

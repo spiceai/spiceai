@@ -41,7 +41,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{TryFutureExt, TryStreamExt};
-use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -206,8 +206,8 @@ impl WorkflowRunsTableProvider {
         repo: &str,
         workflow_id: &str,
         fetch_logs: bool,
-        dataset: &Dataset,
-    ) -> runtime::dataconnector::DataConnectorResult<Self> {
+        dataset: &DatasetSpec,
+    ) -> data_connector_api::DataConnectorResult<Self> {
         let mut fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),

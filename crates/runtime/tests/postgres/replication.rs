@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
+use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
     NoopAppliedLsnStore, PgOutputFormat, ReplicationMetricsCollector, ReplicationParams,
     ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
@@ -72,6 +72,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         initial_snapshot: true,
         snapshot_on_resume: false,
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: false,
@@ -221,6 +222,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     let mut stream = start_replication_stream(input);
@@ -333,6 +335,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
     let envelope = next_envelope(&mut stream, "forced resume snapshot").await?;
@@ -396,6 +399,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
 
@@ -527,6 +531,7 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     let mut stream_a = start_replication_stream(build_input(params_a));
@@ -703,6 +708,7 @@ async fn run_wide_types_scenario(
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
 
@@ -932,6 +938,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     // Cold bootstrap, then let the caught-up source reach Ready. Committing the

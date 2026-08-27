@@ -553,6 +553,46 @@ impl CommitChange for SnapshotBoundaryCommitter {
     }
 }
 
+/// The zero-row boundary envelope carrying a [`SnapshotBoundaryCommitter`]:
+/// promotes the member out of `SNAPSHOTTING`, persists the captured head, and
+/// requests the reconnect — once the consumer has durably applied everything
+/// before it.
+///
+/// `history_unavailable` additionally asks the consumer to replace the
+/// acceleration's contents from the source before applying anything further
+/// (see [`crate::cdc::ChangeEnvelope::history_unavailable`]). The committer
+/// rides that same envelope rather than following it, for two reasons: the head
+/// must not be persisted until the replacement is durably applied, and a real
+/// committer keeps the envelope out of the consumer's zero-row heartbeat
+/// stripping — which a no-op one would not survive, leaving the rebuild
+/// unrequested.
+fn snapshot_boundary_envelope(
+    source: &Arc<SharedSource>,
+    key: &MemberKey,
+    schema: &SchemaRef,
+    dataset: String,
+    history_unavailable: bool,
+) -> Result<ChangeEnvelope> {
+    let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
+        message: e.to_string(),
+    };
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+        .map_err(schema_mismatch)?
+        .into_parts()
+        .map_err(schema_mismatch)?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotBoundaryCommitter {
+            source: Arc::clone(source),
+            key: key.clone(),
+            dataset,
+        }),
+        batch,
+        // Readiness stays lag-based: a member still loading is not ready.
+        false,
+        history_unavailable,
+    ))
+}
+
 struct MemberHandle {
     dataset_name: String,
     schema: SchemaRef,
@@ -822,7 +862,7 @@ async fn attach_member(
         );
     }
     let rejoining = lock(&source.detached).remove(&member_key);
-    let (floor, gtid_seed, snapshotting): (BinlogPosition, GtidSet, bool) = resolve_start_position(
+    let (floor, gtid_seed, start): (BinlogPosition, GtidSet, MemberStart) = resolve_start_position(
         &mut conn,
         &params,
         &position_store,
@@ -839,6 +879,10 @@ async fn attach_member(
         tracing::debug!(dataset = %dataset_name, error = %e, "setup disconnect");
     }
 
+    // Both loading starts hold the member SNAPSHOTTING until its boundary
+    // envelope lands, so neither can advance the shared floor on rows the
+    // consumer has not applied yet.
+    let snapshotting = start.is_loading();
     let (sender, receiver) = mpsc::channel(DEFAULT_MEMBER_CHANNEL_CAPACITY);
     source
         .ack
@@ -885,65 +929,84 @@ async fn attach_member(
     }
 
     // Head of the member's stream: initial snapshot (whose completion hook
-    // promotes it and reconnects), or an immediate empty head on resume.
-    let head: ChangesStream = if snapshotting {
-        let dataset_for_boundary = dataset_name.clone();
-        // Clear stale accelerator state before the snapshot so a cold or
-        // re-bootstrap (`invalid_checkpoint_behavior: restart`) load is a full
-        // replace, not an upsert over rows the source no longer has — mirrors
-        // the per-dataset `start_inner` truncate prelude.
-        let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
-        let snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
-            params: params.clone(),
-            layout,
-            schema: Arc::clone(&schema),
-            primary_keys,
-            column_map,
-            database,
-            table,
-            dataset_name,
-            metrics: Arc::clone(&metrics),
-        });
-        // Snapshot completion is signalled by a real boundary committer, NOT a
-        // stream-drain hook: the committer's `commit()` runs on the apply loop
-        // only after every prior (snapshot) envelope is durably applied, whereas
-        // a drain hook fires when the reader pulls it — up to a prefetch-channel
-        // ahead of durable apply. Promoting + persisting this member's head
-        // before its snapshot is durably applied would lose base rows on a
-        // crash. On a snapshot error the stream ends before this envelope, so
-        // the member stays SNAPSHOTTING and re-snapshots on rejoin (see
-        // `detach_member`). `persist_all` also skips SNAPSHOTTING members until
-        // this fires.
-        let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
-            message: e.to_string(),
-        };
-        let (_, boundary_batch, _, _) = crate::cdc::build_heartbeat_envelope(&schema, None, false)
-            .map_err(schema_mismatch)?
-            .into_parts()
-            .map_err(schema_mismatch)?;
-        let boundary = ChangeEnvelope::from_parts(
-            Box::new(SnapshotBoundaryCommitter {
-                source: Arc::clone(source),
-                key: member_key.clone(),
-                dataset: dataset_for_boundary,
-            }),
-            boundary_batch,
-            false,
-            // Not a history-unavailable signal: this boundary envelope exists to
-            // persist the snapshot head, and MySQL's own purged-binlog case is
-            // not wired to this mechanism.
-            false,
-        );
-        Box::pin(
-            stream::once(async move { Ok(truncate) })
-                .chain(snapshot)
-                .chain(stream::once(async move { Ok(boundary) })),
-        )
-    } else {
-        metrics.mark_bootstrap_complete();
-        Box::pin(stream::empty::<
-            std::result::Result<ChangeEnvelope, StreamError>,
-        >())
+    // promotes it and reconnects), the consumer-side rebuild that replaces it
+    // when the acceleration already holds rows, or an immediate empty head on
+    // resume.
+    let head: ChangesStream = match start {
+        MemberStart::Rebuild => {
+            // One zero-row envelope asking the consumer to replace the
+            // acceleration's contents from the source, and nothing else: the
+            // replacement is atomic, so queries keep seeing the pre-rebuild
+            // contents until it swaps. Clearing the table here and letting the
+            // snapshot refill it — what a `truncate` prelude does — is
+            // observable to queries as an empty, then partially filled, table.
+            let signal = snapshot_boundary_envelope(
+                source,
+                &member_key,
+                &schema,
+                dataset_name.clone(),
+                true,
+            )?;
+            tracing::warn!(
+                dataset = %dataset_name,
+                connection = %source.key.label(),
+                "the persisted binlog position for this dataset is unusable and its acceleration survives restarts, so it will be rebuilt from the source before changes are applied"
+            );
+            // No snapshot runs on this path — the consumer's rebuild replaces it
+            // — so the gauge's "finished, or skipped" state is reached here.
+            // Leaving it at 0 would strand every readiness probe reading it.
+            metrics.mark_bootstrap_complete();
+            Box::pin(stream::once(async move { Ok(signal) }))
+        }
+        MemberStart::Snapshot => {
+            // Clear whatever a crashed earlier load left behind, so the snapshot
+            // is a full replace rather than an upsert over rows the source no
+            // longer has. Reached only when nothing was ever persisted for this
+            // member, so there is no completed load to preserve; an acceleration
+            // that has one takes the `Rebuild` arm above.
+            let truncate = super::truncate_envelope(&schema, &primary_keys, &column_map)?;
+            // Built before the snapshot input takes ownership of `dataset_name`.
+            //
+            // Snapshot completion is signalled by a real boundary committer, NOT
+            // a stream-drain hook: the committer's `commit()` runs on the apply
+            // loop only after every prior (snapshot) envelope is durably applied,
+            // whereas a drain hook fires when the reader pulls it — up to a
+            // prefetch-channel ahead of durable apply. Promoting + persisting
+            // this member's head before its snapshot is durably applied would
+            // lose base rows on a crash. On a snapshot error the stream ends
+            // before this envelope, so the member stays SNAPSHOTTING and
+            // re-snapshots on rejoin (see `detach_member`). `persist_all` also
+            // skips SNAPSHOTTING members until this fires.
+            let boundary = snapshot_boundary_envelope(
+                source,
+                &member_key,
+                &schema,
+                dataset_name.clone(),
+                false,
+            )?;
+            let snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
+                params: params.clone(),
+                layout,
+                schema: Arc::clone(&schema),
+                primary_keys,
+                column_map,
+                database,
+                table,
+                dataset_name,
+                metrics: Arc::clone(&metrics),
+            });
+            Box::pin(
+                stream::once(async move { Ok(truncate) })
+                    .chain(snapshot)
+                    .chain(stream::once(async move { Ok(boundary) })),
+            )
+        }
+        MemberStart::Stream => {
+            metrics.mark_bootstrap_complete();
+            Box::pin(stream::empty::<
+                std::result::Result<ChangeEnvelope, StreamError>,
+            >())
+        }
     };
 
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
@@ -991,9 +1054,106 @@ fn file_checkpoint_verdict(persisted_file_present: bool) -> CheckpointVerdict {
     }
 }
 
+/// How a member's stream starts once its position has been resolved.
+///
+/// The distinction that matters is between the two loading starts: a snapshot
+/// refills an acceleration that holds nothing worth keeping, while a rebuild
+/// replaces one that is already serving rows and must never be emptied first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberStart {
+    /// Resume from the persisted position; nothing to load.
+    Stream,
+    /// Snapshot into an acceleration with no completed load behind it: no
+    /// position was ever persisted for this member.
+    Snapshot,
+    /// A position was persisted but cannot be resumed from, so the acceleration
+    /// holds rows whose explanation is gone from the source's binary log. Only
+    /// re-reading the table can correct them, and the consumer owns the
+    /// accelerator so it can do that as one atomic replacement — see
+    /// [`crate::cdc::ChangeEnvelope::history_unavailable`].
+    Rebuild,
+}
+
+impl MemberStart {
+    /// Whether the member is loading its acceleration, by either route. Held
+    /// `SNAPSHOTTING` in the ack until its boundary envelope lands.
+    const fn is_loading(self) -> bool {
+        matches!(self, Self::Snapshot | Self::Rebuild)
+    }
+
+    /// Whether a start resolved *without* a usable position must persist the
+    /// head it just captured, before any rows land.
+    ///
+    /// Only [`Self::Stream`] does. The two loading starts carry a boundary
+    /// committer that persists the head after their rows are durably applied,
+    /// so recording it up front would let a crash mid-load resume past base
+    /// rows that never arrived. A member that loads nothing has no such
+    /// committer, and its head has to be recorded for the next start.
+    ///
+    /// That makes it the complement of [`Self::is_loading`] over today's three
+    /// starts, and it is still stated separately: the two answer different
+    /// questions — whether the ack floor is held, and who owns the checkpoint
+    /// write — so a start added later has to answer both rather than inherit
+    /// one from the other.
+    const fn persists_head_before_loading(self) -> bool {
+        // Exhaustive over the closed enum rather than a `matches!`: a start
+        // added later has to state which side it is on here, instead of
+        // inheriting "does not persist" from a wildcard.
+        match self {
+            Self::Stream => true,
+            Self::Snapshot | Self::Rebuild => false,
+        }
+    }
+}
+
+/// Which start a member takes when it holds no position it can resume from.
+///
+/// `has_recorded_position` is asked first, because it — not `snapshot_mode` —
+/// answers whether the acceleration is already holding rows. Two routes arrive
+/// here with one recorded, and a rebuild answers both:
+///
+/// * **The checkpoint was found unusable** and `invalid_checkpoint_behavior` is
+///   `restart` (`error` fails the member's stream before reaching here). The
+///   source's binary log no longer explains the rows already there: a row
+///   deleted at the source inside the unreachable window has no change event
+///   left to carry the deletion, so streaming from the current head would serve
+///   that row in every later query, and persisting the head would make it
+///   permanent.
+/// * **`initial_snapshot: always`**, which discards a still-resumable position
+///   by request. Nothing is wrong with the source on this route and
+///   `invalid_checkpoint_behavior` is never consulted — but the acceleration is
+///   holding rows just the same, so it is replaced rather than emptied and
+///   refilled.
+///
+/// `initial_snapshot: disabled` does not suppress the first of those. It says a
+/// *first* load must not read the table — a statement about rows the stream has
+/// not been asked to deliver — and cannot say that an acceleration whose
+/// history the source dropped may keep serving rows the source no longer has.
+/// `mysql_replication_invalid_checkpoint_behavior` decides that, and `restart`
+/// asks for exactly this recovery. `disabled` and `always` are values of one
+/// parameter, so an acceleration reaching a rebuild under `disabled` reached it
+/// by the unusable-checkpoint route and no other.
+///
+/// Neither route uses the snapshot path: a rebuild is a single zero-row signal
+/// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
+///
+/// Pure so the ordering is unit-testable without a live `MySQL`.
+fn start_without_usable_position(
+    snapshot_mode: InitialSnapshotMode,
+    has_recorded_position: bool,
+) -> MemberStart {
+    if has_recorded_position {
+        MemberStart::Rebuild
+    } else if snapshot_mode == InitialSnapshotMode::Disabled {
+        MemberStart::Stream
+    } else {
+        MemberStart::Snapshot
+    }
+}
+
 /// Resolve a fresh (non-rejoin) member's start position, applying
 /// `invalid_checkpoint_behavior` per member. Returns
-/// `(floor, gtid_seed, snapshotting)`. `gtid_seed` is the executed GTID set to
+/// `(floor, gtid_seed, start)`. `gtid_seed` is the executed GTID set to
 /// seed the member's ack from (empty when the dump is file-positioning);
 /// `use_gtid` is the source's current mode (all members share it).
 #[expect(
@@ -1012,13 +1172,27 @@ async fn resolve_start_position(
     database: &str,
     table: &str,
     use_gtid: bool,
-) -> Result<(BinlogPosition, GtidSet, bool)> {
+) -> Result<(BinlogPosition, GtidSet, MemberStart)> {
     let persisted = position_store
         .load()
         .await
         .map_err(|e| Error::PositionStoreAccess {
             message: e.to_string(),
         })?;
+
+    // A recorded position proves the acceleration is holding rows: the store is
+    // durable (an accelerator that does not survive restarts is wired to
+    // `NoopPositionStore`, which records nothing) and a load once ran far enough
+    // to record progress. Such an acceleration must be replaced, not emptied and
+    // refilled.
+    //
+    // The converse does not hold, and this deliberately under-claims rather than
+    // guessing: a durable acceleration whose sidecar failed to open also records
+    // nothing, and reads here as a first load. Closing that needs the store to
+    // say whether it can record at all, and the params to say whether the
+    // acceleration survives restarts — the shape `postgres_replication` uses.
+    // Tracked in #13021.
+    let has_recorded_position = persisted.is_some();
 
     // `Some((position, gtid_seed))` to resume, `None` to (re)snapshot.
     let resume: Option<(BinlogPosition, GtidSet)> = match persisted {
@@ -1031,13 +1205,7 @@ async fn resolve_start_position(
             )
             .is_err()
             {
-                apply_invalid_checkpoint(
-                    params,
-                    position_store,
-                    dataset_name,
-                    "layout/schema drift",
-                )
-                .await?;
+                apply_invalid_checkpoint(params, dataset_name, "layout/schema drift")?;
                 None
             } else {
                 match persisted.cursor_type {
@@ -1078,25 +1246,13 @@ async fn resolve_start_position(
                                 match gtid_checkpoint_verdict(&set, &source_executed) {
                                     CheckpointVerdict::Resume => Some((persisted.position, set)),
                                     CheckpointVerdict::Unresumable(reason) => {
-                                        apply_invalid_checkpoint(
-                                            params,
-                                            position_store,
-                                            dataset_name,
-                                            reason,
-                                        )
-                                        .await?;
+                                        apply_invalid_checkpoint(params, dataset_name, reason)?;
                                         None
                                     }
                                 }
                             }
                             Err(reason) => {
-                                apply_invalid_checkpoint(
-                                    params,
-                                    position_store,
-                                    dataset_name,
-                                    reason,
-                                )
-                                .await?;
+                                apply_invalid_checkpoint(params, dataset_name, reason)?;
                                 None
                             }
                         }
@@ -1108,13 +1264,7 @@ async fn resolve_start_position(
                         match file_checkpoint_verdict(present) {
                             CheckpointVerdict::Resume => Some((persisted.position, GtidSet::new())),
                             CheckpointVerdict::Unresumable(reason) => {
-                                apply_invalid_checkpoint(
-                                    params,
-                                    position_store,
-                                    dataset_name,
-                                    reason,
-                                )
-                                .await?;
+                                apply_invalid_checkpoint(params, dataset_name, reason)?;
                                 None
                             }
                         }
@@ -1136,13 +1286,13 @@ async fn resolve_start_position(
         } else {
             tracing::info!(dataset = %dataset_name, position = %position, "shared mysql binlog: resuming from persisted file+offset position");
         }
-        return Ok((position, gtid_seed, false));
+        return Ok((position, gtid_seed, MemberStart::Stream));
     }
 
     // No usable position: capture the head (and its executed GTID set, when
-    // GTID-positioning) first so the snapshot overlap replays idempotently, then
-    // either snapshot from it or (snapshot disabled) stream from it after
-    // persisting it up front.
+    // GTID-positioning) first so the load's overlap replays idempotently, then
+    // load from it — by snapshot or by rebuild — or, for a member with nothing
+    // to load, stream from it after persisting it up front.
     let (head, head_gtid) = if use_gtid {
         super::setup::fetch_head_and_gtid(conn).await?
     } else {
@@ -1151,7 +1301,8 @@ async fn resolve_start_position(
             GtidSet::new(),
         )
     };
-    if params.snapshot_mode == InitialSnapshotMode::Disabled {
+    let start = start_without_usable_position(params.snapshot_mode, has_recorded_position);
+    if start.persists_head_before_loading() {
         let initial = PersistedPosition {
             position: head.clone(),
             schema_json: checkpoint_schema_json.map(ToString::to_string),
@@ -1165,17 +1316,15 @@ async fn resolve_start_position(
         if let Err(e) = position_store.save(&initial).await {
             tracing::warn!(dataset = %dataset_name, error = %e, "failed to persist initial binlog head");
         }
-        Ok((head, head_gtid, false))
-    } else {
-        Ok((head, head_gtid, true))
     }
+    Ok((head, head_gtid, start))
 }
 
 /// Apply `invalid_checkpoint_behavior` for one member: `Error` fails the
-/// member's stream; `Restart` clears its saved position so it re-snapshots.
-async fn apply_invalid_checkpoint(
+/// member's stream; `Restart` accepts the rebuild, leaving the unusable position
+/// in place for [`rebootstrap_member`]'s boundary committer to replace.
+fn apply_invalid_checkpoint(
     params: &ReplicationParams,
-    position_store: &Arc<dyn PositionStore>,
     dataset_name: &str,
     reason: &str,
 ) -> Result<()> {
@@ -1188,15 +1337,16 @@ async fn apply_invalid_checkpoint(
             message: format!(
                 "cannot resume mysql binlog for {dataset_name}: {reason}. Resuming could serve \
                  incorrect data. Set `mysql_replication_invalid_checkpoint_behavior: restart` to \
-                 drop the saved position and re-snapshot the table."
+                 rebuild the acceleration from the source instead. See: \
+                 https://spiceai.org/docs/components/data-connectors/mysql"
             ),
         }
         .fail(),
         InvalidCheckpointBehavior::Restart => {
-            tracing::warn!(dataset = %dataset_name, reason, "persisted mysql binlog checkpoint unusable; rebootstrapping");
-            if let Err(e) = position_store.clear().await {
-                tracing::warn!(dataset = %dataset_name, error = %e, "failed to clear unusable binlog position");
-            }
+            tracing::warn!(dataset = %dataset_name, reason, "persisted mysql binlog checkpoint unusable; rebuilding");
+            // Deliberately left in place until the rebuild's boundary committer
+            // replaces it with the new head — same invariant, and same reasoning,
+            // as `rebootstrap_member`.
             Ok(())
         }
     }
@@ -2175,90 +2325,59 @@ async fn rebootstrap_all_for_restart(
         if member.sender.is_closed() {
             continue;
         }
-        rebootstrap_member(source, params, &key, &member, &head, &head_gtid).await?;
+        rebootstrap_member(source, &key, &member, &head, &head_gtid).await?;
     }
     Ok(())
 }
 
-/// Re-snapshot one member in place after its resume position was purged and
-/// `invalid_position_behavior = Restart`. Drops the purged checkpoint first (a
-/// crash mid-rebootstrap must cold-start, never resume a half-applied snapshot),
-/// resets the slot to `head` held `SNAPSHOTTING`, then pushes a fresh
-/// truncate → snapshot → boundary through the member's LIVE channel — the same
-/// bootstrap it received at cold start, delivered mid-stream because the runtime
-/// holds a single `ChangesStream` and never re-subscribes. The boundary's
-/// [`SnapshotBoundaryCommitter`] clears `SNAPSHOTTING`, persists the new head,
-/// and requests the reconnect that promotes the member back to streaming.
+/// Rebuild one member in place after its resume position was purged and
+/// `invalid_position_behavior = Restart`. Resets the slot to `head` held
+/// `SNAPSHOTTING`, then pushes one rebuild signal through the member's LIVE
+/// channel — delivered mid-stream because the runtime holds a single
+/// `ChangesStream` and never re-subscribes.
+///
+/// The purged checkpoint is deliberately left in place until the boundary
+/// committer replaces it with the new head. It is the only durable evidence that
+/// this acceleration holds rows no position explains: clearing it up front and
+/// then crashing mid-rebuild would leave a populated acceleration with no
+/// checkpoint, which the next start reads as a first load — and a first load
+/// empties the table and refills it from a snapshot, which is the very window
+/// this exists to close. Leaving it costs at most one repeated rebuild after a
+/// crash, since the next start re-detects it as unusable and lands here again.
+///
+/// The member is serving rows here, so the acceleration is replaced rather than
+/// refilled: the consumer answers
+/// [`crate::cdc::ChangeEnvelope::history_unavailable`] with one atomic overwrite
+/// and queries keep seeing the pre-rebuild contents until it swaps. Clearing the
+/// table and streaming a fresh snapshot into it — the shape this replaced —
+/// is observable to every query for the length of the re-read as an empty, then
+/// partially filled, table.
+///
+/// The signal's [`SnapshotBoundaryCommitter`] clears `SNAPSHOTTING`, persists the
+/// new head, and requests the reconnect that promotes the member back to
+/// streaming, all after the consumer has durably applied the replacement.
 async fn rebootstrap_member(
     source: &Arc<SharedSource>,
-    params: &ReplicationParams,
     key: &MemberKey,
     member: &Arc<MemberHandle>,
     head: &BinlogPosition,
     head_gtid: &GtidSet,
 ) -> Result<()> {
-    if let Err(e) = member.position_store.clear().await {
-        tracing::warn!(dataset = %member.dataset_name, error = %e, "failed to clear purged mysql binlog checkpoint before re-snapshot");
-    }
     // Reset to head, held SNAPSHOTTING so `persist_all`/promotion skip it until
-    // the boundary lands — identical to a cold-start member.
+    // the boundary lands — identical to a loading member.
     source
         .ack
         .register_with_gtid(key, head.clone(), head_gtid.clone(), true);
 
-    let ml = lock(&member.layout).clone();
-    let dropped = "changes stream receiver dropped during re-snapshot";
-    let truncate = super::truncate_envelope(&member.schema, &member.primary_keys, &ml.column_map)?;
-    if member.sender.send(Ok(truncate)).await.is_err() {
-        source.detach_member(key, dropped, true);
-        return Ok(());
-    }
-
-    let mut snapshot = super::bootstrap::snapshot_stream(super::bootstrap::SnapshotInput {
-        params: params.clone(),
-        layout: ml.layout.clone(),
-        schema: Arc::clone(&member.schema),
-        primary_keys: member.primary_keys.clone(),
-        column_map: ml.column_map.clone(),
-        database: key.0.clone(),
-        table: key.1.clone(),
-        dataset_name: member.dataset_name.clone(),
-        metrics: Arc::clone(&member.metrics),
-    });
-    while let Some(item) = snapshot.next().await {
-        let failed = item.is_err();
-        if member.sender.send(item).await.is_err() {
-            source.detach_member(key, dropped, true);
-            return Ok(());
-        }
-        if failed {
-            // Snapshot errored; leave the member SNAPSHOTTING with no boundary so
-            // it cannot falsely advance. The error is now visible downstream.
-            return Ok(());
-        }
-    }
-
-    let schema_mismatch = |e: crate::cdc::ChangeBatchError| Error::SchemaMismatch {
-        message: e.to_string(),
-    };
-    let (_, boundary_batch, _, _) =
-        crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
-            .map_err(schema_mismatch)?
-            .into_parts()
-            .map_err(schema_mismatch)?;
-    let boundary = ChangeEnvelope::from_parts(
-        Box::new(SnapshotBoundaryCommitter {
-            source: Arc::clone(source),
-            key: key.clone(),
-            dataset: member.dataset_name.clone(),
-        }),
-        boundary_batch,
-        false,
-        // See the sibling boundary envelope: not a history-unavailable signal.
-        false,
-    );
-    if member.sender.send(Ok(boundary)).await.is_err() {
-        source.detach_member(key, dropped, true);
+    let signal = snapshot_boundary_envelope(
+        source,
+        key,
+        &member.schema,
+        member.dataset_name.clone(),
+        true,
+    )?;
+    if member.sender.send(Ok(signal)).await.is_err() {
+        source.detach_member(key, "changes stream receiver dropped during rebuild", true);
     }
     Ok(())
 }
@@ -2371,6 +2490,8 @@ async fn poll_head_and_heartbeat(
 mod tests {
     use crate::mysql_replication::metrics::Metrics;
 
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use super::*;
 
     fn key(db: &str, t: &str) -> MemberKey {
@@ -2385,6 +2506,318 @@ mod tests {
 
     fn gtids(raw: &str) -> GtidSet {
         GtidSet::parse(raw).expect("parse gtid set")
+    }
+
+    fn test_params() -> ReplicationParams {
+        ReplicationParams {
+            opts: mysql_async::Opts::from_url("mysql://user:pass@localhost:3306/db")
+                .expect("parse test connection url"),
+            server_id: 1,
+            snapshot_mode: InitialSnapshotMode::default(),
+            bootstrap_batch_size: 1,
+            checkpoint_interval: Duration::from_secs(1),
+            invalid_position_behavior: InvalidCheckpointBehavior::Restart,
+            ready_lag: Duration::from_secs(2),
+        }
+    }
+
+    /// Stands in for a member's durable accelerator sidecar, so a test can read
+    /// back what the rebuild did (or did not) do to the persisted checkpoint.
+    #[derive(Default)]
+    struct MemoryPositionStore {
+        inner: Mutex<Option<PersistedPosition>>,
+    }
+
+    #[async_trait]
+    impl super::super::PositionStore for MemoryPositionStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<Option<PersistedPosition>, super::super::StoreError> {
+            Ok(lock(&self.inner).clone())
+        }
+        async fn save(
+            &self,
+            position: &PersistedPosition,
+        ) -> std::result::Result<(), super::super::StoreError> {
+            *lock(&self.inner) = Some(position.clone());
+            Ok(())
+        }
+        async fn clear(&self) -> std::result::Result<(), super::super::StoreError> {
+            *lock(&self.inner) = None;
+            Ok(())
+        }
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    /// A source with one live member whose channel the test owns, built without
+    /// touching `MySQL`: everything `rebootstrap_member` reads is local state.
+    /// One live member and everything a test needs to observe what it emitted.
+    struct TestMember {
+        source: Arc<SharedSource>,
+        member: Arc<MemberHandle>,
+        position_store: Arc<MemoryPositionStore>,
+        receiver: mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
+    }
+
+    fn source_with_member(member_key: &MemberKey) -> TestMember {
+        let params = test_params();
+        let source = Arc::new(SharedSource {
+            key: SourceKey {
+                host: "localhost".to_string(),
+                port: 3306,
+                user: "user".to_string(),
+                pass: None,
+                ssl: None,
+                server_id: params.server_id,
+            },
+            params: params.clone(),
+            setup_lock: tokio::sync::Mutex::new(()),
+            members: Mutex::new(HashMap::new()),
+            ack: Arc::new(AckTable::default()),
+            pump_started: AtomicBool::new(true),
+            restart_requested: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            detached: Mutex::new(HashSet::new()),
+        });
+        let (sender, receiver) = mpsc::channel(8);
+        let position_store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
+        let member = Arc::new(MemberHandle {
+            dataset_name: "orders".to_string(),
+            schema: test_schema(),
+            primary_keys: vec!["id".to_string()],
+            layout: Mutex::new(Arc::new(MemberLayout {
+                // Covers every column of `test_schema`, so anything the member
+                // builds from the layout (a truncate row included) is buildable
+                // — an under-covered fixture would fail a test for its own
+                // reasons rather than the asserted one.
+                layout: super::super::setup::TableLayout {
+                    columns: vec![
+                        super::super::setup::SourceColumn {
+                            name: "id".to_string(),
+                            column_type: "bigint".to_string(),
+                            enum_variants: None,
+                            set_variants: None,
+                            is_primary_key: true,
+                        },
+                        super::super::setup::SourceColumn {
+                            name: "name".to_string(),
+                            column_type: "varchar(64)".to_string(),
+                            enum_variants: None,
+                            set_variants: None,
+                            is_primary_key: false,
+                        },
+                    ],
+                },
+                column_map: vec![0, 1],
+                pk_source_indexes: vec![0],
+            })),
+            sender,
+            metrics: MetricsCollector::new(),
+            ready_lag: params.ready_lag,
+            position_store: Arc::clone(&position_store) as Arc<dyn PositionStore>,
+            checkpoint_schema_json: None,
+            cursor_type: CursorType::File,
+        });
+        lock(&source.members).insert(member_key.clone(), Arc::clone(&member));
+        // A streaming member: the rebuild is what puts it back into SNAPSHOTTING.
+        source
+            .ack
+            .register(member_key, pos("binlog.000001", 100), false);
+        source.ack.promote_ready_members();
+        TestMember {
+            source,
+            member,
+            position_store,
+            receiver,
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_replaces_the_acceleration_instead_of_emptying_it() {
+        // A purged binlog position under `invalid_checkpoint_behavior: restart`
+        // must not clear the acceleration and refill it through the change
+        // stream: for the whole re-read, queries would be answered from an empty,
+        // then partially filled, table. The member asks the consumer to replace
+        // the contents atomically instead, so a query issued mid-rebuild returns
+        // either the pre-rebuild rows or the completed ones.
+        let member_key = key("db", "orders");
+        let TestMember {
+            source,
+            member,
+            position_store,
+            mut receiver,
+        } = source_with_member(&member_key);
+        // The purged checkpoint this member is recovering from.
+        let purged = PersistedPosition {
+            position: pos("binlog.000001", 100),
+            schema_json: None,
+            gtid_set: None,
+            cursor_type: CursorType::File,
+        };
+        position_store
+            .save(&purged)
+            .await
+            .expect("seed the purged checkpoint");
+
+        rebootstrap_member(
+            &source,
+            &member_key,
+            &member,
+            &pos("binlog.000004", 4),
+            &GtidSet::new(),
+        )
+        .await
+        .expect("rebootstrap the member");
+
+        let envelope = receiver
+            .try_recv()
+            .expect("the rebuild signal is sent")
+            .expect("the rebuild signal is not a stream error");
+        assert!(
+            envelope.history_unavailable(),
+            "the member must ask the consumer to rebuild from the source"
+        );
+        assert!(
+            !envelope.is_no_op_heartbeat(),
+            "the signal carries the boundary committer, so the consumer's heartbeat \
+             stripping cannot drop it and leave the new head unpersisted"
+        );
+        assert!(
+            envelope.is_empty(),
+            "the rebuild is a zero-row signal: no truncate, and no snapshot rows \
+             for the consumer to apply on top of a table it is about to replace"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "the rebuild signal is the whole prelude — nothing follows it on the \
+             member's channel"
+        );
+
+        // Held SNAPSHOTTING until the signal's committer runs, so the shared floor
+        // cannot advance onto rows the consumer has not applied.
+        let slot = source.ack.slot(&member_key).expect("member slot");
+        assert!(slot.has(SNAPSHOTTING));
+        assert_eq!(slot.committed(), pos("binlog.000004", 4));
+
+        // The unusable checkpoint stays until the signal's committer replaces it
+        // with the new head — see `rebootstrap_member` for why.
+        let still_there = position_store
+            .load()
+            .await
+            .expect("store readable")
+            .expect("the purged checkpoint survives until the rebuild commits");
+        assert_eq!(still_there.position, purged.position);
+    }
+
+    #[tokio::test]
+    async fn only_the_rebuild_boundary_asks_for_a_replacement() {
+        // The same envelope serves both loading starts; a first load has nothing
+        // to preserve and must NOT trigger a rebuild — that would re-read the
+        // source table on every cold start.
+        let member_key = key("db", "orders");
+        let TestMember { source, member, .. } = source_with_member(&member_key);
+
+        for (history_unavailable, expected) in [(false, false), (true, true)] {
+            let envelope = snapshot_boundary_envelope(
+                &source,
+                &member_key,
+                &member.schema,
+                member.dataset_name.clone(),
+                history_unavailable,
+            )
+            .expect("build the boundary envelope");
+            assert_eq!(envelope.history_unavailable(), expected);
+            // Both carry the boundary committer: a snapshot's head must survive
+            // the consumer's heartbeat stripping too.
+            assert!(!envelope.is_no_op_heartbeat());
+            assert!(!envelope.is_dataset_ready());
+        }
+    }
+
+    #[test]
+    fn an_unusable_position_rebuilds_even_when_the_initial_snapshot_is_disabled() {
+        // Regression test for #13024. Asking `initial_snapshot` before "is this
+        // acceleration already holding rows" lets a durable acceleration whose
+        // binlog position the source purged stream on from the current head:
+        // every row deleted at the source inside the purged window survives in
+        // the acceleration and is served by every later query, with nothing
+        // logged.
+        //
+        // A recorded position is the evidence that rows are there, so it
+        // decides, whatever the snapshot mode says. `always` is included
+        // because it reaches the same helper by the other route — it discards a
+        // still-resumable position by request — and must reload the rows it is
+        // holding by replacement rather than by emptying and refilling.
+        for mode in [
+            InitialSnapshotMode::Auto,
+            InitialSnapshotMode::Always,
+            InitialSnapshotMode::Disabled,
+        ] {
+            assert_eq!(
+                start_without_usable_position(mode, true),
+                MemberStart::Rebuild,
+                "a recorded position that will not be resumed from must be rebuilt under \
+                 initial_snapshot: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_load_still_honours_the_initial_snapshot_mode() {
+        // The other half of the ordering: with nothing recorded there are no
+        // rows to preserve, so the mode is the only instruction and it is
+        // followed. `disabled` must not be turned into a re-read of the whole
+        // table on every cold start.
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Disabled, false),
+            MemberStart::Stream
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Auto, false),
+            MemberStart::Snapshot
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Always, false),
+            MemberStart::Snapshot
+        );
+    }
+
+    #[test]
+    fn only_a_start_that_loads_nothing_persists_the_head_up_front() {
+        // A loading start's head is persisted by its boundary committer, once
+        // its rows are durably applied. Recording it before they land would let
+        // a crash mid-load resume past base rows that never arrived — so a
+        // rebuild reached with the snapshot disabled must not pick up the
+        // streaming member's up-front save.
+        assert!(
+            !MemberStart::Rebuild.persists_head_before_loading(),
+            "a rebuild's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            !MemberStart::Snapshot.persists_head_before_loading(),
+            "a snapshot's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            MemberStart::Stream.persists_head_before_loading(),
+            "a member that loads nothing has no committer, so its head must be recorded here or \
+             the next start resumes from an older position"
+        );
+    }
+
+    #[test]
+    fn both_loading_starts_hold_the_member_snapshotting() {
+        // The ack floor is held for whichever way the acceleration is loaded. A
+        // rebuild that reported itself as not-loading would let the shared floor
+        // advance past rows the consumer has not applied yet.
+        assert!(MemberStart::Snapshot.is_loading());
+        assert!(MemberStart::Rebuild.is_loading());
+        assert!(!MemberStart::Stream.is_loading());
     }
 
     #[test]

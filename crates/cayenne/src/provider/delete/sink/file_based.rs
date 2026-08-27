@@ -305,7 +305,7 @@ impl FileBasedDeletionSink {
         // segments immediately and cannot disappear from a later directory
         // listing before ever being invalidated.
         self.provider
-            .invalidate_segment_cache_paths(retired_cache_paths)
+            .invalidate_retired_paths(retired_cache_paths)
             .await;
         if let Some(error) = delete_error {
             return Err(error);

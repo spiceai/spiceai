@@ -34,7 +34,7 @@ use std::{
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
     download::{ST_CONFIG_NAMES, download_artifacts},
-    tokenization::EncodingInput,
+    tokenization::{EncodingInput, Tokenization},
 };
 
 use tempfile::tempdir;
@@ -45,7 +45,14 @@ pub(crate) fn load_tokenizer(model_root: &Path) -> Result<Tokenizer> {
         "Loading model tokenizer from {:?}",
         model_root.join("tokenizer.json")
     );
-    let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
+    let mut tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+    // Some Sentence-Transformers tokenizers bake a fixed-length padding and truncation into `tokenizer.json`.
+    // Clear both here so TEI is the single source of truth, matching upstream text-embeddings-inference.
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
     Ok(tokenizer)
@@ -69,6 +76,45 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     tracing::trace!("Model config parsed: {:?}", config);
 
     Ok(config)
+}
+
+/// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
+/// `Infer` pipeline from a directory of model artifacts. Shared by
+/// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
+/// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
+/// otherwise duplicate this setup.
+pub(crate) fn load_tokenization(
+    root: &Path,
+    max_seq_length_overwrite: Option<usize>,
+) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
+    let tokenizer = load_tokenizer(root)?;
+    let config = load_config(root)?;
+    let position_offset = position_offset(&config);
+
+    let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+        max_seq_length
+    } else {
+        match max_seq_length_from_st_config(root) {
+            Ok(max_seq_length_opt) => {
+                max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                config.max_position_embeddings - position_offset
+            }
+        }
+    };
+
+    let token = Tokenization::new(
+        1,
+        tokenizer.clone(),
+        max_input_length,
+        position_offset,
+        None,
+        None,
+    );
+
+    Ok((tokenizer, config, token))
 }
 
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
@@ -295,5 +341,52 @@ pub(crate) fn pool_from_str(p: &str) -> Option<Pool> {
         "splade" => Some(Pool::Splade),
         "last_token" => Some(Pool::LastToken),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_tokenizer;
+    use tempfile::tempdir;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+
+    // Regression test for #13415: a tokenizer.json that bakes in a fixed-length padding and
+    // truncation must not keep them. TEI owns padding/masking; a leaked fixed padding pads every
+    // input to that width and the padding then corrupts mean-pooled embeddings (near-random
+    // retrieval). `load_tokenizer` must strip both so TEI is the single source of truth.
+    #[test]
+    fn load_tokenizer_clears_baked_in_padding_and_truncation() {
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(128),
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 128,
+                ..Default::default()
+            }))
+            .expect("failed to set truncation on fixture tokenizer");
+
+        // Sanity check that the fixture actually carries the settings we intend to strip.
+        assert!(tokenizer.get_padding().is_some());
+        assert!(tokenizer.get_truncation().is_some());
+
+        let dir = tempdir().expect("failed to create temp dir");
+        tokenizer
+            .save(dir.path().join("tokenizer.json"), false)
+            .expect("failed to save fixture tokenizer");
+
+        let loaded = load_tokenizer(dir.path()).expect("failed to load tokenizer");
+
+        assert!(
+            loaded.get_padding().is_none(),
+            "load_tokenizer must clear the baked-in padding"
+        );
+        assert!(
+            loaded.get_truncation().is_none(),
+            "load_tokenizer must clear the baked-in truncation"
+        );
     }
 }

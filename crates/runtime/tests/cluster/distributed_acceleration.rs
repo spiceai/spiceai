@@ -190,7 +190,9 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
 /// federation wrapper must not hide the inner `AcceleratedTable` from `should_partition`;
 /// the query must still distribute (`FlightSqlExec`).
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(not(target_os = "windows"))]
+// Builds a DuckDB file to federate over, so it needs the optional `duckdb`
+// dependency this crate only carries under its own feature.
+#[cfg(all(not(target_os = "windows"), feature = "duckdb"))]
 async fn cluster_distributes_accelerated_table_with_federated_source() -> Result<(), anyhow::Error>
 {
     let _ = tracing_subscriber::fmt()

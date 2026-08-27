@@ -27,7 +27,7 @@ use crate::{
     },
     dataconnector::{
         DataConnector, DataConnectorFactory,
-        parameters::{ConnectorParams, ConnectorParamsBuilder},
+        parameters::{ConnectorParams, ConnectorParamsBuilder, RuntimeConnectorContext},
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,
@@ -296,6 +296,7 @@ impl SpiceCloudPlatformCatalog {
                         message: e.to_string(),
                         source: e,
                     })?,
+                &RuntimeConnectorContext::for_dataset(&template_dataset),
             )
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {

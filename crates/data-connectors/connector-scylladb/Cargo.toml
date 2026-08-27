@@ -26,6 +26,7 @@ description = "ScyllaDB data connector for Spice.ai runtime"
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["federation"] }
@@ -33,7 +34,7 @@ futures.workspace = true
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 scylla.workspace = true
 snafu.workspace = true
@@ -41,6 +42,10 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
+tokio.workspace = true
 
 [lints]
 workspace = true

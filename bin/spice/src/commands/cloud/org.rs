@@ -16,16 +16,18 @@ limitations under the License.
 
 //! Organization context for `spice cloud`.
 //!
-//! Spice Cloud management tokens are scoped to one organization when they are
-//! minted, so a user who belongs to both a personal org and a company org needs
-//! a credential per org plus a record of which one commands act on. This module
-//! owns both halves:
+//! Spice Cloud user access tokens follow the user's memberships, while machine
+//! credentials remain bound to one organization. The CLI keeps an explicit
+//! organization selection and optional per-org credential copies so both token
+//! kinds can be selected without guessing. This module owns both halves:
 //!
 //! - the **active org**, a machine-wide setting in `~/.spice/cloud-context.json`
 //!   so a new shell keeps operating on the org the last `org use` selected;
 //! - the **per-org credential**, stored under `SPICE_SPICEAI_TOKEN_<ORG>`
 //!   alongside the default `SPICE_SPICEAI_TOKEN`, so authenticating against a
 //!   second org never overwrites the first.
+//! - the **keychain org index**, a non-secret list in the same context file so
+//!   `logout --scope all` can enumerate credentials that have no env-file key.
 //!
 //! Selecting an org is a statement of intent only. Every request still carries
 //! the org to the server, which is the sole authority on membership.
@@ -47,6 +49,7 @@ pub const DEFAULT_API_KEY_VAR: &str = "SPICE_SPICEAI_API_KEY";
 /// Environment variable that overrides the persisted active org for one process.
 pub const ACTIVE_ORG_VAR: &str = "SPICE_CLOUD_ORG";
 
+#[cfg(not(test))]
 const DOT_SPICE: &str = ".spice";
 const CONTEXT_FILE: &str = "cloud-context.json";
 const MAX_ORG_NAME_LEN: usize = 64;
@@ -54,14 +57,18 @@ const MAX_ORG_NAME_LEN: usize = 64;
 /// Machine-wide `spice cloud` state that is not a secret.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudContext {
-    /// Organization subsequent commands act on. `None` means "the org the
-    /// credential was minted for", which for most users is their personal org.
+    /// Organization subsequent commands act on. `None` means the credential's
+    /// default organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_org: Option<String>,
 
     /// When the active org was last changed, for `whoami` and support triage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+
+    /// Organizations whose credentials were written to the platform keychain.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub keychain_orgs: BTreeSet<String>,
 }
 
 /// Reject org names that are not safe to put in a URL, a header, or an
@@ -112,9 +119,48 @@ pub fn validate_org_name(org: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the home directory cannot be determined.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the fallible production context-path contract"
+    )
+)]
 fn context_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| crate::error::HomeDirectoryNotFoundSnafu.build())?;
-    Ok(home.join(DOT_SPICE).join(CONTEXT_FILE))
+    #[cfg(test)]
+    {
+        Ok(test_context_file::path())
+    }
+
+    #[cfg(not(test))]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| crate::error::HomeDirectoryNotFoundSnafu.build())?;
+        Ok(home.join(DOT_SPICE).join(CONTEXT_FILE))
+    }
+}
+
+/// Redirects cloud-context helpers to a temporary file in tests.
+#[cfg(test)]
+pub(crate) mod test_context_file {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static DIR: RefCell<Option<tempfile::TempDir>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn path() -> PathBuf {
+        DIR.with_borrow_mut(|dir| {
+            dir.get_or_insert_with(|| tempfile::tempdir().expect("create test context directory"))
+                .path()
+                .join(super::CONTEXT_FILE)
+        })
+    }
+
+    pub(crate) fn reset() {
+        DIR.with_borrow_mut(|dir| *dir = None);
+    }
 }
 
 /// Load the persisted cloud context, or the default when none has been written.
@@ -190,6 +236,56 @@ pub fn clear_active_org() -> Result<()> {
     save_context(&context)
 }
 
+/// Record organizations whose credentials are being written to the keychain.
+///
+/// The index is written before the credentials. A failed credential write can
+/// therefore leave a harmless stale name, but never an unenumerable secret.
+///
+/// # Errors
+///
+/// Returns an error if an organization name is invalid or the context cannot
+/// be loaded or saved.
+pub(super) fn remember_keychain_orgs(orgs: &BTreeSet<String>) -> Result<()> {
+    if orgs.is_empty() {
+        return Ok(());
+    }
+
+    let mut context = load_context()?;
+    for org in orgs {
+        validate_org_name(org)?;
+        context.keychain_orgs.insert(org.clone());
+    }
+    save_context(&context)
+}
+
+/// Forget an organization after its keychain credential has been removed.
+///
+/// # Errors
+///
+/// Returns an error if the context cannot be loaded or saved.
+pub(super) fn forget_keychain_org(org: &str) -> Result<()> {
+    let mut context = load_context()?;
+    if context.keychain_orgs.remove(org) {
+        save_context(&context)?;
+    }
+    Ok(())
+}
+
+/// Clear the keychain organization index after all indexed credentials have
+/// been removed.
+///
+/// # Errors
+///
+/// Returns an error if the context cannot be loaded or saved.
+pub(super) fn clear_keychain_orgs() -> Result<()> {
+    let mut context = load_context()?;
+    if !context.keychain_orgs.is_empty() {
+        context.keychain_orgs.clear();
+        save_context(&context)?;
+    }
+    Ok(())
+}
+
 /// The active org for this process: `SPICE_CLOUD_ORG` if set, else the
 /// persisted selection.
 ///
@@ -259,6 +355,12 @@ fn decode_org(encoded: &str) -> Option<String> {
     (!org.is_empty()).then_some(org)
 }
 
+/// Recover an organization name from a `save_credentials("SPICEAI", ...)`
+/// token key. Default and API-key entries do not identify an organization.
+pub(super) fn org_from_credential_key(key: &str) -> Option<String> {
+    decode_org(key.strip_prefix("TOKEN_")?)
+}
+
 /// Environment variable holding the management credential for `org`.
 ///
 /// `spicehq` → `SPICE_SPICEAI_TOKEN_SPICEHQ`.
@@ -286,10 +388,7 @@ pub fn read_credential(var: &str) -> Option<String> {
         return Some(value);
     }
 
-    if let Ok(entry) = keyring::Entry::new(var, "spice")
-        && let Ok(value) = entry.get_password()
-        && !value.is_empty()
-    {
+    if let Some(value) = crate::commands::login::keychain::read(var) {
         return Some(value);
     }
 
@@ -315,12 +414,10 @@ pub fn default_token() -> Option<String> {
 
 /// The credential bound to `org`.
 ///
-/// Deliberately does **not** fall back to the default credential. Spice Cloud
-/// binds a token to one organization at mint time, so using the personal-org
-/// token for a request that names another org runs the command against the
-/// wrong organization while the CLI reports the requested one — the failure
-/// mode behind every wrong-target incident this design is meant to prevent.
-/// Callers surface [`CloudErrorCode::OrgCredentialMissing`] instead.
+/// Deliberately does **not** decide whether the default credential may fall
+/// back. Callers first prefer this explicit copy, then may probe the default
+/// credential: a user token is valid for every member organization, while a
+/// machine token has no user membership and must stay organization-bound.
 #[must_use]
 pub fn token_for_org(org: &str) -> Option<String> {
     read_credential(&org_token_var(org))
@@ -347,11 +444,29 @@ pub fn has_org_token(org: &str) -> bool {
 }
 
 /// Orgs with a credential of their own, discovered from the env file and the
-/// process environment. Used to list known orgs when the API cannot enumerate
-/// them, and to log out of every stored session.
-#[must_use]
-pub fn orgs_with_stored_tokens() -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
+/// process environment, plus the non-secret index of keychain-only credentials.
+/// Used to list known orgs when the API cannot enumerate them, and to log out of
+/// every stored session.
+///
+/// # Errors
+///
+/// Returns an error if the persisted context cannot be read or contains an
+/// invalid indexed organization.
+pub fn orgs_with_stored_tokens() -> Result<BTreeSet<String>> {
+    stored_orgs_from_sources(
+        load_context()?,
+        std::env::vars().chain(crate::commands::login::env_file_vars()),
+    )
+}
+
+fn stored_orgs_from_sources(
+    context: CloudContext,
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Result<BTreeSet<String>> {
+    for org in &context.keychain_orgs {
+        validate_org_name(org)?;
+    }
+    let mut names = context.keychain_orgs;
     let prefix = format!("{DEFAULT_TOKEN_VAR}_");
 
     let mut collect = |key: &str| {
@@ -366,19 +481,13 @@ pub fn orgs_with_stored_tokens() -> BTreeSet<String> {
         }
     };
 
-    for (key, value) in std::env::vars() {
+    for (key, value) in vars {
         if !value.is_empty() {
             collect(&key);
         }
     }
 
-    for (key, value) in crate::commands::login::env_file_vars() {
-        if !value.is_empty() {
-            collect(&key);
-        }
-    }
-
-    names
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -466,6 +575,49 @@ mod tests {
         assert!(decode_org("").is_none());
         assert!(decode_org("SPICE_").is_none(), "truncated escape");
         assert!(decode_org("SPICE_ZZ").is_none(), "non-hex escape");
+    }
+
+    #[test]
+    fn credential_keys_recover_only_per_org_tokens() {
+        assert_eq!(
+            org_from_credential_key("TOKEN_SPICE_2DHQ").as_deref(),
+            Some("spice-hq")
+        );
+        assert!(org_from_credential_key("TOKEN").is_none());
+        assert!(org_from_credential_key("API_KEY_SPICEHQ").is_none());
+    }
+
+    #[test]
+    fn keychain_only_orgs_are_enumerated_for_logout() {
+        let context = CloudContext {
+            keychain_orgs: BTreeSet::from(["keychain-org".to_string()]),
+            ..CloudContext::default()
+        };
+        let stored = stored_orgs_from_sources(
+            context,
+            [
+                (
+                    "SPICE_SPICEAI_TOKEN_ENV_2DORG".to_string(),
+                    "token".to_string(),
+                ),
+                ("SPICE_SPICEAI_TOKEN_EMPTY".to_string(), String::new()),
+            ],
+        )
+        .expect("stored organization sources should be valid");
+
+        assert_eq!(
+            stored,
+            BTreeSet::from(["env-org".to_string(), "keychain-org".to_string()])
+        );
+    }
+
+    #[test]
+    fn old_context_files_default_to_no_keychain_orgs() {
+        let context: CloudContext =
+            serde_json::from_str(r#"{"active_org":"acme","updated_at":"2026-08-20T00:00:00Z"}"#)
+                .expect("the prior context schema should remain readable");
+
+        assert!(context.keychain_orgs.is_empty());
     }
 
     #[test]

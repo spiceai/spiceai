@@ -676,21 +676,22 @@ impl BootstrapBuilder {
                     None => fb.append_null(),
                 }
             }
-            Self::Decimal128(b, _precision, scale) => {
+            Self::Decimal128(b, precision, scale) => {
                 // Read NUMERIC as text from Postgres; parse to i128 with the
-                // dataset's declared scale. Uses the same routine as the WAL
-                // path so behavior is consistent.
+                // dataset's declared precision and scale, through the same
+                // routine as the WAL path. Both must be passed: a snapshot that
+                // widened precision would admit rows the replication stream
+                // rejects, so the same source value would land differently
+                // depending on which path carried it.
                 let v: Option<String> =
                     row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read numeric (as text): {e}"),
                     })?;
                 match v {
                     Some(s) => {
-                        let value =
-                            super::changes::parse_pg_numeric_public(&s, *scale).map_err(|e| {
-                                super::Error::SchemaMismatch {
-                                    message: format!("bootstrap numeric parse '{s}': {e}"),
-                                }
+                        let value = super::changes::parse_pg_numeric_public(&s, *precision, *scale)
+                            .map_err(|e| super::Error::SchemaMismatch {
+                                message: format!("bootstrap numeric parse '{s}': {e}"),
                             })?;
                         b.append_value(value);
                     }

@@ -146,8 +146,9 @@ use bytes::Bytes;
 
 use super::{
     AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
-    Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
-    config::ReplicationParams, pgoutput, resilience, schema_evolution::RelationSchemaTracker, slot,
+    Result, SchemaEvolutionPolicy, XidRegistry, bootstrap, changes::PgChangeRows, client,
+    config::ReplicationParams, pgoutput, resilience, retention,
+    schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -495,6 +496,14 @@ struct MemberHandle {
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     /// Wakes the applied-position writer when this member publishes a position.
     watermark_notify: Arc<Notify>,
+    /// The dataset's outstanding-write-back-transaction registry — `Some` only for
+    /// a durable-write-back dataset, the same `Arc` the connector's delivery path
+    /// registers into. When a committed transaction's `xid` is a member of this
+    /// registry, [`deliver_commit`] drops that member's changes (the echo of its
+    /// own write-back) and acks the commit with a zero-row envelope instead of
+    /// applying it. `None` members are never filtered. See
+    /// `cdc-echo-drop-xid-design.md`.
+    write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -554,6 +563,17 @@ struct AckSlot {
     /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
     /// used), so it adds no false sharing.
     recorded: AtomicU64,
+    /// Whether a mid-stream rebuild request is outstanding for this member.
+    ///
+    /// [`SNAPSHOTTING`] is the *hold*, and two independent things take it: a
+    /// member's initial snapshot, and a rebuild requested after the slot was
+    /// replaced. One bit cannot say who holds it, so the snapshot's completion hook
+    /// would release a hold the rebuild still needs — and a member released early
+    /// is credited to the WAL head by [`AckTable::credit_idle`] and then *recorded*
+    /// there by [`publish_idle_positions`], for contents its rebuild has not
+    /// delivered. This distinguishes the two: while it is set, only the rebuild's
+    /// own completion may release the hold.
+    rebuild_pending: AtomicBool,
     /// Highest position *proven durable and eligible to record*, published by
     /// whichever producer established it — an envelope commit, a snapshot/rebuild
     /// boundary, or the idle carry-forward sweep — and drained by the single
@@ -576,6 +596,7 @@ impl AckSlot {
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -590,6 +611,7 @@ impl AckSlot {
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -622,6 +644,33 @@ impl AckSlot {
     /// enough for the commit path: one atomic max, no I/O and no lock.
     fn note_pending(&self, lsn: u64) {
         advance_monotonic(&self.pending, lsn);
+    }
+
+    /// Seat a member resuming on a position a previous process durably recorded
+    /// as applied. A recorded position means "everything at or below this LSN is
+    /// durably in the acceleration" (see [`Self::recorded`]), which makes it two
+    /// things at once:
+    ///
+    ///   * **recordable** — the idle carry-forward may extend it
+    ///     ([`publish_idle_positions`]), hence `note_recorded`/`note_pending`;
+    ///   * **the replay-suppression floor** — a reconnect replay must not
+    ///     re-deliver anything at or below it ([`Self::already_committed`]),
+    ///     hence `committed`/`delivered`.
+    ///
+    /// Seeding only the first half loses writes for a durable write-back dataset:
+    /// its echo registry prunes entries against this same recorded position, so a
+    /// crash while the slot's `confirmed_flush_lsn` lags it replays echoes whose
+    /// entries are already pruned — re-applied as ordinary changes, they regress
+    /// the acceleration to a stale echo image, and the next write-back delivery
+    /// then regresses the source too (#13368).
+    ///
+    /// `committed` before `delivered`, per the torn-read invariant on
+    /// [`AckTable::credit_idle`].
+    fn seat_recorded(&self, lsn: u64) {
+        self.note_recorded(lsn);
+        self.note_pending(lsn);
+        advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.delivered, lsn);
     }
 
     /// Advance this member's committed floor (monotonic). Called lock-free from
@@ -724,6 +773,39 @@ impl AckTable {
     /// that reconnect.
     fn snapshot_finished(&self, key: &MemberKey) {
         if let Some(slot) = write_lock(&self.members).get(key) {
+            // A rebuild requested after the slot was replaced holds the same bit,
+            // and its contents are not in the acceleration until *it* commits. A
+            // member whose initial snapshot finishes in that window must stay held:
+            // releasing here would let the next connect promote it, `credit_idle`
+            // carry its floor to the WAL head, and `publish_idle_positions` record
+            // a position for rows the rebuild has not delivered. See
+            // [`AckSlot::rebuild_pending`].
+            if slot.rebuild_pending.load(Ordering::Acquire) {
+                return;
+            }
+            slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
+        }
+    }
+
+    /// Take the rebuild's hold on `key`, so only [`Self::rebuild_finished`] can
+    /// release it. Idempotent, and safe on a member that is already holding for its
+    /// initial snapshot — that snapshot's completion then becomes a no-op.
+    fn mark_rebuild_pending(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(true, Ordering::Release);
+        }
+    }
+
+    /// Release the hold taken by [`Self::mark_rebuild_pending`], once the consumer
+    /// has committed the rebuild and its contents are durable.
+    ///
+    /// Clears the marker *before* the hold, so a concurrent `snapshot_finished`
+    /// either sees the marker and defers (this call then does the release) or sees
+    /// it clear and releases a hold this call has already given up. Neither order
+    /// leaves the member held with nothing left to release it.
+    fn rebuild_finished(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(false, Ordering::Release);
             slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
         }
     }
@@ -783,6 +865,35 @@ impl AckTable {
                 prev & SNAPSHOTTING != 0
             }
             None => false,
+        }
+    }
+
+    /// Move every *held* floor — an unclaimed reservation, or a detached member's
+    /// frozen position — up to `at`, after the slot those floors were holding
+    /// history in has been replaced.
+    ///
+    /// A held floor exists to stop the slot acknowledging changes nobody has
+    /// consumed yet. A replacement slot has no such changes: everything before its
+    /// creation point is gone from the source, and whatever claims the floor later
+    /// has a watermark the slot cannot reach, so it is rebuilt from the source
+    /// rather than replayed to. Leaving these floors where they were would pin
+    /// [`Self::flush_lsn`] below the replacement for good, so the new slot would
+    /// never acknowledge anything and would retain WAL without bound — trading the
+    /// invalidation this just recovered from for a slow version of the same
+    /// problem.
+    ///
+    /// Live members are deliberately untouched: their floors are still the
+    /// authority on what they have applied, and their rebuild's committer is what
+    /// moves them.
+    fn reseat_held_floors(&self, at: u64) {
+        for slot in write_lock(&self.members).values() {
+            if slot.state.load(Ordering::Acquire) & (LIVE | STREAMING) != 0 {
+                continue;
+            }
+            // `committed` before `delivered`, per [`AckSlot`]: a torn read must
+            // never be able to show `delivered > committed`.
+            advance_monotonic(&slot.committed, at);
+            advance_monotonic(&slot.delivered, at);
         }
     }
 
@@ -936,11 +1047,47 @@ fn snapshot_watermark_envelope(
             slot,
             lsn,
             dataset,
+            // The join path chains a stream hook for this instead; see `live_flip`.
+            live_flip: None,
         }),
         batch,
         // Readiness stays lag-based: an acceleration being loaded is not ready.
         false,
         history_unavailable,
+    ))
+}
+
+/// [`snapshot_watermark_envelope`] for a rebuild requested *mid-stream*, whose
+/// committer also releases the hold the request was enqueued behind.
+///
+/// The join path decides a rebuild before the member's stream exists, so it chains
+/// a completion hook after the request. There is no such chaining point once the
+/// member is streaming, and the mailbox is the only channel to it — so the hook
+/// lives in the committer instead. See [`SnapshotWatermarkCommitter::live_flip`].
+fn rebuild_request_envelope(
+    source: &Arc<SharedSource>,
+    member_key: &MemberKey,
+    member: &Arc<MemberHandle>,
+    lsn: u64,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
+        .map_err(|e| StreamError::External(e.to_string()))?
+        .into_parts()
+        .map_err(|e| StreamError::External(e.to_string()))?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotWatermarkCommitter {
+            watermark_notify: Arc::clone(&source.watermark_notify),
+            slot: source.ack.slot(member_key),
+            lsn,
+            dataset: member.dataset_name.clone(),
+            live_flip: Some((Arc::clone(source), member_key.clone())),
+        }),
+        batch,
+        // Readiness stays lag-based: an acceleration being reloaded is not ready.
+        false,
+        // The whole point of the envelope: the consumer replaces the acceleration's
+        // contents from the source rather than applying anything onto them.
+        true,
     ))
 }
 
@@ -973,6 +1120,20 @@ struct SnapshotWatermarkCommitter {
     /// whereas a later LSN could skip a change the snapshot did not see.
     lsn: u64,
     dataset: String,
+    /// Set only for a rebuild requested *mid-stream*, where there is no head
+    /// stream to chain a completion hook onto. Releases the hold the request was
+    /// enqueued behind and asks the pump to reconnect, so the member is promoted
+    /// and its replay resumes.
+    ///
+    /// Later than the join path's equivalent hook, which fires when the consumer
+    /// *polls* the request rather than when it commits it — deliberately, because
+    /// the hold is what keeps the recorded position from running ahead of the
+    /// rebuild, and only the commit proves the rebuild durable.
+    ///
+    /// A rebuild that never commits leaves the member held, which is the same
+    /// conservative outcome a failed initial snapshot gets: it is not routed to
+    /// and not credited until it detaches and rejoins from scratch.
+    live_flip: Option<(Arc<SharedSource>, MemberKey)>,
 }
 
 #[async_trait]
@@ -985,6 +1146,12 @@ impl CommitChange for SnapshotWatermarkCommitter {
             slot.note_pending(self.lsn);
         }
         self.watermark_notify.notify_one();
+        // After the position is published, so a member that becomes routable cannot
+        // be credited before the position covering its rebuild exists.
+        if let Some((source, member_key)) = &self.live_flip {
+            source.ack.rebuild_finished(member_key);
+            source.restart_requested.store(true, Ordering::Release);
+        }
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -1382,6 +1549,64 @@ impl<T> MailboxSendOutcome<T> {
 struct MemberMailboxReceiver {
     shared: Arc<MemberMailbox>,
     draining: Vec<PendingItem>,
+    /// This member's echo filter, if it is a durable write-back dataset. `None`
+    /// for every other dataset, which makes `pop`'s echo-drop check a single
+    /// pointer read.
+    echo_filter: Option<EchoFilter>,
+}
+
+/// A durable write-back member's view of its own change stream: the registry
+/// that recognizes the echo of its deliveries, plus the once-per-dataset report
+/// that someone *else* is writing the same table.
+struct EchoFilter {
+    registry: Arc<XidRegistry>,
+    /// Named in the external-writer report, so an operator knows which dataset
+    /// to act on.
+    dataset_name: String,
+    /// Whether [`external_write_warning`] has already been reported for this
+    /// dataset. The receiver is owned by the single per-dataset consumer and
+    /// `pop` takes `&mut self`, so a plain `bool` needs no synchronization.
+    warned_external_write: bool,
+}
+
+impl EchoFilter {
+    fn new(registry: Arc<XidRegistry>, dataset_name: String) -> Self {
+        Self {
+            registry,
+            dataset_name,
+            warned_external_write: false,
+        }
+    }
+
+    /// The external-writer report to log for one envelope, or `None` — either no
+    /// foreign transaction reached it, or the report has already been made for
+    /// this dataset. Split out from the logging so the once-only behaviour is
+    /// asserted directly rather than through a captured subscriber.
+    fn external_write_report(&mut self, saw_foreign_txn: bool) -> Option<String> {
+        if !saw_foreign_txn || self.warned_external_write {
+            return None;
+        }
+        self.warned_external_write = true;
+        Some(external_write_warning(&self.dataset_name))
+    }
+}
+
+/// The one-time report a durable write-back dataset makes the first time a
+/// change reaches it from a transaction Spice did not issue.
+///
+/// Durable write-back delivers each committed accelerator row to the source as an
+/// unconditional `INSERT ... ON CONFLICT (pk) DO UPDATE` — it never compares
+/// against what the source currently holds — so it is safe only while the
+/// accelerator is the sole writer of the rows it delivers. A foreign transaction
+/// on the table is the only evidence the runtime ever gets that a deployment has
+/// left that regime, and it is worth saying out loud once.
+///
+/// Built here, and asserted in this module's tests, so a reword cannot silently
+/// drop the dataset name, the consequence, or the docs link.
+fn external_write_warning(dataset_name: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' received a change from a transaction Spice did not issue, so this table has a writer other than Spice and durable write-back may overwrite that writer's row on its next delivery: it upserts each committed row by primary key without comparing against the source. Write to '{dataset_name}' only through Spice, or use a different `write_mode` for its acceleration. Reported once per dataset per run. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    )
 }
 
 impl MemberMailboxReceiver {
@@ -1393,14 +1618,59 @@ impl MemberMailboxReceiver {
     }
 
     fn pop(&mut self) -> Option<std::result::Result<ChangeEnvelope, StreamError>> {
-        let item = self.draining.pop()?;
+        let mut item = self.draining.pop()?;
         self.shared.buffered_items.fetch_sub(1, Ordering::AcqRel);
         // Release exactly what the publishes contributed: an envelope's final
         // `encoded_len` is the sum of its own and every operand merged into it.
+        // Computed on the as-buffered size, before any echo-drop below — the
+        // mailbox byte budget accounts for what was admitted, not what a
+        // dataset-specific filter later discards.
         self.shared
             .buffered_bytes
             .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
         self.shared.capacity_notify.notify_one();
+        // Echo suppression, decided here rather than in the shared pump: drop
+        // every chunk of this envelope whose xid this member's own registry
+        // recognizes as one of its own write-back deliveries. `contains` is a
+        // lock-free mirror read, so this never blocks; a member with no
+        // registry (the overwhelming majority of datasets) skips straight past.
+        if let (PendingItem::Changes(pending), Some(filter)) =
+            (&mut item, self.echo_filter.as_mut())
+        {
+            let scan = pending.rows.drop_echoed(&filter.registry);
+            // A change from a transaction this dataset did not issue means the
+            // accelerator is not the only writer of this table, the one condition
+            // durable write-back cannot make safe. Report it once: every later
+            // foreign write says the same thing, and a per-envelope log would
+            // drown the stream it is describing.
+            if let Some(report) = filter.external_write_report(scan.saw_foreign_txn) {
+                tracing::warn!(dataset = %filter.dataset_name, "{report}");
+            }
+            if !scan.dropped.is_empty() {
+                // `flush_to` is this envelope's *latest* folded commit
+                // (coalescing takes the max — see `try_merge`), which can be
+                // at or after an earlier-folded dropped chunk's real commit
+                // LSN. Recording too-high an observed LSN only delays that
+                // entry's prune until the floor also reaches the later
+                // commits, never prunes it early — safe, same direction as
+                // `commit_lsn_upper_bound`'s existing best-effort tolerance.
+                //
+                // Best-effort persistence, matching every other bookkeeping
+                // write in this registry (see `set_upper_bound`): a failure is
+                // covered by GC, so it is logged there, not surfaced here.
+                // Spawned rather than awaited because `pop` drives a sync
+                // `Stream::poll_next` — `mark_commit_observed` cannot run
+                // inline without blocking it on the registry's async state.
+                let registry = Arc::clone(&filter.registry);
+                let flush_to = pending.flush_to;
+                let dropped = scan.dropped;
+                tokio::spawn(async move {
+                    for xid in dropped {
+                        registry.mark_commit_observed(xid, flush_to).await;
+                    }
+                });
+            }
+        }
         Some(item.into_stream_item())
     }
 }
@@ -1493,6 +1763,11 @@ fn member_mailbox_with_limits(
         MemberMailboxReceiver {
             shared,
             draining: Vec::new(),
+            // Set by the caller after construction for a write-back dataset
+            // (see the member registration call site); every other caller
+            // (including every test that isn't exercising echo-drop) leaves
+            // this `None`, so the filter costs one pointer read per envelope.
+            echo_filter: None,
         },
     )
 }
@@ -1524,6 +1799,13 @@ struct SharedSource {
     /// later must snapshot even if their table already sat in the publication:
     /// a fresh slot has no history for anyone.
     slot_created_fresh: AtomicBool,
+    /// How many times the slot behind this source has been replaced, so an actor
+    /// holding an observation of the *previous* slot can tell that it is stale.
+    ///
+    /// Only the pump reads it, and only to decide whether the refusal it is about
+    /// to act on still describes the slot that is there — see
+    /// [`recover_unusable_slot`].
+    slot_generation: AtomicU64,
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
@@ -1540,6 +1822,14 @@ struct SharedSource {
     /// exist only between a resume and the last member joining) instead of a
     /// lock acquisition.
     outstanding_reservations: AtomicUsize,
+    /// What the source server does on its own about this slot, as read during the
+    /// first member's setup.
+    ///
+    /// Kept here so the shutdown message can state what removes the slot without
+    /// connecting to ask. A retained slot is not dropped at shutdown, so that path
+    /// opens no connection at all — and shutdown must never wait on the source for
+    /// a log line.
+    retention_posture: Mutex<Option<retention::SlotRetentionPosture>>,
 }
 
 impl SharedSource {
@@ -1556,8 +1846,10 @@ impl SharedSource {
             watermark_notify: Arc::new(Notify::new()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
+            slot_generation: AtomicU64::new(0),
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
+            retention_posture: Mutex::new(None),
             reservations_installed: AtomicBool::new(false),
             outstanding_reservations: AtomicUsize::new(0),
         }
@@ -1645,6 +1937,7 @@ impl SharedSource {
                 dataset: member.dataset_name.clone(),
                 store: Arc::clone(&member.applied_lsn_store),
                 slot,
+                write_back_registry: member.write_back_registry.clone(),
             });
             self.watermark_notify.notify_one();
         }
@@ -1911,6 +2204,54 @@ fn get_or_create_source(key: &SourceKey, params: &ReplicationParams) -> Arc<Shar
     source
 }
 
+/// Take on, for the source as a whole, what this member's slot setup established.
+///
+/// Runs before the joining member is registered, so everything here describes the
+/// source as it was *without* it: the members already attached, and the floors
+/// already held.
+///
+/// Callers must hold [`SharedSource::setup_lock`] — `attach_member` does, which is
+/// also what keeps the replacement handling below from racing the pump's own
+/// recovery of the same slot.
+async fn apply_slot_setup(
+    source: &Arc<SharedSource>,
+    setup: &slot::SharedMemberSetup,
+    metrics: &ReplicationMetricsCollector,
+) {
+    // Whichever member set the slot up read this; keep it for the shutdown
+    // message, which has no connection of its own to ask on.
+    *lock(&source.retention_posture) = Some(setup.slot.retention_posture);
+    if setup.slot.created_fresh {
+        source.slot_created_fresh.store(true, Ordering::Release);
+    }
+    if setup.slot.consistent_lsn > 0 {
+        source.ack.seed(setup.slot.consistent_lsn);
+        metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
+    }
+    // Did this setup put a different slot under the members already streaming here?
+    // Their positions were measured against the one that was there before, and a
+    // slot created at the current WAL position cannot reach them.
+    let replaced = match setup.slot.history {
+        slot::SlotHistory::ReplacedInvalidated => true,
+        // Nothing existed to create a replacement *of* until this source has a
+        // member: the first one to arrive is what creates the slot in the ordinary
+        // case, and there is no history behind it.
+        slot::SlotHistory::CreatedFromAbsent => !source.live_members().is_empty(),
+        // `FastForwarded` discards history for every member too, but keying on it
+        // needs to be measured against two held-floor tests (#12609) that this
+        // cannot run — tracked in #13305.
+        slot::SlotHistory::Kept | slot::SlotHistory::FastForwarded => false,
+    };
+    if replaced {
+        install_replacement_slot(source, setup.slot.consistent_lsn).await;
+    }
+    // Before anything can be credited on this source, pin the floor for the
+    // published tables whose datasets have not joined yet — including, when
+    // this member is the first to arrive on a resuming slot, the ones that will
+    // join after it.
+    source.install_reservations(setup);
+}
+
 /// Register one member on the source (caller holds the setup lock):
 /// validate + publication ADD TABLE + slot create-if-first, decide whether a
 /// snapshot is needed, wire the routing channel, and start the pump if this is
@@ -1929,6 +2270,7 @@ async fn attach_member(
         metrics,
         policy,
         applied_lsn_store,
+        write_back_registry,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -1996,18 +2338,7 @@ async fn attach_member(
 
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
-    if setup.slot.created_fresh {
-        source.slot_created_fresh.store(true, Ordering::Release);
-    }
-    if setup.slot.consistent_lsn > 0 {
-        source.ack.seed(setup.slot.consistent_lsn);
-        metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
-    }
-    // Before anything can be credited on this source, pin the floor for the
-    // published tables whose datasets have not joined yet — including, when
-    // this member is the first to arrive on a resuming slot, the ones that will
-    // join after it.
-    source.install_reservations(&setup);
+    apply_slot_setup(source, &setup, &metrics).await;
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
@@ -2026,39 +2357,46 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
 
-    // Is there a gap this slot cannot supply?
-    //
-    // Computed, not inferred. The watermark records the LSN the acceleration's
-    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
-    // still stream from. A watermark older than that is a gap no stream can fill:
-    // a row deleted at the source in that window has no change event left to
-    // replay, so appending snapshot rows over the survivors would leave the
-    // deletion applied at the source and never here, in every later query.
-    //
-    // The three outcomes:
-    //
-    //   * no watermark -> this acceleration has never been loaded. A first
-    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
-    //     also every ephemeral accelerator (their store records nothing, since
-    //     they boot empty and re-snapshot every start).
-    //   * watermark, and the slot still reaches it -> resume; the WAL between the
-    //     two is still there to replay.
-    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
-    //     to the consumer, which owns the accelerator and can replace its
-    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    // How far a previous process advanced this acceleration. Whether that is a gap
+    // this slot cannot supply — and what to tell the operator when it is — is
+    // `super::rebuild_cause`'s, computed once the member is seated below. A gap
+    // the stream cannot fill is handed to the consumer, which owns the accelerator
+    // and can replace its contents atomically (see
+    // `cdc::ChangeEnvelope::history_unavailable`).
     let watermark = match applied_lsn_store.load().await {
         Ok(watermark) => watermark,
         Err(e) => {
-            // Reading it failed, so we cannot prove the gap is fillable. Treat it
-            // the same as a position belonging to another source — unusable — so
-            // the acceleration is rebuilt: a needless rebuild costs a re-read,
-            // while a wrong resume silently keeps rows the source has deleted.
+            // Reading it failed, so we cannot prove the gap is fillable — the
+            // acceleration is rebuilt: a needless rebuild costs a re-read, while a
+            // wrong resume silently keeps rows the source has deleted.
             tracing::warn!(
                 dataset = %dataset_name,
                 "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
             );
-            super::RecordedPosition::ForeignSource
+            super::RecordedPosition::Unusable(super::UnusableReason::Unreadable)
         }
+    };
+    // A recorded position ahead of the source's current WAL position cannot
+    // belong to this server's history — the source was restored or rewound since
+    // it was recorded (see `recorded_position_is_ahead_of_source`). Downgrade it
+    // BEFORE classification and seating: resuming on it would keep pre-restore
+    // rows, and seating it as the replay floor would silently suppress every
+    // legitimate post-restore change at or below it.
+    let watermark = if super::recorded_position_is_ahead_of_source(
+        &watermark,
+        setup.current_wal_lsn,
+    ) {
+        if let super::RecordedPosition::At(recorded) = &watermark {
+            tracing::warn!(
+                dataset = %dataset_name,
+                recorded_lsn = recorded.lsn,
+                current_wal_lsn = setup.current_wal_lsn,
+                "Dataset '{dataset_name}' recorded its acceleration as applied up to a position ahead of the source's current WAL position, which means the source was restored or rewound (for example from a backup or point-in-time recovery) after the position was recorded, so the acceleration will be rebuilt from the source rather than resumed — resuming would keep pre-restore rows and skip post-restore changes. See: https://spiceai.org/docs/components/data-connectors/postgres"
+            );
+        }
+        super::RecordedPosition::Unusable(super::UnusableReason::RewoundSource)
+    } else {
+        watermark
     };
     // Absence of a watermark is evidence of a gap only when the acceleration
     // could be holding rows this process did not load AND a position could have
@@ -2087,7 +2425,13 @@ async fn attach_member(
     // `register` also takes over any hold installed for this table through its rejoin
     // branch, keeping the held floor — so the replay this member is owed starts where
     // the slot resumed, not where a slot-mate was credited.
-    let (sender, receiver) = member_mailbox(params.member_channel_capacity);
+    let (sender, mut receiver) = member_mailbox(params.member_channel_capacity);
+    // This member's own echo filter, if it is a durable write-back dataset (see
+    // `MemberMailboxReceiver::pop`) — the registry is cloned here because
+    // `write_back_registry` itself is moved into `MemberHandle` below.
+    receiver.echo_filter = write_back_registry
+        .clone()
+        .map(|registry| EchoFilter::new(registry, dataset_name.clone()));
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` below.)
     metrics.set_slot_name(source.key.slot_name.clone());
@@ -2095,60 +2439,44 @@ async fn attach_member(
     source.claim_reservation(&member_key);
     let ack_slot = source.ack.slot(&member_key);
 
-    // The earliest position this member can actually be supplied from, which is *not*
-    // the earliest the slot still retains. Two distinct limits, and the later one
-    // binds:
-    //
-    //   * Postgres forwards a `START_REPLICATION` position below the slot's
-    //     `confirmed_flush_lsn` up to it ("has been already streamed, forwarding to
-    //     ..." in `CreateDecodingContext`), so once the slot has acknowledged past a
-    //     change no client can ask for it again — the WAL may still be on disk under
-    //     `restart_lsn`, but it is unreachable through this slot.
-    //   * this member's own seated floor, which a slot-mate's traffic may have
-    //     carried past the snapshot above.
-    //
-    // Comparing against `restart_lsn` alone would call an unfillable gap resumable
-    // and skip the difference silently.
+    // Emptiness licenses skipping the rebuild only when something *else* is going
+    // to load the table, hence the `snapshotting` gate. When no snapshot runs — a
+    // pre-existing slot whose publication already carries this table, or snapshots
+    // disabled outright — the rebuild is the only thing that would populate the
+    // acceleration, and skipping it would resume from the slot's position and
+    // leave every row that predates it missing for good.
+    let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
+    // The floor passed here is the one the member was *actually* seated at above,
+    // not the snapshot `setup` was built from — see the registration comment for
+    // why the difference is a silent skip rather than a rounding error.
     let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
-    let earliest_streamable_lsn = setup
-        .slot_restart_lsn
-        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
-    let rebuild_via_consumer = super::needs_rebuild(
+    let rebuild_cause = super::rebuild_cause(
         &watermark,
-        earliest_streamable_lsn,
-        !params.ephemeral_accelerator && tracks_positions,
+        setup.slot_restart_lsn,
+        setup.slot.consistent_lsn.max(seated_floor),
+        !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
     );
-
-    // Why the rebuild, in the terms the operator can act on. The four causes are
-    // genuinely different situations, and the acknowledged-past one is the easiest to
-    // mistake for a retention problem: the WAL is still on disk, but a slot cannot
-    // re-stream what it has already acknowledged.
-    let rebuild_reason = match &watermark {
-        super::RecordedPosition::Absent => {
-            "it has no recorded position, so the rows it already holds cannot be shown to be current"
-        }
-        super::RecordedPosition::ForeignSource => {
-            "the position it recorded belongs to a different source, so it does not describe these rows"
-        }
-        super::RecordedPosition::At(watermark)
-            if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
-        {
-            "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
-        }
-        super::RecordedPosition::At(_) => {
-            "the slot no longer retains the changes following the position it recorded as applied"
-        }
-    };
+    let rebuild_via_consumer = rebuild_cause.is_some();
+    // A rebuild is a full re-read nobody asked for, and which cause fired is what
+    // says whether to look at the source, the configuration, or the slot — so it
+    // is reported as a label rather than left to be recovered from log text. Set
+    // unconditionally (not only inside `if let Some`): the collector is reused
+    // across reattaches, so a clean resume must clear a cause an earlier attach
+    // left set, or the metric would keep exporting it as if this attach rebuilt.
+    metrics.set_rebuild_cause(rebuild_cause.map(super::RebuildCause::label));
 
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
     // Seeding it lets an idle member carry that position forward (see
-    // `flush_idle_watermarks`) instead of waiting for a change that may never come.
+    // `flush_idle_watermarks`) instead of waiting for a change that may never come
+    // — and, through the member's `committed` floor, keeps the coming reconnect
+    // replay from re-delivering commits the acceleration durably holds (see
+    // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
+    // write-back dataset).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
         && !rebuild_via_consumer
     {
-        slot.note_recorded(resumed.lsn);
-        slot.note_pending(resumed.lsn);
+        slot.seat_recorded(resumed.lsn);
     }
     lock(&source.members).insert(
         member_key.clone(),
@@ -2163,6 +2491,7 @@ async fn attach_member(
             ready_lag: params.ready_lag,
             applied_lsn_store: Arc::clone(&applied_lsn_store),
             watermark_notify: Arc::clone(&source.watermark_notify),
+            write_back_registry,
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -2272,7 +2601,9 @@ async fn attach_member(
                 _ => "none".to_string(),
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
-            "this acceleration will be rebuilt from the source before changes are applied: {rebuild_reason}"
+            rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
+            "this acceleration will be rebuilt from the source before changes are applied: {}",
+            rebuild_cause.map_or("", super::RebuildCause::reason)
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
@@ -2396,6 +2727,203 @@ fn connection_params_mismatch(
     None
 }
 
+/// How many times one pump will replace an invalidated slot inside
+/// [`SLOT_INVALIDATION_WINDOW`] before giving up on the source.
+const MAX_SLOT_REPLACEMENTS: usize = 3;
+/// The window [`MAX_SLOT_REPLACEMENTS`] is counted over.
+const SLOT_INVALIDATION_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Bounds automatic replacement of an unusable slot.
+///
+/// Rate-limited rather than counted for the pump's lifetime. A process running for
+/// months may legitimately be invalidated more than a handful of times — each one a
+/// genuine recovery — whereas three inside an hour says the source cannot retain
+/// enough WAL to cover this dataset, and replacing the slot again would only
+/// repeat. That distinction matters because every replacement costs a full re-read
+/// of every table on the slot, so an unbounded cycle turns a retention limit into
+/// sustained load on the source it was protecting.
+#[derive(Debug)]
+struct SlotReplacementBudget {
+    /// When each replacement inside the window happened, oldest first. Bounded by
+    /// [`MAX_SLOT_REPLACEMENTS`].
+    at: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl SlotReplacementBudget {
+    fn new() -> Self {
+        Self {
+            at: std::collections::VecDeque::with_capacity(MAX_SLOT_REPLACEMENTS),
+        }
+    }
+
+    /// Whether another replacement is within budget, recording it when it is.
+    fn admit(&mut self, now: std::time::Instant) -> bool {
+        while self
+            .at
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= SLOT_INVALIDATION_WINDOW)
+        {
+            self.at.pop_front();
+        }
+        if self.at.len() >= MAX_SLOT_REPLACEMENTS {
+            return false;
+        }
+        self.at.push_back(now);
+        true
+    }
+}
+
+/// Replace a slot that can no longer supply changes, and ask every acceleration on
+/// it to rebuild.
+///
+/// Called from the pump's connect path, which is what makes the ordering below
+/// safe: nothing routes to a member until this returns and the pump reconnects, so
+/// the rebuild request is the first thing each member sees, and the WAL that
+/// follows lands on top of it in mailbox order. This is the same ordering the join
+/// path relies on for a rebuild decided at startup — back-pressure in the member
+/// mailbox, not a wait here.
+///
+/// What the members are then owed — a rebuild each, held until its contents are
+/// durable — is [`install_replacement_slot`]'s, which the join path shares.
+///
+/// On failure returns a message describing what could not be done, for the caller
+/// to surface.
+async fn recover_unusable_slot(
+    source: &Arc<SharedSource>,
+    refused_generation: u64,
+) -> std::result::Result<(), String> {
+    // The same lock `attach_member` holds for slot DDL, which is what makes the
+    // member set stable across `install_replacement_slot` (see there) and what
+    // serializes this against a join replacing the same slot. Safe to take from the
+    // pump: `attach_member` holds it only across synchronous setup and never waits
+    // on the pump, and the pump already takes it in `try_finish_if_empty`.
+    let _setup = source.setup_lock.lock().await;
+    // The refusal describes the slot as it was when this connection ended, and a
+    // join can replace an invalidated slot during the reconnect backoff that
+    // follows — the only window in which it can, since `PostgreSQL` refuses to drop
+    // a slot an active walsender holds. That join adopts its replacement through
+    // the same path below, so replacing again would drop a healthy slot and leave
+    // every member holding *two* rebuild requests against one
+    // [`AckSlot::rebuild_pending`] flag: the first to commit would clear the hold
+    // the second still needs, and the member would be credited and its position
+    // recorded for contents that rebuild has not delivered.
+    if source.slot_generation.load(Ordering::Acquire) != refused_generation {
+        tracing::info!(
+            slot = %source.key.slot_name,
+            "the replication slot was replaced while this stream was reconnecting, and every acceleration on it was already asked to rebuild; streaming resumes on the replacement"
+        );
+        return Ok(());
+    }
+    let new_lsn = slot::replace_unusable_slot(&source.params)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    install_replacement_slot(source, new_lsn).await;
+    Ok(())
+}
+
+/// Take on a slot that replaced the one this source's positions were measured
+/// against, and which starts at `new_lsn` carrying no history.
+///
+/// Two paths put a replacement under a live source, and both owe it everything
+/// here: the pump's recovery from a stream the slot refused, and a joining member
+/// whose setup found the slot invalidated and recreated it. One function is what
+/// keeps them from drifting, because a replacement adopted without this leaves the
+/// members already streaming resuming from a position it cannot reach — and a row
+/// deleted at the source in between has no change event left to carry the
+/// deletion, so it survives in the acceleration and in every later query (#13229).
+///
+/// Each member is *held* before its request is enqueued — not routed to, never
+/// credited, floor pinned — and released only when the consumer commits the
+/// rebuild. That is load-bearing rather than tidy. [`AckTable::credit_idle`]
+/// advances a streaming member's floor to the WAL head whenever it has nothing in
+/// flight, and a queued control envelope is not in flight by that measure, so a
+/// member left streaming would be credited past the replacement's start while its
+/// rebuild was still sitting in its mailbox. [`publish_idle_positions`] would then
+/// *record* that position, and a crash in the window would resume on a watermark
+/// describing contents the acceleration never received.
+///
+/// Members' `committed` floors are otherwise left where they are. The recorded
+/// position only moves forward through the rebuild's own committer, which runs
+/// after the consumer has made those contents durable.
+///
+/// Callers must hold [`SharedSource::setup_lock`], so the member set is stable
+/// across the walk below — see [`request_rebuild_of_attached_members`].
+async fn install_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
+    // The replacement carries no history, so a member joining after this cannot
+    // resume either — it snapshots, exactly as it would on a slot this process had
+    // just created.
+    source.slot_created_fresh.store(true, Ordering::Release);
+    // Pin the shared flush at the replacement's start: the pump must not ask for a
+    // position the new slot cannot honour, and `flush_lsn` only ever raises, so the
+    // ack cannot move past it until members actually commit past it.
+    source.ack.seed(new_lsn);
+
+    request_rebuild_of_attached_members(source, new_lsn).await;
+    source.ack.reseat_held_floors(new_lsn);
+    // Last, so this reads as adopted only once every member has been asked to
+    // rebuild: the join reaches here from a stream future the consumer can drop, and
+    // publishing the new generation first would let a cancellation leave members
+    // unasked while [`recover_unusable_slot`] skipped the recovery that would have
+    // asked them.
+    source.slot_generation.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Ask every already-attached member to rebuild from the source, because the slot
+/// their recorded positions were measured against has been replaced by one that
+/// starts at `new_lsn` and carries no history.
+///
+/// Callers must hold [`SharedSource::setup_lock`], and reach this through
+/// [`install_replacement_slot`], which needs the set of attached members to be stable
+/// across the walk: a member registering between the snapshot below and the reseat
+/// that follows would be neither asked to rebuild nor reseated, and would then
+/// resume on a watermark the replacement cannot reach.
+///
+/// Ordering is carried by the member mailbox rather than by waiting here. Changes
+/// already staged for a member sit *ahead* of its request and are applied first,
+/// then the rebuild replaces the contents wholesale; that ordering matters, because
+/// a staged insert applied *after* the rebuild would resurrect a row the source has
+/// since deleted, and the replacement slot has no delete event left to correct it.
+async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn: u64) {
+    let members = source.live_members();
+    // Every member is held before *any* request is enqueued, and without an await in
+    // between. `AckTable::credit_idle` advances a streaming member's floor to the WAL
+    // head whenever it has nothing in flight, and a queued control envelope does not
+    // count as in flight — so a member still streaming would be credited, and then
+    // recorded, past contents its rebuild had not delivered. The send below can park
+    // on a full mailbox, and the pump reconnects without taking `setup_lock`, so
+    // holding as each member's turn came would leave the ones later in the walk
+    // promotable and creditable for the length of that park.
+    for (member_key, _) in &members {
+        source.ack.register(member_key, true);
+        // Claim the hold as the rebuild's, so the member's own initial-snapshot
+        // completion cannot release it out from under the rebuild.
+        source.ack.mark_rebuild_pending(member_key);
+    }
+    for (member_key, member) in members {
+        let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
+        if member.sender.send_control(envelope).await.is_some() {
+            // The consumer is gone, so there is no acceleration left to rebuild.
+            // Detaching freezes its floor, which the caller's `reseat_held_floors`
+            // then moves to the replacement — it has no history left to be owed.
+            source.ack.rebuild_finished(&member_key);
+            source.detach_member(
+                &member_key,
+                "receiver gone while replacing an unusable replication slot",
+                true,
+            );
+            continue;
+        }
+        tracing::warn!(
+            dataset = %member.dataset_name,
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            rebuild_as_of = %slot::format_lsn(new_lsn),
+            "this acceleration will be rebuilt from the source before further changes are applied: the replication slot it was streaming from was replaced, so the changes since the position it recorded as applied are no longer available to stream"
+        );
+    }
+}
+
 /// Send a fatal error to every member and terminate the source.
 async fn fatal_broadcast(source: &Arc<SharedSource>, message: String) {
     tracing::error!(
@@ -2433,6 +2961,9 @@ struct OrphanedPosition {
     dataset: String,
     store: Arc<dyn AppliedLsnStore>,
     slot: Arc<AckSlot>,
+    /// The detached member's write-back registry, so a position written for it
+    /// still prunes any echo entry the durable floor has now passed.
+    write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 /// The **only** writer of applied positions for a source.
@@ -2521,7 +3052,13 @@ async fn write_published_positions(source: &Arc<SharedSource>) {
     let orphans = std::mem::take(&mut *lock(&source.orphaned_positions));
     let mut unwritten = Vec::new();
     for orphan in orphans {
-        write_one(&orphan.dataset, &orphan.store, &orphan.slot).await;
+        write_one(
+            &orphan.dataset,
+            &orphan.store,
+            &orphan.slot,
+            orphan.write_back_registry.as_ref(),
+        )
+        .await;
         if orphan.slot.pending() > orphan.slot.recorded() {
             unwritten.push(orphan);
         }
@@ -2533,17 +3070,39 @@ async fn write_published_positions(source: &Arc<SharedSource>) {
         let Some(slot) = source.ack.slot(&member_key) else {
             continue;
         };
-        write_one(&member.dataset_name, &member.applied_lsn_store, &slot).await;
+        write_one(
+            &member.dataset_name,
+            &member.applied_lsn_store,
+            &slot,
+            member.write_back_registry.as_ref(),
+        )
+        .await;
     }
 }
 
-async fn write_one(dataset: &str, store: &Arc<dyn AppliedLsnStore>, slot: &Arc<AckSlot>) {
+async fn write_one(
+    dataset: &str,
+    store: &Arc<dyn AppliedLsnStore>,
+    slot: &Arc<AckSlot>,
+    write_back_registry: Option<&Arc<XidRegistry>>,
+) {
     let pending = slot.pending();
     if pending == 0 || pending <= slot.recorded() {
         return;
     }
     match store.save(AppliedLsn { lsn: pending }).await {
-        Ok(()) => slot.note_recorded(pending),
+        Ok(()) => {
+            slot.note_recorded(pending);
+            // The durable applied floor for this member has advanced to `pending`.
+            // Any registered write-back whose echo committed at or below it is now
+            // durably consumed and can never be replayed, so drop it — the only
+            // steady-state removal path (GC covers the rest). Persisting here is
+            // best-effort inside `prune_acked`; a failure leaves the entry for the
+            // next prune or startup GC.
+            if let Some(registry) = write_back_registry {
+                registry.prune_acked(pending).await;
+            }
+        }
         Err(e) => tracing::warn!(
             dataset = %dataset,
             "could not record how far this acceleration has been advanced (lsn={pending}); a restart before it is recorded rebuilds from the source rather than resuming: {e}"
@@ -2564,18 +3123,43 @@ fn finish_pump(source: &Arc<SharedSource>) {
     }
 }
 
-/// Drop the shared slot when the pump stops for runtime shutdown and no member
-/// needs it to survive.
+/// State what removes the shared slot, and drop it when the pump stops for runtime
+/// shutdown and no member needs it to survive.
 ///
 /// Reading the source's own params is authoritative for every member: a member
 /// whose accelerator durability disagrees is rejected at join time with
 /// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
 /// this value.
 ///
-/// Best-effort and time-bounded — shutdown never blocks on the source, and a
-/// surviving slot costs retained WAL, not correctness.
+/// The drop is best-effort and time-bounded — shutdown never blocks on the source,
+/// and a surviving slot costs retained WAL, not correctness.
+///
+/// The lifetime message is repeated here because this is the moment it is
+/// actionable: at creation an operator can do least about the slot, and by the time
+/// Spice is being decommissioned — which is exactly when an abandoned slot starts
+/// costing disk — the creation-time line is behind log rotation. It is emitted even
+/// for a slot about to be dropped, precisely because that drop is best-effort: an
+/// unreachable source or a missing privilege leaves the slot behind, and the
+/// operator then needs to know what it is and how to find it.
 async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
-    if source.params.slot_is_disposable() {
+    let disposable = source.params.slot_is_disposable();
+    // A source whose first member never finished setup has no posture recorded.
+    // Assume the server does nothing for us rather than claim a timeout that may
+    // not exist: the resulting message tells the operator how to find and drop
+    // the slot, which is true regardless.
+    let recorded = *lock(&source.retention_posture);
+    let posture = recorded.unwrap_or(retention::SlotRetentionPosture {
+        server_version_num: 0,
+        idle_timeout_seconds: None,
+    });
+    tracing::info!(
+        "{}",
+        retention::slot_lifetime_message(
+            &source.key.slot_name,
+            retention::SlotRemoval::resolve(disposable, posture),
+        )
+    );
+    if disposable {
         slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
@@ -2659,6 +3243,17 @@ async fn run_pump(source: Arc<SharedSource>) {
     };
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Declared outside the reconnect loop so the bound is over the pump's life,
+    // not per attempt.
+    let mut slot_replacements = SlotReplacementBudget::new();
+    // Set to the slot generation *this connection* was streaming when it reports the
+    // slot unusable, and acted on at the top of the reconnect loop — see there for
+    // why the two are separated, and `recover_unusable_slot` for why the generation
+    // rather than a bare flag. Read at connect rather than when the refusal is
+    // dequeued: the error can sit in the client's queue while a join replaces the
+    // slot, and tagging it with the generation of the replacement would make a stale
+    // refusal look current and drop a healthy slot.
+    let mut unusable_slot_generation: Option<u64> = None;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
@@ -2696,17 +3291,66 @@ async fn run_pump(source: Arc<SharedSource>) {
             drop_slot_if_ephemeral(&source).await;
             return;
         }
+        // Replace a slot the previous connection reported unusable, before building
+        // a config that would ask the same dead slot for changes.
+        //
+        // Deliberately here rather than where the refusal surfaces.
+        // `ReplicationClient::connect` only spawns a worker — `START_REPLICATION`
+        // runs inside it, so the refusal always arrives through `recv`, with that
+        // connection still live. `PostgreSQL` refuses to drop a slot an active
+        // walsender holds, and the client is dropped when the recv loop exits, so
+        // this is the first point at which the drop can succeed.
+        if let Some(refused_generation) = unusable_slot_generation.take() {
+            disconnect_at.get_or_insert_with(std::time::Instant::now);
+            // The budget counts slot replacements *observed* in the window, not the
+            // ones this path performed: a refusal `recover_unusable_slot` skips is
+            // one a join already replaced the slot for, and a source burning through
+            // replacements is the condition the budget exists to stop either way.
+            if slot_replacements.admit(std::time::Instant::now()) {
+                if let Err(reason) = recover_unusable_slot(&source, refused_generation).await {
+                    fatal_broadcast(
+                        &source,
+                        format!(
+                            "Failed to replace PostgreSQL replication slot `{slot_name}` after the server stopped streaming from it: {reason}. The slot cannot supply changes and cannot be replaced, so this dataset has no source of changes. Check that the replication user may drop and create replication slots, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres"
+                        ),
+                    )
+                    .await;
+                    break 'reconnect;
+                }
+                backoff.reset();
+            } else {
+                fatal_broadcast(
+                    &source,
+                    format!(
+                        "Failed to stream changes from PostgreSQL replication slot `{slot_name}`: it has stopped supplying changes {MAX_SLOT_REPLACEMENTS} times within {window_minutes} minutes, so the source is not retaining enough WAL to cover this dataset and replacing the slot again would only repeat. Raise max_slot_wal_keep_size on the source, or reduce replication lag, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres",
+                        window_minutes = SLOT_INVALIDATION_WINDOW.as_secs() / 60,
+                    ),
+                )
+                .await;
+                break 'reconnect;
+            }
+        }
         source.reap_closed_members();
         if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
             tracing::info!(
                 slot = %slot_name,
                 "all members detached; shutting down shared replication stream"
             );
+            // Same release as a runtime shutdown. This source is finished and about
+            // to leave the registry, so nothing later can do it: without this, a
+            // slot whose acceleration does not survive a restart keeps retaining WAL
+            // on the source from the moment its dataset is removed, which is exactly
+            // what the lifetime message promises it will not do.
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         // Joins that happened before this (re)connect are picked up by it.
         source.restart_requested.store(false, Ordering::Release);
 
+        // The slot epoch this connection streams, read before the config is built
+        // from it: a replacement installed after this point is one this connection
+        // never saw, and a refusal it reports must not be attributed to it.
+        let connection_generation = source.slot_generation.load(Ordering::Acquire);
         let config = client::build_replication_config(
             &params,
             &slot_name,
@@ -2772,6 +3416,12 @@ async fn run_pump(source: Arc<SharedSource>) {
         // consumer decodes + builds them (see `PgChangeRows`).
         let mut txn: TxnBuffer = TxnBuffer::default();
         let mut txn_open = false;
+        // The `xid` of the open transaction, captured at its Begin and held across
+        // the transaction exactly like `txn_open` (Commit carries no xid). At Commit
+        // this is matched against each member's write-back registry to drop the
+        // echo of that member's own delivery. A fresh binding per connection resets
+        // it on reconnect, and it is cleared at every Commit.
+        let mut current_txn_xid: Option<u32> = None;
         // Unpublished envelopes, one per member, folding consecutive commits for
         // the same table. Dropped on reconnect: a held envelope was `deliver`ed
         // but never `commit`ted, so it pins this member's ack floor and the slot
@@ -2824,6 +3474,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     slot = %slot_name,
                     "all members detached; shutting down shared replication stream"
                 );
+                // Drop the connection first: `PostgreSQL` refuses to drop a slot an
+                // active walsender still holds, and this exit is the one that still
+                // has one open.
+                drop(client);
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             source.release_unclaimed_reservations(params.unclaimed_reservation_grace);
@@ -2900,6 +3555,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                 Acquired::CleanClose => break 'recv,
                 Acquired::RecvError(e) => {
                     source.for_each_member_metrics(ReplicationMetricsCollector::inc_recv_error);
+                    // The slot can no longer supply changes. Note it and break to
+                    // the reconnect loop, which replaces it *before* connecting
+                    // again — the replacement cannot happen here, because this
+                    // connection's walsender must be gone first and `client` is
+                    // dropped when this loop exits. Reconnecting without replacing
+                    // would ask the same dead slot for changes forever.
+                    if resilience::is_slot_unusable(&e) {
+                        unusable_slot_generation = Some(connection_generation);
+                        source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
+                        break 'recv;
+                    }
                     if resilience::is_transient_pgwire(&e) {
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         reconnect_attempts = reconnect_attempts.saturating_add(1);
@@ -2934,9 +3600,12 @@ async fn run_pump(source: Arc<SharedSource>) {
             // downstream back-pressure is not our decode cost.
             let mut send_wait_us: u64 = 0;
             match event {
-                ReplicationEvent::Begin { .. } => {
+                ReplicationEvent::Begin { xid, .. } => {
                     txn_open = true;
                     txn.clear();
+                    // Held until this transaction's Commit, where it selects the
+                    // arbitrated member whose echo is dropped.
+                    current_txn_xid = Some(xid);
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
@@ -3004,6 +3673,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     ..
                 } => {
                     txn_open = false;
+                    let txn_xid = current_txn_xid.take();
                     send_wait_us = deliver_commit(
                         &source,
                         &mut eager_hold,
@@ -3015,6 +3685,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             end_lsn: end_lsn.0,
                             commit_time_micros,
                         },
+                        txn_xid,
                     )
                     .await;
                     // The ack floor + freshness watermark are published to every
@@ -3235,6 +3906,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         member.sender.close();
     }
     finish_pump(&source);
+    // A slot left behind by a source that died is the mystery slot this is all meant
+    // to prevent, so release it on this path too. The connection is already gone —
+    // it lived inside the reconnect loop.
+    drop_slot_if_ephemeral(&source).await;
 }
 
 /// Validate a (re)decoded Relation against its subscribed dataset and (re)build
@@ -3677,6 +4352,7 @@ async fn flush_expired_eager_envelopes(
 /// back-pressure is not misattributed to decode cost (it is carried per dataset
 /// by `member_send_wait_micros_total`). Returns ~0 whenever every member's
 /// mailbox had spare capacity.
+#[expect(clippy::too_many_arguments)]
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     eager_hold: &mut EagerHold,
@@ -3685,6 +4361,7 @@ async fn deliver_commit(
     routes: &RouteMap,
     txn: TxnBuffer,
     boundary: CommitBoundary,
+    current_txn_xid: Option<u32>,
 ) -> u64 {
     let commit_time = client::pg_epoch_to_system_time(boundary.commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -3755,12 +4432,29 @@ async fn deliver_commit(
         // Build against the member's *working* schema (registered schema plus any
         // adopted mid-stream widening — see `handle_relation`), not the fixed
         // registered schema, so an adopted column reaches the accelerator.
+        //
+        // Echo suppression is tagged, not decided, here: every relation's changes
+        // are always forwarded, tagged with this commit's xid. Whether a tagged
+        // chunk is actually this member's own write-back echo is decided by
+        // `MemberMailboxReceiver::pop` against that member's own registry, off
+        // this shared per-commit loop — a member with no registry never matches,
+        // so a non-write-back dataset pays only the tag itself (an `Option<u32>`
+        // copy), never a lookup.
         let rows = PgChangeRows::new(
             Arc::clone(working_schema),
             Arc::clone(rel),
             raw,
             commit_ts_ms,
         );
+        // Tag only a member that holds a registry: one without it can never match
+        // an xid, so tagging would buy nothing and cost an allocation per relation
+        // per commit. A slot with no write-back member therefore does no xid
+        // bookkeeping at all, and on a mixed slot only the write-back table pays.
+        let rows = if member.write_back_registry.is_some() {
+            rows.with_source_xid(current_txn_xid)
+        } else {
+            rows
+        };
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
         // its source commit time is within the member's `ready_lag` of now, i.e.
@@ -3894,6 +4588,7 @@ mod tests {
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
+            acceleration: crate::cdc::AccelerationContents::Unknown,
             status_interval: std::time::Duration::from_secs(5),
             watermark_flush_interval: std::time::Duration::from_secs(30),
             bootstrap_batch_size: 8192,
@@ -3914,18 +4609,117 @@ mod tests {
     ) -> slot::SharedMemberSetup {
         slot::SharedMemberSetup {
             slot_restart_lsn: Some(0),
+            // Far ahead of every LSN these tests use, so no test watermark ever
+            // reads as a rewound source (see `recorded_position_is_ahead_of_source`).
+            current_wal_lsn: u64::MAX,
             slot: slot::SlotInfo {
                 slot_name: "slot".to_string(),
                 publication_name: "pub".to_string(),
                 consistent_lsn,
                 snapshot_name: None,
                 created_fresh,
+                history: slot::SlotHistory::Kept,
                 generated_columns: vec![],
+                retention_posture: retention::SlotRetentionPosture {
+                    server_version_num: 170_000,
+                    idle_timeout_seconds: None,
+                },
             },
             table_added: false,
             generated_columns: vec![],
             publication_tables: tables.iter().map(|t| key(t)).collect(),
         }
+    }
+
+    /// A member can be mid-initial-snapshot when the slot is replaced, and then two
+    /// independent things hold it: its snapshot, and its rebuild. They share one
+    /// [`SNAPSHOTTING`] bit, so whichever finishes first would release the other's
+    /// hold — and a member released before its rebuild commits is credited to the
+    /// WAL head by `credit_idle` and then recorded there by
+    /// `publish_idle_positions`, for rows the rebuild has not delivered.
+    #[test]
+    fn a_snapshot_finishing_does_not_release_a_pending_rebuilds_hold() {
+        let ack = AckTable::default();
+        let member = key("orders");
+
+        // The member joins and starts its initial snapshot: held.
+        ack.register(&member, true);
+        assert!(!ack.is_streaming(&member));
+
+        // The slot is replaced mid-snapshot, so the member is also asked to rebuild.
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        // Its snapshot completes. That must NOT release the hold, because the
+        // rebuild's contents are not in the acceleration yet.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            !ack.is_streaming(&member),
+            "the snapshot's completion released the rebuild's hold: the member is routable and \
+             creditable while the rows its rebuild will deliver are still in its mailbox"
+        );
+
+        // Only the rebuild's own commit releases it.
+        ack.rebuild_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            ack.is_streaming(&member),
+            "a committed rebuild must release the hold, or the member never streams again"
+        );
+    }
+
+    /// The reverse order has to work too: nothing may leave a member held with no
+    /// remaining path to release it.
+    #[test]
+    fn a_rebuild_finishing_first_still_lets_the_member_stream() {
+        let ack = AckTable::default();
+        let member = key("orders");
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        ack.rebuild_finished(&member);
+        // A late snapshot hook now finds no rebuild pending and releases a hold that
+        // is already given up — a no-op, not a re-hold.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(ack.is_streaming(&member));
+    }
+
+    /// Every replacement costs a full re-read of every table on the slot, so the
+    /// bound is what keeps a source that cannot retain enough WAL from turning
+    /// into sustained load on itself.
+    #[test]
+    fn slot_replacement_is_bounded_per_window_not_per_lifetime() {
+        let mut budget = SlotReplacementBudget::new();
+        let start = std::time::Instant::now();
+        for n in 0..MAX_SLOT_REPLACEMENTS {
+            assert!(budget.admit(start), "replacement {n} is within budget");
+        }
+        assert!(
+            !budget.admit(start),
+            "the replacement past the bound must be refused rather than rebuilding on a cycle"
+        );
+
+        // Once the window has passed, the source has demonstrably been healthy
+        // across it, so a later invalidation is a fresh recovery rather than a
+        // continuation. Counting for the pump's lifetime instead would eventually
+        // fail a long-running process for being long-running.
+        let later = start + SLOT_INVALIDATION_WINDOW;
+        assert!(budget.admit(later));
+
+        // Entries expiring one at a time must free exactly one slot, not reset the
+        // budget: a source invalidating every 20 minutes stays bounded.
+        let mut budget = SlotReplacementBudget::new();
+        for n in 0..MAX_SLOT_REPLACEMENTS {
+            assert!(budget.admit(start + std::time::Duration::from_mins(n as u64)));
+        }
+        let first_expired = start + SLOT_INVALIDATION_WINDOW;
+        assert!(budget.admit(first_expired), "the oldest entry has expired");
+        assert!(
+            !budget.admit(first_expired),
+            "only the expired entry was freed"
+        );
     }
 
     /// The two slot lifetimes must render as distinguishable prose -- the
@@ -4032,7 +4826,9 @@ mod tests {
     ) -> (Arc<SharedSource>, Vec<MemberProbe>) {
         let source_key = SourceKey::from_params(&test_params());
         let source = Arc::new(SharedSource::new(source_key, test_params()));
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
+        // One column rather than none: a zero-row envelope carries a struct array,
+        // which cannot be built over zero fields. See [`TINY_SCHEMA`].
+        let schema = tiny_schema();
         let mut probes = Vec::with_capacity(n);
         for i in 0..n {
             let member_key = key(&format!("t{i}"));
@@ -4051,6 +4847,7 @@ mod tests {
                     sender,
                     metrics: Arc::clone(&metrics),
                     ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: None,
                 }),
             );
             probes.push((member_key, metrics, receiver));
@@ -4090,6 +4887,7 @@ mod tests {
                 sender,
                 metrics: ReplicationMetricsCollector::new(),
                 ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: None,
             }),
         );
         source.ack.register(&member_key, false);
@@ -4210,6 +5008,7 @@ mod tests {
                     sender,
                     metrics: ReplicationMetricsCollector::new(),
                     ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: None,
                 }),
             );
             source.ack.register(&member_key, false);
@@ -5364,6 +6163,228 @@ mod tests {
         );
     }
 
+    /// Two datasets share a slot. The server invalidates it, and the *second*
+    /// dataset's join is what notices — its setup drops the invalidated slot and
+    /// creates a replacement at the current WAL position.
+    ///
+    /// The first dataset is still attached, and its recorded position was measured
+    /// against the slot that just went away. Nothing in the replacement reaches it:
+    /// a row deleted at the source in between has no change event left to carry the
+    /// deletion, so an acceleration allowed to resume keeps that row in every later
+    /// query. The join owes it exactly what the pump's own recovery owes it — a
+    /// rebuild from the source, and a hold until that rebuild is durable (#13229).
+    #[tokio::test]
+    async fn a_join_that_replaced_the_slot_rebuilds_the_members_already_attached() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+        // A published table whose dataset has not joined, holding the floor at the
+        // point the old slot resumed from.
+        source.ack.reserve(&key("unjoined"), 100);
+
+        let mut setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
+        setup.slot.history = slot::SlotHistory::ReplacedInvalidated;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        // The pump's next connect promotes whatever is ready. The members asked to
+        // rebuild must not be among them: a promoted member is credited to the WAL
+        // head by `credit_idle` and recorded there, for contents its rebuild has not
+        // delivered.
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            // The request is enqueued before the join returns, so it is already
+            // there — polled rather than awaited so a missing one fails here
+            // instead of hanging on a wait that can never finish.
+            let envelope = futures::FutureExt::now_or_never(rx.next())
+                .expect("each attached member is asked to rebuild before the join returns")
+                .expect("the member's mailbox is open")
+                .expect("a valid rebuild request");
+            assert!(
+                envelope.history_unavailable(),
+                "the member must be asked to replace its contents from the source, not to apply \
+                 anything onto them"
+            );
+            assert!(
+                !source.ack.is_streaming(member_key),
+                "a member with a rebuild outstanding must stay held, so nothing credits it past \
+                 contents the rebuild has not delivered"
+            );
+            assert_eq!(
+                source.ack.committed(member_key),
+                100,
+                "an attached member's floor moves only through its rebuild's own committer"
+            );
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "one rebuild per member: a second request would re-read the whole table"
+            );
+        }
+
+        assert_eq!(
+            source.ack.committed(&key("unjoined")),
+            500,
+            "the replacement has no changes below its own start for an unjoined table to be owed, \
+             so a held floor left below it would pin the slot's acknowledgement there for good"
+        );
+        assert_eq!(
+            source.ack.flush_lsn(),
+            500,
+            "the slot acks the replacement's start"
+        );
+        assert!(
+            source.slot_created_fresh.load(Ordering::Acquire),
+            "a dataset joining after this cannot resume from the replacement either"
+        );
+    }
+
+    /// The counterpart: a slot that kept its history must leave the members already
+    /// attached alone, and `created_fresh` cannot be the signal that tells the two
+    /// apart — it is also true where nothing was discarded (a slot that exists but
+    /// has never been acknowledged, and the fast-forward for a re-bootstrap).
+    ///
+    /// Rebuilding on it moves floors that are still owed their changes: it regressed
+    /// `a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed` and
+    /// `a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_changes`
+    /// (#12609) when it was tried. This differs from the test above by the discard
+    /// signal alone.
+    #[tokio::test]
+    async fn a_join_on_a_slot_that_kept_its_history_leaves_attached_members_alone() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+        source.ack.reserve(&key("unjoined"), 100);
+
+        let setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
+        assert!(
+            setup.slot.created_fresh && setup.slot.history == slot::SlotHistory::Kept,
+            "the outcome under test is a fresh-looking slot that discarded nothing"
+        );
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "nothing was discarded, so no attached member is owed a rebuild"
+            );
+            assert!(
+                source.ack.is_streaming(member_key),
+                "an attached member must keep streaming when the slot kept its history"
+            );
+            assert_eq!(source.ack.committed(member_key), 100);
+        }
+        assert_eq!(
+            source.ack.committed(&key("unjoined")),
+            100,
+            "the hold for an unjoined table still covers changes nobody has consumed"
+        );
+    }
+
+    /// The same replacement by a different route: an operator drops the slot while
+    /// the pump is between connections — the only time `PostgreSQL` lets them — and
+    /// the next dataset to join finds no slot and creates one.
+    ///
+    /// Nothing about that outcome says "invalidated", but the members already
+    /// streaming are in exactly the position they are after an invalidated slot is
+    /// replaced: their recorded positions were measured against a slot that is gone,
+    /// and the one created in its place starts at the current WAL position.
+    #[tokio::test]
+    async fn a_join_that_created_a_slot_under_members_already_attached_rebuilds_them() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+
+        let mut setup = shared_setup(500, true, &["t0", "t1"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_some(),
+                "a member streaming from the slot that was replaced must be rebuilt"
+            );
+            assert!(!source.ack.is_streaming(member_key));
+        }
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            1,
+            "the slot under this source was replaced, so observations of the old one are stale"
+        );
+    }
+
+    /// The ordinary first start, which reaches the same outcome and must do none of
+    /// it: creating a slot because none existed replaces nothing when nobody was
+    /// streaming from one.
+    #[tokio::test]
+    async fn the_first_member_to_create_a_slot_replaces_nothing() {
+        let (source, _) = test_source_with_members(0);
+
+        let mut setup = shared_setup(500, true, &["t0"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            0,
+            "no slot was replaced, so nothing any actor observed has been retired"
+        );
+    }
+
+    /// The pump latches a refusal against the slot it was streaming, then waits out
+    /// its reconnect backoff — the one window in which a joining dataset can replace
+    /// that slot, because `PostgreSQL` will not drop one an active walsender holds.
+    ///
+    /// By the time the pump acts, the slot its refusal describes is gone and every
+    /// member has already been asked to rebuild. Replacing again would drop a
+    /// healthy slot and leave each member holding two rebuild requests against one
+    /// `rebuild_pending` flag, so the first to commit would release the hold the
+    /// second still needs — crediting the member, and recording its position, for
+    /// contents that rebuild has not delivered.
+    #[tokio::test]
+    async fn a_refusal_of_an_already_replaced_slot_does_not_replace_it_again() {
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _, rx) = &mut probes[0];
+        source.ack.register(member_key, false);
+        source.ack.commit(member_key, 100);
+        source.ack.promote_ready_members();
+
+        // What the pump holds: the slot generation as of the connection that was
+        // refused.
+        let refused_generation = source.slot_generation.load(Ordering::Acquire);
+
+        // A join replaces the slot and adopts the replacement, which is what asks
+        // this member to rebuild.
+        install_replacement_slot(&source, 500).await;
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_some(),
+            "the join's replacement is what asks the member to rebuild"
+        );
+
+        recover_unusable_slot(&source, refused_generation)
+            .await
+            .expect("a refusal of a slot that is already gone is not a failure");
+
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_none(),
+            "the member must not be asked to rebuild a second time for one replacement"
+        );
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            refused_generation + 1,
+            "one replacement happened, so the generation moved exactly once"
+        );
+    }
+
     /// A published table no dataset ever subscribes to would pin WAL for the
     /// whole slot forever. Releasing its hold (done only once the table is out
     /// of the publication) lets the floor advance again.
@@ -5751,6 +6772,711 @@ mod tests {
             ack.flush_lsn(),
             final_committed,
             "floor converged to the member's committed"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Echo-drop filter (`deliver_commit` with a write-back registry) — #13348.
+    // ---------------------------------------------------------------------
+
+    /// In-memory [`BlobCheckpointStore`] backing an [`XidRegistry`] under test.
+    #[derive(Default)]
+    struct EchoFakeStore {
+        data: ParkingMutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl runtime_checkpoint_api::BlobCheckpointStore for EchoFakeStore {
+        async fn get(
+            &self,
+        ) -> std::result::Result<
+            Option<runtime_checkpoint_api::BlobCheckpoint>,
+            runtime_checkpoint_api::CheckpointError,
+        > {
+            Ok(self
+                .data
+                .lock()
+                .clone()
+                .map(|data| runtime_checkpoint_api::BlobCheckpoint {
+                    data,
+                    updated_at: None,
+                }))
+        }
+
+        async fn upsert(
+            &self,
+            data: &str,
+        ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+            *self.data.lock() = Some(data.to_string());
+            Ok(())
+        }
+    }
+
+    /// A registry holding `xid` as an outstanding write-back transaction. The low
+    /// 32 bits are what the stream carries, so a `u32` promoted to `u64` matches.
+    async fn registry_with_xid(xid: u32) -> Arc<XidRegistry> {
+        let registry = XidRegistry::load(
+            Arc::new(EchoFakeStore::default()),
+            "localhost:5432/db/public.t0".to_string(),
+            "t0".to_string(),
+        )
+        .await
+        .expect("registry loads from an empty store");
+        registry
+            .register(u64::from(xid))
+            .await
+            .expect("register the write-back xid");
+        registry
+    }
+
+    /// Hand-built pgoutput `Relation` message: one key `id` `int4` column, matching
+    /// [`tiny_schema`]. Same wire layout the decoder's own fixtures use.
+    fn relation_msg(relation_id: u32, table: &str) -> Bytes {
+        let mut out = vec![b'R'];
+        out.extend_from_slice(&relation_id.to_be_bytes());
+        out.extend_from_slice(b"public\0");
+        out.extend_from_slice(table.as_bytes());
+        out.push(0);
+        out.push(b'd');
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.push(0x01);
+        out.extend_from_slice(b"id\0");
+        out.extend_from_slice(&23u32.to_be_bytes());
+        out.extend_from_slice(&(-1i32).to_be_bytes());
+        Bytes::from(out)
+    }
+
+    /// Hand-built pgoutput `Insert` message with a single text `id` value.
+    fn insert_msg(relation_id: u32, value: &str) -> Bytes {
+        let mut out = vec![b'I'];
+        out.extend_from_slice(&relation_id.to_be_bytes());
+        out.push(b'N');
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.push(b't');
+        out.extend_from_slice(
+            &u32::try_from(value.len())
+                .expect("value fits u32")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(value.as_bytes());
+        Bytes::from(out)
+    }
+
+    /// A two-member source for the echo-drop tests: `t0` (relation 100, carrying
+    /// `t0_registry`) and `t1` (relation 101, never a write-back target). Both are
+    /// promoted to streaming, their relations decoded into `decoder`, and their
+    /// routes built. Returns the source, decoder, routes, and the two members'
+    /// mailbox receivers in `[t0, t1]` order.
+    fn echo_scenario(
+        t0_registry: Option<Arc<XidRegistry>>,
+    ) -> (
+        Arc<SharedSource>,
+        pgoutput::Decoder,
+        RouteMap,
+        Vec<MemberMailboxReceiver>,
+    ) {
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let schema = tiny_schema();
+        let mut receivers = Vec::new();
+        for (table, registry) in [("t0", t0_registry), ("t1", None)] {
+            let member_key = key(table);
+            let (sender, mut receiver) = member_mailbox(8);
+            // The echo-drop decision now lives on the receiver (see
+            // `MemberMailboxReceiver::pop`), so the test's registry must be
+            // attached here too, matching the real member-registration path.
+            receiver.echo_filter = registry
+                .clone()
+                .map(|registry| EchoFilter::new(registry, table.to_string()));
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
+                    dataset_name: table.to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_keys: vec!["id".into()],
+                    generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::Block,
+                    sender,
+                    metrics: ReplicationMetricsCollector::new(),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: registry,
+                }),
+            );
+            source.ack.register(&member_key, false);
+            receivers.push(receiver);
+        }
+        source.ack.promote_ready_members();
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        for (relation_id, table) in [(100u32, "t0"), (101u32, "t1")] {
+            decoder
+                .decode(relation_msg(relation_id, table))
+                .expect("decode relation");
+            let member_key = key(table);
+            let member = source.member(&member_key).expect("member present");
+            let slot = source.ack.slot(&member_key).expect("ack slot present");
+            routes.insert(
+                relation_id,
+                Route {
+                    key: member_key,
+                    member,
+                    slot,
+                    working_schema: Arc::clone(&schema),
+                },
+            );
+        }
+        (source, decoder, routes, receivers)
+    }
+
+    /// Coalescing limits with the eager hold disabled, so `deliver_commit`
+    /// publishes each envelope straight to its mailbox and a test can read it
+    /// without driving the pump's age-based flush.
+    fn immediate_eager_settings() -> EagerSettings {
+        eager_settings(CoalescingLimits {
+            max_envelope_age: std::time::Duration::ZERO,
+            eager_max_rows: 1024,
+            backpressure_max_rows: 1024,
+            max_mailbox_bytes: usize::MAX,
+        })
+    }
+
+    /// Run one commit through `deliver_commit` with a fresh (empty) eager hold.
+    async fn deliver_one_commit(
+        source: &Arc<SharedSource>,
+        decoder: &pgoutput::Decoder,
+        routes: &RouteMap,
+        txn: TxnBuffer,
+        end_lsn: u64,
+        xid: Option<u32>,
+    ) {
+        let mut hold = EagerHold::default();
+        deliver_commit(
+            source,
+            &mut hold,
+            immediate_eager_settings(),
+            decoder,
+            routes,
+            txn,
+            CommitBoundary {
+                end_lsn,
+                commit_time_micros: 0,
+            },
+            xid,
+        )
+        .await;
+    }
+
+    fn txn_with(entries: &[(RelationId, &str)]) -> TxnBuffer {
+        let mut txn = TxnBuffer::default();
+        for &(relation_id, value) in entries {
+            txn.entry(relation_id)
+                .or_default()
+                .push(insert_msg(relation_id, value));
+        }
+        txn
+    }
+
+    /// A registered xid drops only the arbitrated member's changes; a second
+    /// member's changes in the same transaction are delivered intact.
+    #[tokio::test]
+    async fn registered_xid_drops_arbitrated_relation_and_delivers_others() {
+        let xid = 4242u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+        let end_lsn = 900u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1"), (101, "2")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // t1 (no registry) delivers its one change unchanged.
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("t1 envelope is not an error");
+        assert_eq!(
+            t1.num_rows_hint(),
+            1,
+            "the non-arbitrated change is delivered"
+        );
+
+        // t0 (arbitrated) delivers a zero-row ack instead of its dropped echo, and
+        // that ack carries the commit LSN forward.
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("t0 ack envelope is not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            0,
+            "the echo is dropped; only a zero-row ack is sent"
+        );
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        assert_eq!(
+            t0_slot.delivered(),
+            end_lsn,
+            "the ack staged the commit LSN"
+        );
+        t0.commit().await.expect("commit the zero-row ack");
+        assert_eq!(
+            t0_slot.committed(),
+            end_lsn,
+            "committing the ack advances the arbitrated member's floor"
+        );
+    }
+
+    /// A registry-bearing member that receives a transaction it did *not* write
+    /// back delivers every row unchanged. Regression test for #13350: an earlier
+    /// `drop_echoed` drained the chunk buffers up front and only restored them
+    /// when something was echoed, so a normal (non-echo) transaction on a
+    /// write-back dataset lost all of its CDC rows.
+    #[tokio::test]
+    async fn unregistered_xid_delivers_all_rows_on_write_back_member() {
+        // t0 carries a registry, but for a *different* transaction than the one
+        // delivered, so the delivered transaction is not an echo.
+        let registered_xid = 4242u32;
+        let foreign_xid = 7777u32;
+        let registry = registry_with_xid(registered_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            900,
+            Some(foreign_xid),
+        )
+        .await;
+
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("t0 envelope is not an error");
+        // Built, not hinted. `num_rows_hint` is an estimate precomputed beside
+        // the buffered chunks, so it keeps claiming a row after the chunks have
+        // been dropped — the exact shape of the regression this test names. Only
+        // the built batch proves the change survived the filter.
+        assert_eq!(
+            t0.change_batch()
+                .expect("the surviving change builds")
+                .record
+                .num_rows(),
+            1,
+            "a transaction this member did not write back is delivered unchanged"
+        );
+        assert!(
+            !registry.contains(foreign_xid),
+            "the foreign transaction was never a registry member"
+        );
+    }
+
+    /// A transaction that is *only* the arbitrated member's echo still advances its
+    /// watermark via the zero-row ack — a filtered echo is real source progress.
+    #[tokio::test]
+    async fn filtered_empty_transaction_advances_watermark() {
+        let xid = 77u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+        let end_lsn = 500u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(
+            ack.num_rows_hint(),
+            0,
+            "a filtered-empty txn delivers no rows"
+        );
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        assert_eq!(
+            t0_slot.delivered(),
+            end_lsn,
+            "flush_to is the commit end LSN"
+        );
+        ack.commit().await.expect("commit the ack");
+        assert_eq!(t0_slot.committed(), end_lsn, "the watermark advances");
+    }
+
+    /// With no registry on the member, `deliver_commit` behaves exactly as before:
+    /// every relation's changes are delivered, and no zero-row ack is produced.
+    #[tokio::test]
+    async fn absent_registry_delivers_every_change() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1"), (101, "2")]),
+            700,
+            // An xid is present, but no member registers one, so nothing matches.
+            Some(4242),
+        )
+        .await;
+
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "no registry means no filtering for t0"
+        );
+        assert_eq!(t1.num_rows_hint(), 1, "t1 delivers as usual");
+    }
+
+    /// The report is made on the first foreign transaction and never again, and
+    /// it carries the three things an operator acts on: which dataset, what
+    /// delivery may do to the other writer's row, and where to read more.
+    /// Asserted on the string so a reword cannot quietly drop one.
+    #[tokio::test]
+    async fn an_external_write_is_reported_once_and_names_the_dataset() {
+        // The registry's contents are irrelevant here — this asserts only the
+        // once-only report and its wording.
+        let mut filter = EchoFilter::new(registry_with_xid(1).await, "orders_wb".to_string());
+
+        assert!(
+            filter.external_write_report(false).is_none(),
+            "an envelope with no foreign transaction reports nothing"
+        );
+
+        let report = filter
+            .external_write_report(true)
+            .expect("the first foreign transaction is reported");
+        assert!(
+            report.contains("'orders_wb'"),
+            "names the dataset: {report}"
+        );
+        assert!(
+            report.contains("overwrite"),
+            "states what delivery may do to the other writer's row: {report}"
+        );
+        assert!(
+            report.contains("https://spiceai.org/docs/"),
+            "links the docs: {report}"
+        );
+        assert!(!report.contains('\n'), "stays on a single line: {report}");
+
+        assert!(
+            filter.external_write_report(true).is_none(),
+            "every later foreign transaction says the same thing and is not repeated"
+        );
+    }
+
+    /// A transaction Spice did not issue is reported: the write-back table has a
+    /// second writer, the one condition the feature cannot make safe. (That such
+    /// a transaction is also *delivered* is
+    /// `unregistered_xid_delivers_all_rows_on_write_back_member`.)
+    #[tokio::test]
+    async fn a_foreign_transaction_is_reported() {
+        let registry = registry_with_xid(11).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            800,
+            Some(22),
+        )
+        .await;
+
+        receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert!(
+            receivers[0]
+                .echo_filter
+                .as_ref()
+                .expect("t0 has an echo filter")
+                .warned_external_write,
+            "the external writer is reported"
+        );
+    }
+
+    /// A dataset's own write-back echo must not be mistaken for someone else's
+    /// write — that would warn about the very writes the feature is delivering.
+    #[tokio::test]
+    async fn a_datasets_own_echo_is_not_reported_as_external() {
+        let xid = 33u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            810,
+            Some(xid),
+        )
+        .await;
+
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(ack.num_rows_hint(), 0, "the echo is dropped");
+        assert!(
+            !receivers[0]
+                .echo_filter
+                .as_ref()
+                .expect("t0 has an echo filter")
+                .warned_external_write,
+            "the dataset's own delivery is not an external write"
+        );
+    }
+
+    /// An envelope built for a member that suppresses no echoes carries no xids,
+    /// and the filter must then keep every chunk. Unreachable through the pump
+    /// (it tags exactly the members that hold a registry), but it pins the safe
+    /// direction: deliver the change rather than discard it.
+    #[tokio::test]
+    async fn an_untracked_envelope_keeps_every_chunk() {
+        let registry = registry_with_xid(7).await;
+        let mut rows = PgChangeRows::new(
+            tiny_schema(),
+            Arc::clone(&TINY_RELATION),
+            vec![Bytes::from_static(b"I")],
+            Some(0),
+        );
+
+        let scan = rows.drop_echoed(&registry);
+
+        assert!(
+            scan.dropped.is_empty(),
+            "nothing can match an untagged chunk"
+        );
+        assert!(
+            !scan.saw_foreign_txn,
+            "an untagged chunk is not evidence of a foreign transaction"
+        );
+        assert!(
+            !ChangeRows::is_empty(&rows),
+            "the chunk survives an untracked pass"
+        );
+    }
+
+    /// The commit is observed (so the entry becomes prunable at its LSN) but the
+    /// entry survives until the durable floor reaches that LSN — never removed at
+    /// commit-observation.
+    #[tokio::test]
+    async fn commit_observed_entry_survives_until_prune_reaches_it() {
+        let xid = 909u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+        let end_lsn = 640u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // Popping the envelope is what triggers the echo-drop and its (spawned,
+        // best-effort) `mark_commit_observed` — see `MemberMailboxReceiver::pop`.
+        // Commit-observation no longer happens inline in `deliver_commit`.
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(ack.num_rows_hint(), 0, "the echo is dropped");
+
+        assert!(
+            registry.contains(xid),
+            "the entry is not removed at commit-observation"
+        );
+        // A floor below the observed commit LSN leaves it in place...
+        registry.prune_acked(end_lsn - 1).await;
+        assert!(
+            registry.contains(xid),
+            "the entry survives while the durable floor is below its commit LSN"
+        );
+        // ...and reaching it prunes the entry (only possible because the commit was
+        // observed at `end_lsn`; an unobserved entry would never prune). The
+        // observation lands on a task `pop` spawned rather than awaited, so poll
+        // for it rather than assuming one `prune_acked` call already sees it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            registry.prune_acked(end_lsn).await;
+            if !registry.contains(xid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "entry was never pruned: mark_commit_observed's spawned task never landed"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Reconnect replay: replaying the same transaction without an intervening
+    /// `prune_acked` (the slot resends everything after `confirmed_flush` on any
+    /// reconnect) drops the echo again — the ordering regression the design guards.
+    #[tokio::test]
+    async fn reconnect_replay_without_prune_drops_echo_again() {
+        let xid = 313u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+        let end_lsn = 800u64;
+
+        // First delivery: echo dropped, zero-row ack produced. The ack is NOT
+        // committed here, modelling a durability floor that has not yet passed it.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // Claim the first pass's envelope before replaying. An unclaimed
+        // `Changes` tail absorbs the next publish — `try_publish` folds a
+        // compatible envelope into it rather than appending an item — so leaving
+        // it unread would merge the replay into the first delivery and there
+        // would be only one envelope to read, not two.
+        let first = receivers[0]
+            .next()
+            .await
+            .expect("first ack")
+            .expect("not an error");
+
+        // Reconnect replay of the very same transaction, no prune in between.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // Both passes produced a zero-row ack for t0, never a data envelope: the
+        // echo was dropped on the replay just as on the first delivery.
+        let second = receivers[0]
+            .next()
+            .await
+            .expect("replayed ack")
+            .expect("not an error");
+        assert_eq!(
+            first.num_rows_hint(),
+            0,
+            "the echo is dropped on first delivery"
+        );
+        assert_eq!(
+            second.num_rows_hint(),
+            0,
+            "the echo is dropped again on reconnect replay, never re-applied"
+        );
+    }
+
+    /// Restart replay must not re-deliver commits at or below the position a
+    /// member durably recorded as applied. The echo registry prunes its entries
+    /// against that same recorded position, so a replayed echo below it arrives
+    /// unregistered — re-applying it as an ordinary change regresses the
+    /// acceleration to the stale echo image, silently losing acknowledged
+    /// writes (regression test for #13368). `seat_recorded` is exactly what
+    /// `attach_member` runs for a member resuming without a rebuild.
+    #[tokio::test]
+    async fn resumed_member_suppresses_replay_below_recorded_position() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+        let recorded = 900u64;
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        t0_slot.seat_recorded(recorded);
+
+        // Replay of a commit at the recorded position: its registry entry was
+        // pruned before the restart, so only the seated floor protects it.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "72"), (101, "72")]),
+            recorded,
+            Some(4242),
+        )
+        .await;
+
+        // t1 never recorded a position — the replay is delivered to it as usual.
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("not an error");
+        assert_eq!(t1.num_rows_hint(), 1, "an unseated member gets the replay");
+
+        // t0 durably holds everything at or below `recorded`: nothing may be
+        // delivered, not even a zero-row ack (its floor already covers the LSN).
+        assert_eq!(
+            t0_slot.delivered(),
+            recorded,
+            "no envelope was staged for the seated member"
+        );
+
+        // A genuinely new commit above the recorded position flows normally.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "79")]),
+            recorded + 1,
+            Some(4243),
+        )
+        .await;
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope for the new commit")
+            .expect("not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "commits above the recorded position are delivered"
         );
     }
 }

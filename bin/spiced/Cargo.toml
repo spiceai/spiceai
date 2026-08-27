@@ -42,6 +42,10 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
+accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
+accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
+accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
+accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -52,12 +56,15 @@ connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
 cpu-budget = { path = "../../crates/cpu-budget" }
 crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
+podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
+opentelemetry-prometheus.workspace = true
 parking_lot.workspace = true
 opentelemetry-zipkin.workspace = true
 opentelemetry_sdk.workspace = true
@@ -78,6 +85,7 @@ serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
+zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
@@ -89,6 +97,8 @@ telemetry = { path = "../../crates/telemetry" }
 # snmalloc build.
 tikv-jemallocator = { version = "0.6.0", optional = true, features = ["profiling"] }
 tokio.workspace = true
+# `CancellationToken` for the latches the connection report waits on.
+tokio-util.workspace = true
 tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
 tracing-log = "0.2.0"
@@ -96,8 +106,20 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
 
+# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
+# Cayenne), so the startup parallelism declaration is gated the same way.
+[target.'cfg(not(windows))'.dependencies]
+# The Cayenne engine is not built on Windows, so it is a target dependency rather
+# than an optional one behind a feature.
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
+vortex-utils.workspace = true
+
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+# The cloud-connect cache-write seam probes the connect mutation lock directly
+# to prove the guard is still held while the blocking write runs.
+fs4 = { workspace = true }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 # Builds the `RequestContext` the trace-span test needs; `spiced` itself only
 # ever sees one through `runtime`.
 runtime-request-context = { path = "../../crates/runtime-request-context" }
@@ -158,7 +180,7 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["connector-duckdb", "runtime/duckdb"]
+duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
@@ -185,21 +207,21 @@ odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
-postgres-accel = ["runtime/postgres-accel"]
+postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
-smb = ["connector-smb"]
+smb = ["connector-smb", "runtime/smb"]
 snapshots = ["runtime/snapshots"]
 client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
-sqlite = ["runtime/sqlite"]
+sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["runtime/turso"]
+turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]

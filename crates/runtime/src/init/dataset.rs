@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     future::Future,
@@ -24,13 +25,12 @@ use std::{
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
     OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
     UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
@@ -42,9 +42,7 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
-    dataaccelerator::{
-        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
-    },
+    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -106,7 +104,7 @@ impl Runtime {
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -832,6 +830,42 @@ impl Runtime {
             return Err(err);
         }
 
+        // A `drasi` block only takes effect through the change stream, so a
+        // dataset without one forwards nothing. Silently publishing no changes
+        // to a configured Drasi source is worse than refusing the dataset: the
+        // continuous queries downstream would simply never fire, with nothing to
+        // point at.
+        if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
+            let refresh_mode = ds
+                .acceleration
+                .as_ref()
+                .map(|a| data_connector.resolve_refresh_mode(a.refresh_mode));
+
+            let reason = match refresh_mode {
+                None => Some("not accelerated".to_string()),
+                // Lowercased to match the value as it is spelled in the
+                // Spicepod, which is what the operator has to change.
+                Some(mode) if mode != RefreshMode::Changes => Some(format!(
+                    "accelerated with 'refresh_mode: {}'",
+                    format!("{mode:?}").to_lowercase()
+                )),
+                Some(_) if !data_connector.supports_changes_stream() => Some(format!(
+                    "backed by the {source} connector, which does not support change data capture"
+                )),
+                Some(_) => None,
+            };
+
+            if let Some(reason) = reason {
+                let err = DrasiWithoutChangeStreamSnafu {
+                    dataset_name: ds.name.to_string(),
+                    reason,
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
+
         // Durable write-back delivers each committed row to the source. Unless
         // the connector can do that atomically, delivery has to emulate an
         // upsert as a standalone delete plus a separate insert — and because the
@@ -846,6 +880,29 @@ impl Runtime {
             let err = DurableWriteBackUnsupportedBySourceSnafu {
                 dataset_name: ds.name.to_string(),
                 connector: source.clone(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
+        // The delivery worker keys each committed row on a SINGLE primary-key
+        // column (`write_back_worker.rs` returns early for `pk_columns.len() != 1`,
+        // because a composite key can't be turned into the `pk IN (...)` filter it
+        // delivers with). A composite-key dataset would otherwise register and
+        // then silently never deliver — the markers accumulate undelivered. Reject
+        // it here so the limitation surfaces as a loud, actionable error instead of
+        // silent data non-delivery.
+        if let Some(acceleration) = &ds.acceleration
+            && acceleration.resolves_to_durable_write_back()
+            && let Some(primary_key) = &acceleration.primary_key
+            && primary_key.columns.len() > 1
+        {
+            let err = DurableWriteBackCompositePrimaryKeySnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.clone(),
+                primary_key: primary_key.columns.join(", "),
+                pk_columns: primary_key.columns.len(),
             }
             .build();
             warn_spaced!(spaced_tracer, "{}{err}", "");
@@ -877,7 +934,10 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+        {
             Ok(provider) => {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
@@ -1223,12 +1283,15 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
-            UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .build()
-        })?;
+        let read_table = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+            .map_err(|_| {
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .build()
+            })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -1381,14 +1444,40 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector =
-            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
-                dc.context(UnableToInitializeDataConnectorSnafu {})?
-            } else {
-                // Only reachable if the connector is deregistered between the check above and
-                // this lookup; report the same error rather than a second, blunter one.
-                return Err(unknown_data_connector(source).await);
-            };
+        let mut data_connector = if let Some(dc) = dataconnector::create_new_connector(
+            source,
+            params,
+            &RuntimeConnectorContext::for_dataset(&ds),
+        )
+        .await
+        {
+            dc.context(UnableToInitializeDataConnectorSnafu {})?
+        } else {
+            // Only reachable if the connector is deregistered between the check above and
+            // this lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_data_connector(source).await);
+        };
+
+        // Innermost of the stream decorators, so the properties Drasi receives
+        // are the source table's own columns. Wrapping outside the embedding
+        // decorator would instead publish every computed embedding vector as a
+        // node property.
+        if let Some(drasi) = ds.drasi.clone().filter(is_drasi_forwarding) {
+            tracing::warn!(
+                "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+            );
+
+            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi)
+                .await
+                .map_err(|e| crate::Error::UnableToInitializeDataConnector {
+                    source: Box::new(e),
+                })?;
+
+            data_connector = Arc::new(crate::drasi::connector::DrasiConnector::new(
+                data_connector,
+                delivery,
+            ));
+        }
 
         if ds.has_embeddings() {
             data_connector = Arc::new(EmbeddingConnector::new(
@@ -1645,7 +1734,7 @@ impl Runtime {
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -1846,12 +1935,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -2091,39 +2179,37 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at().await {
-                if is_shutdown_cancellation(&e) {
-                    tracing::debug!(
-                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                        dataset.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Failed to update _fetched_at for cached dataset {}: {e}",
-                        dataset.name
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "Updated _fetched_at for all records in cached dataset {}",
-                    dataset.name
-                );
-            }
+    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
+        Ok(()) => {
+            tracing::info!(
+                "Updated _fetched_at for all records in cached dataset {}",
+                dataset.name
+            );
+        }
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(
+                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                dataset.name
+            );
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to initialize caching engine for {}: {e}",
+                "Failed to update _fetched_at for cached dataset {}: {e}",
                 dataset.name
             );
         }
     }
 }
 
+/// Whether a dataset's `drasi:` block is live.
+fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
+    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
         register_connector_factory,
@@ -2145,10 +2231,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             let creates = Arc::clone(&self.creates);
             Box::pin(async move {
                 creates.fetch_add(1, Ordering::SeqCst);
@@ -2167,7 +2254,7 @@ mod tests {
         fn static_schema(
             &self,
             _params: &ConnectorParams,
-            dataset: &crate::component::dataset::Dataset,
+            dataset: &DatasetSpec,
         ) -> Option<arrow_schema::SchemaRef> {
             crate::component::dataset::declared_schema::declared_schema_for(dataset)
                 .ok()
@@ -2186,7 +2273,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
         }
@@ -2311,10 +2399,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
         }
 
@@ -2338,7 +2427,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "id",
@@ -2368,10 +2458,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
 

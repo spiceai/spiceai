@@ -242,21 +242,59 @@ impl CayenneCatalogConnector {
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
         let raw_tuning = self.params.get("tuning").expose().ok();
-        let (tuning_mode, tuning_was_invalid) =
-            crate::dataaccelerator::cayenne::autotune::TuningMode::parse(raw_tuning);
-        if tuning_was_invalid {
+
+        // Probe under the resolved data/metadata dirs, falling back to the data base path.
+        let base = crate::spice_data_base_path();
+        let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
+        let metastore_path = metadata_dir.clone().unwrap_or(base);
+
+        // The engine owns both the `tuning` vocabulary and the hardware probe: a catalog
+        // has no schema inference, so the seed comes from the host alone, and the
+        // controller anchors its bounds to `[floor, 4x seed]` — a seed that ignored the
+        // host would leave it riding the wrong window. Asked through the registration
+        // slice rather than by naming the engine crate.
+        let tuning = data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
+            // Built only to ask for tuning seeds, which are derived from the host rather
+            // than from any runtime-level setting.
+            .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults);
+        let outcome = if let Some(engine) = tuning {
+            engine
+                .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
+                .await
+        } else {
+            // This catalog builds its provider from the `cayenne` library, so it works in a
+            // binary that links no Cayenne *accelerator* — but only the engine can seed the
+            // controller, so `adaptive` cannot be honoured here. Say so rather than quietly
+            // serving a statically-tuned catalog, which is the same configuration an
+            // operator would get by asking for `auto`.
+            //
+            // The engine owns the `tuning` vocabulary; the two names are recognized here
+            // only to decide which warning a build that cannot ask should emit, so that a
+            // typo is still reported rather than passing as a valid mode.
+            let value = raw_tuning.map(str::trim).unwrap_or_default();
+            if value.eq_ignore_ascii_case("adaptive") {
+                tracing::warn!(
+                    "Cayenne catalog parameter `tuning` is 'adaptive', but this build links no Cayenne accelerator to size the controller, so the catalog runs with static tuning ('auto') instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
+                );
+            }
+            data_accelerator_api::AdaptiveTuningOutcome {
+                tuning_value_invalid: !value.is_empty()
+                    && !value.eq_ignore_ascii_case("auto")
+                    && !value.eq_ignore_ascii_case("adaptive"),
+                seeds: None,
+            }
+        };
+
+        if outcome.tuning_value_invalid {
             tracing::warn!(
-                "Invalid Cayenne catalog parameter `tuning` value `{}`; expected `auto` or `adaptive`, defaulting to `auto`.",
+                "Invalid Cayenne catalog parameter `tuning` value `{}`; expected `auto` or `adaptive`, defaulting to `auto`",
                 raw_tuning.unwrap_or_default().trim()
             );
         }
-        let dynamic_tuning = tuning_mode.is_adaptive();
+        let dynamic_tuning = outcome.seeds.is_some();
 
-        // Seed the adaptive-tunable knobs from the host hardware profile (only
-        // when adaptive is requested — `auto` keeps the engine defaults so the
-        // static path is byte-identical to prior behavior). The seed values are
-        // ONLY applied where the operator did not pin the knob explicitly, so an
-        // explicit `cayenne_*` value still wins.
         let (
             seed_compaction_background_interval_ms,
             seed_compaction_trigger_files,
@@ -264,36 +302,16 @@ impl CayenneCatalogConnector {
             seed_inline_flush_max_segments,
             seed_inline_flush_max_bytes,
             seed_write_concurrency,
-        ) = if dynamic_tuning {
-            use crate::dataaccelerator::cayenne::autotune::{HardwareProfile, WorkloadProfile};
-            // Probe storage under the resolved data/metadata dirs (falling back to
-            // the spice data base path), mirroring the accelerator's detection.
-            let base = crate::spice_data_base_path();
-            let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
-            let metastore_path = metadata_dir.clone().unwrap_or(base);
-            // No StorageProfile override is plumbed on the catalog path; auto-detect.
-            let hw = HardwareProfile::detect(
-                crate::component::dataset::acceleration::StorageProfile::Auto,
-                &data_path,
-                &metastore_path,
-            )
-            .await;
-            // Hardware-only workload profile (no inferred row_count / row width).
-            let wl = WorkloadProfile::default();
-            let caps = hw.inline_flush_caps(&wl);
-            (
-                // Small-write/CDC cadence so the controller has a tick to ride.
-                Some(10_000_u64),
-                Some(4_usize),
-                Some(caps.max_rows),
-                Some(caps.max_segments),
-                Some(caps.max_bytes),
-                // Seed write concurrency to the CPU budget's core count so the
-                // controller's [1, cores] window matches the entitlement.
-                Some(hw.cores),
-            )
-        } else {
-            (None, None, None, None, None, None)
+        ) = match outcome.seeds {
+            Some(seeds) => (
+                Some(seeds.compaction_background_interval_ms),
+                Some(seeds.compaction_trigger_files),
+                Some(seeds.inline_flush_max_rows),
+                Some(seeds.inline_flush_max_segments),
+                Some(seeds.inline_flush_max_bytes),
+                Some(seeds.write_concurrency),
+            ),
+            None => (None, None, None, None, None, None),
         };
 
         // The seed only applies where the operator did not set the knob; an

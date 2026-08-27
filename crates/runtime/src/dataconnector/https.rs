@@ -14,23 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
     TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_IDENTITY_PARAM_NAMES, TLS_CLIENT_KEY,
     TLS_CLIENT_KEY_FILE,
 };
 use crate::dataconnector::http_rate_control::{
-    self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
-    HttpRateControlMetricsProvider,
+    self, HTTP_RATE_CONTROL_METRIC_SPECS, HttpRateControlConfig, HttpRateControlMetricSource,
+    HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
 };
-use runtime_metrics::component::MetricsProvider;
+use data_components::http::metrics::{HttpCacheMetrics, names as http_cache_metric_names};
+use opentelemetry::KeyValue;
+use runtime_api_types::v1::ComponentType;
+use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, OAuth2Auth, OAuth2Config, OAuthGrant, TokenHeader,
@@ -87,11 +91,18 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
+    /// Spicepod name, which keys the persisted shared-rate-controller state. Captured at
+    /// construction because it is not part of a dataset's configuration spec.
+    app_name: Arc<str>,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
     emit_rate_control_metrics: bool,
     rate_control_metric_source: Option<HttpRateControlMetricSource>,
+    /// Occupancy of this dataset's HTTP response cache. Held here rather than on
+    /// the table provider because metrics are registered against the dataset
+    /// before the provider is built.
+    cache_metrics: Arc<HttpCacheMetrics>,
 }
 
 impl std::fmt::Display for Https {
@@ -201,7 +212,7 @@ impl Https {
 
     fn ensure_rate_control_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         let rate_control = http_rate_control::resolve_config(
             &self.params,
@@ -244,6 +255,8 @@ struct HttpProviderParams {
     request_filters: RequestFilterParams,
     rate_control: HttpRateControlConfig,
     max_request_partitions: Option<usize>,
+    cache_max_size_bytes: usize,
+    cache_fallback_ttl: Option<Duration>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
 }
@@ -251,7 +264,7 @@ struct HttpProviderParams {
 impl Https {
     fn resolve_http_provider_params(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<HttpProviderParams> {
         let file_format = self
             .params
@@ -372,6 +385,46 @@ impl Https {
             dataset,
             "https",
         )?;
+
+        // Both of these bound memory, so an unparseable value is refused rather
+        // than quietly replaced by a default: silently falling back would leave
+        // the operator believing a budget they set is in force.
+        let cache_max_size_bytes = match self
+            .params
+            .get("response_cache_max_size_bytes")
+            .expose()
+            .ok()
+        {
+            Some(value) => value.parse::<usize>().map_err(|_| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/http"
+                    ),
+                }
+            })?,
+            None => data_components::http::provider::DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES,
+        };
+
+        let cache_fallback_ttl = match self
+            .params
+            .get("response_cache_fallback_ttl")
+            .expose()
+            .ok()
+        {
+            Some(value) => Some(fundu::parse_duration(value).map_err(|source| {
+                DataConnectorError::InvalidConfiguration {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/http"
+                    ),
+                    source: Box::new(source),
+                }
+            })?),
+            None => None,
+        };
 
         let max_request_partitions = self
             .params
@@ -522,13 +575,15 @@ impl Https {
             },
             rate_control,
             max_request_partitions,
+            cache_max_size_bytes,
+            cache_fallback_ttl,
             health_probe,
             pagination,
         })
     }
 
     fn apply_allowed_paths(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         provider: data_components::http::provider::HttpTableProvider,
         allowed_paths: Vec<String>,
     ) -> DataConnectorResult<data_components::http::provider::HttpTableProvider> {
@@ -604,7 +659,7 @@ impl Https {
 
     fn map_client_identity_config_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: &ClientIdentityConfigError,
     ) -> DataConnectorError {
         match error {
@@ -638,7 +693,7 @@ impl Https {
 
     fn ensure_client_identity_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !self.client_identity_params_are_configured() {
             return Ok(());
@@ -667,7 +722,7 @@ impl Https {
     /// there skips `resolve_oauth2_auth`'s validation as well.
     fn ensure_auth_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !any_oauth_param_set(&self.params) {
             return Ok(());
@@ -693,7 +748,7 @@ impl Https {
     /// `OAuth2` params this only warns: the header list is used for far more
     /// than authentication, so rejecting it would fail datasets that load and
     /// serve correctly today.
-    fn warn_ignored_http_headers(&self, dataset: &Dataset) {
+    fn warn_ignored_http_headers(&self, dataset: &DatasetSpec) {
         if param_is_set(&self.params, "http_headers") {
             tracing::warn!(
                 "Dataset {}: '{}' is not applied to structured HTTP file datasets, which are served by the listing connector. The headers are ignored; use a dynamic JSON HTTP API dataset if the endpoint requires them.",
@@ -705,7 +760,7 @@ impl Https {
 
     fn resolve_client_identity_config(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
         let client_certificate_path = self
             .params
@@ -743,7 +798,7 @@ impl Https {
 
     async fn resolve_client_identity(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<Identity>> {
         let Some(config) = self.resolve_client_identity_config(dataset)? else {
             return Ok(None);
@@ -804,7 +859,7 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -897,7 +952,7 @@ impl Https {
     /// inconsistent for the selected grant.
     fn resolve_oauth2_auth(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<(OAuth2Config, OAuthGrant)>> {
         // Local grant discriminant, resolved before the grant-specific
         // credentials are validated.
@@ -1057,7 +1112,7 @@ impl Https {
     /// `Authorization` (which carries `Bearer <token>`); `auth_header_name`
     /// overrides it (e.g. `X-Shopify-Access-Token`, which carries the bare
     /// token).
-    fn resolve_token_header(&self, dataset: &Dataset) -> DataConnectorResult<TokenHeader> {
+    fn resolve_token_header(&self, dataset: &DatasetSpec) -> DataConnectorResult<TokenHeader> {
         let name = self
             .params
             .get("auth_header_name")
@@ -1087,7 +1142,7 @@ impl Https {
     /// configuration issues; transport, 5xx, 408/429 (transient), and parse
     /// errors are connection-level.
     fn map_auth_error(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         err: data_components::http::auth::Error,
     ) -> DataConnectorError {
         use data_components::http::auth::Error as AuthErr;
@@ -1118,7 +1173,7 @@ impl Https {
     /// Create HTTP table provider for JSON API endpoints
     async fn create_http_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
@@ -1143,6 +1198,8 @@ impl Https {
             request_filters,
             rate_control,
             max_request_partitions,
+            cache_max_size_bytes,
+            cache_fallback_ttl,
             health_probe,
             pagination,
         } = self.resolve_http_provider_params(dataset)?;
@@ -1169,6 +1226,8 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_max_request_partitions(max_request_partitions)
+        .with_cache_limits(cache_max_size_bytes, cache_fallback_ttl)
+        .with_cache_metrics(Arc::clone(&self.cache_metrics))
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -1289,7 +1348,7 @@ impl Https {
             .reserve_shared_rate_controller_for_component(
                 &base_url,
                 &rate_control,
-                dataset.app.name.as_str(),
+                self.app_name.as_ref(),
                 &ConnectorComponent::from(dataset),
                 "https",
             )
@@ -1423,7 +1482,7 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
 /// the historical behavior). Nullability is the declared `nullable:`,
 /// defaulting to `true`.
 fn build_json_nest_schema(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     nesting: &HttpJsonNesting,
 ) -> Result<arrow_schema::SchemaRef, crate::component::dataset::declared_type::ParseTypeError> {
     use crate::component::dataset::declared_type::parse_declared_type;
@@ -1463,7 +1522,7 @@ fn build_json_nest_schema(
 /// inference.
 fn static_schema_for_https_dataset(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<arrow_schema::SchemaRef> {
     if !params_indicate_dynamic_api(params) {
         return None;
@@ -1487,7 +1546,7 @@ fn static_schema_for_https_dataset(
 ///
 /// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
-fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
+fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<HttpJsonNesting>> {
     let marked_columns: Vec<&Column> = dataset
         .columns
         .iter()
@@ -1589,7 +1648,8 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
@@ -1600,7 +1660,7 @@ impl DataConnector for Https {
             // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
-            return listing_connector.read_provider(dataset).await;
+            return listing_connector.read_provider(context, dataset).await;
         }
 
         // Validate acceleration mode for HTTP connector (JSON API endpoints only)
@@ -1626,18 +1686,22 @@ impl DataConnector for Https {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        if !self.emit_rate_control_metrics {
-            return None;
-        }
-
-        Some(Arc::new(HttpRateControlMetricsProvider::new(
-            "http",
-            Arc::clone(&self.metrics),
-            self.rate_control_metric_source.clone(),
-        )))
+        // Always `Some`: the response cache reports unconditionally, because
+        // memory it holds is otherwise attributable to nothing. Rate control
+        // still reports only where it was asked to.
+        Some(Arc::new(HttpsMetricsProvider {
+            cache_metrics: Arc::clone(&self.cache_metrics),
+            rate_control: self.emit_rate_control_metrics.then(|| {
+                HttpRateControlMetricsProvider::new(
+                    "http",
+                    Arc::clone(&self.metrics),
+                    self.rate_control_metric_source.clone(),
+                )
+            }),
+        }))
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
@@ -1646,6 +1710,105 @@ impl DataConnector for Https {
             ComponentInitialization::OnStartup(StartupOptions {
                 dataset_health_monitor: DatasetHealthMonitor::Disabled,
             })
+        }
+    }
+}
+
+/// Occupancy of one dataset's HTTP response cache.
+///
+/// This cache is not one of the caches under `runtime.caching`, so nothing else
+/// reports it: without these, memory it holds shows up only as process RSS with
+/// nothing to attribute it to. Both auto-register for that reason — an operator
+/// should not have to know the cache exists in order to see it.
+const HTTP_CACHE_METRIC_SPECS: &[MetricSpec] = &[
+    MetricSpec::new(
+        http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES,
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Bytes retained by the HTTP connector's response cache, counting response bodies, their headers and the request keys they are held under. Excludes the cache's own per-entry bookkeeping.",
+    )
+    .unit("By")
+    .auto_register(),
+    MetricSpec::new(
+        http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT,
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Number of responses held by the HTTP connector's response cache.")
+    .auto_register(),
+];
+
+/// Everything this connector reports when rate control is emitting too.
+///
+/// Advertising is not free: dataset initialization registers every auto metric a
+/// provider advertises, and a metric with no callback behind it fails
+/// registration and logs an error. So the list has to narrow to what this
+/// provider can actually observe — see [`HttpsMetricsProvider::available_metrics`].
+static HTTP_ALL_METRIC_SPECS: LazyLock<Vec<MetricSpec>> = LazyLock::new(|| {
+    let mut specs = HTTP_CACHE_METRIC_SPECS.to_vec();
+    specs.extend_from_slice(HTTP_RATE_CONTROL_METRIC_SPECS);
+    specs
+});
+
+/// Reports both of this connector's metric families through one provider.
+///
+/// They are reported together because a dataset registers exactly one provider,
+/// and the two have different lifetimes: the response cache always reports,
+/// while rate control reports only for the dataset that owns the shared
+/// controller.
+#[derive(Debug)]
+struct HttpsMetricsProvider {
+    cache_metrics: Arc<HttpCacheMetrics>,
+    rate_control: Option<HttpRateControlMetricsProvider>,
+}
+
+impl MetricsProvider for HttpsMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "http"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        // Only what this provider can observe. Every auto-registering metric
+        // advertised here is registered for the dataset, and one whose callback
+        // is absent fails that registration with an error log — so advertising
+        // the rate-control family while it is disabled would put eleven of those
+        // in the log of every ordinary HTTP dataset.
+        if self.rate_control.is_some() {
+            &HTTP_ALL_METRIC_SPECS
+        } else {
+            HTTP_CACHE_METRIC_SPECS
+        }
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES => {
+                let metrics = Arc::clone(&self.cache_metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(metrics.retained_bytes(), &attributes);
+                })))
+            }
+            http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT => {
+                let metrics = Arc::clone(&self.cache_metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(metrics.items(), &attributes);
+                })))
+            }
+            // Delegating rather than inheriting a default: rate control owns how
+            // its own metrics are labelled (it relabels `name` to `origin`), and
+            // reimplementing that here would drift from it.
+            _ => self
+                .rate_control
+                .as_ref()
+                .and_then(|provider| provider.callback_to_observe_metric(metric, attributes)),
         }
     }
 }
@@ -1718,6 +1881,10 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum size (in bytes) for request_headers filter values. Default: 16384 (16KiB)."),
         ParameterSpec::runtime("max_request_partitions")
             .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
+        ParameterSpec::runtime("response_cache_max_size_bytes")
+            .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
+        ParameterSpec::runtime("response_cache_fallback_ttl")
+            .description("How long to keep a response whose origin sent no 'Cache-Control' header at all, for example '5m' or '30s'. An origin that did send 'Cache-Control' is always honoured instead, including its refusals. Unset by default, which keeps such responses uncached."),
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
@@ -1773,25 +1940,28 @@ impl DataConnectorFactory for HttpsFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
-            let rate_control_registry = params
-                .http_rate_control_registry()
-                .unwrap_or_else(http_rate_control::global_registry);
+            let app = context.app();
+            let runtime_rate_control_params = Some(app.runtime.params.clone());
+            let app_name: Arc<str> = Arc::from(app.name.as_str());
+            let rate_control_registry = context.http_rate_control_registry();
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
                         let connector = Https {
                             params: params.parameters.clone(),
+                            app_name: Arc::clone(&app_name),
                             runtime_rate_control_params: runtime_rate_control_params.clone(),
                             rate_control_registry: Arc::clone(&rate_control_registry),
                             metrics: Arc::new(HttpRateControlMetrics::default()),
                             emit_rate_control_metrics: false,
                             rate_control_metric_source: None,
+                            cache_metrics: HttpCacheMetrics::new(),
                         };
                         connector.is_structured_format(dataset)
                     };
@@ -1807,11 +1977,13 @@ impl DataConnectorFactory for HttpsFactory {
 
             Ok(Arc::new(Https {
                 params: params.parameters,
+                app_name,
                 runtime_rate_control_params,
                 rate_control_registry,
                 metrics,
                 emit_rate_control_metrics,
                 rate_control_metric_source,
+                cache_metrics: HttpCacheMetrics::new(),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -1841,7 +2013,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn static_schema(
         &self,
         params: &ConnectorParams,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<arrow_schema::SchemaRef> {
         static_schema_for_https_dataset(&params.parameters, dataset)
     }
@@ -1884,7 +2056,7 @@ impl ListingTableConnector for HttpListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -1940,13 +2112,13 @@ impl ListingTableConnector for HttpListingConnector {
     }
 }
 
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_http_connector,
     REGISTER_HTTP_CONNECTOR,
     "http",
     HttpsFactory
 );
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_https_connector,
     REGISTER_HTTPS_CONNECTOR,
     "https",
@@ -1956,8 +2128,10 @@ register_data_connector!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
     use crate::secrets::Secrets;
     use app::AppBuilder;
@@ -2002,6 +2176,7 @@ mod tests {
         .expect("test connector parameters should be valid");
 
         Https {
+            app_name: Arc::from("test_app"),
             params,
             runtime_rate_control_params: if runtime_params.is_empty() {
                 None
@@ -2017,6 +2192,7 @@ mod tests {
             metrics: Arc::new(HttpRateControlMetrics::default()),
             emit_rate_control_metrics: true,
             rate_control_metric_source: None,
+            cache_metrics: HttpCacheMetrics::new(),
         }
     }
 
@@ -2132,7 +2308,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("full refresh without refresh_sql should be rejected");
 
@@ -2153,7 +2329,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("append mode should continue to provider validation");
 
@@ -2414,7 +2590,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         )
         .await;
 
-        let Err(error) = connector.read_provider(&dataset).await else {
+        let Err(error) = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+        else {
             panic!("structured HTTP file datasets should reject HTTP rate-control defaults");
         };
 
@@ -2494,7 +2673,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("caching mode should continue to provider validation");
 
@@ -2507,7 +2686,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured formats should bypass JSON refresh_sql validation");
 
@@ -2525,7 +2704,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured HTTP file datasets should reject mTLS client identity params");
 
@@ -2573,7 +2752,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .await;
 
             let error = connector
-                .read_provider(&dataset)
+                .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
                 .await
                 .expect_err("structured HTTP file datasets should reject OAuth2 params");
 
@@ -2625,7 +2804,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         // without a refresh token — proof the auth config was validated rather
         // than dropped.
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("OAuth2 config without a refresh token should fail validation");
         assert!(
@@ -2979,6 +3158,147 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .build_http_client(&dataset)
             .await
             .expect("valid file-based mTLS identity should build an HTTP client");
+    }
+
+    #[tokio::test]
+    async fn response_cache_limits_default_when_unset() {
+        let connector = test_connector_with(&[]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("defaults should resolve");
+
+        assert_eq!(
+            params.cache_max_size_bytes,
+            data_components::http::provider::DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES
+        );
+        assert_eq!(
+            params.cache_fallback_ttl, None,
+            "an origin that sends no Cache-Control stays uncached unless a fallback was asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_limits_are_taken_from_the_dataset() {
+        let connector = test_connector_with(&[
+            ("response_cache_max_size_bytes", "1048576"),
+            ("response_cache_fallback_ttl", "90s"),
+        ])
+        .await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let params = connector
+            .resolve_http_provider_params(&dataset)
+            .expect("configured cache limits should resolve");
+
+        assert_eq!(params.cache_max_size_bytes, 1_048_576);
+        assert_eq!(params.cache_fallback_ttl, Some(Duration::from_secs(90)));
+    }
+
+    /// Both parameters bound memory, so an unusable value is refused rather than
+    /// replaced by a default: falling back silently would leave the operator
+    /// believing a budget they set is in force.
+    #[tokio::test]
+    async fn an_unparseable_response_cache_size_is_refused() {
+        let connector = test_connector_with(&[("response_cache_max_size_bytes", "64MiB")]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("an unparseable cache size should be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("response_cache_max_size_bytes") && message.contains("64MiB"),
+            "the message must name the parameter and the value it rejected: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_response_cache_fallback_ttl_is_refused() {
+        let connector = test_connector_with(&[("response_cache_fallback_ttl", "soon")]).await;
+        let dataset = test_dataset("https://api.example.com/data", RefreshMode::Append, None).await;
+
+        let Err(error) = connector.resolve_http_provider_params(&dataset) else {
+            panic!("an unparseable fallback TTL should be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("response_cache_fallback_ttl"),
+            "the message must name the parameter: {message}"
+        );
+    }
+
+    /// The cache reports whether or not rate control does. Before this, the
+    /// connector had no metrics provider at all unless rate control was emitting,
+    /// so the memory this cache holds was attributable to nothing.
+    #[tokio::test]
+    async fn the_response_cache_reports_without_rate_control() {
+        let mut connector = test_connector_with(&[]).await;
+        connector.emit_rate_control_metrics = false;
+
+        let metrics_provider = DataConnector::metrics_provider(&connector)
+            .expect("the response cache reports even with rate control off");
+
+        for metric_name in [
+            http_cache_metric_names::RESPONSE_CACHE_SIZE_BYTES,
+            http_cache_metric_names::RESPONSE_CACHE_ITEMS_COUNT,
+        ] {
+            let metric = metrics_provider
+                .get_metric(metric_name)
+                .unwrap_or_else(|| panic!("metric {metric_name} should be available"));
+            assert!(
+                metric.auto_register,
+                "{metric_name} must auto-register: an operator should not have to know the cache exists to see it"
+            );
+            assert!(
+                metrics_provider
+                    .callback_to_observe_metric(metric, vec![])
+                    .is_some(),
+                "{metric_name} must have an observation callback"
+            );
+        }
+
+        // Advertising is not free. Dataset initialization registers every auto
+        // metric a provider advertises, and one whose callback is absent fails
+        // that registration with an error log — so advertising the rate-control
+        // family while it is disabled would put one of those in the log of every
+        // ordinary HTTP dataset.
+        for metric in metrics_provider.available_metrics() {
+            assert!(
+                metrics_provider
+                    .callback_to_observe_metric(metric, vec![])
+                    .is_some(),
+                "{} is advertised but cannot be observed, so registering it fails",
+                metric.name
+            );
+        }
+        assert!(
+            metrics_provider
+                .get_metric("rate_control_available_permits")
+                .is_none(),
+            "rate-control metrics must not be advertised while rate control is off"
+        );
+    }
+
+    /// Rate-control metrics keep working through the combined provider — a
+    /// delegating impl that silently answered `None` would leave them
+    /// registered but never observed.
+    #[tokio::test]
+    async fn rate_control_metrics_still_observe_through_the_combined_provider() {
+        let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        let metrics_provider =
+            DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
+
+        let metric = metrics_provider
+            .get_metric("rate_control_max_concurrent_requests")
+            .expect("rate-control metrics remain available");
+        assert!(
+            metrics_provider
+                .callback_to_observe_metric(metric, vec![])
+                .is_some(),
+            "a rate-control metric must still be observed, not just listed"
+        );
     }
 
     #[tokio::test]
