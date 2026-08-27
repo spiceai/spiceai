@@ -658,6 +658,14 @@ pub struct CdcSchemaEvolution {
 /// accelerator deletes the data directory and its metastore slice at bootstrap; and
 /// `memory` because nothing was persisted to reopen. Sending those three to the manual
 /// remedy would cost an operator a needless drop and recreate.
+///
+/// That rebuild restores the *schema* under all three, but only `file_update` also restores
+/// the *rows* on its own — its recreate runs through registration, which refreshes from the
+/// source. `file_create` and `memory` are ephemeral to replication
+/// (`accelerator_is_ephemeral`), and their resume snapshot is forced only when the source's
+/// initial snapshot is already enabled, so under `pg_replication_initial_snapshot: disabled`
+/// they come back empty. The message has to name that cost, because the sentence two
+/// earlier promises the acceleration still holds every row it held before.
 // Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
 // otherwise this is dead code on Windows and `-D warnings` fails the build there.
 #[cfg(not(windows))]
@@ -670,6 +678,9 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          so the acceleration still holds every row it held before it. \
          Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
          rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
+         Under `mode: file_create` and `mode: memory` that restart reloads the rows only if the source's initial snapshot is enabled; \
+         with it disabled (`pg_replication_initial_snapshot: disabled`) the acceleration comes back empty and holds only what the \
+         change stream delivers from its resume position onward. \
          Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
          new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
          Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
@@ -4400,6 +4411,20 @@ mod tests {
             "restart is the cheapest remedy in every mode that does not reopen a stored table, and \
              all three must be offered it — `file_update` recreates, `file_create` starts from an \
              empty directory, `memory` never persisted one: {msg}"
+        );
+        // The restart arm sits two sentences after "still holds every row it held before it".
+        // Under the two modes that are ephemeral to replication that promise and that remedy
+        // disagree whenever the source's initial snapshot is disabled: the acceleration boots
+        // empty and no snapshot replays the history. Naming the cost is what keeps the
+        // reassurance honest, so it is asserted rather than left to review.
+        assert!(
+            msg.contains(
+                "`mode: file_create` and `mode: memory` that restart reloads the rows only if"
+            ) && msg.contains("`pg_replication_initial_snapshot: disabled`")
+                && msg.contains("comes back empty"),
+            "a restart repopulates `file_create` / `memory` only when the source's initial \
+             snapshot is enabled, so the message must name that cost rather than let the \
+             'still holds every row' reassurance imply the rows return unconditionally: {msg}"
         );
         assert!(
             msg.contains("Under `mode: file` a restart reopens the stored table and refuses again"),
