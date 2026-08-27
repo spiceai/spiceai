@@ -493,39 +493,72 @@ fn narrowed_child_holds_a_reachable_null(parent: &ArrayData, index: usize) -> bo
     let Some(child) = parent.child_data().get(index) else {
         return false;
     };
-    let Some(nulls) = logical_nulls_of(child) else {
-        return false;
+
+    // Only a parent that grants an exemption needs to know *which* rows are null; the rest need
+    // only whether any null exists, which [`child_holds_a_logical_null`] can often answer without
+    // materializing a null buffer at all.
+    let masked_by = |mask: Option<NullBuffer>| match logical_nulls_of(child) {
+        None => false,
+        Some(nulls) => !mask.is_some_and(|reachable_only_where_parent_is_null| {
+            reachable_only_where_parent_is_null.contains(&nulls)
+        }),
     };
 
     match parent.data_type() {
         // Arrow's `Struct` arm: a child null sitting under a null parent slot is unreachable.
-        DataType::Struct(_) => !parent
-            .nulls()
-            .is_some_and(|reachable_only_where_parent_is_null| {
-                reachable_only_where_parent_is_null.contains(&nulls)
-            }),
+        DataType::Struct(_) => match parent.nulls() {
+            None => child_holds_a_logical_null(child),
+            mask => masked_by(mask.cloned()),
+        },
         // Arrow's `FixedSizeList` arm: the parent's mask, expanded over the fixed element count.
-        DataType::FixedSizeList(_, len) => {
-            let element_len = usize::try_from(*len).unwrap_or(0);
-            !parent
-                .nulls()
-                .is_some_and(|parent_nulls| parent_nulls.expand(element_len).contains(&nulls))
-        }
-        DataType::Union(fields, mode) => {
-            union_variant_selects_a_null(parent, fields, *mode, index, &nulls)
-        }
+        DataType::FixedSizeList(_, len) => match parent.nulls() {
+            None => child_holds_a_logical_null(child),
+            Some(parent_nulls) => {
+                let element_len = usize::try_from(*len).unwrap_or(0);
+                masked_by(Some(parent_nulls.expand(element_len)))
+            }
+        },
+        DataType::Union(fields, mode) => match logical_nulls_of(child) {
+            None => false,
+            Some(nulls) => union_variant_selects_a_null(parent, fields, *mode, index, &nulls),
+        },
         DataType::ListView(_) | DataType::LargeListView(_) => false,
         // `List`, `LargeList` and `Map` take no exemption in `validate_nulls`, so neither here.
-        _ => true,
+        _ => child_holds_a_logical_null(child),
+    }
+}
+
+/// Whether `child` holds any logical null at all.
+///
+/// This is the cheap half of the question, for a parent that grants no exemption and so needs no
+/// positions. It matters most for `RunEndEncoded`: [`logical_nulls_of`] would allocate a bitmap
+/// sized to the **logical** row count, which for a highly compressed run-end array is far larger
+/// than the data it describes, and the answer is already in its `values` child.
+fn child_holds_a_logical_null(child: &ArrayData) -> bool {
+    match child.data_type() {
+        // A run-end-encoded array has no null buffer of its own — a null run is a null in `values`.
+        // A run that a slice excludes is over-counted here; refusing then costs an error on a
+        // relabel that would have been sound, where accepting would publish a column whose nulls
+        // the planner has been told cannot exist.
+        DataType::RunEndEncoded(..) => child
+            .child_data()
+            .get(1)
+            .is_some_and(|values| values.null_count() > 0),
+        // Every value of a `Null` array is null and it carries no buffer to say so, so its length
+        // is the whole answer.
+        DataType::Null => !child.is_empty(),
+        _ => logical_nulls_of(child).is_some_and(|nulls| nulls.null_count() > 0),
     }
 }
 
 /// The nulls of `child` as a reader sees them, rather than as its own null buffer states them.
 ///
-/// Only two encodings differ, and they are the reason this exists: a `RunEndEncoded` array has no
-/// null buffer of its own — a null run is a null in its `values` child, expanded over the run — and
-/// a `Dictionary` can hold nulls in its values, reachable only through the keys that select them.
-/// Both are answered by Arrow's own [`Array::logical_nulls`] rather than by re-deriving them.
+/// Four types differ from their physical null buffer, and each would otherwise read as null-free
+/// from it: a `RunEndEncoded` array has no null buffer at all (a null run is a null in `values`,
+/// expanded over the run); a `Dictionary` can hold nulls in its values, reachable through the keys
+/// that select them; a `Union` has none of its own either, its nulls being those of the child each
+/// row selects; and every value of a `Null` array is null with no buffer to say so. All four are
+/// answered by Arrow's own [`Array::logical_nulls`] rather than by re-deriving them.
 ///
 /// Every other type reports its physical nulls, which for them *are* the logical ones. Taking that
 /// branch without building an array also keeps this away from `make_array`, which would panic on
@@ -533,9 +566,10 @@ fn narrowed_child_holds_a_reachable_null(parent: &ArrayData, index: usize) -> bo
 /// nullable `entries` field, so a `Map` child awaiting that correction cannot be materialized here.
 fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
     match child.data_type() {
-        DataType::RunEndEncoded(..) | DataType::Dictionary(..) => {
-            make_array(child.clone()).logical_nulls()
-        }
+        DataType::RunEndEncoded(..)
+        | DataType::Dictionary(..)
+        | DataType::Union(..)
+        | DataType::Null => make_array(child.clone()).logical_nulls(),
         _ => child.nulls().cloned(),
     }
 }
@@ -1275,6 +1309,70 @@ mod tests {
             "a key selecting a null dictionary value is a null of the column, so narrowing the \
              item must be refused",
         );
+
+        assert!(
+            err.to_string().contains("item"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// A `Union` child carries no null buffer of its own — its nulls are those of the child each row
+    /// selects — so an enclosing `List`, whose `validate_nulls` arm reads the physical count, sees
+    /// zero. Measured: without the guard this relabel returns `Ok`.
+    #[test]
+    fn relabel_refuses_narrowing_over_a_union_whose_selected_value_is_null() {
+        let union = UnionArray::try_new(
+            UnionFields::try_new(vec![0_i8], vec![Field::new("v", DataType::Int32, true)])
+                .expect("one type id for one field"),
+            vec![0_i8, 0].into(),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+        )
+        .expect("a sparse union over one variant");
+        let union_type = union.data_type().clone();
+        assert_eq!(
+            union.to_data().null_count(),
+            0,
+            "a union has no null buffer of its own — that is what an enclosing physical check misses"
+        );
+        let source = ListArray::new(
+            Arc::new(Field::new("item", union_type.clone(), true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(union),
+            None,
+        );
+        let target = DataType::List(Arc::new(Field::new("item", union_type, false)));
+
+        let err = relabel_array_data(source.to_data(), &target)
+            .expect_err("row 1 selects `v`, which is null there, so the item is null");
+
+        assert!(
+            err.to_string().contains("item"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// Every value of a `Null` array is null, and it carries no buffer to say so — so a physical
+    /// null count reads zero for a column that is nothing but nulls. Measured: without the guard
+    /// this relabel returns `Ok`.
+    #[test]
+    fn relabel_refuses_narrowing_over_a_null_child_that_is_entirely_null() {
+        let nulls = ArrayData::new_null(&DataType::Null, 2);
+        assert_eq!(
+            nulls.null_count(),
+            0,
+            "a Null array states its nulls in its type, not a buffer"
+        );
+        let source = ListArray::new(
+            Arc::new(Field::new("item", DataType::Null, true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(make_array(nulls)),
+            None,
+        );
+        let target = DataType::List(Arc::new(Field::new("item", DataType::Null, false)));
+
+        let err = relabel_array_data(source.to_data(), &target)
+            .expect_err("every value of a Null array is null, so the item cannot be non-nullable");
 
         assert!(
             err.to_string().contains("item"),
