@@ -661,6 +661,20 @@ impl<'a> AppendMutationWriter<'a> {
                 if stage_on_conflict {
                     let record_seq = self.table.sequence_high_water().await;
                     self.table.record_file_pk_keys(&validated_keys, record_seq);
+                    // Unlike every other `record_file_pk_keys` call site, this one
+                    // records BEFORE the publish: the staged files are not yet
+                    // discoverable and the read filter skips the unpublished
+                    // tombstone, so until `CayenneCdcWrite::finish` these keys exist
+                    // only in the PK cache. Anything that drops that cache
+                    // (`clear_cached_pk_keyset`, a discarded index, an abandoned
+                    // validation) does so on the premise that the next rebuild reads
+                    // the commit back from the table, which is not true yet — so
+                    // also hand the keys to the in-flight registration, where a
+                    // rebuild folds them in and the publish retires them.
+                    self.table.attach_inflight_staged_pk_keys(
+                        prepared_append.staging_snapshot_id(),
+                        &validated_keys,
+                    );
                 }
                 drop(held_write_guard);
 

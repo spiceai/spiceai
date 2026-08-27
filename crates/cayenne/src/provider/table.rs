@@ -2191,7 +2191,21 @@ pub struct CayenneTableProvider {
     /// process. `ensure_no_incomplete_write` ignores these WALs so CDC Stage A
     /// can continue while a previous Stage B is pending; after restart the set
     /// is empty, so the same WALs are treated as crash-recovery input.
-    inflight_staging_appends: Arc<ParkingMutex<HashSet<String>>>,
+    ///
+    /// The value carries the primary keys that append validated while its rows
+    /// were still private, for the arm that records them BEFORE publishing
+    /// (`AppendMutationWriter`'s pipelined `stage_on_conflict` path). Those keys
+    /// exist nowhere a keyset rebuild can read them — the staged files are not
+    /// yet discoverable and the read filter skips the unpublished tombstone — so
+    /// [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the same
+    /// way [`Self::fold_mem_tier_keys_into_keyset`] folds the un-checkpointed RAM
+    /// tier. Holding them HERE rather than only in the PK cache is what makes
+    /// that sound: [`Self::clear_cached_pk_keyset`] and the index-discard paths
+    /// empty the cache, and their stated premise — the next rebuild reads this
+    /// commit from the table — does not hold while the commit is still staged.
+    /// Empty for every other append (they record after publishing, so the scan
+    /// sees their rows).
+    inflight_staging_appends: Arc<ParkingMutex<HashMap<String, PkDigestSet>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -4020,7 +4034,7 @@ impl CayenneTableProvider {
     pub(crate) fn register_inflight_staging_append(&self, staging_snapshot_id: &str) {
         self.inflight_staging_appends
             .lock()
-            .insert(staging_snapshot_id.to_string());
+            .insert(staging_snapshot_id.to_string(), PkDigestSet::default());
     }
 
     pub(crate) fn unregister_inflight_staging_append(&self, staging_snapshot_id: &str) {
@@ -4029,10 +4043,57 @@ impl CayenneTableProvider {
             .remove(staging_snapshot_id);
     }
 
+    /// Attach the primary keys a staged append validated while its rows are
+    /// still private, so a keyset rebuild running before the publish can fold
+    /// them in (see the field's doc comment).
+    ///
+    /// Retired by [`Self::unregister_inflight_staging_append`], which every exit
+    /// path already reaches: the publish path via
+    /// `PreparedStagedAppend::finish` — which runs strictly AFTER
+    /// `apply_under_barrier` has made the files discoverable — the abort path
+    /// via `rollback`, and a cancelled or abandoned append via `Drop`. Retiring
+    /// late is what correctness needs: a rebuild that folds keys the scan has
+    /// already read is a union of the same key, whereas retiring before the
+    /// publish would reopen exactly the window this closes.
+    ///
+    /// A no-op when the append is no longer registered, which is the caller
+    /// racing its own retirement; the keys are then already covered by the
+    /// table.
+    pub(crate) fn attach_inflight_staged_pk_keys(
+        &self,
+        staging_snapshot_id: &str,
+        keys: &PkDigestSet,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(slot) = self
+            .inflight_staging_appends
+            .lock()
+            .get_mut(staging_snapshot_id)
+        {
+            *slot = keys.clone();
+        }
+    }
+
+    /// The keys of every staged-but-unpublished append, for a keyset rebuild to
+    /// fold in. Callers MUST capture this under `listing_fence.read()` alongside
+    /// the snapshot list, so an append is either still registered here or
+    /// already published into the `current_snapshot_id` the same fence captured
+    /// — never in neither.
+    fn snapshot_inflight_staged_pk_keys(&self) -> Vec<PkDigestSet> {
+        self.inflight_staging_appends
+            .lock()
+            .values()
+            .filter(|keys| !keys.is_empty())
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn staging_append_is_inflight(&self, staging_snapshot_id: &str) -> bool {
         self.inflight_staging_appends
             .lock()
-            .contains(staging_snapshot_id)
+            .contains_key(staging_snapshot_id)
     }
 
     pub(crate) fn has_inflight_staging_appends(&self) -> bool {
@@ -7267,7 +7328,7 @@ impl CayenneTableProvider {
             // list when both flags are clear.
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
-            inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
+            inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
             retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
@@ -10298,7 +10359,7 @@ impl CayenneTableProvider {
         // together under the WRITE fence, so resolving cold after this block would
         // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
         // snapshot and the post-promotion cold manifest.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
+        let (mem_snapshots, staged_keys, protected_snapshots, current_snapshot_id, cold_files) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -10306,6 +10367,12 @@ impl CayenneTableProvider {
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
+            // Staged-but-unpublished appends join the same fenced instant, for the
+            // reason the mem-tier snapshot does: a pipelined staged append
+            // publishes its files under the WRITE fence and only then retires its
+            // registration, so reading both here leaves a key in this capture or in
+            // the `current_snapshot_id` scan below — never in neither.
+            let staged_keys = self.snapshot_inflight_staged_pk_keys();
             // Wait-free Arc::clone — the inner HashMap is shared, not cloned.
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
@@ -10334,6 +10401,7 @@ impl CayenneTableProvider {
             };
             (
                 mem_snapshots,
+                staged_keys,
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
@@ -10504,6 +10572,9 @@ impl CayenneTableProvider {
         // Finally fold in the un-checkpointed mem-tier keys (snapshotted at the top).
         Self::fold_mem_tier_keys_into_keyset(&mem_snapshots, pk_indices, converter, &mut keyset)?;
 
+        // …and the keys of staged appends whose files this scan could not see.
+        Self::fold_inflight_staged_keys_into_keyset(&staged_keys, &mut keyset);
+
         // Floor every rebuilt entry's per-key OCC sequence at the end-of-scan
         // high-water. A commit that landed during the rebuild may not be
         // reflected in the scanned keys, so any transaction that began before
@@ -10537,6 +10608,50 @@ impl CayenneTableProvider {
     /// only removes false-negatives, and a false positive is a redundant, correct
     /// upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
     /// the caller) so a concurrent checkpoint-clear cannot hide a key from both.
+    /// Fold in the keys of staged-but-unpublished appends, so a rebuild does not
+    /// drop a key whose rows exist only in a private staging directory.
+    ///
+    /// The durable scan in [`Self::load_existing_pk_index`] reads the current
+    /// snapshot, and a pipelined staged append's files are deliberately not
+    /// discoverable there until its finalize flips the tombstone and moves them
+    /// in. That append has nonetheless already validated its keys and recorded
+    /// them, so between those two points the key lives ONLY in the PK cache — and
+    /// [`Self::clear_cached_pk_keyset`] and the index-discard paths empty that
+    /// cache on the premise that a rebuild reads the commit back from the table,
+    /// which is not yet true. Without this fold the next upsert of such a key
+    /// false-negatives in [`Self::apply_on_conflict_to_batch`], records NO
+    /// supersede tombstone, and leaves two live rows for one declared primary key.
+    ///
+    /// Exactly the shape of [`Self::fold_mem_tier_keys_into_keyset`], and safe
+    /// for the same reasons: keys already present from the durable scan keep
+    /// their `RowLocation`, and an over-approximation only removes false
+    /// negatives — a key whose append later aborts costs a redundant, correct
+    /// upsert tombstone. `staged_keys` MUST be captured under the same listing
+    /// fence as the snapshot list (see the caller).
+    fn fold_inflight_staged_keys_into_keyset(
+        staged_keys: &[PkDigestSet],
+        keyset: &mut BoundedShardedPkIndexBuilder,
+    ) {
+        for keys in staged_keys {
+            for key in keys.iter() {
+                // Single hash lookup, preserving any durable-scan `RowLocation`.
+                keyset.insert_if_absent(key.clone(), RowLocation::FileUnlocated);
+            }
+        }
+    }
+
+    /// [`Self::fold_inflight_staged_keys_into_keyset`] for the persisted-bloom
+    /// fast path, which reconstructs the index without the full-table scan and
+    /// therefore has the same blind spot. Mirrors
+    /// [`Self::fold_mem_tier_keys_into_bloom`].
+    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[PkDigestSet], bloom: &mut PkBloom) {
+        for keys in staged_keys {
+            for key in keys.iter() {
+                bloom.insert(key.as_ref());
+            }
+        }
+    }
+
     fn fold_mem_tier_keys_into_keyset(
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
         pk_indices: &[usize],
@@ -10829,7 +10944,7 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+        let (mem_snapshots, staged_keys, protected_snapshots, current_snapshot_id) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -10837,9 +10952,17 @@ impl CayenneTableProvider {
                 .iter()
                 .map(ArcSwap::load_full)
                 .collect();
+            // Same fenced instant as the full rebuild captures them in, and for the
+            // same reason — see `load_existing_pk_index`.
+            let staged_keys = self.snapshot_inflight_staged_pk_keys();
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
-            (mem_snapshots, protected_snapshots, current_snapshot_id)
+            (
+                mem_snapshots,
+                staged_keys,
+                protected_snapshots,
+                current_snapshot_id,
+            )
         };
 
         // Gate on the snapshot tag: the bloom covers the full current snapshot
@@ -10880,6 +11003,8 @@ impl CayenneTableProvider {
         // RAM-only key omitted here would false-negative its next update and leak
         // the prior copy (durable over-count). Mirrors `load_existing_pk_index`.
         Self::fold_mem_tier_keys_into_bloom(&mem_snapshots, pk_indices, converter, &mut bloom)?;
+        // …and the keys of staged appends whose files no scan can see yet.
+        Self::fold_inflight_staged_keys_into_bloom(&staged_keys, &mut bloom);
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             checkpoint_snapshot = checkpoint_snapshot.as_str(),
@@ -49204,6 +49329,222 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn keyset_rebuild_after_invalidation_no_overcount_sharded() {
         keyset_rebuild_after_invalidation_no_overcount(4).await;
+    }
+
+    /// Regression test for #13639: the pipelined staged append records its
+    /// validated primary keys BEFORE its rows are discoverable, so a keyset
+    /// rebuild landing in that window reads them from neither the table nor the
+    /// cache — and the paths that drop the cache do so on the stated premise
+    /// that a rebuild reads the commit back from the table, which is not yet
+    /// true. A key known only to the staged write then reads as new on the next
+    /// upsert, records NO supersede tombstone, and leaves two live rows for one
+    /// declared primary key.
+    ///
+    /// Deterministic, no concurrency. Seeding an upsert first is what puts the
+    /// table into `pending_pk_deletions`, which is what routes the later
+    /// all-new-keys batch through the `stage_on_conflict` arm that records early.
+    #[tokio::test]
+    async fn keyset_rebuild_sees_an_unpublished_staged_appends_keys() {
+        const STAGED_KEY: i64 = 4242;
+        let table = "keyset_rebuild_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table(table, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // 1. Seed a key and upsert it, so the table carries PK tombstones. Every
+        //    later append then takes the staged (`stage_on_conflict`) arm, which
+        //    is the only `record_file_pk_keys` call site that runs before its
+        //    publish.
+        for value in [10_i64, 20] {
+            provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[value])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed write should prepare")
+                .finish()
+                .await
+                .expect("finalize seed write");
+        }
+
+        // 2. Insert a BRAND-NEW key through that arm and HOLD the receipt: its
+        //    keys are recorded, its rows are not yet discoverable, and no other
+        //    tier holds the key. This is the window.
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: the new key must be staged, not published — otherwise \
+             the rebuild below would legitimately read it from the table"
+        );
+
+        // 3. Drop the cached keyset the way a background compaction, a
+        //    pending-log overflow, or an abandoned validation stream does.
+        provider.clear_cached_pk_keyset();
+
+        // 4. UPDATE the staged key. This rebuilds the keyset from the table,
+        //    which cannot see the staged rows; without folding the in-flight
+        //    staged keys the update false-negatives and records no tombstone.
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        // 5. Publish both, oldest first.
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let pairs = collect_id_value_pairs(&ctx, &provider, table).await;
+        let staged_rows: Vec<i64> = pairs
+            .iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(
+            staged_rows.len(),
+            1,
+            "two live rows for one primary key: the rebuild did not see the staged \
+             append's key, so the update recorded no supersede tombstone (rows for \
+             {STAGED_KEY}: {staged_rows:?})"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, table).await,
+            2,
+            "table must hold exactly the seeded key and the staged key"
+        );
+    }
+
+    /// The persisted-bloom fast path reconstructs the index without the
+    /// full-table scan, so it has the same blind spot as the rebuild above and
+    /// needs the same fold. Same window, same failure, different reconstruction:
+    /// persist a checkpoint for the current snapshot first, so the update in
+    /// step 4 is served by `try_load_persisted_pk_index` instead of
+    /// `load_existing_pk_index`.
+    #[tokio::test]
+    async fn persisted_bloom_index_sees_an_unpublished_staged_appends_keys() {
+        const STAGED_KEY: i64 = 5353;
+        let table = "persisted_bloom_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table(table, ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        for value in [10_i64, 20] {
+            provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[value])),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("seed write should prepare")
+                .finish()
+                .await
+                .expect("finalize seed write");
+        }
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: key must be staged"
+        );
+
+        // Checkpoint the CURRENT snapshot's keys into the persisted bloom. The
+        // staged append has not flipped the snapshot yet, so the fast path's
+        // snapshot gate holds and the update below takes it.
+        let current_snapshot_id = provider.get_current_snapshot_id();
+        provider
+            .try_persist_pk_bloom_checkpoint(&current_snapshot_id, 2)
+            .await
+            .expect("persist the PK bloom checkpoint");
+        provider.clear_cached_pk_keyset();
+
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let staged_rows: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            staged_rows.len(),
+            1,
+            "two live rows for one primary key: the persisted-bloom index did not \
+             carry the staged append's key (rows for {STAGED_KEY}: {staged_rows:?})"
+        );
+    }
+
+    /// The keys of an in-flight staged append are held OUTSIDE the PK cache, so
+    /// `clear_cached_pk_keyset` — which empties every cache on the premise that a
+    /// rebuild re-reads the commit from the table — cannot discard them, and they
+    /// are retired by the same registration the publish already unregisters.
+    ///
+    /// Pins the mechanism directly: the end-to-end guard above can only observe
+    /// it through a row count, so a change that kept the row count while losing
+    /// the survival property would pass there and fail here.
+    #[tokio::test]
+    async fn inflight_staged_pk_keys_survive_a_keyset_clear() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("staged_pk_keys_survive_clear", ctx.runtime_env()).await;
+
+        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)])
+            .expect("row converter for the Int64 primary key");
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef])
+            .expect("convert the primary key column");
+        let key = rows.row(0).owned();
+        let mut keys = PkDigestSet::default();
+        keys.insert_with_digest(pk_digest(&key), key.clone());
+
+        let staging_snapshot_id = "_staging/inflight-staged-keys";
+        provider.register_inflight_staging_append(staging_snapshot_id);
+        provider.attach_inflight_staged_pk_keys(staging_snapshot_id, &keys);
+
+        provider.clear_cached_pk_keyset();
+        let captured = provider.snapshot_inflight_staged_pk_keys();
+        assert_eq!(
+            captured.len(),
+            1,
+            "clearing the PK cache must not discard an in-flight staged append's keys"
+        );
+        assert!(
+            captured[0].contains_digest(pk_digest(&key)),
+            "the surviving entry must carry the staged key itself"
+        );
+
+        // The publish path's unregister is what retires them, so a rebuild after
+        // it folds nothing and reads the now-discoverable rows from the table.
+        provider.unregister_inflight_staging_append(staging_snapshot_id);
+        assert!(
+            provider.snapshot_inflight_staged_pk_keys().is_empty(),
+            "retiring the registration must release the staged keys"
+        );
     }
 
     /// Concurrent SAME-PK append seq-ordering guard (the `mem_tier_publish_lock`).
