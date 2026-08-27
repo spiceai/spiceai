@@ -83,18 +83,33 @@ impl Operation {
     }
 }
 
-/// Codes AWS returns when it will not accept the request's credentials at all — the key is
-/// unknown, the signature does not match it, or the session token has expired. Retrying cannot
-/// help; the credentials themselves have to change.
+/// Codes AWS returns when it does not accept the identity behind the request at all — the
+/// access key is unknown to AWS, no key reached it, or the session token has expired. Retrying
+/// cannot help; the credentials themselves have to change.
 const CREDENTIALS_REJECTED_CODES: &[&str] = &[
     "UnrecognizedClientException",
-    "InvalidSignatureException",
     "InvalidClientTokenId",
     "MissingAuthenticationToken",
-    "IncompleteSignature",
     "ExpiredToken",
     "ExpiredTokenException",
 ];
+
+/// Codes AWS returns when it could not verify the request's *signature*. This is deliberately
+/// not the credential class: a signature can fail to verify with a perfectly valid key pair —
+/// a host clock more than a few minutes out makes the signature expire, and a signature scoped
+/// to the wrong region is rejected as mismatched. Telling those operators to replace their keys
+/// is advice that cannot work, which is worse than saying nothing.
+const SIGNATURE_REJECTED_CODES: &[&str] = &["InvalidSignatureException", "IncompleteSignature"];
+
+/// AWS's own message distinguishes the causes behind these two codes ("Signature expired…" vs
+/// "…does not match the signature you provided"), and [`describe`] carries it through, so the
+/// remedy names every cause rather than guessing at one.
+const SIGNATURE_REMEDY: &str = concat!(
+    "AWS could not verify the request signature, which a valid key pair can still fail: ",
+    "check that the host clock is accurate (a signature expires minutes after it is made), ",
+    "that `aws_region` names the region serving this model, ",
+    "and that `aws_secret_access_key` belongs with `aws_access_key_id`."
+);
 
 /// Codes AWS returns when the credentials are valid but the identity may not make this call —
 /// a missing IAM action, or the identity not having access to this model in this region.
@@ -122,6 +137,8 @@ fn describe(
     let code = code?;
     let remedy = if CREDENTIALS_REJECTED_CODES.contains(&code) {
         operation.credentials_remedy().to_string()
+    } else if SIGNATURE_REJECTED_CODES.contains(&code) {
+        SIGNATURE_REMEDY.to_string()
     } else if ACCESS_DENIED_CODES.contains(&code) {
         // Not "request access in the console": Bedrock grants model access automatically for
         // most models now, and the ones that don't route through Marketplace or a provider
@@ -170,8 +187,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, Operation, UNKNOWN_MODEL, describe,
-        explain,
+        ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, Operation, SIGNATURE_REJECTED_CODES,
+        UNKNOWN_MODEL, describe, explain,
     };
     use aws_smithy_types::error::metadata::{ErrorMetadata, ProvideErrorMetadata};
 
@@ -343,6 +360,7 @@ mod tests {
     fn every_listed_code_is_described_and_carries_a_remedy() {
         for code in CREDENTIALS_REJECTED_CODES
             .iter()
+            .chain(SIGNATURE_REJECTED_CODES.iter())
             .chain(ACCESS_DENIED_CODES.iter())
         {
             for operation in EVERY_OPERATION {
@@ -357,14 +375,56 @@ mod tests {
     }
 
     #[test]
-    fn the_two_code_lists_are_disjoint() {
-        // A code in both lists would take whichever remedy is tested first, so the operator
-        // could be told to rotate credentials AWS had already accepted.
-        for code in CREDENTIALS_REJECTED_CODES {
-            assert!(
-                !ACCESS_DENIED_CODES.contains(code),
-                "{code} is classified as both a credential rejection and an access denial"
-            );
+    fn the_code_lists_are_pairwise_disjoint() {
+        // A code in two lists takes whichever remedy is tested first, so the operator could be
+        // told to rotate credentials AWS had already accepted, or to fix a clock when the key
+        // is simply unknown.
+        let lists = [
+            ("credentials", CREDENTIALS_REJECTED_CODES),
+            ("signature", SIGNATURE_REJECTED_CODES),
+            ("access denied", ACCESS_DENIED_CODES),
+        ];
+        for (i, (name, codes)) in lists.iter().enumerate() {
+            for (other_name, other) in &lists[i + 1..] {
+                for code in *codes {
+                    assert!(
+                        !other.contains(code),
+                        "{code} is classified as both a {name} and an {other_name} rejection"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_signature_failure_is_not_reported_as_a_bad_key_pair() {
+        // A signature can fail to verify with a valid key pair — a skewed host clock expires
+        // it, and a signature scoped to the wrong region is rejected as mismatched. An operator
+        // told to replace their keys would rotate a working key pair and still be broken.
+        // Pin the membership, not just the wording: emptying the list would leave the loop
+        // below with nothing to iterate and the test would pass with the defect restored.
+        assert_eq!(
+            SIGNATURE_REJECTED_CODES,
+            ["InvalidSignatureException", "IncompleteSignature"],
+            "a signature code moved out of this class silently takes the credential remedy"
+        );
+
+        for code in SIGNATURE_REJECTED_CODES {
+            for operation in EVERY_OPERATION {
+                let out = rendered(code, None, operation);
+                assert!(
+                    out.contains("clock") && out.contains("`aws_region`"),
+                    "{code} must name the causes a key rotation cannot fix: {out}"
+                );
+                assert!(
+                    !out.contains("to an active key pair"),
+                    "{code} must not be reported as a credential replacement: {out}"
+                );
+                assert!(
+                    !out.contains("bedrock:InvokeModel"),
+                    "{code} is not an authorization failure: {out}"
+                );
+            }
         }
     }
 
@@ -459,6 +519,30 @@ mod tests {
             !out.contains("unhandled error"),
             "the SDK rendering must not survive: {out}"
         );
+    }
+
+    #[test]
+    fn no_message_renders_with_broken_spacing() {
+        // These messages are assembled from wrapped source, and `rustfmt` joins a continued
+        // top-level `const` onto one line while keeping the indentation the continuation was
+        // meant to swallow — which put runs of spaces inside the rendered text.
+        for code in CREDENTIALS_REJECTED_CODES
+            .iter()
+            .chain(SIGNATURE_REJECTED_CODES.iter())
+            .chain(ACCESS_DENIED_CODES.iter())
+        {
+            for operation in EVERY_OPERATION {
+                let out = rendered(code, Some("an AWS message"), operation);
+                assert!(
+                    !out.contains("  "),
+                    "{code}/{operation:?} renders a run of spaces: {out}"
+                );
+                assert!(
+                    !out.contains('\n'),
+                    "{code}/{operation:?} must stay on one line: {out}"
+                );
+            }
+        }
     }
 
     #[test]
