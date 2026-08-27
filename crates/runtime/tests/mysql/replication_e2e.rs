@@ -755,7 +755,19 @@ async fn session_net_write_timeout(
             return Ok(None);
         }
     };
-    Ok(value.and_then(|value| value.parse().ok()))
+    // No row is "cannot answer" — the dump session is not instrumented — and
+    // skips the assertion. A row whose value is not a number is a different
+    // thing entirely, and folding it into the same `None` would let this test
+    // pass without ever reading the session it exists to read.
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = value.parse::<u64>().map_err(|e| {
+        anyhow!(
+            "performance_schema reported net_write_timeout = `{value}`, which is not a number: {e}"
+        )
+    })?;
+    Ok(Some(seconds))
 }
 
 /// Wait for the dump thread id to change, i.e. the pump has reconnected.
