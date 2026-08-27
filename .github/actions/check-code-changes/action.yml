@@ -62,6 +62,9 @@ inputs:
         # The reachability guard's own regression harness runs in `lint-rust`,
         # so a change to it changes what the Rust gate enforces.
         - 'scripts/test_check_module_reachability.py'
+        - 'scripts/check_fork_patches.py'
+        - 'scripts/test_check_fork_patches.py'
+        - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
 
