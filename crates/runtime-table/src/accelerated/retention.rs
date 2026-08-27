@@ -17,7 +17,7 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use crate::accelerated::{
-    DataRetentionFilter, Retention, refresh, refresh_task::collect_all_indexes,
+    DataRetentionFilter, Retention, RetentionPredicate, refresh, refresh_task::collect_all_indexes,
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
@@ -176,10 +176,8 @@ impl super::AcceleratedTable {
         loop {
             interval_timer.tick().await;
 
-            // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
-            let _lock_guard = accelerator_write_mutex.lock().await;
-
             let mut exprs = Vec::new();
+            let mut computed: Option<&Arc<dyn RetentionPredicate>> = None;
 
             // convert retention filters into data eviction expressions
             for filter in &retention.filters {
@@ -187,6 +185,12 @@ impl super::AcceleratedTable {
                     DataRetentionFilter::Expression { delete_expr } => {
                         log_retention_action(&dataset_name, "using SQL expression");
                         exprs.push(delete_expr.clone());
+                    }
+                    DataRetentionFilter::Computed { predicate } => {
+                        // Resolved below, once the static filters have been
+                        // combined — it is given their result and has the last
+                        // word on it.
+                        computed = Some(predicate);
                     }
                     DataRetentionFilter::Time {
                         period,
@@ -255,12 +259,35 @@ impl super::AcceleratedTable {
             }
 
             // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
-            let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
-                tracing::warn!(
-                    "[retention] No valid retention filters found for dataset {dataset_name}"
-                );
-                continue;
+            let configured = exprs.into_iter().map(|e| *e).reduce(Expr::or);
+
+            let expr = if let Some(predicate) = computed {
+                match predicate.delete_expr(&accelerator, configured).await {
+                    // Nothing to remove this tick is the ordinary case for a
+                    // budget that is not yet exceeded, so it is not a warning.
+                    Ok(None) => continue,
+                    Ok(Some(expr)) => expr,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[retention] Failed to resolve what to delete for dataset {dataset_name}, so it keeps whatever is past its retention until the next check. Cause: {e}"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                let Some(expr) = configured else {
+                    tracing::warn!(
+                        "[retention] No valid retention filters found for dataset {dataset_name}"
+                    );
+                    continue;
+                };
+                expr
             };
+
+            // Taken only around the delete. Resolving the predicate above can
+            // query the accelerator, and holding this across that query would
+            // stall every write for its duration.
+            let _lock_guard = accelerator_write_mutex.lock().await;
 
             if let Ok(num_records) = apply_retention_filters_once(
                 &dataset_name,

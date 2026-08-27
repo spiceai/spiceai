@@ -424,6 +424,14 @@ pub struct Acceleration {
 
     pub caching_stale_if_error: StaleIfError,
 
+    /// Byte budget for a `refresh_mode: caching` accelerator, from
+    /// `caching_max_size`. `None` leaves the cache bounded only by its TTLs.
+    pub caching_max_size: Option<u64>,
+
+    /// Row budget for a `refresh_mode: caching` accelerator, from
+    /// `caching_max_items`. `None` leaves the cache bounded only by its TTLs.
+    pub caching_max_items: Option<u64>,
+
     pub refresh_cron: Option<Arc<str>>,
 
     pub refresh_sql: Option<String>,
@@ -839,6 +847,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let caching_stale_while_revalidate_ttl =
             parse_caching_stale_while_revalidate_ttl(&mut params)?;
         let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+        let caching_max_size = parse_caching_max_size(&mut params)?;
+        let caching_max_items = parse_caching_max_items(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -863,6 +873,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             caching_ttl,
             caching_stale_while_revalidate_ttl,
             caching_stale_if_error,
+            caching_max_size,
+            caching_max_items,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -915,6 +927,8 @@ impl Default for Acceleration {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: StaleIfError::default(),
+            caching_max_size: None,
+            caching_max_items: None,
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -970,9 +984,99 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
     Ok(false)
 }
 
-/// Parse `caching_ttl` duration from params for caching mode.
+/// Parse the caching-mode entry TTL, accepted under either of its two names.
+///
+/// `caching_item_ttl` spells the suffix the runtime's other caches use
+/// (`item_ttl` on the SQL-results, search-results and embeddings caches);
+/// `caching_ttl` is the name this parameter shipped under. Both are read so
+/// neither spelling is silently ignored, and setting both to different values
+/// is an error rather than a coin flip.
 fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, ParseError> {
-    parse_duration_param(params, "caching_ttl")
+    // Both are removed unconditionally: leaving one behind would let it read
+    // as an unrecognised parameter later.
+    let ttl = parse_duration_param(params, "caching_ttl")?;
+    let item_ttl = parse_duration_param(params, "caching_item_ttl")?;
+
+    match (ttl, item_ttl) {
+        (Some(ttl), Some(item_ttl)) if ttl != item_ttl => {
+            Err(ParseError::InvalidAccelerationConfiguration {
+                detail: format!(
+                    "Conflicting cache TTLs: 'caching_ttl' is {ttl:?} but 'caching_item_ttl' is {item_ttl:?}. They name the same setting — set only one."
+                ),
+            })
+        }
+        (Some(ttl), _) => Ok(Some(ttl)),
+        (None, item_ttl) => Ok(item_ttl),
+    }
+}
+
+/// Parse `caching_max_size`, the byte budget a caching accelerator's stored
+/// rows may occupy, e.g. `512MiB`.
+fn parse_caching_max_size(params: &mut Option<Params>) -> Result<Option<u64>, ParseError> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove("caching_max_size") else {
+        return Ok(None);
+    };
+    match &value {
+        // A plain YAML integer is a byte count, so `caching_max_size: 1048576`
+        // means the same as `'1048576'` rather than being rejected.
+        spicepod::param::ParamValue::Int(n) => {
+            u64::try_from(*n)
+                .map(Some)
+                .map_err(|_| ParseError::InvalidAccelerationConfiguration {
+                    detail: format!(
+                        "Invalid 'caching_max_size' value: {n}. Expected a byte size such as '256MiB' or '1GB'."
+                    ),
+                })
+        }
+        spicepod::param::ParamValue::String(s) => {
+            // Refuse an unparseable budget rather than falling back to
+            // unbounded: this parameter is the bound, and a silent default
+            // would leave an operator believing a limit they set is in force.
+            let bytes = byte_unit::Byte::parse_str(s, true).map_err(|e| {
+                ParseError::InvalidAccelerationConfiguration {
+                    detail: format!(
+                        "Invalid 'caching_max_size' value: '{s}' ({e}). Expected a byte size such as '256MiB' or '1GB'."
+                    ),
+                }
+            })?;
+            Ok(Some(bytes.as_u64()))
+        }
+        _ => Err(ParseError::InvalidAccelerationConfiguration {
+            detail: format!(
+                "Invalid 'caching_max_size' param value: {value:?}. Expected a byte size such as '256MiB' or '1GB'."
+            ),
+        }),
+    }
+}
+
+/// Parse `caching_max_items`, the number of rows a caching accelerator may
+/// keep.
+fn parse_caching_max_items(params: &mut Option<Params>) -> Result<Option<u64>, ParseError> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove("caching_max_items") else {
+        return Ok(None);
+    };
+    let detail = || {
+        format!(
+            "Invalid 'caching_max_items' param value: {value:?}. Expected a whole number of rows, such as '10000'."
+        )
+    };
+    match &value {
+        spicepod::param::ParamValue::String(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ParseError::InvalidAccelerationConfiguration { detail: detail() }),
+        spicepod::param::ParamValue::Int(n) => u64::try_from(*n)
+            .map(Some)
+            .map_err(|_| ParseError::InvalidAccelerationConfiguration { detail: detail() }),
+        _ => Err(ParseError::InvalidAccelerationConfiguration { detail: detail() }),
+    }
 }
 
 /// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.
@@ -1041,6 +1145,7 @@ fn parse_duration_param(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use spicepod::param::ParamValue;
     use std::sync::Arc;
 
     /// The three connectors that override `DataConnector::resolve_refresh_mode`, plus
@@ -1130,6 +1235,122 @@ mod tests {
         // Test missing parameter (default)
         let result = parse_caching_stale_if_error(&mut None).expect("to parse");
         assert_eq!(result, StaleIfError::Disabled);
+    }
+
+    #[test]
+    fn caching_max_size_accepts_byte_sizes_and_refuses_anything_else() {
+        for (input, expected) in [
+            ("1024", 1024_u64),
+            ("256MiB", 256 * 1024 * 1024),
+            ("1GB", 1_000_000_000),
+        ] {
+            let params = Params::from_string_map(HashMap::from([(
+                "caching_max_size".to_string(),
+                input.to_string(),
+            )]));
+            let parsed = parse_caching_max_size(&mut Some(params))
+                .unwrap_or_else(|e| panic!("'{input}' should parse: {e}"));
+            assert_eq!(parsed, Some(expected), "for '{input}'");
+        }
+
+        // An unparseable budget must fail the dataset rather than silently
+        // leaving the cache unbounded — the parameter *is* the bound.
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_max_size".to_string(),
+            "lots".to_string(),
+        )]));
+        let err = parse_caching_max_size(&mut Some(params)).expect_err("should error");
+        assert!(
+            err.to_string().contains("caching_max_size"),
+            "error must name the parameter: {err}"
+        );
+
+        // A YAML integer is a byte count, not a type error.
+        let mut params = Params::from_string_map(HashMap::new());
+        params
+            .data
+            .insert("caching_max_size".to_string(), ParamValue::Int(1_048_576));
+        assert_eq!(
+            parse_caching_max_size(&mut Some(params)).expect("to parse"),
+            Some(1_048_576)
+        );
+
+        assert_eq!(parse_caching_max_size(&mut None).expect("to parse"), None);
+    }
+
+    #[test]
+    fn caching_max_items_accepts_a_row_count_and_refuses_anything_else() {
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_max_items".to_string(),
+            "10000".to_string(),
+        )]));
+        assert_eq!(
+            parse_caching_max_items(&mut Some(params)).expect("to parse"),
+            Some(10_000)
+        );
+
+        for invalid in ["-1", "1.5", "many", ""] {
+            let params = Params::from_string_map(HashMap::from([(
+                "caching_max_items".to_string(),
+                invalid.to_string(),
+            )]));
+            let err = parse_caching_max_items(&mut Some(params))
+                .err()
+                .unwrap_or_else(|| panic!("'{invalid}' must be refused, not silently ignored"));
+            assert!(
+                err.to_string().contains("caching_max_items"),
+                "error must name the parameter: {err}"
+            );
+        }
+
+        assert_eq!(parse_caching_max_items(&mut None).expect("to parse"), None);
+    }
+
+    #[test]
+    fn caching_item_ttl_is_accepted_as_the_entry_ttl() {
+        // `item_ttl` is the suffix the runtime's other caches use, so both
+        // spellings must reach the same setting rather than one being ignored.
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_item_ttl".to_string(),
+            "45s".to_string(),
+        )]));
+        assert_eq!(
+            parse_caching_ttl(&mut Some(params)).expect("to parse"),
+            Some(Duration::from_secs(45))
+        );
+
+        let params = Params::from_string_map(HashMap::from([(
+            "caching_ttl".to_string(),
+            "45s".to_string(),
+        )]));
+        assert_eq!(
+            parse_caching_ttl(&mut Some(params)).expect("to parse"),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn conflicting_ttl_spellings_are_an_error_not_a_coin_flip() {
+        let params = Params::from_string_map(HashMap::from([
+            ("caching_ttl".to_string(), "30s".to_string()),
+            ("caching_item_ttl".to_string(), "10m".to_string()),
+        ]));
+        let err = parse_caching_ttl(&mut Some(params)).expect_err("should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("caching_ttl") && msg.contains("caching_item_ttl"),
+            "error must name both spellings: {msg}"
+        );
+
+        // Agreeing values are fine.
+        let params = Params::from_string_map(HashMap::from([
+            ("caching_ttl".to_string(), "30s".to_string()),
+            ("caching_item_ttl".to_string(), "30s".to_string()),
+        ]));
+        assert_eq!(
+            parse_caching_ttl(&mut Some(params)).expect("to parse"),
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]
