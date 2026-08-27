@@ -296,6 +296,16 @@ impl CayenneCatalogProvider {
                 message: format!("Failed to create metadata directory '{metadata_dir}': {e}"),
             })?;
 
+        // Asked a second time, and both calls are load-bearing. A path component that does
+        // not exist resolves to itself, and `canonicalize` reports a *dangling symlink* as
+        // `NotFound` exactly as it reports an absent entry — so a `cayenne_data_dir` that is
+        // a symlink to a not-yet-existing directory compares as the literal link path, and
+        // the check above cannot see that creating the metadata directory is what makes the
+        // link live and points it at that very directory. Re-asking here closes that
+        // creation-order window, and it must happen *before* the metastore is opened below:
+        // by then a refusal would leave a `cayenne.db` behind for the next start to find.
+        Self::ensure_metastore_outside_data_dir(reported_name, &data_dir, &metadata_dir).await?;
+
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
         let catalog = Arc::new(CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?)
@@ -937,6 +947,48 @@ mod tests {
             !data_dir.exists(),
             "a refused catalog must not have created {}",
             data_dir.display()
+        );
+    }
+
+    /// Regression test for the creation-order bypass: `canonicalize` reports a dangling
+    /// symlink as `NotFound`, exactly as it reports an absent entry, so a `data_dir` that
+    /// is a symlink to a directory that does not exist yet compares as the literal link
+    /// path and reads as disjoint. Creating the metadata directory is then what makes the
+    /// link live and aims it at that directory, so the catalog would open with its data
+    /// and its metastore in one physical directory. `try_new` re-asks after the metadata
+    /// directory exists and before the metastore is opened, which is what catches it.
+    #[tokio::test]
+    async fn a_data_dir_symlinked_onto_a_not_yet_created_metastore_is_refused() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("meta");
+        let data_dir = base.path().join("data");
+
+        // Dangling on purpose: `meta` does not exist yet, so neither path resolves.
+        std::os::unix::fs::symlink(&metadata_dir, &data_dir).expect("create a dangling link");
+        assert!(
+            !metadata_dir.exists(),
+            "the link must dangle for this to be the case under test"
+        );
+
+        let mut config = config(&base.path().to_string_lossy());
+        config.data_dir = Some(data_dir.to_string_lossy().into_owned());
+        config.metadata_dir = Some(metadata_dir.to_string_lossy().into_owned());
+
+        let error = CayenneCatalogProvider::try_new(
+            config,
+            std::sync::Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+            data_components::catalog_filter::TableSelector::select_all(),
+        )
+        .await
+        .expect_err("a data directory that resolves onto the metastore must be refused");
+
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
+        assert!(
+            !metadata_dir.join("cayenne.db").exists(),
+            "the refusal must land before the metastore is created"
         );
     }
 
