@@ -118,7 +118,7 @@ pub enum Error {
 
     /// The catalog's data directory contains its own metastore.
     #[snafu(display(
-        "Failed to load catalog '{catalog_name}' (cayenne): its data directory '{data_dir}' contains the metastore at '{metadata_dir}', so clearing the data directory would delete the catalog that holds the manifests, snapshot pointers and partition rows for every Cayenne table in this instance. Set `cayenne_metadata_dir` to a directory outside `cayenne_data_dir`. See: https://spiceai.org/docs/components/catalogs/cayenne"
+        "Failed to load catalog '{catalog_name}' (cayenne): its data directory '{data_dir}' contains the metastore at '{metadata_dir}', so clearing the data directory would delete the catalog that holds the manifests, snapshot pointers and partition rows for every Cayenne table in this instance. Move that metastore directory — `cayenne.db` and its `-wal`/`-shm` sidecars — to a location outside '{data_dir}', then set `cayenne_metadata_dir` to where you moved it; repointing `cayenne_metadata_dir` without moving the files opens a new empty catalog and every existing table stops resolving. See: https://spiceai.org/docs/components/catalogs/cayenne"
     ))]
     MetastoreInsideDataDir {
         /// The catalog whose configuration was refused.
@@ -860,7 +860,11 @@ mod tests {
         for expected in [
             "trades",
             "cayenne_metadata_dir",
-            "cayenne_data_dir",
+            // The remedy has to say *move*, not merely repoint: an operator who only
+            // changes `cayenne_metadata_dir` gets a new empty catalog and every existing
+            // table stops resolving, which is the failure this refusal exists to prevent.
+            "Move that metastore directory",
+            "opens a new empty catalog",
             "https://spiceai.org/docs/components/catalogs/cayenne",
         ] {
             assert!(
