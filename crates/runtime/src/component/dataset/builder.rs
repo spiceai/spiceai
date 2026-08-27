@@ -76,13 +76,20 @@ pub struct DatasetBuilder {
 /// A function rather than an inline `tracing::warn!` so the wording — which is
 /// the whole of this feature for the person reading the log — is assertable.
 ///
+/// Single quotes around the name the operator chose, backticks around the config
+/// keys they are being told to act on, per the repo's message convention.
+///
 /// It names only the fields it was given, and does not say "the rest of the
 /// block": `ready_state` is read out of a disabled block and applied, so a claim
 /// about everything under `enabled` would be untrue for it.
 fn disabled_acceleration_warning(dataset: &str, ignored: &[String]) -> String {
+    let keys = ignored
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "Dataset {dataset} sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated.",
-        ignored.join(", ")
+        "Dataset '{dataset}' sets `acceleration.enabled: false`, so these settings in its acceleration block are read and then ignored: {keys}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     )
 }
 
@@ -485,10 +492,14 @@ mod tests {
             "api_data",
             &["engine".to_string(), "refresh_mode".to_string()],
         );
-        assert!(warning.contains("api_data"), "{warning}");
-        assert!(warning.contains("engine, refresh_mode"), "{warning}");
+        // Quoting and backticking are the repo's convention, not decoration: an
+        // unquoted name vanishes when it is empty and reads as prose when it is
+        // a word like `orders`.
+        assert!(warning.contains("'api_data'"), "{warning}");
+        assert!(warning.contains("`engine`, `refresh_mode`"), "{warning}");
         assert!(warning.contains("acceleration.enabled: false"), "{warning}");
         assert!(warning.contains("Remove `enabled: false`"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs/"), "{warning}");
     }
 
     #[test]
