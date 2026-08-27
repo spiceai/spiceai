@@ -107,16 +107,15 @@ impl GraphQLContext for PullRequestTableArgs {
         // discussion comments are enabled, each PR also retrieves discussion comments.
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
         let base = Self::BASE_QUERY_COST;
+        // The `reviewThreads` connection charges its own page size on top of the
+        // comments connection nested under each thread.
+        let review_threads =
+            Self::REVIEW_THREADS_PER_PR + (Self::REVIEW_THREADS_PER_PR * self.max_comments_fetched);
         match self.include_comments {
             PullRequestCommentType::None => Some(base),
-            PullRequestCommentType::Review => {
-                Some(base + (Self::REVIEW_THREADS_PER_PR * self.max_comments_fetched))
-            } // base + (20 review threads * comments_to_fetch)
+            PullRequestCommentType::Review => Some(base + review_threads),
             PullRequestCommentType::Discussion => Some(base + self.max_comments_fetched), // base + comments_to_fetch (discussion comments)
-            PullRequestCommentType::All => Some(
-                base + (Self::REVIEW_THREADS_PER_PR * self.max_comments_fetched)
-                    + self.max_comments_fetched,
-            ),
+            PullRequestCommentType::All => Some(base + review_threads + self.max_comments_fetched),
         }
     }
 }
@@ -267,14 +266,18 @@ impl PullRequestTableArgs {
 
     /// Point cost of one page of the query with no comments requested: 1 for
     /// the pull request connection, plus the page size of every connection
-    /// underneath it.
+    /// underneath it. A connection selected only for its `totalCount` charges 1,
+    /// the same as every other table.
     const BASE_QUERY_COST: u32 = 1 /* pullRequests */
         + 100 /* labels */
         + 25 /* commits */
         + 100 /* assignees */
         + Self::CLOSING_ISSUES_PER_PR
         + 1 /* commits(last: 1) for the check rollup */
-        + 1 /* timelineItems(last: 1) for closed_by */;
+        + 1 /* timelineItems(last: 1) for closed_by */
+        + 1 /* reviews, count only */
+        + 1 /* comments, count only */
+        + 1 /* reactions, count only */;
 
     /// Conservative upper bound on the number of nodes contributed by a
     /// single PR's non-comment fields. Kept as a constant so
@@ -1023,6 +1026,33 @@ mod tests {
         assert!(
             cost <= 2000,
             "pulls query cost {cost} exceeds the 2000-point burst, so every scan would fail"
+        );
+    }
+
+    /// The declared cost is what paces the rate controller, so a connection
+    /// added to the query without a matching point is a silent under-charge —
+    /// the controller keeps issuing requests GitHub has already stopped
+    /// accounting for. Pinning both ends forces the derivation to be redone
+    /// alongside any change to the query.
+    #[test]
+    fn query_cost_charges_every_connection_in_the_query() {
+        let base = args(PullRequestCommentType::None, crate::MAX_COMMENTS_FETCHED)
+            .query_cost()
+            .expect("pulls to declare a query cost");
+
+        // 1 pullRequests + 100 labels + 25 commits + 100 assignees
+        // + 20 closingIssuesReferences + 1 commits(last: 1) + 1 timelineItems(last: 1)
+        // + 1 each for the count-only reviews, comments and reactions.
+        assert_eq!(base, 251, "the pulls base cost no longer matches its query");
+
+        let worst_case = args(PullRequestCommentType::All, crate::MAX_COMMENTS_FETCHED)
+            .query_cost()
+            .expect("pulls to declare a query cost");
+
+        // base + 20 reviewThreads + (20 threads x 75 comments) + 75 discussion comments.
+        assert_eq!(
+            worst_case, 1846,
+            "the pulls worst-case cost no longer matches its query"
         );
     }
 }

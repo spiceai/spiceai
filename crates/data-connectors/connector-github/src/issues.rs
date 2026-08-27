@@ -83,10 +83,12 @@ impl GraphQLContext for IssuesTableArgs {
 
     fn query_cost(&self) -> Option<u32> {
         // Each connection in the query charges its page size, and 1 for the issue
-        // connection itself:
+        // connection itself. A connection selected only for its `totalCount`
+        // charges 1, the same as every other table:
         // 1 + 100 (labels) + 25 (comments) + 100 (assignees) + 1 (timelineItems)
+        // + 1 (reactions)
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(227)
+        Some(228)
     }
 }
 
