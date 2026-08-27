@@ -977,14 +977,22 @@ impl Runtime {
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     if !err.is_retriable() {
-                        error_spaced!(spaced_tracer, "{}{err}", "");
+                        error_spaced!(
+                            spaced_tracer,
+                            "Failed to initialize dataset '{}'. {err}",
+                            ds.name.table()
+                        );
                         return PermanentDatasetFailureSnafu {
                             dataset: ds.name.clone(),
                             reason: err.to_string(),
                         }
                         .fail();
                     }
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Failed to initialize dataset '{}'. {err}",
+                        ds.name.table()
+                    );
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }

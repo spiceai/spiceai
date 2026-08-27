@@ -168,6 +168,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
+qdrant = { path = "../qdrant", optional = true }
 duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
@@ -324,6 +325,13 @@ elasticsearch = [
     "dep:duration-parse",
     "search/elasticsearch",
     "runtime-search/elasticsearch",
+]
+qdrant = [
+    "data_components/qdrant",
+    "dep:qdrant",
+    "dep:duration-parse",
+    "search/qdrant",
+    "runtime-search/qdrant",
 ]
 duckdb = [
     "dep:duckdb",

@@ -630,7 +630,7 @@ Required checks in the merge queue (the `trunk` ruleset):
 
 Advisory checks that also run on `merge_group` but don't block (they can be
 promoted to required with a gate job later): `integration tests (llms)`,
-`Elasticsearch Integration Tests`, `Helm Lint`.
+`Elasticsearch Integration Tests`, `Qdrant Integration Tests`, `Helm Lint`.
 
 GitHub uses one required-checks list both before queue entry and on the merge
 queue commit. Therefore every required workflow triggers on both `pull_request`
