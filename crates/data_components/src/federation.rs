@@ -342,7 +342,8 @@ mod tests {
     /// plan renders as SQL that means something other than the plan, so a
     /// federated query returns wrong rows or fails to bind. Nothing else in this
     /// repository notices if such a fix is lost, so every one of them wants a
-    /// guard here — #13081 tracks the ones still unguarded.
+    /// guard here — #13081 is the earlier instance of this gap, and the fixes it
+    /// named are guarded below.
     ///
     /// This unparses through the federation executor, which supplies no dialect
     /// here, so the SQL is the default dialect's rather than any one connector's.
