@@ -595,7 +595,10 @@ fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
         DataType::RunEndEncoded(..)
         | DataType::Dictionary(..)
         | DataType::Union(..)
-        | DataType::Null => in_own_rows(make_array(child.clone()).logical_nulls()?, child),
+        | DataType::Null => Some(in_own_rows(
+            make_array(child.clone()).logical_nulls()?,
+            child,
+        )),
         _ => child.nulls().cloned(),
     }
 }
@@ -606,13 +609,13 @@ fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
 /// child is windowed by `child`'s offset. Anything else is a disagreement this cannot resolve, and
 /// it resolves to *every row null* rather than to none: the callers read an absent buffer as "no
 /// nulls", so returning `None` here would admit a narrowing that nothing had actually checked.
-fn in_own_rows(nulls: NullBuffer, child: &ArrayData) -> Option<NullBuffer> {
+fn in_own_rows(nulls: NullBuffer, child: &ArrayData) -> NullBuffer {
     if nulls.len() == child.len() {
-        return Some(nulls);
+        return nulls;
     }
     match child.offset().checked_add(child.len()) {
-        Some(end) if end <= nulls.len() => Some(nulls.slice(child.offset(), child.len())),
-        _ => Some(NullBuffer::new_null(child.len())),
+        Some(end) if end <= nulls.len() => nulls.slice(child.offset(), child.len()),
+        _ => NullBuffer::new_null(child.len()),
     }
 }
 
@@ -1648,7 +1651,7 @@ mod tests {
         .expect("a sparse union over one variant");
         let union_type = union.data_type().clone();
         let source = StructArray::new(
-            Fields::from(vec![Field::new("u", union_type.clone(), true)]),
+            Fields::from(vec![Field::new("u", union_type, true)]),
             vec![Arc::new(union) as ArrayRef],
             Some(NullBuffer::from(vec![false, true, true])),
         )
