@@ -33126,6 +33126,33 @@ mod tests {
         );
     }
 
+    /// Waits, holding the caller's compaction lock, for the detached post-write
+    /// compaction pass to reach that lock, find it held, and exit.
+    ///
+    /// `flush_pending_maintenance` drains the maintenance lane but only
+    /// *schedules* this pass, and the task opens with a yield — so it can first
+    /// reach for the lock after the caller releases it and consume the tier the
+    /// caller is arranging. `drain_in_flight_maintenance` cannot be used here:
+    /// it ends by taking the same lock.
+    ///
+    /// The flag is set before the task spawns and cleared on any exit, so once
+    /// it reads false with the lock still held, no scheduled pass remains.
+    async fn park_post_write_compaction(provider: &CayenneTableProvider) {
+        for _ in 0..1_000 {
+            if !provider
+                .post_write_compaction_scheduled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "the detached post-write compaction pass never parked; it would race the \
+             assertions below for the protected tier"
+        );
+    }
+
     /// Brings a freshly-written table to the state the budget assertions below
     /// describe: every insert registered as a protected snapshot, and no pending
     /// mem-tier delete left to cap the merge fence.
@@ -33237,6 +33264,7 @@ mod tests {
                 .flush_pending_maintenance()
                 .await
                 .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&finite).await;
             drop(setup_guard);
         }
 
@@ -33312,6 +33340,7 @@ mod tests {
                 .flush_pending_maintenance()
                 .await
                 .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&unbounded).await;
             drop(setup_guard);
         }
         let unbounded_before = settle_protected_tier(&unbounded, TRIGGER).await;
