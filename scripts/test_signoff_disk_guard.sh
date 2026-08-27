@@ -533,7 +533,7 @@ assert_recorder "records the ELF spelling of the same condition" \
    exit 104' \
   104 no "" no yes
 # Both halves are required, and this is the direction that costs the most if it
-# is wrong: this repo own suites assert on error strings, so a loader message
+# is wrong: this repo's own suites assert on error strings, so a loader message
 # quoted by a failing test must stay a verdict about the branch.
 assert_recorder "leaves a failure unmarked when the loader wording is only quoted" \
   'echo "assertion failed: expected Exec format error (os error 8)"
