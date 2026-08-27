@@ -139,14 +139,18 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
-        TableSource, Volatility, builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
+        expr::ScalarFunction,
     };
     use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
+    use datafusion::sql::unparser::dialect::{
+        BigQueryDialect, DefaultDialect, DuckDBDialect, PostgreSqlDialect,
+    };
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -420,5 +424,173 @@ mod tests {
         // The limit has to be taken first, so it is rendered in a scope the
         // filter sits outside of.
         assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
+    }
+
+    fn unparse_with(dialect_name: &str, dialect: &dyn Dialect, plan: &LogicalPlan) -> String {
+        Unparser::new(dialect)
+            .plan_to_sql(plan)
+            .unwrap_or_else(|error| {
+                panic!("{dialect_name} dialect should unparse the plan: {error}")
+            })
+            .to_string()
+    }
+
+    /// Byte offset of the first `needle`, or a failure naming what was looked for.
+    fn first_offset_of(sql: &str, needle: &str) -> usize {
+        let Some(at) = sql.find(needle) else {
+            panic!("expected `{needle}` in: {sql}");
+        };
+        at
+    }
+
+    /// Regression test for the empty-projection fallback: a `Projection` with no
+    /// output expressions must not unparse to an empty `SELECT` list.
+    ///
+    /// The shape arises on its own — `count(*)` planned over a view or subquery whose
+    /// columns are all pruned leaves `Projection: <empty>` over the scan. Rendered
+    /// literally that is `SELECT FROM t`, which `DuckDB` and others reject outright
+    /// with a parser error, so the federated query fails rather than returning
+    /// anything. The fork emits `SELECT 1` for dialects that refuse an empty list.
+    ///
+    /// This is deliberately not swept over every dialect. The fallback is keyed on
+    /// `Dialect::supports_empty_select_list`, and a dialect that declares it accepts
+    /// an empty list is entitled to keep one — `PostgreSqlDialect` does, and renders
+    /// `SELECT FROM "t"`. The two below are the ones that refuse it, so they are the
+    /// ones the fallback has to reach.
+    #[test]
+    fn an_empty_projection_does_not_unparse_to_an_empty_select_list() {
+        let plan = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![Field::new("a", DataType::Int32, false)]),
+            None,
+        )
+        .expect("scan t")
+        .project(Vec::<Expr>::new())
+        .expect("empty projection")
+        .build()
+        .expect("build");
+
+        let refuse_an_empty_list: Vec<(&str, Arc<dyn Dialect>)> = vec![
+            ("default", Arc::new(DefaultDialect {})),
+            ("duckdb", Arc::new(DuckDBDialect::new())),
+        ];
+        for (dialect_name, dialect) in refuse_an_empty_list {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let select_list = &sql[..first_offset_of(&sql, "FROM")];
+            assert_ne!(
+                select_list.trim(),
+                "SELECT",
+                "{dialect_name}: an empty select list is not a statement this engine will parse: {sql}"
+            );
+        }
+    }
+
+    /// A projection casting `ts` to a timestamp carrying `tz`, which is the shape
+    /// that reaches the dialect's `AT TIME ZONE` rendering.
+    fn timestamp_cast_to_zone(tz: &str) -> LogicalPlan {
+        LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )]),
+            None,
+        )
+        .expect("scan t")
+        .project(vec![cast(
+            col("t.ts"),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+        )])
+        .expect("timestamp cast")
+        .build()
+        .expect("build")
+    }
+
+    /// Regression test for the two `AT TIME ZONE` fixes the fork carries: #160 makes
+    /// the unparser emit the timezone at all, and #195 keeps `DuckDB` from receiving a
+    /// fixed *zero* offset it cannot resolve.
+    ///
+    /// Before #160 the timezone was dropped from the SQL entirely, so the remote
+    /// engine evaluated the expression in its own session timezone and returned a
+    /// different instant — silently, for every federated query touching a
+    /// `timestamptz`. #195 is the other direction: Arrow carries a fixed UTC offset
+    /// rather than an IANA name (Iceberg maps every `timestamptz` column to
+    /// `+00:00`), `DuckDB` resolves `AT TIME ZONE` through an ICU zone-name lookup,
+    /// and the result was a permanent `Unknown TimeZone '+00:00'`
+    /// ([#12528](https://github.com/spiceai/spiceai/issues/12528)).
+    ///
+    /// A *non-zero* offset is deliberately still emitted verbatim, and still rejected
+    /// by `DuckDB`: there is no safe total mapping from an offset to a zone name, and
+    /// a clear error beats a possibly-wrong instant. The named-zone arm holds
+    /// `DuckDB` to the faithful rendering so a later fix cannot suppress the zone
+    /// wholesale.
+    ///
+    /// The sweep covers the dialects whose timestamp type carries a zone at all.
+    /// `MySqlDialect` renders the cast as `DATETIME`, which has no zone to carry, so
+    /// dropping it there is the dialect being right rather than the patch being lost.
+    #[test]
+    fn a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it() {
+        let named = "America/New_York";
+        let zone_aware: Vec<(&str, Arc<dyn Dialect>)> = vec![
+            ("default", Arc::new(DefaultDialect {})),
+            ("postgres", Arc::new(PostgreSqlDialect {})),
+        ];
+        for (dialect_name, dialect) in zone_aware {
+            let sql = unparse_with(
+                dialect_name,
+                dialect.as_ref(),
+                &timestamp_cast_to_zone(named),
+            );
+            assert!(
+                sql.contains(named),
+                "{dialect_name}: the timezone was dropped, so the remote engine evaluates this in \
+                 its own session timezone and returns a different instant: {sql}"
+            );
+        }
+
+        let duckdb = DuckDBDialect::new();
+        let utc_offset = unparse_with("duckdb", &duckdb, &timestamp_cast_to_zone("+00:00"));
+        assert!(
+            !utc_offset.contains("AT TIME ZONE"),
+            "duckdb: a fixed zero offset reaches DuckDB's ICU zone-name lookup, which knows only \
+             named zones, and fails permanently with `Unknown TimeZone '+00:00'`: {utc_offset}"
+        );
+        let named_zone = unparse_with("duckdb", &duckdb, &timestamp_cast_to_zone(named));
+        assert!(
+            named_zone.contains("AT TIME ZONE") && named_zone.contains(named),
+            "duckdb: a named zone is resolvable and has to keep the faithful rendering, or the \
+             instant changes: {named_zone}"
+        );
+    }
+
+    /// Regression test for the `BigQuery` type spelling carried by fork PR #147:
+    /// `BigQuery` names the 64-bit float type `FLOAT64` and rejects `DOUBLE`.
+    ///
+    /// A cast is the common way this reaches the wire — a federated predicate
+    /// comparing a column to a float literal unparses through it — and the failure is
+    /// the whole query, not a wrong row.
+    #[test]
+    fn bigquery_names_the_float_type_the_way_bigquery_does() {
+        let plan = LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![Field::new("n", DataType::Int64, false)]),
+            None,
+        )
+        .expect("scan t")
+        .project(vec![cast(col("t.n"), DataType::Float64)])
+        .expect("float cast")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
+        assert!(
+            sql.contains("FLOAT64"),
+            "bigquery: BigQuery has no `DOUBLE` type, so this statement is rejected: {sql}"
+        );
+        assert!(
+            !sql.contains("DOUBLE"),
+            "bigquery: BigQuery has no `DOUBLE` type, so this statement is rejected: {sql}"
+        );
     }
 }

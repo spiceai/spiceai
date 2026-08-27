@@ -466,4 +466,159 @@ mod tests {
 
         Ok(())
     }
+
+    /// Run `sql` and read the single `Int64` it returns.
+    ///
+    /// The fork guards below assert counts rather than rendered batches on purpose: a
+    /// snapshot can be regenerated, and a guard that a lost patch can be made to pass
+    /// by re-recording it guards nothing.
+    async fn scalar_count(ctx: &TestSessionContext, sql: &str) -> anyhow::Result<i64> {
+        use datafusion::arrow::array::AsArray as _;
+        use datafusion::arrow::datatypes::Int64Type;
+
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let total = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .sum();
+        Ok(total)
+    }
+
+    /// Vortex has to be able to cast a `vortex.date` column to `vortex.timestamp`.
+    ///
+    /// Vortex stores a `Date32` column as the `vortex.date` extension type, and a
+    /// pushed-down `CAST(date_col AS TIMESTAMP)` is evaluated by Vortex rather than
+    /// by `DataFusion`. Upstream Vortex refuses that cast; the kernel that performs
+    /// it lives in the `spiceai/vortex` fork (fork PR #28), and a re-cut that drops
+    /// it takes no build with it — the plan still pushes the filter down and the
+    /// scan then fails on a cast Vortex no longer knows how to do.
+    ///
+    /// This asserts the kernel directly rather than through a SQL filter, because
+    /// the two are not the same question: the kernel is registered on
+    /// `ExtensionArray`, and the scan also evaluates the pushed-down predicate
+    /// against *constant* arrays built from chunk statistics, which reach a
+    /// different cast path the fork does not patch. That second path fails today
+    /// (`No CastReduce to cast constant array from vortex.date[days] to
+    /// vortex.timestamp[ns]`), so a SQL-level assertion would be pinning a bug
+    /// rather than the patch.
+    #[test]
+    fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
+        use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
+        use datafusion::arrow::datatypes::{DataType, Field, TimeUnit, TimestampMillisecondType};
+        use vortex::array::ArrayRef as VortexArrayRef;
+        use vortex::array::VortexSessionExecute;
+        use vortex::array::builtins::ArrayBuiltins;
+        use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
+        use vortex::dtype::{DType, Nullability};
+
+        // 1970-01-01, 2024-01-15, and a NULL, so the cast has to carry validity as
+        // well as values.
+        let dates = Date32Array::from(vec![Some(0), Some(19_737), None]);
+        let source = VortexArrayRef::from_arrow(&dates, true)?;
+
+        let millis = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let target = DType::from_arrow((&millis, Nullability::Nullable));
+        let cast = source.cast(target.clone())?;
+        assert_eq!(
+            cast.dtype(),
+            &target,
+            "the cast has to land on the target type"
+        );
+
+        // Read the values back rather than stopping at the type: a cast that lands
+        // on `vortex.timestamp` and puts the wrong instants in it is the failure
+        // this guard is for, and it would pass a type-and-length assertion.
+        let session = VortexSession::default();
+        let arrow = session.arrow().execute_arrow(
+            cast,
+            Some(&Field::new("event_ts", millis, true)),
+            &mut session.create_execution_ctx(),
+        )?;
+        let timestamps = arrow.as_primitive::<TimestampMillisecondType>();
+
+        assert_eq!(timestamps.len(), 3, "the cast has to preserve every row");
+        assert_eq!(timestamps.value(0), 0, "1970-01-01 is the epoch");
+        assert_eq!(
+            timestamps.value(1),
+            1_705_276_800_000,
+            "2024-01-15 is 19_737 days after the epoch, at midnight"
+        );
+        assert!(
+            timestamps.is_null(2),
+            "a NULL date has to stay NULL through the cast, not become the epoch"
+        );
+
+        Ok(())
+    }
+
+    /// A large `IN` list has to stay evaluable.
+    ///
+    /// An `IN (…)` filter is pushed into the Vortex scan as one `list_contains`
+    /// call, and Vortex evaluates it by OR-ing one equality array per list element.
+    /// Upstream accumulates those into a left-deep chain, so a list of N elements
+    /// builds a tree N deep and evaluating it recurses N frames — a large enough
+    /// `IN` list overflows the stack and takes the process down. The fork balances
+    /// the OR tree to depth `log2(N)` instead (fork PR #37).
+    ///
+    /// Losing the balance is invisible to the compiler: the same call, the same
+    /// results for the small lists every other test uses. This one is sized past the
+    /// point where a left-deep chain is a problem, so if the patch goes missing it
+    /// stops passing — by failing, or by crashing the test binary, which `nextest`
+    /// reports either way.
+    #[tokio::test]
+    async fn test_large_in_list_filter_pushdown_stays_evaluable() -> anyhow::Result<()> {
+        // Deep enough that a left-deep OR chain is thousands of levels, small enough
+        // that the balanced form is a handful of milliseconds.
+        const IN_LIST_LEN: i32 = 8_192;
+        // Rows are 0..ROWS. The IN list starts at ROWS / 2, so half of it matches a
+        // row and half of it matches nothing — a list that matched everything would
+        // pass on a filter that was dropped rather than evaluated.
+        const ROWS: i32 = 2_048;
+
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE ids \
+                    (id INT NOT NULL) \
+                STORED AS vortex \
+                LOCATION '/large_in_list/'",
+            )
+            .await?;
+
+        let values = (0..ROWS)
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.session
+            .sql(&format!("INSERT INTO ids VALUES {values}"))
+            .await?
+            .collect()
+            .await?;
+
+        let in_list = (0..IN_LIST_LEN)
+            .map(|offset| (ROWS / 2 + offset).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let matched = scalar_count(
+            &ctx,
+            &format!("SELECT count(*) FROM ids WHERE id IN ({in_list})"),
+        )
+        .await?;
+
+        assert_eq!(
+            matched,
+            i64::from(ROWS / 2),
+            "the IN list covers the upper half of the rows and nothing else"
+        );
+
+        Ok(())
+    }
 }

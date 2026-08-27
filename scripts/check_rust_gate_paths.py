@@ -66,6 +66,12 @@ RUST_SOURCE_PATHS = (
     ".cargo/config.toml",
     # Holds every -Dclippy::… flag the gate enforces.
     "Makefile",
+    # `check_fork_patches.py` validates this file against `Cargo.lock`, so it is
+    # an input the gate reads. Gated by name rather than derived: nothing in the
+    # `lint-rust` recipe names it, only the guard it feeds. Left ungated, a
+    # ledger-only edit skips the very check that would have rejected it, and the
+    # mismatch surfaces on someone else's unrelated Rust PR.
+    "docs/dev/fork_patches.md",
 )
 
 # Paths that must NOT drag in the Rust gate — otherwise the fast-track is dead

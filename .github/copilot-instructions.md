@@ -159,6 +159,8 @@ Git deps in `Cargo.toml`: always a full 40-character SHA (reproducible, unambigu
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "<full 40-char sha>" } # branch: spice
 ```
 
+**Moving a fork pin re-audits that fork's patches.** A fork branch is re-cut per upstream major, and a Spice patch not deliberately carried across is lost *silently* — the crate reverts to upstream behaviour and the fork's own tests leave with the patch (it has happened: [#13524](https://github.com/spiceai/spiceai/issues/13524), and a `SIGSEGV` that shipped). `docs/dev/fork_patches.md` records, per fork, every patch and the test **in this repo** that fails if it goes missing; `scripts/check_fork_patches.py` (in `make lint-rust`) fails the build when a pin moves without that ledger being updated. Adding a patch to a fork adds its row and a guard in the same change.
+
 ## Adding a data connector
 
 1. `data_components/src/{connector}.rs` — `TableProvider` impl
