@@ -809,10 +809,11 @@ mod tests {
     #[tokio::test]
     async fn the_default_layout_is_accepted() {
         let base = tempfile::tempdir().expect("temp dir");
-        let config = config(&base.path().to_string_lossy());
+        let base = base.path().to_string_lossy();
 
-        let data_dir = format!("{}/cayenne_cayenne/data", config.spice_data_base_path);
-        let metadata_dir = format!("{}/cayenne_cayenne/metadata", config.spice_data_base_path);
+        // The two spellings `try_new` falls back to when neither is configured.
+        let data_dir = format!("{base}/cayenne_cayenne/data");
+        let metadata_dir = format!("{base}/cayenne_cayenne/metadata");
 
         CayenneCatalogProvider::ensure_metastore_outside_data_dir(
             "cayenne",

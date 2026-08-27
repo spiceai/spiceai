@@ -357,19 +357,42 @@ mod tests {
 
     #[test]
     fn fs_probe_path_strips_every_file_scheme_spelling() {
-        assert_eq!(fs_probe_path("file:///data/cayenne"), "/data/cayenne");
+        assert_eq!(
+            fs_probe_path("file:///data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
         assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
-        assert_eq!(fs_probe_path("file://localhost/data"), "/data");
-        assert_eq!(fs_probe_path("/data/cayenne"), "/data/cayenne");
+        // An explicit authority (e.g. localhost) is dropped down to the path.
+        assert_eq!(
+            fs_probe_path("file://localhost/data/cayenne"),
+            "/data/cayenne"
+        );
+        // Plain paths pass through unchanged.
+        assert_eq!(
+            fs_probe_path("/data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
         assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
     }
 
     #[test]
     fn is_local_path_admits_local_spellings_and_refuses_object_stores() {
+        // Local absolute paths.
         assert!(is_local_path("/data/cayenne"));
+        assert!(is_local_path("/var/spice/data"));
+
+        // Local relative paths.
         assert!(is_local_path("./data"));
+        assert!(is_local_path("data/cayenne"));
+
+        // file:// URIs are local.
         assert!(is_local_path("file:///data/cayenne"));
+        assert!(is_local_path("file://localhost/data"));
+
+        // Object stores are not — including a bucket whose name contains a dash run.
         assert!(!is_local_path("s3://bucket/prefix"));
+        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
         assert!(!is_local_path("gs://bucket/prefix"));
+        assert!(!is_local_path("az://container/blob"));
     }
 }
