@@ -208,7 +208,7 @@ pub(crate) enum MaintenanceOutcome {
     /// folded into it.
     Coalesced,
     /// The operation is not configured for this table (no retention filters).
-    NotConfigured,
+    DeclinedNotConfigured,
     /// Fewer candidates than the pass's amortization threshold, so they are
     /// left for a later pass.
     DeclinedBelowThreshold,
@@ -229,7 +229,7 @@ impl MaintenanceOutcome {
             Self::Reclaimed => "reclaimed",
             Self::NoOp => "no_op",
             Self::Coalesced => "coalesced",
-            Self::NotConfigured => "not_configured",
+            Self::DeclinedNotConfigured => "declined_not_configured",
             Self::DeclinedBelowThreshold => "declined_below_threshold",
             Self::DeclinedManifestUnprovable => "declined_manifest_unprovable",
             Self::DeclinedNotDue => "declined_not_due",
@@ -306,6 +306,17 @@ mod tests {
     };
     use std::collections::HashSet;
 
+    const MAINTENANCE_OUTCOMES: [MaintenanceOutcome; 8] = [
+        MaintenanceOutcome::Reclaimed,
+        MaintenanceOutcome::NoOp,
+        MaintenanceOutcome::Coalesced,
+        MaintenanceOutcome::DeclinedNotConfigured,
+        MaintenanceOutcome::DeclinedBelowThreshold,
+        MaintenanceOutcome::DeclinedManifestUnprovable,
+        MaintenanceOutcome::DeclinedNotDue,
+        MaintenanceOutcome::Failed,
+    ];
+
     const COMPACTION_OUTCOMES: [CompactionOutcome; 17] = [
         CompactionOutcome::Committed,
         CompactionOutcome::NoOp,
@@ -340,16 +351,7 @@ mod tests {
         }
 
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for outcome in [
-            MaintenanceOutcome::Reclaimed,
-            MaintenanceOutcome::NoOp,
-            MaintenanceOutcome::Coalesced,
-            MaintenanceOutcome::NotConfigured,
-            MaintenanceOutcome::DeclinedBelowThreshold,
-            MaintenanceOutcome::DeclinedManifestUnprovable,
-            MaintenanceOutcome::DeclinedNotDue,
-            MaintenanceOutcome::Failed,
-        ] {
+        for outcome in MAINTENANCE_OUTCOMES {
             assert!(
                 seen.insert(outcome.as_str()),
                 "duplicate maintenance outcome label: {}",
@@ -379,6 +381,25 @@ mod tests {
     /// phantom refusal.
     #[test]
     fn declines_are_exactly_the_declined_prefixed_labels() {
+        // BOTH families, because the `outcome=~"declined_.*"` selector spans
+        // them: one unprefixed decline in either drops silently out of the
+        // answer to "what is stopping maintenance". `not_configured` was exactly
+        // that — a pass that never ran, invisible to the selector.
+        for outcome in MAINTENANCE_OUTCOMES {
+            let is_decline = !matches!(
+                outcome,
+                MaintenanceOutcome::Reclaimed
+                    | MaintenanceOutcome::NoOp
+                    | MaintenanceOutcome::Coalesced
+                    | MaintenanceOutcome::Failed
+            );
+            assert_eq!(
+                is_decline,
+                outcome.as_str().starts_with("declined_"),
+                "{} is labelled inconsistently with whether it is a decline",
+                outcome.as_str()
+            );
+        }
         for outcome in COMPACTION_OUTCOMES {
             let is_decline = !matches!(
                 outcome,

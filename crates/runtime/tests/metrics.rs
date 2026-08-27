@@ -402,6 +402,8 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_snapshot_manifest_files",
     "cayenne_metastore_table_rows",
     "cayenne_memory_account_bytes",
+    "cayenne_mem_tier_bytes",
+    "cayenne_scan_file_statistics_entries",
     "cayenne_memory_account_reserved_bytes",
     "cayenne_inline_cache_bytes",
     "cayenne_inline_cache_batches",

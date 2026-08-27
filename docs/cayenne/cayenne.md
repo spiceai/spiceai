@@ -1436,7 +1436,12 @@ Everything above is what the metastore *tracks*. The data directory also holds r
 - `cayenne_data_dir_bytes{table, kind}` and `cayenne_data_dir_files{table, kind}` — measured by walking the table directory, split by file role: `data` (`.vortex` anywhere under the table, *including* snapshot directories no manifest references), `deletion_vector` (under `deletions/`), `staging` (under `_staging/` — an interrupted write's residue when it outlives the write), `other` (write-ahead logs, temporaries). Role is decided by **position**, not extension: a `.vortex` under `_staging/` is staging residue.
 - `cayenne_data_dir_snapshot_dirs{table}` — snapshot directories present on disk. Far above the live snapshot count means retired directories the sweep has not reclaimed.
 
-`cayenne_data_dir_bytes{kind="data"}` materially above `cayenne_storage_bytes{tier="current"} + {tier="protected"}` is space no query can use.
+Space no query can use shows up as the directory exceeding the manifest. Aggregate the tiers before comparing — a bare `{tier="current"} + {tier="protected"}` matches on labels that differ, so it yields nothing:
+
+```promql
+sum by (table) (cayenne_data_dir_bytes{kind="data"})
+  - sum by (table) (cayenne_storage_bytes{tier=~"current|protected"})
+```
 
 **Local filesystem only.** On object storage the equivalent is a paginated LIST of the whole table prefix — a per-request charge every sample would repeat — so there the manifest figures stand alone. The walk is skipped rather than approximated, so a missing series is never mistaken for an empty directory.
 
@@ -1515,7 +1520,7 @@ Two aggregation rules follow, and getting either wrong is easy:
 Reported as a numeric gauge rather than a label for the reason `cayenne_data_storage_class` is: the value is what changes over time, and a label would spread one index across three series with two of them stale.
 
 - `cayenne_pk_index_bytes{table, site}` — approximate resident bytes of that cache, whichever representation it holds
-- `cayenne_pk_index_keys{table, site}` — keys that cache covers
+- `cayenne_pk_index_keys{table, site}` — DISTINCT keys that cache covers, published **only in exact mode**. A bloom cannot enumerate its members, so it reports `cayenne_pk_bloom_insertions` instead (see below); publishing a bloom's tally under a name that says "keys" made a hot-key workload look like unbounded cardinality growth
 - `cayenne_pk_index_budget_bytes{table, site}` — the *effective* budget for that cache: half the per-table figure on a sharded table, already clamped by whatever the fleet has left (the process-global ceiling itself is `cayenne_fleet_budget_limit_bytes{budget="pk_keyset"}`)
 
 The three are only interpretable together. Bytes alone cannot distinguish an **exact keyset growing toward its budget** (which will degrade to a bloom and give most of them back) from a **bloom already at its fixed size** (which will not shrink); the budget alone says nothing about how close the table is to that transition. `bytes / budget_bytes` at `format = 1` is the countdown to a format change.
@@ -1524,7 +1529,9 @@ The three are only interpretable together. Bytes alone cannot distinguish an **e
 
 - `cayenne_pk_index_discard_total{table, site, kind, reason}` — indexes thrown away rather than cached back. `site` (`table_keyset` / `sharded_keyset`) is the load-bearing label: a discard rate concentrated at one site points at that site's guard rather than at the workload. `reason` is `overflowed` (the pending-key log's byte cap was too small for the commit rate during a validation), `invalidated` (something superseded the table state), or `over_budget` / `replay_over_budget`.
 - `cayenne_pk_index_preserved_total{table, site, kind}` — the positive control. Without it a low discard count could equally mean a healthy preserve path or that nothing ever checked an index out.
-- `cayenne_pk_bloom_bits{table, site}` and `cayenne_pk_bloom_bits_per_key{table, site}` — that cache's filter density. A filter resident at many times the bits-per-key the sizing code asks for is invisible in the bytes alone (they look like a large cache) and in the key count alone (it looks correct); only the ratio shows it. There is no separate bloom key count: it is the same set `cayenne_pk_index_keys` reports for that `site`, and a second series would only invite the two to be summed.
+- `cayenne_pk_bloom_bits{table, site}`, `cayenne_pk_bloom_insertions{table, site}`, and `cayenne_pk_bloom_bits_per_insertion{table, site}` — that cache's filter density. A filter resident at many times the bits-per-key the sizing code asks for is invisible in the bytes alone (they look like a large cache) and in the key count alone (it looks correct); only the ratio shows it.
+
+  **The denominator is insertions, not distinct keys.** `PkBloom::insert` tallies calls, because a bloom cannot enumerate its members: re-upserting one key increments it every time, and keys long since superseded still count. So `insertions` is an *upper bound* on the distinct live keys, and `bits_per_insertion` is a *lower bound* on the true bits per distinct key. The bound runs in the useful direction — a value already above the configured target proves over-allocation, since the real density is higher still — but it cannot prove the absence of over-allocation, which is why both are named for what they actually measure.
 
   Both are emitted on **every** tick and **zeroed when that cache holds no bloom**, not skipped. A skipped gauge keeps its last value, so a cache that rebuilt an exact index would go on reporting the density of a filter that no longer exists — and a stale over-allocation reads exactly like a live one. A live bloom always allocates bits, so zero here unambiguously means "no bloom", which `cayenne_pk_index_format` states independently.
 - `cayenne_pk_bloom_split_rows_total{table, result}` — apply rows the filter split: `miss` rows skip on-conflict validation entirely, `hit` rows are validated. This is the filter's return on its resident bytes, stated directly.

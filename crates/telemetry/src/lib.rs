@@ -2817,6 +2817,54 @@ pub mod cayenne {
             .record(reserved_bytes, dimensions);
     }
 
+    static MEM_TIER_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the resident bytes of one table's in-memory CDC tier.
+    /// `dimensions` carries `table`.
+    ///
+    /// The process-global figure (`cayenne_fleet_budget_used_bytes{budget="mem_tier"}`)
+    /// says the tier is where the memory went; this says WHICH table put it
+    /// there. On a `mode: memory` table the tier holds the whole dataset
+    /// permanently, so the per-table split is what separates one such table from
+    /// a fleet of small ones.
+    pub fn track_mem_tier_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        MEM_TIER_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_mem_tier_bytes")
+                    .with_description(
+                        "Resident bytes of one Cayenne table's in-memory CDC tier — the per-table breakdown of `cayenne_fleet_budget_used_bytes{budget=\"mem_tier\"}`.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(bytes, dimensions);
+    }
+
+    static SCAN_FILE_STATISTICS_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the number of entries in one table's scan file-statistics cache.
+    /// `dimensions` carries `table`.
+    ///
+    /// ENTRIES, not bytes: `DataFusion`'s cache trait exposes only `len()`, and
+    /// the per-entry `Statistics` cannot be sized through it. The entry count is
+    /// still the growth signal that matters — the cache holds one entry per file
+    /// and nothing bounds it, so a table accumulating files accumulates entries
+    /// with them, and this is the only view of that.
+    pub fn track_scan_file_statistics_entries(entries: u64, dimensions: &[KeyValue]) {
+        SCAN_FILE_STATISTICS_ENTRIES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_scan_file_statistics_entries")
+                    .with_description(
+                        "Entries in one Cayenne table's scan file-statistics cache (one per file, unbounded). Entries rather than bytes: DataFusion's cache trait exposes no per-entry size.",
+                    )
+                    .with_unit("entries")
+                    .build()
+            })
+            .record(entries, dimensions);
+    }
+
     static INLINE_CACHE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static INLINE_CACHE_BATCHES: OnceLock<Gauge<u64>> = OnceLock::new();
 
@@ -2951,7 +2999,11 @@ pub mod cayenne {
     /// them means one is stale. A per-table maximum would hide exactly that.
     /// Do NOT sum `keys` across `site` — it double-counts every key. (Bytes do
     /// sum; keys do not.)
-    pub fn track_pk_index_shape(format: CayennePkIndexFormat, keys: u64, dimensions: &[KeyValue]) {
+    pub fn track_pk_index_shape(
+        format: CayennePkIndexFormat,
+        keys: Option<u64>,
+        dimensions: &[KeyValue],
+    ) {
         PK_INDEX_FORMAT
             .get_or_init(|| {
                 operational_meter()
@@ -2962,12 +3014,17 @@ pub mod cayenne {
                     .build()
             })
             .record(format.metric_code(), dimensions);
+        // `None` in bloom mode: publishing an insertion tally under a name that
+        // says "keys" made a hot-key workload report ever-growing cardinality.
+        let Some(keys) = keys else {
+            return;
+        };
         PK_INDEX_KEYS
             .get_or_init(|| {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_keys")
                     .with_description(
-                        "Keys one Cayenne primary-key existence cache covers — exact entries, or a bloom's inserted-key count. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
+                        "DISTINCT primary keys one Cayenne existence cache covers. Published only in exact mode, where the count is authoritative; a bloom cannot enumerate its members and reports `cayenne_pk_bloom_insertions` instead. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
                     )
                     .with_unit("keys")
                     .build()
@@ -2977,41 +3034,57 @@ pub mod cayenne {
 
     /// One primary-key cache's bloom density, sampled on the background
     /// maintenance tick.
-    ///
-    /// No key count of its own: it is the same set `cayenne_pk_index_keys`
-    /// reports for this `site`, and a second series for it would invite the two
-    /// to be summed.
     #[derive(Debug, Clone, Copy)]
     pub struct CayennePkBloomState {
         /// Bits allocated by this cache's filter, or summed across its per-shard
         /// filters — every one of them is resident.
         pub bits: u64,
-        /// Allocated bits per key covered by this cache. The configured target is
-        /// single-digit; an order of magnitude above it is over-allocation, and
-        /// on a large table that gap is the difference between a filter that
-        /// fits in memory and one that does not.
-        pub bits_per_key: f64,
+        /// INSERTION count, not distinct keys. A bloom cannot enumerate its
+        /// members, so the filter tallies calls: re-upserting one key increments
+        /// it every time, and keys long since superseded are still counted. It is
+        /// therefore an upper bound on the distinct live keys covered.
+        pub insertions: u64,
+        /// Allocated bits per INSERTION — a LOWER BOUND on the true bits per
+        /// distinct key, since insertions are at or above distinct keys.
+        ///
+        /// The bound is in the useful direction: a value already above the
+        /// configured target proves over-allocation, because the true density is
+        /// higher still. It cannot prove the absence of over-allocation, which is
+        /// why it is named for the denominator it actually has.
+        pub bits_per_insertion: f64,
     }
 
-    static PK_BLOOM_BITS_PER_KEY: OnceLock<Gauge<f64>> = OnceLock::new();
+    static PK_BLOOM_BITS_PER_INSERTION: OnceLock<Gauge<f64>> = OnceLock::new();
     static PK_BLOOM_BITS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static PK_BLOOM_INSERTIONS: OnceLock<Gauge<u64>> = OnceLock::new();
 
     /// Publishes one cache's bloom density gauges. `dimensions` carries `table`
     /// and `site`. Emit on every sample, ZEROED when that cache holds no bloom:
     /// a skipped gauge keeps its last value, so a cache that rebuilt an exact
     /// index would go on reporting a filter that no longer exists.
     pub fn track_pk_bloom(state: CayennePkBloomState, dimensions: &[KeyValue]) {
-        PK_BLOOM_BITS_PER_KEY
+        PK_BLOOM_INSERTIONS
             .get_or_init(|| {
                 operational_meter()
-                    .f64_gauge("cayenne_pk_bloom_bits_per_key")
+                    .u64_gauge("cayenne_pk_bloom_insertions")
                     .with_description(
-                        "Bits one Cayenne primary-key cache's bloom filters allocate per key it covers. Compare against the configured target — far above it is over-allocation, and resident bytes scale with the gap.",
+                        "Insertions into one Cayenne primary-key cache's bloom filters. NOT distinct keys: a bloom cannot enumerate its members, so re-upserting one key counts every time and superseded keys still count. An upper bound on the distinct live keys covered.",
+                    )
+                    .with_unit("insertions")
+                    .build()
+            })
+            .record(state.insertions, dimensions);
+        PK_BLOOM_BITS_PER_INSERTION
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_pk_bloom_bits_per_insertion")
+                    .with_description(
+                        "Bits one Cayenne primary-key cache's bloom filters allocate per INSERTION — a lower bound on the true bits per distinct key. Already above the configured target proves over-allocation; it cannot prove the absence of it.",
                     )
                     .with_unit("bits")
                     .build()
             })
-            .record(state.bits_per_key, dimensions);
+            .record(state.bits_per_insertion, dimensions);
         PK_BLOOM_BITS
             .get_or_init(|| {
                 operational_meter()

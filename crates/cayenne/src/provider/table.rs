@@ -8750,6 +8750,7 @@ impl CayenneTableProvider {
         self.sample_write_shape_metrics();
         self.sample_memory_account_metrics();
         self.sample_inline_cache_metrics();
+        self.sample_in_memory_tier_metrics();
         Self::sample_fleet_budget_metrics();
 
         // Three cadences, because the three samples differ by orders of
@@ -8803,6 +8804,34 @@ impl CayenneTableProvider {
                 "table",
                 self.table_metadata.table_name.clone(),
             )],
+        );
+    }
+
+    /// Publish the per-table size of the in-memory CDC tier and the scan
+    /// file-statistics cache.
+    ///
+    /// Both are off-pool: nothing registers them against the query memory pool,
+    /// so neither appears in any pool gauge. The mem-tier figure is the per-table
+    /// breakdown of `cayenne_fleet_budget_used_bytes{budget="mem_tier"}` — the
+    /// fleet total says the tier is where the memory went, this says which table
+    /// put it there, which is the difference between one `mode: memory` table
+    /// holding a whole dataset and a fleet of small ones.
+    fn sample_in_memory_tier_metrics(&self) {
+        let dimensions = [telemetry::KeyValue::new(
+            "table",
+            self.table_metadata.table_name.clone(),
+        )];
+        telemetry::cayenne::track_mem_tier_bytes(self.mem_tier.total_bytes(), &dimensions);
+        // Entries, not bytes: `DataFusion`'s cache trait exposes only `len()`, so
+        // the per-entry `Statistics` cannot be sized through it. One entry per
+        // file and nothing bounds it, so the count is the growth signal even
+        // without a byte figure.
+        telemetry::cayenne::track_scan_file_statistics_entries(
+            u64::try_from(datafusion_execution::cache::CacheAccessor::len(
+                &*self.scan_file_statistics,
+            ))
+            .unwrap_or(u64::MAX),
+            &dimensions,
         );
     }
 
@@ -8921,19 +8950,26 @@ impl CayenneTableProvider {
             &dimensions,
         );
 
+        // `keys` is `Some` only in exact mode. A bloom's tally counts INSERTIONS —
+        // re-upserting one key increments it every time and superseded keys still
+        // count — so publishing it as a key count made a hot-key workload report
+        // ever-growing cardinality and a falsely falling density. It goes out as
+        // `cayenne_pk_bloom_insertions` instead, named for what it is.
         let (format, keys, density) = match observed {
             PkIndexObservation::LockBusy => return,
-            PkIndexObservation::Absent => {
-                (telemetry::cayenne::CayennePkIndexFormat::Absent, 0, None)
-            }
-            PkIndexObservation::Cached((keys, Some(density))) => (
+            PkIndexObservation::Absent => (
+                telemetry::cayenne::CayennePkIndexFormat::Absent,
+                Some(0),
+                None,
+            ),
+            PkIndexObservation::Cached((_, Some(density))) => (
                 telemetry::cayenne::CayennePkIndexFormat::Bloom,
-                u64::try_from(keys).unwrap_or(u64::MAX),
+                None,
                 Some(density),
             ),
             PkIndexObservation::Cached((keys, None)) => (
                 telemetry::cayenne::CayennePkIndexFormat::Exact,
-                u64::try_from(keys).unwrap_or(u64::MAX),
+                Some(u64::try_from(keys).unwrap_or(u64::MAX)),
                 None,
             ),
         };
@@ -8945,18 +8981,22 @@ impl CayenneTableProvider {
         // that no longer exists — and a stale over-allocation reads exactly like
         // a live one. A live bloom always allocates bits, so zero unambiguously
         // means "no bloom", which `cayenne_pk_index_format` states independently.
-        let (inserted_keys, bits) = density.unwrap_or((0, 0));
+        let (insertions, bits) = density.unwrap_or((0, 0));
         #[expect(
             clippy::cast_precision_loss,
-            reason = "key and bit counts are far below f64's exact-integer range, and the ratio is a display figure"
+            reason = "insertion and bit counts are far below f64's exact-integer range, and the ratio is a display figure"
         )]
-        let bits_per_key = if bits == 0 || inserted_keys == 0 {
+        let bits_per_insertion = if bits == 0 || insertions == 0 {
             0.0
         } else {
-            bits as f64 / inserted_keys as f64
+            bits as f64 / insertions as f64
         };
         telemetry::cayenne::track_pk_bloom(
-            telemetry::cayenne::CayennePkBloomState { bits, bits_per_key },
+            telemetry::cayenne::CayennePkBloomState {
+                bits,
+                insertions,
+                bits_per_insertion,
+            },
             &dimensions,
         );
     }
@@ -17621,8 +17661,14 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if the pass produced a new snapshot.
     async fn run_one_compaction_pass(&self) -> Result<bool> {
         let pass_start = std::time::Instant::now();
+        let table_name = self.table_metadata.table_name.as_str();
 
         if self.has_inflight_staging_appends() {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::SubsetCurrent,
+                CompactionOutcome::DeclinedStagingInflight,
+            );
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -17642,6 +17688,11 @@ impl CayenneTableProvider {
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
             && maintenance_trigger.is_none()
         {
+            maintenance_metrics::track_compaction(
+                table_name,
+                CompactionKind::SubsetCurrent,
+                CompactionOutcome::DeclinedBelowTrigger,
+            );
             return Ok(false);
         }
 
@@ -22786,7 +22837,7 @@ impl CayenneTableProvider {
             maintenance_metrics::track_maintenance(
                 table_name,
                 MaintenanceOp::Retention,
-                MaintenanceOutcome::NotConfigured,
+                MaintenanceOutcome::DeclinedNotConfigured,
             );
             return Ok(0);
         }
@@ -32857,6 +32908,15 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
         let protected_len = self.protected_snapshots.load().len();
         if protected_len < min_inputs {
+            // The most common idle path for the protected-subset merge, and it
+            // recorded nothing — so "why isn't the subset merge running" had no
+            // series at all, which reads identically to the pass not being
+            // instrumented.
+            maintenance_metrics::track_compaction(
+                self.table_metadata.table_name.as_str(),
+                CompactionKind::ProtectedSubset,
+                CompactionOutcome::DeclinedBelowTrigger,
+            );
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
