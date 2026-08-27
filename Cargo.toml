@@ -271,7 +271,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "d9da7cd1f100144e37bcd233296d9112a043e146" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "0c829eb4fd6c8be4df7a70886314dd9d81e4d983" } # branch: sgrebnov/duckdb-1.4.4-as-1.10505 (spiceai-54 + the DuckDB 1.4.4 rev; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -556,7 +556,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "7229b20daf24765c84d294c52cf4b4165ca79073" } # branch: spiceai-1.5.5
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "ca13264106d24ff237f7212a71cb6595e2f8b666" } # branch: sgrebnov/duckdb-1.4.4-as-1.10505 (DuckDB 1.4.4 engine published under crate version 1.10505.0; A/B against 1.5.5 rev 7229b20daf24765c84d294c52cf4b4165ca79073)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 

@@ -7306,7 +7306,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=d9da7cd1f100144e37bcd233296d9112a043e146#d9da7cd1f100144e37bcd233296d9112a043e146"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=0c829eb4fd6c8be4df7a70886314dd9d81e4d983#0c829eb4fd6c8be4df7a70886314dd9d81e4d983"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7871,11 +7871,11 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 [[package]]
 name = "duckdb"
 version = "1.10505.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7229b20daf24765c84d294c52cf4b4165ca79073#7229b20daf24765c84d294c52cf4b4165ca79073"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=ca13264106d24ff237f7212a71cb6595e2f8b666#ca13264106d24ff237f7212a71cb6595e2f8b666"
 dependencies = [
  "arrow",
+ "calamine",
  "cast",
- "comfy-table",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
@@ -7883,6 +7883,7 @@ dependencies = [
  "num",
  "num-integer",
  "r2d2",
+ "rust_decimal",
  "strum 0.27.2",
 ]
 
@@ -11550,15 +11551,15 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.10505.0"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7229b20daf24765c84d294c52cf4b4165ca79073#7229b20daf24765c84d294c52cf4b4165ca79073"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=ca13264106d24ff237f7212a71cb6595e2f8b666#ca13264106d24ff237f7212a71cb6595e2f8b666"
 dependencies = [
  "cc",
  "flate2",
  "pkg-config",
+ "reqwest 0.12.24",
  "serde",
  "serde_json",
  "tar",
- "ureq 3.3.0",
  "vcpkg",
  "zip 6.0.0",
 ]
