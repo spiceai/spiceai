@@ -27,6 +27,7 @@ subject="$script_dir/signoff"
 
 tests_run=0
 failures=0
+skipped=0
 
 fail_test() {
   failures=$((failures + 1))
@@ -430,6 +431,36 @@ assert_preflight_lock_silent_on() {
   echo "  ok: $name"
 }
 
+# Same contract as assert_preflight_lock, but with PATH untouched so the *installed*
+# cargo answers. Used only by the drift cases below, which exist precisely to check
+# what real cargo says rather than what the stub was told to say.
+assert_preflight_lock_real() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result rc output
+  result="$(call_subject_in "$dir" 'preflight_lockfile' \
+    GITHUB_STEP_SUMMARY="$summary" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" ]]; then
+    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
+      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
+      return
+    fi
+  fi
+  echo "  ok: $name"
+}
+
 with_lock_dir="$lock_dir/with-lock"
 mkdir -p "$with_lock_dir"
 printf 'version = 4\n' >"$with_lock_dir/Cargo.lock"
@@ -461,8 +492,8 @@ assert_preflight_lock "recognises the older cargo wording too" "$with_lock_dir" 
 assert_preflight_lock "says the branch was not evaluated" "$with_lock_dir" 72 \
   "not evaluated" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
-assert_preflight_lock "names the remedy rather than only the symptom" "$with_lock_dir" 72 \
-  "commit it, and sign off again" \
+assert_preflight_lock "names a command that actually regenerates the lockfile" "$with_lock_dir" 72 \
+  "cargo update --workspace" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 # Fatal locally as well as remotely: unlike the disk floor this is not a
 # threshold someone may reasonably run under, it is a step certain to fail after
@@ -502,6 +533,52 @@ assert_preflight_lock "does not read a mention of --locked as a refusal" "$with_
 bash_dir="$(dirname "$(command -v bash)")"
 assert_preflight_lock "proceeds when cargo is unavailable" "$with_lock_dir" 0 "" \
   "PATH=$bash_dir"
+
+# A missing lockfile is a violation, not an absence of one. Asserted with the stub
+# reporting a clean pass, so the case proves the refusal happens before cargo is
+# consulted at all — and it closes a real hole: a branch that deletes Cargo.lock
+# would otherwise skip every check, and the `git status` backstop in pr.yml is the
+# other half of the same fix.
+toml_only_dir="$lock_dir/toml-only"
+mkdir -p "$toml_only_dir"
+printf '[workspace]\n' >"$toml_only_dir/Cargo.toml"
+assert_preflight_lock "stops a workspace whose Cargo.lock is missing" "$toml_only_dir" 72 \
+  "Cargo.lock is missing"
+assert_preflight_lock "says a missing lockfile left the branch unevaluated" "$toml_only_dir" 72 \
+  "not evaluated"
+assert_preflight_lock "names how to restore a missing lockfile" "$toml_only_dir" 72 \
+  "cargo update --workspace"
+
+# Drift detector. Everything above feeds the guard hand-written strings, so none of
+# it would notice cargo rewording its `--locked` diagnostic — the guard would stop
+# guarding, silently, on a toolchain bump. This case drives the *installed* cargo
+# against a lockfile that really is stale, so the wording is checked rather than
+# assumed. A crate with no dependencies resolves with no network and in well under
+# a second, which is what keeps this affordable here.
+if command -v cargo >/dev/null 2>&1; then
+  real_dir="$lock_dir/real-cargo"
+  mkdir -p "$real_dir/src"
+  printf 'fn main() {}\n' >"$real_dir/src/main.rs"
+  printf '[package]\nname = "lockdrift"\nversion = "0.2.0"\nedition = "2021"\n\n[dependencies]\n' \
+    >"$real_dir/Cargo.toml"
+  if (cd "$real_dir" && cargo generate-lockfile --offline >/dev/null 2>&1); then
+    # PATH left alone: the point is the real cargo, so the stub must not shadow it.
+    assert_preflight_lock_real "the installed cargo agrees a matching lockfile is fine" \
+      "$real_dir" 0 ""
+    # Bump the package version the lockfile just recorded, so the lock is stale in
+    # exactly the way #13598's merge was.
+    printf '[package]\nname = "lockdrift"\nversion = "0.3.0"\nedition = "2021"\n\n[dependencies]\n' \
+      >"$real_dir/Cargo.toml"
+    assert_preflight_lock_real "the installed cargo's refusal is still recognised" \
+      "$real_dir" 72 "no longer matches the workspace manifests"
+  else
+    skipped=$((skipped + 1))
+    echo "  SKIP: cargo generate-lockfile --offline failed; cannot build the drift fixture"
+  fi
+else
+  skipped=$((skipped + 1))
+  echo "  SKIP: no cargo on PATH; the cargo-wording drift cases did not run"
+fi
 
 echo
 echo "run_make_step + build_hit_disk_full"
@@ -1048,11 +1125,11 @@ assert_describe "declines the missing-target verdict for a signalled run" 71 "" 
 # as a check failure it sends them looking for a lint denial in a log containing
 # no compilation. The remedy has to be in the description itself.
 assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by someone)" \
+  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
-assert_describe "tells the author to regenerate and commit the lockfile" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by someone)" \
-  "regenerate and commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "names the command that regenerates the lockfile" 72 \
+  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
   "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
@@ -1109,4 +1186,8 @@ if [[ "$failures" -gt 0 ]]; then
   echo "${failures} of ${tests_run} tests failed"
   exit 1
 fi
-echo "all ${tests_run} tests passed"
+if [[ "$skipped" -gt 0 ]]; then
+  echo "all ${tests_run} tests passed (${skipped} group(s) skipped — see SKIP lines above)"
+else
+  echo "all ${tests_run} tests passed"
+fi

@@ -777,6 +777,85 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
+      # Ask cargo, before anything is compiled, whether Cargo.lock still describes
+      # these manifests — the question `Check if Cargo.lock is updated` asks at the
+      # very bottom of this job, after the whole suite has run.
+      #
+      # On 2026-08-26 that cost 13 merge-queue branches the better part of an hour
+      # each, and the report was the single line `Update Cargo.lock` (#13598). The
+      # staleness is born in the queue: one PR changes a version in
+      # `[workspace.package]` while another adds or renames a member, git merges
+      # both cleanly because they touch different regions of the lockfile, and the
+      # combination is stale. Neither author can see it first, because on a pull
+      # request `Attestation` is the only job that runs.
+      #
+      # `--locked` is cargo's own resolution with permission to rewrite the lock
+      # withheld, so this is the resolver answering about itself rather than a
+      # hand-rolled version diff — members inherit versions from
+      # `[workspace.package]` and dependencies resolve through `[patch]` tables, and
+      # reimplementing that would be a second resolver to keep in step with the
+      # first. (`cargo update --workspace --locked` is a plausible cheaper oracle;
+      # not adopted here because it has not been measured on this workspace.)
+      #
+      # This job only: the same batch left `Rust Lint` and `Build (release profile)`
+      # green, because they run cargo — which silently rewrites the lock — and never
+      # diff it afterwards. So one early check in the one job that reports is the
+      # whole fix, and putting it in `setup-rust` instead would have charged 40 call
+      # sites, including jobs like e2e_test_ci that deliberately start from a fresh
+      # CARGO_HOME, for a report none of them make.
+      #
+      # Cost here is one resolution pass with no compilation (~10s against this
+      # runner's warm ~/.cargo), whose registry and git-dependency fetches the build
+      # in the next steps performs anyway.
+      - name: Check Cargo.lock matches the manifests
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          set -uo pipefail
+
+          # A missing lockfile is not "nothing to check" — to cargo it is itself a
+          # `--locked` violation, and treating it as a pass opens a real hole: a
+          # branch that deletes Cargo.lock skips this step, the first unlocked cargo
+          # command recreates it as an *untracked* file, and `git diff` at the bottom
+          # of this job does not look at untracked files. Keyed on Cargo.toml so the
+          # step still no-ops anywhere that is not this workspace.
+          if [ -f Cargo.toml ] && [ ! -f Cargo.lock ]; then
+            echo "::error::Cargo.toml is present but Cargo.lock is missing, so nothing pins this build's dependency versions. Restore the lockfile (git checkout trunk -- Cargo.lock, then 'cargo update --workspace' if the manifests moved) and re-queue."
+            exit 1
+          fi
+          [ -f Cargo.lock ] || exit 0
+
+          # stderr only: the metadata itself is ~700 KB of JSON nobody here reads.
+          # `--color never` so escape sequences cannot land inside the phrase matched
+          # below.
+          if err="$(cargo metadata --locked --color never --format-version 1 2>&1 >/dev/null)"; then
+            exit 0
+          fi
+
+          # Only cargo's own refusal to rewrite the lock is a verdict about this
+          # tree. An unreachable registry or an unparseable manifest is either
+          # infrastructure or something the build reports minutes later with far
+          # better context, and reporting it here as a stale lockfile would send the
+          # reader to the wrong fix. Same principle as setup-rust's awk guard: a
+          # check that could not run must not answer the question it was asked.
+          #
+          # The wording has changed across cargo releases ("cannot update the lock
+          # file … because --locked was passed", "the lock file … needs to be updated
+          # but --locked was passed"); both name the flag, so match on that. If it
+          # changes again this step stops guarding rather than misfiring — and
+          # scripts/test_signoff_disk_guard.sh drives the *pinned* cargo against a
+          # deliberately stale fixture so that drift shows up as a failing test
+          # instead of as a check that quietly stopped working.
+          case "$err" in
+            *"--locked was passed"*)
+              echo "::error::Cargo.lock no longer matches the workspace manifests, so cargo has to rewrite it before anything can build — this run would spend the whole suite and then fail 'Check if Cargo.lock is updated'. Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and re-queue. In the merge queue this usually means one PR in the batch changed a manifest version while another added or renamed a member, and nothing regenerated the lock for the combination."
+              printf '%s\n' "$err" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "::warning::Could not check whether Cargo.lock is current: cargo metadata failed for a reason other than the lockfile being stale. Read this job's own build failure, not this step."
+          printf '%s\n' "$err" >&2
+
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
@@ -859,18 +938,25 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
-      # The backstop, kept behind the assertion `setup-rust` now makes before
-      # anything is compiled: this one can still catch a lock cargo rewrote during
-      # the run for a reason resolution alone would not have refused. What it
-      # cannot do is be the *first* report — reaching this step means the whole
-      # suite has already run, which is why the early check exists.
+      # The backstop, kept behind the early assertion above: it can still catch a
+      # lock some step in this job rewrote for a reason resolution alone would not
+      # have refused. What it cannot do is be the *first* report — reaching this step
+      # means the whole suite has already run, which is why the early check exists.
+      #
+      # `git status --porcelain --untracked-files=all` rather than `git diff`:
+      # `git diff` compares tracked content only, so a branch that *deletes*
+      # Cargo.lock and lets the first cargo command recreate it as an untracked file
+      # passes a diff-based check with the lockfile no longer in the tree at all.
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          if git diff --exit-code Cargo.lock; then
+          set -uo pipefail
+          status="$(git status --porcelain --untracked-files=all -- Cargo.lock)"
+          if [ -z "${status}" ]; then
             echo "Cargo.lock is up to date"
           else
-            echo "::error::Cargo.lock changed while this job ran, so the committed lockfile does not describe this tree. Run any cargo command on the branch, commit the regenerated Cargo.lock, and re-queue. The diff above is what cargo rewrote."
+            git diff -- Cargo.lock || true
+            echo "::error::Cargo.lock is not the committed one any more (git status: ${status}), so the lockfile in this branch does not describe the tree this job built. Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and re-queue."
             exit 1
           fi
 

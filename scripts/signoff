@@ -1232,9 +1232,13 @@ describe_check_failure() {
       # judged, and the remedy is one command. Without its own case this reads as
       # "Sign-off checks failed", which sends the author looking for a lint denial
       # in a log that contains no compilation at all.
-      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock does not match the manifests; regenerate and commit it (triggered by ${user})"
-      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — cargo would have to rewrite \`Cargo.lock\` to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run any cargo command on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
-      SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock does not match the workspace manifests (the checks did not run) — regenerate and commit it, then sign off again"
+      #
+      # "missing or out of date" because the preflight returns this kind for both:
+      # an absent Cargo.lock is a `--locked` violation in cargo's own terms, not an
+      # absence of one, and the two share a remedy.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — \`Cargo.lock\` is missing, or cargo would have to rewrite it to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run \`cargo update --workspace\` on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock is missing or does not match the workspace manifests (the checks did not run) — run 'cargo update --workspace', commit it, then sign off again"
       ;;
     *)
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
@@ -1399,18 +1403,18 @@ preflight_disk() {
 
 # Stop before the Rust checks when Cargo.lock no longer describes the manifests.
 #
-# `pr.yml` already asks this question, in `Check if Cargo.lock is updated` — the
-# last step of `Build and Test`, after the whole suite has run. So a branch whose
-# lockfile is stale builds for the better part of an hour, passes everything, and
-# then fails on a `git diff` of a file cargo rewrote on its way past. In the merge
-# queue that ejects the batch, and the batch is where this shape of staleness is
+# `pr.yml` asks this question twice now: once early in `Build and Test` (cheap and
+# named) and once at the bottom of that job as a backstop. Neither runs on a pull
+# request, though — there `Attestation` is the only job — so the merge queue is
+# where a stale lockfile is first seen, and the queue is also where this shape is
 # born: one PR changes a manifest version while another adds or renames a member,
 # git merges both cleanly because they touch different regions, and nothing
-# regenerates the lock for the combination. Neither author can see it, because on
-# a pull request `Attestation` is the only job that runs.
+# regenerates the lock for the combination. On 2026-08-26 that ejected 13 queue
+# branches, each after the better part of an hour (#13598).
 #
-# So the sign-off gate is the first place it *can* be seen, and asking cargo to
-# resolve without permission to rewrite the lock answers it in seconds.
+# The sign-off gate is therefore the first place the *author* can be told, and
+# asking cargo to resolve without permission to rewrite the lock answers it in
+# seconds.
 #
 # `--locked` rather than a hand-rolled version comparison, because the comparison
 # is cargo's resolution: members inherit versions from `[workspace.package]`,
@@ -1422,7 +1426,24 @@ preflight_disk() {
 preflight_lockfile() {
   local out rc=0
 
+  # A missing lockfile is not "nothing to check" — to cargo it is itself a
+  # `--locked` violation, and treating it as a pass would let a branch that
+  # deletes Cargo.lock through the gate entirely. Keyed on Cargo.toml so the
+  # preflight still no-ops wherever this script runs outside a Cargo workspace.
+  if [[ -f Cargo.toml && ! -f Cargo.lock ]]; then
+    local restore="Restore it (git checkout ${LINT_BASE_BRANCH} -- Cargo.lock, then 'cargo update --workspace' if the manifests moved), commit it, and sign off again."
+    info "${NO} Cargo.toml is present but Cargo.lock is missing."
+    info "  Nothing pins this branch's dependency versions, so the gate would resolve them"
+    info "  freshly and attest a build no one else can reproduce. The branch was not evaluated."
+    info "  ${restore}"
+    if is_remote_run; then
+      echo "::error title=Sign-off cannot run on this branch::Cargo.toml is present but Cargo.lock is missing. The branch was not evaluated. ${restore}"
+    fi
+    append_step_summary "### Preflight: Cargo.lock is missing"$'\n'"\`Cargo.toml\` is present but \`Cargo.lock\` is not, so nothing pins this branch's dependency versions and **the checks did not run**. ${restore}"$'\n'
+    return "$EXIT_LOCKFILE_STALE"
+  fi
   [[ -f Cargo.lock ]] || { debug "no Cargo.lock in this workspace — nothing to check"; return 0; }
+
   if ! command -v cargo >/dev/null 2>&1; then
     info "cargo not found — skipping the Cargo.lock freshness check"
     return 0
@@ -1430,8 +1451,10 @@ preflight_lockfile() {
 
   # Captured with `|| rc=$?` rather than read from $? on the next line: this
   # script runs under `set -e`, and a bare failing assignment would abort the
-  # run on cargo status before the guard could decide what it meant.
-  out="$(cargo metadata --locked --format-version 1 2>&1 >/dev/null)" || rc=$?
+  # run on cargo's status before the guard could decide what it meant.
+  # `--color never` so escape sequences cannot land inside the phrase matched
+  # below.
+  out="$(cargo metadata --locked --color never --format-version 1 2>&1 >/dev/null)" || rc=$?
   if (( rc == 0 )); then
     debug "Cargo.lock still describes the workspace manifests"
     return 0
@@ -1441,17 +1464,25 @@ preflight_lockfile() {
   # Every other failure — an unreachable registry, a manifest cargo cannot read
   # at all, a missing rustc — is either infrastructure or something the gate
   # itself reports with far better context a few minutes later, and calling it a
-  # stale lockfile here would send the reader to the wrong fix. The wording has
-  # changed across cargo releases ("cannot update the lock file … because
-  # --locked was passed", "the lock file … needs to be updated but --locked was
-  # passed"); both name the flag, so match on that rather than on a whole phrase.
+  # stale lockfile here would send the reader to the wrong fix.
+  #
+  # The wording has changed across cargo releases ("cannot update the lock file …
+  # because --locked was passed", "the lock file … needs to be updated but
+  # --locked was passed"); both name the flag, so match on that rather than on a
+  # whole phrase. If it changes again this guard stops guarding rather than
+  # misfiring — and scripts/test_signoff_disk_guard.sh drives the *installed*
+  # cargo against a deliberately stale fixture, so that drift surfaces as a
+  # failing test instead of as a check that quietly stopped working.
   if [[ "$out" != *"--locked was passed"* ]]; then
     info "warning: could not check whether Cargo.lock is current (cargo metadata exited ${rc} for another reason) — skipping that check"
     debug "cargo metadata --locked said: ${out}"
     return 0
   fi
 
-  local remedy="Run 'cargo metadata --locked' on the branch to see it, then run any cargo command to regenerate Cargo.lock, commit it, and sign off again."
+  # Not "run any cargo command": under this repo's own `--locked` habits, and for
+  # commands like `cargo fmt` that never resolve, most of them will not regenerate
+  # anything. Name one that does.
+  local remedy="Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and sign off again ('cargo metadata --locked' shows what cargo objects to)."
   info "${NO} Cargo.lock no longer matches the workspace manifests."
   info "  Cargo would have to rewrite the lockfile to build this branch, so the gate would run to"
   info "  completion and then fail on 'Check if Cargo.lock is updated'. The branch was not evaluated."
