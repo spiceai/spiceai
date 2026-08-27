@@ -629,11 +629,50 @@ else
   # and reads the root lockfile, so the guard must not read "no lockfile beside me"
   # as "this branch has no lockfile" — that would refuse every sign-off run from a
   # subdirectory with a diagnosis that is simply false.
-  if [[ -f "$lock_repo_root/Cargo.lock" && -d "$lock_repo_root/crates" ]]; then
+  #
+  # Its own two-level fixture, not a member of *this* repository. Running the guard
+  # from `crates/<x>` would walk up to the real root and resolve the whole
+  # workspace — ~2,000 locked packages across dozens of Git sources — in a job that
+  # restores no Cargo cache and allows 20 minutes. Worse, the assertion below pins
+  # the success message, and an unreachable registry makes `preflight_lockfile`
+  # fail *open* with a different one: the case would go red on a network hiccup,
+  # reporting a guard regression that had not happened. A fixture with no
+  # dependencies answers the same question offline in milliseconds.
+  #
+  # The fixture has to satisfy three conditions the case is worthless without:
+  #
+  #   - the member needs a manifest. Without one the guard returns at its `[[ -f
+  #     Cargo.toml ]]` line before cargo is invoked at all, and the case asserts
+  #     the exit status of a code path that never ran — which is what it did.
+  #   - the member must not declare `[workspace]`. Such a crate is its own
+  #     workspace root, so cargo stops there rather than walking up.
+  #   - the member must have no `Cargo.lock` beside it, or there is no walk-up.
+  #
+  # And the assertion pins the *message*, not just the status: both the walk-up and
+  # the no-manifest short-circuit return 0, so the status alone cannot tell a
+  # working case from a vacuous one.
+  walkup_root="$lock_dir/walkup"
+  walkup_member="$walkup_root/member"
+  mkdir -p "$walkup_member/src"
+  printf 'fn main() {}\n' >"$walkup_member/src/main.rs"
+  printf '[workspace]\nmembers = ["member"]\n' >"$walkup_root/Cargo.toml"
+  printf '[package]\nname = "lockwalk"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' \
+    >"$walkup_member/Cargo.toml"
+  if (cd "$walkup_root" && RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" \
+      cargo generate-lockfile --offline >/dev/null 2>&1); then
     assert_preflight_lock_real "reads the root lockfile from a member directory" \
-      "$lock_repo_root/crates" 0 "" RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+      "$walkup_member" 0 "still describes the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" SIGNOFF_DEBUG=1
+    # And it is the *root* lockfile it read. Without this, a guard that ignored the
+    # lockfile entirely from a member directory would pass the case above: remove
+    # the root lock and the same invocation has to refuse.
+    mv "$walkup_root/Cargo.lock" "$walkup_root/Cargo.lock.bak"
+    assert_preflight_lock_real "refuses from a member when the root lockfile is missing" \
+      "$walkup_member" 72 "does not describe the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+    mv "$walkup_root/Cargo.lock.bak" "$walkup_root/Cargo.lock"
   else
-    lock_fixture_unavailable "no root Cargo.lock in this checkout, so the member-directory case could not run"
+    lock_fixture_unavailable "cargo generate-lockfile --offline failed for the walk-up fixture, so the member-directory case could not run"
   fi
 fi
 
@@ -728,33 +767,124 @@ if command -v git >/dev/null 2>&1; then
 fi
 
 # $3 is the exit status postcheck_lockfile should return, $4 the snapshot to
-# compare against ("" = the lockfile was clean when the checks started).
+# compare against.
 assert_postcheck() {
   local name="$1" dir="$2" want_rc="$3" before="$4" want_output="${5:-}"
   shift 5
   _assert_lock "postcheck_lockfile '${before}'" "$name" "$dir" "$want_rc" "$want_output" "$@"
 }
 
+# The snapshot the way run_checks takes it: through the subject's own function, so
+# these cases cannot drift from what production compares.
+postcheck_snapshot() {
+  (cd "$1" && bash -c 'source "$1"; lockfile_fingerprint' _ "$subject" 2>/dev/null)
+}
+
 if [[ -z "$postcheck_repo" ]]; then
   lock_fixture_unavailable "could not create a git fixture, so postcheck_lockfile was not exercised"
 else
-  assert_postcheck "passes when the checks left the lockfile alone" "$postcheck_repo" 0 "" ""
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  assert_postcheck "passes when the checks left the lockfile alone" "$postcheck_repo" 0 "$lock_snap" ""
   printf '\n# rewritten by cargo\n' >>"$postcheck_repo/Cargo.lock"
-  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 72 "" \
+  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 72 "$lock_snap" \
     "rewrote Cargo.lock"
   assert_postcheck "says the committed lockfile no longer describes the tree" \
-    "$postcheck_repo" 72 "" "does not"
-  # `signoff -f` on a tree that was already carrying lockfile edits: the run is
-  # judged on what *it* changed, not on what it inherited. Without the snapshot
-  # this case would refuse every forced sign-off on a lockfile edit in progress.
+    "$postcheck_repo" 72 "$lock_snap" "does not"
+
+  # `signoff -f` on a tree that was already carrying lockfile edits. Both halves
+  # matter, and only a content snapshot can tell them apart — the tree reads
+  # ` M Cargo.lock` in both:
+  #
+  #   - the run is judged on what *it* changed, not on what it inherited, so an
+  #     edit already in the tree is not a refusal…
+  #   - …but a *further* rewrite by the checks is, and that is the case a porcelain
+  #     comparison silently passed.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
   assert_postcheck "ignores lockfile edits the tree already carried" "$postcheck_repo" 0 \
-    " M Cargo.lock" ""
+    "$lock_snap" ""
+  printf '\n# and again, by the gate\n' >>"$postcheck_repo/Cargo.lock"
+  assert_postcheck "refuses a further rewrite of an already-modified lockfile" \
+    "$postcheck_repo" 72 "$lock_snap" "rewrote Cargo.lock"
+
   # A lockfile deleted in the commit and recreated by cargo is untracked, not
   # modified — the state `git diff` cannot see, which is why lockfile_status asks
   # for --untracked-files=all.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
   (cd "$postcheck_repo" && git rm -q --cached Cargo.lock && printf 'version = 4\n' >Cargo.lock) >/dev/null 2>&1
-  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 72 "" \
-    "rewrote Cargo.lock"
+  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 72 \
+    "$lock_snap" "rewrote Cargo.lock"
+
+  # And a lockfile the checks deleted outright: `absent` is a fingerprint like any
+  # other, so this needs no special case in the guard — but it does need a case
+  # here, because it is the one state a digest comparison could get wrong.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  rm -f "$postcheck_repo/Cargo.lock"
+  assert_postcheck "notices a lockfile the checks deleted" "$postcheck_repo" 72 \
+    "$lock_snap" "rewrote Cargo.lock"
+  printf 'version = 4\n' >"$postcheck_repo/Cargo.lock"
+fi
+
+# The same guard where Git cannot answer at all: a directory that is not a
+# repository stands in for the supported non-colocated JJ workspace, which has no
+# `.git`. lockfile_status is empty here both before and after, so a porcelain
+# comparison sees two equal strings and passes — the hole this fixture exists to
+# keep closed. It runs whether or not git is installed, and needs no fixture repo.
+postcheck_nogit="$lock_dir/postcheck-nogit"
+mkdir -p "$postcheck_nogit"
+printf 'version = 4\n' >"$postcheck_nogit/Cargo.lock"
+lock_snap="$(postcheck_snapshot "$postcheck_nogit")"
+assert_postcheck "passes outside a git repository when the lockfile is untouched" \
+  "$postcheck_nogit" 0 "$lock_snap" ""
+printf '\n# rewritten by cargo\n' >>"$postcheck_nogit/Cargo.lock"
+assert_postcheck "refuses a rewrite outside a git repository" \
+  "$postcheck_nogit" 72 "$lock_snap" "rewrote Cargo.lock"
+
+echo
+echo "lockfile_fingerprint"
+# The snapshot the post-check compares. Its one forbidden answer is the empty
+# string: two of those are equal, so an empty answer does not weaken the guard, it
+# removes it.
+assert_fingerprint() {
+  local name="$1" dir="$2" want="$3"
+  tests_run=$((tests_run + 1))
+  local got
+  got="$(postcheck_snapshot "$dir")"
+  if [[ -z "$got" ]]; then
+    fail_test "$name: fingerprint was empty, which compares equal to any other empty answer"
+    return
+  fi
+  case "$want" in
+    absent) [[ "$got" == "absent" ]] || { fail_test "$name: expected 'absent', got '${got}'"; return; } ;;
+    present) [[ "$got" != "absent" ]] || { fail_test "$name: expected a digest, got 'absent'"; return; } ;;
+  esac
+  echo "  ok: $name"
+}
+
+fingerprint_dir="$lock_dir/fingerprint"
+mkdir -p "$fingerprint_dir"
+assert_fingerprint "answers 'absent' with no lockfile" "$fingerprint_dir" absent
+printf 'version = 4\n' >"$fingerprint_dir/Cargo.lock"
+assert_fingerprint "answers a digest for a lockfile that exists" "$fingerprint_dir" present
+
+tests_run=$((tests_run + 1))
+fingerprint_a="$(postcheck_snapshot "$fingerprint_dir")"
+printf '\n# one more line\n' >>"$fingerprint_dir/Cargo.lock"
+fingerprint_b="$(postcheck_snapshot "$fingerprint_dir")"
+if [[ "$fingerprint_a" != "$fingerprint_b" ]]; then
+  echo "  ok: the digest moves when the content does"
+else
+  fail_test "the digest did not move when Cargo.lock changed (both: ${fingerprint_a})"
+fi
+
+# Content, not mtime: a rewrite that restores the original bytes is not a rewrite
+# the merge queue would reject, and a digest that moved on touch alone would refuse
+# every run whose checks rewrote the lockfile identically.
+tests_run=$((tests_run + 1))
+printf 'version = 4\n' >"$fingerprint_dir/Cargo.lock"
+if [[ "$(postcheck_snapshot "$fingerprint_dir")" == "$fingerprint_a" ]]; then
+  echo "  ok: the digest is of content, not of mtime"
+else
+  fail_test "the digest changed for identical content, so it reads mtime rather than bytes"
 fi
 
 echo

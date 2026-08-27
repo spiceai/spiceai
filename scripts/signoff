@@ -1516,16 +1516,54 @@ preflight_lockfile() {
 
 # What `git` says about Cargo.lock right now, or the empty string when git cannot
 # answer (a JJ workspace, no repository, no git). `--untracked-files=all` because
-# the interesting states include one `git diff` cannot see: a lockfile deleted in
-# the commit and recreated by cargo is *untracked*, not modified.
+# the state a reader most needs named is one `git diff` cannot see: a lockfile
+# deleted in the commit and recreated by cargo is *untracked*, not modified.
+#
+# Diagnostic only. postcheck_lockfile decides on a lockfile_fingerprint, so an
+# empty answer here costs the operator a sentence, not the guard its verdict.
 lockfile_status() {
   # Asked of git directly rather than through $VCS: this runs before detect_vcs on
-  # some paths, and an uninitialised $VCS would silently answer "no lockfile news"
-  # — which is the one answer that must never be a guess. A colocated JJ workspace
-  # has a .git and is answered correctly; a non-colocated one has none and skips.
+  # some paths, and an uninitialised $VCS would answer "no lockfile news" for a tree
+  # that has some. A colocated JJ workspace has a .git and is answered correctly; a
+  # non-colocated one has none and skips.
   command -v git >/dev/null 2>&1 || return 0
   git rev-parse --git-dir >/dev/null 2>&1 || return 0
   git status --porcelain --untracked-files=all -- Cargo.lock 2>/dev/null || true
+}
+
+# What Cargo.lock *is* right now: `absent`, or a digest of its bytes. Read off the
+# filesystem rather than out of `git status`, for two reasons the post-check below
+# depends on:
+#
+#   - Git cannot always answer. In a non-colocated JJ workspace there is no `.git`,
+#     so lockfile_status is empty both before and after the checks, and comparing
+#     two empty strings retires the guard silently in exactly the setup that has no
+#     other backstop.
+#   - Porcelain state is coarser than content. Under `scripts/signoff -f` a tree
+#     already carrying lockfile edits reads ` M Cargo.lock`, and it still reads
+#     ` M Cargo.lock` after cargo has rewritten it further — the same string for two
+#     different files. A digest separates "the run inherited this edit" from "the
+#     run made another one", which is the distinction the post-check is for.
+lockfile_fingerprint() {
+  [[ -f Cargo.lock ]] || { printf 'absent\n'; return 0; }
+
+  local digest=""
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256 Cargo.lock 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  if [[ -z "$digest" ]] && command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum Cargo.lock 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  if [[ -z "$digest" ]]; then
+    # POSIX, so this is the floor rather than another maybe. CRC and size both, to
+    # keep it a content check and not a length check.
+    digest="$(cksum Cargo.lock 2>/dev/null | awk 'NR==1{print $1 "-" $2}')"
+  fi
+
+  # Never answer with the empty string. Two of those compare equal, so an empty
+  # answer does not degrade the guard, it retires it — the same failure mode as
+  # the git-less case above. Size alone is weaker, and says so.
+  printf '%s\n' "${digest:-size-$(wc -c <Cargo.lock 2>/dev/null | tr -d ' ')}"
 }
 
 # Refuse a sign-off whose own checks rewrote Cargo.lock.
@@ -1542,14 +1580,20 @@ lockfile_status() {
 #
 # Compared against a snapshot taken before the checks rather than against "clean",
 # so `scripts/signoff -f` on a tree that was already carrying lockfile edits is
-# judged on what *this run* changed.
+# judged on what *this run* changed. The snapshot is a lockfile_fingerprint, not a
+# `git status` line — see that function for why the porcelain state cannot carry
+# this comparison.
 postcheck_lockfile() {
   local before="$1" after
-  after="$(lockfile_status)"
+  after="$(lockfile_fingerprint)"
   [[ "$after" != "$before" ]] || return 0
 
+  # Git for the diagnostic only, never for the verdict: it names the state a reader
+  # can go look at, and it is allowed to have nothing to say.
+  local git_state
+  git_state="$(lockfile_status)"
   local remedy="Commit the regenerated Cargo.lock and sign off again."
-  info "${NO} The checks rewrote Cargo.lock (git status: ${after:-clean} — was: ${before:-clean})."
+  info "${NO} The checks rewrote Cargo.lock${git_state:+ (git status: ${git_state})}."
   info "  Cargo brought the lockfile up to date while the gate ran, so the committed one does not"
   info "  describe the tree these checks passed on, and the merge queue would reject it."
   info "  ${remedy}"
@@ -1650,7 +1694,7 @@ run_checks() {
   # post-check below can tell what the checks changed from what the tree already
   # carried under a forced run.
   local lock_before
-  lock_before="$(lockfile_status)"
+  lock_before="$(lockfile_fingerprint)"
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
