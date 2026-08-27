@@ -104,8 +104,8 @@ async fn build_time_warnings_reach_the_installed_subscriber() {
         logged.contains(TIMEOUT_WARNING),
         "the invalid-timeout warning must reach the installed subscriber, got: {logged}"
     );
-    // Emitted through `in_tracing_context`, which must defer to the subscriber
-    // already installed rather than shadow it with a temporary one.
+    // An INFO from another module further into the build, so what the window
+    // covers is the whole call rather than its first statements.
     assert!(
         logged.contains("Initialized sql results cache"),
         "the caching line must reach the installed subscriber, got: {logged}"
