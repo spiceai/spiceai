@@ -666,9 +666,20 @@ pub struct CdcSchemaEvolution {
 /// `disabled` is preserved as an explicit opt-out. `file_update` is classified *persistent*, so
 /// no resume snapshot is forced for it at all, while its recreate still empties the table: under
 /// `auto` it comes back holding only later changes (#13546). `always` is therefore the one
-/// setting that makes the restart row-safe in every mode, which is why the message names it
-/// rather than a mode carve-out. Saying this is load-bearing because the sentence two earlier
-/// promises the acceleration still holds every row it held before.
+/// setting that makes the restart row-safe under every mode *where the connector has it*, which
+/// is why the message names the setting rather than a mode carve-out. Saying this is load-bearing
+/// because the sentence two earlier promises the acceleration still holds every row it held
+/// before.
+///
+/// That qualification is not pedantry: the setting exists on only half the sources that reach
+/// here, which is why the message names both arms rather than the parameter alone. The refusal is
+/// connector-blind by construction —
+/// `install_cdc_schema_evolution` keys on `RefreshMode::Changes` alone, and the refusal itself on
+/// `CayenneWriteTarget::Partitioned`, a property of the acceleration — so every changes-capable
+/// source reaches this string. Of the six, `connector-postgres`, `connector-mysql` and
+/// `connector-dynamodb` declare `replication_initial_snapshot`; Debezium, MongoDB and `cdc_ingest`
+/// declare no initial-snapshot parameter at all. Naming the setting without that second arm would
+/// send half of them to a key their connector does not have, having promised their history back.
 // Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
 // otherwise this is dead code on Windows and `-D warnings` fails the build there.
 #[cfg(not(windows))]
@@ -681,11 +692,13 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          so the acceleration still holds every row it held before it. \
          Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
          rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
-         Under all three that restart rebuilds the schema, but it reloads the rows only when the connector's initial snapshot \
-         runs on resume, which `<connector>_replication_initial_snapshot` governs (for example `pg_replication_initial_snapshot`): \
+         Under all three that restart rebuilds the schema, but it reloads the rows only where the source can replay them. \
+         Where the connector takes an initial-snapshot setting — `pg_`, `mysql_` and `dynamodb_replication_initial_snapshot` — \
          set it to `always` before restarting if the acceleration has to come back with its history, since `auto` skips the \
-         snapshot under `mode: file_update` and `disabled` skips it under every mode. Otherwise the acceleration comes back \
-         holding only what the change stream delivers from its resume position onward. \
+         snapshot under `mode: file_update` and `disabled` skips it under every mode. Where it does not — Debezium, MongoDB \
+         and `cdc_ingest` have no such setting — the acceleration comes back holding only what the change stream delivers \
+         from its resume position onward, and restoring its history means replaying the source from an earlier position or \
+         reloading the dataset with a full refresh. \
          Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
          new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
          Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
@@ -2841,21 +2854,23 @@ impl RefreshTask {
                 // `cayenne_accelerator()` cannot resolve a provider through the
                 // partition fan-out, not because the engine cannot evolve. The
                 // "cast and carry on" fallback below is only safe when a restart
-                // repairs the divergence, and for this target it does not: the
-                // accelerator pins the partitioned provider to
-                // `SchemaEvolutionMode::Disabled` when it builds it, so a
-                // restart re-classifies and refuses again (#12999). The one
-                // exception is `mode: file_update`, and its recreate is a
-                // fallback rather than a bypass: Cayenne is in the
-                // in-place-evolution set, so registration still calls
-                // `evolve_accelerated_table_schema` first and reaches the
-                // drop-and-recreate only once the partitioned accelerator
-                // refuses. What the mode guarantees is that the recreate
-                // follows — `recreates_on_schema_mismatch` is true for it
-                // regardless of engine — so the refusal is never where the
-                // change stops. The refusal message names that mode rather than
-                // the write target, because the mode is what the operator can
-                // read off their own spicepod.
+                // repairs the divergence, and for this target a restart that
+                // *reopens* the stored table does not: the accelerator pins the
+                // partitioned provider to `SchemaEvolutionMode::Disabled` when it
+                // builds it, so registration re-classifies and refuses again
+                // (#12999). Only `mode: file` reopens. The other three come back
+                // rebuilt against the new schema — `file_update` because
+                // `recreates_on_schema_mismatch` holds for it whatever the engine,
+                // so registration calls `evolve_accelerated_table_schema` first and
+                // reaches the drop-and-recreate once the partitioned accelerator
+                // refuses in-place evolution; `file_create` because the accelerator
+                // deletes the data directory and its metastore slice at bootstrap;
+                // `memory` because nothing was persisted to reopen. The refusal
+                // itself is not mode-conditional — the guard below returns the error
+                // for every mode, because the apply cannot widen a partitioned
+                // target under any of them. The mode gates *recovery*, which is why
+                // the message names modes rather than the write target: the mode is
+                // what the operator can read off their own spicepod.
                 #[cfg(not(windows))]
                 if matches!(
                     extract_cayenne_write_target(&self.accelerator),
@@ -4423,18 +4438,33 @@ mod tests {
         // empty and no snapshot replays the history. Naming the cost is what keeps the
         // reassurance honest, so it is asserted rather than left to review.
         assert!(
-            msg.contains("reloads the rows only when the connector's initial snapshot")
+            msg.contains("reloads the rows only where the source can replay them")
                 && msg.contains("set it to `always` before restarting"),
             "a restart rebuilds the schema but not necessarily the rows, so the message must name \
              that cost and the setting that fixes it rather than let the 'still holds every row' \
              reassurance imply the rows return unconditionally: {msg}"
         );
-        // Connector-neutral on purpose: this formatter serves the generic `refresh_mode: changes`
-        // apply path, and MySQL and DynamoDB expose `mysql_`/`dynamodb_`-prefixed keys, so naming
-        // only the PostgreSQL one would send those operators to a setting that does not exist.
+        // Both arms, because this formatter serves the generic `refresh_mode: changes` apply path
+        // and the refusal is connector-blind: it keys on `CayenneWriteTarget::Partitioned`, a
+        // property of the acceleration, so every changes-capable source reaches this one string.
+        // Only half of them declare the setting — `connector-postgres`, `connector-mysql` and
+        // `connector-dynamodb` do; Debezium, MongoDB and `cdc_ingest` declare no initial-snapshot
+        // parameter at all. Naming the setting alone sent that second half to a key their
+        // connector does not have, having just promised their history would come back.
         assert!(
-            msg.contains("`<connector>_replication_initial_snapshot`"),
-            "the remediation must use the connector-neutral parameter vocabulary: {msg}"
+            msg.contains("`pg_`, `mysql_` and `dynamodb_replication_initial_snapshot`"),
+            "the setting must be named for exactly the connectors that declare it: {msg}"
+        );
+        assert!(
+            msg.contains("Debezium, MongoDB and `cdc_ingest` have no such setting"),
+            "the sources with no initial-snapshot setting must be told so, and told what restoring \
+             their history actually takes, rather than left to look for a key they do not have: \
+             {msg}"
+        );
+        assert!(
+            msg.contains("replaying the source from an earlier position or")
+                && msg.contains("reloading the dataset with a full refresh"),
+            "the no-setting arm needs a remedy, not just the bad news: {msg}"
         );
         // No mode may be advertised as row-safe without the snapshot: `file_update` is classified
         // persistent, so `auto` forces no resume snapshot for it while its recreate still empties
