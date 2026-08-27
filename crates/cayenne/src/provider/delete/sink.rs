@@ -736,15 +736,14 @@ impl CayenneDeletionSink {
 
         // One source for the whole key-based path: the visibility-filtered plan when the
         // caller supplied one, else the raw listings. See `live_scan_plan`.
-        let scan_plans: Vec<Arc<dyn ExecutionPlan>> = match &self.live_scan_plan {
-            Some(plan) => vec![Arc::clone(plan)],
-            None => {
-                let mut plans = Vec::with_capacity(tables.len());
-                for table in tables {
-                    plans.push(table.scan(&ctx.state(), None, &[], None).await?);
-                }
-                plans
+        let scan_plans: Vec<Arc<dyn ExecutionPlan>> = if let Some(plan) = &self.live_scan_plan {
+            vec![Arc::clone(plan)]
+        } else {
+            let mut plans = Vec::with_capacity(tables.len());
+            for table in tables {
+                plans.push(table.scan(&ctx.state(), None, &[], None).await?);
             }
+            plans
         };
 
         // PK-IN-list fast path: when the filter encodes the PK deletion values
