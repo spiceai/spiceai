@@ -786,10 +786,10 @@ else
   lock_snap="$(postcheck_snapshot "$postcheck_repo")"
   assert_postcheck "passes when the checks left the lockfile alone" "$postcheck_repo" 0 "$lock_snap" ""
   printf '\n# rewritten by cargo\n' >>"$postcheck_repo/Cargo.lock"
-  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 72 "$lock_snap" \
+  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 73 "$lock_snap" \
     "rewrote Cargo.lock"
   assert_postcheck "says the committed lockfile no longer describes the tree" \
-    "$postcheck_repo" 72 "$lock_snap" "does not"
+    "$postcheck_repo" 73 "$lock_snap" "does not"
 
   # `signoff -f` on a tree that was already carrying lockfile edits. Both halves
   # matter, and only a content snapshot can tell them apart — the tree reads
@@ -804,14 +804,14 @@ else
     "$lock_snap" ""
   printf '\n# and again, by the gate\n' >>"$postcheck_repo/Cargo.lock"
   assert_postcheck "refuses a further rewrite of an already-modified lockfile" \
-    "$postcheck_repo" 72 "$lock_snap" "rewrote Cargo.lock"
+    "$postcheck_repo" 73 "$lock_snap" "rewrote Cargo.lock"
 
   # A lockfile deleted in the commit and recreated by cargo is untracked, not
   # modified — the state `git diff` cannot see, which is why lockfile_status asks
   # for --untracked-files=all.
   lock_snap="$(postcheck_snapshot "$postcheck_repo")"
   (cd "$postcheck_repo" && git rm -q --cached Cargo.lock && printf 'version = 4\n' >Cargo.lock) >/dev/null 2>&1
-  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 72 \
+  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 73 \
     "$lock_snap" "rewrote Cargo.lock"
 
   # And a lockfile the checks deleted outright: `absent` is a fingerprint like any
@@ -819,7 +819,7 @@ else
   # here, because it is the one state a digest comparison could get wrong.
   lock_snap="$(postcheck_snapshot "$postcheck_repo")"
   rm -f "$postcheck_repo/Cargo.lock"
-  assert_postcheck "notices a lockfile the checks deleted" "$postcheck_repo" 72 \
+  assert_postcheck "notices a lockfile the checks deleted" "$postcheck_repo" 73 \
     "$lock_snap" "rewrote Cargo.lock"
   printf 'version = 4\n' >"$postcheck_repo/Cargo.lock"
 fi
@@ -837,7 +837,7 @@ assert_postcheck "passes outside a git repository when the lockfile is untouched
   "$postcheck_nogit" 0 "$lock_snap" ""
 printf '\n# rewritten by cargo\n' >>"$postcheck_nogit/Cargo.lock"
 assert_postcheck "refuses a rewrite outside a git repository" \
-  "$postcheck_nogit" 72 "$lock_snap" "rewrote Cargo.lock"
+  "$postcheck_nogit" 73 "$lock_snap" "rewrote Cargo.lock"
 
 echo
 echo "lockfile_fingerprint"
@@ -1210,6 +1210,24 @@ assert_failure_kind "keeps a stale lockfile distinct with a cache hit recorded" 
 # ...and it must not swallow a genuinely signalled run, which is decided first.
 assert_failure_kind "a signalled run stays signalled, not a stale lockfile" 72 "signalled" \
   SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The fifth way, and the only one that follows a suite that *passed*: the
+# post-check found the checks had rewritten Cargo.lock. It must not share
+# stale-lockfile's status, because that kind publishes "the checks did not run"
+# — false here, and the reason this distinction exists at all.
+assert_failure_kind "calls a rewritten lockfile its own kind, not a stale one" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "keeps a rewritten lockfile distinct from a check failure" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 200)"
+# The post-check read the file itself, so no later reading may overrule it —
+# including a watched build's, which by definition ran and passed here.
+assert_failure_kind "keeps a rewritten lockfile distinct on a near-empty volume" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a rewritten lockfile distinct with a cache hit recorded" 73 \
+  "rewritten-lockfile" SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and, as for every other named cause, "no verdict" still outranks it.
+assert_failure_kind "a signalled run stays signalled, not a rewritten lockfile" 73 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -1382,6 +1400,35 @@ assert_describe() {
   echo "  ok: $name"
 }
 
+# What a verdict must *not* say. The two lockfile kinds are distinguished by
+# exactly this: sharing a status made the post-check publish the preflight's
+# "the checks did not run", so a positive assertion on the new wording would not
+# have caught the bug — only an assertion that the old wording is absent does.
+assert_describe_lacks() {
+  local name="$1" check_status="$2" forbidden="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local result rc output
+  result="$(call_subject \
+    "describe_check_failure ${check_status} 21195 someone
+     printf 'DESC[%s]\nMSG[%s]\nSUM[%s]\n' \
+       \"\$SIGNOFF_FAILURE_STATUS_DESC\" \"\$SIGNOFF_FAILURE_MESSAGE\" \"\$SIGNOFF_FAILURE_SUMMARY\"" \
+    "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ "$output" == *"${forbidden}"* ]]; then
+    fail_test "$name: verdict must not contain '${forbidden}', got: ${output}"
+    return
+  fi
+  echo "  ok: $name"
+}
+
 # The regression, stated as the contract: run 30942941645 on PR #12448 timed out
 # with the suite still passing, and published "Sign-off checks failed after
 # 21195s" — a code failure that had not happened, on top of a `signoff=success`
@@ -1439,6 +1486,25 @@ assert_describe "names the command that regenerates the lockfile" 72 \
   "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
+  "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The post-check's refusal is the one that follows a *passing* suite, and its
+# whole reason for having a status of its own is that the two must read
+# differently. Both halves are asserted: what it does say, and what it must not.
+assert_describe "says a rewritten lockfile passed its checks, not that they failed" 73 \
+  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "the checks passed" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "names committing the regenerated lockfile as the remedy" 73 \
+  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "commit the regenerated Cargo.lock and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
+# The regression this distinction exists to prevent, stated as a contract: the
+# post-check must never publish the preflight's "did not run" wording.
+assert_describe_lacks "does not claim the checks did not run for a rewritten lockfile" 73 \
+  "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not claim the branch was not evaluated for a rewritten lockfile" 73 \
+  "the branch was not evaluated" STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and "no verdict" outranks this cause too.
+assert_describe "declines the rewritten-lockfile verdict for a signalled run" 73 "" \
   "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 echo
 

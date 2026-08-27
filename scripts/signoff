@@ -811,6 +811,14 @@ readonly EXIT_MAKE_TARGET_MISSING=71
 # manifests, so cargo would have to rewrite it before anything could be built —
 # see preflight_lockfile.
 readonly EXIT_LOCKFILE_STALE=72
+# run_checks returns this when the checks themselves rewrote Cargo.lock, so the
+# committed lockfile does not describe the tree they passed on — see
+# postcheck_lockfile. Deliberately *not* EXIT_LOCKFILE_STALE: that status means
+# the gate refused before compiling anything, and describe_check_failure says so
+# in as many words. This one is the opposite shape — the checks ran and passed,
+# and only the attestation is refused — so it needs its own kind to avoid
+# publishing "the checks did not run" about a run whose whole suite is green.
+readonly EXIT_LOCKFILE_REWRITTEN=73
 # Bash reports a foreground child killed by signal N as 128+N, and run_make_step
 # returns make's own status untouched. So a status at or above this means `make`
 # never reached a verdict of its own — the process tree was signalled. That is
@@ -1159,6 +1167,15 @@ failure_kind() {
     return
   fi
 
+  # Not a preflight at all, and the one kind here that follows a *passing* suite:
+  # the post-check found that lint and nextest rewrote Cargo.lock on their way
+  # past. Same absolute authority as the preflights above — the post-check read
+  # the file itself — but the opposite story, so it must not share their status.
+  if [[ "$check_status" -eq "$EXIT_LOCKFILE_REWRITTEN" ]]; then
+    echo "rewritten-lockfile"
+    return
+  fi
+
   # If we watched the build, the watch decides — both ways. No ENOSPC line means
   # the build ran out of many things but not disk, and a free-space reading must
   # not overrule that: on a shared pool another run can drag the volume under any
@@ -1253,6 +1270,18 @@ describe_check_failure() {
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — \`Cargo.lock\` is missing, or cargo would have to rewrite it to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run \`cargo update --workspace\` on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock is missing or does not match the workspace manifests (the checks did not run) — run 'cargo update --workspace', commit it, then sign off again"
+      ;;
+    rewritten-lockfile)
+      # The inverse of every case above: the checks *did* run, and they passed.
+      # What is refused is the attestation, because cargo brought Cargo.lock up to
+      # date while they ran, so the tree they passed on is not the tree the commit
+      # describes. Saying "the checks did not run" here — which sharing
+      # stale-lockfile's status would do — sends the author to look for a lint
+      # denial in a log full of green, and understates the remedy: there is
+      # nothing in the diff to fix, only a regenerated lockfile to commit.
+      SIGNOFF_FAILURE_STATUS_DESC="Checks passed in ${elapsed}s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Cannot attest** after ${elapsed}s — **the checks ran and passed**, but cargo brought \`Cargo.lock\` up to date while they ran, so the committed lockfile does not describe the tree they passed on and the merge queue would reject it. Nothing here is a statement about the code, and there is nothing in the diff to fix. Commit the regenerated \`Cargo.lock\` and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off cannot attest this branch: the checks passed, but they rewrote Cargo.lock — commit the regenerated Cargo.lock and sign off again"
       ;;
     *)
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
@@ -1601,7 +1630,8 @@ postcheck_lockfile() {
     echo "::error title=Sign-off cannot attest this branch::The checks rewrote Cargo.lock, so the committed lockfile does not describe the tree they passed on. ${remedy}"
   fi
   append_step_summary "### Cargo.lock was rewritten by the checks"$'\n'"Cargo brought \`Cargo.lock\` up to date while the gate ran, so the committed one does not describe the tree these checks passed on and **the merge queue would reject it**. ${remedy}"$'\n'
-  return "$EXIT_LOCKFILE_STALE"
+  # Not EXIT_LOCKFILE_STALE: these checks completed and passed. See that constant.
+  return "$EXIT_LOCKFILE_REWRITTEN"
 }
 
 # Unit tests for the packages a branch touched, run before the full workspace
