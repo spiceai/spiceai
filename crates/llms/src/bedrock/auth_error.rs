@@ -67,17 +67,27 @@ impl Operation {
     /// The credential parameters this component accepts. `aws_profile` is embeddings-only —
     /// `BedrockModelParams` neither accepts nor forwards it — so a chat remedy that named it
     /// would send the operator to a setting the chat path ignores.
+    ///
+    /// The precedence in the remedy is real and load-bearing:
+    /// `aws_sdk_credential_bridge::initiate_config_with_credentials` installs a static
+    /// credentials provider whenever both key parameters are set and never consults
+    /// `aws_iam_role_source`, and a later `profile_name` does not displace it. An operator who
+    /// adds the fallback while leaving the rejected keys in place keeps sending those keys.
     fn credentials_remedy(self) -> &'static str {
         match self {
             Self::Chat | Self::ChatStream => {
-                "Set `aws_access_key_id` and `aws_secret_access_key` to an active key pair (and \
-                 `aws_session_token` if the credentials are temporary), or set \
-                 `aws_iam_role_source` to resolve them instead."
+                "Replace `aws_access_key_id` and `aws_secret_access_key` with an active key pair \
+                 (and `aws_session_token` if the credentials are temporary). To resolve \
+                 credentials some other way, remove both of those parameters first and then set \
+                 `aws_iam_role_source` — an explicit key pair takes precedence and is sent even \
+                 when a role source is configured."
             }
             Self::Embeddings => {
-                "Set `aws_access_key_id` and `aws_secret_access_key` to an active key pair (and \
-                 `aws_session_token` if the credentials are temporary), or set \
-                 `aws_iam_role_source` or `aws_profile` to resolve them instead."
+                "Replace `aws_access_key_id` and `aws_secret_access_key` with an active key pair \
+                 (and `aws_session_token` if the credentials are temporary). To resolve \
+                 credentials some other way, remove both of those parameters first and then set \
+                 `aws_iam_role_source` or `aws_profile` — an explicit key pair takes precedence \
+                 and is sent even when a role source or profile is configured."
             }
         }
     }
@@ -117,11 +127,22 @@ const SIGNATURE_REMEDY: &str = concat!(
 );
 
 /// Codes AWS returns when it knows the identity but will not let this call through — a missing
-/// IAM action, or the account or identity not having access to this model in this region.
+/// IAM action, or the identity not having access to this model in this region.
 ///
-/// `NotAuthorized` and `OptInRequired` are from AWS's common-error set rather than Bedrock's own
-/// modelled errors, so they arrive unmodelled exactly as the credential codes do.
-const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "NotAuthorized", "OptInRequired"];
+/// `NotAuthorized` is from AWS's common-error set rather than Bedrock's own modelled errors, so
+/// it arrives unmodelled exactly as the credential codes do.
+const ACCESS_DENIED_CODES: &[&str] = &["AccessDeniedException", "NotAuthorized"];
+
+/// The code AWS returns when the *account* is not subscribed to the service, rather than the
+/// identity lacking a permission. An IAM grant cannot resolve it, and suggesting one would
+/// broaden access while Bedrock stays unavailable — so it is deliberately not an access denial.
+const NOT_SUBSCRIBED_CODES: &[&str] = &["OptInRequired"];
+
+const NOT_SUBSCRIBED_REMEDY: &str = concat!(
+    "Amazon Bedrock is not enabled for this AWS account in the region set by `aws_region`. ",
+    "Enable Bedrock for the account in that region and request access to this model there; ",
+    "no IAM grant on the identity can resolve this."
+);
 
 #[derive(Debug, Snafu)]
 #[snafu(display("Failed to call Bedrock model '{model_id}': {detail}. {remedy} See: {docs_url}"))]
@@ -167,6 +188,8 @@ fn describe(
         operation.credentials_remedy().to_string()
     } else if SIGNATURE_REJECTED_CODES.contains(&code) {
         SIGNATURE_REMEDY.to_string()
+    } else if NOT_SUBSCRIBED_CODES.contains(&code) {
+        NOT_SUBSCRIBED_REMEDY.to_string()
     } else if ACCESS_DENIED_CODES.contains(&code) {
         // Naming one action is not enough on its own: a request carrying a guardrail also needs
         // `bedrock:ApplyGuardrail`, and an inference profile needs its own actions, so an
@@ -244,8 +267,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, Operation, SIGNATURE_REJECTED_CODES,
-        UNKNOWN_MODEL, explain,
+        ACCESS_DENIED_CODES, CREDENTIALS_REJECTED_CODES, NOT_SUBSCRIBED_CODES, Operation,
+        SIGNATURE_REJECTED_CODES, UNKNOWN_MODEL, explain,
     };
     use aws_sdk_bedrockruntime::error::ErrorMetadata;
     use aws_sdk_bedrockruntime::operation::{
@@ -369,7 +392,6 @@ mod tests {
                 "AccessDeniedException",
                 Some("You don't have access to the model with the specified model ID."),
             ),
-            ("OptInRequired", None),
             ("NotAuthorized", None),
         ] {
             for operation in EVERY_OPERATION {
@@ -478,7 +500,7 @@ mod tests {
                     "{code} must name the causes a key rotation cannot fix: {out}"
                 );
                 assert!(
-                    !out.contains("to an active key pair"),
+                    !out.contains("with an active key pair"),
                     "{code} must not be reported as a credential replacement: {out}"
                 );
                 assert!(
@@ -486,6 +508,54 @@ mod tests {
                     "{code} is not an authorization failure: {out}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_unsubscribed_account_is_not_reported_as_a_missing_iam_grant() {
+        // AWS defines `OptInRequired` as the account needing the service enabled, not the
+        // identity needing a permission. Advising an IAM grant broadens access and leaves
+        // Bedrock exactly as unavailable as it was.
+        assert_eq!(NOT_SUBSCRIBED_CODES, ["OptInRequired"]);
+        assert!(
+            !ACCESS_DENIED_CODES.contains(&"OptInRequired"),
+            "account enablement is not an authorization failure"
+        );
+
+        for operation in EVERY_OPERATION {
+            let out = rendered("OptInRequired", None, operation);
+            assert!(
+                out.contains("not enabled for this AWS account"),
+                "{operation:?} must name account enablement: {out}"
+            );
+            assert!(
+                out.contains("no IAM grant"),
+                "{operation:?} must say an IAM grant cannot resolve it: {out}"
+            );
+            assert!(
+                !out.contains("Grant the identity"),
+                "{operation:?} must not ask for an IAM grant: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_credential_fallback_says_the_rejected_keys_must_be_removed() {
+        // `aws_sdk_credential_bridge::initiate_config_with_credentials` installs a static
+        // credentials provider whenever both key parameters are set, and never reaches
+        // `aws_iam_role_source`; a later `profile_name` does not displace it. So "set a role
+        // source instead" without "remove the keys first" is advice that changes nothing — the
+        // operator keeps sending the very keys AWS rejected.
+        for operation in EVERY_OPERATION {
+            let out = rendered("UnrecognizedClientException", None, operation);
+            assert!(
+                out.contains("remove both of those parameters first"),
+                "{operation:?} must say the keys have to go first: {out}"
+            );
+            assert!(
+                out.contains("takes precedence"),
+                "{operation:?} must say why: {out}"
+            );
         }
     }
 
@@ -520,6 +590,7 @@ mod tests {
         CREDENTIALS_REJECTED_CODES
             .iter()
             .chain(SIGNATURE_REJECTED_CODES.iter())
+            .chain(NOT_SUBSCRIBED_CODES.iter())
             .chain(ACCESS_DENIED_CODES.iter())
             .copied()
     }
@@ -532,6 +603,7 @@ mod tests {
         let lists = [
             ("credentials", CREDENTIALS_REJECTED_CODES),
             ("signature", SIGNATURE_REJECTED_CODES),
+            ("not subscribed", NOT_SUBSCRIBED_CODES),
             ("access denied", ACCESS_DENIED_CODES),
         ];
         for (i, (name, codes)) in lists.iter().enumerate() {
