@@ -531,13 +531,13 @@ mod tests {
             false,
         )]);
 
-        let undeclinable = [
+        let declined_filters = [
             (&schema, col("ts").gt(micros_literal(i64::MAX))),
             (&schema, col("ts").gt(micros_literal(-i64::MAX))),
             (&seconds_schema, col("ts").gt(seconds_literal(i64::MAX))),
         ];
 
-        for (schema, filter) in &undeclinable {
+        for (schema, filter) in &declined_filters {
             assert_eq!(
                 duckdb_filter_pushdown(schema, filter),
                 TableProviderFilterPushDown::Unsupported,
