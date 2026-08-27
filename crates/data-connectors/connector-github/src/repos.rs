@@ -234,7 +234,11 @@ fn gql_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, true),
         Field::new(OWNER_COLUMN, DataType::Utf8, false),
-        Field::new(REPO_COLUMN, DataType::Utf8, true),
+        // Never null on either shape: the repository-scoped path supplies the
+        // name, and GitHub types `Repository.name` as `String!`. Declaring it
+        // nullable would make every consumer of the identity join handle a key
+        // that cannot occur.
+        Field::new(REPO_COLUMN, DataType::Utf8, false),
         Field::new("name_with_owner", DataType::Utf8, true),
         Field::new("description", DataType::Utf8, true),
         Field::new("url", DataType::Utf8, true),

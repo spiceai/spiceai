@@ -7,7 +7,7 @@ expression: batches_to_string(&result_batches)
 +--------------------------+---------------+-------------+
 | id                       | Utf8          | YES         |
 | owner                    | Utf8          | NO          |
-| repo                     | Utf8          | YES         |
+| repo                     | Utf8          | NO          |
 | name_with_owner          | Utf8          | YES         |
 | description              | Utf8          | YES         |
 | url                      | Utf8          | YES         |
