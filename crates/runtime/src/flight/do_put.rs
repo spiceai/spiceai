@@ -377,15 +377,23 @@ impl MapEntriesGuard {
     /// Decodes one `FlightData` message and brings its `MAP` columns in line with the map layout.
     ///
     /// `Ok(None)` is a message that carries no batch, read from the IPC header: a schema-only
-    /// message. A message whose header declares a record batch but will not decode is a
-    /// malformed stream, and is reported with the decoder's own error rather than skipped.
+    /// message, or one with no header at all. A message whose header declares a record batch but
+    /// will not decode is a malformed stream, and is reported with the decoder's own error rather
+    /// than skipped — as is a header that will not parse at all, since neither tells the client
+    /// anything if it is reported as an absent batch.
     fn decode(
         &self,
         message: &FlightData,
         dictionaries_by_id: &HashMap<i64, arrow::array::ArrayRef>,
         path: &TableReference,
     ) -> Result<Option<RecordBatch>, Status> {
-        if !carries_record_batch(&message.data_header) {
+        let declares_batch = declares_record_batch(&message.data_header).map_err(|e| {
+            let message = decode_failure_message(path, &e);
+            tracing::error!(dataset = %path, "{message}");
+            Status::invalid_argument(message)
+        })?;
+
+        if !declares_batch {
             return Ok(None);
         }
 
@@ -408,16 +416,26 @@ impl MapEntriesGuard {
     }
 }
 
-/// Whether an IPC message carries a record batch, read from the message header.
+/// Whether an IPC message's header declares a record batch, read from the message header.
 ///
 /// The header is the discriminator, not the body length: a batch of zero rows — and a batch
 /// whose columns need no buffers — is sent as a `RecordBatch` header with an empty body, so
-/// treating an empty body as "no batch" drops rows the writer sent. A header that will not
-/// parse is reported as carrying no batch, since the decode that would follow reads the same
-/// bytes and could not succeed either.
-fn carries_record_batch(data_header: &[u8]) -> bool {
+/// treating an empty body as "no batch" drops rows the writer sent.
+///
+/// A message with no header bytes at all declares no batch — Flight allows a metadata-only
+/// message, and there is nothing there to misread. A header that has bytes but will not parse is
+/// neither a batch nor the absence of one: it is a malformed stream, and the `Err` is what lets
+/// the caller report that parse failure instead of the "carries no record batch" diagnosis a
+/// `false` would produce, which names the wrong problem and hides the reason the IPC was
+/// rejected.
+fn declares_record_batch(data_header: &[u8]) -> Result<bool, String> {
+    if data_header.is_empty() {
+        return Ok(false);
+    }
+
     arrow_ipc::root_as_message(data_header)
-        .is_ok_and(|message| message.header_type() == arrow_ipc::MessageHeader::RecordBatch)
+        .map(|message| message.header_type() == arrow_ipc::MessageHeader::RecordBatch)
+        .map_err(|e| e.to_string())
 }
 
 fn create_response_stream(
@@ -998,6 +1016,52 @@ mod tests {
                 )
                 .expect("a schema message is not a failure")
                 .is_none()
+        );
+    }
+
+    /// A message with no IPC header is metadata-only, not malformed: there are no bytes there to
+    /// misread, so it is skipped exactly as a schema message is.
+    #[test]
+    fn a_message_with_no_header_carries_no_batch() {
+        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+
+        assert!(
+            guard
+                .decode(
+                    &FlightData::default(),
+                    &HashMap::new(),
+                    &TableReference::bare("orders")
+                )
+                .expect("a message with no header is not a failure")
+                .is_none()
+        );
+    }
+
+    /// A header that has bytes but will not parse is a malformed stream. Reporting it as a message
+    /// that merely carries no batch names the wrong problem and drops the reason the IPC was
+    /// rejected, so it is refused with the parse failure the client can act on.
+    #[test]
+    fn a_malformed_header_is_refused_with_the_parse_failure() {
+        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+        let malformed = FlightData {
+            data_header: (&b"this is not a flatbuffer"[..]).into(),
+            ..Default::default()
+        };
+
+        let status = guard
+            .decode(&malformed, &HashMap::new(), &TableReference::bare("orders"))
+            .expect_err("a header that will not parse is a malformed stream");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("Failed to read the Arrow data"),
+            "the parse failure has to reach the client, not an absent-batch diagnosis: {}",
+            status.message()
+        );
+        assert!(
+            !status.message().contains("carries no record batch"),
+            "a malformed header is not an absent batch: {}",
+            status.message()
         );
     }
 }
