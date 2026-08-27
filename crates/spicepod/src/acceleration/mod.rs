@@ -646,6 +646,50 @@ const fn default_true() -> bool {
     true
 }
 
+impl Acceleration {
+    /// The acceleration fields this block sets that the runtime will ignore
+    /// because `enabled: false` turns the whole block off, in the order they
+    /// should be reported.
+    ///
+    /// Empty for an enabled block, and for a disabled block that sets nothing
+    /// else — `enabled: false` on its own is a deliberate, complete
+    /// configuration.
+    ///
+    /// Derived from the serialized form rather than a hand-written field list,
+    /// so a field added to this struct later is covered without anyone
+    /// remembering to add it here. A field counts as set when it serializes to
+    /// something other than what the same block carries at its default, which
+    /// is what distinguishes `mode: memory` written out by hand — inert either
+    /// way — from `mode: file`.
+    #[must_use]
+    pub fn fields_ignored_when_disabled(&self) -> Vec<String> {
+        if self.enabled {
+            return Vec::new();
+        }
+
+        let disabled_default = Self {
+            enabled: false,
+            ..Self::default()
+        };
+        let (Ok(serde_json::Value::Object(configured)), Ok(serde_json::Value::Object(unset))) = (
+            serde_json::to_value(self),
+            serde_json::to_value(&disabled_default),
+        ) else {
+            // Nothing here is worth failing a load over: this reports on a
+            // configuration, it does not decide one.
+            return Vec::new();
+        };
+
+        let mut ignored: Vec<String> = configured
+            .into_iter()
+            .filter(|(field, value)| field != "enabled" && unset.get(field) != Some(value))
+            .map(|(field, _)| field)
+            .collect();
+        ignored.sort();
+        ignored
+    }
+}
+
 impl Default for Acceleration {
     #[expect(deprecated)]
     fn default() -> Self {
@@ -693,6 +737,109 @@ impl Default for Acceleration {
 mod tests {
     use super::*;
     use yaml;
+
+    fn acceleration_from_yaml(spec: &str) -> Acceleration {
+        yaml::from_str(spec).expect("acceleration should deserialize")
+    }
+
+    #[test]
+    fn a_disabled_acceleration_reports_the_settings_it_discards() {
+        // The reported shape of #13514: everything below `enabled: false` is
+        // read, accepted and then ignored, and the dataset serves federated
+        // queries that look like a working cache.
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                engine: duckdb
+                mode: file
+                refresh_mode: caching
+                primary_key: '(request_query, request_path)'
+                params:
+                  duckdb_file: api_cache.db
+                  caching_ttl: 1s
+            ",
+        );
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            vec![
+                "engine".to_string(),
+                "mode".to_string(),
+                "params".to_string(),
+                "primary_key".to_string(),
+                "refresh_mode".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disabled_acceleration_that_sets_nothing_else_discards_nothing() {
+        // `enabled: false` alone is a complete, deliberate configuration and
+        // must stay silent, or every dataset that turns acceleration off warns.
+        let acceleration = acceleration_from_yaml("enabled: false");
+        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+    }
+
+    #[test]
+    fn a_field_written_out_at_its_default_is_not_reported_as_discarded() {
+        // `mode: memory` is what an omitted `mode` already means, so nothing is
+        // lost by ignoring it and saying otherwise would be noise.
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                mode: memory
+            ",
+        );
+        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+    }
+
+    #[test]
+    fn an_enabled_acceleration_discards_nothing_however_it_is_configured() {
+        // The whole block applies, so there is nothing to report — this is the
+        // direction that would otherwise warn on every accelerated dataset.
+        let acceleration = acceleration_from_yaml(
+            r"
+                engine: duckdb
+                mode: file
+                refresh_mode: full
+            ",
+        );
+        assert!(acceleration.enabled, "enabled defaults to true");
+        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+    }
+
+    #[test]
+    fn enabled_is_never_reported_as_one_of_the_discarded_fields() {
+        // It is the field doing the discarding; naming it in its own list would
+        // read as though turning acceleration off had itself been ignored.
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                engine: duckdb
+            ",
+        );
+        let ignored = acceleration.fields_ignored_when_disabled();
+        assert!(
+            !ignored.iter().any(|field| field == "enabled"),
+            "{ignored:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_added_to_the_block_later_is_covered_without_a_list_to_update() {
+        // The guard against this helper going stale: it is derived from the
+        // serialized form, so a field this test does not know about still shows
+        // up. `retention_period` stands in for "whatever is added next".
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                retention_period: 24h
+            ",
+        );
+        assert_eq!(
+            acceleration.fields_ignored_when_disabled(),
+            vec!["retention_period".to_string()]
+        );
+    }
 
     #[test]
     fn test_deserialize_acceleration_on_conflict_string() {

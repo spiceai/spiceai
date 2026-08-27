@@ -102,6 +102,22 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         let metadata = dataset.metadata();
 
+        // `enabled: false` turns the whole block off, so anything else set in it
+        // is read, accepted and then never applied. Say so rather than leaving a
+        // dataset that looks configured to cache serving every query from the
+        // source (#13514). Read from the Spicepod block, before the conversion
+        // below resolves its defaults and the distinction is gone.
+        if let Some(acceleration_block) = dataset.acceleration.as_ref() {
+            let ignored = acceleration_block.fields_ignored_when_disabled();
+            if !ignored.is_empty() {
+                tracing::warn!(
+                    "Dataset {} sets `acceleration.enabled: false`, so the rest of its acceleration block is ignored: {}. Remove `enabled: false` to apply them, or remove them to keep the dataset unaccelerated.",
+                    dataset.name,
+                    ignored.join(", ")
+                );
+            }
+        }
+
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
