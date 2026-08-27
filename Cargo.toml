@@ -271,7 +271,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "0c829eb4fd6c8be4df7a70886314dd9d81e4d983" } # branch: sgrebnov/duckdb-1.4.4-as-1.10505 (spiceai-54 + the DuckDB 1.4.4 rev; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "79e12b967ac3af236f0df87474f244f1b473f2cd" } # branch: sgrebnov/duckdb-1.4.4-as-1.10505 (spiceai-54 + the DuckDB 1.4.4 rev; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
