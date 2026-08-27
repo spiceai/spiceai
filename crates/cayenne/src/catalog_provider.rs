@@ -115,6 +115,34 @@ pub enum Error {
         /// The underlying catalog error.
         source: CatalogError,
     },
+
+    /// The catalog's data directory contains its own metastore.
+    #[snafu(display(
+        "Failed to load catalog '{catalog_name}' (cayenne): its data directory '{data_dir}' contains the metastore at '{metadata_dir}', so clearing the data directory would delete the catalog that holds the manifests, snapshot pointers and partition rows for every Cayenne table in this instance. Set `cayenne_metadata_dir` to a directory outside `cayenne_data_dir`. See: https://spiceai.org/docs/components/catalogs/cayenne"
+    ))]
+    MetastoreInsideDataDir {
+        /// The catalog whose configuration was refused.
+        catalog_name: String,
+        /// The resolved data directory.
+        data_dir: String,
+        /// The resolved metastore directory it contains.
+        metadata_dir: String,
+    },
+
+    /// Neither directory could be placed on the filesystem, so the check cannot run.
+    #[snafu(display(
+        "Failed to load catalog '{catalog_name}' (cayenne): could not resolve its data directory '{data_dir}' or metastore directory '{metadata_dir}', so Spice cannot establish that they are separate and will not open a catalog it might later delete. Check that both paths and their parents exist and are readable. Cause: {source}. See: https://spiceai.org/docs/components/catalogs/cayenne"
+    ))]
+    CayenneDirsUnresolvable {
+        /// The catalog whose configuration was refused.
+        catalog_name: String,
+        /// The resolved data directory.
+        data_dir: String,
+        /// The resolved metastore directory.
+        metadata_dir: String,
+        /// Why the path could not be resolved.
+        source: std::io::Error,
+    },
 }
 
 /// A specialized [`Result`](std::result::Result) type for Cayenne catalog operations.
@@ -160,6 +188,43 @@ impl std::fmt::Debug for CayenneCatalogProvider {
 }
 
 impl CayenneCatalogProvider {
+    /// Refuse a catalog whose data directory would contain its metastore.
+    ///
+    /// The dataset-level accelerator runs the same by-name check immediately before the
+    /// recursive delete a schema recreate performs. This path has no such delete today,
+    /// so the check runs at open time instead — the point where the operator can still
+    /// edit the spicepod, rather than on the first teardown a later change introduces.
+    /// Both call the one implementation in [`crate::metastore_layout`], so the two
+    /// surfaces cannot drift into disagreeing about what overlaps.
+    ///
+    /// Neither directory need exist yet: an unresolvable *component* is taken as itself
+    /// and the comparison degrades to a lexical one. An unresolvable *path* is a
+    /// different matter and refuses, because an overlap that cannot be ruled out is one
+    /// that has to be assumed.
+    async fn ensure_metastore_outside_data_dir(
+        catalog_name: &str,
+        data_dir: &str,
+        metadata_dir: &str,
+    ) -> Result<()> {
+        let overlap = crate::metastore_layout::overlapping_metastore_dir(data_dir, metadata_dir)
+            .await
+            .map_err(|source| Error::CayenneDirsUnresolvable {
+                catalog_name: catalog_name.to_string(),
+                data_dir: data_dir.to_string(),
+                metadata_dir: metadata_dir.to_string(),
+                source,
+            })?;
+
+        if let Some((data, metadata)) = overlap {
+            return Err(Error::MetastoreInsideDataDir {
+                catalog_name: catalog_name.to_string(),
+                data_dir: data.to_string_lossy().into_owned(),
+                metadata_dir: metadata.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new Cayenne catalog provider.
     ///
     /// Initializes the `SQLite` metadata catalog and local file storage.
@@ -173,7 +238,8 @@ impl CayenneCatalogProvider {
     /// # Errors
     ///
     /// Returns an error if the metadata or data directories cannot be created,
-    /// or if the metadata catalog fails to initialize.
+    /// if the metadata catalog fails to initialize, or if the data directory would
+    /// contain the metastore — see [`Self::ensure_metastore_outside_data_dir`].
     pub async fn try_new(
         config: CayenneCatalogProviderConfig,
         runtime_env: Arc<RuntimeEnv>,
@@ -187,6 +253,15 @@ impl CayenneCatalogProvider {
             .metadata_dir
             .clone()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/metadata"));
+
+        // Resolved before either directory is created, because the check below refuses a
+        // configuration and a refused catalog must not leave a metastore behind it.
+        let data_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
+
+        Self::ensure_metastore_outside_data_dir(catalog_name, &data_dir, &metadata_dir).await?;
 
         // Ensure metadata directory exists
         tokio::fs::create_dir_all(&metadata_dir)
@@ -203,11 +278,6 @@ impl CayenneCatalogProvider {
         catalog.init().await.context(CatalogInitSnafu)?;
 
         // Initialize local file storage
-        let data_dir = config
-            .data_dir
-            .clone()
-            .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
-
         tokio::fs::create_dir_all(&data_dir)
             .await
             .map_err(|e| Error::InvalidConfiguration {
@@ -699,5 +769,173 @@ impl SchemaProvider for CayenneSchemaProvider {
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.write().remove(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CayenneCatalogProvider, CayenneCatalogProviderConfig, Error};
+
+    /// A config that configures nothing but the base path, so each test states only the
+    /// two directories it is about.
+    fn config(base: &str) -> CayenneCatalogProviderConfig {
+        CayenneCatalogProviderConfig {
+            data_dir: None,
+            metadata_dir: None,
+            spice_data_base_path: base.to_string(),
+            footer_cache_mb: None,
+            segment_cache_mb: None,
+            target_file_size_mb: None,
+            compression_strategy: None,
+            upload_concurrency: None,
+            write_concurrency: None,
+            inline_max_rows: None,
+            inline_max_bytes: None,
+            inline_max_buffer_bytes: None,
+            inline_flush_max_rows: None,
+            inline_flush_max_segments: None,
+            inline_flush_max_bytes: None,
+            pk_conflict_detection: None,
+            dynamic_tuning: false,
+            compaction_background_interval_ms: None,
+            compaction_trigger_files: None,
+            bake_deletion_index_trigger: None,
+        }
+    }
+
+    /// The defaults this connector ships are structurally disjoint — `…/data` beside
+    /// `…/metadata` — so the guard must not refuse a catalog that configured nothing.
+    /// Without this, "the guard fires" and "the guard fires on everything" look alike.
+    #[tokio::test]
+    async fn the_default_layout_is_accepted() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let config = config(&base.path().to_string_lossy());
+
+        let data_dir = format!("{}/cayenne_cayenne/data", config.spice_data_base_path);
+        let metadata_dir = format!("{}/cayenne_cayenne/metadata", config.spice_data_base_path);
+
+        CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "cayenne",
+            &data_dir,
+            &metadata_dir,
+        )
+        .await
+        .expect("the shipped defaults are disjoint");
+    }
+
+    /// Regression test for #13105: the catalog connector carries the same
+    /// `data_dir`/`metadata_dir` pair as the dataset-level accelerator and validated
+    /// neither, so an operator could point the metastore inside the directory a
+    /// teardown clears. Refused at open time, where the spicepod can still be edited.
+    #[tokio::test]
+    async fn a_metastore_inside_the_data_dir_is_refused() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data_dir = base.path().join("data").to_string_lossy().into_owned();
+        let metadata_dir = format!("{data_dir}/catalog");
+
+        let error = CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "trades",
+            &data_dir,
+            &metadata_dir,
+        )
+        .await
+        .expect_err("a metastore inside the data directory must be refused");
+
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
+
+        let rendered = error.to_string();
+        for expected in [
+            "trades",
+            "cayenne_metadata_dir",
+            "cayenne_data_dir",
+            "https://spiceai.org/docs/components/catalogs/cayenne",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal must name `{expected}` so an operator can act on it: {rendered}"
+            );
+        }
+    }
+
+    /// The two directories being one directory is the same catalog loss, and is what a
+    /// single `cayenne_data_dir` pointed at the metastore produces.
+    #[tokio::test]
+    async fn a_metastore_at_the_data_dir_itself_is_refused() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let shared = base.path().join("shared").to_string_lossy().into_owned();
+
+        let error =
+            CayenneCatalogProvider::ensure_metastore_outside_data_dir("trades", &shared, &shared)
+                .await
+                .expect_err("one directory serving as both must be refused");
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
+    }
+
+    /// The refusal has to land before either directory is created: a catalog that is
+    /// refused must not leave a metastore — or the directory that would hold one —
+    /// behind it, since the next start would then find a catalog where the operator
+    /// never put one.
+    #[tokio::test]
+    async fn a_refused_catalog_creates_no_directories() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let mut config = config(&base.path().to_string_lossy());
+        let data_dir = base.path().join("data");
+        config.data_dir = Some(data_dir.to_string_lossy().into_owned());
+        config.metadata_dir = Some(data_dir.join("catalog").to_string_lossy().into_owned());
+
+        let error = CayenneCatalogProvider::try_new(
+            config,
+            std::sync::Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()),
+            data_components::catalog_filter::TableSelector::select_all(),
+        )
+        .await
+        .expect_err("an overlapping catalog configuration must be refused");
+
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
+        assert!(
+            !data_dir.exists(),
+            "a refused catalog must not have created {}",
+            data_dir.display()
+        );
+    }
+
+    /// A sibling that merely shares a name prefix is disjoint. Refusing it would break
+    /// a working configuration, which is the cost of a containment test that compares
+    /// strings rather than path components.
+    #[tokio::test]
+    async fn a_sibling_sharing_a_name_prefix_is_accepted() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data_dir = base.path().join("meta").to_string_lossy().into_owned();
+        let metadata_dir = base.path().join("metadata").to_string_lossy().into_owned();
+
+        CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "trades",
+            &data_dir,
+            &metadata_dir,
+        )
+        .await
+        .expect("`meta` and `metadata` are siblings, not nested");
+    }
+
+    /// A data directory on object storage cannot hold the metastore, so a catalog that
+    /// puts its data there keeps working with the metastore on local disk.
+    #[tokio::test]
+    async fn an_object_store_data_dir_is_accepted() {
+        CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "trades",
+            "s3://bucket/trades/",
+            "/var/spice/metadata",
+        )
+        .await
+        .expect("a metastore cannot live inside an object-store prefix");
     }
 }
