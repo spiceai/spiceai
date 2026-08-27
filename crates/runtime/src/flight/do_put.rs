@@ -376,17 +376,16 @@ impl MapEntriesGuard {
 
     /// Decodes one `FlightData` message and brings its `MAP` columns in line with the map layout.
     ///
-    /// `Ok(None)` is a message that carries no batch: an empty body, which is how a schema-only
-    /// message arrives. A message that does carry a body but will not decode is a malformed
-    /// stream, and is reported with the decoder's own error rather than skipped — the same
-    /// discriminator `maybe_read_first_batch` uses on the scheduler path.
+    /// `Ok(None)` is a message that carries no batch, read from the IPC header: a schema-only
+    /// message. A message whose header declares a record batch but will not decode is a
+    /// malformed stream, and is reported with the decoder's own error rather than skipped.
     fn decode(
         &self,
         message: &FlightData,
         dictionaries_by_id: &HashMap<i64, arrow::array::ArrayRef>,
         path: &TableReference,
     ) -> Result<Option<RecordBatch>, Status> {
-        if message.data_body.is_empty() {
+        if !carries_record_batch(&message.data_header) {
             return Ok(None);
         }
 
@@ -407,6 +406,18 @@ impl MapEntriesGuard {
             Status::invalid_argument(message)
         })
     }
+}
+
+/// Whether an IPC message carries a record batch, read from the message header.
+///
+/// The header is the discriminator, not the body length: a batch of zero rows — and a batch
+/// whose columns need no buffers — is sent as a `RecordBatch` header with an empty body, so
+/// treating an empty body as "no batch" drops rows the writer sent. A header that will not
+/// parse is reported as carrying no batch, since the decode that would follow reads the same
+/// bytes and could not succeed either.
+fn carries_record_batch(data_header: &[u8]) -> bool {
+    arrow_ipc::root_as_message(data_header)
+        .is_ok_and(|message| message.header_type() == arrow_ipc::MessageHeader::RecordBatch)
 }
 
 fn create_response_stream(
@@ -511,13 +522,14 @@ fn create_response_stream(
                             let new_batch = match guard.decode(&message, &dictionaries_by_id, &path) {
                                 Ok(Some(new_batch)) => new_batch,
                                 Ok(None) => {
-                                    // Only an empty body reaches here now: a body that will
-                                    // not decode is refused by `decode` with the decoder's own
-                                    // error. Mid-stream, an empty body is not the schema-only
-                                    // first message, so it carries no rows and the stream has
+                                    // Only a non-batch header reaches here: a message whose
+                                    // header declares a record batch is decoded, empty body and
+                                    // all, and one that will not decode is refused by `decode`
+                                    // with the decoder's own error. Mid-stream, a schema message
+                                    // is not the schema-only first message, so the stream has
                                     // gone out of step with what it declared.
                                     let message = format!(
-                                        "Received an empty Arrow message partway through the write to dataset '{path}', so the rest of the stream was not applied and any batch already accepted may have been. \
+                                        "Received an Arrow message that carries no record batch partway through the write to dataset '{path}', so the rest of the stream was not applied and any batch already accepted may have been. \
                                         Send every message after the schema as a record batch. \
                                         See: https://spiceai.org/docs/api/arrow-flight-sql"
                                     );
@@ -839,6 +851,48 @@ mod tests {
             arrow_schema::DataType::Map(entries, _) => !entries.is_nullable(),
             other => panic!("expected a Map column, got {other:?}"),
         }
+    }
+
+    /// Regression test for #13495: a batch of zero rows is still a batch. Arrow encodes one as a
+    /// `RecordBatch` message with an empty body, so a decoder that discriminates on body length
+    /// reports it as carrying no batch — and mid-stream this path refuses the whole write once
+    /// that happens, after earlier batches have already been appended, which a retry duplicates.
+    #[test]
+    fn a_zero_row_batch_is_decoded_rather_than_read_as_a_schema_message() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let guard = MapEntriesGuard::for_declared(Arc::clone(&schema));
+        let path = TableReference::bare("orders");
+        let dictionaries = HashMap::new();
+
+        let messages = flight_messages(&batch);
+        assert!(
+            messages
+                .last()
+                .expect("the encoding carries a batch message")
+                .data_body
+                .is_empty(),
+            "premise of this test: Arrow sends a zero-row batch with an empty body"
+        );
+
+        let decoded: Vec<RecordBatch> = messages
+            .iter()
+            .filter_map(|message| {
+                guard
+                    .decode(message, &dictionaries, &path)
+                    .expect("a zero-row batch decodes")
+            })
+            .collect();
+
+        let [decoded] = decoded.as_slice() else {
+            panic!("exactly one message carries a batch, got {}", decoded.len());
+        };
+        assert_eq!(decoded.num_rows(), 0);
+        assert_eq!(&decoded.schema(), guard.write_schema());
     }
 
     /// Regression test for #13495: a client declaring a `MAP`'s `entries` nullable — which the
