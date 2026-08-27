@@ -541,8 +541,15 @@ fn narrowed_child_holds_a_reachable_null(parent: &ArrayData, index: usize) -> bo
             None => false,
             Some(nulls) => union_variant_selects_a_null(parent, fields, *mode, index, &nulls),
         },
-        DataType::ListView(_) | DataType::LargeListView(_) => false,
         // `List`, `LargeList` and `Map` take no exemption in `validate_nulls`, so neither here.
+        //
+        // The list views land here too, and deliberately. `validate_nulls` omits them, but that is
+        // a gap in it rather than a proof that narrowing them is sound, and a guard against a
+        // schema that understates its nulls has to fail closed on a shape it cannot decide.
+        // Deciding them exactly needs the offset-and-size reachability rule this does not
+        // re-derive, so the whole child is checked: a value the views never address is
+        // over-counted, which costs an error on a sound relabel where the alternative publishes a
+        // column whose nulls the planner has been told cannot exist.
         _ => child_holds_a_logical_null(child),
     }
 }
@@ -1781,6 +1788,29 @@ mod tests {
 
         assert!(
             err.to_string().contains("'u'"),
+            "the error must name the field it refused, got: {err}"
+        );
+    }
+
+    /// `validate_nulls` omits the list views, so nothing downstream refuses this either — the
+    /// guard has to fail closed rather than read that omission as permission.
+    #[test]
+    fn relabel_refuses_narrowing_a_list_view_item_that_holds_nulls() {
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let source = ArrayData::builder(DataType::ListView(Arc::clone(&item)))
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32]))
+            .add_buffer(Buffer::from_slice_ref([2_i32]))
+            .add_child_data(Int32Array::from(vec![Some(1), None]).to_data())
+            .build()
+            .expect("one view over two values");
+        let target = DataType::ListView(Arc::new(Field::new("item", DataType::Int32, false)));
+
+        let err = relabel_array_data(source, &target)
+            .expect_err("the viewed values include a null, so narrowing the item must be refused");
+
+        assert!(
+            err.to_string().contains("item"),
             "the error must name the field it refused, got: {err}"
         );
     }
