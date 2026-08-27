@@ -487,10 +487,14 @@ fn relabel_field_pairs<'a>(
 ///    routinely carry nulls no reader can reach.
 ///
 /// Every other shape keeps Arrow's exemption unchanged, including the strict one it applies to
-/// list-like parents. That is deliberate: matching `validate_nulls` means this can only ever refuse
-/// what Arrow would refuse anyway, never more. `ListView` and `LargeListView` are absent from
-/// `validate_nulls` and stay unchecked here for the same reason — deciding them needs the offset
-/// reachability rule this is careful not to re-derive.
+/// list-like parents, so for the shapes `validate_nulls` covers this refuses what Arrow would refuse
+/// anyway and no more.
+///
+/// The shapes it does *not* cover are the opposite case, and they fail **closed**. `ListView`,
+/// `LargeListView` and `Union` are absent from `validate_nulls`, so nothing downstream refuses their
+/// narrowings either; reading that absence as permission would publish the contradictory schema this
+/// exists to prevent, precisely where Arrow polices nothing. They are decided conservatively here
+/// instead — see the fallback arm and [`union_logical_nulls`].
 fn narrowed_child_holds_a_reachable_null(parent: &ArrayData, index: usize) -> bool {
     let Some(child) = parent.child_data().get(index) else {
         return false;
@@ -619,9 +623,18 @@ fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
 ///
 /// Computed here rather than delegated, because `UnionArray::logical_nulls` is not slice-correct —
 /// a union rebuilt from sliced `ArrayData` carries the offset on its type ids but not on its
-/// children, and what it then reports depends on the variant count rather than on the data. Every
-/// step that cannot be read resolves to *null*, so an unreadable union refuses the narrowing
-/// instead of passing it.
+/// children, and what it then reports depends on the variant count rather than on the data: a
+/// length-3 buffer for one variant, and `None` — no nulls at all — for two. `None` is the answer
+/// that matters, since every caller reads an absent buffer as nothing to refuse. Every step that
+/// cannot be read resolves to *null* here, so an unreadable union refuses rather than passes.
+///
+/// **A sliced sparse union rests on an unresolved premise, tracked by #13635.** This addresses its
+/// children at `offset + row`, which is what `ArrayData::slice` setting an offset implies — but
+/// Arrow's own value access ignores that offset and reads from row `0`, so the two disagree about
+/// which values the array holds at all. Where they disagree this refuses, which is the safe
+/// direction for a guard against a schema that understates its nulls, and may be a false refusal if
+/// the question is settled the other way. Do not "fix" the arithmetic to match value access without
+/// resolving #13635 first: that would turn a false refusal into a false acceptance.
 fn union_logical_nulls(union: &ArrayData) -> Option<NullBuffer> {
     let DataType::Union(fields, mode) = union.data_type() else {
         return None;
