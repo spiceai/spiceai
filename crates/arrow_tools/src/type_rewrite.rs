@@ -360,9 +360,11 @@ pub fn relabel_array_data(
 /// Widening (non-nullable → nullable) is always sound and is left alone. Narrowing is the direction
 /// that can lie: a field declared non-nullable over a child that holds nulls is published as fact,
 /// and `DataFusion` derives expression nullability from those fields — it constant-folds `IS NULL`
-/// over a non-nullable column to `false`, so rows that really are null are filtered out. That is a
-/// wrong-results shape rather than a crash, which is why it is refused here rather than left to
-/// surface downstream.
+/// over a non-nullable column to `false`, dropping rows that really are null, and `IS NOT NULL` to
+/// `true`, keeping those same rows where the predicate should have removed them. The two fail in
+/// opposite directions, which is why the error this reports names neither and says the query
+/// returns the wrong rows. Either way it is a wrong-results shape rather than a crash, so it is
+/// refused here rather than left to surface downstream.
 ///
 /// `ArrayData::build` catches part of this and cannot be relied on for the rest. Its
 /// `validate_nulls` checks non-nullable children only for `Struct`, `List`, `LargeList`, `Map` and
@@ -694,9 +696,9 @@ fn relabel_narrows_a_field_that_holds_nulls(source: &Field, target: &Field) -> A
     // one-line contract this error is read under, and split one log record into two.
     ArrowError::InvalidArgumentError(format!(
         "Cannot relabel the Arrow field '{}' as '{}': the target declares it non-nullable while the \
-         column still holds nulls, so a query using `IS NULL` or `IS NOT NULL` on it would be \
-         planned against a schema that contradicts the data and drop rows that really are null. \
-         Declare the field nullable, or remove the nulls before relabelling.",
+         column still holds nulls, so a query using `IS NULL` or `IS NOT NULL` on it is planned \
+         against a schema that contradicts the data and returns the wrong rows. Declare the field \
+         nullable, or remove the nulls before relabelling.",
         source.name().escape_debug(),
         target.name().escape_debug(),
     ))
@@ -1726,6 +1728,10 @@ mod tests {
         for expected in [
             "'physical'",
             "'logical'",
+            // Neutral on purpose: `IS NULL` folds to `false` and drops null rows, while
+            // `IS NOT NULL` folds to `true` and keeps them. A consequence naming only the first
+            // is false for the second, and this message names both predicates.
+            "returns the wrong rows",
             "Declare the field nullable, or remove the nulls before relabelling.",
         ] {
             assert!(
