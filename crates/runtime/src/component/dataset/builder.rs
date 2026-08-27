@@ -132,10 +132,14 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         let metadata = dataset.metadata();
 
         // `enabled: false` turns the whole block off, so anything else set in it
-        // is read, accepted and then never applied. Collect that here, while the
-        // Spicepod block is still in hand and before the conversion below
-        // resolves its defaults away (#13514); it is reported after the name is
-        // validated.
+        // is read, accepted and then never applied — with one exception, which
+        // is above: `ready_state` is pulled out of this block and applied to the
+        // dataset whether or not acceleration is enabled, and
+        // `fields_ignored_when_disabled` leaves it out for exactly that reason.
+        //
+        // Collect the rest here, while the Spicepod block is still in hand and
+        // before the conversion below resolves its defaults away (#13514); it is
+        // reported after the name is validated.
         let ignored_acceleration_fields = dataset
             .acceleration
             .as_ref()
