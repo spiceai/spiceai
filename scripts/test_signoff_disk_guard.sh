@@ -379,18 +379,21 @@ exit "${STUB_CARGO_RC:-0}"
 STUB
 chmod +x "$cargo_stub_dir/cargo"
 
-# $3 is the exit status preflight_lockfile should return: 0 to proceed, 72 to stop.
-assert_preflight_lock() {
-  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
-  shift 4
+
+# One assertion for all three lockfile entry points, since they differ only in
+# which snippet runs and which cargo is on PATH. $1 is the snippet, then the same
+# (name, dir, want_rc, want_output) contract as the other assert_ helpers, then
+# environment assignments for `env`.
+_assert_lock() {
+  local snippet="$1" name="$2" dir="$3" want_rc="$4" want_output="${5:-}"
+  shift 5
   tests_run=$((tests_run + 1))
 
   local summary="$lock_dir/summary"
   : >"$summary"
 
   local result rc output
-  result="$(call_subject_in "$dir" 'preflight_lockfile' \
-    "PATH=$cargo_stub_dir:$PATH" GITHUB_STEP_SUMMARY="$summary" "$@")"
+  result="$(call_subject_in "$dir" "$snippet" GITHUB_STEP_SUMMARY="$summary" "$@")"
   rc="${result%%|*}"
   output="${result#*|}"
 
@@ -407,10 +410,28 @@ assert_preflight_lock() {
   echo "  ok: $name"
 }
 
-# Asserts an explanation is *absent*. For the "cargo broke for another reason"
-# cases the failure worth guarding against is not a wrong status but a wrong
-# story: a guard that blames the lockfile for every cargo failure sends the
-# reader to regenerate a file that was never the problem.
+# $3 is the exit status preflight_lockfile should return: 0 to proceed, 72 to stop.
+# The stub cargo answers, so each case states exactly what cargo said.
+assert_preflight_lock() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  _assert_lock 'preflight_lockfile' "$name" "$dir" "$want_rc" "$want_output" \
+    "PATH=$cargo_stub_dir:$PATH" "$@"
+}
+
+# Same, with PATH untouched so the *installed* cargo answers. Used by the drift
+# cases, which exist precisely to check what real cargo says rather than what the
+# stub was told to say.
+assert_preflight_lock_real() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  _assert_lock 'preflight_lockfile' "$name" "$dir" "$want_rc" "$want_output" "$@"
+}
+
+# Refuses to accept an explanation that should be absent. For the "cargo broke for
+# another reason" cases the failure worth guarding against is not a wrong status
+# but a wrong story: a guard that blames the lockfile for every cargo failure sends
+# the reader to regenerate a file that was never the problem.
 assert_preflight_lock_silent_on() {
   local name="$1" dir="$2" unwanted="$3"
   shift 3
@@ -427,36 +448,6 @@ assert_preflight_lock_silent_on() {
   if [[ "$output" == *"$unwanted"* ]] || grep -qF "$unwanted" "$summary"; then
     fail_test "$name: did not expect '${unwanted}', got '${output}' / '$(cat "$summary")'"
     return
-  fi
-  echo "  ok: $name"
-}
-
-# Same contract as assert_preflight_lock, but with PATH untouched so the *installed*
-# cargo answers. Used only by the drift cases below, which exist precisely to check
-# what real cargo says rather than what the stub was told to say.
-assert_preflight_lock_real() {
-  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
-  shift 4
-  tests_run=$((tests_run + 1))
-
-  local summary="$lock_dir/summary"
-  : >"$summary"
-
-  local result rc output
-  result="$(call_subject_in "$dir" 'preflight_lockfile' \
-    GITHUB_STEP_SUMMARY="$summary" "$@")"
-  rc="${result%%|*}"
-  output="${result#*|}"
-
-  if [[ "$rc" -ne "$want_rc" ]]; then
-    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
-    return
-  fi
-  if [[ -n "$want_output" ]]; then
-    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
-      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
-      return
-    fi
   fi
   echo "  ok: $name"
 }
@@ -495,8 +486,8 @@ assert_preflight_lock "stops a branch whose lockfile is stale" "$with_lock_dir" 
 assert_preflight_lock "recognises the older cargo wording too" "$with_lock_dir" 72 \
   "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_OLD"
-assert_preflight_lock "says the branch was not evaluated" "$with_lock_dir" 72 \
-  "not evaluated" \
+assert_preflight_lock "says where the cost lands if this is not fixed" "$with_lock_dir" 72 \
+  "only after the whole suite has run" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 assert_preflight_lock "names a command that actually regenerates the lockfile" "$with_lock_dir" 72 \
   "cargo update --workspace" \
@@ -507,8 +498,12 @@ assert_preflight_lock "names a command that actually regenerates the lockfile" "
 assert_preflight_lock "stops a local run as well as a remote one" "$with_lock_dir" 72 \
   "does not describe the workspace manifests" \
   STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
-assert_preflight_lock "annotates a remote stop for the run page" "$with_lock_dir" 72 \
-  "::error title=Sign-off cannot run on this branch::" \
+# The annotation is deliberately not worded as a sign-off verdict: this guard now
+# also runs from pr.yml Build and Test, where "the branch was not evaluated" would
+# be false. It fires in any Actions job, not only a remote sign-off, for the same
+# reason.
+assert_preflight_lock "annotates the stop for the run page in a sign-off run" "$with_lock_dir" 72 \
+  "::error title=Cargo.lock does not match the manifests::" \
   SIGNOFF_REMOTE_RUN=1 STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 
 # The other direction, and the one that matters more. An unreachable registry, a
@@ -642,16 +637,51 @@ else
   fi
 fi
 
-# The two copies of this guard have to agree on the phrase they match, or one of
-# them stops guarding while the tests still pass. Asserted against the files
-# themselves because nothing else connects them.
+
+# pr.yml runs this guard rather than carrying its own copy, which is the only
+# reason there is one wording to keep correct instead of two. If that call is ever
+# replaced by an inline cargo invocation the two will drift, and the one that
+# drifts is the one nobody notices has stopped guarding.
 tests_run=$((tests_run + 1))
-if grep -q -- '--locked was passed' "$subject" \
-  && grep -q -- '--locked was passed' "$lock_repo_root/.github/workflows/pr.yml"; then
-  echo "  ok: scripts/signoff and pr.yml match on the same cargo phrase"
+if grep -q 'signoff preflight-lockfile' "$lock_repo_root/.github/workflows/pr.yml"; then
+  echo "  ok: pr.yml runs scripts/signoff preflight-lockfile"
 else
-  fail_test "scripts/signoff and .github/workflows/pr.yml no longer match on '--locked was passed'"
+  fail_test ".github/workflows/pr.yml no longer runs 'signoff preflight-lockfile'"
 fi
+
+# ...and the subcommand it names has to exist and reach the guard. Run as a
+# command rather than sourced, so the dispatch table is covered too — the same
+# shape as the preflight-disk subcommand cases below.
+assert_preflight_lockfile_cmd() {
+  local name="$1" dir="$2" want_rc="$3" want_out="$4"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local output rc
+  output="$(cd "$dir" && env "PATH=$cargo_stub_dir:$PATH" "$@" \
+    bash "$subject" preflight-lockfile 2>&1)"
+  rc=$?
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: '${output}')"
+  elif [[ -n "$want_out" && "$output" != *"$want_out"* ]]; then
+    fail_test "$name: expected '${want_out}' in the output, got '${output}'"
+  else
+    echo "  ok: $name"
+  fi
+}
+
+assert_preflight_lockfile_cmd "the subcommand passes a matching lockfile" \
+  "$with_lock_dir" 0 ""
+assert_preflight_lockfile_cmd "the subcommand stops a stale lockfile" \
+  "$with_lock_dir" 72 "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+# The annotation has to reach a plain Actions job, not only a remote sign-off:
+# pr.yml's Build and Test is not a sign-off run, and its failure summary is what
+# the author reads.
+assert_preflight_lockfile_cmd "the subcommand annotates a plain Actions job" \
+  "$with_lock_dir" 72 "::error title=Cargo.lock does not match the manifests::" \
+  GITHUB_ACTIONS=true STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
 
 # And the preflight has to actually be wired into the gate: a function nothing
 # calls is a test suite passing over dead code.
@@ -702,28 +732,7 @@ fi
 assert_postcheck() {
   local name="$1" dir="$2" want_rc="$3" before="$4" want_output="${5:-}"
   shift 5
-  tests_run=$((tests_run + 1))
-
-  local summary="$lock_dir/summary"
-  : >"$summary"
-
-  local result rc output
-  result="$(call_subject_in "$dir" "postcheck_lockfile '${before}'" \
-    GITHUB_STEP_SUMMARY="$summary" "$@")"
-  rc="${result%%|*}"
-  output="${result#*|}"
-
-  if [[ "$rc" -ne "$want_rc" ]]; then
-    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
-    return
-  fi
-  if [[ -n "$want_output" ]]; then
-    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
-      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
-      return
-    fi
-  fi
-  echo "  ok: $name"
+  _assert_lock "postcheck_lockfile '${before}'" "$name" "$dir" "$want_rc" "$want_output" "$@"
 }
 
 if [[ -z "$postcheck_repo" ]]; then
