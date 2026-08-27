@@ -19,16 +19,14 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{
-    Statistics,
-    tree_node::{Transformed, TreeNode},
-};
+use datafusion::common::Statistics;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::{ConstExpr, EquivalenceProperties, OrderingRequirements};
+use datafusion::physical_expr::projection::{ProjectionMapping, ProjectionTargets};
+use datafusion::physical_expr::{EquivalenceProperties, OrderingRequirements};
 use datafusion::physical_plan::execution_plan::{
     CardinalityEffect, InvariantLevel, check_default_invariants,
 };
@@ -111,103 +109,60 @@ impl SchemaCastScanExec {
     /// The equivalence properties this exec advertises, derived from its input's.
     ///
     /// This exec casts values in place, so it reports `maintains_input_order` and
-    /// `CardinalityEffect::Equal`. Both make `EnforceSorting` push an ordering
-    /// requirement *through* it to the child and drop the sort once the child
-    /// satisfies the requirement — so every property the child used to satisfy it
-    /// has to survive into what this exec advertises, not just the child's output
-    /// ordering. An equality filter below (`WHERE pk = ?`) satisfies `ORDER BY pk`
-    /// by making `pk` constant rather than by any ordering, and a constant that
-    /// stops here leaves the `SortPreservingMergeExec` above with an unordered
-    /// child, which `SanityCheckPlan` rejects.
+    /// `CardinalityEffect::Equal`. Both let `EnforceSorting` push an ordering
+    /// requirement *through* it into the child and drop the sort once the child
+    /// satisfies the requirement — but the node `SanityCheckPlan` then validates the
+    /// surviving `SortPreservingMergeExec` against is *this* one. So whatever the
+    /// child used to discharge the requirement has to survive into what this exec
+    /// advertises, and a property dropped here does not cost a sort: it rejects the
+    /// plan. A constant (`WHERE pk = ?` satisfying `ORDER BY pk`), an equivalence
+    /// class (`WHERE a = b` making an ordering on `a` satisfy `ORDER BY b`) and a
+    /// secondary ordering all reach that same failure.
     ///
-    /// A property is propagated only when every column its expression references
-    /// survives into the output schema with the same data type. Column indices are
-    /// remapped by name because the output schema may reorder or drop columns
-    /// relative to the input. Type casts are not universally monotonic
-    /// (`Utf8`→numeric, float NaN handling) and do not preserve a constant's value,
-    /// so an expression referencing a cast column is dropped.
-    ///
-    /// Two classes of the input's properties are still dropped: equivalence classes
-    /// (`WHERE a = b` below makes an ordering on `a` satisfy `ORDER BY b`), and every
-    /// ordering past the input's first. Dropping a property is safe — it costs a
-    /// sort, never correctness — but each is the same trap as the constants above, so
-    /// closing one belongs with closing all of them: `EquivalenceProperties::project`
-    /// forwards orderings, constants and equivalence classes together, keyed on a
-    /// `ProjectionMapping` built from the same-name-same-type guard below. Reach for
-    /// that rather than a third enumerated branch.
-    /// (`EquivalenceProperties::with_new_schema` is not a substitute: it demands
-    /// index-aligned, identically-typed schemas, which is exactly what this exec
-    /// exists to break.)
+    /// So forward the input's properties wholesale rather than by kind, and put the
+    /// conservatism in the column mapping instead: an input column is mapped only
+    /// when the output schema still has it, by name, with an unchanged data type.
+    /// The output schema may reorder, drop, or retype columns, and a cast is neither
+    /// universally monotonic (`Utf8`→numeric, float NaN handling) nor value
+    /// preserving, so anything referencing a column that fails that test is absent
+    /// from the mapping and [`EquivalenceProperties::project`] drops it.
     fn output_equivalence_properties(
         input: &Arc<dyn ExecutionPlan>,
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
     ) -> EquivalenceProperties {
-        // The `Err` is a control-flow signal for "this column does not survive", never
-        // surfaced: `remap` turns it into `None` and the property is dropped.
-        let unmappable = || DataFusionError::Plan("column does not survive the cast".to_string());
-        let remap = |expr: &Arc<dyn PhysicalExpr>| -> Option<Arc<dyn PhysicalExpr>> {
-            Arc::clone(expr)
-                .transform_up(|expr| {
-                    let Some(col) = expr.downcast_ref::<Column>() else {
-                        return Ok(Transformed::no(expr));
-                    };
-                    let input_field = input_schema
-                        .fields()
-                        .get(col.index())
-                        .ok_or_else(unmappable)?;
-                    let (output_idx, output_field) = output_schema
-                        .column_with_name(col.name())
-                        .ok_or_else(unmappable)?;
-                    if input_field.data_type() != output_field.data_type() {
-                        return Err(unmappable());
-                    }
-                    if output_idx == col.index() {
-                        // Same position: rebuilding the column would allocate a name and
-                        // force every ancestor expression node to be rebuilt with it.
-                        return Ok(Transformed::no(expr));
-                    }
-                    Ok(Transformed::yes(
-                        Arc::new(Column::new(col.name(), output_idx)) as Arc<dyn PhysicalExpr>,
-                    ))
-                })
-                .ok()
-                .map(|transformed| transformed.data)
-        };
-
-        let input_properties = input.equivalence_properties();
-        let mut eq_properties = EquivalenceProperties::new(Arc::clone(output_schema));
-        if let Some(ordering) = input_properties.output_ordering() {
-            let remapped: Option<Vec<PhysicalSortExpr>> = ordering
-                .iter()
-                .map(|sort_expr| {
-                    Some(PhysicalSortExpr {
-                        expr: remap(&sort_expr.expr)?,
-                        options: sort_expr.options,
-                    })
-                })
-                .collect();
-            if let Some(new_ordering) = remapped {
-                eq_properties.add_orderings([new_ordering]);
+        // Grouped by source column: one output name may be produced more than once,
+        // and every target of a source has to travel with it.
+        let mut sources: Vec<(usize, ProjectionTargets)> = Vec::new();
+        for (output_idx, output_field) in output_schema.fields().iter().enumerate() {
+            let Some((input_idx, input_field)) = input_schema.column_with_name(output_field.name())
+            else {
+                continue;
+            };
+            if input_field.data_type() != output_field.data_type() {
+                continue;
+            }
+            let target: Arc<dyn PhysicalExpr> =
+                Arc::new(Column::new(output_field.name(), output_idx));
+            match sources.iter_mut().find(|(idx, _)| *idx == input_idx) {
+                Some((_, targets)) => targets.push((target, output_idx)),
+                None => sources.push((
+                    input_idx,
+                    ProjectionTargets::from(vec![(target, output_idx)]),
+                )),
             }
         }
-
-        let constants: Vec<ConstExpr> = input_properties
-            .constants()
+        let mapping: ProjectionMapping = sources
             .into_iter()
-            .filter_map(|constant| {
-                Some(ConstExpr::new(
-                    remap(&constant.expr)?,
-                    constant.across_partitions,
-                ))
+            .map(|(input_idx, targets)| {
+                let source: Arc<dyn PhysicalExpr> =
+                    Arc::new(Column::new(input_schema.field(input_idx).name(), input_idx));
+                (source, targets)
             })
             .collect();
-        if !constants.is_empty() && eq_properties.add_constants(constants).is_err() {
-            // `add_constants` only fails on an internal invariant, and half-updated
-            // properties are not safe to advertise, so advertise none.
-            return EquivalenceProperties::new(Arc::clone(output_schema));
-        }
-        eq_properties
+        input
+            .equivalence_properties()
+            .project(&mapping, Arc::clone(output_schema))
     }
 }
 
@@ -461,6 +416,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::logical_expr::TableProviderFilterPushDown;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -1065,6 +1021,111 @@ mod tests {
             constant_column_indices(schema_cast.as_ref(), "id"),
             vec![0],
             "this exec must advertise the constant the ordering rests on:\n{rendered}"
+        );
+    }
+
+    /// A sort requirement in `schema`'s coordinates, ascending, NULLs last.
+    fn ascending_on(schema: &SchemaRef, name: &str) -> Vec<PhysicalSortExpr> {
+        vec![PhysicalSortExpr::new(
+            physical_col(name, schema).expect("column"),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )]
+    }
+
+    fn a_b_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]))
+    }
+
+    /// An equivalence class the child used to satisfy an ordering must survive.
+    ///
+    /// `WHERE a = b` makes an ordering on `a` satisfy `ORDER BY b`. `EnforceSorting`
+    /// pushes the requirement through this exec, the child discharges it, and no sort
+    /// is added — so if the class stops here, the merge above has an unordered child
+    /// and the plan is rejected, exactly as it was for constants.
+    #[test]
+    fn an_equivalence_class_propagates_through_the_schema_cast() {
+        let schema = a_b_schema();
+        let ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("a", &schema).expect("col a")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
+            ordering,
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            physical_col("a", &schema).expect("col a"),
+            Operator::Eq,
+            physical_col("b", &schema).expect("col b"),
+        ));
+        let filtered: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, sorted).expect("filter exec"));
+        assert!(
+            filtered
+                .equivalence_properties()
+                .ordering_satisfy(ascending_on(&schema, "b"))
+                .expect("ordering satisfaction"),
+            "precondition: the child satisfies ORDER BY b through a = b"
+        );
+
+        let schema_cast = SchemaCastScanExec::new(filtered, Arc::clone(&schema));
+
+        assert!(
+            schema_cast
+                .properties()
+                .eq_properties
+                .ordering_satisfy(ascending_on(&schema, "b"))
+                .expect("ordering satisfaction"),
+            "the equivalence class the child discharged the requirement with must survive"
+        );
+    }
+
+    /// Likewise for an input that advertises more than one ordering: the child
+    /// satisfies `ORDER BY b` through its second one, so that one has to survive too.
+    /// Forwarding only the input's primary ordering concatenates them into
+    /// `[a ASC, b ASC]`, which does not satisfy `[b ASC]` — satisfaction is a prefix
+    /// check.
+    #[test]
+    fn a_secondary_ordering_propagates_through_the_schema_cast() {
+        let schema = a_b_schema();
+        let orderings: Vec<LexOrdering> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                LexOrdering::new(vec![
+                    PhysicalSortExpr::new_default(physical_col(name, &schema).expect("column"))
+                        .asc(),
+                ])
+                .expect("lex ordering")
+            })
+            .collect();
+        let source = MemorySourceConfig::try_new(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory source")
+            .try_with_sort_information(orderings)
+            .expect("sort information");
+        let ordered: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(source);
+        assert!(
+            ordered
+                .equivalence_properties()
+                .ordering_satisfy(ascending_on(&schema, "b"))
+                .expect("ordering satisfaction"),
+            "precondition: the child satisfies ORDER BY b through its second ordering"
+        );
+
+        let schema_cast = SchemaCastScanExec::new(ordered, Arc::clone(&schema));
+
+        assert!(
+            schema_cast
+                .properties()
+                .eq_properties
+                .ordering_satisfy(ascending_on(&schema, "b"))
+                .expect("ordering satisfaction"),
+            "every ordering the child can discharge a requirement with must survive"
         );
     }
 }
