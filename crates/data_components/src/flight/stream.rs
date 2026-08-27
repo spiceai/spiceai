@@ -313,7 +313,10 @@ mod tests {
             .expect("a nullable entries declaration is relabelled, not refused");
 
         let [batch] = batches.as_slice() else {
-            panic!("the producer serves exactly one batch, got {}", batches.len());
+            panic!(
+                "the producer serves exactly one batch, got {}",
+                batches.len()
+            );
         };
         assert!(
             conforming(&batch.schema()),
