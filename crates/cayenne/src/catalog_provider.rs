@@ -201,19 +201,28 @@ impl CayenneCatalogProvider {
     /// and the comparison degrades to a lexical one. An unresolvable *path* is a
     /// different matter and refuses, because an overlap that cannot be ruled out is one
     /// that has to be assumed.
+    ///
+    /// A data directory naming an object store is compared rather than exempted, because
+    /// this provider creates whatever it is given — see the call below.
     async fn ensure_metastore_outside_data_dir(
         catalog_name: &str,
         data_dir: &str,
         metadata_dir: &str,
     ) -> Result<()> {
-        let overlap = crate::metastore_layout::overlapping_metastore_dir(data_dir, metadata_dir)
-            .await
-            .map_err(|source| Error::CayenneDirsUnresolvable {
-                catalog_name: catalog_name.to_string(),
-                data_dir: data_dir.to_string(),
-                metadata_dir: metadata_dir.to_string(),
-                source,
-            })?;
+        // The local variant, not the exempting one: this provider creates `data_dir` with
+        // `create_dir_all` whatever it says, so every value here is a filesystem path. The
+        // object-store exemption is a substring test for `://`, which would wave through a
+        // local directory whose name merely contains it — and unlike the accelerator, this
+        // path has no second, exemption-free scan behind it to catch that.
+        let overlap =
+            crate::metastore_layout::overlapping_metastore_dir_local(data_dir, metadata_dir)
+                .await
+                .map_err(|source| Error::CayenneDirsUnresolvable {
+                    catalog_name: catalog_name.to_string(),
+                    data_dir: data_dir.to_string(),
+                    metadata_dir: metadata_dir.to_string(),
+                    source,
+                })?;
 
         if let Some((data, metadata)) = overlap {
             return Err(Error::MetastoreInsideDataDir {
@@ -927,16 +936,43 @@ mod tests {
         .expect("`meta` and `metadata` are siblings, not nested");
     }
 
-    /// A data directory on object storage cannot hold the metastore, so a catalog that
-    /// puts its data there keeps working with the metastore on local disk.
+    /// An object-store-looking data directory is accepted because it does not contain the
+    /// metastore, not because it was waved past the comparison. This provider creates
+    /// `data_dir` locally whatever it says, so nothing here may be exempted on the
+    /// strength of a `://` in its name.
     #[tokio::test]
-    async fn an_object_store_data_dir_is_accepted() {
+    async fn an_object_store_shaped_data_dir_is_compared_not_exempted() {
         CayenneCatalogProvider::ensure_metastore_outside_data_dir(
             "trades",
             "s3://bucket/trades/",
             "/var/spice/metadata",
         )
         .await
-        .expect("a metastore cannot live inside an object-store prefix");
+        .expect("a data directory that does not contain the metastore is accepted");
+    }
+
+    /// Regression test for the exemption hole: `is_local_path` is a substring test for
+    /// `://`, so a perfectly ordinary local directory whose *name* contains it would be
+    /// treated as object storage and skip the comparison entirely — while `create_dir_all`
+    /// still creates it and a metastore configured inside it is still reachable. The
+    /// accelerator can afford that exemption because an exemption-free on-disk scan gates
+    /// its delete; this path has no such second check.
+    #[tokio::test]
+    async fn a_local_data_dir_whose_name_contains_a_scheme_is_still_compared() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data_dir = base.path().join("q://data").to_string_lossy().into_owned();
+        let metadata_dir = format!("{data_dir}/catalog");
+
+        let error = CayenneCatalogProvider::ensure_metastore_outside_data_dir(
+            "trades",
+            &data_dir,
+            &metadata_dir,
+        )
+        .await
+        .expect_err("a local directory is compared however its name is spelled");
+        assert!(
+            matches!(error, Error::MetastoreInsideDataDir { .. }),
+            "expected a metastore-overlap refusal, got: {error}"
+        );
     }
 }

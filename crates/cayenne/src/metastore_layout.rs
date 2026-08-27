@@ -34,6 +34,12 @@ limitations under the License.
 //! directory they name overlap. Finding a metastore that no parameter names is a
 //! property of what is on disk immediately before a delete, so it belongs beside that
 //! delete rather than in this shared answer.
+//!
+//! Two entry points, differing only in whether an object-store data directory is exempted:
+//! [`overlapping_metastore_dir`] for a caller whose data directory may genuinely be remote,
+//! and [`overlapping_metastore_dir_local`] for one that treats every value as a filesystem
+//! path. Picking the wrong one is not a style choice — see the latter for why the exemption
+//! is unsound where it does not apply.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -220,6 +226,37 @@ pub async fn overlapping_metastore_dir(
     let Some(absolute_data) = absolute_data_dir(data_dir)? else {
         return Ok(None);
     };
+    compare_against(absolute_data, metadata_dir).await
+}
+
+/// As [`overlapping_metastore_dir`], but for a caller that treats *every* `data_dir` as a
+/// filesystem path.
+///
+/// The object-store exemption is not merely unnecessary for such a caller, it is unsound:
+/// [`is_local_path`] is a substring test, so a local directory whose name merely contains
+/// `://` — `/tmp/q://data` — is exempted while the caller goes on to create it, and a
+/// metastore configured inside it is then never compared. The accelerator can afford the
+/// exemption because its data directory really may be on object storage and because its
+/// delete is additionally gated on an exemption-free scan of what is on disk; a caller
+/// with neither of those properties must use this instead.
+///
+/// # Errors
+///
+/// Returns an error when either directory cannot be resolved, on the same terms as
+/// [`overlapping_metastore_dir`].
+pub async fn overlapping_metastore_dir_local(
+    data_dir: &str,
+    metadata_dir: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    compare_against(absolute_dir(data_dir)?, metadata_dir).await
+}
+
+/// Resolve `absolute_data`, then report the first location a recursive delete of it would
+/// reach that is also the metastore directory.
+async fn compare_against(
+    absolute_data: PathBuf,
+    metadata_dir: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
     let data = resolve_in_filesystem_order(&absolute_data).await?;
     Ok(overlap_candidates(metadata_dir)
         .await?
