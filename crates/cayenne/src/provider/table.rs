@@ -30700,7 +30700,12 @@ impl CayenneTableProvider {
         let protected_snapshot_tables = if self.pk_deletion_strategy.is_position_based() {
             None
         } else {
-            Some(self.build_protected_snapshot_listing_tables()?)
+            Some(
+                self.build_protected_snapshot_listing_tables()?
+                    .into_iter()
+                    .map(|(snapshot_id, _, table)| (snapshot_id, table))
+                    .collect(),
+            )
         };
 
         let sink: Arc<dyn DeletionSink> = Arc::new(FileBasedDeletionSink::new(
@@ -30832,11 +30837,10 @@ impl CayenneTableProvider {
         // superseded from the row that replaced it. Dropping the sequence here is what
         // let a key-based delete match a retired version and tombstone the KEY, taking
         // the live row with it.
-        let protected = self.protected_snapshots.load();
         let mut snapshot_tables: Vec<(Option<i64>, Arc<ListingTable>)> = self
             .build_protected_snapshot_listing_tables()?
             .into_iter()
-            .map(|(snapshot_id, table)| (protected.get(&snapshot_id).copied(), table))
+            .map(|(_, max_delete_seq_at_creation, table)| (Some(max_delete_seq_at_creation), table))
             .collect();
         // Also scan the cold tier so a key-delete of a cold-resident row is
         // found and tombstoned (the cross-tier scan then hides it via the shared
@@ -30989,11 +30993,16 @@ impl CayenneTableProvider {
     /// Returns a vec of `(snapshot_id, listing_table)` pairs.
     fn build_protected_snapshot_listing_tables(
         &self,
-    ) -> datafusion_common::Result<Vec<(String, Arc<ListingTable>)>> {
+    ) -> datafusion_common::Result<Vec<(String, i64, Arc<ListingTable>)>> {
+        // ONE load, and the threshold travels with the table it belongs to. Loading this
+        // map again at a call site to look the threshold up is a race: a staged publish
+        // or compaction landing between the two loads returns a table whose id is absent
+        // from the second map, and a missing threshold reads as "every tombstone
+        // applies" — which filters live replacement rows out of the delete entirely.
         let protected_snapshots = self.protected_snapshots.load();
 
         let mut result = Vec::with_capacity(protected_snapshots.len());
-        for snapshot_id in protected_snapshots.keys() {
+        for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots.iter() {
             let snapshot_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
                 &self.table_metadata.table_id,
@@ -31011,7 +31020,11 @@ impl CayenneTableProvider {
                     "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
                 ))
             })?;
-            result.push((snapshot_id.clone(), listing_table));
+            result.push((
+                snapshot_id.clone(),
+                *max_delete_seq_at_creation,
+                listing_table,
+            ));
         }
         Ok(result)
     }
@@ -47191,18 +47204,20 @@ mod tests {
         }
     }
 
-    /// REPRO (investigation, not a fix): does a predicate `DELETE` on a key-based CDC
-    /// upsert table hide a row whose LIVE value does not match the predicate?
+    /// A predicate `DELETE` on a key-based CDC upsert table must not hide a row whose
+    /// LIVE value does not match the predicate.
     ///
-    /// `CayenneDeletionSink::delete_from` scans every table in `additional_scan_tables`
-    /// raw — `table.scan(state, None, &[], None)`, no deletion-visibility filter — and
-    /// `build_deletion_vector_sink` passes the protected-snapshot listings. A CDC upsert
-    /// publishes each batch as its own protected snapshot, so the scan can reach the
-    /// SUPERSEDED version of a key. A key-based tombstone names the key, so matching the
-    /// old value should hide the live replacement too.
+    /// `CayenneDeletionSink` still scans each table in `additional_scan_tables` raw, so
+    /// it reaches versions an upsert has superseded — a CDC upsert publishes every batch
+    /// as its own protected snapshot. What keeps a key-based tombstone off the live row
+    /// is the per-snapshot threshold: each listing carries its
+    /// `max_delete_seq_at_creation`, and an extracted key is dropped when
+    /// `get_with_min_seq` finds a tombstone newer than it, which is precisely the read
+    /// path's own visibility rule.
     ///
     /// Key 7 is written at 10 (matches `value < 50`), then upserted to 60 (does not).
-    /// `DELETE WHERE value < 50` must leave `(7, 60)` alone.
+    /// `DELETE WHERE value < 50` must leave `(7, 60)` alone. Verified to fail without the
+    /// threshold filter — it returns an empty table.
     #[tokio::test]
     async fn predicate_delete_must_not_hide_a_live_row_superseding_a_matching_version() {
         let ctx = SessionContext::new();
@@ -47419,6 +47434,16 @@ mod tests {
             "precondition: the rows must be in the metastore inline corpus"
         );
 
+        // Recording the inlined keys here would leave the cache naming rows retention is
+        // about to delete, and a later `DoNothing` insert validating against one of them
+        // would be dropped as a duplicate of a row that no longer exists. The durable and
+        // staged paths clear instead of record for exactly this reason.
+        assert!(
+            provider.sharded_pk_keyset_cache.lock().is_none(),
+            "arming retention must clear the PK keyset rather than record keys the \
+             pass may remove"
+        );
+
         provider
             .flush_pending_maintenance()
             .await
@@ -47429,6 +47454,200 @@ mod tests {
             vec![(2, 60)],
             "the inline commit must arm retention, and that pass must remove the row \
              below the floor"
+        );
+    }
+
+    /// The composite / non-integer key half of the delete-visibility fix.
+    ///
+    /// `is_live_row_key` is a separate code path from `is_live_int64_pk` — a different
+    /// index (`KeyDeletionIndex`), a different key encoding — so the Int64 repro proves
+    /// nothing about it. Same shape: a key upserted past the predicate must survive.
+    #[tokio::test]
+    async fn predicate_delete_must_not_hide_a_live_row_for_a_composite_primary_key() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .create(CreateTableOptions {
+                table_name: "delete_supersede_composite".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["tenant".to_string(), "id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "tenant".to_string(),
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    // Each write must become its own Vortex file / protected snapshot.
+                    // `VortexConfig::default()` inlines up to 1024 rows, which would
+                    // absorb both writes into the metastore corpus and never reach the
+                    // raw protected-snapshot scan this test is about.
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("composite-key upsert table created");
+
+        let row = |value: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["acme"])),
+                    Arc::new(Int64Array::from(vec![7_i64])),
+                    Arc::new(Int64Array::from(vec![value])),
+                ],
+            )
+            .expect("composite-key batch")
+        };
+
+        insert_batch(&provider, row(10)).await;
+        insert_batch(&provider, row(60)).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+
+        assert_eq!(
+            scan_composite_values(&provider).await,
+            vec![60],
+            "precondition: the upsert superseded the old version"
+        );
+        assert!(
+            !provider.protected_snapshots.load().is_empty(),
+            "precondition: the superseded version must live in a protected snapshot — \
+             that raw scan is the hazard, and an inlined corpus would not reach it"
+        );
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            0,
+            "precondition: nothing may be absorbed into the inline corpus"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_composite_values(&provider).await,
+            vec![60],
+            "the live row does not match `value < 50`, so a key tombstone written from \
+             the superseded version must not take it"
+        );
+    }
+
+    /// The `value` column of every visible row, for the composite-key table above.
+    async fn scan_composite_values(provider: &CayenneTableProvider) -> Vec<i64> {
+        use arrow::array::Int64Array;
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let batches = collect(plan, ctx.task_ctx()).await.expect("scan");
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column is Int64");
+            for row in 0..batch.num_rows() {
+                values.push(column.value(row));
+            }
+        }
+        values.sort_unstable();
+        values
+    }
+
+    /// Retention defers on a staged append mid-finalization for the same reason it defers
+    /// on an unpublished tombstone: the checkpoint it would run flushes inline rows while
+    /// that publish is still in flight. `sort_and_rewrite_data` guards the same pair.
+    #[tokio::test]
+    async fn retention_defers_while_a_staged_append_is_finalizing() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (plain, catalog, _tmp) =
+            create_inlining_table("retention_defers_staging", Arc::clone(&runtime_env)).await;
+        let table_name = plain.table_metadata.table_name.clone();
+        let schema = Arc::clone(&plain.table_metadata.schema);
+        drop(plain);
+
+        let seeded =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen without retention");
+        insert_batch(&seeded, id_value_batch(schema, &[1, 2], &[10, 60])).await;
+        drop(seeded);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            catalog,
+            vec![retention_predicate()],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+        assert!(
+            provider.cached_inlined_row_count() > 0,
+            "precondition: the corpus must be inline, or the guard is skipped"
+        );
+
+        // Stage B of a pipelined append: registered as in flight, not yet published.
+        provider
+            .inflight_staging_appends
+            .lock()
+            .insert("staged-snapshot".to_string());
+        assert!(provider.has_inflight_staging_appends(), "precondition");
+
+        assert_eq!(
+            provider
+                .apply_retention_filters()
+                .await
+                .expect("retention defers rather than failing"),
+            RetentionPass::Deferred,
+            "retention must decline the pass while a staged append is finalizing"
+        );
+
+        provider.inflight_staging_appends.lock().clear();
+        provider
+            .apply_retention_filters()
+            .await
+            .expect("retention proceeds once the publish lands");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(2, 60)],
+            "once the window closes retention removes exactly the matching row"
         );
     }
 

@@ -3163,6 +3163,17 @@ fn wrap_with_native_vector_indexes(
 /// expired rows are hidden from every read whether or not they were physically deleted,
 /// memory mode included. Naming it here would tell the operator their data is exposed
 /// when it is not.
+/// Whether a `mode: memory` acceleration warrants [`memory_mode_retention_warning`].
+///
+/// Deliberately keyed on `retention_sql` alone. `retention_period` is a scan-time keep
+/// filter, so its expired rows are excluded from every read in either mode — warning
+/// about it would tell the operator their data is exposed when it is not. An earlier
+/// revision of this warning did exactly that, which is why the condition is a named
+/// predicate with its own test rather than an inline `||`.
+const fn memory_mode_retention_warning_applies(memory_mode: bool, has_retention_sql: bool) -> bool {
+    memory_mode && has_retention_sql
+}
+
 fn memory_mode_retention_warning(table_name: &str) -> String {
     format!(
         "Dataset '{table_name}' (cayenne): `retention_sql` is not applied to a `mode: memory` acceleration, so rows matching that predicate stay queryable in the accelerated table. Set `mode: file` to have it applied, or use `retention_period`, which filters expired rows out of every read in either mode. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
@@ -3956,7 +3967,7 @@ impl DataAccelerator for CayenneAccelerator {
             Vec::new()
         };
 
-        if memory_mode && !retention_filters.is_empty() {
+        if memory_mode_retention_warning_applies(memory_mode, !retention_filters.is_empty()) {
             tracing::warn!("{}", memory_mode_retention_warning(&table_name));
         }
 
@@ -5011,6 +5022,24 @@ mod tests {
                 "log messages stay on one line: {warning}"
             );
         }
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_covers_retention_sql_and_spares_retention_period() {
+        assert!(
+            memory_mode_retention_warning_applies(true, true),
+            "a memory-mode table with retention_sql keeps rows the predicate matches"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(true, false),
+            "retention_period alone must NOT warn: its keep filter excludes expired rows \
+             from every read in either mode, so warning would claim an exposure that does \
+             not exist"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(false, true),
+            "a file-mode table applies retention_sql, so there is nothing to warn about"
+        );
     }
 
     #[test]
