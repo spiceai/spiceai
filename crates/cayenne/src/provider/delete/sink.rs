@@ -53,6 +53,7 @@ use super::super::deletion_strategy::{
 };
 use super::super::memory_account::CayenneMemoryAccount;
 use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
+use super::filter_exec::{InsertRecordHandling, is_pk_visible_i64, is_pk_visible_row_key};
 use super::vector_io::DeletionVectorWriteResult;
 use super::vector_io::{
     DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter,
@@ -686,19 +687,40 @@ impl CayenneDeletionSink {
     }
 
     /// Extract row keys from a batch using the `RowConverter`.
-    /// Whether an Int64-keyed row from a snapshot whose rows are visible above
-    /// `min_delete_seq` is still live — i.e. no tombstone NEWER than that threshold
-    /// covers it. `None` is the base case (current snapshot, cold tier): every delete
-    /// applies. This is the read path's own rule, applied per row instead of per plan.
+    /// Which insert records apply when probing rows from a snapshot whose deletions are
+    /// visible above `min_delete_seq`.
+    ///
+    /// Mirrors the read path exactly: the main listing applies them
+    /// (`apply_deletion_filter`), so a key deleted and later re-inserted is live again,
+    /// while a protected snapshot ignores them (`apply_partial_deletion_filter`) because
+    /// its own threshold already excludes everything older. Getting this wrong is not
+    /// academic — treating a re-inserted key as deleted skips it, and the DELETE then
+    /// leaves a row it was asked to remove.
+    const fn insert_record_handling(min_delete_seq: Option<i64>) -> InsertRecordHandling {
+        if min_delete_seq.is_some() {
+            InsertRecordHandling::Ignore
+        } else {
+            InsertRecordHandling::Apply
+        }
+    }
+
+    /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
+    /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
+    /// cold tier, where every delete applies.
+    ///
+    /// Delegates to the read path's own predicate rather than probing the index directly:
+    /// a bare `get_with_min_seq(..).is_none()` is only half the rule, and misses that a
+    /// tombstoned key re-inserted after its delete is visible again.
     fn is_live_int64_pk(&self, pk: i64, min_delete_seq: Option<i64>) -> bool {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
-            } => deletion_snapshot
-                .load()
-                .tombstones
-                .get_with_min_seq(pk, min_delete_seq)
-                .is_none(),
+            } => is_pk_visible_i64(
+                pk,
+                &deletion_snapshot.load().tombstones,
+                Self::insert_record_handling(min_delete_seq),
+                min_delete_seq,
+            ),
             _ => true,
         }
     }
@@ -708,11 +730,12 @@ impl CayenneDeletionSink {
         match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
-            } => deletion_snapshot
-                .load()
-                .tombstones
-                .get_with_min_seq(key, min_delete_seq)
-                .is_none(),
+            } => is_pk_visible_row_key(
+                key,
+                &deletion_snapshot.load().tombstones,
+                Self::insert_record_handling(min_delete_seq),
+                min_delete_seq,
+            ),
             _ => true,
         }
     }
