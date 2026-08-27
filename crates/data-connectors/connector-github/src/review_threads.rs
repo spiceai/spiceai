@@ -80,9 +80,10 @@ impl GraphQLContext for ReviewThreadsTableArgs {
     }
 
     fn query_cost(&self) -> Option<u32> {
-        // 1 (pullRequests) + 100 (reviewThreads per pull request)
+        // 1 (pullRequests) + 100 (reviewThreads per pull request) + the count-only
+        // `comments` connection, which opens once per thread.
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(1 + THREADS_PER_PULL_REQUEST)
+        Some(1 + THREADS_PER_PULL_REQUEST + THREADS_PER_PULL_REQUEST)
     }
 }
 
@@ -297,7 +298,12 @@ mod tests {
         let cost = args()
             .query_cost()
             .expect("review_threads to declare a query cost");
-        assert_eq!(cost, 1 + THREADS_PER_PULL_REQUEST);
+        // 1 pullRequests + 100 reviewThreads + one count-only `comments`
+        // connection per thread.
+        assert_eq!(
+            cost,
+            1 + THREADS_PER_PULL_REQUEST + THREADS_PER_PULL_REQUEST
+        );
         assert!(
             cost <= 2000,
             "review_threads query cost {cost} exceeds the burst"

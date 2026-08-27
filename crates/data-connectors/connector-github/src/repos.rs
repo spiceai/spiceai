@@ -24,7 +24,7 @@ limitations under the License.
 //! shape is also the table the `owner` / `repo` columns on every other GitHub
 //! table join back to.
 
-use crate::identity::{OWNER_COLUMN, REPO_COLUMN};
+use crate::identity::{OWNER_COLUMN, REPO_COLUMN, canonical_identity};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use connector_graphql::graphql::{
     ErrorChecker, GraphQLContext, Result,
@@ -186,24 +186,27 @@ impl GitHubTableArgs for ReposTableArgs {
     }
 }
 
-/// Stamps the identity columns from the dataset path rather than the response.
+/// Stamps the identity columns, taking `owner` from the dataset path.
 ///
-/// GitHub treats owner and repository names as case-insensitive and answers in
-/// its own canonical casing, but SQL string equality is not case-insensitive.
-/// Taking `owner` from the response would make `github.com/SpiceAI/spiceai/repo`
-/// carry a different `owner` than every path-stamped table, and a join between
-/// them would silently match nothing. `name_with_owner` still carries GitHub's
-/// canonical spelling for anyone who wants it.
-///
-/// The owner-level shape has one row per repository, so only `repo` comes from
-/// the response there — as `name`, which is the row's own identity rather than
-/// the dataset's.
+/// The owner-level shape has one row per repository, so `repo` can only come
+/// from the response there — as `name`, which is the row's own identity rather
+/// than the dataset's. That is the one place these columns are sourced from
+/// GitHub rather than from the path, so it is also the one place the two
+/// spellings could diverge; [`canonical_identity`] folds both, which is what
+/// lets a row from here join a row from a repository-scoped table.
+/// `name_with_owner` still carries GitHub's own spelling for display.
 fn stamp_identity(row: &mut Map<String, Value>, owner: &str, repo: Option<&str>) {
-    row.insert(OWNER_COLUMN.to_string(), Value::String(owner.to_string()));
+    row.insert(
+        OWNER_COLUMN.to_string(),
+        Value::String(canonical_identity(owner)),
+    );
 
-    let repo = match repo {
-        Some(repo) => Value::String(repo.to_string()),
-        None => row.get("name").cloned().unwrap_or(Value::Null),
+    let repo = match repo.map(canonical_identity) {
+        Some(repo) => Value::String(repo),
+        None => match row.get("name").and_then(Value::as_str) {
+            Some(name) => Value::String(canonical_identity(name)),
+            None => Value::Null,
+        },
     };
     row.insert(REPO_COLUMN.to_string(), repo);
     row.remove("name");
@@ -392,22 +395,54 @@ mod tests {
         assert_eq!(row["license"], Value::Null);
     }
 
-    /// GitHub answers in its own canonical casing, so reading identity out of the
-    /// response would make a join against a path-stamped table miss on casing.
+    /// The repository-scoped shape names its repository in the dataset path, so
+    /// identity comes from there and not from the response — the response is
+    /// about one repository either way, and `name` is what the owner-level shape
+    /// needs it for.
     #[test]
     fn the_repo_level_shape_stamps_identity_from_the_path_not_the_response() {
         let args = ReposTableArgs {
-            owner: "SpiceAI".to_string(),
-            repo: Some("SpiceAI".to_string()),
-            component: shared_component("test.repo_casing"),
+            owner: "spiceai".to_string(),
+            repo: Some("spicetrade".to_string()),
+            component: shared_component("test.repo_identity"),
         };
 
         let row = unnest_one(&args, &repository_node());
 
-        assert_eq!(row["owner"], json!("SpiceAI"));
-        assert_eq!(row["repo"], json!("SpiceAI"));
-        // GitHub's canonical spelling is still available.
+        assert_eq!(row["owner"], json!("spiceai"));
+        assert_eq!(row["repo"], json!("spicetrade"));
         assert_eq!(row["name_with_owner"], json!("spiceai/spicetrade"));
+    }
+
+    /// The owner-level shape is the one place `repo` is read from GitHub rather
+    /// than from the dataset path, so it is the one place the two spellings can
+    /// diverge. Both are folded, which is what lets a row from here join a row
+    /// from a repository-scoped table.
+    #[test]
+    fn both_shapes_agree_on_identity_whatever_the_path_casing() {
+        let owner_level = unnest_one(
+            &ReposTableArgs {
+                owner: "SpiceAI".to_string(),
+                repo: None,
+                component: shared_component("test.repos_casing"),
+            },
+            &repository_node(),
+        );
+        let repo_level = unnest_one(
+            &ReposTableArgs {
+                owner: "SpiceAI".to_string(),
+                repo: Some("SpiceTrade".to_string()),
+                component: shared_component("test.repo_casing"),
+            },
+            &repository_node(),
+        );
+
+        assert_eq!(owner_level["owner"], repo_level["owner"]);
+        assert_eq!(owner_level["repo"], repo_level["repo"]);
+        assert_eq!(owner_level["owner"], json!("spiceai"));
+        assert_eq!(owner_level["repo"], json!("spicetrade"));
+        // GitHub's own spelling stays available for display.
+        assert_eq!(owner_level["name_with_owner"], json!("spiceai/spicetrade"));
     }
 
     #[test]
