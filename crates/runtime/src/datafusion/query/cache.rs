@@ -479,6 +479,15 @@ impl Query {
             }
         };
 
+        // Counted here rather than at the cache lookup: an entry the clock marked
+        // stale is still not *served* if the request's own `max-stale` is
+        // shorter than the configured window, or if it fails to decode. Both of
+        // those return a miss above, so recording earlier would overcount the
+        // refresh misses the window actually absorbed.
+        if entry_validity == EntryValidity::StaleWhileRevalidate {
+            cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
+        }
+
         let record_batch_stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
 
         Ok(CacheResponse::from(
@@ -768,6 +777,7 @@ impl Query {
                                         "Background revalidation failed during collection: {}",
                                         e
                                     );
+                                    record_revalidation_outcome(RevalidationOutcome::CollectFailed);
                                 }
                             }
                         }
@@ -777,6 +787,7 @@ impl Query {
                                 "Background revalidation query failed: {}",
                                 e
                             );
+                            record_revalidation_outcome(RevalidationOutcome::QueryFailed);
                         }
                     }
 

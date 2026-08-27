@@ -145,6 +145,10 @@ impl StaleRejectionReason {
 pub enum RevalidationOutcome {
     /// The fresh result replaced the entry.
     Stored,
+    /// The revalidation query itself failed to execute.
+    QueryFailed,
+    /// The query ran but its result stream failed part-way through.
+    CollectFailed,
     /// A table the revalidation read was invalidated while it ran, so its
     /// result may predate that invalidation and was discarded.
     InvalidatedMidFlight,
@@ -159,8 +163,10 @@ pub enum RevalidationOutcome {
 
 impl RevalidationOutcome {
     /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Stored,
+        Self::QueryFailed,
+        Self::CollectFailed,
         Self::InvalidatedMidFlight,
         Self::TransientErrors,
         Self::EncodeFailed,
@@ -170,6 +176,8 @@ impl RevalidationOutcome {
     fn as_str(self) -> &'static str {
         match self {
             Self::Stored => "stored",
+            Self::QueryFailed => "query_failed",
+            Self::CollectFailed => "collect_failed",
             Self::InvalidatedMidFlight => "invalidated_mid_flight",
             Self::TransientErrors => "transient_errors",
             Self::EncodeFailed => "encode_failed",
@@ -285,7 +293,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_invalidation_stale_hits"))
                     .with_description(
-                        "Number of lookups served from an entry a table invalidation had marked stale, within the configured stale-while-revalidate window. These are counted as hits, and each starts one background revalidation.",
+                        "Number of results served from an entry a table invalidation had marked stale, within the configured stale-while-revalidate window. Counted where the result is handed back, so a request whose own `max-stale` is shorter than the window, or whose entry fails to decode, is not counted here even though the entry was found.",
                     )
                     .build()
             });
@@ -401,14 +409,6 @@ pub trait CacheMetrics: Send + Sync {
     fn record_table_invalidation(mode: InvalidationMode)
     where
         Self: Sized;
-    /// Records a lookup served from an entry a table invalidation had marked
-    /// stale, within the configured stale-while-revalidate window. The
-    /// counterpart to [`Self::record_stale_rejection`]: the same invalidation,
-    /// on a cache the operator has configured to serve the previous result
-    /// while a fresh one is computed.
-    fn record_invalidation_stale_hit()
-    where
-        Self: Sized;
     fn update_hit_ratio(hits: u64, total: u64)
     where
         Self: Sized;
@@ -467,10 +467,6 @@ impl CacheMetrics for CachedSearchResult {
         search_results::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
     }
 
-    fn record_invalidation_stale_hit() {
-        search_results::INVALIDATION_STALE_HITS.add(1, &[]);
-    }
-
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         search_results::HIT_RATIO.record(ratio, &[]);
@@ -518,10 +514,6 @@ impl CacheMetrics for CachedQueryResult {
         sql_results::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
     }
 
-    fn record_invalidation_stale_hit() {
-        sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
-    }
-
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         sql_results::HIT_RATIO.record(ratio, &[]);
@@ -567,10 +559,6 @@ impl CacheMetrics for CachedEmbeddingResult {
 
     fn record_table_invalidation(mode: InvalidationMode) {
         embeddings::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
-    }
-
-    fn record_invalidation_stale_hit() {
-        embeddings::INVALIDATION_STALE_HITS.add(1, &[]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {

@@ -1374,7 +1374,6 @@ mod tests {
         fn record_max_size(_size: u64) {}
         fn record_eviction(_reason: EvictionReason) {}
         fn record_stale_rejection(_reason: StaleRejectionReason) {}
-        fn record_invalidation_stale_hit() {}
         fn record_table_invalidation(_mode: InvalidationMode) {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
         fn publish_counters_at_zero() {}
@@ -1695,7 +1694,6 @@ mod tests {
                 fn record_size(_size: u64) {}
                 fn record_max_size(_size: u64) {}
                 fn record_stale_rejection(_reason: StaleRejectionReason) {}
-                fn record_invalidation_stale_hit() {}
                 fn record_table_invalidation(_mode: InvalidationMode) {}
                 fn update_hit_ratio(_hits: u64, _total: u64) {}
                 fn publish_counters_at_zero() {}

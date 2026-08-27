@@ -827,9 +827,6 @@ impl QueryResultsCacheProvider {
         let validity = EntryValidity::from_u8(observed.load(std::sync::atomic::Ordering::Relaxed));
 
         if let Some(result) = result {
-            if validity == EntryValidity::StaleWhileRevalidate {
-                CachedQueryResult::record_invalidation_stale_hit();
-            }
             Some((result, validity))
         } else {
             let reason = match validity {
@@ -933,6 +930,15 @@ impl QueryResultsCacheProvider {
     ///   began after the mark.
     /// - without it there is no staleness anyone has agreed to serve, so the
     ///   entry is [`EntryValidity::Invalidated`] immediately.
+    ///
+    /// The mark-anchored window is an upper bound on servability, not a
+    /// guarantee of residency. The backend expires an entry `item_ttl +
+    /// stale_while_revalidate_ttl` after it was *stored*, regardless of any
+    /// mark, so an invalidation landing late in an entry's life opens a window
+    /// the entry may not survive: the effective window is the shorter of the
+    /// two. That can only end the stale-serving period early, never extend it
+    /// past the mark, so it is safe — it just yields fewer absorbed misses than
+    /// the window alone would suggest.
     ///
     /// Ties count as invalidated: an invalidation recorded in the same instant
     /// as the read began must be assumed to have happened first.
