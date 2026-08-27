@@ -122,6 +122,7 @@ fn resolve_table_path(path: &[String]) -> datafusion::sql::TableReference {
 }
 
 async fn decode_flight_batches(
+    table: &datafusion::sql::TableReference,
     streaming: Peekable<Streaming<FlightData>>,
 ) -> Result<
     (
@@ -167,7 +168,7 @@ async fn decode_flight_batches(
         Status::invalid_argument("DoPut stream must include at least one schema message")
     })?;
 
-    normalize_map_entries(&schema, batches)
+    normalize_map_entries(table, &schema, batches)
 }
 
 /// Brings a decoded `DoPut` stream in line with the Arrow map layout.
@@ -178,6 +179,7 @@ async fn decode_flight_batches(
 /// schema, so what its batches need is resolved once, and the corrected schema is returned with
 /// them — it is the one they now carry.
 fn normalize_map_entries(
+    table: &datafusion::sql::TableReference,
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
@@ -187,7 +189,7 @@ fn normalize_map_entries(
         .map(|batch| {
             normalizer.normalize(batch).map_err(|e| {
                 Status::invalid_argument(format!(
-                    "Failed to read the Arrow data sent to the Flight SQL server ({e}), so no rows were written. \
+                    "Failed to read the Arrow data sent to table '{table}' ({e}), so no rows were written. \
                      Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
                      See: https://spiceai.org/docs/api/arrow-flight-sql"
                 ))
@@ -260,12 +262,13 @@ async fn do_put_raw(
         return Err(Status::invalid_argument("no path provided"));
     }
 
+    let table = resolve_table_path(path);
     let table_provider = ctx
-        .table_provider(resolve_table_path(path))
+        .table_provider(table.clone())
         .await
         .map_err(handle_datafusion_error)?;
 
-    let (schema, batches) = decode_flight_batches(streaming).await?;
+    let (schema, batches) = decode_flight_batches(&table, streaming).await?;
 
     // Cast batches to the table's schema for compatible type differences
     // (e.g. Timestamp(µs) incoming vs Timestamp(ns) in the table).
@@ -295,6 +298,11 @@ async fn do_put_raw(
 #[cfg(test)]
 mod tests {
     use super::normalize_map_entries;
+
+    /// The table a `DoPut` resolved to, as `do_put_raw` would have resolved it.
+    fn test_table() -> datafusion::sql::TableReference {
+        datafusion::sql::TableReference::partial("sales", "orders")
+    }
     use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Schema};
     use std::sync::Arc;
@@ -359,7 +367,7 @@ mod tests {
         let batch = map_batch(None);
         let declared = batch.schema();
 
-        let (schema, batches) = normalize_map_entries(&declared, vec![batch])
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
             .expect("a nullable entries declaration is relabelled, not refused");
 
         match schema.field(0).data_type() {
@@ -383,12 +391,14 @@ mod tests {
         let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
         let declared = batch.schema();
 
-        let status = normalize_map_entries(&declared, vec![batch])
+        let status = normalize_map_entries(&test_table(), &declared, vec![batch])
             .expect_err("entries carrying nulls have no representation to relabel to");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(
-            status.message().contains("'m'") && status.message().contains("arrow-flight-sql"),
-            "the refusal must name the column and point at the docs: {}",
+            status.message().contains("'m'")
+                && status.message().contains("'sales.orders'")
+                && status.message().contains("arrow-flight-sql"),
+            "the refusal must name the column and the table it was written to, and point at the docs: {}",
             status.message()
         );
     }
@@ -407,8 +417,8 @@ mod tests {
         .expect("int batch");
         let declared = batch.schema();
 
-        let (schema, batches) =
-            normalize_map_entries(&declared, vec![batch]).expect("nothing to normalize");
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect("nothing to normalize");
         assert!(Arc::ptr_eq(&schema, &declared));
         assert_eq!(batches.len(), 1);
     }

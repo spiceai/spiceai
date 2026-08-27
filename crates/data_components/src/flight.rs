@@ -76,11 +76,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read query results from Arrow Flight ({source}), so the query cannot return rows. \
+        "Failed to read query results from Arrow Flight for table {table} ({source}), so the query cannot return rows. \
         Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
         See: https://spiceai.org/docs/components/data-connectors"
     ))]
-    MapEntriesNotNormalizable { source: map_entries::Error },
+    MapEntriesNotNormalizable {
+        table: String,
+        source: map_entries::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -525,8 +528,14 @@ impl ExecutionPlan for FlightExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            query_to_stream(
+                self.client.clone(),
+                sql,
+                self.table_reference.to_quoted_string(),
+            ),
+        );
 
         Ok(Box::pin(stream_adapter))
     }
@@ -535,6 +544,7 @@ impl ExecutionPlan for FlightExec {
 fn query_to_stream(
     client: FlightClient,
     sql: String,
+    table: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         // The stream's schema is whatever its batches carry, so the normalizer is resolved from
@@ -546,7 +556,7 @@ fn query_to_stream(
                     match batch {
                         Ok(batch) => yield normalizer
                             .normalize(batch)
-                            .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { source })),
+                            .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { table: table.clone(), source })),
                         Err(error) => {
                             yield Err(map_query_stream_error(error));
                         }

@@ -315,7 +315,7 @@ pub(crate) async fn do_get(
         parameter_schema,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let param_values = decode_param_values(&parameters).map_err(error_to_status)?;
+    let param_values = decode_param_values(&parameters).map_err(param_error_to_status)?;
 
     // Rewrite SQL with explicit type casts when parameter schema is available.
     let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
@@ -448,6 +448,16 @@ pub(super) fn decode_param_values(
 
 pub(super) fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
     Status::internal(format!("{err:?}"))
+}
+
+/// Reports a failure to decode the parameters a client sent with a prepared statement.
+///
+/// Every way [`decode_param_values`] can fail describes the client's own bytes — an IPC stream that
+/// does not parse, batches whose schemas disagree, a `MAP` declaration the Arrow layout forbids, or
+/// a value that is not representable as a scalar. None of them is a server fault, so none of them
+/// becomes more likely to succeed on a retry, which is what `Internal` would invite the client to do.
+pub(super) fn param_error_to_status<E: std::fmt::Display>(err: E) -> Status {
+    Status::invalid_argument(format!("{err}"))
 }
 
 #[cfg(test)]

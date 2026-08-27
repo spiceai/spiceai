@@ -93,7 +93,7 @@ pub enum Error {
     StreamRead { source: tonic::Status },
 
     #[snafu(display(
-        "Failed to read the Arrow data sent for table {table} ({source}), so the rest of the stream was not applied and any batch already accepted may have been. \
+        "Failed to read the Arrow data sent for table '{table}' ({source}), so the rest of the stream was not applied and any batch already accepted may have been. \
         Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
         See: https://spiceai.org/docs/api/arrow-flight-sql"
     ))]
@@ -1316,8 +1316,8 @@ mod tests {
             "malformed client input must not be reported as an internal error"
         );
         assert!(
-            status.message().contains("sales.orders"),
-            "message must name the table: {}",
+            status.message().contains("'sales.orders'"),
+            "message must name the table, quoted so a dotted identifier stays unambiguous: {}",
             status.message()
         );
     }

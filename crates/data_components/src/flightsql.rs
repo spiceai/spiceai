@@ -126,11 +126,14 @@ pub enum Error {
     InvalidSortExpression { expr: String },
 
     #[snafu(display(
-        "Failed to read query results from the Flight SQL server ({source}), so the query cannot return rows. \
+        "Failed to read query results from the Flight SQL server for table {table_name} ({source}), so the query cannot return rows. \
         Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
         See: https://spiceai.org/docs/components/data-connectors/flightsql"
     ))]
-    MapEntriesNotNormalizable { source: map_entries::Error },
+    MapEntriesNotNormalizable {
+        table_name: String,
+        source: map_entries::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -887,10 +890,13 @@ impl ExecutionPlan for FlightSqlExec {
             client.set_token(token.clone());
         }
 
-        let inner =
-            query_to_stream(client, sql, Arc::clone(&self.cookie_store)).map(move |result| {
-                result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema))
-            });
+        let inner = query_to_stream(
+            client,
+            sql,
+            Arc::clone(&self.cookie_store),
+            self.table_reference.to_quoted_string(),
+        )
+        .map(move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)));
 
         let timed_stream = stream! {
             futures::pin_mut!(inner);
@@ -1065,6 +1071,7 @@ pub fn query_to_stream(
     mut client: FlightSqlClient,
     sql: String,
     cookie_store: Arc<CookieStore>,
+    table_name: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         // The stream's schema is whatever its batches carry, so the normalizer is resolved from
@@ -1090,7 +1097,7 @@ pub fn query_to_stream(
                                 match batch {
                                     Ok(batch) => yield normalizer
                                         .normalize(batch)
-                                        .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { source })),
+                                        .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { table_name: table_name.clone(), source })),
                                     Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
@@ -1489,10 +1496,15 @@ mod tests {
         let client: FlightSqlClient =
             arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-        let batches = query_to_stream(client, "SELECT 1".to_string(), Arc::clone(&cookie_store))
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("query should succeed");
+        let batches = query_to_stream(
+            client,
+            "SELECT 1".to_string(),
+            Arc::clone(&cookie_store),
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query should succeed");
         assert!(batches.is_empty());
         assert!(cookie_seen.load(Ordering::SeqCst));
 
@@ -1934,10 +1946,15 @@ mod tests {
         let client: FlightSqlClient =
             arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
 
-        let batches = query_to_stream(client, "SELECT m FROM t".to_string(), cookie_store)
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("a nullable entries declaration is relabelled, not refused");
+        let batches = query_to_stream(
+            client,
+            "SELECT m FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("a nullable entries declaration is relabelled, not refused");
 
         let [batch] = batches.as_slice() else {
             panic!("the server serves exactly one batch, got {}", batches.len());
@@ -2008,10 +2025,15 @@ mod tests {
             arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
         client.set_token(TOKEN_VALUE.to_string());
 
-        let _batches = query_to_stream(client, "SELECT 1".to_string(), Arc::clone(&cookie_store))
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("query should succeed");
+        let _batches = query_to_stream(
+            client,
+            "SELECT 1".to_string(),
+            Arc::clone(&cookie_store),
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query should succeed");
 
         assert!(
             token_seen.load(Ordering::SeqCst),
