@@ -17249,6 +17249,7 @@ dependencies = [
  "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "byte-unit",
  "bytes",
  "chrono",
  "criterion 0.7.0",
