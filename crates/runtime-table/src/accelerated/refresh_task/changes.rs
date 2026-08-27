@@ -693,7 +693,8 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
          rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
          Under all three that restart rebuilds the schema, but it reloads the rows only where the source can replay them. \
-         Where the connector takes an initial-snapshot setting — `pg_`, `mysql_` and `dynamodb_replication_initial_snapshot` — \
+         Where the connector takes an initial-snapshot setting — `pg_replication_initial_snapshot`, \
+         `mysql_replication_initial_snapshot` and `dynamodb_replication_initial_snapshot` — \
          set it to `always` before restarting if the acceleration has to come back with its history, since `auto` skips the \
          snapshot under `mode: file_update` and `disabled` skips it under every mode. Where it does not — Debezium, MongoDB \
          and `cdc_ingest` have no such setting — the acceleration comes back holding only what the change stream delivers \
@@ -4452,8 +4453,12 @@ mod tests {
         // parameter at all. Naming the setting alone sent that second half to a key their
         // connector does not have, having just promised their history would come back.
         assert!(
-            msg.contains("`pg_`, `mysql_` and `dynamodb_replication_initial_snapshot`"),
-            "the setting must be named for exactly the connectors that declare it: {msg}"
+            msg.contains("`pg_replication_initial_snapshot`")
+                && msg.contains("`mysql_replication_initial_snapshot`")
+                && msg.contains("`dynamodb_replication_initial_snapshot`"),
+            "the setting must be named for exactly the connectors that declare it, and spelled out \
+             — a shared-suffix abbreviation reads as though `pg_` and `mysql_` were whole keys: \
+             {msg}"
         );
         assert!(
             msg.contains("Debezium, MongoDB and `cdc_ingest` have no such setting"),
