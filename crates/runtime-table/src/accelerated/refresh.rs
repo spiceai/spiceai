@@ -24,6 +24,7 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated::refresh_task::RefreshTask;
+use crate::accelerated::refresh_task::collect_all_indexes;
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
     create_periodic_snapshot_callback, spawn_snapshot_interval_task,
@@ -822,6 +823,11 @@ impl Refresher {
             }) => (Some(Arc::clone(manager)), Some(create_trigger)),
             None => (None, None),
         };
+        if let Some(manager) = &snapshot_manager {
+            manager
+                .set_indexes(collect_all_indexes(&self.accelerator, &self.federated))
+                .await;
+        }
 
         let checkpointer = self.checkpointer.clone();
         // Checkpoints (and snapshot metadata) persist the canonical registration

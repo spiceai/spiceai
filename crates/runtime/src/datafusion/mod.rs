@@ -2638,6 +2638,7 @@ impl DataFusion {
         } else {
             Arc::new(federated_read_table)
         };
+        let source_table_provider_for_index = Arc::clone(&source_table_provider);
 
         let source_schema = source_table_provider.schema();
 
@@ -3044,6 +3045,7 @@ impl DataFusion {
             get_acceleration_layout(dataset, &self.accelerator_engine_registry)
                 .await
                 .ok();
+        let index_restore_layout = acceleration_layout.clone();
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
@@ -3209,6 +3211,12 @@ impl DataFusion {
             }
         }
 
+        let bootstrap_index_info = match &bootstrap_status {
+            BootstrapStatus::Bootstrapped(info) if !info.index_snapshots.is_empty() => {
+                Some(info.clone())
+            }
+            BootstrapStatus::Bootstrapped(_) | BootstrapStatus::None => None,
+        };
         accelerated_table_builder.bootstrap_status(bootstrap_status);
 
         // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
@@ -3239,6 +3247,41 @@ impl DataFusion {
                 accel.type_rewrite_rules()
             });
         accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
+
+        if let Some(info) = bootstrap_index_info
+            && let Some(layout) = index_restore_layout
+            && let Some(engine) = engine_to_acceleration_engine(acceleration_settings.engine)
+            && let Some(manager) = SnapshotManager::try_new(
+                dataset.name.to_string(),
+                acceleration_settings.snapshot_behavior.clone(),
+                layout,
+                engine,
+            )
+            .await
+        {
+            // A trigger-initialized connector exposes a placeholder here. Full-text search
+            // constructs its index only after the real provider is available, so a snapshot
+            // artifact cannot be schema-validated or installed at this point.
+            if let Some(source_provider_for_index) =
+                source_table_provider_for_index.try_table_provider_sync()
+            {
+                crate::search::full_text::table::restore_bootstrapped_full_text_index(
+                    &manager,
+                    &info.index_snapshots,
+                    source_provider_for_index,
+                    &dataset.columns,
+                    &dataset.name,
+                    crate::search::full_text::table::dataset_attaches_stream(&source, dataset),
+                    info.snapshot_id,
+                )
+                .await;
+            } else {
+                tracing::debug!(
+                    dataset = %dataset.name,
+                    "Full-text snapshot artifact is not installed because the source table is deferred; no restored full-text index is available until the dataset is initialized with a ready source"
+                );
+            }
+        }
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)

@@ -22,7 +22,12 @@ limitations under the License.
 //! [`TableLayer`] is what each capability implements.
 
 use async_trait::async_trait;
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{
+    any::Any,
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -57,6 +62,14 @@ pub enum WriteWindow {
     ReplaceAll,
 }
 
+/// Stable identity of an index artifact stored alongside an acceleration snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotIndexIdentity {
+    pub kind: &'static str,
+    pub columns: Vec<String>,
+    pub discriminator: Option<String>,
+}
+
 impl From<InsertOp> for WriteWindow {
     fn from(op: InsertOp) -> Self {
         match op {
@@ -79,6 +92,27 @@ pub trait Index: Debug + Send + Sync + 'static {
 
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String>;
+
+    /// Returns the identity of durable state that can be snapshotted, if any.
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        None
+    }
+
+    /// Makes the index's durable state consistent and returns the directory to archive.
+    async fn freeze_for_snapshot(&self) -> Result<PathBuf> {
+        Err(datafusion::error::DataFusionError::NotImplemented(format!(
+            "Index {} does not support snapshots",
+            self.name()
+        )))
+    }
+
+    /// Replaces this index's durable state from a validated extracted directory.
+    async fn restore_from(&self, _extracted_dir: &Path) -> Result<()> {
+        Err(datafusion::error::DataFusionError::NotImplemented(format!(
+            "Index {} does not support snapshot restore",
+            self.name()
+        )))
+    }
 
     /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
     /// "*_embedding" column) then modify the provided batches to include the computed column.
