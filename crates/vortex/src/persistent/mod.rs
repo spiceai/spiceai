@@ -609,10 +609,10 @@ mod tests {
     #[test]
     fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
         use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
-        use datafusion::arrow::datatypes::{DataType, Field, TimestampMillisecondType, TimeUnit};
+        use datafusion::arrow::datatypes::{DataType, Field, TimeUnit, TimestampMillisecondType};
         use vortex::array::ArrayRef as VortexArrayRef;
-        use vortex::array::builtins::ArrayBuiltins;
         use vortex::array::VortexSessionExecute;
+        use vortex::array::builtins::ArrayBuiltins;
         use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
         use vortex::dtype::{DType, Nullability};
 
