@@ -646,6 +646,11 @@ const fn default_true() -> bool {
     true
 }
 
+/// Fields of an acceleration block that a disabled block does not discard: the
+/// switch itself, and the one setting the dataset reads out of the block before
+/// discarding the rest.
+const CONSUMED_WHEN_DISABLED: [&str; 2] = ["enabled", "ready_state"];
+
 impl Acceleration {
     /// The acceleration fields this block sets that the runtime will ignore
     /// because `enabled: false` turns the whole block off, in the order they
@@ -661,6 +666,11 @@ impl Acceleration {
     /// something other than what the same block carries at its default, which
     /// is what distinguishes `mode: memory` written out by hand — inert either
     /// way — from `mode: file`.
+    ///
+    /// Two fields are never reported. `enabled` is the field doing the
+    /// discarding. `ready_state` is read out of this block and applied to the
+    /// dataset before the block is discarded — deprecated, but not ignored —
+    /// so calling it ignored would be untrue.
     #[must_use]
     pub fn fields_ignored_when_disabled(&self) -> Vec<String> {
         if self.enabled {
@@ -682,7 +692,9 @@ impl Acceleration {
 
         let mut ignored: Vec<String> = configured
             .into_iter()
-            .filter(|(field, value)| field != "enabled" && unset.get(field) != Some(value))
+            .filter(|(field, value)| {
+                !CONSUMED_WHEN_DISABLED.contains(&field.as_str()) && unset.get(field) != Some(value)
+            })
             .map(|(field, _)| field)
             .collect();
         ignored.sort();
@@ -804,6 +816,22 @@ mod tests {
             ",
         );
         assert!(acceleration.enabled, "enabled defaults to true");
+        assert!(acceleration.fields_ignored_when_disabled().is_empty());
+    }
+
+    #[test]
+    fn a_ready_state_inside_a_disabled_block_is_not_reported_as_discarded() {
+        // `acceleration.ready_state` is deprecated, but the dataset still reads
+        // it out of this block and applies it whether or not acceleration is
+        // enabled — so it is the one setting here that a disabled block does not
+        // discard, and saying otherwise would send the reader to fix something
+        // that is working.
+        let acceleration = acceleration_from_yaml(
+            r"
+                enabled: false
+                ready_state: on_load
+            ",
+        );
         assert!(acceleration.fields_ignored_when_disabled().is_empty());
     }
 
