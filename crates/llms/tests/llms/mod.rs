@@ -271,12 +271,6 @@ async fn run_test(
     Ok(Some(actual_resp))
 }
 
-/// How long the background task in [`spawned_work_outlives_per_test_runtime`] stays alive after
-/// reporting that it started. Long enough that the per-test runtime is always dropped first, and
-/// short enough to keep the surviving-work case quick — the dying case does not wait for it, it
-/// observes the dropped sender instead.
-const BACKGROUND_TASK_LIFETIME: Duration = Duration::from_millis(500);
-
 /// Drives a body that spawns a background task, drops the runtime the test itself owns, and
 /// reports whether the task then ran to completion.
 ///
@@ -291,11 +285,17 @@ fn spawned_work_outlives_per_test_runtime(via_shared_runtime: bool) -> bool {
         .build()
         .expect("failed to build the per-test runtime");
 
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
     let body = async move {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _ = started_tx.send(());
-            tokio::time::sleep(BACKGROUND_TASK_LIFETIME).await;
+            // Wait to be released rather than for a fixed time. The release is sent only after
+            // the per-test runtime is dropped, so the drop always happens first however the test
+            // thread is scheduled; a timer here would let a preempted thread finish the task
+            // early and report the control case as surviving.
+            let _ = release_rx.await;
             let _ = finished_tx.send(());
         });
         // Both cases must measure survival rather than whether the task ever got going, so let
@@ -309,6 +309,9 @@ fn spawned_work_outlives_per_test_runtime(via_shared_runtime: bool) -> bool {
         per_test.block_on(body);
     }
     drop(per_test);
+    // Released only now: a task that died with the runtime can never observe this, so the two
+    // cases are separated by what survives the drop rather than by elapsed time.
+    let _ = release_tx.send(());
 
     // Dropping a runtime drops its tasks, which drops `finished_tx` and disconnects the channel,
     // so a task that died is reported immediately rather than by waiting out the timeout.
