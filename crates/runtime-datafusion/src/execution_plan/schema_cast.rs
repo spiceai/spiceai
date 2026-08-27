@@ -131,10 +131,30 @@ impl SchemaCastScanExec {
         input_schema: &SchemaRef,
         output_schema: &SchemaRef,
     ) -> EquivalenceProperties {
-        // Grouped by source column: one output name may be produced more than once,
+        // A name that repeats in either schema is ambiguous, and the ambiguity is not
+        // academic: `try_cast_to` re-labels the batch positionally when the schemas
+        // already agree, and matches by first name when it has to build columns. Those
+        // resolve a repeated name to different inputs, so keying the mapping on the
+        // name could advertise one column's properties for another column's values.
+        // Map only unambiguous names.
+        let occurs_once = |schema: &SchemaRef, name: &str| {
+            schema
+                .fields()
+                .iter()
+                .filter(|field| field.name() == name)
+                .count()
+                == 1
+        };
+
+        // Grouped by source column: one input column may be produced more than once,
         // and every target of a source has to travel with it.
         let mut sources: Vec<(usize, ProjectionTargets)> = Vec::new();
         for (output_idx, output_field) in output_schema.fields().iter().enumerate() {
+            if !occurs_once(output_schema, output_field.name())
+                || !occurs_once(input_schema, output_field.name())
+            {
+                continue;
+            }
             let Some((input_idx, input_field)) = input_schema.column_with_name(output_field.name())
             else {
                 continue;
@@ -1083,6 +1103,41 @@ mod tests {
                 .ordering_satisfy(ascending_on(&schema, "b"))
                 .expect("ordering satisfaction"),
             "the equivalence class the child discharged the requirement with must survive"
+        );
+    }
+
+    /// A column name that repeats is ambiguous about which input it came from, and
+    /// `try_cast_to` resolves that ambiguity two different ways depending on whether
+    /// it can re-label the batch wholesale. Advertising the first column's properties
+    /// for all of them could therefore describe values another column holds, so a
+    /// repeated name carries nothing.
+    #[test]
+    fn a_repeated_column_name_propagates_nothing() {
+        let duplicated = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        // Constant on the *first* `x` only; the second holds unrelated values.
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("x", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+        ));
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(predicate, Arc::new(EmptyExec::new(Arc::clone(&duplicated))))
+                .expect("filter exec"),
+        );
+        assert!(
+            !constant_column_indices(filtered.as_ref(), "x").is_empty(),
+            "precondition: the child holds a constant on one of the two `x` columns"
+        );
+
+        let schema_cast = SchemaCastScanExec::new(filtered, Arc::clone(&duplicated));
+
+        assert!(
+            constant_column_indices(&schema_cast, "x").is_empty(),
+            "an ambiguous name must carry no properties, or one column's constant \
+             describes another column's values"
         );
     }
 
