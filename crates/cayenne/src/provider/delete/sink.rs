@@ -73,7 +73,7 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
-use datafusion::physical_plan::execute_stream;
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion_catalog::TableProvider;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
@@ -415,6 +415,16 @@ pub struct CayenneDeletionSink {
     /// listing table — the protected snapshots and (for cold-tier tables) the
     /// cold-tier files. The sink treats every entry uniformly.
     additional_scan_tables: Vec<Arc<ListingTable>>,
+    /// Visibility-filtered source for a KEY-based filtered delete, replacing the raw
+    /// per-listing scans below.
+    ///
+    /// Those listings are files, not a view: scanning them reaches row versions an
+    /// upsert has already superseded. A key-based tombstone names the KEY, so matching
+    /// a superseded value whose live replacement does NOT match the predicate deletes
+    /// the live row — the caller asked to remove rows the table no longer contains and
+    /// lost one it does. A position-based tombstone names a file and row position and
+    /// cannot alias like that, which is why it keeps the raw path.
+    live_scan_plan: Option<Arc<dyn ExecutionPlan>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -468,11 +478,20 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             additional_scan_tables,
+            live_scan_plan: None,
             runtime_env,
             write_lock,
             seq_allocator,
             count_exact: false,
         }
+    }
+
+    /// Supply the visibility-filtered plan a key-based filtered delete must match
+    /// against instead of the raw listings. See [`Self::live_scan_plan`].
+    #[must_use]
+    pub(crate) fn with_live_scan_plan(mut self, plan: Arc<dyn ExecutionPlan>) -> Self {
+        self.live_scan_plan = Some(plan);
+        self
     }
 
     /// Set whether this sink must return an exact, verified deleted-row count.
@@ -715,6 +734,19 @@ impl CayenneDeletionSink {
 
         let coerced_filters = self.coerce_filters_for_schema()?;
 
+        // One source for the whole key-based path: the visibility-filtered plan when the
+        // caller supplied one, else the raw listings. See `live_scan_plan`.
+        let scan_plans: Vec<Arc<dyn ExecutionPlan>> = match &self.live_scan_plan {
+            Some(plan) => vec![Arc::clone(plan)],
+            None => {
+                let mut plans = Vec::with_capacity(tables.len());
+                for table in tables {
+                    plans.push(table.scan(&ctx.state(), None, &[], None).await?);
+                }
+                plans
+            }
+        };
+
         // PK-IN-list fast path: when the filter encodes the PK deletion values
         // directly (`pk IN (...)`), extract them and write deletion vectors
         // WITHOUT a full table scan.
@@ -791,9 +823,8 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                for scan_plan in &scan_plans {
+                    let mut stream = execute_stream(Arc::clone(scan_plan), ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
@@ -853,9 +884,8 @@ impl CayenneDeletionSink {
                 let mut delete_sequence: Option<i64> = None;
                 let mut staged = StagedPkDelete::new(&self.pk_deletion_strategy, table_name)?;
 
-                for table in tables {
-                    let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
-                    let mut stream = execute_stream(scan_plan, ctx.task_ctx())?;
+                for scan_plan in &scan_plans {
+                    let mut stream = execute_stream(Arc::clone(scan_plan), ctx.task_ctx())?;
 
                     while let Some(batch_result) = stream.next().await {
                         let batch =
