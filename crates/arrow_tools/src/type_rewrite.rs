@@ -588,8 +588,13 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
 /// from it: a `RunEndEncoded` array has no null buffer at all (a null run is a null in `values`,
 /// expanded over the run); a `Dictionary` can hold nulls in its values, reachable through the keys
 /// that select them; a `Union` has none of its own either, its nulls being those of the child each
-/// row selects; and every value of a `Null` array is null with no buffer to say so. All four are
-/// answered by Arrow's own [`Array::logical_nulls`] rather than by re-deriving them.
+/// row selects; and every value of a `Null` array is null with no buffer to say so.
+///
+/// Three of the four are answered by Arrow's own [`Array::logical_nulls`] rather than by
+/// re-deriving them. `Union` is the exception, and deliberately so: this file derives a union's
+/// nulls itself in [`union_logical_nulls`], because `UnionArray::logical_nulls` is not
+/// slice-correct — see the arm below for what it reports instead. A caller reading this comment
+/// must not conclude that a union's answer carries Arrow's semantics.
 ///
 /// That answer is not always in the child's coordinates, which is why [`in_own_rows`] follows it.
 /// Measured against the pinned arrow-rs: a one-variant sparse union sliced to `len 1, offset 1`
