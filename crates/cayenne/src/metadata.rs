@@ -2098,6 +2098,84 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
+/// One Cayenne table's disk and metastore footprint, read from the metastore's
+/// own accounting rather than by walking the table directory.
+///
+/// The manifest (`cayenne_snapshot_file`), the deletion-vector catalog, and the
+/// cold-tier manifest already record every file's size and row count, so a
+/// handful of aggregate queries answer "how big is this dataset, and which
+/// layer is growing" without a LIST per snapshot. That matters because the
+/// tables this is sampled on are exactly the ones with thousands of files.
+///
+/// Every field is `i64` because that is what the metastore returns; the callers
+/// that publish these as gauges saturate to `u64` at the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableStorageStats {
+    /// Data files in the current snapshot.
+    pub current_files: i64,
+    /// On-disk bytes of the current snapshot's data files.
+    pub current_bytes: i64,
+    /// Rows in the current snapshot's data files, before deletions apply.
+    pub current_rows: i64,
+    /// Data files across the live protected snapshots (the merge-on-read runs).
+    pub protected_files: i64,
+    /// On-disk bytes of the protected snapshots' data files.
+    pub protected_bytes: i64,
+    /// Rows in the protected snapshots' data files, before deletions apply.
+    pub protected_rows: i64,
+    /// Manifest rows naming a snapshot that is no longer live — dead weight in
+    /// the metastore until a compaction or overwrite prunes them.
+    pub unreachable_manifest_rows: i64,
+    /// Distinct `file_path` values referenced by any live snapshot — the number
+    /// of real files the reachable manifest rows describe.
+    ///
+    /// Always `<=` the reachable row count, and usually strictly less: a
+    /// manifest row is a `(snapshot, file)` pair, and compaction deliberately
+    /// references an un-baked file from a new snapshot in place rather than
+    /// copying it, so one file on disk earns a row under every live snapshot
+    /// that references it. Without this figure the row count reads as a file
+    /// count and overstates the table's real state — by an order of magnitude on
+    /// a table with a deep snapshot chain.
+    pub distinct_live_files: i64,
+    /// Files promoted to the cold object-store tier.
+    pub cold_files: i64,
+    /// Bytes of the cold-tier files.
+    pub cold_bytes: i64,
+    /// Rows in the cold-tier files.
+    pub cold_rows: i64,
+    /// Live deletion-vector files.
+    pub delete_files: i64,
+    /// On-disk bytes of the deletion-vector files.
+    pub delete_file_bytes: i64,
+    /// Tombstones recorded across those deletion-vector files.
+    pub delete_file_tombstones: i64,
+    /// Registered snapshot sequences (the durable protected-snapshot set).
+    pub snapshot_sequences: i64,
+    /// Per-file pruning-statistics rows.
+    pub file_statistics_rows: i64,
+    /// Re-insert records held in the metastore.
+    pub insert_records: i64,
+    /// Inline (level-0) data entries not yet checkpointed to Vortex files.
+    pub inlined_entries: i64,
+    /// Rows held in those inline entries.
+    pub inlined_rows: i64,
+    /// Serialized Arrow IPC bytes held inline.
+    pub inlined_bytes: i64,
+    /// Inline tombstone entries not yet flushed to deletion vectors.
+    pub inlined_delete_entries: i64,
+    /// Tombstones held in those inline entries.
+    pub inlined_delete_rows: i64,
+}
+
+impl TableStorageStats {
+    /// Manifest rows naming a snapshot that is still live (the current snapshot
+    /// or a registered snapshot sequence).
+    #[must_use]
+    pub const fn reachable_manifest_rows(&self) -> i64 {
+        self.current_files + self.protected_files
+    }
+}
+
 /// Aggregate size information for inline data entries in the metastore.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinedDataStats {

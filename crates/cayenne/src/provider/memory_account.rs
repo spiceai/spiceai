@@ -116,6 +116,25 @@ impl CayenneMemoryAccount {
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.lock().size()
     }
+
+    /// The three accounted components, as `(keyset, deletion index, cold
+    /// existence)`.
+    ///
+    /// Exported alongside [`Self::reserved_bytes`] because their relationship is
+    /// the diagnosis, not either one alone. These are what Cayenne *computed*;
+    /// `reserved_bytes` is what actually reached the `DataFusion` pool. Equal
+    /// means the accounting lands, and a resident-memory figure far above the
+    /// pool is then off-pool structures. Components far above the reservation
+    /// means the accounting itself is not landing — and no single gauge can tell
+    /// those two apart.
+    #[must_use]
+    pub(crate) fn component_bytes(&self) -> (usize, usize, usize) {
+        (
+            self.keyset_bytes.load(Ordering::Relaxed),
+            self.deletion_bytes.load(Ordering::Relaxed),
+            self.cold_existence_bytes.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Drop for CayenneMemoryAccount {

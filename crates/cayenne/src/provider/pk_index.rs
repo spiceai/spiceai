@@ -749,6 +749,14 @@ impl PkBloom {
         }
     }
 
+    /// `(inserted keys, allocated bits)` for this filter.
+    pub(crate) fn density(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.inserted_keys).unwrap_or(u64::MAX),
+            u64::try_from(self.size_bytes()).unwrap_or(u64::MAX / 8) * 8,
+        )
+    }
+
     /// The frame version this filter serializes as.
     #[cfg(test)]
     pub(crate) fn frame_version(&self) -> u32 {
@@ -1186,6 +1194,20 @@ impl CachedPkIndex {
             Self::Bloom(bloom) => bloom.size_bytes(),
         }
     }
+
+    /// `(inserted keys, allocated bits)` when this index is a bloom, `None` when
+    /// it is still an exact keyset.
+    ///
+    /// Their ratio is the filter's density. It is worth exporting because a
+    /// filter can be resident at many times the bits-per-key the sizing code
+    /// asks for, and nothing else makes that visible: the bytes alone look like
+    /// a large table, and the key count alone looks correct.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(bloom) => Some(bloom.density()),
+        }
+    }
 }
 
 /// One committed key batch held while a PK existence index was checked out of
@@ -1329,6 +1351,8 @@ impl PendingPkKeys {
         let restored = RestoredPkKeys {
             batches: std::mem::take(&mut self.batches),
             discard_index: self.overflowed || self.invalidated,
+            overflowed: self.overflowed,
+            invalidated: self.invalidated,
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1376,6 +1400,12 @@ impl PendingPkKeys {
 pub(crate) struct RestoredPkKeys {
     batches: Vec<PendingPkKeyBatch>,
     discard_index: bool,
+    /// The log stopped recording, so keys committed during the checkout are
+    /// unrecoverable. Retained separately from `discard_index` so the discard
+    /// counter can name which condition fired.
+    overflowed: bool,
+    /// The cache was invalidated while the index was out.
+    invalidated: bool,
 }
 
 impl RestoredPkKeys {
@@ -1385,6 +1415,23 @@ impl RestoredPkKeys {
     /// answer "absent" for a live key, which reads as a new primary key.
     pub(crate) fn index_must_be_discarded(&self) -> bool {
         self.discard_index
+    }
+
+    /// Which of the two conditions forced the discard, as a metric label.
+    ///
+    /// They are different problems: `overflowed` means the pending-key log's
+    /// byte cap is too small for the commit rate during a validation, while
+    /// `invalidated` means something superseded the table state (a delete, a
+    /// compaction, a recovery, or a second concurrent checkout). Collapsing them
+    /// into one counter hides which lever to reach for — and an `invalidated`
+    /// rate on a table doing neither is how a checkout-time guard firing on
+    /// indexes that needed no invalidating becomes visible.
+    pub(crate) const fn discard_reason(&self) -> Option<&'static str> {
+        match (self.overflowed, self.invalidated) {
+            (true, _) => Some("overflowed"),
+            (false, true) => Some("invalidated"),
+            (false, false) => None,
+        }
     }
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
@@ -1622,6 +1669,39 @@ impl ShardedPkIndex {
                 .iter()
                 .map(PkBloom::size_bytes)
                 .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// Live keys across all shards: exact entries, or inserted keys in bloom
+    /// mode.
+    pub(crate) fn key_count(&self) -> usize {
+        match self {
+            Self::Exact(keysets) => keysets
+                .iter()
+                .map(CachedPkKeyset::len)
+                .fold(0, usize::saturating_add),
+            Self::Bloom(blooms) => blooms
+                .iter()
+                .map(|bloom| bloom.inserted_keys)
+                .fold(0, usize::saturating_add),
+        }
+    }
+
+    /// `(inserted keys, allocated bits)` summed over the per-shard filters when
+    /// this index is in bloom mode, `None` while it is still exact. See
+    /// [`CachedPkIndex::bloom_density`] for why the ratio matters.
+    pub(crate) fn bloom_density(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Bloom(blooms) => Some(blooms.iter().map(PkBloom::density).fold(
+                (0_u64, 0_u64),
+                |(keys, bits), (shard_keys, shard_bits)| {
+                    (
+                        keys.saturating_add(shard_keys),
+                        bits.saturating_add(shard_bits),
+                    )
+                },
+            )),
         }
     }
 

@@ -1599,7 +1599,7 @@ impl MetastoreBackend for SqliteMetastore {
         // METRIC 2 (WAL bytes): sample the -wal file size right after the
         // checkpoint copied as many frames as it could. A cheap stat(); a missing
         // file (just truncated) reports 0.
-        self.sample_wal_bytes().await;
+        self.sample_file_footprint().await;
         Ok(())
     }
 
@@ -1692,11 +1692,33 @@ impl SqliteMetastore {
         tokio::fs::metadata(&wal_path).await.map_or(0, |m| m.len())
     }
 
-    /// Sample the current `-wal` file size and publish it to the METRIC 2
-    /// `cayenne_metastore_wal_bytes` gauge.
-    async fn sample_wal_bytes(&self) {
-        let bytes = self.read_wal_bytes().await;
-        telemetry::cayenne::track_metastore_wal_bytes(bytes, &[]);
+    /// Read the current database file size in bytes (cheap `stat()`), without
+    /// recording it. Best-effort: an unreadable or in-memory database reports 0.
+    async fn read_db_bytes(&self) -> u64 {
+        tokio::fs::metadata(self.db_path())
+            .await
+            .map_or(0, |m| m.len())
+    }
+
+    /// Sample the metastore's on-disk footprint — the database file and its
+    /// `-wal` — and publish both gauges.
+    ///
+    /// Two `stat()` calls on a background tick. The WAL half was already
+    /// exported; the database half is the larger and slower-moving of the two,
+    /// and without it the total metadata footprint could not be read off
+    /// `/metrics` at all.
+    ///
+    /// Both carry a `catalog` label. The metastore is per-dataset and its file
+    /// is always named `cayenne.db`, so an unlabelled gauge has every dataset's
+    /// sample overwriting the others on one series — which is what the WAL gauge
+    /// did before this.
+    async fn sample_file_footprint(&self) {
+        let dimensions = [telemetry::KeyValue::new(
+            "catalog",
+            self.db_path().to_string(),
+        )];
+        telemetry::cayenne::track_metastore_wal_bytes(self.read_wal_bytes().await, &dimensions);
+        telemetry::cayenne::track_metastore_db_bytes(self.read_db_bytes().await, &dimensions);
     }
 }
 

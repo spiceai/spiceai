@@ -69,6 +69,7 @@ use futures::{StreamExt, TryStreamExt};
 use opentelemetry::global;
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use runtime::{Runtime, auth::EndpointAuth, config::Config, datafusion::query::QueryBuilder};
+use spicepod::param::Params;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     component::dataset::{Dataset, TimeFormat},
@@ -341,6 +342,71 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     dataset
 }
 
+/// A Cayenne file-mode dataset whose background maintenance tick fires fast
+/// enough for a test to observe one pass.
+///
+/// The footprint sample runs on that tick, so the interval has to be short; its
+/// own 30-second floor does not suppress the FIRST sample, which is the one this
+/// test reads.
+fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
+    let csv = fixture_csv(dir, name);
+    write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
+
+    let mut dataset = Dataset::new(format!("file://{}", csv.display()), name);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(
+            [
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.join(format!("{name}-cayenne")).display().to_string(),
+                ),
+                (
+                    "cayenne_compaction_background_interval_ms".to_string(),
+                    "250".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// Cayenne's maintenance and footprint families, which answer "which pass is
+/// declining, and is the table growing while it does".
+///
+/// Presence is the whole assertion: each of these is emitted from a decision
+/// point or a sample that had no instrumentation at all, so a refactor that
+/// drops the call site leaves the operator back where they started — reading
+/// debug logs — with nothing failing.
+const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
+    "cayenne_deletion_index_len",
+    "cayenne_deletion_index_reinserts",
+    "cayenne_deletion_index_bytes",
+    "cayenne_pk_index_format",
+    "cayenne_pk_index_keys",
+    "cayenne_pk_index_bytes",
+    "cayenne_pk_index_budget_bytes",
+    "cayenne_storage_files",
+    "cayenne_storage_bytes",
+    "cayenne_storage_rows",
+    "cayenne_snapshot_manifest_rows",
+    "cayenne_snapshot_manifest_files",
+    "cayenne_metastore_table_rows",
+    "cayenne_memory_account_bytes",
+    "cayenne_memory_account_reserved_bytes",
+    "cayenne_inline_cache_bytes",
+    "cayenne_inline_cache_batches",
+    "cayenne_data_dir_bytes",
+    "cayenne_data_dir_files",
+    "cayenne_data_dir_snapshot_dirs",
+];
+
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -562,6 +628,64 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
         (refresh_lag_ms - expected_lag_ms).abs() < f64::EPSILON,
         "the source moved {FIXTURE_EPOCH_STEP_SECONDS}s forward, so the refresh lag must be \
          {expected_lag_ms}ms, not {refresh_lag_ms}ms"
+    );
+}
+
+/// Cayenne's maintenance and footprint families must reach `/metrics`.
+///
+/// They are emitted from decision points and a background sample that had no
+/// instrumentation at all, and the failure mode is silent: drop the call site
+/// and the operator is back to reading debug logs with nothing failing. So this
+/// asserts the families arrive, which is the one thing a unit test on the label
+/// vocabulary cannot cover.
+///
+/// The dataset sets a 250 ms compaction interval because the footprint sample
+/// rides that tick. Its own 30-second floor does not suppress the first sample,
+/// which is the one read here.
+#[tokio::test]
+async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
+    let registry = &*PROMETHEUS;
+
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let app = AppBuilder::new("metrics_cayenne_dataset")
+        .with_dataset(cayenne_backed_dataset(dir.path(), "cayenne_scores"))
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+
+    // Poll for the families rather than sleeping the tick out: the sample fires
+    // on a background wake whose exact timing is not ours to predict, and a
+    // fixed sleep would either flake or be needlessly slow.
+    let arrived = wait_until(Duration::from_mins(1), || async {
+        let reported = reported_metric_names(registry);
+        EXPECTED_CAYENNE_MAINTENANCE_METRICS
+            .iter()
+            .all(|metric| reported.contains(*metric))
+    })
+    .await;
+    let reported = reported_metric_names(registry);
+    assert!(
+        arrived,
+        "a loaded Cayenne dataset did not report its maintenance and footprint families"
+    );
+    assert_all_reported(
+        &reported,
+        EXPECTED_CAYENNE_MAINTENANCE_METRICS,
+        "a loaded Cayenne dataset did not report its maintenance and footprint families",
     );
 }
 
