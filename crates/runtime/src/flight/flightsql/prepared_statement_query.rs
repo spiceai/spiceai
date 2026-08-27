@@ -1954,10 +1954,9 @@ mod tests {
         }
     }
 
-    /// The one shape relabelling cannot fix is refused where the column can still be named,
-    /// rather than surfacing as `MapArray entries cannot contain nulls` from an unrelated kernel.
-    #[test]
-    fn a_map_parameter_whose_entries_carry_nulls_is_refused_by_name() {
+    /// Builds the one `MAP` shape relabelling cannot repair: `entries` declared nullable *and*
+    /// carrying an actual null, which the Arrow map layout has no valid representation for.
+    fn entries_with_nulls_map_batch() -> arrow::array::RecordBatch {
         use arrow::array::{
             Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
         };
@@ -1993,18 +1992,40 @@ mod tests {
             .add_child_data(entries.to_data())
             .build()
             .expect("map array data");
-        let batch = RecordBatch::try_new(
+        RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
             vec![Arc::new(MapArray::from(data)) as ArrayRef],
         )
-        .expect("map batch");
+        .expect("map batch")
+    }
 
-        let err = decode_param_values(&ipc_stream(&batch))
+    /// The one shape relabelling cannot fix is refused where the column can still be named,
+    /// rather than surfacing as `MapArray entries cannot contain nulls` from an unrelated kernel.
+    #[test]
+    fn a_map_parameter_whose_entries_carry_nulls_is_refused_by_name() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
             .expect_err("entries carrying nulls have no representation to relabel to");
         let message = err.to_string();
         assert!(
             message.contains("'m'") && message.contains("arrow-flight-sql"),
             "the refusal must name the column and point at the docs: {message}"
+        );
+    }
+
+    /// The query path and the update path both decode parameters with `decode_param_values` and
+    /// report a failure with `param_error_to_status`. Every failure that decode can produce
+    /// describes the client's own bytes, so it must reach the client as `InvalidArgument` — never
+    /// as an `Internal` the client would be entitled to retry — and must still name the column.
+    #[test]
+    fn a_malformed_map_parameter_is_reported_as_invalid_argument() {
+        let err = decode_param_values(&ipc_stream(&entries_with_nulls_map_batch()))
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        let status = super::param_error_to_status(err);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'m'"),
+            "the status must still name the column: {}",
+            status.message()
         );
     }
 }

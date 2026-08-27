@@ -396,11 +396,7 @@ impl MapEntriesGuard {
             dictionaries_by_id,
         )
         .map_err(|e| {
-            let message = format!(
-                "Failed to read the Arrow data sent for dataset '{path}' ({e}), so the write was not applied. \
-                Send each message as an Arrow IPC record batch matching the schema the stream declared. \
-                See: https://spiceai.org/docs/api/arrow-flight-sql"
-            );
+            let message = decode_failure_message(path, &e);
             tracing::error!(dataset = %path, "{message}");
             Status::invalid_argument(message)
         })?;
@@ -641,6 +637,21 @@ fn create_response_stream(
 
         tracing::debug!("Finished writing data into dataset: {path}");
     }
+}
+
+/// Reports Arrow data a client sent that will not decode.
+///
+/// [`MapEntriesGuard::decode`] serves the first message of a write and every later one alike, so
+/// this may assert only what holds for both: a first message that fails has applied nothing, while
+/// a later one may follow batches the sink has already accepted. It therefore says the write did
+/// not complete and leaves the rollback question to the callers that can answer it — claiming the
+/// write "was not applied" would be false for every message after the first.
+fn decode_failure_message(path: &TableReference, source: &impl std::fmt::Display) -> String {
+    format!(
+        "Failed to read the Arrow data sent for dataset '{path}' ({source}), so the write did not complete. \
+         Send each message as an Arrow IPC record batch matching the schema the stream declared. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
 }
 
 /// The failure a client sees when the Arrow data it streamed holds a `MAP` column that cannot be
@@ -890,6 +901,29 @@ mod tests {
             "the refusal must name the dataset and the column: {}",
             status.message()
         );
+    }
+
+    /// The decode failure is reported by a function shared with the first message of the write,
+    /// so it must not claim a rollback it cannot guarantee — while still naming the dataset,
+    /// giving a remediation, and pointing at the docs.
+    #[test]
+    fn the_decode_failure_names_the_dataset_without_promising_a_rollback() {
+        let message = super::decode_failure_message(
+            &TableReference::partial("sales", "orders"),
+            &"unexpected end of stream",
+        );
+
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(message.contains("unexpected end of stream"), "{message}");
+        assert!(
+            !message.contains("the write was not applied"),
+            "a message shared with the mid-stream path cannot promise nothing was written: {message}"
+        );
+        assert!(
+            message.contains("Send each message as an Arrow IPC record batch"),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
     }
 
     /// A schema message carries no batch. It is skipped rather than refused, which is what the
