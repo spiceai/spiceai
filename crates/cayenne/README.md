@@ -875,13 +875,24 @@ Only **S3 Express One Zone** is supported for data storage; standard S3 buckets 
 
 #### Data types
 
-Some Arrow data types are not natively supported by the Vortex format:
+Some Arrow data types cannot be stored in the Vortex format, and are rejected at table creation:
 
 - `Interval`
 - `Duration`
 - `FixedSizeBinary`
-- `Float16` (auto-converted to `Float32`)
-- Non-microsecond `Timestamp` units (auto-normalized to microseconds, timezone preserved)
+- `Union`
+- `RunEndEncoded`
+
+`Map` is storable: Vortex has no map type but stores one as `List<Struct<keys, values>>` and
+restores it on read, so a map column round-trips.
+
+One type is rewritten rather than rejected:
+
+- `Float16` (stored as `Float32`)
+
+`Timestamp` columns keep the unit and timezone their source reports; all four Arrow units are
+stored as-is. A table created before that behaviour changed still stores microseconds, and
+keeps doing so for its lifetime.
 
 The `cayenne_unsupported_type_action` parameter controls handling:
 
