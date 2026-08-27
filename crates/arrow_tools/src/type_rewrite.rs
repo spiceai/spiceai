@@ -577,10 +577,14 @@ fn child_holds_a_logical_null(child: &ArrayData) -> bool {
 /// row selects; and every value of a `Null` array is null with no buffer to say so. All four are
 /// answered by Arrow's own [`Array::logical_nulls`] rather than by re-deriving them.
 ///
-/// Every other type reports its physical nulls, which for them *are* the logical ones. Taking that
-/// branch without building an array also keeps this away from `make_array`, which would panic on
-/// the very shape [`MapEntriesNonNullable`] exists to correct: `MapArray::try_new` refuses a
-/// nullable `entries` field, so a `Map` child awaiting that correction cannot be materialized here.
+/// Every other type reports its physical nulls, which for them *are* the logical ones, and takes a
+/// branch that builds no array at all.
+///
+/// Materializing here is safe even for a `Map` still awaiting the [`MapEntriesNonNullable`]
+/// correction, which is worth stating because the neighbouring doc comment invites the opposite
+/// conclusion: it is `MapArray::try_new` that refuses a nullable `entries` field, while
+/// `make_array` goes through `MapArray::from`, which does not. Measured against the pinned
+/// arrow-rs — `make_array` on such a map, and on a dictionary over one, both return normally.
 fn logical_nulls_of(child: &ArrayData) -> Option<NullBuffer> {
     match child.data_type() {
         DataType::RunEndEncoded(..)
@@ -1560,6 +1564,44 @@ mod tests {
             err.to_string().contains("'a'"),
             "the error must name the field it refused, got: {err}"
         );
+    }
+
+    /// Answering a question about a `Dictionary` means materializing it, and `make_array` recurses
+    /// into its values — so a map still awaiting the [`MapEntriesNonNullable`] correction ends up
+    /// there too. That is safe: `MapArray::try_new` refuses a nullable `entries` field, but
+    /// `make_array` goes through `MapArray::from`, which does not.
+    ///
+    /// This pins the fact rather than the reasoning. The dictionary holds no null, so the narrowing
+    /// is admitted; if a future arrow-rs made `MapArray::from` validate, this would abort instead —
+    /// which is exactly the regression worth catching, since it would turn a `Result` API into a
+    /// panic on a shape this crate exists to handle.
+    #[test]
+    fn relabel_can_inspect_a_dictionary_over_a_map_awaiting_its_entries_correction() {
+        let (map, _) = map_with_nullable_entries();
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(map.data_type().clone()));
+        let dictionary = ArrayData::builder(dictionary_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32]))
+            .add_child_data(map)
+            .build()
+            .expect("one key over a one-entry dictionary of maps");
+        let source = ArrayData::builder(DataType::List(Arc::new(Field::new(
+            "item",
+            dictionary_type.clone(),
+            true,
+        ))))
+        .len(1)
+        .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+        .add_child_data(dictionary)
+        .build()
+        .expect("a list of one dictionary");
+        let target = DataType::List(Arc::new(Field::new("item", dictionary_type, false)));
+
+        let relabelled = relabel_array_data(source, &target)
+            .expect("the dictionary holds no null, so narrowing the item is admitted");
+
+        assert_eq!(relabelled.data_type(), &target);
     }
 
     /// `MapEntriesNonNullable` is not exempt from the proof. `build` refuses this one too (`Map` is
