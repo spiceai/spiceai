@@ -99,15 +99,27 @@ pub struct ReplicationParams {
     pub ephemeral_accelerator: bool,
     /// What the dataset's accelerator held when this stream was built.
     ///
-    /// Only [`AccelerationContents::Empty`] carries weight, and only over the
-    /// single question of whether a *missing* watermark is evidence of a gap: an
-    /// acceleration holding no rows cannot be hiding a row the source deleted
-    /// while it was away, which is the divergence a rebuild exists to repair.
-    /// Anything else — including a probe that could not answer — leaves the
-    /// rebuild in place.
+    /// Only [`AccelerationContents::Empty`] carries weight — anything else,
+    /// including a probe that could not answer, leaves the rebuild decision
+    /// exactly where the recorded position alone would put it.
     ///
-    /// Even then it only applies when an initial snapshot is going to run, since
-    /// otherwise the rebuild is the only thing that would load the table at all.
+    /// Emptiness is read in two opposite directions, and which one applies turns
+    /// on whether an initial snapshot is going to run. `super::rebuild_cause`
+    /// owns both readings; this is the summary:
+    ///
+    /// - Against a *missing* watermark, with a snapshot running, it *suppresses*
+    ///   a rebuild: an acceleration holding no rows cannot be hiding a row the
+    ///   source deleted while it was away, which is the divergence a rebuild
+    ///   exists to repair, and the snapshot is what loads the table.
+    /// - Against a *present, usable* watermark, with no snapshot running, it
+    ///   *causes* one (`RebuildCause::EmptyWithUsablePosition`): the
+    ///   position says every change below it is applied and the table is
+    ///   observed empty, so resuming would leave every row that predates it
+    ///   missing for good, and nothing else is going to load them.
+    ///
+    /// Both gates are the same observation — a rebuild is needed exactly when
+    /// nothing else will populate the table — which is why the snapshot
+    /// condition is inverted between them rather than shared.
     ///
     /// Per-dataset, so it is deliberately not part of the shared-slot params
     /// compatibility check: two datasets legitimately share a slot while one is
