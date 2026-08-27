@@ -167,6 +167,14 @@ pub struct SQLResultsCacheConfig {
     /// Maximum age for serving stale cached results while revalidating in the background.
     /// When set, cached results past their TTL (but within this additional window) will be
     /// served immediately while a background refresh is triggered.
+    ///
+    /// Setting this also changes what an accelerated refresh (or DML) does to the cached
+    /// results that read the affected dataset: instead of evicting them, it marks them stale
+    /// as of the refresh, and the same window applies from that instant. Each dependent
+    /// result is then served once more while a background revalidation replaces it, rather
+    /// than every one of them becoming a synchronous miss on the same refresh tick. Leaving
+    /// this unset keeps a refresh a hard invalidation.
+    ///
     /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_while_revalidate_ttl: Option<String>,

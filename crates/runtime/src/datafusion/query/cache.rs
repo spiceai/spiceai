@@ -19,6 +19,7 @@ use super::{
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
+    EntryValidity, RevalidationOutcome,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
     result::query::CachedStream,
@@ -94,6 +95,16 @@ enum CacheResult {
     Hit(QueryResult),
     MissOrSkipped,
     WrongCacheKeyType,
+}
+
+/// Records how a background stale-while-revalidate revalidation ended.
+///
+/// Reaches the counter directly rather than through `CacheMetrics`, matching
+/// the sibling stale-while-revalidate counters incremented from this module:
+/// revalidation is specific to the SQL results cache, so there is no generic
+/// value type to dispatch on.
+fn record_revalidation_outcome(outcome: RevalidationOutcome) {
+    cache::metrics::sql_results::SWR_REVALIDATIONS.add(1, &[outcome.key_value()]);
 }
 
 impl Query {
@@ -362,20 +373,27 @@ impl Query {
             key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
         };
 
-        let cached_result = match cache_provider.get_raw_key(&raw_key).await {
-            Ok(Some(result)) => result,
-            Ok(None) => {
-                return Ok(
-                    CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheMiss)
-                        .with_query_tracker(tracker)
-                        .with_raw_key(Some(raw_key)),
-                );
-            }
-            Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
-        };
+        // `get_raw_key_with_validity`, not `get_raw_key`: this is the path that
+        // implements stale-while-revalidate, so it is the one that can serve an
+        // entry a table invalidation has marked stale and start the background
+        // revalidation replacing it, instead of taking the miss.
+        let (cached_result, entry_validity) =
+            match cache_provider.get_raw_key_with_validity(&raw_key).await {
+                Ok(Some(hit)) => hit,
+                Ok(None) => {
+                    return Ok(CacheResponse::from(
+                        CacheResult::MissOrSkipped,
+                        CacheStatus::CacheMiss,
+                    )
+                    .with_query_tracker(tracker)
+                    .with_raw_key(Some(raw_key)));
+                }
+                Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
+            };
 
         // Determine cache status based on stale-while-revalidate configuration
         let mut cache_status = CacheStatus::CacheHit;
+        let mut revalidate = false;
 
         // Determine the effective stale-while-revalidate duration from either:
         // 1. The request's max-stale directive (client explicitly willing to accept stale data)
@@ -411,21 +429,38 @@ impl Query {
                     "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
                 );
                 cache_status = CacheStatus::CacheStaleWhileRevalidate;
-
-                // Extract plan from cache key if available to avoid re-parsing
-                let plan = match key {
-                    CacheKey::LogicalPlan(p) => Some(*p),
-                    _ => None,
-                };
-                Self::trigger_background_query_revalidation(
-                    Arc::clone(df),
-                    sql,
-                    plan,
-                    raw_key,
-                    request_context.cache_namespace(),
-                    Arc::clone(&cached_result.input_tables),
-                );
+                revalidate = true;
             }
+        }
+
+        // An accelerated refresh, or DML, landing after this entry read its
+        // tables leaves the entry resident but stale rather than evicting it
+        // whenever `stale_while_revalidate_ttl` is configured — see
+        // `QueryResultsCacheProvider::entry_validity`. Serving it here, and
+        // revalidating behind it, is what keeps a refresh from turning every
+        // dependent entry into a synchronous miss on the same tick.
+        if entry_validity == EntryValidity::StaleWhileRevalidate {
+            tracing::debug!(
+                "A table this cache entry read was refreshed, serving it stale and triggering background revalidation"
+            );
+            cache_status = CacheStatus::CacheStaleWhileRevalidate;
+            revalidate = true;
+        }
+
+        if revalidate {
+            // Extract plan from cache key if available to avoid re-parsing
+            let plan = match key {
+                CacheKey::LogicalPlan(p) => Some(*p),
+                _ => None,
+            };
+            Self::trigger_background_query_revalidation(
+                Arc::clone(df),
+                sql,
+                plan,
+                raw_key,
+                request_context.cache_namespace(),
+                Arc::clone(&cached_result.input_tables),
+            );
         }
 
         tracker = tracker.map(|t| {
@@ -547,6 +582,11 @@ impl Query {
     }
 
     /// Handles caching of query results after background revalidation
+    ///
+    /// Every path that returns without storing leaves the entry this
+    /// revalidation was meant to replace in place, to be served stale until it
+    /// expires. Since the queries themselves keep succeeding, the counter is
+    /// the only thing that surfaces a revalidation that never lands.
     async fn cache_revalidation_result(
         df: &Arc<DataFusion>,
         cache_key: &RawCacheKey,
@@ -571,6 +611,7 @@ impl Query {
                     cache_key = cache_key_u64,
                     "An input table was invalidated during background revalidation, discarding the result rather than repopulating the cache"
                 );
+                record_revalidation_outcome(RevalidationOutcome::InvalidatedMidFlight);
                 return;
             }
 
@@ -582,6 +623,7 @@ impl Query {
                     cache_key = cache_key_u64,
                     "Background revalidation returned transient HTTP error responses, preserving stale cache"
                 );
+                record_revalidation_outcome(RevalidationOutcome::TransientErrors);
                 return;
             }
 
@@ -609,11 +651,13 @@ impl Query {
                             "Background revalidation failed to cache results: {}",
                             e
                         );
+                        record_revalidation_outcome(RevalidationOutcome::PutFailed);
                     } else {
                         tracing::debug!(
                             cache_key = cache_key_u64,
                             "Background revalidation completed successfully and cached"
                         );
+                        record_revalidation_outcome(RevalidationOutcome::Stored);
                     }
                 }
                 Err(e) => {
@@ -622,6 +666,7 @@ impl Query {
                         "Background revalidation failed to encode results: {}",
                         e
                     );
+                    record_revalidation_outcome(RevalidationOutcome::EncodeFailed);
                 }
             }
         } else {
@@ -1042,6 +1087,22 @@ mod tests {
             .await;
     }
 
+    /// Registers an empty in-memory table, so a query over it records a real
+    /// input table for the cache entry to be invalidated on.
+    fn register_empty_table(df: &Arc<DataFusion>, name: &'static str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![arrow::array::RecordBatch::new_empty(schema)]],
+        )
+        .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare(name), Arc::new(table))
+            .expect("should register table");
+    }
+
     /// Runs `sql` to completion under `request_context`, draining the stream so
     /// any cache write completes, and returns the observed cache status.
     async fn run_and_drain(
@@ -1085,18 +1146,7 @@ mod tests {
         }))
         .await;
 
-        // A real table, so the plan records an input table to invalidate on.
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-        ]));
-        let table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![arrow::array::RecordBatch::new_empty(schema)]],
-        )
-        .expect("valid mem table");
-        df.ctx
-            .register_table(TableReference::bare("swr_table"), Arc::new(table))
-            .expect("should register table");
+        register_empty_table(&df, "swr_table");
 
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
@@ -1133,7 +1183,11 @@ mod tests {
             "background revalidation never refreshed the cache entry"
         );
 
-        // The revalidated entry must still be tied to its input table.
+        // The revalidated entry must still be tied to its input table. With a
+        // stale window configured the invalidation marks it stale rather than
+        // evicting it, so what proves the tie is the status moving off
+        // CacheHit: an entry that had lost its table set would match no
+        // invalidation at all and stay a plain hit.
         df.caching()
             .invalidate_for_table(TableReference::bare("swr_table"))
             .await
@@ -1144,8 +1198,116 @@ mod tests {
 
         assert_eq!(
             run_and_drain(df, request_context, SQL).await,
+            CacheStatus::CacheStaleWhileRevalidate,
+            "a revalidated entry must still be invalidated by a refresh of its input table"
+        );
+    }
+
+    /// An accelerated refresh must not turn every dependent cached result into
+    /// a synchronous miss on the same tick. With `stale_while_revalidate_ttl`
+    /// configured, the invalidation marks dependent entries stale as of the
+    /// refresh instead of evicting them: the next hit on each key is served
+    /// from the previous result and starts the one background revalidation that
+    /// replaces it.
+    #[tokio::test]
+    async fn test_invalidation_serves_stale_while_revalidating_when_a_window_is_configured() {
+        const SQL: &str = "SELECT count(*) FROM refreshed_table";
+
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            // Long enough that nothing expires on the ordinary TTL, so only the
+            // invalidation can make an entry stale.
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            stale_while_revalidate_ttl: Some("5m".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        register_empty_table(&df, "refreshed_table");
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheMiss
+        );
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheHit
+        );
+
+        df.caching()
+            .invalidate_for_table(TableReference::bare("refreshed_table"))
+            .await
+            .expect("invalidation should succeed");
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheStaleWhileRevalidate,
+            "a refresh must leave the previous result servable rather than flushing it"
+        );
+
+        // The revalidation stores a result whose read began after the refresh,
+        // so the entry becomes a plain hit again. Poll for it rather than
+        // sleeping a fixed interval.
+        let mut revalidated = false;
+        for _ in 0..100 {
+            if run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await
+                == CacheStatus::CacheHit
+            {
+                revalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            revalidated,
+            "background revalidation never replaced the entry the refresh marked stale"
+        );
+    }
+
+    /// Without a stale window there is no staleness anyone has agreed to be
+    /// served, so a refresh stays a hard invalidation and the next query is a
+    /// miss.
+    #[tokio::test]
+    async fn test_invalidation_stays_hard_without_a_stale_window() {
+        const SQL: &str = "SELECT count(*) FROM evicted_table";
+
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        register_empty_table(&df, "evicted_table");
+
+        let request_context =
+            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheMiss
+        );
+        assert_eq!(
+            run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
+            CacheStatus::CacheHit
+        );
+
+        df.caching()
+            .invalidate_for_table(TableReference::bare("evicted_table"))
+            .await
+            .expect("invalidation should succeed");
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
+        assert_eq!(
+            run_and_drain(df, request_context, SQL).await,
             CacheStatus::CacheMiss,
-            "a revalidated entry must still be evicted when its input table is invalidated"
+            "with no stale window configured a refresh must still flush dependent results"
         );
     }
 
