@@ -235,7 +235,7 @@ async fn get_or_create_cached<T: Clone>(
 fn cached<T: Clone>(cache: &Mutex<Option<T>>) -> Result<Option<T>, anyhow::Error> {
     let guard = cache
         .lock()
-        .map_err(|_| anyhow::anyhow!("cache could not be unlocked"))?;
+        .map_err(|_| anyhow::anyhow!("cache could not be locked"))?;
     Ok(guard.clone())
 }
 
