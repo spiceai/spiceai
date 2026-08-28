@@ -5609,12 +5609,20 @@ impl CayenneTableProvider {
     /// position cache for **every** strategy, so position-based deletes are
     /// pushed into the Vortex scan (`Selection::ExcludeRoaring`, page-skippable).
     /// For PK-less (`PositionBased`) tables this is the long-standing behavior.
-    /// For PK tables (`Int64Pk`/`RowConverterBased`) the position cache is empty
-    /// under `deletion_mode: key` (no position vectors are ever written or
-    /// loaded), so the provider is a no-op there and behavior is byte-identical
-    /// to not attaching it; under `deletion_mode: position` it carries the
-    /// located-row deletes while the `{Int64Pk,KeyBased}DeletionFilterExec` above
-    /// the scan still handles the unlocated/key-based rows (dual application).
+    /// For PK tables (`Int64Pk`/`RowConverterBased`) under `deletion_mode:
+    /// position` it carries the located-row deletes while the
+    /// `{Int64Pk,KeyBased}DeletionFilterExec` above the scan still handles the
+    /// unlocated/key-based rows (dual application).
+    ///
+    /// Do NOT skip the attachment for a key-mode PK table on the grounds that
+    /// such a table writes no position vectors. A table that ran under `position`
+    /// before its mode resolved to `key` keeps its durable vectors, they load
+    /// into the same cache on reopen, and this provider is the only thing that
+    /// applies them — the key twins that also masked those rows are prunable,
+    /// after which nothing else hides them. Detaching it resurrects every one;
+    /// `position_deletion_vectors_still_apply_after_reopening_in_key_mode` and
+    /// `legacy_position_vectors_survive_a_key_mode_rewrite_after_the_flip` both
+    /// fail on exactly that mutation.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
@@ -27842,7 +27850,10 @@ impl CayenneTableProvider {
                         )),
                     )),
                     // Position-delete files (written under `deletion_mode: position`
-                    // for located rows) load here; empty for key-mode tables.
+                    // for located rows) load here in EVERY mode: a key-mode table
+                    // writes none, but one that ran under `position` before its
+                    // mode resolved to `key` keeps its durable vectors and must
+                    // keep applying them after reopen.
                     position_deletions: Arc::new(ArcSwap::from_pointee(
                         per_file_row_ids
                             .into_iter()
@@ -27867,7 +27878,10 @@ impl CayenneTableProvider {
                         )),
                     )),
                     // Position-delete files (written under `deletion_mode: position`
-                    // for located rows) load here; empty for key-mode tables.
+                    // for located rows) load here in EVERY mode: a key-mode table
+                    // writes none, but one that ran under `position` before its
+                    // mode resolved to `key` keeps its durable vectors and must
+                    // keep applying them after reopen.
                     position_deletions: Arc::new(ArcSwap::from_pointee(
                         per_file_row_ids
                             .into_iter()
