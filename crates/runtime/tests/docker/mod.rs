@@ -51,7 +51,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a container name is waited on before it is reused, once its
 /// removal has been requested.
-const NAME_RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
+const NAME_RELEASE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How often the name is re-checked while waiting for it to be released.
 const NAME_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
