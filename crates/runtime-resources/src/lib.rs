@@ -379,6 +379,12 @@ Threads:\t32
         let resident = process_resident_memory().expect("this process is resident");
 
         assert!(resident.total > 0, "a running process has resident memory");
+
+        // The anon/file split only exists on the platforms that implement it;
+        // the fallback arm deliberately reports zero rather than fabricating an
+        // attribution, so asserting it unconditionally would fail on every other
+        // target.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
             resident.anon > 0,
             "a running process has anonymous memory (heap and stacks)"

@@ -15,7 +15,6 @@ limitations under the License.
 //! Memory-pool accounting for Cayenne resident state that lives outside query execution.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use parking_lot::Mutex as ParkingMutex;
@@ -37,39 +36,81 @@ use parking_lot::Mutex as ParkingMutex;
 /// reservation's job here is visibility + correct cross-consumer back-pressure,
 /// not to gate Cayenne's own growth.
 pub(crate) struct CayenneMemoryAccount {
-    reservation: ParkingMutex<MemoryReservation>,
-    keyset_bytes: AtomicUsize,
-    deletion_bytes: AtomicUsize,
-    cold_existence_bytes: AtomicUsize,
+    /// The reservation and the three component figures it is computed from, under
+    /// one lock.
+    ///
+    /// The components are not independent of the reservation — the reservation
+    /// *is* their sum, and their agreement is the whole diagnosis (see
+    /// [`Self::snapshot`]). Published from separate atomics, a sampler could pair
+    /// one write's components with another write's total and report an accounting
+    /// gap that does not exist, and a mutation that computed its total before a
+    /// concurrent one could resize the pool back down to a stale figure. Every
+    /// mutation already had to take this lock to resize, so holding the
+    /// components here costs no extra acquisition.
+    state: ParkingMutex<AccountState>,
+}
+
+struct AccountState {
+    reservation: MemoryReservation,
+    keyset_bytes: usize,
+    deletion_bytes: usize,
+    cold_existence_bytes: usize,
+}
+
+impl AccountState {
+    fn resize_to_total(&mut self) {
+        let total = self
+            .keyset_bytes
+            .saturating_add(self.deletion_bytes)
+            .saturating_add(self.cold_existence_bytes);
+        // `resize` is infallible (over-commits the greedy pool). See the
+        // `CayenneMemoryAccount` docstring for why deletions must never
+        // fail-to-fit.
+        self.reservation.resize(total);
+    }
+}
+
+/// A coherent read of one table's accounting: the three components Cayenne
+/// computed, and the total that reached the `DataFusion` pool. Every figure is
+/// bytes.
+pub(crate) struct MemoryAccountSnapshot {
+    /// The PK keyset — an exact keyset or the bloom that replaced it.
+    pub keyset: usize,
+    /// Deletion and insert-record indexes.
+    pub deletion_index: usize,
+    /// The cold-tier PK existence view.
+    pub cold_existence: usize,
+    /// What the `DataFusion` pool reservation actually holds — the sum of the
+    /// three above as of this same read.
+    pub reserved: usize,
 }
 
 impl CayenneMemoryAccount {
     #[must_use]
     pub(crate) fn new(table_id: &str, pool: &Arc<dyn MemoryPool>) -> Self {
         Self {
-            reservation: ParkingMutex::new(
-                MemoryConsumer::new(format!("cayenne:{table_id}")).register(pool),
-            ),
-            keyset_bytes: AtomicUsize::new(0),
-            deletion_bytes: AtomicUsize::new(0),
-            cold_existence_bytes: AtomicUsize::new(0),
+            state: ParkingMutex::new(AccountState {
+                reservation: MemoryConsumer::new(format!("cayenne:{table_id}")).register(pool),
+                keyset_bytes: 0,
+                deletion_bytes: 0,
+                cold_existence_bytes: 0,
+            }),
         }
-    }
-
-    fn resize_to_total(&self) {
-        let total = self
-            .keyset_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(self.deletion_bytes.load(Ordering::Relaxed))
-            .saturating_add(self.cold_existence_bytes.load(Ordering::Relaxed));
-        // `resize` is infallible (over-commits the greedy pool). See the type
-        // docstring for why deletions must never fail-to-fit.
-        self.reservation.lock().resize(total);
     }
 
     /// Account the resident bytes of the PK keyset (exact keyset or bloom).
     pub(crate) fn set_keyset_bytes(&self, bytes: usize) {
-        let previous = self.keyset_bytes.swap(bytes, Ordering::Relaxed);
+        let previous = {
+            let mut state = self.state.lock();
+            let previous = std::mem::replace(&mut state.keyset_bytes, bytes);
+            state.resize_to_total();
+            previous
+        };
+        // The fleet delta is applied off this lock: it is a saturating add/sub on
+        // a process-global counter, so concurrent transitions of this table
+        // compose in any order, and taking a second lock inside the first buys
+        // nothing.
+        //
         // Keep this table's share of the process-global keyset ceiling in step,
         // as a delta. Residency is recomputed and republished here on every
         // change, so one place can hold the fleet figure honest.
@@ -92,48 +133,51 @@ impl CayenneMemoryAccount {
         } else if previous > bytes {
             super::pk_keyset_budget::release_keyset_bytes((previous - bytes) as u64);
         }
-        self.resize_to_total();
     }
 
     /// Account the resident bytes of deletion + insert-record indexes (deleted
     /// keys, insert records, and position deletion vectors). Reset to 0 at
     /// compaction.
     pub(crate) fn set_deletion_bytes(&self, bytes: usize) {
-        self.deletion_bytes.store(bytes, Ordering::Relaxed);
-        self.resize_to_total();
+        let mut state = self.state.lock();
+        state.deletion_bytes = bytes;
+        state.resize_to_total();
     }
 
     /// Account the resident bytes of the cold-tier PK existence view (the
     /// per-cold-file bloom union). Reset to 0 whenever the view is cleared.
     pub(crate) fn set_cold_existence_bytes(&self, bytes: usize) {
-        self.cold_existence_bytes.store(bytes, Ordering::Relaxed);
-        self.resize_to_total();
+        let mut state = self.state.lock();
+        state.cold_existence_bytes = bytes;
+        state.resize_to_total();
     }
 
     /// Current total reserved bytes (keyset + deletions + cold existence). For
     /// observability and tests.
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
-        self.reservation.lock().size()
+        self.state.lock().reservation.size()
     }
 
-    /// The three accounted components, as `(keyset, deletion index, cold
-    /// existence)`.
+    /// The components and the reservation, read together.
     ///
-    /// Exported alongside [`Self::reserved_bytes`] because their relationship is
-    /// the diagnosis, not either one alone. These are what Cayenne *computed*;
+    /// Both halves are published because their relationship is the diagnosis,
+    /// not either one alone. The components are what Cayenne *computed*;
     /// `reserved_bytes` is what actually reached the `DataFusion` pool. Equal
     /// means the accounting lands, and a resident-memory figure far above the
     /// pool is then off-pool structures. Components far above the reservation
     /// means the accounting itself is not landing — and no single gauge can tell
-    /// those two apart.
+    /// those two apart, which is why they must come from one read rather than
+    /// two.
     #[must_use]
-    pub(crate) fn component_bytes(&self) -> (usize, usize, usize) {
-        (
-            self.keyset_bytes.load(Ordering::Relaxed),
-            self.deletion_bytes.load(Ordering::Relaxed),
-            self.cold_existence_bytes.load(Ordering::Relaxed),
-        )
+    pub(crate) fn snapshot(&self) -> MemoryAccountSnapshot {
+        let state = self.state.lock();
+        MemoryAccountSnapshot {
+            keyset: state.keyset_bytes,
+            deletion_index: state.deletion_bytes,
+            cold_existence: state.cold_existence_bytes,
+            reserved: state.reservation.size(),
+        }
     }
 }
 
@@ -147,7 +191,7 @@ impl Drop for CayenneMemoryAccount {
     /// memory actually in use. The `MemoryReservation` beside it already frees
     /// itself on drop; this gives the fleet budget the same property.
     fn drop(&mut self) {
-        let held = self.keyset_bytes.load(Ordering::Relaxed);
+        let held = self.state.get_mut().keyset_bytes;
         if held > 0 {
             super::pk_keyset_budget::release_keyset_bytes(held as u64);
         }
@@ -159,6 +203,26 @@ mod tests {
     use super::*;
 
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    #[test]
+    fn snapshot_components_always_sum_to_the_reservation() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let account = CayenneMemoryAccount::new("coherence", &pool);
+
+        for (keyset, deletion, cold) in [(0, 0, 0), (400, 0, 0), (400, 600, 0), (7, 600, 90)] {
+            account.set_keyset_bytes(keyset);
+            account.set_deletion_bytes(deletion);
+            account.set_cold_existence_bytes(cold);
+
+            let snapshot = account.snapshot();
+            assert_eq!(
+                snapshot.keyset + snapshot.deletion_index + snapshot.cold_existence,
+                snapshot.reserved,
+                "a snapshot's components and its reservation must agree, or the \
+                 gap between them reads as an accounting bug that is not there"
+            );
+        }
+    }
 
     #[test]
     fn cayenne_memory_account_tracks_keyset_and_deletions() {

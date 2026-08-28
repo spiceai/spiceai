@@ -2190,13 +2190,12 @@ pub struct CayenneTableProvider {
     /// The same, for the cheap in-memory gauges. Loose enough that the compaction
     /// tick never trips it; tight enough to bound the post-write driver.
     in_memory_sample_gate: Arc<SampleGate>,
-    /// Encode fan-out the most recent snapshot write resolved to, and the branch
-    /// that chose it (a [`WriteShapeDecision`] discriminant). Written at the
-    /// decision, published on the background tick — see
-    /// [`CayenneTableProvider::record_write_shape`] for why the write path stores
-    /// rather than emits. `0` shards means no write has happened yet.
-    last_write_shape_shards: Arc<AtomicU64>,
-    last_write_shape_decision: Arc<AtomicU8>,
+    /// Encode fan-out the most recent snapshot write resolved to, packed with the
+    /// branch that chose it. Written at the decision, published on the background
+    /// tick — see [`CayenneTableProvider::record_write_shape`] for why the write
+    /// path stores rather than emits, and [`pack_write_shape`] for why the pair
+    /// shares one atomic. `0` means no write has happened yet.
+    last_write_shape: Arc<AtomicU64>,
     /// Coalesces write-driven listing refreshes and table-statistics updates
     /// so CDC catch-up bursts do not synchronously pay metastore/listing work
     /// on every append.
@@ -2934,15 +2933,21 @@ impl SampleGate {
         if self.in_flight.swap(true, Ordering::AcqRel) {
             return None;
         }
-        // RE-READ after winning the flag. The checks above ran before the claim,
-        // so a caller can pass them, stall, and acquire only after a concurrent
-        // winner has already completed a sample and advanced `last_success` — then
-        // run a second expensive pass immediately on a pre-check that is no longer
-        // true. Prevented overlap is not the same as an enforced cadence.
+        // RE-READ BOTH clocks after winning the flag. The checks above ran before
+        // the claim, so a caller can pass them, stall, and acquire only after a
+        // concurrent winner has already run a sample — and then repeat it
+        // immediately on a pre-check that is no longer true. Prevented overlap is
+        // not an enforced cadence.
+        //
+        // Both, not just `last_success`: if the concurrent sample FAILED,
+        // `last_success` never advanced, so a success-only recheck would wave the
+        // stalled caller straight through and repeat an expensive failing sample
+        // with the retry backoff bypassed.
         let now = duration_millis_saturating(PROCESS_START.elapsed());
-        if since_stamp(self.last_success_ms.load(Ordering::Relaxed), now)
-            < duration_millis_saturating(min_interval)
-        {
+        let still_due = since_stamp(self.last_success_ms.load(Ordering::Relaxed), now)
+            >= duration_millis_saturating(min_interval)
+            && since_stamp(self.last_attempt_ms.load(Ordering::Relaxed), now) >= retry_floor;
+        if !still_due {
             self.in_flight.store(false, Ordering::Release);
             return None;
         }
@@ -3005,6 +3010,28 @@ enum PkIndexObservation {
     Absent,
     /// The lock was taken and an index is cached.
     Cached(PkIndexShape),
+}
+
+/// Low bits of the packed write shape holding the shard count.
+const WRITE_SHAPE_SHARD_MASK: u64 = (1 << 56) - 1;
+
+/// Pack a shard count and the branch that chose it into one word.
+///
+/// The pair is a single diagnostic — a fan-out of 1 means opposite things
+/// depending on the branch — so it has to be published from ONE atomic load.
+/// Two independent atomics let a sampler run between the stores, or interleave
+/// with a concurrent writer, and export a count paired with another write's
+/// decision.
+const fn pack_write_shape(shards: u64, decision: WriteShapeDecision) -> u64 {
+    ((decision as u64) << 56) | (shards & WRITE_SHAPE_SHARD_MASK)
+}
+
+/// Inverse of [`pack_write_shape`].
+const fn unpack_write_shape(packed: u64) -> (u64, WriteShapeDecision) {
+    (
+        packed & WRITE_SHAPE_SHARD_MASK,
+        WriteShapeDecision::from_u8((packed >> 56) as u8),
+    )
 }
 
 /// Which branch chose a write's encode fan-out.
@@ -5304,6 +5331,32 @@ impl CayenneTableProvider {
             .collect()
     }
 
+    /// Bytes that unlinking `path` actually returns to the filesystem.
+    ///
+    /// Zero when another pathname still links the same inode: subset compaction
+    /// carries an unpicked file into the new snapshot's directory with
+    /// [`tokio::fs::hard_link`], so a retired snapshot's copy of that file can
+    /// share its data with the live one. Unlinking that name frees nothing, and
+    /// billing its full length to `cayenne_maintenance_reclaimed_bytes_total`
+    /// would report space returned that the table still occupies — the one
+    /// reading an operator uses to decide whether cleanup is keeping up.
+    ///
+    /// Read before the unlink, so the count is against the link state that made
+    /// the decision.
+    fn unlink_frees_bytes(path: &std::path::Path) -> u64 {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return 0;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                return 0;
+            }
+        }
+        metadata.len()
+    }
+
     /// Ref-count-aware deletion of a single retired snapshot directory (local
     /// FS, blocking I/O). Deletes only the data files inside `snapshot_dir`
     /// whose table-relative path
@@ -5386,7 +5439,7 @@ impl CayenneTableProvider {
             // Sized BEFORE the unlink, and only for the files about to be
             // removed, so the reclaim figure is the bytes actually given back
             // rather than an inference from the file count.
-            let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+            let bytes = Self::unlink_frees_bytes(&path);
             retired_files.push((path, cache_path, bytes));
         }
 
@@ -7690,10 +7743,7 @@ impl CayenneTableProvider {
             footprint_sample_gate: Arc::new(SampleGate::default()),
             data_dir_sample_gate: Arc::new(SampleGate::default()),
             in_memory_sample_gate: Arc::new(SampleGate::default()),
-            last_write_shape_shards: Arc::new(AtomicU64::new(0)),
-            last_write_shape_decision: Arc::new(AtomicU8::new(
-                WriteShapeDecision::ConcurrencyBounded as u8,
-            )),
+            last_write_shape: Arc::new(AtomicU64::new(0)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
             filter_column_observations: Arc::new(
@@ -8815,13 +8865,15 @@ impl CayenneTableProvider {
     /// components-versus-reservation comparison is the only thing that separates
     /// them.
     fn sample_memory_account_metrics(&self) {
-        let (keyset, deletion, cold_existence) = self.table_memory.component_bytes();
+        // One read, so the components and the reservation cannot come from
+        // either side of a concurrent mutation and manufacture a gap.
+        let accounted = self.table_memory.snapshot();
         let to_gauge = |bytes: usize| u64::try_from(bytes).unwrap_or(u64::MAX);
         telemetry::cayenne::track_memory_account(
-            to_gauge(keyset),
-            to_gauge(deletion),
-            to_gauge(cold_existence),
-            to_gauge(self.table_memory.reserved_bytes()),
+            to_gauge(accounted.keyset),
+            to_gauge(accounted.deletion_index),
+            to_gauge(accounted.cold_existence),
+            to_gauge(accounted.reserved),
             &[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
@@ -9032,7 +9084,6 @@ impl CayenneTableProvider {
                 delete_file_tombstones: to_gauge(stats.delete_file_tombstones),
                 manifest_rows_reachable: to_gauge(stats.reachable_manifest_rows),
                 manifest_rows_unreachable: to_gauge(stats.unreachable_manifest_rows),
-                manifest_live_files: to_gauge(stats.distinct_live_files),
                 snapshot_sequences: to_gauge(stats.snapshot_sequences),
                 file_statistics_rows: to_gauge(stats.file_statistics_rows),
                 insert_records: to_gauge(stats.insert_records),
@@ -9301,10 +9352,13 @@ impl CayenneTableProvider {
     /// the most recent write decided, which is exactly what the gauge would have
     /// held.
     fn record_write_shape(&self, shards: usize, decision: WriteShapeDecision) {
-        self.last_write_shape_shards
-            .store(u64::try_from(shards).unwrap_or(u64::MAX), Ordering::Relaxed);
-        self.last_write_shape_decision
-            .store(decision as u8, Ordering::Relaxed);
+        self.last_write_shape.store(
+            pack_write_shape(
+                u64::try_from(shards).unwrap_or(WRITE_SHAPE_SHARD_MASK),
+                decision,
+            ),
+            Ordering::Relaxed,
+        );
     }
 
     /// Publish the last write's encode fan-out and the branch that chose it.
@@ -9312,7 +9366,10 @@ impl CayenneTableProvider {
     /// Skipped until a write has happened: a fan-out of zero would read as a
     /// stalled writer rather than as an idle table.
     fn sample_write_shape_metrics(&self) {
-        let shards = self.last_write_shape_shards.load(Ordering::Relaxed);
+        // ONE load, so the count and the decision that produced it cannot come
+        // from different writes.
+        let packed = self.last_write_shape.load(Ordering::Relaxed);
+        let (shards, decision) = unpack_write_shape(packed);
         if shards == 0 {
             return;
         }
@@ -9320,13 +9377,7 @@ impl CayenneTableProvider {
             shards,
             &[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
-                telemetry::KeyValue::new(
-                    "decision",
-                    WriteShapeDecision::from_u8(
-                        self.last_write_shape_decision.load(Ordering::Relaxed),
-                    )
-                    .as_str(),
-                ),
+                telemetry::KeyValue::new("decision", decision.as_str()),
             ],
         );
     }
@@ -9648,8 +9699,7 @@ impl CayenneTableProvider {
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
             data_dir_sample_gate: Arc::clone(&self.data_dir_sample_gate),
             in_memory_sample_gate: Arc::clone(&self.in_memory_sample_gate),
-            last_write_shape_shards: Arc::clone(&self.last_write_shape_shards),
-            last_write_shape_decision: Arc::clone(&self.last_write_shape_decision),
+            last_write_shape: Arc::clone(&self.last_write_shape),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             filter_column_observations: Arc::clone(&self.filter_column_observations),
@@ -16202,6 +16252,16 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        // Recorded HERE, at the gate that fired — not after candidate selection.
+        // Selection can still decline (`declined_no_candidates`,
+        // `declined_no_qualifying_tier`), and a decline beside a flat trigger
+        // counter is exactly the "trigger never fired" reading this pair exists
+        // to rule out.
+        maintenance_metrics::track_trigger(
+            table_name,
+            CompactionKind::SubsetCurrent,
+            CompactionTrigger::SmallFileCount,
+        );
 
         // Position-delete-mode tables: serialize against writers + visibility
         // flips for the whole pass, identical to the protected-snapshot subset
@@ -17696,6 +17756,29 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
+        // At the gate, before selection — see the same recording in
+        // `compact_current_snapshot_small_files`.
+        match maintenance_trigger {
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount { .. }) => {
+                maintenance_metrics::track_trigger(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionTrigger::ProtectedSnapshotCount,
+                );
+            }
+            Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge { .. }) => {
+                maintenance_metrics::track_trigger(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionTrigger::ProtectedSnapshotAge,
+                );
+            }
+            _ => maintenance_metrics::track_trigger(
+                table_name,
+                CompactionKind::SubsetCurrent,
+                CompactionTrigger::SmallFileCount,
+            ),
+        }
 
         if let Some(trigger) = maintenance_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
@@ -17907,30 +17990,6 @@ impl CayenneTableProvider {
     }
 
     fn log_snapshot_maintenance_trigger(&self, trigger: SnapshotMaintenanceTrigger) {
-        // The single place these three triggers are reported, so the counter
-        // lives here rather than at each call site — a new trigger cannot then
-        // be added to the log without also being counted. `kind` names the pass
-        // the trigger fires: the count/age triggers drive a full rewrite, the
-        // small-file trigger the current-snapshot pass.
-        maintenance_metrics::track_trigger(
-            self.table_metadata.table_name.as_str(),
-            match trigger {
-                SnapshotMaintenanceTrigger::SmallFileCount { .. } => CompactionKind::SubsetCurrent,
-                SnapshotMaintenanceTrigger::ProtectedSnapshotCount { .. }
-                | SnapshotMaintenanceTrigger::ProtectedSnapshotAge { .. } => CompactionKind::Full,
-            },
-            match trigger {
-                SnapshotMaintenanceTrigger::SmallFileCount { .. } => {
-                    CompactionTrigger::SmallFileCount
-                }
-                SnapshotMaintenanceTrigger::ProtectedSnapshotCount { .. } => {
-                    CompactionTrigger::ProtectedSnapshotCount
-                }
-                SnapshotMaintenanceTrigger::ProtectedSnapshotAge { .. } => {
-                    CompactionTrigger::ProtectedSnapshotAge
-                }
-            },
-        );
         match trigger {
             SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
                 protected_snapshot_count,
@@ -22918,15 +22977,17 @@ impl CayenneTableProvider {
             table_name,
             MaintenanceOp::Retention,
             if deleted_count > 0 {
-                MaintenanceOutcome::Reclaimed
+                // `applied`, NOT `reclaimed`: this pass writes tombstones and
+                // returns no space by itself.
+                MaintenanceOutcome::Applied
             } else {
                 MaintenanceOutcome::NoOp
             },
         );
-        // Retention's reclaim is rows, not files: the tombstones it writes are
-        // what a later compaction and deletion-vector sweep turn back into
-        // space, so a rising row count here with flat sweep reclaim is exactly
-        // the "deletes recorded, nothing given back" shape.
+        // Rows only, and they are rows TOMBSTONED rather than space freed — a
+        // later compaction and deletion-vector sweep turn them back into bytes.
+        // A rising count here beside flat sweep reclaim is exactly the "deletes
+        // recorded, nothing given back" shape.
         maintenance_metrics::track_reclaimed(
             table_name,
             MaintenanceOp::Retention,
@@ -46178,6 +46239,46 @@ mod tests {
         assert!(
             !invalidated.borrow().contains(&referenced_cache_path),
             "a path referenced in place by a live snapshot must remain cached"
+        );
+    }
+
+    /// Unlinking one of several links to an inode frees nothing, so the
+    /// reclaimed-bytes counter must not bill it. Subset compaction hard-links an
+    /// unpicked file into the new snapshot's directory, which makes this the
+    /// common case for a retired snapshot's copy of an inherited file — bill it
+    /// and the counter claims space back that the table still occupies.
+    #[test]
+    fn unlink_frees_bytes_ignores_a_file_another_link_still_holds() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sole = tmp.path().join("sole.vortex");
+        std::fs::write(&sole, vec![7u8; 512]).expect("write the sole-link file");
+        assert_eq!(
+            CayenneTableProvider::unlink_frees_bytes(&sole),
+            512,
+            "the only link to an inode frees the whole file"
+        );
+
+        let shared = tmp.path().join("shared.vortex");
+        std::fs::write(&shared, vec![7u8; 512]).expect("write the shared file");
+        let alias = tmp.path().join("alias.vortex");
+        std::fs::hard_link(&shared, &alias).expect("hard-link it, as subset compaction does");
+        assert_eq!(
+            CayenneTableProvider::unlink_frees_bytes(&shared),
+            0,
+            "a second link to the same inode means this unlink frees nothing"
+        );
+
+        std::fs::remove_file(&alias).expect("drop the alias");
+        assert_eq!(
+            CayenneTableProvider::unlink_frees_bytes(&shared),
+            512,
+            "once the alias is gone the remaining link owns the bytes again"
+        );
+
+        assert_eq!(
+            CayenneTableProvider::unlink_frees_bytes(&tmp.path().join("absent.vortex")),
+            0,
+            "an unreadable path is never billed"
         );
     }
 

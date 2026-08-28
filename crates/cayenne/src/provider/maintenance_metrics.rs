@@ -20,9 +20,10 @@ limitations under the License.
 //! Maintenance is a set of passes that mostly decide NOT to run: a compaction
 //! declines because a lock is held or a budget is exceeded, a deletion-vector
 //! sweep declines because it cannot prove the current snapshot is empty. Each
-//! of those declines used to be a `tracing::debug!` and nothing countable, so
-//! "the table is growing and nothing reclaims it" could not be told apart from
-//! "reclamation ran and found nothing to reclaim" without a debug-log run.
+//! decline is a correct decision that nonetheless leaves the table larger, so
+//! every one is countable — otherwise "the table is growing and nothing
+//! reclaims it" cannot be told apart from "reclamation ran and found nothing to
+//! reclaim".
 //!
 //! Every exit of an instrumented pass records exactly one [`CompactionOutcome`]
 //! or [`MaintenanceOutcome`], so a table's counter series is its complete
@@ -253,9 +254,16 @@ impl MaintenanceOp {
 /// How a non-compaction maintenance pass ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MaintenanceOutcome {
-    /// The pass reclaimed something. Pair with
-    /// [`track_reclaimed`] for how much.
+    /// The pass physically reclaimed something. Pair with [`track_reclaimed`]
+    /// for how much.
     Reclaimed,
+    /// The pass did its work, but that work does not itself return space.
+    ///
+    /// Retention is the case: it writes tombstones, and the bytes come back
+    /// later when a compaction rewrites without the dead rows and the
+    /// deletion-vector sweep unlinks the vectors. Reporting it as `reclaimed`
+    /// made reclamation dashboards climb on a pass that freed nothing.
+    Applied,
     /// The pass ran and found nothing to reclaim.
     NoOp,
     /// A pass of this operation was already in flight, so this request was
@@ -292,6 +300,7 @@ impl MaintenanceOutcome {
     #[cfg(test)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::Reclaimed,
+        Self::Applied,
         Self::NoOp,
         Self::Coalesced,
         Self::DeclinedNotConfigured,
@@ -305,6 +314,7 @@ impl MaintenanceOutcome {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Reclaimed => "reclaimed",
+            Self::Applied => "applied",
             Self::NoOp => "no_op",
             Self::Coalesced => "coalesced",
             Self::DeclinedNotConfigured => "declined_not_configured",
@@ -427,6 +437,7 @@ mod tests {
             let is_decline = !matches!(
                 outcome,
                 MaintenanceOutcome::Reclaimed
+                    | MaintenanceOutcome::Applied
                     | MaintenanceOutcome::NoOp
                     | MaintenanceOutcome::Coalesced
                     | MaintenanceOutcome::Failed

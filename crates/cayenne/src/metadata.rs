@@ -2111,20 +2111,22 @@ pub struct InlinedData {
 /// that publish these as gauges saturate to `u64` at the boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TableStorageStats {
-    /// DISTINCT physical data files the current snapshot references.
+    /// Data-file paths the current snapshot references.
     ///
-    /// Deduplicated by path, and a file the current snapshot shares with a
-    /// protected one is counted here only — the live pointer owns what it
-    /// references, so `current_*` and `protected_*` partition the table rather
-    /// than overlapping.
+    /// PATHS, not inodes: a manifest `file_path` is resolved against its own
+    /// snapshot's directory, so a filename appearing under two snapshots is two
+    /// files as far as every reader is concerned, and subset compaction gets a
+    /// live snapshot its own path by hard-linking. Two paths sharing one inode
+    /// are therefore counted twice — which is also how a `du`-style walk
+    /// (`cayenne_data_dir_bytes`) reads the same directory.
     pub current_files: i64,
     /// On-disk bytes of the current snapshot's data files.
     pub current_bytes: i64,
     /// Rows in the current snapshot's data files, before deletions apply.
     pub current_rows: i64,
-    /// DISTINCT physical data files referenced by a live protected snapshot and
-    /// NOT by the current one (see [`Self::current_files`] for the ownership
-    /// rule).
+    /// Data-file paths referenced by a live protected snapshot — one whose
+    /// sequence is registered and which is not the current snapshot (see
+    /// [`Self::current_files`] for the path-versus-inode rule).
     pub protected_files: i64,
     /// On-disk bytes of the protected snapshots' data files.
     pub protected_bytes: i64,
@@ -2135,22 +2137,11 @@ pub struct TableStorageStats {
     pub unreachable_manifest_rows: i64,
     /// Manifest rows naming a snapshot that is still live.
     ///
-    /// A row is a `(snapshot, file)` pair, so this is at or above
-    /// [`Self::distinct_live_files`] by the in-place reference multiplicity. Kept
-    /// distinct from the file count because the unreachable remainder has to be
-    /// taken against rows, not files.
+    /// A row is a `(snapshot, file)` pair, and each pair is one path on disk, so
+    /// this equals [`Self::current_files`] + [`Self::protected_files`]. It is
+    /// published beside the unreachable count because the remainder only means
+    /// something taken against the live rows.
     pub reachable_manifest_rows: i64,
-    /// Distinct `file_path` values referenced by any live snapshot — the number
-    /// of real files the reachable manifest rows describe.
-    ///
-    /// Always `<=` the reachable row count, and usually strictly less: a
-    /// manifest row is a `(snapshot, file)` pair, and compaction deliberately
-    /// references an un-baked file from a new snapshot in place rather than
-    /// copying it, so one file on disk earns a row under every live snapshot
-    /// that references it. Without this figure the row count reads as a file
-    /// count and overstates the table's real state — by an order of magnitude on
-    /// a table with a deep snapshot chain.
-    pub distinct_live_files: i64,
     /// Files promoted to the cold object-store tier.
     pub cold_files: i64,
     /// Bytes of the cold-tier files.
@@ -2182,10 +2173,11 @@ pub struct TableStorageStats {
 }
 
 impl TableStorageStats {
-    /// Total physical bytes the live data files occupy across the warm tiers.
+    /// Bytes the live data-file paths describe across the warm tiers.
     ///
-    /// Safe to add because the tiers partition the file set (see
-    /// [`Self::current_files`]); summing the raw manifest rows would not be.
+    /// Safe to add because the tiers partition the live manifest rows. Not a
+    /// physical figure where hard links are in play — see
+    /// [`Self::current_files`].
     #[must_use]
     pub const fn live_data_bytes(&self) -> i64 {
         self.current_bytes + self.protected_bytes

@@ -2180,7 +2180,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_counter("cayenne_compaction_outcome_total")
                     .with_description(
-                        "Cayenne compaction passes by kind and outcome. `outcome` is `committed`, `no_op`, `failed`, or a `declined_<reason>` naming why the pass did not run.",
+                        "Cayenne compaction passes by kind and outcome. `outcome` is `committed`, `no_op` (ran, nothing to merge), `aborted_concurrent_change` (merged, then a concurrent change invalidated the inputs at commit — work paid and discarded), `failed`, or a `declined_<reason>` naming why the pass never ran.",
                     )
                     .with_unit("passes")
                     .build()
@@ -2292,7 +2292,7 @@ pub mod cayenne {
             .get_or_init(|| {
                 operational_meter()
                     .u64_counter("cayenne_maintenance_reclaimed_rows_total")
-                    .with_description("Rows dropped by Cayenne maintenance passes — tombstones for a deletion-vector sweep, deleted rows for a retention pass.")
+                    .with_description("Rows dropped by Cayenne maintenance passes. For a deletion-vector sweep these are tombstones retired from the metastore; for a retention pass they are rows TOMBSTONED, whose bytes return only when a later compaction rewrites without them — see the `applied` outcome.")
                     .with_unit("rows")
                     .build()
             })
@@ -2399,14 +2399,6 @@ pub mod cayenne {
         /// Manifest rows pointing at snapshots that are no longer live — dead
         /// weight in the metastore until a compaction prunes them.
         pub manifest_rows_unreachable: u64,
-        /// Distinct files the reachable manifest rows describe.
-        ///
-        /// A manifest row is a `(snapshot, file)` pair, so this is `<=`
-        /// `manifest_rows_reachable` and usually strictly less. Without it the
-        /// row count reads as a file count and overstates real state — by an
-        /// order of magnitude on a table with a deep snapshot chain, which is
-        /// alarming for entirely the wrong reason.
-        pub manifest_live_files: u64,
         /// Registered snapshot sequences (the durable protected-snapshot set).
         pub snapshot_sequences: u64,
         /// Per-file pruning-statistics rows (`cayenne_snapshot_file_statistics`).
@@ -2429,7 +2421,6 @@ pub mod cayenne {
     static STORAGE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static STORAGE_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
     static STORAGE_MANIFEST_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
-    static STORAGE_MANIFEST_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
     static STORAGE_METASTORE_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
 
     /// Publishes one table's footprint gauges. `dimensions` carries `table`; a
@@ -2445,7 +2436,7 @@ pub mod cayenne {
             operational_meter()
                 .u64_gauge("cayenne_storage_files")
                 .with_description(
-                    "Files a Cayenne table holds, by storage tier (`current`, `protected`, `cold`, `delete_vector`, `inline`).",
+                    "Files a Cayenne table holds, by storage tier (`current`, `protected`, `cold`, `delete_vector`, `inline`). On the warm tiers these are data-file PATHS: a manifest path is resolved against its own snapshot's directory, so a file a new snapshot inherited via a hard link counts under both. `cayenne_maintenance_reclaimed_bytes_total` is the physical counterpart.",
                 )
                 .with_unit("files")
                 .build()
@@ -2511,7 +2502,7 @@ pub mod cayenne {
             operational_meter()
                 .u64_gauge("cayenne_snapshot_manifest_rows")
                 .with_description(
-                    "Rows a Cayenne table holds in the `cayenne_snapshot_file` manifest, split by whether the snapshot they name is still live. A row is a (snapshot, file) pair, NOT a file — read the reachable count against `cayenne_snapshot_manifest_files`. Unreachable rows are metastore weight no query can use.",
+                    "Rows a Cayenne table holds in the `cayenne_snapshot_file` manifest, split by whether the snapshot they name is still live. A row is a (snapshot, file) pair naming one path on disk, so the reachable count equals the sum of `cayenne_storage_files` over the `current` and `protected` tiers. Unreachable rows are metastore weight no query can use.",
                 )
                 .with_unit("rows")
                 .build()
@@ -2524,23 +2515,11 @@ pub mod cayenne {
             manifest_rows.record(value, &d);
         }
 
-        STORAGE_MANIFEST_FILES
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_snapshot_manifest_files")
-                    .with_description(
-                        "Distinct files the live Cayenne snapshot manifest describes. Always at or below `cayenne_snapshot_manifest_rows{reachable=\"true\"}`, because compaction references an un-baked file from a new snapshot in place rather than copying it, so one file earns a row under every live snapshot referencing it. This is the file count; the row count is not.",
-                    )
-                    .with_unit("files")
-                    .build()
-            })
-            .record(storage.manifest_live_files, dimensions);
-
         let metastore_rows = STORAGE_METASTORE_ROWS.get_or_init(|| {
             operational_meter()
                 .u64_gauge("cayenne_metastore_table_rows")
                 .with_description(
-                    "Metastore rows attributable to one Cayenne table, by metastore table — the per-table breakdown of metastore growth. These are ROW counts, not state: `cayenne_snapshot_file` counts (snapshot, file) pairs including dead snapshots' — see `cayenne_snapshot_manifest_files` and `cayenne_snapshot_manifest_rows{reachable}` before reading a large value as a large table.",
+                    "Metastore rows attributable to one Cayenne table, by metastore table — the per-table breakdown of metastore growth. These are ROW counts, not state: `cayenne_snapshot_file` counts (snapshot, file) pairs including dead snapshots' — see `cayenne_snapshot_manifest_rows{reachable}` before reading a large value as a large table.",
                 )
                 .with_unit("rows")
                 .build()
@@ -3157,7 +3136,7 @@ pub mod cayenne {
 
     /// Records the encode fan-out one write resolved to, together with the
     /// branch that chose it. `dimensions` carries `table` and `decision`
-    /// (`serial_sort_columns` / `serial_zorder` / `size_bounded` /
+    /// (`serial_sort_columns` / `size_bounded` /
     /// `concurrency_bounded`).
     ///
     /// The shard count alone cannot be acted on: a fan-out of 1 caused by a

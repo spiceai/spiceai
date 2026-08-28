@@ -1374,11 +1374,13 @@ sum by (kind, outcome) (rate(cayenne_compaction_outcome_total{outcome=~"declined
 | `declined_no_qualifying_tier` | no size tier has accumulated enough runs |
 | `declined_sizing_failed` | an input could not be sized, and an unknown size cannot count as free against a memory ceiling |
 | `declined_no_clean_prefix` | a live snapshot is not clean past the prefix cutoff, so the bake's prune would be withheld and its write amplification wasted |
+| `declined_not_configured` | the pass is not configured for this table (no cold-tier location) — a permanent state, so a steady count here is the expected shape |
 
 `cayenne_compaction_trigger_total{table, kind, trigger}` names which threshold asked for a pass — `small_file_count`, `protected_snapshot_count`, `protected_snapshot_age`, `deletion_index`, `deletion_index_memory_ceiling`. Read against the outcome counter it separates "the trigger never fired" from "it fired and the pass was declined", which are different problems with different fixes.
 
-The non-compaction passes use the same grammar under `cayenne_maintenance_outcome_total{table, op, outcome}`, with `op` ∈ `orphan_dv_sweep`, `retention`, `retired_dir_sweep`. Two of its outcomes are worth naming explicitly because both used to be silent:
+The non-compaction passes use the same grammar under `cayenne_maintenance_outcome_total{table, op, outcome}`, with `op` ∈ `orphan_dv_sweep`, `retention`, `retired_dir_sweep`. Its outcomes need a few reading rules of their own:
 
+- `applied` — the pass did its work, but that work returns no space by itself. Retention is the only case: it writes tombstones, and the bytes come back when a later compaction rewrites without the dead rows and the deletion-vector sweep unlinks the vectors. `applied` climbing while `reclaimed` stays flat for the same table is exactly the "deletes recorded, nothing given back" shape.
 - `declined_manifest_unprovable` — the current snapshot's manifest is empty while its directory is not, so the deletion-vector sweep cannot prove no live row is shadowed. **Every** pass returns here until that resolves, so deletion vectors accumulate with the sweep apparently running.
 - `coalesced` — a sweep was already in flight, so this request folded into it.
 - `declined_live_reference` vs `declined_not_due` — for the retired-directory sweep these look alike and have opposite prognoses. `not_due` means nothing had reached its grace window (or every candidate is pinned by an in-flight scan); it resolves itself. `live_reference` means candidates **were** examined and none could be removed, because their files are still referenced in place by a live snapshot or a non-data sidecar keeps the directory alive — which resolves only when the referencing snapshot is itself retired, possibly never. A directory reported `live_reference` indefinitely is space that is not coming back on its own.
@@ -1387,7 +1389,7 @@ The non-compaction passes use the same grammar under `cayenne_maintenance_outcom
 
 Two properties of that family are load-bearing:
 
-- **The units are files and bytes, never directories.** The retired-directory sweep counts the files it unlinked and their real sizes, sized before the unlink — including the files it removes from a directory that *survives* because a live snapshot still references others in place. Counting a removed directory as one "file" (or reporting zero for a partial cleanup) got the rate wrong in both directions on exactly the tables worth measuring.
+- **The units are files and bytes, never directories** — and the bytes are *physical*. The retired-directory sweep counts the files it unlinked, including those it removes from a directory that *survives* because a live snapshot still references others in place, and sizes each one before the unlink. A file whose inode another pathname still links contributes **zero bytes**: subset compaction hard-links an unpicked file into the new snapshot's directory, so unlinking the retired snapshot's name for it frees nothing, and billing its length would claim back space the table still occupies. This is the one family that is physical rather than logical — `cayenne_storage_bytes` and `cayenne_data_dir_bytes` both count pathnames.
 - **The reclaim totals and the outcome are independent.** A pass that cleaned four directories and failed on a fifth reports `failed` — the failure is the actionable half, and the directory that will never go away is what an operator needs — while still publishing everything the pass did give back. Labelling such a pass `reclaimed` because the majority succeeded would hide the one that did not.
 
 ## The state the decisions read
@@ -1403,21 +1405,20 @@ The bake's trigger compares two numbers, and both are exported so a `declined_be
 
 `cayenne_storage_{files,bytes,rows}{table, tier}` splits the table by the layer that produced it — `current`, `protected`, `cold`, `delete_vector`, `inline`. The split is what makes growth attributable: a rising `protected` file count is read amplification, a rising `delete_vector` byte count is a deletion set outgrowing the data it shadows, and a rising `inline` count is level-0 that no checkpoint has drained.
 
-`files` on the `current` and `protected` tiers is a manifest row count, so it carries the same caveat as the next section: a file referenced in place by two live snapshots counts once per snapshot. `cayenne_snapshot_manifest_files` is the distinct-file figure.
+`files` on the `current` and `protected` tiers counts data-file **paths**. A manifest `file_path` is resolved against its own snapshot's directory, so a filename appearing under two live snapshots is two paths and counts twice — even when subset compaction hard-linked them to one inode, which is the usual case for a file a new snapshot inherits. That matches `cayenne_data_dir_bytes`, which walks the filesystem the same way. For bytes actually returned to the disk, read `cayenne_maintenance_reclaimed_bytes_total`, which counts a file only when it removed the file's last link.
 
-### A manifest row is not a file
+### A manifest row count is not a live-state count
 
-`cayenne_snapshot_file` holds one row per **(snapshot, file)** pair, so its row count overstates the table's real state twice over: dead snapshots keep their rows until a compaction prunes them, *and* compaction deliberately references an un-baked file from a new snapshot **in place** rather than copying it, so one file on disk earns a row under every live snapshot that references it. On a table with a deep snapshot chain the row count can run an order of magnitude above the file count — alarming for entirely the wrong reason.
+`cayenne_snapshot_file` holds one row per **(snapshot, file)** pair, and dead snapshots keep their rows until a compaction or overwrite prunes them. So the raw row count in `cayenne_metastore_table_rows{metastore_table="cayenne_snapshot_file"}` overstates live state by the prune backlog, which on a busy table is most of it.
 
-So the row count is never published alone. Three gauges resolve it, and each is meaningless without the others:
+The split resolves it, and neither half means much alone:
 
 | metric | what it counts |
 |---|---|
-| `cayenne_snapshot_manifest_rows{table, reachable="true"}` | (snapshot, file) pairs a live snapshot names |
+| `cayenne_snapshot_manifest_rows{table, reachable="true"}` | pairs a live snapshot names — equal to `cayenne_storage_files` summed over the `current` and `protected` tiers |
 | `cayenne_snapshot_manifest_rows{table, reachable="false"}` | pairs naming a dead snapshot — metastore weight no query can use |
-| `cayenne_snapshot_manifest_files{table}` | **distinct files** those reachable rows describe |
 
-`reachable="true"` divided by `manifest_files` is the reference multiplicity; `reachable="false"` is the prune backlog. Read either alone and you get the wrong number.
+`reachable="false"` is the prune backlog: rising while compactions commit means the prune is not keeping up with snapshot turnover.
 
 ### Metastore size
 
@@ -1543,9 +1544,9 @@ The three are only interpretable together. Bytes alone cannot distinguish an **e
 
 `cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it.
 
-## A note on counter density
+## A note on resolution
 
-The counters here are OpenTelemetry counters, exported on the reader's interval rather than per event. They are reliable for *whether* something happened and for coarse ratios; for precise rates over short windows, prefer the gauges, which are sampled densely.
+The counters here are cumulative OpenTelemetry counters: they accumulate every recorded event and are exported on the reader's interval, so a `rate()` between two scrapes is exact — no event is lost between them. What the reader interval bounds is *resolution*, not accuracy: a burst finer than one scrape interval is visible only as its total. The gauges are last-value and sampled on the maintenance tick, so they carry the opposite trade — dense in time, but they say nothing about what happened between two samples.
 
 ---
 
