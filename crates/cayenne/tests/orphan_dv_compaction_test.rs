@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -140,6 +140,16 @@ async fn protected_subset_merge_schedules_orphan_dv_cleanup_impl(
     );
 
     let table = reopen_with_size_tier_merge_armed(&fixture, table_name, ctx.runtime_env()).await?;
+    // Settle the reopen's own startup pass before the merge, so what is reclaimed
+    // below is attributable to the merge's signal and not to a startup worker
+    // still in flight.
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(
+        key_dv_count(&fixture, &table).await,
+        before,
+        "the floor has not moved yet, so opening the provider reclaims nothing"
+    );
+
     assert!(
         table.compact_protected_snapshots_subset(usize::MAX).await?,
         "the size-tier merge must commit with this many protected snapshots"
@@ -192,6 +202,16 @@ async fn scheduled_cleanup_keeps_a_deletion_vector_still_needed_impl(
     // of those, below the newest DVs — which still shadow rows in the snapshots
     // the merge did not touch.
     let table = reopen_with_size_tier_merge_armed(&fixture, table_name, ctx.runtime_env()).await?;
+    // Settle the reopen's own startup pass before the merge, so what is reclaimed
+    // below is attributable to the merge's signal and not to a startup worker
+    // still in flight.
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(
+        key_dv_count(&fixture, &table).await,
+        before,
+        "the floor has not moved yet, so opening the provider reclaims nothing"
+    );
+
     assert!(
         table.compact_protected_snapshots_subset(before - 2).await?,
         "the bounded size-tier merge must commit"

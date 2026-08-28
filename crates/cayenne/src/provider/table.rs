@@ -32487,8 +32487,13 @@ mod tests {
         );
     }
 
-    /// Signalling a table whose worker is already running must not start a second
-    /// worker, and must leave the state dirty so that worker sweeps again.
+    /// Signalling a table whose worker is already running must record the signal
+    /// on that worker rather than start a second one. The state IS the spawn
+    /// decision — `schedule_orphan_dv_sweep` spawns only on an idle-to-running
+    /// transition — so asserting it is a complete and deterministic check of the
+    /// one-worker invariant. Its behavioural consequence (a replayed pass, not a
+    /// concurrent one) is covered by
+    /// `orphan_dv_sweep_replays_a_signal_raised_mid_pass`.
     #[tokio::test]
     async fn orphan_dv_sweep_signal_starts_no_second_worker() {
         let ctx = SessionContext::new();
@@ -32498,9 +32503,6 @@ mod tests {
             &[10, 20, 30, 40, 50],
         )
         .await;
-        // Above the production threshold, so a worker that should not exist would
-        // visibly reclaim rather than decline.
-        seed_orphan_delete_files(&provider, ORPHANED_DV_CLEANUP_MIN_FILES, 0).await;
 
         // Stand in for a worker mid-pass.
         provider
@@ -32518,17 +32520,6 @@ mod tests {
             provider.orphan_dv_sweep_state.load(Ordering::Acquire),
             ORPHAN_DV_SWEEP_RUNNING_DIRTY,
             "a further signal leaves the state dirty"
-        );
-
-        // Proving a worker was NOT spawned needs a window rather than a condition
-        // to poll, so give one that a real sweep of this backlog clears many times
-        // over (the same bounded-negative-observation shape as the fence guards
-        // above), then confirm the backlog is untouched.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            key_dv_count(&provider).await,
-            ORPHANED_DV_CLEANUP_MIN_FILES,
-            "no second worker may sweep while one is already running"
         );
 
         provider
