@@ -10628,27 +10628,6 @@ impl CayenneTableProvider {
         Ok(keyset.finish())
     }
 
-    /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
-    /// so a cold rebuild does not drop keys that live ONLY in the RAM tier (a
-    /// brand-new insert not yet checkpointed, or an updated key whose superseding
-    /// copy is still in RAM). The durable scan in [`Self::load_existing_pk_index`] sees
-    /// only checkpointed files; a rebuild forced by [`Self::clear_cached_pk_keyset`]
-    /// (compaction / deletion-vector refresh) does NOT flush the mem-tier first, so
-    /// without this fold the next UPDATE of a RAM-only key would false-negative in
-    /// [`Self::apply_on_conflict_to_batch`] (`existing_keys.get(&key)` is `None`),
-    /// record NO tombstone, and leak the prior copy — a durable over-count that
-    /// compaction cannot heal because there is no tombstone to apply. This covers
-    /// BOTH cold-rebuild callers (the serial `prepare_stream_for_insert` and the
-    /// sharded `build_sharded_pk_index`, which re-shards the keyset via `from_exact`)
-    /// and is a no-op for non-memory tables (empty `mem_tier` segments).
-    ///
-    /// Keys already present from the durable scan keep their `RowLocation`; RAM-only
-    /// keys are added as `FileUnlocated` — a benign label, since the mem-tier
-    /// tombstone unions the file and inline delete lists, so the label does not change
-    /// tombstone coverage. Re-adding a mem-tier-tombstoned key is harmless: a superset
-    /// only removes false-negatives, and a false positive is a redundant, correct
-    /// upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
-    /// the caller) so a concurrent checkpoint-clear cannot hide a key from both.
     /// Fold in the keys of staged-but-unpublished appends, so a rebuild does not
     /// drop a key whose rows exist only in a private staging directory.
     ///
@@ -10693,6 +10672,27 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Re-add the CURRENT un-checkpointed mem-tier keys to a freshly rebuilt keyset,
+    /// so a cold rebuild does not drop keys that live ONLY in the RAM tier (a
+    /// brand-new insert not yet checkpointed, or an updated key whose superseding
+    /// copy is still in RAM). The durable scan in [`Self::load_existing_pk_index`] sees
+    /// only checkpointed files; a rebuild forced by [`Self::clear_cached_pk_keyset`]
+    /// (compaction / deletion-vector refresh) does NOT flush the mem-tier first, so
+    /// without this fold the next UPDATE of a RAM-only key would false-negative in
+    /// [`Self::apply_on_conflict_to_batch`] (`existing_keys.get(&key)` is `None`),
+    /// record NO tombstone, and leak the prior copy — a durable over-count that
+    /// compaction cannot heal because there is no tombstone to apply. This covers
+    /// BOTH cold-rebuild callers (the serial `prepare_stream_for_insert` and the
+    /// sharded `build_sharded_pk_index`, which re-shards the keyset via `from_exact`)
+    /// and is a no-op for non-memory tables (empty `mem_tier` segments).
+    ///
+    /// Keys already present from the durable scan keep their `RowLocation`; RAM-only
+    /// keys are added as `FileUnlocated` — a benign label, since the mem-tier
+    /// tombstone unions the file and inline delete lists, so the label does not change
+    /// tombstone coverage. Re-adding a mem-tier-tombstoned key is harmless: a superset
+    /// only removes false-negatives, and a false positive is a redundant, correct
+    /// upsert tombstone. `mem_snapshots` MUST be captured before the durable scan (see
+    /// the caller) so a concurrent checkpoint-clear cannot hide a key from both.
     fn fold_mem_tier_keys_into_keyset(
         mem_snapshots: &[Arc<crate::provider::mem_tier::MemTier>],
         pk_indices: &[usize],
