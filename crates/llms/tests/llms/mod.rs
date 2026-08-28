@@ -699,3 +699,65 @@ async fn test_tool_use(
 
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }
+
+/// The built-in Anthropic default has to satisfy two things no unit test can check: Anthropic
+/// still serves it, and it still accepts the sampling controls the adapter forwards. Anthropic's
+/// newest generation answers ``temperature` is deprecated for this model.` and rejects the request
+/// outright (#13564), so a default bumped onto such a model would turn every configuration that
+/// sets `temperature` into a guaranteed 400 — while every test that sets none of these stays green.
+/// This is the guard for that, and it is why the default trails Anthropic's newest model.
+///
+/// One control per request: every Claude 4+ model rejects `temperature` and `top_p` set *together*,
+/// so a request carrying both asserts nothing about the default — it 400s on any model this constant
+/// may name. #13579 tracks the adapter forwarding that combination.
+///
+/// This builds its own model rather than going through `run_test`/`get_or_create_model`, which is
+/// the one deviation from every other test in this file and is load-bearing. That cache holds one
+/// client per provider for the whole binary while each `#[tokio::test]` owns its own runtime, so a
+/// request can be issued on a client whose hyper dispatch task was spawned on a runtime that has
+/// since been dropped — it then fails with `User(DispatchGone)` before reaching Anthropic (#13575).
+/// Measured, not assumed: that is what took this guard in
+/// [run 32982484882](https://github.com/spiceai/spiceai/actions/runs/32982484882) and again in
+/// [run 33017678054](https://github.com/spiceai/spiceai/actions/runs/33017678054) after it had been
+/// narrowed to a single test, because the exposure comes from *which* runtime created the cached
+/// client, not from how many tests or requests use it. Owning the client keeps its dispatch task on
+/// this test's runtime, so a failure here is Anthropic's answer rather than a dead client.
+///
+/// No snapshots: the assertion is that each request was accepted at all. Passing `None` as the model
+/// id is what makes this exercise whatever the default currently is rather than a pinned copy of it.
+#[tokio::test]
+async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
+    LazyLock::force(&DOTENV);
+    let _tracing = init_tracing(None);
+
+    if TEST_ARGS.skip_model("anthropic") {
+        tracing::debug!("Skipping test anthropic/default_sampling_controls");
+        return;
+    }
+
+    let model = create::create_anthropic(None)
+        .unwrap_or_else(|e| panic!("failed to build the default Anthropic model: {e}"));
+
+    // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic: `temperature` and
+    // `top_p` pass through, and `top_logprobs` becomes Anthropic's `top_k`. That last translation
+    // is between unrelated parameters and is itself a defect (#13581) — this asserts only that the
+    // default model accepts what the converter currently sends, not that it should send it.
+    for (control, value) in [
+        ("temperature", json!(0.5)),
+        ("top_p", json!(0.9)),
+        ("top_logprobs", json!(5)),
+    ] {
+        let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "not_needed",
+            "messages": [{"role": "user", "content": "Say Hello"}],
+            "max_completion_tokens": 16,
+            control: value,
+        }))
+        .unwrap_or_else(|e| panic!("failed to create the {control} request: {e}"));
+
+        model
+            .chat_request(req)
+            .await
+            .unwrap_or_else(|e| panic!("the default model rejected {control}: {e:#?}"));
+    }
+}
