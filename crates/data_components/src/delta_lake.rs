@@ -524,13 +524,48 @@ fn rewrite_column_names(
         .data)
 }
 
+/// How much of one refusal's rendered text is kept before it is truncated. Long enough to carry
+/// any real column name and the clause around it; short enough that a malformed schema naming a
+/// column with a megabyte of text cannot turn a refusal into a megabyte of message.
+const MAX_RENDERED_CHARS: usize = 512;
+
+/// Renders text the table chose so it stays on one line and still names exactly one column.
+///
+/// Column and nested field names come out of the Delta schema, so a name holding a newline would
+/// split a refusal that [`unmatched_nested_field`] documents — and `refusals_stay_on_one_line`
+/// asserts — as a single line, and each fragment would read like an independent failure.
+///
+/// Control characters are *escaped* rather than replaced, because the operator reads this message
+/// to find the column in their own schema: collapsing them to spaces would render the distinct
+/// columns `a\tb` and `a b` identically, and name the wrong one half the time. Everything else is
+/// passed through, so the quotes and punctuation the refusals put around these names survive.
+fn as_one_line(text: &str) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    for character in text.chars().take(MAX_RENDERED_CHARS) {
+        if character.is_control() {
+            rendered.extend(character.escape_debug());
+        } else {
+            rendered.push(character);
+        }
+    }
+    // `nth` rather than `count`: asking how long the whole text is would walk all of it, which is
+    // the work the cap exists to avoid.
+    if text.chars().nth(MAX_RENDERED_CHARS).is_some() {
+        rendered.push('\u{2026}');
+    }
+    rendered
+}
+
 /// The refusal [`logical_target_in_source_order`] returns, in the shape this connector's other
 /// messages take: the table and column that cannot be read, the disagreement, what it costs, and
 /// the one action that re-reads the schema. `disagreement` completes "column '<name>' ...".
 ///
 /// Kept on one line in the rendered value — the `\` continuations below strip the newline and the
-/// indentation that follows it, which `refusals_stay_on_one_line` holds to.
+/// indentation that follows it, which `refusals_stay_on_one_line` holds to. The names the table
+/// supplies are rendered through [`as_one_line`] for the same reason.
 fn unmatched_nested_field(table_url: &Url, column: &str, disagreement: &str) -> DataFusionError {
+    let column = as_one_line(column);
+    let disagreement = as_one_line(disagreement);
     DataFusionError::Plan(format!(
         "Failed to read Delta Lake table '{table_url}': column '{column}' {disagreement}, so its \
          fields cannot be matched to their names and the column would be read with its values \
@@ -2036,6 +2071,75 @@ mod tests {
         assert!(
             message.contains("https://spiceai.org/docs/components/data-connectors/delta-lake"),
             "the refusal must carry the docs link: {message}"
+        );
+    }
+
+    /// The names in a refusal come out of the table, so the one-line guarantee above has to hold
+    /// for a schema that names a column with a newline in it rather than only for the names a
+    /// test picks.
+    #[test]
+    fn a_name_the_table_chose_cannot_split_a_refusal() {
+        let message = unmatched_nested_field(
+            &test_table_url(),
+            "two\nlines",
+            "holds a nested field 'also\rsplit' that the table's column mapping does not name",
+        )
+        .to_string();
+
+        assert!(
+            !message.contains('\n') && !message.contains('\r'),
+            "a name the table chose must not split the refusal: {message:?}"
+        );
+        assert!(
+            message.contains(r"column 'two\nlines'"),
+            "the column must still be named, with the break escaped in place: {message}"
+        );
+        assert!(
+            message.contains(r"nested field 'also\rsplit'"),
+            "the nested name must still be named, with the break escaped in place: {message}"
+        );
+    }
+
+    /// Escaping rather than replacing is what makes the rendered name identify one column: an
+    /// operator reads this message to find the column in their own schema, so two columns that
+    /// differ only in a control character must not render the same way.
+    #[test]
+    fn two_names_differing_only_in_a_control_character_render_differently() {
+        let tabbed =
+            unmatched_nested_field(&test_table_url(), "a\tb", "holds something unmappable")
+                .to_string();
+        let spaced = unmatched_nested_field(&test_table_url(), "a b", "holds something unmappable")
+            .to_string();
+
+        assert_ne!(
+            tabbed, spaced,
+            "`a\\tb` and `a b` are different columns and must not produce the same refusal"
+        );
+        assert!(
+            tabbed.contains(r"column 'a\tb'"),
+            "the tab must survive as an escape rather than becoming a space: {tabbed}"
+        );
+    }
+
+    /// A schema is free to name a column with a megabyte of text. One refusal must stay a message
+    /// someone can read, not a copy of that name.
+    #[test]
+    fn a_name_longer_than_the_cap_is_truncated() {
+        let message = unmatched_nested_field(
+            &test_table_url(),
+            &"x".repeat(MAX_RENDERED_CHARS * 4),
+            "holds something unmappable",
+        )
+        .to_string();
+
+        assert!(
+            message.chars().count() < MAX_RENDERED_CHARS * 3,
+            "an oversized name must not be copied into the refusal whole: {} chars",
+            message.chars().count()
+        );
+        assert!(
+            message.contains('\u{2026}'),
+            "a truncated name must say it was truncated: {message}"
         );
     }
 
