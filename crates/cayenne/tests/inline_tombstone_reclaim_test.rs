@@ -50,10 +50,16 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 test_with_backends!(inline_tombstones_drain_when_corpus_is_empty);
 test_with_backends!(file_backed_upserts_reclaim_inline_tombstones);
 
-/// Tombstone budget for the reclamation test, in serialized bytes. One tombstone
-/// here holds three 8-byte keys behind a format tag, so a few rounds cross it —
-/// the shipped default is megabytes.
-const TOMBSTONE_BUDGET_BYTES: i64 = 64;
+/// Tombstone budget for the reclamation test, in metastore bytes — the shipped
+/// default is megabytes.
+///
+/// One tombstone here costs `INLINED_DELETE_ROW_OVERHEAD_BYTES` (128) plus a
+/// 25-byte payload (a format tag and three 8-byte keys), so 153. The budget sits
+/// above one and below two, which is what makes the test deterministic: the first
+/// round leaves an observable row because it cannot yet arm the reclamation, and
+/// the second crosses the budget. A budget under the per-row overhead would arm
+/// on the very first tombstone and could clear it before the count is sampled.
+const TOMBSTONE_BUDGET_BYTES: i64 = 256;
 
 fn table_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -268,15 +274,15 @@ async fn file_backed_upserts_reclaim_inline_tombstones(fixture: common::TestFixt
         "the workload must write inline tombstones, or it does not cover #13621"
     );
 
-    // The reclamation runs in a background task scheduled from the write path,
-    // so give it a bounded window — the same race the inline auto-checkpoint has.
+    // Every round after the seed supersedes the same PKs, so each writes exactly
+    // one tombstone row: unreclaimed, the count is ROUNDS and never falls. That
+    // is the count to beat — not the observed peak, which depends on when the
+    // background reclamation happens to land relative to the samples.
     let settled =
-        common::poll_inlined_delete_count_at_most(&fixture.catalog, &table_id, peak_tombstones - 1)
-            .await?;
+        common::poll_inlined_delete_count_at_most(&fixture.catalog, &table_id, ROUNDS - 1).await?;
 
-    // Unreclaimed, the count is one row per round and never falls.
     assert!(
-        settled < peak_tombstones,
+        settled < ROUNDS,
         "inline tombstones must be reclaimed once they pass the budget, not accumulate: \
          peaked at {peak_tombstones}, settled at {settled} after {ROUNDS} upsert rounds (#13621)"
     );

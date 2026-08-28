@@ -15969,7 +15969,7 @@ impl CayenneTableProvider {
                     self.0.store(false, Ordering::Release);
                 }
             }
-            let _clear = ClearOnDrop(Arc::clone(&table.inline_checkpoint_scheduled));
+            let clear_on_exit = ClearOnDrop(Arc::clone(&table.inline_checkpoint_scheduled));
 
             tokio::task::yield_now().await;
             let result = async {
@@ -15990,16 +15990,21 @@ impl CayenneTableProvider {
                 false
             };
 
-            // Release the coalescing slot HERE rather than leaving it to
-            // `ClearOnDrop`, then re-check. Without this an arm that raced this
-            // pass is lost: a `release_pending_inline_tombstone` firing while the
-            // pass is still running loses its `swap(true)` and schedules nothing,
-            // and the clear that follows leaves no task behind — so a table that
-            // goes idle right there stays over budget until its next write.
-            // Storing `false` twice is harmless.
-            table
-                .inline_checkpoint_scheduled
-                .store(false, Ordering::Release);
+            // Release the coalescing slot HERE, before the re-check, rather than
+            // letting the guard do it on the way out. Without this an arm that
+            // raced this pass is lost: a `release_pending_inline_tombstone`
+            // firing while the pass is still running loses its `swap(true)` and
+            // schedules nothing, and the clear that follows leaves no task behind
+            // — so a table that goes idle right there stays over budget until its
+            // next write.
+            //
+            // Dropping the guard is what releases the slot, and it MUST be a drop
+            // rather than a bare store: a still-armed guard would fire again when
+            // this task exits and write `false` over a replacement task's `true`,
+            // letting a second pass spawn alongside it and defeating the
+            // coalescing this flag exists to provide. Everything above this point
+            // is still covered against panics; nothing below can panic.
+            drop(clear_on_exit);
 
             // Re-arm only where a fresh pass would make progress, so this cannot
             // spin: a pass that deferred on an unpublished staged tombstone would

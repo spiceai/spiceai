@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
-/// `PRAGMA auto_vacuum` integer value for INCREMENTAL (0 = NONE, 1 = FULL, 2 = INCREMENTAL).
+/// `PRAGMA auto_vacuum` integer values (0 = NONE, 1 = FULL, 2 = INCREMENTAL).
+const SQLITE_AUTO_VACUUM_NONE: i64 = 0;
 const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
 
 /// Read the database's live `auto_vacuum` mode. Fixed at file creation — the
@@ -1664,31 +1665,36 @@ impl MetastoreBackend for SqliteMetastore {
                 .await
                 .map_err(map_err)?
         } else {
-            let (is_incremental, reclaimed) = guard
+            let (mode, reclaimed) = guard
                 .call(move |conn| {
                     // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims
-                    // at commit time, so it needs nothing here either.
+                    // at commit time, so it needs nothing here either. The mode
+                    // itself is returned, not just "is it INCREMENTAL", so the
+                    // caller can tell a FULL database (reclaiming, fine) from a
+                    // NONE one (never reclaiming, worth saying so).
                     let mode = read_auto_vacuum_mode(conn)?;
-                    let is_inc = mode == SQLITE_AUTO_VACUUM_INCREMENTAL;
-                    if !is_inc {
-                        return Ok((false, 0));
+                    if mode != SQLITE_AUTO_VACUUM_INCREMENTAL {
+                        return Ok((mode, 0));
                     }
                     let n = reclaim_freelist_pages(conn, max_pages)?;
-                    Ok((true, n))
+                    Ok((mode, n))
                 })
                 .await
                 .map_err(map_err)?;
+            let is_incremental = mode == SQLITE_AUTO_VACUUM_INCREMENTAL;
             // Racing first probes may both try to set; the value is deterministic
             // for a given file so a failed set is fine.
             // One-shot: this branch runs only until the mode is cached, so the
             // warning fires at most once per metastore file per process. Without
             // it a database created under the old `none` default is silently
             // never reclaimed, and the only symptom is a `.db` that never shrinks.
+            // FULL is excluded — it reclaims on every commit, so it needs neither
+            // this driver nor a migration.
             if self
                 .db_auto_vacuum_is_incremental
                 .set(is_incremental)
                 .is_ok()
-                && !is_incremental
+                && mode == SQLITE_AUTO_VACUUM_NONE
             {
                 tracing::warn!(
                     "Metastore '{}' was created with `auto_vacuum` disabled, so freed pages are reused but never returned to the filesystem and the file stays at its high-water size. SQLite fixes this mode at file creation: recreate the metastore, or run a full `VACUUM` on it, to adopt the `incremental` default. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
