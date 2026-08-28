@@ -348,12 +348,57 @@ fn assistant_messages_to_content_blocks(
     Ok(MessageParam::assistant(content_blocks))
 }
 
+/// Refuses a request that asks for per-token log probabilities.
+///
+/// Anthropic's Messages API has no `logprobs` equivalent: it returns no per-token probabilities,
+/// and this adapter's response conversion consequently leaves `ChatChoice::logprobs` empty. A
+/// request for them therefore cannot be served, and answering it with a completion that silently
+/// omits them hides that from the caller, so the parameters are named and refused instead.
+fn refuse_unsupported_logprobs(
+    model: &AnthropicModelVariant,
+    value: &CreateChatCompletionRequest,
+) -> Result<(), OpenAIError> {
+    // `logprobs: Some(false)` asks for nothing and is satisfiable, so only a positive request is
+    // refused. `top_logprobs` is refused on its own: OpenAI documents it as requiring
+    // `logprobs: true`, but a caller setting only `top_logprobs` is still asking for log
+    // probabilities, so leaving that spelling accepted would serve the same request silently.
+    //
+    // `param` reports the more specific field, while `remedy` names every field that has to go:
+    // dropping just `top_logprobs` from a request that also set `logprobs: true` would otherwise
+    // earn a second refusal.
+    let (param, remedy) = match (value.top_logprobs.is_some(), value.logprobs == Some(true)) {
+        (true, true) => ("top_logprobs", "`logprobs` and `top_logprobs`"),
+        (true, false) => ("top_logprobs", "`top_logprobs`"),
+        (false, true) => ("logprobs", "`logprobs`"),
+        (false, false) => return Ok(()),
+    };
+
+    Err(OpenAIError::ApiError(ApiError {
+        // Either field can arrive from the request or from the model's configured defaults, so
+        // the remedy names both origins.
+        message: format!(
+            "Failed to run model '{model}' (anthropic): the `{param}` parameter is not supported. \
+             Anthropic's Messages API returns no per-token log probabilities. \
+             Remove {remedy} from the request and from the model's parameters, \
+             or use a model provider that reports them. \
+             See: https://spiceai.org/docs/components/models/anthropic"
+        ),
+        // The caller sent something this provider cannot serve, so it is their request that is
+        // invalid. `openai_error_to_response` reads `code` to pick the status, and anything it
+        // does not recognize becomes a 500 — which would report a client error as a server fault.
+        r#type: Some("invalid_request_error".to_string()),
+        param: Some(param.to_string()),
+        code: Some("invalid_request_error".to_string()),
+    }))
+}
+
 impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCreateParams {
     type Error = OpenAIError;
     fn try_from(
         pair: (AnthropicModelVariant, CreateChatCompletionRequest),
     ) -> Result<Self, Self::Error> {
         let (model, value) = pair;
+        refuse_unsupported_logprobs(&model, &value)?;
         let cache_control = value
             .prompt_cache_key
             .as_ref()
@@ -367,7 +412,11 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(MessageCreateParams {
-            top_k: value.top_logprobs.map(u32::from),
+            // No OpenAI request field corresponds to Anthropic's `top_k`, which restricts which
+            // tokens may be sampled. `top_logprobs` asks how many alternatives to report and
+            // leaves sampling untouched, so carrying one into the other would answer a request to
+            // observe the distribution by narrowing it instead.
+            top_k: None,
             top_p: value.top_p,
             temperature: value.temperature,
             max_tokens: value
@@ -523,5 +572,128 @@ mod tests {
             params.cache_control,
             Some(CacheControlEphemeral::ephemeral())
         );
+    }
+
+    fn request_with(
+        mutate: impl FnOnce(&mut CreateChatCompletionRequest),
+    ) -> CreateChatCompletionRequest {
+        let mut req = CreateChatCompletionRequest {
+            messages: vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("Rank the alternatives.")
+                    .build()
+                    .expect("user message should build")
+                    .into(),
+            ],
+            ..CreateChatCompletionRequest::default()
+        };
+        mutate(&mut req);
+        req
+    }
+
+    fn convert(req: CreateChatCompletionRequest) -> Result<MessageCreateParams, OpenAIError> {
+        MessageCreateParams::try_from(("claude-sonnet-4-6".to_string(), req))
+    }
+
+    /// Returns the refusal's own fields.
+    ///
+    /// Asserting on `OpenAIError`'s `Display` instead would be vacuous: it appends
+    /// `(param: ...)` and `(code: ...)` to the message, so a check that the rendered string
+    /// mentions a parameter passes even when the human-readable message never names it.
+    fn refusal(err: &OpenAIError) -> &ApiError {
+        match err {
+            OpenAIError::ApiError(api) => api,
+            other => panic!("expected an ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_request_for_log_probabilities_is_refused_rather_than_narrowing_sampling() {
+        for (param, remedy, req) in [
+            (
+                "top_logprobs",
+                "`top_logprobs`",
+                request_with(|r| r.top_logprobs = Some(5)),
+            ),
+            (
+                "logprobs",
+                "`logprobs`",
+                request_with(|r| r.logprobs = Some(true)),
+            ),
+            (
+                // OpenAI's documented pairing: both set together. The more specific field is
+                // reported, but both have to be named as the remedy — removing only the reported
+                // one would earn a second refusal.
+                "top_logprobs",
+                "`logprobs` and `top_logprobs`",
+                request_with(|r| {
+                    r.logprobs = Some(true);
+                    r.top_logprobs = Some(3);
+                }),
+            ),
+            (
+                // Zero alternatives is still a request for log probabilities, and it is the value
+                // an `Option`-vs-truthiness check is most likely to let through.
+                "top_logprobs",
+                "`top_logprobs`",
+                request_with(|r| r.top_logprobs = Some(0)),
+            ),
+        ] {
+            let err = convert(req).expect_err("a request for log probabilities should be refused");
+            let refusal = refusal(&err);
+
+            assert_eq!(refusal.param.as_deref(), Some(param));
+            // `openai_error_to_response` picks the HTTP status from `code`, and maps anything it
+            // does not recognize to 500. This is a client error, so it has to be the code that
+            // maps to 400.
+            assert_eq!(refusal.code.as_deref(), Some("invalid_request_error"));
+            assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
+
+            // Asserted against the message itself rather than the rendered error, so the
+            // `Display`-appended fields cannot satisfy these on their own.
+            for expected in [
+                "claude-sonnet-4-6",
+                "(anthropic)",
+                remedy,
+                "https://spiceai.org/docs/components/models/anthropic",
+            ] {
+                assert!(
+                    refusal.message.contains(expected),
+                    "refusal should name {expected}, got: {}",
+                    refusal.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_that_asks_for_no_log_probabilities_still_converts() {
+        // `logprobs: Some(false)` is satisfiable — Anthropic returns none and none were wanted —
+        // so refusing it would reject a request the adapter can serve exactly as asked.
+        for req in [
+            request_with(|_| {}),
+            request_with(|r| r.logprobs = Some(false)),
+        ] {
+            let params = convert(req).expect("a request asking for no log probabilities converts");
+            assert_eq!(
+                params.top_k, None,
+                "no OpenAI field maps to Anthropic's top_k, so it must be left unset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sampling_control_the_caller_did_set_is_still_forwarded() {
+        // Guards the refusal against over-reaching: the unsupported parameters are refused, and
+        // the controls Anthropic does accept keep reaching it.
+        let params = convert(request_with(|r| {
+            r.temperature = Some(0.25);
+            r.top_p = Some(0.9);
+        }))
+        .expect("supported sampling controls should convert");
+
+        assert_eq!(params.temperature, Some(0.25));
+        assert_eq!(params.top_p, Some(0.9));
+        assert_eq!(params.top_k, None);
     }
 }
