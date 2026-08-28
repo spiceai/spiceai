@@ -277,7 +277,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)/;
+            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches)\.py$|^docs\/dev\/fork_patches\.md$|^Makefile$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -777,6 +777,41 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
+      # Ask cargo, before anything is compiled, whether Cargo.lock still describes
+      # these manifests — the question `Check if Cargo.lock is updated` asks at the
+      # very bottom of this job, after the whole suite has run.
+      #
+      # On 2026-08-26 that cost 13 merge-queue branches the better part of an hour
+      # each, and the report was the single line `Update Cargo.lock` (#13598). The
+      # staleness is born in the queue: one PR changes a version in
+      # `[workspace.package]` while another adds or renames a member, git merges
+      # both cleanly because they touch different regions of the lockfile, and the
+      # combination is stale. Neither author can see it first, because on a pull
+      # request `Attestation` is the only job that runs.
+      #
+      # `scripts/signoff preflight-lockfile` rather than the same `cargo metadata
+      # --locked` inline: the sign-off gate runs this check too, and two copies of a
+      # guard drift — the one that drifts being the one nobody notices has stopped
+      # guarding. The script owns the fail-open policy (only cargo's own `--locked`
+      # refusal is a verdict; an unreachable registry is not) and the wording it
+      # matches on. Same shape as `signoff preflight-disk` in signoff.yml.
+      #
+      # This job only: the same batch left `Rust Lint` and `Build (release profile)`
+      # green, because they run cargo — which silently rewrites the lock — and never
+      # diff it afterwards. So one early check in the one job that reports is the
+      # whole fix, and putting it in `setup-rust` would have charged 40 call sites,
+      # including jobs like e2e_test_ci that deliberately start from a fresh
+      # CARGO_HOME, for a report none of them make.
+      #
+      # Cost is one resolution pass with no compilation (~10s against this runner's
+      # warm ~/.cargo), whose registry and git-dependency fetches the build in the
+      # next steps performs anyway.
+      - name: Check Cargo.lock matches the manifests
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        # Invoked through `bash` rather than as a path so the job does not depend on
+        # the script's executable bit surviving a checkout on every platform.
+        run: bash scripts/signoff preflight-lockfile
+
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
@@ -859,13 +894,25 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
+      # The backstop, kept behind the early assertion above: it can still catch a
+      # lock some step in this job rewrote for a reason resolution alone would not
+      # have refused. What it cannot do is be the *first* report — reaching this step
+      # means the whole suite has already run, which is why the early check exists.
+      #
+      # `git status --porcelain --untracked-files=all` rather than `git diff`:
+      # `git diff` compares tracked content only, so a branch that *deletes*
+      # Cargo.lock and lets the first cargo command recreate it as an untracked file
+      # passes a diff-based check with the lockfile no longer in the tree at all.
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          if git diff --exit-code Cargo.lock; then
+          set -uo pipefail
+          status="$(git status --porcelain --untracked-files=all -- Cargo.lock)"
+          if [ -z "${status}" ]; then
             echo "Cargo.lock is up to date"
           else
-            echo "Update Cargo.lock"
+            git diff -- Cargo.lock || true
+            echo "::error::Cargo.lock is not the committed one any more (git status: ${status}), so the lockfile in this branch does not describe the tree this job built. Run 'cargo update --workspace' on the branch, commit the regenerated Cargo.lock, and re-queue."
             exit 1
           fi
 
