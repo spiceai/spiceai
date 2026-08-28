@@ -524,6 +524,21 @@ fn rewrite_column_names(
         .data)
 }
 
+/// The refusal [`logical_target_in_source_order`] returns, in the shape this connector's other
+/// messages take: the table and column that cannot be read, the disagreement, what it costs, and
+/// the one action that re-reads the schema. `disagreement` completes "column '<name>' ...".
+///
+/// Kept on one line in the rendered value — the `\` continuations below strip the newline and the
+/// indentation that follows it, which `refusals_stay_on_one_line` holds to.
+fn unmatched_nested_field(table_url: &Url, column: &str, disagreement: &str) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Failed to read Delta Lake table '{table_url}': column '{column}' {disagreement}, so its \
+         fields cannot be matched to their names and the column would be read with its values \
+         under the wrong ones. Re-register the dataset so its schema is read from the current \
+         table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
+    ))
+}
+
 /// Rebuilds `logical` in `source`'s field order, so it describes the layout `source` already has.
 ///
 /// [`relabel_array_data`] pairs children positionally while permitting renames, so a target whose
@@ -569,11 +584,15 @@ fn logical_target_in_source_order(
             if source_fields.len() != physical_fields.len()
                 || physical_fields.len() != logical_fields.len()
             {
-                return Err(DataFusionError::Plan(format!(
-                    "Failed to read Delta Lake table '{table_url}': column '{column}' holds a nested value with {} field(s) where the table's column mapping names {}, so its fields cannot be matched to their names and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
-                    source_fields.len(),
-                    physical_fields.len(),
-                )));
+                return Err(unmatched_nested_field(
+                    table_url,
+                    column,
+                    &format!(
+                        "holds a nested value with {} field(s) where the table's column mapping names {}",
+                        source_fields.len(),
+                        physical_fields.len(),
+                    ),
+                ));
             }
 
             let mut claimed = vec![false; physical_fields.len()];
@@ -583,20 +602,25 @@ fn logical_target_in_source_order(
                     .iter()
                     .position(|physical_field| physical_field.name() == source_field.name())
                 else {
-                    return Err(DataFusionError::Plan(format!(
-                        "Failed to read Delta Lake table '{table_url}': column '{column}' holds a nested field '{}' that the table's column mapping does not name, so it cannot be matched to a logical name and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
-                        source_field.name(),
-                    )));
+                    return Err(unmatched_nested_field(
+                        table_url,
+                        column,
+                        &format!(
+                            "holds a nested field '{}' that the table's column mapping does not name",
+                            source_field.name(),
+                        ),
+                    ));
                 };
 
                 // `position` yields the first match, so two source fields sharing a name would
                 // both take the same logical name and one column's values would be published
                 // twice while the other's were dropped.
                 if std::mem::replace(&mut claimed[index], true) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Failed to read Delta Lake table '{table_url}': column '{column}' holds two nested fields named '{}', so neither can be matched to a logical name and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
-                        source_field.name(),
-                    )));
+                    return Err(unmatched_nested_field(
+                        table_url,
+                        column,
+                        &format!("holds two nested fields named '{}'", source_field.name()),
+                    ));
                 }
 
                 fields.push(logical_field_in_source_order(
@@ -646,9 +670,11 @@ fn logical_target_in_source_order(
         // Refused rather than relabelled on a pairing nothing checked: a nested name that
         // reaches here is one this walk cannot match to a logical name, and guessing it
         // positionally is how values end up under the wrong column.
-        _ => Err(DataFusionError::Plan(format!(
-            "Failed to read Delta Lake table '{table_url}': column '{column}' holds a {source} the table's column mapping describes as a {physical}, so its fields cannot be matched to their names and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
-        ))),
+        _ => Err(unmatched_nested_field(
+            table_url,
+            column,
+            &format!("holds a {source} the table's column mapping describes as a {physical}"),
+        )),
     }
 }
 
@@ -710,10 +736,14 @@ fn build_column_mapping_projection(
                     // the logical field of that name.
                     let physical_field =
                         mapping.schema.field_with_name(field.name()).map_err(|_| {
-                            DataFusionError::Plan(format!(
-                                "Failed to read Delta Lake table '{table_url}': column '{logical_name}' is read from a file field '{}' the table's column mapping does not name, so its nested fields cannot be matched to their names. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
-                                field.name(),
-                            ))
+                            unmatched_nested_field(
+                                table_url,
+                                &logical_name,
+                                &format!(
+                                    "is read from a file field '{}' the table's column mapping does not name",
+                                    field.name(),
+                                ),
+                            )
                         })?;
 
                     // The relabel pairs children positionally, so the target has to be in the
@@ -1982,6 +2012,30 @@ mod tests {
             target, expected,
             "the value must still be reordered, and the flag left as the table declares it for \
              `relabel_array_data` to rule on"
+        );
+    }
+
+    /// Every refusal is a user-facing message, so it stays on one line and the `\` continuations
+    /// that keep the source readable must join with single spaces rather than swallow one.
+    #[test]
+    fn refusals_stay_on_one_line() {
+        let message = unmatched_nested_field(&test_table_url(), "s", "holds something unmappable")
+            .to_string();
+
+        assert!(
+            !message.contains('\n'),
+            "a user-facing message must not embed a newline: {message:?}"
+        );
+        assert!(
+            message.contains(
+                "column 's' holds something unmappable, so its fields cannot be matched to their \
+                 names and the column would be read with its values under the wrong ones."
+            ),
+            "the continuations must join with single spaces: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-connectors/delta-lake"),
+            "the refusal must carry the docs link: {message}"
         );
     }
 
