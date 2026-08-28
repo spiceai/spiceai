@@ -212,10 +212,13 @@ pub struct SqliteMetastoreConfig {
     /// not to tax writers, yet the file stays bounded if a tick lags. `0` makes
     /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
     pub wal_truncate_threshold_bytes: u64,
-    /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
-    /// a full VACUUM to change it), so a metastore created before this defaulted
-    /// to [`SqliteAutoVacuum::Incremental`] keeps its old mode and the driver
-    /// gates on the file's real mode rather than this setting.
+    /// `auto_vacuum` mode. Takes effect only on a fresh DB: moving an existing
+    /// one off NONE takes `PRAGMA auto_vacuum = <mode>` FOLLOWED by a full
+    /// `VACUUM` — the pragma alone is a no-op there, and a bare `VACUUM`
+    /// preserves whatever mode the file already has. So a metastore created
+    /// before this defaulted to [`SqliteAutoVacuum::Incremental`] keeps its old
+    /// mode, and the driver gates on the file's real mode rather than on this
+    /// setting.
     pub auto_vacuum: SqliteAutoVacuum,
     /// Freelist pages reclaimed per maintenance tick when the database is in
     /// INCREMENTAL auto-vacuum mode. Ignored in every other mode.
@@ -1697,7 +1700,7 @@ impl MetastoreBackend for SqliteMetastore {
                 && mode == SQLITE_AUTO_VACUUM_NONE
             {
                 tracing::warn!(
-                    "Metastore '{}' was created with `auto_vacuum` disabled, so freed pages are reused but never returned to the filesystem and the file stays at its high-water size. SQLite fixes this mode at file creation: recreate the metastore, or run a full `VACUUM` on it, to adopt the `incremental` default. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    "Metastore '{}' was created with `auto_vacuum` disabled, so freed pages are reused but never returned to the filesystem and the file stays at its high-water size. SQLite fixes this mode at file creation: to adopt the `incremental` default, stop the runtime and run `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;` against the file, then restart — a `VACUUM` on its own keeps the file on `none`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     self.db_path()
                 );
             }
