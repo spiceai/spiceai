@@ -543,15 +543,16 @@ fn rewrite_column_names(
 /// `logical` exactly.
 ///
 /// Only `Struct`, `List` and `Map` are walked, because those are the only child-bearing types
-/// [`map_delta_data_type_to_arrow_data_type`] builds; anything else has no nested field names to
-/// reorder and is taken from `logical` whole.
+/// [`map_delta_data_type_to_arrow_data_type`] builds. Anything else is taken from `logical` whole,
+/// but only once `source` and `physical` agree — an unwalked node whose names already differ is
+/// refused rather than paired positionally.
 ///
 /// # Errors
 ///
 /// Returns a `DataFusionError` when a source field has no physical field of that name, when two
-/// source fields claim the same physical field, or when a struct's source and physical field
-/// counts disagree. Each of those would otherwise be resolved by a positional pairing that
-/// nothing checked.
+/// source fields claim the same physical field, when a struct's source and physical field counts
+/// disagree, or when an unwalked node's source and physical types differ. Each of those would
+/// otherwise be resolved by a positional pairing that nothing checked.
 fn logical_target_in_source_order(
     source: &DataType,
     physical: &DataType,
@@ -621,10 +622,10 @@ fn logical_target_in_source_order(
             column,
         )?))),
         (
-            DataType::Map(source_entries, source_sorted),
+            DataType::Map(source_entries, _),
             DataType::Map(physical_entries, _),
             DataType::Map(logical_entries, logical_sorted),
-        ) if source_sorted == logical_sorted => Ok(DataType::Map(
+        ) => Ok(DataType::Map(
             Arc::new(logical_field_in_source_order(
                 source_entries,
                 physical_entries,
@@ -632,11 +633,22 @@ fn logical_target_in_source_order(
                 table_url,
                 column,
             )?),
+            // The `sorted` flag is not a field name, so it is carried as `logical` declares it
+            // exactly as before; a disagreement over it is `relabel_array_data`'s to refuse.
             *logical_sorted,
         )),
-        // Nothing nested to reorder. A disagreement that reaches here is one `relabel_array_data`
-        // refuses on its own, so it keeps the message that names the two types.
-        _ => Ok(logical.clone()),
+        // A node this does not walk carries no nested field names to reorder, so `logical` can
+        // only be taken whole once `source` is known to spell its own names the way `physical`
+        // does. That equality is what makes the pairing sound, and it holds for every type the
+        // Delta mapper builds: it renders leaves identically in both modes, and the three
+        // child-bearing types it can produce are walked above.
+        _ if source == physical => Ok(logical.clone()),
+        // Refused rather than relabelled on a pairing nothing checked: a nested name that
+        // reaches here is one this walk cannot match to a logical name, and guessing it
+        // positionally is how values end up under the wrong column.
+        _ => Err(DataFusionError::Plan(format!(
+            "Failed to read Delta Lake table '{table_url}': column '{column}' holds a {source} the table's column mapping describes as a {physical}, so its fields cannot be matched to their names and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
+        ))),
     }
 }
 
@@ -1897,6 +1909,79 @@ mod tests {
         assert_eq!(
             target, expected,
             "a struct nested under a map value must be reordered too"
+        );
+    }
+
+    /// A `LargeList` stands in for any child-bearing type the Delta mapper cannot build, so this
+    /// walk does not descend into it. Taking `logical` whole is only sound when `source` already
+    /// spells its names the way `physical` does.
+    #[test]
+    fn column_mapping_target_takes_an_unwalked_type_whole_when_its_names_already_agree() {
+        let physical = DataType::LargeList(Arc::new(Field::new("col-1", DataType::Int32, true)));
+        let logical = DataType::LargeList(Arc::new(Field::new("a", DataType::Int32, true)));
+
+        let target =
+            logical_target_in_source_order(&physical, &physical, &logical, &test_table_url(), "s")
+                .expect("an unwalked node whose names agree carries no reordering question");
+
+        assert_eq!(
+            target, logical,
+            "a node this walk does not descend into must still be relabelled as it was before"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_refuses_an_unwalked_type_whose_names_differ() {
+        let source = DataType::LargeList(Arc::new(Field::new("col-2", DataType::Int32, true)));
+        let physical = DataType::LargeList(Arc::new(Field::new("col-1", DataType::Int32, true)));
+        let logical = DataType::LargeList(Arc::new(Field::new("a", DataType::Int32, true)));
+
+        let err =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect_err("an unwalked node holding an unmatched name must not be relabelled");
+
+        assert!(
+            err.to_string().contains("column 's'"),
+            "the refusal must name the column: {err}"
+        );
+    }
+
+    /// The `sorted` flag is a different question from field order, so a disagreement over it must
+    /// not cost the reordering of the value beneath it.
+    #[test]
+    fn column_mapping_target_reorders_a_map_value_whose_sorted_flag_disagrees() {
+        let (physical_value, logical_value) = struct_column_mapping();
+        let (source_value, _) = reordered_source();
+
+        let entries = |value: DataType| {
+            Arc::new(Field::new_struct(
+                "key_value",
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", value, true)),
+                ],
+                false,
+            ))
+        };
+        let source = DataType::Map(entries(source_value), true);
+        let physical = DataType::Map(entries(physical_value), false);
+        let logical = DataType::Map(entries(logical_value), false);
+
+        let target =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect("a sorted-flag disagreement is not this function's to refuse");
+
+        let expected = DataType::Map(
+            entries(DataType::Struct(Fields::from(vec![
+                Field::new("b", DataType::Int32, true),
+                Field::new("a", DataType::Int32, true),
+            ]))),
+            false,
+        );
+        assert_eq!(
+            target, expected,
+            "the value must still be reordered, and the flag left as the table declares it for \
+             `relabel_array_data` to rule on"
         );
     }
 
