@@ -524,6 +524,145 @@ fn rewrite_column_names(
         .data)
 }
 
+/// Rebuilds `logical` in `source`'s field order, so it describes the layout `source` already has.
+///
+/// [`relabel_array_data`] pairs children positionally while permitting renames, so a target whose
+/// same-typed sibling fields are ordered differently from the array's is accepted and every child
+/// keeps the values it already held, published under another field's name. The Delta column
+/// mapping cannot give the rename up — its physical field names are opaque column-mapping ids that
+/// never match the logical ones — so the ordering is re-established here instead, which is what
+/// lets the positional pairing downstream be sound.
+///
+/// `physical` supplies the column identity the rename destroys. It and `logical` are two
+/// renderings of one walk over the same Delta schema (see
+/// [`map_delta_data_type_to_arrow_data_type`], which varies only the name it takes from each
+/// field), so the field at a given index in each is the same column. A source field is matched to
+/// the physical field of the same name, and the logical field at that index supplies the name,
+/// nullability and metadata it is relabelled to. When the two orders already agree — which is
+/// every table whose files were written in the order its schema declares — this reproduces
+/// `logical` exactly.
+///
+/// Only `Struct`, `List` and `Map` are walked, because those are the only child-bearing types
+/// [`map_delta_data_type_to_arrow_data_type`] builds; anything else has no nested field names to
+/// reorder and is taken from `logical` whole.
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` when a source field has no physical field of that name, when two
+/// source fields claim the same physical field, or when a struct's source and physical field
+/// counts disagree. Each of those would otherwise be resolved by a positional pairing that
+/// nothing checked.
+fn logical_target_in_source_order(
+    source: &DataType,
+    physical: &DataType,
+    logical: &DataType,
+    table_url: &Url,
+    column: &str,
+) -> std::result::Result<DataType, DataFusionError> {
+    match (source, physical, logical) {
+        (
+            DataType::Struct(source_fields),
+            DataType::Struct(physical_fields),
+            DataType::Struct(logical_fields),
+        ) => {
+            if source_fields.len() != physical_fields.len()
+                || physical_fields.len() != logical_fields.len()
+            {
+                return Err(DataFusionError::Plan(format!(
+                    "Failed to read Delta Lake table '{table_url}': column '{column}' holds a nested value with {} field(s) where the table's column mapping names {}, so its fields cannot be matched to their names and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
+                    source_fields.len(),
+                    physical_fields.len(),
+                )));
+            }
+
+            let mut claimed = vec![false; physical_fields.len()];
+            let mut fields = Vec::with_capacity(source_fields.len());
+            for source_field in source_fields {
+                let Some(index) = physical_fields
+                    .iter()
+                    .position(|physical_field| physical_field.name() == source_field.name())
+                else {
+                    return Err(DataFusionError::Plan(format!(
+                        "Failed to read Delta Lake table '{table_url}': column '{column}' holds a nested field '{}' that the table's column mapping does not name, so it cannot be matched to a logical name and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
+                        source_field.name(),
+                    )));
+                };
+
+                // `position` yields the first match, so two source fields sharing a name would
+                // both take the same logical name and one column's values would be published
+                // twice while the other's were dropped.
+                if std::mem::replace(&mut claimed[index], true) {
+                    return Err(DataFusionError::Plan(format!(
+                        "Failed to read Delta Lake table '{table_url}': column '{column}' holds two nested fields named '{}', so neither can be matched to a logical name and the column would be read with its values under the wrong ones. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
+                        source_field.name(),
+                    )));
+                }
+
+                fields.push(logical_field_in_source_order(
+                    source_field,
+                    &physical_fields[index],
+                    &logical_fields[index],
+                    table_url,
+                    column,
+                )?);
+            }
+
+            Ok(DataType::Struct(fields.into()))
+        }
+        (
+            DataType::List(source_item),
+            DataType::List(physical_item),
+            DataType::List(logical_item),
+        ) => Ok(DataType::List(Arc::new(logical_field_in_source_order(
+            source_item,
+            physical_item,
+            logical_item,
+            table_url,
+            column,
+        )?))),
+        (
+            DataType::Map(source_entries, source_sorted),
+            DataType::Map(physical_entries, _),
+            DataType::Map(logical_entries, logical_sorted),
+        ) if source_sorted == logical_sorted => Ok(DataType::Map(
+            Arc::new(logical_field_in_source_order(
+                source_entries,
+                physical_entries,
+                logical_entries,
+                table_url,
+                column,
+            )?),
+            *logical_sorted,
+        )),
+        // Nothing nested to reorder. A disagreement that reaches here is one `relabel_array_data`
+        // refuses on its own, so it keeps the message that names the two types.
+        _ => Ok(logical.clone()),
+    }
+}
+
+/// One field of [`logical_target_in_source_order`]'s result: everything but the child type is
+/// taken from `logical`, so a source and logical field that already agree rebuild identically.
+fn logical_field_in_source_order(
+    source: &Field,
+    physical: &Field,
+    logical: &Field,
+    table_url: &Url,
+    column: &str,
+) -> std::result::Result<Field, DataFusionError> {
+    Ok(Field::new(
+        logical.name(),
+        logical_target_in_source_order(
+            source.data_type(),
+            physical.data_type(),
+            logical.data_type(),
+            table_url,
+            column,
+        )?,
+        logical.is_nullable(),
+    )
+    .with_metadata(logical.metadata().clone()))
+}
+
 /// Builds a [`ProjectionExec`] that renames columns from physical names back to logical names.
 ///
 /// For columns with nested types (Struct, List, Map) where the physical and logical data types
@@ -534,8 +673,9 @@ fn rewrite_column_names(
 /// column-mapping ids), so the rename must be done as a metadata-only relabel instead.
 fn build_column_mapping_projection(
     exec: Arc<dyn ExecutionPlan>,
-    physical_to_logical: &HashMap<String, String>,
+    mapping: &PhysicalSchemaMapping,
     logical_schema: &SchemaRef,
+    table_url: &Url,
 ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let exec_schema = exec.schema();
     let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = exec_schema
@@ -543,7 +683,8 @@ fn build_column_mapping_projection(
         .iter()
         .enumerate()
         .map(|(i, field)| {
-            let logical_name = physical_to_logical
+            let logical_name = mapping
+                .physical_to_logical
                 .get(field.name())
                 .cloned()
                 .unwrap_or_else(|| field.name().clone());
@@ -552,17 +693,38 @@ fn build_column_mapping_projection(
             // relabel the nested struct/list/map field names from physical to logical.
             let expr: Arc<dyn PhysicalExpr> = match logical_schema.field_with_name(&logical_name) {
                 Ok(logical_field) if field.data_type() != logical_field.data_type() => {
+                    // Only a column the mapping named can get here: a partition column is absent
+                    // from `physical_to_logical`, so it keeps its own name and compares equal to
+                    // the logical field of that name.
+                    let physical_field =
+                        mapping.schema.field_with_name(field.name()).map_err(|_| {
+                            DataFusionError::Plan(format!(
+                                "Failed to read Delta Lake table '{table_url}': column '{logical_name}' is read from a file field '{}' the table's column mapping does not name, so its nested fields cannot be matched to their names. Re-register the dataset so its schema is read from the current table version. See: https://spiceai.org/docs/components/data-connectors/delta-lake",
+                                field.name(),
+                            ))
+                        })?;
+
+                    // The relabel pairs children positionally, so the target has to be in the
+                    // order the scan produces rather than the order the schema declares.
+                    let target = logical_target_in_source_order(
+                        field.data_type(),
+                        physical_field.data_type(),
+                        logical_field.data_type(),
+                        table_url,
+                        &logical_name,
+                    )?;
+
                     Arc::new(RelabelFieldsExpr::new(
                         Arc::new(Column::new(field.name(), i)),
-                        logical_field.data_type().clone(),
+                        target,
                     ))
                 }
                 _ => Arc::new(Column::new(field.name(), i)),
             };
 
-            (expr, logical_name)
+            Ok((expr, logical_name))
         })
-        .collect();
+        .collect::<std::result::Result<Vec<_>, DataFusionError>>()?;
 
     Ok(Arc::new(ProjectionExec::try_new(projection_expr, exec)?))
 }
@@ -935,7 +1097,7 @@ impl TableProvider for DeltaTable {
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            build_column_mapping_projection(exec, &mapping.physical_to_logical, &self.arrow_schema)
+            build_column_mapping_projection(exec, mapping, &self.arrow_schema, &self.table_url)
         } else {
             let physical_expr = state.create_physical_expr(filter, &df_schema)?;
             let schema = self.arrow_schema.project(&non_partition_indices)?;
@@ -1476,10 +1638,267 @@ fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{ArrayRef, Int32Array, StructArray};
+    use arrow::datatypes::Fields;
     use datafusion::logical_expr::{Operator, col, lit, not};
     use datafusion::parquet::arrow::arrow_reader::RowSelector;
 
     use super::*;
+
+    /// The Delta column mapping's physical/logical pair for a struct column, as
+    /// [`map_delta_data_type_to_arrow_data_type`] would render one Delta schema in both modes:
+    /// same field order, physical ids in one and logical names in the other.
+    fn struct_column_mapping() -> (DataType, DataType) {
+        let physical = DataType::Struct(Fields::from(vec![
+            Field::new("col-1", DataType::Int32, true),
+            Field::new("col-2", DataType::Int32, true),
+        ]));
+        let logical = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        (physical, logical)
+    }
+
+    fn test_table_url() -> Url {
+        Url::parse("s3://bucket/table/").expect("test table url should parse")
+    }
+
+    /// A struct whose children are `col-2` then `col-1`, holding `b`'s values then `a`'s — the
+    /// scan output whose order disagrees with the order the Delta schema declares.
+    fn reordered_source() -> (DataType, StructArray) {
+        let fields = Fields::from(vec![
+            Field::new("col-2", DataType::Int32, true),
+            Field::new("col-1", DataType::Int32, true),
+        ]);
+        let array = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![20, 21])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![10, 11])) as ArrayRef,
+            ],
+            None,
+        );
+        (DataType::Struct(fields), array)
+    }
+
+    fn int32_column(array: &StructArray, name: &str) -> Vec<i32> {
+        array
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("relabelled struct should expose a field named '{name}'"))
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("field should still be Int32")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn column_mapping_target_reproduces_the_logical_type_when_the_orders_agree() {
+        let (physical, logical) = struct_column_mapping();
+
+        let target =
+            logical_target_in_source_order(&physical, &physical, &logical, &test_table_url(), "s")
+                .expect("a scan in the declared order should need no reordering");
+
+        assert_eq!(
+            target, logical,
+            "a source already in the declared order must rebuild the logical type exactly, so \
+             every table whose files match its schema is unaffected"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_follows_the_scan_order_for_a_reordered_struct() {
+        let (physical, logical) = struct_column_mapping();
+        let (source, _) = reordered_source();
+
+        let target =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect("a same-typed reorder should be resolved, not refused");
+
+        let expected = DataType::Struct(Fields::from(vec![
+            Field::new("b", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+        ]));
+        assert_eq!(
+            target, expected,
+            "the target must name the scan's first child 'b' — the logical name of the physical \
+             field 'col-2' it actually holds — rather than the schema's first name 'a'"
+        );
+    }
+
+    /// The regression this fix exists for, exercised through the production relabel: the target
+    /// built the old way (the logical type verbatim) publishes each child under its sibling's
+    /// name, and the target built the new way does not.
+    #[test]
+    fn column_mapping_relabel_keeps_values_with_their_own_names_across_a_reorder() {
+        let (physical, logical) = struct_column_mapping();
+        let (source, array) = reordered_source();
+
+        // The old target: the logical type as declared. `relabel_array_data` pairs children
+        // positionally, so it accepts this and transposes the two columns.
+        let transposed = make_array(
+            relabel_array_data(array.to_data(), &logical)
+                .expect("a same-typed reorder is accepted, which is the defect"),
+        );
+        let transposed = transposed
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("relabelled value should still be a struct");
+        assert_eq!(
+            int32_column(transposed, "a"),
+            vec![20, 21],
+            "guards the premise: relabelling to the declared type publishes b's values as 'a'"
+        );
+
+        // The new target, built in the scan's own order.
+        let target =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect("a same-typed reorder should be resolved, not refused");
+        let relabelled = make_array(
+            relabel_array_data(array.to_data(), &target).expect("the reordered target should hold"),
+        );
+        let relabelled = relabelled
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("relabelled value should still be a struct");
+
+        assert_eq!(
+            int32_column(relabelled, "a"),
+            vec![10, 11],
+            "column 'a' must carry the values written for 'a'"
+        );
+        assert_eq!(
+            int32_column(relabelled, "b"),
+            vec![20, 21],
+            "column 'b' must carry the values written for 'b'"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_refuses_a_nested_field_the_mapping_does_not_name() {
+        let (physical, logical) = struct_column_mapping();
+        let source = DataType::Struct(Fields::from(vec![
+            Field::new("col-1", DataType::Int32, true),
+            Field::new("col-9", DataType::Int32, true),
+        ]));
+
+        let err =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect_err("an unmapped nested field must not be paired positionally");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'col-9'") && message.contains("column 's'"),
+            "the refusal must name the unmapped field and its column: {message}"
+        );
+        assert!(
+            message.contains("s3://bucket/table/"),
+            "the refusal must name the table: {message}"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_refuses_two_nested_fields_of_the_same_name() {
+        let (physical, logical) = struct_column_mapping();
+        let source = DataType::Struct(Fields::from(vec![
+            Field::new("col-1", DataType::Int32, true),
+            Field::new("col-1", DataType::Int32, true),
+        ]));
+
+        let err =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect_err("two fields claiming one logical name must be refused");
+
+        assert!(
+            err.to_string().contains("two nested fields named 'col-1'"),
+            "the refusal must say which name is duplicated: {err}"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_refuses_a_struct_whose_field_count_disagrees() {
+        let (physical, logical) = struct_column_mapping();
+        let source = DataType::Struct(Fields::from(vec![Field::new(
+            "col-1",
+            DataType::Int32,
+            true,
+        )]));
+
+        let err =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect_err("a struct the mapping does not describe must be refused");
+
+        assert!(
+            err.to_string().contains("1 field(s)") && err.to_string().contains("names 2"),
+            "the refusal must give both counts: {err}"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_reorders_inside_a_list() {
+        let (physical_item, logical_item) = struct_column_mapping();
+        let (source_item, _) = reordered_source();
+
+        let source = DataType::List(Arc::new(Field::new("item", source_item, true)));
+        let physical = DataType::List(Arc::new(Field::new("item", physical_item, true)));
+        let logical = DataType::List(Arc::new(Field::new("item", logical_item, true)));
+
+        let target =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect("a reorder under a list should be resolved");
+
+        let expected = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("b", DataType::Int32, true),
+                Field::new("a", DataType::Int32, true),
+            ])),
+            true,
+        )));
+        assert_eq!(
+            target, expected,
+            "a struct nested under a list must be reordered too — the relabel pairs positionally \
+             at every level, not just the top"
+        );
+    }
+
+    #[test]
+    fn column_mapping_target_reorders_inside_a_map_value() {
+        let (physical_value, logical_value) = struct_column_mapping();
+        let (source_value, _) = reordered_source();
+
+        let entries = |value: DataType| {
+            Arc::new(Field::new_struct(
+                "key_value",
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", value, true)),
+                ],
+                false,
+            ))
+        };
+        let source = DataType::Map(entries(source_value), false);
+        let physical = DataType::Map(entries(physical_value), false);
+        let logical = DataType::Map(entries(logical_value), false);
+
+        let target =
+            logical_target_in_source_order(&source, &physical, &logical, &test_table_url(), "s")
+                .expect("a reorder under a map value should be resolved");
+
+        let expected = DataType::Map(
+            entries(DataType::Struct(Fields::from(vec![
+                Field::new("b", DataType::Int32, true),
+                Field::new("a", DataType::Int32, true),
+            ]))),
+            false,
+        );
+        assert_eq!(
+            target, expected,
+            "a struct nested under a map value must be reordered too"
+        );
+    }
 
     #[test]
     #[expect(clippy::similar_names)]
