@@ -170,11 +170,23 @@ jobs:
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        # 65 minutes is the slowest this leg has taken across the last ten successful
-        # `merge_group` runs (44-65), so this is that worst case with room to spare. The
-        # spread is wide on a contended pool, and a bound tight enough to fail a
-        # legitimate build would be worse than the slow build it replaced.
-        timeout-minutes: 90
+        # 65 minutes was the slowest this leg had taken across ten successful `merge_group`
+        # runs when the bound was set; on 2026-08-28 that worst case moved. Four consecutive
+        # `merge_group` runs hit 90 minutes with only the last few crates left, on four
+        # different runners, each restoring the same rust-cache entry (full match) with the
+        # disk preflight reporting 40 TiB free and no compile error anywhere in the log.
+        # The same PR had built in 39 minutes ninety minutes earlier, on a batch carrying
+        # strictly more code, so the slowdown is not the diff: measured phase by phase the
+        # work ran ~2.5x slower throughout (cache restore 3m14s -> 5m19s, the `runtime`
+        # crate ~21m -> ~48m), which is what a contended pool looks like.
+        #
+        # A legitimate contended build therefore needs ~100 minutes, and firing at 90 costs
+        # the queue more than waiting does: it discards a nearly finished compile, dequeues
+        # the PR, and makes the queue re-run the whole batch chain, adding load to the pool
+        # that caused the slowdown in the first place. 150 keeps roughly the margin over
+        # worst-observed that the macOS leg below uses, and stays clear of the job's 200 so
+        # the `always()` diagnostics after a genuine wedge still run.
+        timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
