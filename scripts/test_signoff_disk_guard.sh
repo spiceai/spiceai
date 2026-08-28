@@ -10,11 +10,12 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
-# `failure_kind` names two further causes with the same consequence — a run that
-# was signalled and so judged nothing at all, and a branch whose Makefile has no
-# rule for a target the gate invokes, so nothing was compiled — so their cases
-# live here too, alongside `describe_check_failure`, which turns any of them into
-# what the run publishes. The make-target preflight is here for the same reason
+# `failure_kind` names three further causes with the same consequence — a run that
+# was signalled and so judged nothing at all, a branch whose Makefile has no rule
+# for a target the gate invokes, so nothing was compiled, and a test binary the
+# runner's loader will not execute, so nothing was run — so their cases live here
+# too, alongside `describe_check_failure`, which turns any of them into what the
+# run publishes. The make-target preflight is here for the same reason
 # the disk one is: it decides whether a run gets to start, and getting it wrong
 # either way is the bug.
 #
@@ -369,6 +370,9 @@ assert_recorder() {
   # verdicts. Defaulting this to "no" means the existing disk cases now also
   # prove the cache signature does not cross-fire on them.
   local want_cache_marked="${6:-no}"
+  # ...and the same for the unloadable-artifact signature, which the disk and
+  # cache cases above must not trip either.
+  local want_artifact_marked="${7:-no}"
   tests_run=$((tests_run + 1))
 
   local fake_make="$stub_dir/make"
@@ -383,6 +387,7 @@ assert_recorder() {
       if run_make_step some-target; then step_rc=0; else step_rc=$?; fi
       echo "VERDICT=${SIGNOFF_DISK_HIT:+yes}"
       echo "CACHEHIT=${SIGNOFF_CACHE_HIT:+yes}"
+      echo "ARTIFACTHIT=${SIGNOFF_ARTIFACT_HIT:+yes}"
       exit "$step_rc"' _ "$subject" 2>&1)"
   rc=$?
 
@@ -419,6 +424,19 @@ assert_recorder() {
   fi
   if [[ "$cache_marked" != "$want_cache_marked" ]]; then
     fail_test "$name: expected cache_marked=${want_cache_marked}, got ${cache_marked} (output: '${output}')"
+    rm -f "$fake_make"
+    return
+  fi
+
+  local artifact_marked="no"
+  [[ "$output" == *"ARTIFACTHIT=yes"* ]] && artifact_marked="yes"
+  if [[ "$output" != *"ARTIFACTHIT="* ]]; then
+    fail_test "$name: the step never reported an artifact verdict — output: '${output}'"
+    rm -f "$fake_make"
+    return
+  fi
+  if [[ "$artifact_marked" != "$want_artifact_marked" ]]; then
+    fail_test "$name: expected artifact_marked=${want_artifact_marked}, got ${artifact_marked} (output: '${output}')"
     rm -f "$fake_make"
     return
   fi
@@ -496,6 +514,49 @@ assert_recorder "reports disk, not cache, when the volume filled and took sccach
    echo "ld: write() failed, errno=28 (No space left on device)"
    exit 101' \
   101 yes "errno=28" no
+
+# Verbatim from run 32858051094, where a test binary on the shared volume was not
+# a loadable Mach-O and the run reported "Sign-off checks failed" about a branch
+# that never touched the crate. `nextest` fails while *listing*, so no test ran.
+assert_recorder "records a test binary the loader will not execute" \
+  'echo "error: creating test list failed"
+   echo "Caused by:"
+   echo "  for \`runtime-checkpoint-api\`, running command \`target/debug/deps/runtime_checkpoint_api-abc --list --format terse\` failed to execute"
+   echo "Caused by:"
+   echo "  Malformed Mach-o file (os error 88)"
+   exit 104' \
+  104 no "Malformed Mach-o" no yes
+# The Linux runners answer the same condition with ENOEXEC rather than EBADMACHO.
+assert_recorder "records the ELF spelling of the same condition" \
+  'echo "error: creating test list failed"
+   echo "  Exec format error (os error 8)"
+   exit 104' \
+  104 no "" no yes
+# Both halves are required, and this is the direction that costs the most if it
+# is wrong: this repo's own suites assert on error strings, so a loader message
+# quoted by a failing test must stay a verdict about the branch.
+assert_recorder "leaves a failure unmarked when the loader wording is only quoted" \
+  'echo "assertion failed: expected Exec format error (os error 8)"
+   echo "error[E0308]: mismatched types"
+   exit 101' \
+  101 no "E0308" no no
+# ...and the other half alone is an ordinary nextest failure, not an artifact one:
+# listing can fail for reasons that are about the branch, e.g. a test binary that
+# panics in a constructor before it can answer --list.
+assert_recorder "leaves a listing failure unmarked without a loader error" \
+  'echo "error: creating test list failed"
+   echo "  process panicked at crates/runtime/src/lib.rs:1:1"
+   exit 104' \
+  104 no "creating test list failed" no no
+# Disk wins over an unloadable artifact, for the same reason it wins over the
+# cache: a volume that filled mid-link is what truncated the binary, and
+# reclaiming space is the remedy that fixes both.
+assert_recorder "reports disk, not the artifact, when the volume filled first" \
+  'echo "ld: write() failed, errno=28 (No space left on device)"
+   echo "error: creating test list failed"
+   echo "  Malformed Mach-o file (os error 88)"
+   exit 104' \
+  104 yes "errno=28" no no
 
 # Stickiness: a step that merely mentions running out of disk and then succeeds
 # must not leave the verdict blaming the volume for a later, genuine failure.
@@ -671,6 +732,26 @@ assert_failure_kind "calls a failure on a roomy volume a check failure" 101 "che
   STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "calls a failure with unknown free space a check failure" 101 "checks" \
   STUB_DF_RC=1
+
+# The unloadable-artifact kind: the watch was armed, the artifact signature went
+# past, and neither of the two upstream causes did. Distinct from "checks" for
+# the same reason as the kinds above — nothing about the branch was judged.
+assert_failure_kind "calls an unloadable test binary its own kind, not a check failure" 104 "corrupt-artifact" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The two causes that can produce a short artifact outrank naming the symptom,
+# because each carries a different remedy.
+assert_failure_kind "reports disk when the volume filled and the artifact was short" 104 "disk" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "reports cache when the cache was unreachable too" 104 "cache" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and a signalled run still outranks all of them: it reached no verdict at all.
+assert_failure_kind "a signalled run stays signalled, not an unloadable artifact" 143 "signalled" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# An artifact flag inherited from the environment with nothing watching is not a
+# reading anyone took: with the watch disarmed, classification falls back to free
+# space exactly as on a local run.
+assert_failure_kind "ignores an artifact flag when nothing watched the build" 104 "checks" \
+  SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 
 # The cache verdict, same shape as the disk one: authoritative when the watch was
 # armed, and worth nothing without it.
@@ -851,6 +932,18 @@ assert_describe "still publishes the unreachable-cache verdict" 101 \
   "Compiler cache unreachable after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "sccache could not reach its storage" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# An unloadable test binary has to say so in the commit status itself: that
+# description is all most readers see, and worded as a check failure it is
+# indistinguishable from a test that genuinely failed. It also has to name the
+# remedy, since the reader who needs it is not going to open the log.
+assert_describe "says an unloadable test binary could not complete, not that checks failed" 104 \
+  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "the checks did not complete" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "tells the author to re-dispatch rather than to read the log" 104 \
+  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "re-dispatch" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
   "sign-off checks failed" STUB_FREE_KB="$(gib_to_kb 200)"

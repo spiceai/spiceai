@@ -16,6 +16,10 @@ tokio-stream.workspace = true
 snafu.workspace = true
 futures.workspace = true
 bytes.workspace = true
+token_provider = { path = "../token_provider" }
+
+[dev-dependencies]
+secrecy.workspace = true
 
 [lints]
 workspace = true

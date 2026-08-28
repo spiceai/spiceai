@@ -730,7 +730,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)'
+RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches)\.py$|^docs/dev/fork_patches\.md$|^Makefile$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
@@ -854,6 +854,21 @@ readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 # an optional `e` while reading as though it were deliberate.
 readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed|sccache: error: Timed out waiting for server startup'
 
+# The loader's refusal to execute a test binary, in the two spellings the pool's
+# runners produce: EBADMACHO (88) on the macOS boxes, ENOEXEC on the Linux ones.
+# Both mean the file `nextest` was handed is not a loadable executable — a
+# truncated or clobbered artifact on the shared `target/` volume, which is a
+# statement about the runner and not about the branch.
+readonly CORRUPT_ARTIFACT_PATTERN='Malformed Mach-o file|Exec format error'
+
+# The line that says the loader error above came from `nextest` trying to run a
+# build artifact, rather than from a test asserting on that wording. Both are
+# required, because this repo's own suites do assert error strings, and excusing
+# a genuine test failure as infrastructure is the more expensive mistake of the
+# two. `nextest` prints this when a binary fails to execute during enumeration,
+# which is where a corrupt artifact is met first (#13518).
+readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
+
 # Set to 1 on remote runs, where run_make_step watches build output for the
 # out-of-disk and unusable-cache signatures. Separates "watched, and it was
 # neither" from "nothing watched at all", which failure_kind answers differently.
@@ -880,6 +895,12 @@ SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
 # test can set up a classification without running a build.
 SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 
+# Set to 1 by run_make_step when the step it ran could not execute a test binary
+# it built. Same mechanism and the same reason for being a variable rather than
+# a file as the two above, and likewise seeded from the environment so a test
+# can set up a classification without running a build.
+SIGNOFF_ARTIFACT_HIT="${SIGNOFF_ARTIFACT_HIT:-}"
+
 # The statuses the watcher exits with to report each signature. Deliberately
 # not 1 or 2: awk uses those for its own errors, and a watcher that itself died
 # must not be read as a volume that filled. Reserving distinct statuses is also
@@ -887,6 +908,7 @@ SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 # verdict" (anything else), which it must not conflate — see run_make_step.
 readonly DISK_WATCH_HIT_STATUS=3
 readonly CACHE_WATCH_HIT_STATUS=4
+readonly ARTIFACT_WATCH_HIT_STATUS=5
 
 # The watcher itself, held in one place so the probe below runs exactly the
 # program that will read the build output — a probe of anything else predicts
@@ -904,10 +926,13 @@ readonly CACHE_WATCH_HIT_STATUS=4
 readonly DISK_WATCH_PROGRAM='
     $0 ~ pat { hit = 1 }
     $0 ~ cache_pat { cache_hit = 1 }
+    $0 ~ artifact_pat { artifact_hit = 1 }
+    $0 ~ list_pat { list_failed = 1 }
     { print; fflush() }
     END {
       if (hit) exit (hit_status + 0)
       if (cache_hit) exit (cache_status + 0)
+      if (artifact_hit && list_failed) exit (artifact_status + 0)
     }
   '
 
@@ -918,6 +943,8 @@ readonly DISK_WATCH_PROGRAM='
 disk_watch_probe() {
   awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
     -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+    -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
+    -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
     "$DISK_WATCH_PROGRAM" </dev/null >/dev/null 2>&1
 }
 
@@ -946,6 +973,7 @@ run_make_step() {
   # steps later.
   SIGNOFF_DISK_HIT=""
   SIGNOFF_CACHE_HIT=""
+  SIGNOFF_ARTIFACT_HIT=""
   # Ask whether the watcher runs before make writes a byte to it, because the
   # only other place to find out is downstream of make — where a watcher that
   # exits at once closes the pipe under a still-writing make, make dies of
@@ -963,6 +991,8 @@ run_make_step() {
   make "$@" 2>&1 | awk \
       -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
       -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+      -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
+      -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
       "$DISK_WATCH_PROGRAM"
   # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
   # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
@@ -974,6 +1004,8 @@ run_make_step() {
     SIGNOFF_DISK_HIT=1
   elif [[ "$watch_status" -eq "$CACHE_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_CACHE_HIT=1
+  elif [[ "$watch_status" -eq "$ARTIFACT_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_ARTIFACT_HIT=1
   elif [[ "$watch_status" -ne 0 ]]; then
     # The watcher started, so the probe cleared it, and then died part-way
     # through: killed for memory, or a signal that reached the whole group. Its
@@ -1019,6 +1051,12 @@ build_hit_disk_full() {
 # mislabelling that matters most to avoid.
 build_hit_cache_unusable() {
   [[ -n "$SIGNOFF_CACHE_HIT" ]]
+}
+
+# True when the step that failed could not execute a test binary it built. Read
+# in the same shell that ran the step, for the same reason as its two siblings.
+build_hit_corrupt_artifact() {
+  [[ -n "$SIGNOFF_ARTIFACT_HIT" ]]
 }
 
 # Free space in GiB on the volume holding "$1" (default: the working tree).
@@ -1144,6 +1182,14 @@ failure_kind() {
       echo "disk"
     elif build_hit_cache_unusable; then
       echo "cache"
+    elif build_hit_corrupt_artifact; then
+      # Last of the three, because the other two are upstream of this one: a
+      # volume that fills mid-link and a cache that cannot be reached both
+      # produce short or missing artifacts, and naming the cause is what tells
+      # the reader which remedy applies. Reached only when neither of those
+      # signatures went past, i.e. the artifact is unloadable for a reason this
+      # run cannot see.
+      echo "corrupt-artifact"
     else
       echo "checks"
     fi
@@ -1204,6 +1250,22 @@ describe_check_failure() {
       SIGNOFF_FAILURE_STATUS_DESC="Compiler cache unreachable after ${elapsed}s — checks did not complete, re-dispatch (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`sccache\` could not reach its storage endpoint on this runner, so every \`rustc\` invocation failed before compiling anything and **the checks did not complete**. Nothing here is a statement about the branch. Re-dispatch once the runner's cache endpoint is answering; if it stays down, the pool's \`sccache\` service is what needs attention (see \`.github/actions/setup-sccache\`)."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: sccache could not reach its storage (the checks did not complete)"
+      ;;
+    corrupt-artifact)
+      # Neither a verdict on the code nor a threshold anyone can act on: the
+      # runner handed `nextest` a file the loader will not execute, so
+      # enumeration failed and no test ran. Worded like the other kinds that
+      # reached no verdict, because the alternative — the generic "checks
+      # failed" — sends the author to look for a defect in a diff nothing
+      # judged (#13518, and #12813 before it).
+      #
+      # Hedged rather than asserted: this cannot tell whether the crate whose
+      # binary would not load is one the branch touches. A recurrence on this
+      # branch alone, or one naming a crate whose build script it changes, is
+      # worth suspecting the diff for.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a test binary on the runner would not load; re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`nextest\` could not execute a test binary while listing tests, because the runner's copy is not a loadable executable, so **the checks did not complete**. That is a truncated or clobbered artifact on the shared \`target/\` volume rather than a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build script this branch changes, the diff is worth suspecting."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a test binary on the runner would not load, so nextest never ran the suite (the checks did not complete) — re-dispatch"
       ;;
     missing-target)
       # Neither of the two readings above: the runner is fine and the code was
