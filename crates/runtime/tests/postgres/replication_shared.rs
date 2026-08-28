@@ -1697,6 +1697,19 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
          every row committed below that position is missing from it for good. A recorded position \
          means those changes will never be resent — it does not mean the rows are here"
     );
+    // Being loaded does not say *this* arm decided it. Every other rebuild cause
+    // loads too, so a fixture that drifted into an `acknowledged_past` or
+    // `retention_lost` shape — the slot advancing or trimming under the pause
+    // above — would keep this case green with the arm it exists for removed.
+    // `RebuildCause::label` is documented as the stable identifier, so pinning it
+    // here is not a wording dependency.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("empty_with_usable_position"),
+        "the emptied acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}, and only \"empty_with_usable_position\" is the recreate shape — \
+         another cause means the fixture stopped reaching the decision under test"
+    );
     envelope.commit().await?;
 
     drop(rejoined);
