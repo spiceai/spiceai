@@ -1066,8 +1066,16 @@ impl Runtime {
             // case here would leave the dataset stuck in `Refreshing`.
             let table_name = table.to_string();
             tokio::spawn(async move {
-                if let Some(n) = notifier {
-                    n.notified().await;
+                if let Some(completion) = notifier
+                    && completion.wait().await.is_abandoned()
+                {
+                    // The table was removed before the refresh we triggered
+                    // landed. Acking readiness here would tell the scheduler a
+                    // partition set is loaded that never was.
+                    tracing::debug!(
+                        "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
+                    );
+                    return;
                 }
                 // Statistics flow via the periodic ExecutorStatistics reporter, not
                 // this readiness ack.

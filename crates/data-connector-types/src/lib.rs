@@ -121,6 +121,15 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "Failed to set up durable write-back delivery for the {connector_component} ({dataconnector}). {source}"
+    ))]
+    UnableToGetWriteBackDeliverer {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to setup the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetCatalogProvider {
         dataconnector: String,

@@ -117,6 +117,7 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     }
 }
 

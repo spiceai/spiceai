@@ -80,6 +80,7 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                 Box::new(|| {
                     Box::pin(async {
                         create::create_google("gemini-2.0-flash")
+                            .await
                             .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
                     })
                 }),

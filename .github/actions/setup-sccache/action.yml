@@ -33,10 +33,46 @@ runs:
         SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
       run: |
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
-        echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-        echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
+
+        # Job-private config + daemon. Self-hosted Macs run several GitHub
+        # runners as the same uid, so ~/.config/sccache/config and the default
+        # daemon port 4226 are shared. A sibling job's spiceio auto-increments
+        # onto the next port, overwrites that file, and this job's sccache then
+        # probes a Connection-refused endpoint (see run 32895059022).
+        #
+        # A hashed TCP port is not job-unique (20k values) and sccache v0.9.1
+        # attaches to whatever daemon already holds that port — `--zero-stats`
+        # then succeeds against the stale job's config. Unix gets a socket
+        # under RUNNER_TEMP instead; Windows (no UDS) gets an ephemeral TCP
+        # port. Both use a finite idle timeout: a unique listen address plus
+        # IDLE_TIMEOUT=0 would leak one immortal daemon per job.
+        conf_dir="${RUNNER_TEMP}/sccache"
+        mkdir -p "$conf_dir"
+        echo "SCCACHE_CONF=${conf_dir}/config" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=7200" >> "$GITHUB_ENV"
+
+        if [[ "${RUNNER_OS}" != "Windows" ]]; then
+          sock="${conf_dir}/sccache.sock"
+          rm -f "$sock"
+          echo "SCCACHE_SERVER_UDS=${sock}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_UDS=${sock}"
+        else
+          port=""
+          if command -v python3 >/dev/null 2>&1; then
+            port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          elif command -v python >/dev/null 2>&1; then
+            port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          fi
+          if [[ -z "${port}" ]]; then
+            ident="${GITHUB_RUN_ID:-0}:${GITHUB_JOB:-job}:${GITHUB_RUN_ATTEMPT:-1}:${RUNNER_NAME:-}"
+            hash=$(printf '%s' "$ident" | cksum | awk '{print $1}')
+            port=$((42000 + hash % 20000))
+          fi
+          echo "SCCACHE_SERVER_PORT=${port}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_PORT=${port}"
+        fi
 
         # Credentials have to be in the environment from here on -- before the cache config
         # is written and before the pre-flight signs its probe request -- and not in
@@ -78,9 +114,9 @@ runs:
         tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
+        : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
+        mkdir -p "$(dirname "${SCCACHE_CONF}")"
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
@@ -112,9 +148,9 @@ runs:
           exit 0
         fi
 
-        rm -rf ~/.config/sccache/config
-        mkdir -p ~/.config/sccache
-        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > ~/.config/sccache/config
+        : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
+        mkdir -p "$(dirname "${SCCACHE_CONF}")"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
@@ -138,11 +174,16 @@ runs:
         $sccacheBinDir = Split-Path $sccacheExePath -Parent
         echo "$sccacheBinDir" >> $env:GITHUB_PATH
 
-        # Configure sccache
-        $configDir = "$env:APPDATA\Mozilla\sccache"
+        # Configure sccache (job-private path from SCCACHE_CONF, not the
+        # per-user APPDATA file — several self-hosted runners can share one uid).
+        $configPath = $env:SCCACHE_CONF
+        if ([string]::IsNullOrEmpty($configPath)) {
+          $configPath = Join-Path $env:RUNNER_TEMP "sccache\config"
+        }
+        $configDir = Split-Path $configPath -Parent
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
         $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
-        $config | Out-File -FilePath "$configDir\config" -Encoding utf8
+        $config | Out-File -FilePath $configPath -Encoding utf8
 
     - name: Confirm the compiler cache answers before wrapping rustc
       if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
