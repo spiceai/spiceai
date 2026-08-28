@@ -686,19 +686,6 @@ pub trait MetadataCatalog: Send + Sync {
         file_path: &str,
     ) -> CatalogResult<Option<SnapshotFileStatistics>>;
 
-    /// Drop the per-file statistics rows for one specific snapshot.
-    ///
-    /// Runs `DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?
-    /// AND snapshot_id = ?`. The stats cache sits alongside the manifest; when a
-    /// single snapshot leaves the live set (for example when time-based
-    /// retention empties a protected snapshot) its stats rows must go too, or
-    /// they leak after the physical files are gone.
-    async fn clear_snapshot_file_statistics_for(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<()>;
-
     /// Drop per-file statistics rows for snapshots other than the current one.
     async fn clear_snapshot_file_statistics_except(
         &self,
@@ -740,13 +727,19 @@ pub trait MetadataCatalog: Send + Sync {
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
-    /// Drop the manifest rows for one specific snapshot (snapshot GC).
+    /// Drop all non-authoritative cached metadata rows for one snapshot that has
+    /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
+    /// `cayenne_snapshot_file_statistics` stats-cache rows.
     ///
-    /// Runs `DELETE FROM cayenne_snapshot_file WHERE table_id = ? AND
-    /// snapshot_id = ?`. Used when a single snapshot leaves the live set — for
-    /// example when time-based retention empties a protected snapshot — so its
-    /// best-effort manifest rows do not leak after the physical files are gone.
-    async fn clear_snapshot_files_for(
+    /// Scans read a snapshot's file set from the directory listing, not from
+    /// these rows, so both are safe to drop the moment the snapshot leaves the
+    /// roster (for example when time-based retention empties a protected
+    /// snapshot). Coupling the two deletions in one method keeps the sibling
+    /// caches from drifting: a caller can never delete the manifest rows and
+    /// forget the stats rows, or the reverse. Physical `.vortex` files are
+    /// reclaimed separately (reader-scoped). Implementations should run both
+    /// deletes in a single backend transaction.
+    async fn clear_snapshot_cached_metadata(
         &self,
         table_id: &str,
         snapshot_id: &str,

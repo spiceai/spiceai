@@ -514,21 +514,11 @@ impl FileBasedDeletionSink {
             //    already gone.
             if let Err(e) = self
                 .catalog
-                .clear_snapshot_files_for(&self.table_id, snapshot_id)
+                .clear_snapshot_cached_metadata(&self.table_id, snapshot_id)
                 .await
             {
                 tracing::warn!(
-                    "Failed to clear snapshot manifest rows for snapshot {snapshot_id} in table {}: {e}",
-                    self.table_name
-                );
-            }
-            if let Err(e) = self
-                .catalog
-                .clear_snapshot_file_statistics_for(&self.table_id, snapshot_id)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to clear snapshot file statistics for snapshot {snapshot_id} in table {}: {e}",
+                    "Failed to clear cached metadata for snapshot {snapshot_id} in table {}: {e}",
                     self.table_name
                 );
             }

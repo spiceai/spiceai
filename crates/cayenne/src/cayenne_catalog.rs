@@ -3667,24 +3667,31 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(results.into_iter().next())
     }
 
-    async fn clear_snapshot_file_statistics_for(
+    async fn clear_snapshot_cached_metadata(
         &self,
         table_id: &str,
         snapshot_id: &str,
     ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1 AND snapshot_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Text(snapshot_id.to_string()),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to clear snapshot file statistics for {snapshot_id}"),
-                source: Box::new(e),
-            })
+        // Drop both sibling caches for the departed snapshot in ONE transaction
+        // so they can never drift apart (one deleted, the other left to leak).
+        let txn = self.begin_transaction().await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.commit().await
     }
 
     async fn clear_snapshot_file_statistics_except(
@@ -3840,26 +3847,6 @@ impl MetadataCatalog for CayenneCatalog {
                 },
             )
             .await
-    }
-
-    async fn clear_snapshot_files_for(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Text(snapshot_id.to_string()),
-                ],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to clear snapshot files for {snapshot_id}"),
-                source: Box::new(e),
-            })
     }
 
     async fn clear_snapshot_files_except(
@@ -8347,7 +8334,7 @@ mod tests {
     /// files nothing else reconciles them, so leaving them behind leaks
     /// metastore rows. A snapshot outside the emptied set stays untouched.
     #[tokio::test]
-    async fn test_clear_snapshot_files_for_deletes_only_target_manifest_rows() {
+    async fn test_clear_snapshot_cached_metadata_deletes_both_tables_for_target() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_retention_emptied_manifest_gc_{}.db",
@@ -8413,13 +8400,9 @@ mod tests {
         }
 
         catalog
-            .clear_snapshot_files_for(&table_id, &emptied)
+            .clear_snapshot_cached_metadata(&table_id, &emptied)
             .await
-            .expect("clear emptied snapshot manifest rows");
-        catalog
-            .clear_snapshot_file_statistics_for(&table_id, &emptied)
-            .await
-            .expect("clear emptied snapshot stats rows");
+            .expect("clear emptied snapshot cached metadata");
 
         // The emptied snapshot's manifest rows are gone (the leak this fix closes).
         assert!(
