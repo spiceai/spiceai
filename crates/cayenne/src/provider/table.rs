@@ -9819,6 +9819,9 @@ impl CayenneTableProvider {
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(),
+            // Main is the only source here, which is the case where a re-insert marker
+            // does mean the row is live.
+            InsertRecordHandling::Apply,
             Arc::clone(self.context.runtime_env()),
             None,
             Arc::clone(&self.seq_allocator),
@@ -14003,6 +14006,9 @@ impl CayenneTableProvider {
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
                 Vec::new(),
+                // Persist-only path: it writes position vectors and never scans. Main is
+                // the only source regardless, so `Apply` states the rule correctly.
+                InsertRecordHandling::Apply,
                 Arc::clone(self.context.runtime_env()),
                 None,
                 Arc::clone(&self.seq_allocator),
@@ -26019,6 +26025,7 @@ impl CayenneTableProvider {
                 checkpoint_start,
             );
             self.fire_slot_advancer(flushed_epoch).await;
+            self.arm_retention_after_checkpoint();
             return Ok(0);
         }
 
@@ -26313,18 +26320,31 @@ impl CayenneTableProvider {
         // the runtime it may advance the source slot to cover this epoch.
         self.fire_slot_advancer(flushed_epoch).await;
 
-        // Arm retention over what this checkpoint just made durable. `cdc_durability`
-        // defaults to `memory` on the CDC profile, and those writes return from
-        // `write_cdc_in_memory` before reaching any durable publish path that arms
-        // retention — so without this a `retention_sql` on the common CDC configuration
-        // never runs at all. Rows still resident in RAM stay out of the deletion sink's
-        // reach, so retention applies to each epoch as it lands: one checkpoint behind,
-        // which is the same eventual guarantee the append path gives.
+        self.arm_retention_after_checkpoint();
+
+        Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
+    }
+
+    /// Arm retention over what a completed mem-tier checkpoint just made durable.
+    ///
+    /// EVERY successful checkpoint exit must call this, including the tombstone-only one
+    /// that publishes no data: a retention pass that returned
+    /// [`RetentionPass::DeferredUntilCheckpoint`] consumed its request without re-arming,
+    /// on the promise that the checkpoint clearing the seal shadow would re-arm it. An
+    /// exit that clears the shadow and returns without arming breaks that promise, and
+    /// because nothing else re-queues the request, a table that then goes idle keeps
+    /// serving durable rows its `retention_sql` should have deleted — for as long as it
+    /// stays idle.
+    ///
+    /// Arming is also why `cdc_durability: memory` gets retention at all: those writes
+    /// return from `write_cdc_in_memory` before reaching any durable publish path.
+    /// Rows still resident in RAM stay out of the deletion sink's reach, so retention
+    /// applies to each epoch as it lands — one checkpoint behind, the same eventual
+    /// guarantee the append path gives.
+    fn arm_retention_after_checkpoint(&self) {
         if self.has_retention_delete_filters() {
             self.schedule_post_write_maintenance(None, false, true, 0);
         }
-
-        Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
 
     /// SEAL the ACTIVE ingestion piece: durably shadow the un-sealed RAM delta
@@ -30870,6 +30890,20 @@ impl CayenneTableProvider {
                 table,
             })
             .collect();
+        // Main's own re-insert handling is decided HERE, on the same condition `scan`
+        // uses (`protected_snapshot_plans.is_empty()`), and read before the cold tier is
+        // appended below — cold files are a separate union branch there and do not enter
+        // that condition. With no protected snapshot, main holds the only copy of a key
+        // and a re-insert marker means the row is live. With one present, the live
+        // replacement lives in the protected snapshot and main holds only the version it
+        // superseded, so the marker must not make that version look live: a predicate
+        // matching only the retired value would tombstone the KEY and take the
+        // replacement with it.
+        let main_insert_records = if snapshot_tables.is_empty() {
+            InsertRecordHandling::Apply
+        } else {
+            InsertRecordHandling::Ignore
+        };
         // Also scan the cold tier so a key-delete of a cold-resident row is
         // found and tombstoned (the cross-tier scan then hides it via the shared
         // key-delete filter). Cold uses key-based deletes, so this is only ever
@@ -30902,6 +30936,7 @@ impl CayenneTableProvider {
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             snapshot_tables,
+            main_insert_records,
             Arc::clone(self.context.runtime_env()),
             write_lock,
             Arc::clone(&self.seq_allocator),
@@ -31003,6 +31038,10 @@ impl CayenneTableProvider {
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // no protected snapshots for PositionBased
+            // Main is the only source, so a re-insert marker on it does mean the row is
+            // live. Position-based deletes address a row by (file, position) and never
+            // consult this, but the value must still state the rule it is standing on.
+            InsertRecordHandling::Apply,
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
@@ -47333,6 +47372,92 @@ mod tests {
         );
     }
 
+    /// The same resurrection hazard one tier up: the superseded version sitting in the
+    /// MAIN snapshot rather than a protected one.
+    ///
+    /// `scan` picks main's insert-record handling on whether any protected snapshot
+    /// exists — `Apply` when none does (main holds the only copy of a key, so a re-insert
+    /// marker means that row is live), `Ignore` when one does (the live replacement is
+    /// THERE, and main holds only the version it superseded). A sink that fixes main at
+    /// `Apply` disagrees with the read path in exactly the second case: `value < 50`
+    /// matches the retired `(7, 10)` in main, writes a key tombstone for 7, and that
+    /// tombstone also hides the live `(7, 60)` that never matched the predicate.
+    ///
+    /// Compaction folds the first write into the current snapshot and the upsert then
+    /// publishes its own protected snapshot — the layout both preconditions assert,
+    /// because either one missing turns this back into the protected-snapshot case that
+    /// `predicate_delete_must_not_hide_a_live_row_superseding_a_matching_version` covers.
+    #[tokio::test]
+    async fn predicate_delete_must_not_hide_a_live_row_superseding_a_main_snapshot_version() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_main_supersede_visibility",
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                // Force each write to its own Vortex file rather than the inline corpus.
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[10])).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        // Fold that write into the CURRENT snapshot: this is what puts the version the
+        // predicate matches behind the MAIN listing table instead of a protected one.
+        let _folded = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction pass ran");
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: (7, 10) must live in the current snapshot, not a protected one, \
+             or this says nothing about how main is scanned"
+        );
+
+        insert_batch(&provider, id_value_batch(schema, &[7], &[60])).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        assert_eq!(
+            provider.protected_snapshots.load().len(),
+            1,
+            "precondition: the upsert must publish its own protected snapshot — with none, \
+             `Apply` on main is correct and the mismatch under test cannot arise"
+        );
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60)],
+            "precondition: the upsert superseded the old version, so only (7, 60) is live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60)],
+            "the live row does not match `value < 50`; a key tombstone written from the \
+             superseded (7, 10) in the MAIN snapshot would hide it"
+        );
+    }
+
     /// `cdc_durability` defaults to `memory` on the CDC profile, and those writes return
     /// from `write_cdc_in_memory` before reaching any durable publish path — so nothing
     /// armed retention for them and a configured `retention_sql` never ran at all. The
@@ -47424,6 +47549,152 @@ mod tests {
             vec![(3, 60), (4, 70)],
             "retention must reach rows that arrived through the default \
              cdc_durability: memory path once their epoch is durable"
+        );
+    }
+
+    /// Every successful checkpoint exit must arm retention, the tombstone-only one
+    /// included.
+    ///
+    /// [`RetentionPass::DeferredUntilCheckpoint`] consumes its request WITHOUT re-arming,
+    /// on the promise that the checkpoint which clears the seal shadow arms it again. The
+    /// tombstone-only exit publishes no data and returns early, so if it skips the arming
+    /// the request is simply lost: nothing else re-queues it, and a table that then goes
+    /// idle keeps serving durable rows its `retention_sql` should have deleted, for as
+    /// long as it stays idle.
+    ///
+    /// Asserts the EFFECT rather than the request flag: the flag is consumed by the
+    /// debounced maintenance pass, so a test that races it passes alone and fails under
+    /// load. Retention either ran or is still queued — both leave the expired row gone,
+    /// while a checkpoint that armed nothing leaves it queryable.
+    ///
+    /// The expired row is seeded through a handle opened WITHOUT retention so that
+    /// making it durable arms nothing; the reopened handle's only arming source is the
+    /// checkpoint under test.
+    #[tokio::test]
+    async fn a_tombstone_only_checkpoint_arms_the_retention_it_owes() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let table_name = "tombstone_only_checkpoint_retention".to_string();
+        // Opened WITHOUT retention: making the seed rows durable must not arm anything,
+        // or the drain below would delete the expired row no matter what the checkpoint
+        // did.
+        let seeder = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(CreateTableOptions {
+                table_name: table_name.clone(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    cdc_durability: crate::metadata::CdcDurability::Memory,
+                    deletion_mode: crate::metadata::DeletionMode::Key,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("table created");
+        seeder.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let _seeded = seeder
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(
+                    Arc::clone(&schema),
+                    &[1, 2, 3],
+                    // 10 is below the retention floor and must not survive; 60 and 70 are
+                    // above it and must.
+                    &[10, 60, 70],
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("in-memory CDC append");
+        let _durable = seeder
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint makes the seed rows durable");
+        drop(seeder);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            catalog,
+            vec![retention_predicate()],
+            ctx.runtime_env(),
+        )
+        .await
+        .expect("reopen with retention");
+        // In-memory CDC deletes are gated on a slot advancer; without one
+        // `write_cdc_delete_keys_in_memory` declines and the tombstone-only arm is
+        // unreachable.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(1, 10), (2, 60), (3, 70)],
+            "precondition: the expired row must still be durable and visible at reopen, \
+             or the assertion below passes without retention ever running"
+        );
+
+        // Append a row and delete it again before it is ever checkpointed: the mem tier
+        // is then left holding its tombstone and no surviving row, which is the
+        // `batches.is_empty()` checkpoint arm ("every appended row superseded / deleted
+        // in-tier"). A delete of an already-durable key is NOT absorbed in memory, so it
+        // cannot produce this state.
+        let _superseded = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[4], &[90])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("in-memory CDC append of the row to supersede");
+        let absorbed = provider
+            .write_cdc_delete_keys_in_memory(&int64_id_batch(&[4_i64]))
+            .await
+            .expect("in-memory CDC delete")
+            .expect("delete absorbed into the mem tier");
+        assert!(absorbed > 0, "the delete must advance a mem-tier epoch");
+        assert!(
+            !provider.mem_tier.is_empty(),
+            "precondition: the tombstone must be resident, or the checkpoint below is a \
+             no-op and never reaches the arm under test"
+        );
+
+        let flushed = provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("tombstone-only checkpoint");
+        assert_eq!(
+            flushed, 0,
+            "precondition: this must be the tombstone-only arm — a checkpoint that \
+             flushed rows exits through the data-bearing path instead"
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("the retention the checkpoint owes");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(2, 60), (3, 70)],
+            "the tombstone-only checkpoint must arm retention: a pass deferred until a \
+             checkpoint re-arms nowhere else, so skipping it here strands the request \
+             and leaves the expired row queryable for as long as the table is idle"
         );
     }
 

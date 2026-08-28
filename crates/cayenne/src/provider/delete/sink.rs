@@ -443,6 +443,15 @@ pub struct CayenneDeletionSink {
     /// is the base case — the current snapshot and cold-tier files, where every delete
     /// applies.
     additional_scan_tables: Vec<DeleteScanSource>,
+    /// How the main listing table treats an upsert's re-insert marker. Carried from the
+    /// caller rather than fixed here, because it is conditional in exactly the way
+    /// `scan` makes it conditional: with no protected snapshot, main holds the only copy
+    /// of a key and a re-insert marker means the row is live (`Apply`); with a protected
+    /// snapshot present, the replacement lives THERE and main holds only the superseded
+    /// version, which the marker must not resurrect (`Ignore`). Assuming `Apply` lets a
+    /// predicate matching only the retired value tombstone the KEY and take the
+    /// replacement — which never matched the predicate — with it.
+    main_insert_records: InsertRecordHandling,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -481,6 +490,7 @@ impl CayenneDeletionSink {
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         additional_scan_tables: Vec<DeleteScanSource>,
+        main_insert_records: InsertRecordHandling,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -496,6 +506,7 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             additional_scan_tables,
+            main_insert_records,
             runtime_env,
             write_lock,
             seq_allocator,
@@ -1007,7 +1018,7 @@ impl CayenneDeletionSink {
         let listing_table = self.listing_table.load_full();
         let mut all_tables = vec![DeleteScanSource {
             min_delete_seq: None,
-            insert_records: InsertRecordHandling::Apply,
+            insert_records: self.main_insert_records,
             table: Arc::clone(&listing_table),
         }];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
@@ -1258,7 +1269,7 @@ impl DeletionSink for CayenneDeletionSink {
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
         let mut all_tables = vec![DeleteScanSource {
             min_delete_seq: None,
-            insert_records: InsertRecordHandling::Apply,
+            insert_records: self.main_insert_records,
             table: Arc::clone(&listing_table),
         }];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
