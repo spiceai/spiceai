@@ -16046,7 +16046,18 @@ impl CayenneTableProvider {
                         );
                     }
                 }
-                Ok(RetentionPass::Deferred) => match retention_failure_action {
+                Ok(RetentionPass::DeferredUntilCheckpoint) => {
+                    // Deliberately NOT re-armed: a seal shadow stands until the next full
+                    // checkpoint, so re-arming would poll at the debounce interval for
+                    // seconds or longer and run this pass's metastore vacuum and WAL
+                    // checkpoint tail every time. `checkpoint_mem_tier_inner` arms
+                    // retention when it clears the shadow, which is the signal to wait on.
+                    tracing::debug!(
+                        table = self.table_metadata.table_name.as_str(),
+                        "Retention deferred until the next mem-tier checkpoint: a seal shadow is present"
+                    );
+                }
+                Ok(RetentionPass::DeferredTransient) => match retention_failure_action {
                     // The background loop sleeps a debounce between passes, so re-arming
                     // retries once the in-flight write publishes — milliseconds away.
                     RetentionFailureAction::Requeue => {
@@ -21153,8 +21164,9 @@ impl CayenneTableProvider {
             // materialization is done.
             // Deferring costs only latency: the in-flight finalize publishes within
             // milliseconds, and re-arming brings the loop back on the next debounce.
+            let shadow_present = self.mem_tier_shadow_present.load(Ordering::Acquire);
             if self.pending_inline_tombstones.load(Ordering::Acquire) > 0
-                || self.mem_tier_shadow_present.load(Ordering::Acquire)
+                || shadow_present
                 || self.has_inflight_staging_appends()
             {
                 drop(checkpoint_guard);
@@ -21167,7 +21179,11 @@ impl CayenneTableProvider {
                 // with no debounce between iterations, so re-arming from inside the pass
                 // would spin it forever while the flag stayed set. Only the caller knows
                 // whether a retry is a background debounce away or has nowhere to go.
-                return Ok(RetentionPass::Deferred);
+                return Ok(if shadow_present {
+                    RetentionPass::DeferredUntilCheckpoint
+                } else {
+                    RetentionPass::DeferredTransient
+                });
             }
             let materialized = self.checkpoint_inlined_data_if_present_for_delete().await;
             drop(checkpoint_guard);
@@ -21190,13 +21206,19 @@ impl CayenneTableProvider {
         // but without the live view, a key tombstone matched against a superseded version
         // would delete the live row. It needs both or neither.
         //
-        // `Cdc`, not `User`: nothing surfaces a "rows affected" count to a client here,
-        // and the exact-count scan is pure cost on a pass that runs on its own.
+        // `User`, despite no client waiting on a "rows affected" count, because the count
+        // is not cosmetic here: `deleted_count > 0` below gates clearing the PK keyset and
+        // the deletion caches. `Cdc` admits the PK-extraction fast path, whose successful
+        // delete returns the sentinel `0` — so a `retention_sql` shaped like
+        // `DELETE ... WHERE id IN (…)` would delete a key while leaving it present in a
+        // `DoNothing` table's keyset, and the next insert of that key would be dropped as
+        // a duplicate of a row that no longer exists. The exact-count scan costs nothing
+        // for the usual time/value retention predicate, which never had a fast path.
         let sink = self
             .build_deletion_vector_sink(
                 &filters,
                 Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::Cdc,
+                DeletionRequestSource::User,
             )
             .await
             .map_err(|err| CatalogError::InvalidOperation {
@@ -47068,7 +47090,7 @@ mod tests {
             .expect("retention defers rather than failing");
         assert_eq!(
             outcome,
-            RetentionPass::Deferred,
+            RetentionPass::DeferredTransient,
             "retention must decline the pass while a tombstone is unpublished, and say so \
              rather than reporting an empty delete"
         );
@@ -47177,8 +47199,10 @@ mod tests {
             .expect("retention defers rather than failing");
         assert_eq!(
             outcome,
-            RetentionPass::Deferred,
-            "retention must decline the pass while a seal shadow is present"
+            RetentionPass::DeferredUntilCheckpoint,
+            "retention must decline the pass while a seal shadow is present, and say that \
+             the wait is for a checkpoint rather than a millisecond window — the caller \
+             polls on one and not the other"
         );
         assert_eq!(
             provider.cached_inlined_row_count(),
@@ -47676,7 +47700,7 @@ mod tests {
                 .apply_retention_filters()
                 .await
                 .expect("retention defers rather than failing"),
-            RetentionPass::Deferred,
+            RetentionPass::DeferredTransient,
             "retention must decline the pass while a staged append is finalizing"
         );
 

@@ -706,7 +706,6 @@ impl CayenneDeletionSink {
         Ok(pk_values)
     }
 
-    /// Extract row keys from a batch using the `RowConverter`.
     /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
     /// `min_delete_seq` is still live. `None` is the base case — the current snapshot and
     /// cold tier, where every delete applies.
@@ -743,6 +742,7 @@ impl CayenneDeletionSink {
         }
     }
 
+    /// Extract row keys from a batch using the `RowConverter`.
     fn extract_row_keys(
         &self,
         batch: &arrow::array::RecordBatch,

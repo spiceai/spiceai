@@ -200,7 +200,18 @@ impl PostWriteMaintenanceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetentionPass {
     Deleted(u64),
-    Deferred,
+    /// Deferred behind something that publishes within milliseconds — an unpublished
+    /// inline-conflict tombstone or a staged append mid-finalize. Worth re-arming: the
+    /// next debounce almost certainly finds the window closed.
+    DeferredTransient,
+    /// Deferred behind a mem-tier seal shadow, which is NOT transient: it stands until
+    /// the next full checkpoint — 10s by default, and indefinitely when the age trigger
+    /// is off and the size gate is unmet. Re-arming would poll at the debounce interval
+    /// for that whole span, dragging `run_maintenance_state`'s metastore vacuum and WAL
+    /// checkpoint tail along on every pass. The checkpoint that clears a shadow arms
+    /// retention itself (see `checkpoint_mem_tier_inner`), so waiting for it costs one
+    /// checkpoint of latency and no polling.
+    DeferredUntilCheckpoint,
 }
 
 pub(crate) enum RetentionFailureAction {
