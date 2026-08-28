@@ -466,6 +466,38 @@ async fn flush_cache_writes(
 
     let flush_start = std::time::Instant::now();
 
+    // One key, one write. Two requests for the same key in a single flush would
+    // share one OR'd delete and then each append their batches, leaving the key
+    // holding the response twice — and a duplicated source row is a wrong query
+    // result, not a housekeeping problem. Only the newest survives; the older
+    // one is a response this key no longer holds.
+    //
+    // The in-flight key set makes this unreachable from the two paths that
+    // enqueue today. It is enforced here as well so the flush does not depend
+    // on its callers for it.
+    let superseded: Vec<bool> = {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(buffer.len());
+        let mut flags: Vec<bool> = buffer
+            .iter()
+            .rev()
+            .map(|req| !seen.insert(req.cache_key.as_str()))
+            .collect();
+        flags.reverse();
+        flags
+    };
+    if superseded.iter().any(|superseded| *superseded) {
+        let dropped = superseded.iter().filter(|s| **s).count();
+        tracing::debug!(
+            "Dropping {dropped} superseded cache write(s) for dataset={dataset_name}: a later write for the same key is in this flush"
+        );
+        let mut index = 0;
+        buffer.retain(|_| {
+            let keep = !superseded[index];
+            index += 1;
+            keep
+        });
+    }
+
     let request_count = buffer.len();
     let total_rows: usize = buffer
         .iter()
@@ -880,6 +912,19 @@ impl CacheRefreshHelper {
 
                 if batches.is_empty() {
                     return Ok::<usize, datafusion::error::DataFusionError>(0);
+                }
+
+                // A failing origin arrives as a successful fetch whose rows
+                // carry a 429 or 5xx status, and this path overwrites the entry
+                // it refreshes. Writing that would replace the last good
+                // response with the origin's error body and serve it as a
+                // cache hit until it expires — so keep what is cached, which is
+                // also what `caching_stale_if_error` exists to do.
+                if !cache::batches_cacheable(&batches) {
+                    tracing::debug!(
+                        "Background refresh for dataset '{dataset_name}' found the origin failing (transient HTTP error response); keeping what is cached"
+                    );
+                    return Ok(0);
                 }
 
                 let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1749,70 +1794,73 @@ impl CacheRefreshHelper {
                 // Claim the key before enqueuing. Without this, two readers
                 // that miss the same key concurrently each append the response
                 // and the key ends up holding it twice — which queries return
-                // as duplicated source rows. The flush releases the claim once
-                // the write has landed.
-                let claimed = {
-                    let mut in_flight = in_flight_revalidations.lock().await;
-                    in_flight.insert(cache_key.clone())
-                };
-                if !claimed {
+                // as duplicated source rows.
+                //
+                // The claim is released by the flush that writes it, so it is
+                // taken only on the path that reaches a flush. Claiming for a
+                // response that is never enqueued would hold the key for the
+                // life of the process and refuse every later write and
+                // revalidation for it.
+                let claimed = batches_cacheable
+                    && in_flight_revalidations
+                        .lock()
+                        .await
+                        .insert(cache_key.clone());
+                if batches_cacheable && !claimed {
                     tracing::debug!(
                         "A write for this key is already pending for dataset={dataset_name}; not enqueuing a second copy"
                     );
                 }
 
-                if batches_cacheable && claimed {
-                    if batches.is_empty() {
-                        tracing::debug!(
-                            "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
+                if claimed {
+                    let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+                    // Send write request to batched consumer. The flush
+                    // task is the one that stamps `__spice_cache_namespace`
+                    // and adds the namespace filter to upsert keys, so it
+                    // can do the right thing based on the accelerator's
+                    // actual storage schema (extended in real deployments,
+                    // unextended in unit-test mocks).
+                    let write_request = CacheWriteRequest {
+                        batches: batches.clone(),
+                        filters: filters.to_vec(),
+                        cache_key: cache_key.clone(),
+                        namespace_id: namespace.storage_id().into(),
+                        replaces_existing: is_expired,
+                    };
+                    if let Err(e) = batch_write_tx.send(write_request).await {
+                        tracing::warn!(
+                            "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
                         );
+                        // No flush will run for this key, so release the
+                        // claim here instead of holding it for good.
+                        in_flight_revalidations.lock().await.remove(&cache_key);
                     } else {
-                        let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-
-                        // Send write request to batched consumer. The flush
-                        // task is the one that stamps `__spice_cache_namespace`
-                        // and adds the namespace filter to upsert keys, so it
-                        // can do the right thing based on the accelerator's
-                        // actual storage schema (extended in real deployments,
-                        // unextended in unit-test mocks).
-                        let write_request = CacheWriteRequest {
-                            batches: batches.clone(),
-                            filters: filters.to_vec(),
-                            cache_key,
-                            namespace_id: namespace.storage_id().into(),
-                            replaces_existing: is_expired,
-                        };
-                        if let Err(e) = batch_write_tx.send(write_request).await {
-                            tracing::warn!(
-                                "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
-                            );
-                        } else {
-                            tracing::trace!(
-                                "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows",
-                            );
-                        }
-
-                        // Propagate cacheable data to children.
-                        let synchronized_children_clone = Arc::clone(&synchronized_children);
-                        let dataset_name_clone = dataset_name.to_string();
-                        let namespace_id_clone: Arc<str> = namespace.storage_id().into();
-                        io_runtime.spawn(async move {
-                            Self::propagate_to_synchronized_children(
-                                &synchronized_children_clone,
-                                &dataset_name_clone,
-                                &filters_clone,
-                                &batches_for_propagate,
-                                is_expired,
-                                &namespace_id_clone,
-                            )
-                            .await;
-                        });
-
-                        tracing::debug!(
-                            "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                        tracing::trace!(
+                            "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows",
                         );
                     }
-                } else {
+
+                    // Propagate cacheable data to children.
+                    let synchronized_children_clone = Arc::clone(&synchronized_children);
+                    let dataset_name_clone = dataset_name.to_string();
+                    let namespace_id_clone: Arc<str> = namespace.storage_id().into();
+                    io_runtime.spawn(async move {
+                        Self::propagate_to_synchronized_children(
+                            &synchronized_children_clone,
+                            &dataset_name_clone,
+                            &filters_clone,
+                            &batches_for_propagate,
+                            is_expired,
+                            &namespace_id_clone,
+                        )
+                        .await;
+                    });
+
+                    tracing::debug!(
+                        "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                    );
+                } else if !batches_cacheable {
                     tracing::debug!(
                         "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
                     );
@@ -4098,6 +4146,131 @@ mod tests {
         );
     }
 
+    /// The claim a miss takes is released by the flush that writes it, so a
+    /// response that is never enqueued must never claim.
+    #[tokio::test]
+    async fn a_failing_origin_does_not_leave_the_key_claimed() {
+        use futures::StreamExt;
+
+        // A held claim refuses every later write *and* revalidation for that
+        // key, for the life of the process — so one 5xx would make the key
+        // permanently uncacheable, which is the opposite of what an operator
+        // asking for a cache expects from a transient origin failure.
+        let http_source = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        while let Some(batch) = stream.next().await {
+            batch.expect("stream");
+        }
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+
+        assert!(
+            in_flight.lock().await.is_empty(),
+            "a key whose response was never enqueued must not stay claimed"
+        );
+    }
+
+    /// The periodic refresh replaces the entry it refreshes, so it must not
+    /// write a failing origin's error body over the last good response.
+    #[tokio::test]
+    async fn a_failing_origin_does_not_overwrite_a_stale_entry_with_its_error_body() {
+        // A 429 or 5xx arrives as a *successful* fetch whose rows carry that
+        // status. Writing it would serve the origin's error body as a cache hit
+        // until it expired, and would defeat `caching_stale_if_error` outright.
+        let origin = Arc::new(MockHttpTableProvider::with_status(503, "upstream down"));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_secs(3600))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["good-body"])) as ArrayRef,
+                Arc::new(arrow::array::UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
+            Arc::clone(&origin) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator),
+            "test_dataset",
+            Duration::from_secs(1),
+            Arc::new(Mutex::new(())),
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(refreshed, 0, "a failing origin refreshes nothing");
+
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .read_table(Arc::clone(&accelerator))
+            .expect("read")
+            .collect()
+            .await
+            .expect("collect");
+        let bodies: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let content = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8");
+                (0..batch.num_rows())
+                    .map(|r| content.value(r).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["good-body".to_string()],
+            "the cached response must survive a failing origin"
+        );
+    }
+
     /// Test that 404 responses are cached.
     ///
     /// Simulates cache miss flow:
@@ -4628,6 +4801,35 @@ mod write_path_tests {
         assert_eq!(
             stored(&accelerator).await,
             vec![("/new".to_string(), "first".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_writes_for_one_key_in_a_flush_store_the_newest_only() {
+        // Both are raised as fresh inserts, so neither deletes. Appending both
+        // would leave the key holding the response twice, which queries return
+        // as duplicated source rows.
+        let (_counting, accelerator) = accelerator_with(vec![], /* can_delete */ true);
+
+        let (tx, handle) = spawn_test_writer(&accelerator);
+        for content in ["older", "newer"] {
+            tx.send(CacheWriteRequest {
+                batches: vec![entry("/a", content)],
+                filters: vec![col("request_path").eq(lit("/a"))],
+                cache_key: "same-key".to_string(),
+                namespace_id: "public".into(),
+                replaces_existing: false,
+            })
+            .await
+            .expect("send");
+        }
+        drop(tx);
+        handle.await.expect("writer");
+
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![("/a".to_string(), "newer".to_string())],
+            "the key must hold one response, and it must be the newest"
         );
     }
 

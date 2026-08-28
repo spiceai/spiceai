@@ -164,7 +164,17 @@ impl CacheEvictionPredicate {
     /// Warns once, at startup, about configurations this can only partly
     /// enforce — so an operator learns it from the log rather than from
     /// unexplained growth.
-    pub fn warn_about_unenforceable(&self, accelerator: &Arc<dyn TableProvider>) {
+    ///
+    /// * `accelerator` - the storage the cache is held in, whose schema decides
+    ///   which entries can be identified and which payloads can be measured.
+    /// * `has_user_retention` - whether the dataset also sets `retention_period`
+    ///   or `retention_sql`. Those evict entries as well, so a cache with no
+    ///   budget of its own is not necessarily unbounded.
+    pub fn warn_about_unenforceable(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        has_user_retention: bool,
+    ) {
         let dataset_name = &self.dataset_name;
         let schema = accelerator.schema();
 
@@ -191,7 +201,7 @@ impl CacheEvictionPredicate {
             );
         }
 
-        if !self.limits.is_enforced() {
+        if !self.limits.is_enforced() && !has_user_retention {
             tracing::warn!(
                 "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` with no `caching_max_size` or `caching_max_items`, so no cached entry is ever evicted and the acceleration will grow without bound — expired entries are deliberately kept as fallback for a failing origin. Set a budget to bound it. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#refresh-modes"
             );
@@ -1271,7 +1281,7 @@ mod tests {
         }
     }
 
-    /// One row for , fetched just now — what a refresh writes back.
+    /// One row for `path`, fetched just now — what a refresh writes back.
     fn refreshed_row(path: &str) -> RecordBatch {
         use arrow::array::{StringArray, TimestampNanosecondArray};
         RecordBatch::try_new(
