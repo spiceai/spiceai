@@ -540,7 +540,10 @@ const MAX_RENDERED_CHARS: usize = 512;
 /// columns `a\tb` and `a b` identically, and name the wrong one half the time. Everything else is
 /// passed through, so the quotes and punctuation the refusals put around these names survive.
 fn as_one_line(text: &str) -> String {
-    let mut rendered = String::with_capacity(text.len());
+    // Capped, not `text.len()`: the whole point of `MAX_RENDERED_CHARS` is that a megabyte-scale
+    // name never costs a megabyte, and preallocating for the input would spend it anyway. The
+    // escapes below can outgrow this, and `String` grows on its own when they do.
+    let mut rendered = String::with_capacity(text.len().min(MAX_RENDERED_CHARS));
     for character in text.chars().take(MAX_RENDERED_CHARS) {
         if character.is_control() {
             rendered.extend(character.escape_debug());
@@ -2140,6 +2143,19 @@ mod tests {
         assert!(
             message.contains('\u{2026}'),
             "a truncated name must say it was truncated: {message}"
+        );
+    }
+
+    /// The cap has to bound what the refusal *allocates*, not only what it renders — a capacity
+    /// hint taken from the oversized input would spend the megabyte the cap exists to avoid.
+    #[test]
+    fn an_oversized_name_does_not_reserve_its_own_length() {
+        let rendered = as_one_line(&"x".repeat(MAX_RENDERED_CHARS * 2000));
+
+        assert!(
+            rendered.capacity() < MAX_RENDERED_CHARS * 8,
+            "the rendering reserved {} bytes for a name it truncates to {MAX_RENDERED_CHARS} chars",
+            rendered.capacity()
         );
     }
 
