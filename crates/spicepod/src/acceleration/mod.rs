@@ -51,8 +51,12 @@ pub enum RefreshMode {
 ///   Every write must be sent as a single `BEGIN; ...; COMMIT;` body: only the
 ///   transactional commit records the write for delivery, so a statement outside
 ///   a transaction is refused rather than accepted with weaker durability than a
-///   caller would assume. `INSERT` and `UPDATE` only — `DELETE` is not supported;
-///   delete at the source and let the change stream carry it back. Requires a
+///   caller would assume. `INSERT` and `UPDATE` only — `DELETE` is not supported.
+///   To delete, first stop writing and wait for
+///   `dataset_acceleration_write_back_pending_keys` to reach zero while write-back
+///   is still enabled (the delivery worker is what drains it), then disable
+///   write-back, delete at the source, and let the change stream carry it back.
+///   Requires a
 ///   single-column `primary_key` to key each delivery on, and
 ///   `replication.enabled: true` as an explicit opt-in to the source lagging the
 ///   accelerator.

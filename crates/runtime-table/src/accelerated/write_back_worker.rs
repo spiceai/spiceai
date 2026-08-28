@@ -204,21 +204,39 @@ impl WriteBackWorker {
     ///
     /// # Errors
     ///
-    /// When the accelerator resolved anything but a single primary-key column,
-    /// which is the one shape a delivery can be keyed on. Registration refuses
-    /// that configuration over the declared key
-    /// ([`Acceleration::durable_write_back_primary_key`]); reaching it here means
-    /// the resolved key disagrees with the declared one, and the table refuses to
-    /// build rather than accept writes it could never deliver.
-    ///
-    /// [`Acceleration::durable_write_back_primary_key`]:
-    ///     runtime_acceleration::acceleration::Acceleration::durable_write_back_primary_key
+    /// As [`Self::new`]: a key this worker could never deliver on refuses to build
+    /// rather than serving writes it cannot carry to the source.
     pub(crate) fn spawn(
         provider: CayenneTableProvider,
         federated: Arc<FederatedTable>,
         dataset_name: String,
         deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     ) -> Result<JoinHandle<()>, AcceleratedTableBuilderError> {
+        let mut worker = Self::new(provider, federated, dataset_name, deliverer)?;
+        WRITE_BACK_GAUGE_OWNERS
+            .lock()
+            .register(&worker.dataset_name, &worker.gauge_owner);
+        Ok(tokio::spawn(async move { worker.run().await }))
+    }
+
+    /// Build the worker, or refuse a key it could never deliver on.
+    ///
+    /// Separate from [`Self::spawn`] so a test constructs a worker the same way
+    /// production does — through both key checks — instead of filling the fields
+    /// itself and skipping them.
+    ///
+    /// # Errors
+    ///
+    /// [`AcceleratedTableBuilderError::DurableWriteBackUndeliverableKey`] when the
+    /// accelerator resolved anything but a single primary-key column, and
+    /// [`AcceleratedTableBuilderError::DurableWriteBackKeyMismatch`] when the
+    /// deliverer would upsert on a different column than the one this worker marks.
+    fn new(
+        provider: CayenneTableProvider,
+        federated: Arc<FederatedTable>,
+        dataset_name: String,
+        deliverer: Option<Arc<dyn WriteBackDeliverer>>,
+    ) -> Result<Self, AcceleratedTableBuilderError> {
         let pk_columns = provider.pk_column_names();
         // The same classifier registration used, over the key the accelerator
         // actually resolved, so the rule cannot hold on one side and not the other.
@@ -235,11 +253,30 @@ impl WriteBackWorker {
                 );
             }
         };
-        let gauge_owner = Arc::new(WriteBackGaugeOwner);
-        WRITE_BACK_GAUGE_OWNERS
-            .lock()
-            .register(&dataset_name, &gauge_owner);
-        let mut worker = Self {
+        // The connector builds its upsert target from the DECLARED key while the
+        // markers above use the RESOLVED one. Same arity is not enough: if they
+        // name different columns, `ON CONFLICT (declared)` inserts a second source
+        // row rather than updating the row this worker marked.
+        //
+        // This covers the connector-owned path only. The `TableProvider` fallback
+        // below writes through a provider whose conflict target this worker cannot
+        // see, so the same disagreement would go unchecked there. Registration
+        // refuses a connector that does not advertise durable delivery, and the one
+        // that advertises it always supplies a deliverer, so no dataset reaches the
+        // fallback today; a connector added with atomic `InsertOp::Replace` and no
+        // deliverer would need this comparison extended to it.
+        if let Some(deliverer) = &deliverer {
+            let target = deliverer.conflict_key();
+            if target != std::slice::from_ref(&pk_column) {
+                return Err(AcceleratedTableBuilderError::DurableWriteBackKeyMismatch {
+                    dataset_name,
+                    resolved: pk_column,
+                    declared: target.join(", "),
+                });
+            }
+        }
+
+        Ok(Self {
             claim_after: None,
             withheld_tracer: SpacedTracer::new(WITHHELD_WARNING_INTERVAL),
             provider: Arc::new(provider),
@@ -248,9 +285,8 @@ impl WriteBackWorker {
             pk_column,
             dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
             dataset_name,
-            gauge_owner,
-        };
-        Ok(tokio::spawn(async move { worker.run().await }))
+            gauge_owner: Arc::new(WriteBackGaugeOwner),
+        })
     }
 
     async fn run(&mut self) {
@@ -786,17 +822,9 @@ mod deliverer_tests {
     use datafusion::prelude::SessionContext;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::on_conflict::OnConflict;
-    use opentelemetry::KeyValue;
     use parking_lot::Mutex;
 
-    use runtime_acceleration::acceleration::{
-        DurableWriteBackKey, classify_durable_write_back_key,
-    };
-
-    use super::{
-        CLAIM_BATCH, SpacedTracer, WITHHELD_WARNING_INTERVAL, WriteBackDeliverer,
-        WriteBackGaugeOwner, WriteBackWorker,
-    };
+    use super::{CLAIM_BATCH, WriteBackDeliverer, WriteBackWorker};
     use crate::federated::FederatedTable;
 
     /// Records every call it receives; `arm_failure` makes the next call
@@ -805,11 +833,17 @@ mod deliverer_tests {
     struct FakeDeliverer {
         upserts: Mutex<Vec<Vec<RecordBatch>>>,
         fail_next: AtomicBool,
+        /// The column this fake upserts on; must match what the fixture's
+        /// provider resolves, exactly as a real connector's must.
+        conflict_key: String,
     }
 
     impl FakeDeliverer {
         fn arc() -> Arc<Self> {
-            Arc::new(Self::default())
+            Arc::new(Self {
+                conflict_key: "id".to_string(),
+                ..Self::default()
+            })
         }
 
         fn arm_failure(&self) {
@@ -829,6 +863,10 @@ mod deliverer_tests {
 
     #[async_trait::async_trait]
     impl WriteBackDeliverer for FakeDeliverer {
+        fn conflict_key(&self) -> &[String] {
+            std::slice::from_ref(&self.conflict_key)
+        }
+
         async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult {
             self.maybe_fail()?;
             self.upserts.lock().push(rows);
@@ -955,31 +993,19 @@ mod deliverer_tests {
         deliverer: Option<Arc<dyn WriteBackDeliverer>>,
         federated: Arc<dyn TableProvider>,
     ) -> WriteBackWorker {
-        let pk_columns = provider.pk_column_names();
-        // Through the same classifier the production path uses, so a fixture
-        // cannot hand the worker a key it would have refused.
-        let DurableWriteBackKey::Single(single) = classify_durable_write_back_key(&pk_columns)
-        else {
-            panic!("the fixture's provider must resolve exactly one primary-key column")
-        };
-        let pk_column = single.to_string();
-        let federated = Arc::new(FederatedTable::new_unchecked(federated));
-        let dataset_name = "orders".to_string();
-        // These tests drive `deliver_batch` directly and never `run`, so nothing
-        // here publishes the backlog gauge. The owner is left unregistered
-        // rather than mutating the process-wide owner stack from a test; `Drop`
-        // treats an unregistered owner as owning nothing.
-        WriteBackWorker {
-            claim_after: None,
-            withheld_tracer: SpacedTracer::new(WITHHELD_WARNING_INTERVAL),
-            provider: Arc::new(provider),
-            federated,
+        // Through `new`, so a fixture passes both key checks exactly as production
+        // does rather than filling the fields itself and skipping them. These tests
+        // drive `deliver_batch` directly and never `run`, so nothing publishes the
+        // backlog gauge; the owner stays unregistered rather than mutating the
+        // process-wide owner stack from a test, and `Drop` treats an unregistered
+        // owner as owning nothing.
+        WriteBackWorker::new(
+            provider,
+            Arc::new(FederatedTable::new_unchecked(federated)),
+            "orders".to_string(),
             deliverer,
-            pk_column,
-            dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
-            dataset_name,
-            gauge_owner: Arc::new(WriteBackGaugeOwner),
-        }
+        )
+        .expect("the fixture's key must be one the worker can deliver on")
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1151,6 +1177,43 @@ mod deliverer_tests {
             2,
             "both markers are kept so the rows are delivered again"
         );
+    }
+
+    /// Same arity is not the same key. The connector's `ON CONFLICT` target comes
+    /// from the declared Spicepod key while markers and point scans use the key the
+    /// accelerator resolved; a persisted table keeps its key across a Spicepod edit,
+    /// so the two can name different single columns. Delivering then updates a row
+    /// this worker never marked — or inserts a second one — so the table refuses to
+    /// build.
+    #[tokio::test]
+    async fn a_deliverer_keyed_on_a_different_column_refuses_to_build() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let provider = new_provider(&temp_dir).await;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(orders_schema(), vec![vec![]]).expect("mem table"),
+        )));
+
+        // The provider resolves `id`; this deliverer would upsert on `name`.
+        let deliverer = Arc::new(FakeDeliverer {
+            conflict_key: "name".to_string(),
+            ..FakeDeliverer::default()
+        });
+
+        let error = WriteBackWorker::spawn(
+            provider,
+            federated,
+            "orders".to_string(),
+            Some(deliverer as Arc<dyn WriteBackDeliverer>),
+        )
+        .expect_err("a deliverer keyed on another column must refuse to build");
+
+        let message = error.to_string();
+        for expected in ["orders", "'id'", "'name'", "second row"] {
+            assert!(
+                message.contains(expected),
+                "the refusal must contain {expected:?}: {message}"
+            );
+        }
     }
 
     /// The second half of the single-key rule. Registration refuses the

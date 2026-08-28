@@ -37,6 +37,7 @@ limitations under the License.
 //! [`WriteMode::WriteBack`]: super::WriteMode::WriteBack
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
@@ -199,6 +200,13 @@ impl DataSink for WriteBackDataSink {
         })?;
 
         self.refresher.set_initial_load_completed(true);
+        // Marked here, not at plan time: a write-back write is refused unless it is
+        // in a transaction, and that is decided when this sink executes, so the
+        // planner cannot know yet whether the table will change. This is the
+        // accelerator accepting the stage, not the COMMIT that publishes it, so a
+        // transaction that later rolls back leaves the table looking newer than its
+        // committed contents — stale in the safe direction.
+        self.refresher.mark_updated_now();
 
         // The delivery worker reconciles this write to the federated source from
         // the dirty-key markers the commit wrote. There is no second path: a
@@ -226,7 +234,7 @@ impl DataSink for WriteBackDataSink {
 /// than suggesting the delete alone is safe.
 pub(crate) fn delete_not_supported(dataset_name: &str) -> DataFusionError {
     DataFusionError::Plan(format!(
-        "Failed to delete from dataset '{dataset_name}': DELETE is not supported while 'acceleration.write_mode: write_back' is enabled, because a delete cannot be recorded for delivery to the federated source. To delete these rows at the source, first take this dataset out of write-back and wait for its `dataset_acceleration_write_back_pending_keys` metric to reach zero, so no committed write is still waiting to be delivered; then delete at the source and let the change stream refresh the accelerator. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to delete from dataset '{dataset_name}': DELETE is not supported while 'acceleration.write_mode: write_back' is enabled, because a delete cannot be recorded for delivery to the federated source. To delete these rows at the source: stop writing to this dataset and wait for its `dataset_acceleration_write_back_pending_keys` metric to reach zero WHILE write-back is still enabled, because the delivery worker is what drains it and taking the dataset out of write-back stops that worker and clears the gauge without delivering anything. Once it reads zero, take the dataset out of write-back, delete at the source, and let the change stream refresh the accelerator. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))
 }
 
@@ -241,17 +249,23 @@ pub(crate) async fn update_write_back(
     filters: Vec<Expr>,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: &str,
+    last_updated_at: Arc<AtomicI64>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     let accelerator_plan = accelerator.update(state, assignments, filters).await?;
     Ok(Arc::new(DeletionExec::new(Arc::new(WriteBackUpdateSink {
         accelerator_plan,
         dataset_name: dataset_name.to_string(),
+        last_updated_at,
     }))))
 }
 
 struct WriteBackUpdateSink {
     accelerator_plan: Arc<dyn ExecutionPlan>,
     dataset_name: String,
+    /// Stamped when the accelerator accepts this update's stage, for the reason
+    /// [`WriteBackDataSink::write_all`] stamps there: whether the write is allowed
+    /// is decided at execution, so the planner cannot stamp it in advance.
+    last_updated_at: Arc<AtomicI64>,
 }
 
 #[async_trait]
@@ -279,6 +293,7 @@ impl DeletionSink for WriteBackUpdateSink {
             Arc::clone(&context),
         )
         .await?;
+        crate::accelerated::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
         Ok(extract_dml_count(&batches))
     }
 }
@@ -330,6 +345,8 @@ pub(crate) async fn execute_insert(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicI64;
+
     use super::super::count_exec;
     use super::{WriteBackUpdateSink, extract_dml_count};
     use arrow::array::{StringArray, UInt64Array};
@@ -410,6 +427,7 @@ mod tests {
         let sink = WriteBackUpdateSink {
             accelerator_plan: count_exec(1),
             dataset_name: "orders".to_string(),
+            last_updated_at: Arc::new(AtomicI64::new(0)),
         };
 
         let error = sink
@@ -425,6 +443,43 @@ mod tests {
         }
     }
 
+    /// A refused write changed nothing, so it must not advance the table's
+    /// freshness timestamp — a bumped timestamp claims the accelerator holds newer
+    /// data than it does, and can trigger timestamp-driven snapshot work for a
+    /// write that never landed.
+    #[tokio::test]
+    async fn a_refused_update_leaves_the_freshness_timestamp_alone() {
+        let last_updated_at = Arc::new(AtomicI64::new(0));
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(1),
+            dataset_name: "orders".to_string(),
+            last_updated_at: Arc::clone(&last_updated_at),
+        };
+
+        sink.delete_from(SessionContext::new().task_ctx())
+            .await
+            .expect_err("a write-back update outside a transaction must be refused");
+        assert_eq!(
+            last_updated_at.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a refused update must not mark the table as changed"
+        );
+
+        // ...and a write that does land still marks it.
+        let sink = WriteBackUpdateSink {
+            accelerator_plan: count_exec(1),
+            dataset_name: "orders".to_string(),
+            last_updated_at: Arc::clone(&last_updated_at),
+        };
+        sink.delete_from(task_ctx_in_transaction())
+            .await
+            .expect("a transactional update stages");
+        assert!(
+            last_updated_at.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a landed update must mark the table as changed"
+        );
+    }
+
     /// Inside a transaction the update stages to the accelerator and returns its
     /// count; the delivery worker carries it to the source from the markers that
     /// commit writes, so nothing is pushed from here.
@@ -433,6 +488,7 @@ mod tests {
         let sink = WriteBackUpdateSink {
             accelerator_plan: count_exec(7),
             dataset_name: "orders".to_string(),
+            last_updated_at: Arc::new(AtomicI64::new(0)),
         };
 
         let count = sink
@@ -453,7 +509,9 @@ mod tests {
             // The transition, not a bare "delete at the source": a committed
             // write for the same key may still be undelivered, and delivery
             // would put the row back after a source-side delete.
-            "take this dataset out of write-back",
+            // The order is the load-bearing part: the worker that drains the
+            // gauge is stopped by leaving write-back, so draining must come first.
+            "WHILE write-back is still enabled",
             "dataset_acceleration_write_back_pending_keys",
             "change stream",
         ] {

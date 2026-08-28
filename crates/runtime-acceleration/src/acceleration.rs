@@ -544,10 +544,47 @@ impl Acceleration {
     /// call it, so the check and the behavior cannot drift apart.
     #[must_use]
     pub fn resolves_to_durable_write_back(&self) -> bool {
-        self.engine == Engine::Cayenne
-            && self.write_mode == spicepod_acceleration::WriteMode::WriteBack
-            && !self.on_conflict.is_empty()
-            && self.refresh_mode == Some(RefreshMode::Changes)
+        self.write_mode == spicepod_acceleration::WriteMode::WriteBack
+            && self.durable_write_back_gaps().iter().all(Option::is_none)
+    }
+
+    /// Each durable-write-back prerequisite this acceleration fails, named as the
+    /// setting that would satisfy it.
+    ///
+    /// One list serves both the predicate and the refusal message, so "durable"
+    /// cannot come to mean one thing to the check and another to what the user is
+    /// told to add. Naming the settings only — the sentence around them belongs to
+    /// the error that renders it.
+    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 3] {
+        [
+            (self.engine != Engine::Cayenne).then_some("acceleration.engine: cayenne"),
+            self.on_conflict
+                .is_empty()
+                .then_some("an 'acceleration.on_conflict' upsert on the primary key"),
+            (self.refresh_mode != Some(RefreshMode::Changes))
+                .then_some("acceleration.refresh_mode: changes"),
+        ]
+    }
+
+    /// The durable-write-back prerequisites this acceleration does not meet, named
+    /// as the settings a user would add, or `None` when it asks for no write-back
+    /// or already meets them.
+    ///
+    /// `write_back` selects the write-back write mode on its own, but only a
+    /// configuration meeting these records markers and runs a delivery worker. One
+    /// that asks for write-back without them has no path to the source at all, so
+    /// it must be refused rather than loaded and then refuse every write.
+    #[must_use]
+    pub fn unmet_durable_write_back_prerequisites(&self) -> Option<Vec<&'static str>> {
+        if self.write_mode != spicepod_acceleration::WriteMode::WriteBack {
+            return None;
+        }
+        let missing: Vec<&'static str> = self
+            .durable_write_back_gaps()
+            .into_iter()
+            .flatten()
+            .collect();
+        (!missing.is_empty()).then_some(missing)
     }
 
     /// The primary key durable write-back can deliver this acceleration on.

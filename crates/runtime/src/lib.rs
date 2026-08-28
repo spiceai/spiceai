@@ -299,11 +299,6 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back' without 'refresh_mode: changes'. Without CDC, 'on_conflict' forces writes to the accelerator only and there is no sync path back to the federated source. Add 'refresh_mode: changes' to enable CDC-based sync, or remove 'on_conflict'."
-    ))]
-    AcceleratedWriteBackWithOnConflict { dataset_name: String },
-
-    #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back commits to the local accelerator and a delivery worker carries the write to the federated source afterwards, so the source lags the accelerator, and the source's own changes come back over the change stream. Set 'replication.enabled: true' to opt in, or use a different write_mode."
     ))]
     AcceleratedWriteBackWithoutReplication { dataset_name: String },
@@ -345,6 +340,15 @@ pub enum Error {
         dataset_name: String,
         connector: String,
         mode: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): 'acceleration.write_mode: write_back' delivers each committed write to the source from the markers its transactional commit records, which requires {missing}. Without that nothing records a write for delivery, so this dataset would load and then refuse every write it is given. Add the missing setting(s), or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackPrerequisitesUnmet {
+        dataset_name: String,
+        connector: String,
+        missing: String,
     },
 
     #[snafu(display(

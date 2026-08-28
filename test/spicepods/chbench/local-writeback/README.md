@@ -12,12 +12,19 @@ serializable-transactions surface (#11870).
   `replication.enabled: true`), with a maintained `SUM(s_quantity)` aggregate on
   `stock` to exercise the IVM path.
 - `direct_write_bench.py` — the driver: concurrent gated stock-decrement
-  transactions to `/v1/sql`, a `DELETE` that a write-back dataset must refuse, and three
+  transactions to `/v1/sql` and three
   self-checked invariants (no-lost-updates / IVM-fresh / write-back-converge).
   Stdlib only (needs `python3`, `psql`, and a running spiced).
 
 This is a **correctness** variant, not a perf run — a laptop cannot sustain
 chbench CDC at scale (see the `accelerated/*-cdc-tuned-*` pods for m7a perf runs).
+
+> **This fixture does not load as written.** Its write-back datasets (`district`,
+> `stock`, `oorder`) declare composite primary keys, and durable write-back keys each
+> delivery on a single column, so the runtime refuses them at registration. They never
+> delivered either — the worker saw the composite key, logged it, and exited, leaving
+> the markers to accumulate. Reviving this benchmark needs write-back datasets keyed on
+> one column, or composite-key delivery support.
 
 ## What it proves
 
@@ -25,7 +32,7 @@ chbench CDC at scale (see the `accelerated/*-cdc-tuned-*` pods for m7a perf runs
 |-----------|---------------|--------|
 | No lost updates under concurrent disjoint-key transactions | P0-2 (dropped OCC stamps) | observed drop in `SUM(s_quantity)` == sum of committed deltas |
 | Maintained aggregate reflects committed transactions | P1 (fused-txn IVM staleness) | maintained `SUM … GROUP BY` == base-scan `SUM` after each round |
-| `DELETE` is refused on a write-back dataset | #13398 | the statement is rejected rather than applied to the accelerator alone: a deletion cannot be recorded for delivery, and inferring one from a key later being unreadable is what deleted source rows nobody deleted. The OCC conflict-correctness this step used to cover has its deterministic proof in the `transaction_has_conflict_degraded_keyset_falls_back_to_per_table` unit test |
+
 
 The **write-back convergence** check (Spice `SUM` == Postgres `SUM` after the
 delivery worker drains) is reported but does **not** gate the exit code: a

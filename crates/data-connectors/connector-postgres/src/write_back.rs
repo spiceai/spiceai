@@ -255,6 +255,13 @@ impl PostgresWriteBackDeliverer {
 
 #[async_trait]
 impl WriteBackDeliverer for PostgresWriteBackDeliverer {
+    fn conflict_key(&self) -> &[String] {
+        match &self.on_conflict {
+            OnConflict::Upsert(columns) | OnConflict::DoNothing(columns) => &columns.columns,
+            OnConflict::DoNothingAll => &[],
+        }
+    }
+
     async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult {
         let mut db = self.pool.connect_direct().await.map_err(|e| {
             delivery_error(

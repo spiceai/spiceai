@@ -30,11 +30,12 @@ use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
     AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
-    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackRecreatingModeSnafu,
-    DurableWriteBackUndeclaredPrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu,
-    DurableWriteBackWithRetentionSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
-    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
-    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackPrerequisitesUnmetSnafu,
+    DurableWriteBackRecreatingModeSnafu, DurableWriteBackUndeclaredPrimaryKeySnafu,
+    DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
+    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
@@ -1550,30 +1551,10 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
-        let has_changes_refresh = acceleration_settings
-            .refresh_mode
-            .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
-        let has_write_back =
-            acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack;
-
-        // `on_conflict` forces writes to the accelerator only. When combined with
-        // `write_mode: write_back` and `refresh_mode: changes` (CDC), on_conflict acts
-        // as WAL UPDATE upsert routing only and write_back can coexist with it.
-        // Reject the combination of on_conflict + write_back without CDC, since there
-        // would be no path to sync the accelerator writes back to the federated source.
-        if has_on_conflict && has_write_back && !has_changes_refresh {
-            crate::AcceleratedWriteBackWithOnConflictSnafu {
-                dataset_name: ds.name.to_string(),
-            }
-            .fail()?;
-        }
-
-        // `write_mode: write_back` commits to the local accelerator first and
-        // asynchronously forwards the same mutation to the federated source.
-        // Because the source commit is not part of the synchronous response,
-        // require `replication.enabled` as the user's explicit opt-in to those
-        // asynchronous source durability semantics.
+        // `write_mode: write_back` commits to the local accelerator and a delivery
+        // worker carries the write to the federated source afterwards, so the source
+        // lags. Require `replication.enabled` as the user's explicit opt-in to that,
+        // and to the source's own changes arriving over the change stream.
         if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
             && !replicate
         {
@@ -2073,14 +2054,14 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::OdbcNotInstalled
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
-        | Error::AcceleratedWriteBackWithOnConflict { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
         // Durable write-back configurations that would acknowledge a write the
         // dataset cannot then deliver.
         | Error::DurableWriteBackWithRetention { .. }
         | Error::DurableWriteBackRecreatingMode { .. }
         | Error::DurableWriteBackCompositePrimaryKey { .. }
-        | Error::DurableWriteBackUndeclaredPrimaryKey { .. } => true,
+        | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
+        | Error::DurableWriteBackPrerequisitesUnmet { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2192,6 +2173,21 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
     if ds.has_full_text_column() && !ds.is_accelerated() {
         return Err(FullTextSearchRequiresAccelerationSnafu {
             dataset_name: ds.name.to_string(),
+        }
+        .build());
+    }
+
+    // `write_mode: write_back` selects the write-back path on its own, but only a
+    // configuration that resolves to DURABLE write-back records markers and runs a
+    // delivery worker. One that asks for write-back without them has no path to the
+    // source: it would load and then refuse every write.
+    if let Some(acceleration) = &ds.acceleration
+        && let Some(missing) = acceleration.unmet_durable_write_back_prerequisites()
+    {
+        return Err(DurableWriteBackPrerequisitesUnmetSnafu {
+            dataset_name: ds.name.to_string(),
+            connector: ds.source().to_string(),
+            missing: missing.join(", "),
         }
         .build());
     }
@@ -2510,83 +2506,86 @@ mod tests {
         );
     }
 
-    /// Every one of these settings is ordinary outside durable write-back, and
-    /// there are four ways to be outside it. Each case carries all four refusable
-    /// settings and leaves the regime by a different door, so the scoping is
-    /// asserted against each condition rather than against `write_mode` four times.
+    /// Every one of these settings is ordinary on an acceleration that does not ask
+    /// for write-back at all — retention, a recreating mode and a composite key are
+    /// unremarkable there, because nothing depends on the accelerator holding a row
+    /// until a delivery carries it away.
+    ///
+    /// Leaving the regime any *other* way — the engine, `on_conflict` or
+    /// `refresh_mode` — still requests `write_mode: write_back`, which cannot be
+    /// delivered and is refused by the prerequisites gate instead. Those doors are
+    /// covered by `validate_dataset_refuses_write_back_without_the_durable_prerequisites`.
     #[tokio::test]
-    async fn validate_dataset_refuses_none_of_them_outside_durable_write_back() {
+    async fn validate_dataset_allows_all_of_them_when_write_back_is_not_requested() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
 
-        // Everything the durable regime refuses, in one acceleration.
-        let refusable = spicepod::acceleration::Acceleration {
+        let acceleration = spicepod::acceleration::Acceleration {
             retention_period: Some("1d".to_string()),
             mode: spicepod::acceleration::Mode::FileCreate,
             primary_key: Some("(id, region)".to_string()),
+            write_mode: spicepod::acceleration::WriteMode::default(),
             ..durable_write_back_acceleration()
         };
 
-        for (acceleration, door) in [
-            (
-                spicepod::acceleration::Acceleration {
-                    write_mode: spicepod::acceleration::WriteMode::default(),
-                    ..refusable.clone()
-                },
-                "write_mode is not write_back",
-            ),
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
+            "none of these settings is refusable without write-back"
+        );
+    }
+
+    /// `write_mode: write_back` without the settings that make it durable used to
+    /// load and then refuse every write: the write-back path is selected from
+    /// `write_mode` alone, but only a resolving configuration records markers and
+    /// runs a delivery worker.
+    #[tokio::test]
+    async fn validate_dataset_refuses_write_back_without_the_durable_prerequisites() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        for (acceleration, named) in [
             (
                 spicepod::acceleration::Acceleration {
                     engine: Some("duckdb".to_string()),
-                    ..refusable.clone()
+                    ..durable_write_back_acceleration()
                 },
-                "the engine is not cayenne",
+                "acceleration.engine: cayenne",
             ),
             (
                 spicepod::acceleration::Acceleration {
                     on_conflict: HashMap::new(),
-                    ..refusable.clone()
+                    ..durable_write_back_acceleration()
                 },
-                "no on_conflict upsert is configured",
+                "acceleration.on_conflict",
             ),
             (
                 spicepod::acceleration::Acceleration {
                     refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
-                    ..refusable
+                    ..durable_write_back_acceleration()
                 },
-                "refresh_mode is not changes",
+                "acceleration.refresh_mode: changes",
             ),
         ] {
+            let err = validate_dataset(&dataset_with_acceleration(&runtime, acceleration))
+                .expect_err("write-back without its prerequisites must be refused");
             assert!(
-                validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
-                "these settings stay allowed when {door}"
+                matches!(err, Error::DurableWriteBackPrerequisitesUnmet { .. }),
+                "expected a prerequisites refusal, got: {err}"
+            );
+            // The message is the user's only account of what to add, so it names
+            // the setting rather than saying something is missing.
+            assert!(
+                err.to_string().contains(named),
+                "the refusal must name {named:?}: {err}"
             );
         }
-    }
 
-    /// As with retention, the mode rejection is the whole explanation the user
-    /// gets, so it names the mode that is refused and the one that works.
-    #[test]
-    fn the_mode_rejection_names_the_mode_and_the_one_that_works() {
-        let message = DurableWriteBackRecreatingModeSnafu {
-            dataset_name: "orders".to_string(),
-            connector: "postgres".to_string(),
-            mode: "file_create".to_string(),
-        }
-        .build()
-        .to_string();
-        for expected in [
-            "orders",
-            "postgres",
-            "file_create",
-            "acknowledged write would be lost",
-            "'acceleration.mode: file'",
-            "https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
-        ] {
-            assert!(
-                message.contains(expected),
-                "the rejection must contain {expected:?}: {message}"
-            );
-        }
+        assert!(
+            validate_dataset(&dataset_with_acceleration(
+                &runtime,
+                durable_write_back_acceleration()
+            ))
+            .is_ok(),
+            "a configuration meeting them all must still load"
+        );
     }
 
     /// The rejection is the only account a user gets of why the dataset will not
@@ -3224,6 +3223,12 @@ mod tests {
             connector: "postgres".to_string(),
         }
         .build();
+        let prerequisites = DurableWriteBackPrerequisitesUnmetSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            missing: "acceleration.refresh_mode: changes".to_string(),
+        }
+        .build();
         let composite_key = DurableWriteBackCompositePrimaryKeySnafu {
             dataset_name: "orders".to_string(),
             connector: "postgres".to_string(),
@@ -3237,6 +3242,7 @@ mod tests {
             &recreating_mode,
             &composite_key,
             &undeclared_key,
+            &prerequisites,
         ] {
             assert!(
                 is_permanent_dataset_failure(err),

@@ -261,6 +261,15 @@ pub enum AcceleratedTableBuilderError {
         dataset_name: String,
         pk_columns: usize,
     },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back marks and delivers each committed row keyed on '{resolved}', the primary key this dataset's accelerator resolved, but its source connector was configured to upsert on '{declared}'. Delivering on a different column would write a second row at the source instead of updating the one that was marked. Set 'acceleration.primary_key' to '{resolved}', or recreate the acceleration so it resolves the declared key. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackKeyMismatch {
+        dataset_name: String,
+        resolved: String,
+        declared: String,
+    },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -582,8 +591,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes commit to the local accelerator first,
-    /// then asynchronously persist to the federated source.
+    /// Enable write-back mode: writes commit to the local accelerator inside a
+    /// transaction, and a delivery worker carries them to the federated source
+    /// afterwards.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -1992,7 +2002,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2097,7 +2114,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2114,6 +2138,7 @@ impl TableLayer for AcceleratedTable {
                     filters,
                     Arc::clone(&self.accelerator),
                     &self.dataset_name.to_string(),
+                    Arc::clone(&self.last_updated_at),
                 )
                 .await
             }

@@ -77,4 +77,14 @@ pub trait WriteBackDeliverer: Send + Sync {
     /// Returns an error if the transaction cannot be prepared, executed, or
     /// committed; the worker retries the whole pass.
     async fn deliver_upserts(&self, rows: Vec<RecordBatch>) -> DeliveryResult;
+
+    /// The primary-key column this deliverer upserts on — its `ON CONFLICT` target.
+    ///
+    /// The worker keys its markers and its point scan on the key the *accelerator*
+    /// resolved, while a connector builds this target from the key the Spicepod
+    /// *declares*. Those are different values, and if they name different columns
+    /// an update writes a second row at the source instead of updating the one the
+    /// marker refers to. The worker compares them and refuses to start rather than
+    /// deliver against a row identity it did not mark.
+    fn conflict_key(&self) -> &[String];
 }
