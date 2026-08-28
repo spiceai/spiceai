@@ -53,7 +53,7 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub const SCYLLADB_DATACONNECTOR: &str = "scylladb"; // const needs to be accessible when ScyllaDB isn't built
-/// The cargo feature that builds the ScyllaDB data connector into `spiced`.
+/// The cargo feature that builds the `ScyllaDB` data connector into `spiced`.
 pub const SCYLLADB_FEATURE: &str = "scylladb";
 pub mod deferred;
 // ducklake: moved to crates/data-connectors/connector-ducklake

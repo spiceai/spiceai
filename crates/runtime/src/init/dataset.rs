@@ -2143,7 +2143,7 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
 /// The error for a `from:` naming a connector this build does not register: the closest
 /// registered name plus the full list, so the message names a fix.
 ///
-/// ODBC and ScyllaDB are the exceptions. They are real connectors that this build may simply
+/// ODBC and `ScyllaDB` are the exceptions. They are real connectors that this build may simply
 /// not have been compiled with, so they get the build instruction for their feature instead of
 /// a "did you mean" over the connectors that happen to be present.
 async fn unknown_data_connector(source: &str) -> Error {
@@ -2402,7 +2402,7 @@ mod tests {
         );
     }
 
-    /// ScyllaDB is not in the default build either, so a `from: scylladb:` earns the same
+    /// `ScyllaDB` is not in the default build either, so a `from: scylladb:` earns the same
     /// build-or-Enterprise instruction rather than a "did you mean" over what is registered.
     #[tokio::test]
     async fn an_unregistered_scylladb_connector_reports_the_missing_build() {
