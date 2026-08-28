@@ -32,6 +32,25 @@ limitations under the License.
 //! 3. **Byte budget** — `caching_max_size`, measured by summing each row's
 //!    payload bytes.
 //!
+//! ## What a sweep costs
+//!
+//! Deriving rather than storing means each sweep asks the accelerator, and the
+//! question is a `GROUP BY` over every stored row. With a byte budget set it
+//! also sums `octet_length` over the payload columns, which reads every cached
+//! response body; without one that measurement is not requested at all, so a
+//! TTL-only cache pays for the grouping and not for the bodies. The interval
+//! floors at [`MIN_SWEEP_INTERVAL`], so the recurring cost scales with what is
+//! cached, not with what the workload is doing.
+//!
+//! That is the price of the trade below, and it is a real one: a measured run
+//! swept a 2,500,000-entry `DuckDB` acceleration every five minutes for 84
+//! minutes without failing, but the ranking materialises one record per entry
+//! while it runs. Deferring each entry's key strings until the delete actually
+//! names it — at most [`MAX_ENTRIES_PER_SWEEP`] of them, and none at all on the
+//! [`bulk_range`] path — would remove most of that, and is the identified next
+//! step. Keeping a running tally beside the table instead is the alternative
+//! this module exists to avoid; see below.
+//!
 //! Both the deadline and the size are *derived* rather than stored. A row's
 //! deadline is `_fetched_at + caching_ttl`, and `caching_ttl` is dataset
 //! configuration the sweep already has, so a stored copy would only be a
@@ -62,11 +81,11 @@ use tokio::runtime::Handle;
 use datafusion::logical_expr::Operator;
 use util::timestamp_filter::TimestampFilterConvert;
 
-use super::{Retention, RetentionPredicate};
-use super::retention::create_timestamp_filter_converter;
 use super::caching::{
     CACHE_NAMESPACE_COLUMN, CACHE_REFRESHED_AT_COLUMN, REQUEST_KEY_COLUMNS, effective_max_age,
 };
+use super::retention::create_timestamp_filter_converter;
+use super::{Retention, RetentionPredicate};
 use runtime_datafusion::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 use util::expr::combine_exprs_balanced;
@@ -297,8 +316,13 @@ impl RetentionPredicate for CacheEvictionPredicate {
         // it in microseconds, and a `DuckDB` cast carrying a timezone has to be
         // rendered as `AT TIME ZONE` (#12528) — neither is something a literal
         // written here could know.
-        let refreshed_at =
-            create_timestamp_filter_converter(accelerator, CACHE_REFRESHED_AT_COLUMN, None, None, None);
+        let refreshed_at = create_timestamp_filter_converter(
+            accelerator,
+            CACHE_REFRESHED_AT_COLUMN,
+            None,
+            None,
+            None,
+        );
 
         // With `stale_if_error` an expired entry is deliberately kept as
         // fallback for a failing origin, so there is no deadline to apply.
@@ -315,7 +339,8 @@ impl RetentionPredicate for CacheEvictionPredicate {
             // Expiry can still run row by row, safely: with no key there is no
             // entry to leave half of. The dataset's own retention predicate is
             // row-level already and passes through unchanged.
-            let expired = cutoff.and_then(|cutoff| row_level_expiry_expr(&refreshed_at, cutoff));
+            let expired =
+                cutoff.and_then(|cutoff| row_level_expiry_expr(refreshed_at.as_ref(), cutoff));
             return Ok(combine_exprs_balanced(
                 [configured, expired].into_iter().flatten().collect(),
                 Expr::or,
@@ -380,8 +405,8 @@ impl RetentionPredicate for CacheEvictionPredicate {
         // One range predicate when the doomed and surviving entries do not
         // overlap in fetch time: exact, and not bounded by how many entries it
         // covers.
-        if let Some(bulk) = bulk_cutoff(&doomed, &survivors)
-            && let Some(expr) = row_level_expiry_expr(&refreshed_at, bulk)
+        if let Some((from, to)) = bulk_range(&doomed, &survivors)
+            && let Some(expr) = fetched_at_between(refreshed_at.as_ref(), from, to)
         {
             return Ok(Some(expr));
         }
@@ -399,7 +424,7 @@ impl RetentionPredicate for CacheEvictionPredicate {
         }
         let predicates: Vec<Expr> = naming
             .iter()
-            .filter_map(|entry| entry_predicate(&entry.key, entry.newest, &refreshed_at))
+            .filter_map(|entry| entry_predicate(&entry.key, entry.newest, refreshed_at.as_ref()))
             .collect();
         Ok(combine_exprs_balanced(predicates, Expr::or))
     }
@@ -413,8 +438,11 @@ impl RetentionPredicate for CacheEvictionPredicate {
 /// window is unservable on its own terms. A row with no fetch time goes too:
 /// there is no deadline to hold it to, and the read path already treats a null
 /// timestamp as expired.
-fn row_level_expiry_expr(refreshed_at: &Option<TimestampFilterConvert>, cutoff: i64) -> Option<Expr> {
-    let converter = refreshed_at.as_ref()?;
+fn row_level_expiry_expr(
+    refreshed_at: Option<&TimestampFilterConvert>,
+    cutoff: i64,
+) -> Option<Expr> {
+    let converter = refreshed_at?;
     Some(converter.convert(u128::try_from(cutoff).ok()?, Operator::LtEq))
 }
 
@@ -508,11 +536,18 @@ fn payload_columns(
 /// Payload columns [`payload_bytes_expr`] cannot weigh, so `caching_max_size`
 /// under-counts by whatever they hold.
 ///
-/// [`RESPONSE_HEADERS_COLUMN`] is excluded deliberately: it is a `Map` on every
-/// HTTP response, it is small beside the body it accompanies, and reporting it
-/// would put a warning in the log of every ordinary caching dataset that sets a
-/// budget — which is how a warning stops being read. Anything else nested is
-/// worth saying out loud, because it could be the payload itself.
+/// [`RESPONSE_HEADERS_COLUMN`] is excluded from the *warning* deliberately: it
+/// is a `Map` on every HTTP response, so reporting it would put a line in the
+/// log of every ordinary caching dataset that sets a budget, telling the
+/// operator about a column they did not choose to store and cannot stop the
+/// connector storing — which is how a warning stops being read.
+///
+/// It is genuinely not counted, though, and an origin sending large or numerous
+/// headers therefore holds bytes the budget does not charge for. That shortfall
+/// is stated where an operator setting a budget will look for it, on
+/// `caching_max_size` itself, rather than as a warning they cannot act on.
+/// Anything else nested is worth saying out loud, because it could be the
+/// payload itself.
 fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
     payload_columns(schema)
         .filter(|field| field.name() != RESPONSE_HEADERS_COLUMN)
@@ -566,33 +601,59 @@ fn nameable<'a>(doomed: &'a [&'a EntryCost]) -> (&'a [&'a EntryCost], usize) {
     (&doomed[deferred..], deferred)
 }
 
-/// The `_fetched_at` cutoff that deletes exactly `doomed` and nothing else, when
+/// The `_fetched_at` window that holds exactly `doomed` and no survivor, when
 /// one exists.
 ///
 /// Eviction normally names each entry by key, because a cached response can span
 /// rows with different fetch times and a range delete could cut one in half. But
 /// when every doomed entry's newest row is older than every survivor's oldest
-/// row, no entry straddles the boundary and `_fetched_at <= cutoff` selects the
-/// doomed set exactly — one small predicate instead of an `OR` per entry.
+/// row, no entry straddles the boundary and a range over the doomed entries'
+/// own fetch times selects them exactly — one small predicate instead of an
+/// `OR` per entry.
 ///
-/// That matters because predicate width is capped by stack depth
-/// ([`MAX_ENTRIES_PER_SWEEP`]), so naming entries individually cannot evict
-/// faster than a few hundred per sweep — which a cache ingesting hundreds per
-/// second outruns forever. A workload that fetches new keys over time separates
-/// cleanly in fetch order, so this is the ordinary case and the per-key fallback
-/// is for the interleaved one.
+/// That matters because predicate width is capped ([`MAX_ENTRIES_PER_SWEEP`]),
+/// so naming entries individually cannot evict faster than a few hundred per
+/// sweep — which a cache ingesting hundreds per second outruns forever. A
+/// workload that fetches new keys over time separates cleanly in fetch order,
+/// so this is the ordinary case and the per-key fallback is for the interleaved
+/// one.
+///
+/// The window is closed at **both** ends, which is what makes it safe to build
+/// from a ranking taken without the write lock. An open `_fetched_at <= cutoff`
+/// would also select anything arriving after the ranking with a fetch time
+/// below that cutoff — a row this sweep never measured and never decided about,
+/// and if it belonged to an entry whose other rows are newer, half of that entry
+/// would go and the rest would be served as though it were the whole response.
+/// Bounding below at the oldest row the ranking actually saw means the delete
+/// can only reach rows that were there when the decision was made.
 ///
 /// Returns `None` if either side lacks a fetch time, or if the two overlap.
-fn bulk_cutoff(doomed: &[&EntryCost], survivors: &[&EntryCost]) -> Option<i64> {
+fn bulk_range(doomed: &[&EntryCost], survivors: &[&EntryCost]) -> Option<(i64, i64)> {
     // `try_fold` on both sides: one pass each, and a missing fetch time on
     // either stops it rather than being folded away.
-    let newest_doomed = doomed
+    let (oldest_doomed, newest_doomed) = doomed
         .iter()
-        .try_fold(i64::MIN, |acc, e| e.newest.map(|n| acc.max(n)))?;
+        .try_fold((i64::MAX, i64::MIN), |(oldest, newest), entry| {
+            Some((oldest.min(entry.oldest?), newest.max(entry.newest?)))
+        })?;
     let oldest_survivor = survivors
         .iter()
         .try_fold(i64::MAX, |acc, e| e.oldest.map(|o| acc.min(o)))?;
-    (newest_doomed < oldest_survivor).then_some(newest_doomed)
+    (newest_doomed < oldest_survivor).then_some((oldest_doomed, newest_doomed))
+}
+
+/// `from <= _fetched_at <= to`, built for the column's stored type.
+fn fetched_at_between(
+    refreshed_at: Option<&TimestampFilterConvert>,
+    from: i64,
+    to: i64,
+) -> Option<Expr> {
+    let converter = refreshed_at?;
+    Some(
+        converter
+            .convert(u128::try_from(from).ok()?, Operator::GtEq)
+            .and(converter.convert(u128::try_from(to).ok()?, Operator::LtEq)),
+    )
 }
 
 /// Chooses which entries to evict from `entries`, which must be ordered
@@ -731,7 +792,7 @@ async fn rank_entries(
 fn entry_predicate(
     key: &[(String, Option<String>)],
     ranked_newest: Option<i64>,
-    refreshed_at: &Option<TimestampFilterConvert>,
+    refreshed_at: Option<&TimestampFilterConvert>,
 ) -> Option<Expr> {
     let identity = key
         .iter()
@@ -911,7 +972,51 @@ mod tests {
         let survivors = [cost(Some(30), Some(40)), cost(Some(50), Some(60))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
-        assert_eq!(bulk_cutoff(&d, &s), Some(20));
+        assert_eq!(bulk_range(&d, &s), Some((5, 20)));
+    }
+
+    #[test]
+    fn the_bulk_window_is_closed_below_the_oldest_row_the_ranking_saw() {
+        // The ranking is taken without the write lock, so rows can arrive after
+        // it. An open `_fetched_at <= cutoff` would select one stamped below
+        // that cutoff even though this sweep never measured it — and if its
+        // entry's other rows are newer, half the entry would go and the rest
+        // would be served as though it were the whole response.
+        let doomed = [cost(Some(10), Some(20)), cost(Some(14), Some(18))];
+        let survivors = [cost(Some(30), Some(40))];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+
+        let (from, to) = bulk_range(&d, &s).expect("range");
+        assert_eq!(
+            (from, to),
+            (10, 20),
+            "the window spans exactly the rows the ranking saw"
+        );
+
+        let arrived_after_the_ranking = 5;
+        assert!(
+            arrived_after_the_ranking < from,
+            "a row stamped before anything this sweep ranked is outside the window"
+        );
+    }
+
+    #[test]
+    fn the_bulk_predicate_bounds_both_ends() {
+        // Asserted on the predicate's shape rather than on what a permissive
+        // test double does with it: the lower bound is the whole guarantee, and
+        // dropping it would still pass every eviction test in this file.
+        let rendered = fetched_at_between(refreshed_at_converter().as_ref(), 10, 20)
+            .expect("predicate")
+            .to_string();
+        assert!(
+            rendered.contains(">="),
+            "the window must be closed below: {rendered}"
+        );
+        assert!(
+            rendered.contains("<="),
+            "the window must be closed above: {rendered}"
+        );
     }
 
     #[test]
@@ -923,7 +1028,7 @@ mod tests {
         let survivors = [cost(Some(20), Some(40))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
         let s: Vec<&EntryCost> = survivors.iter().collect();
-        assert_eq!(bulk_cutoff(&d, &s), None);
+        assert_eq!(bulk_range(&d, &s), None);
     }
 
     #[test]
@@ -933,7 +1038,7 @@ mod tests {
         let d1 = [cost(Some(10), None)];
         let s1 = [cost(Some(30), Some(40))];
         assert_eq!(
-            bulk_cutoff(
+            bulk_range(
                 &d1.iter().collect::<Vec<_>>(),
                 &s1.iter().collect::<Vec<_>>()
             ),
@@ -943,7 +1048,7 @@ mod tests {
         let d2 = [cost(Some(10), Some(20))];
         let s2 = [cost(None, Some(40))];
         assert_eq!(
-            bulk_cutoff(
+            bulk_range(
                 &d2.iter().collect::<Vec<_>>(),
                 &s2.iter().collect::<Vec<_>>()
             ),
@@ -956,7 +1061,7 @@ mod tests {
         // No survivors means no boundary to violate.
         let doomed = [cost(Some(1), Some(2)), cost(Some(3), Some(4))];
         let d: Vec<&EntryCost> = doomed.iter().collect();
-        assert_eq!(bulk_cutoff(&d, &[]), Some(4));
+        assert_eq!(bulk_range(&d, &[]), Some((1, 4)));
     }
 
     #[tokio::test]
@@ -987,7 +1092,7 @@ mod tests {
         .await;
 
         assert!(
-            deleted as usize > MAX_ENTRIES_PER_SWEEP,
+            u64::try_from(MAX_ENTRIES_PER_SWEEP).is_ok_and(|cap| deleted > cap),
             "one sweep must be able to evict past the per-predicate cap, or a \
              cache over budget never converges: deleted={deleted}"
         );
@@ -998,8 +1103,8 @@ mod tests {
     /// real delete translator accepts.
     ///
     /// `MemTable`, which the tests above delete through, evaluates arbitrary
-    /// DataFusion expressions — so it accepted an `IS NULL` term that the DuckDB
-    /// accelerator rejects outright with "Expression not supported". A measured
+    /// `DataFusion` expressions — so it accepted an `IS NULL` term that the
+    /// `DuckDB` accelerator rejects outright with "Expression not supported". A measured
     /// run failed *every* sweep on that one term and evicted nothing at all,
     /// while the suite was green. The test double being more capable than the
     /// engine is what hid it, so this asserts on the predicate's shape rather
@@ -1014,13 +1119,13 @@ mod tests {
 
         let converter = refreshed_at_converter();
         let mut rendered = vec![
-            entry_predicate(&key, None, &converter)
+            entry_predicate(&key, None, converter.as_ref())
                 .expect("identity")
                 .to_string(),
-            entry_predicate(&key, Some(1_700_000_000), &converter)
+            entry_predicate(&key, Some(1_700_000_000), converter.as_ref())
                 .expect("ranked")
                 .to_string(),
-            row_level_expiry_expr(&converter, 1_700_000_000)
+            row_level_expiry_expr(converter.as_ref(), 1_700_000_000)
                 .expect("expiry")
                 .to_string(),
         ];
@@ -1047,7 +1152,7 @@ mod tests {
             ("request_path".to_string(), Some("/users".to_string())),
             ("request_query".to_string(), None),
         ];
-        assert!(entry_predicate(&with_null, None, &refreshed_at_converter()).is_none());
+        assert!(entry_predicate(&with_null, None, refreshed_at_converter().as_ref()).is_none());
 
         // The shape the HTTP connector actually stores: absent query and body
         // are empty strings, so they match by equality.
@@ -1055,7 +1160,7 @@ mod tests {
             ("request_path".to_string(), Some("/users".to_string())),
             ("request_query".to_string(), Some(String::new())),
         ];
-        let rendered = entry_predicate(&empty, Some(10), &refreshed_at_converter())
+        let rendered = entry_predicate(&empty, Some(10), refreshed_at_converter().as_ref())
             .unwrap()
             .to_string();
         assert!(
@@ -1068,7 +1173,7 @@ mod tests {
     fn entry_predicate_of_an_empty_key_is_none() {
         // Guards the delete path: an unconstrained predicate would delete the
         // whole cache.
-        assert!(entry_predicate(&[], None, &refreshed_at_converter()).is_none());
+        assert!(entry_predicate(&[], None, refreshed_at_converter().as_ref()).is_none());
     }
 
     #[test]
@@ -1256,11 +1361,8 @@ mod tests {
     /// builds, for tests that call the predicate builders directly.
     fn refreshed_at_converter() -> Option<TimestampFilterConvert> {
         let accelerator = Arc::new(
-            data_components::arrow::write::MemTable::try_new(
-                Arc::new(http_cache_schema()),
-                vec![],
-            )
-            .expect("mem table"),
+            data_components::arrow::write::MemTable::try_new(Arc::new(http_cache_schema()), vec![])
+                .expect("mem table"),
         ) as Arc<dyn TableProvider>;
         create_timestamp_filter_converter(&accelerator, CACHE_REFRESHED_AT_COLUMN, None, None, None)
     }
@@ -1443,7 +1545,9 @@ mod tests {
         let expr = combine_exprs_balanced(
             doomed
                 .iter()
-                .filter_map(|entry| entry_predicate(&entry.key, entry.newest, &refreshed_at_converter()))
+                .filter_map(|entry| {
+                    entry_predicate(&entry.key, entry.newest, refreshed_at_converter().as_ref())
+                })
                 .collect(),
             Expr::or,
         )

@@ -542,6 +542,9 @@ pub struct Refresher {
     accelerator: Arc<dyn TableProvider>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
+    /// The caching accelerator's claim set, forwarded to the refresh task so
+    /// its periodic stale-row refresh claims the keys it replaces.
+    in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     refresh_on_startup: RefreshOnStartup,
@@ -611,6 +614,7 @@ impl Refresher {
             refresh,
             accelerator,
             caching: None,
+            in_flight_revalidations: None,
             refresh_task_runner: None,
             checkpointer: None,
             refresh_on_startup: RefreshOnStartup::default(),
@@ -634,6 +638,14 @@ impl Refresher {
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
         }
+    }
+
+    pub fn in_flight_revalidations(
+        &mut self,
+        in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
+    ) -> &mut Self {
+        self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
     }
 
     pub fn caching(&mut self, caching: &Option<Arc<Caching>>) -> &mut Self {
@@ -927,6 +939,11 @@ impl Refresher {
 
         refresh_task_runner = refresh_task_runner
             .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+
+        if let Some(in_flight_revalidations) = &self.in_flight_revalidations {
+            refresh_task_runner = refresh_task_runner
+                .with_in_flight_revalidations(Arc::clone(in_flight_revalidations));
+        }
 
         let mut refresh_task_runner = refresh_task_runner.build();
 

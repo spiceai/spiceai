@@ -429,6 +429,14 @@ pub struct Acceleration {
     /// `caching_ttl` — and with `caching_stale_if_error: enabled` not even that,
     /// since expired entries are deliberately kept as fallback for a failing
     /// origin, leaving nothing to bound the acceleration.
+    ///
+    /// The budget measures the payload each entry holds — its text and
+    /// fixed-width columns — not bytes on disk, which the engine's own indexes
+    /// and compression decide. Two things it does not charge for: a response's
+    /// header map, whose size no expression here can measure, and any other
+    /// column of a type that cannot be weighed, which is warned about by name at
+    /// load. An origin sending unusually large headers therefore holds bytes
+    /// outside this ceiling.
     pub caching_max_size: Option<u64>,
 
     /// Row budget for a `refresh_mode: caching` accelerator, from

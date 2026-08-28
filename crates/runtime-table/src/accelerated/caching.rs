@@ -50,11 +50,76 @@ use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
 use util::expr::combine_exprs_balanced;
 
-/// Type alias for tracking in-flight revalidation requests.
-/// The key is a cache key derived from the filter expressions (`request_path`, `request_query`, `request_body`).
-/// When a revalidation is in progress for a cache key, other requests for the same key will skip
-/// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
-pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
+/// The cache keys a write is currently pending for, one entry per claim.
+///
+/// The key is derived from the filter expressions (`request_path`,
+/// `request_query`, `request_body`) and the namespace. Claims are taken and
+/// released through [`CacheKeyClaim`] rather than by touching this directly.
+///
+/// A synchronous lock: every critical section is one `HashSet` operation, never
+/// held across an `.await`, and [`CacheKeyClaim`]'s `Drop` must be able to
+/// release without one.
+pub type InFlightRevalidations = Arc<parking_lot::Mutex<HashSet<String>>>;
+
+/// A cache key claimed for writing, released when this is dropped.
+///
+/// One key, one writer. Two writers for the same key each append their
+/// response, leaving the key holding it twice — which queries return as
+/// duplicated source rows.
+///
+/// The claim deliberately spans the whole window in which a writer's view of
+/// the key can go stale, so it is taken *before* the origin is asked rather
+/// than after. Replacing an entry is a delete followed by an append, and a
+/// reader scanning in between sees no rows and reads a miss. By the time that
+/// reader's own fetch returns, the replacement may have landed and released;
+/// claiming only then would let it append beside a response it never saw.
+///
+/// Dropping releases the claim, so a fetch that never returns or a query
+/// cancelled while waiting for write-channel capacity cannot leave a key
+/// claimed for the life of the process — which would refuse every later write
+/// *and* revalidation for it, making one transient failure permanent.
+pub struct CacheKeyClaim {
+    key: String,
+    in_flight: InFlightRevalidations,
+    /// Set once a queued write owns the claim; that write releases it after it
+    /// has landed, so dropping this must not.
+    queued: bool,
+}
+
+impl CacheKeyClaim {
+    /// Claims `key`, or `None` when a write for it is already pending.
+    pub fn acquire(in_flight: &InFlightRevalidations, key: String) -> Option<Self> {
+        if !in_flight.lock().insert(key.clone()) {
+            return None;
+        }
+        Some(Self {
+            key,
+            in_flight: Arc::clone(in_flight),
+            queued: false,
+        })
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Hands the claim to a write that has been queued, which releases it once
+    /// the write has landed. Call only after the send has succeeded: a claim
+    /// given to a request that never reaches the flush is never released.
+    fn into_queued(mut self) {
+        self.queued = true;
+    }
+}
+
+impl Drop for CacheKeyClaim {
+    fn drop(&mut self) {
+        if self.queued {
+            return;
+        }
+        self.in_flight.lock().remove(&self.key);
+    }
+}
 
 pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
@@ -592,7 +657,9 @@ async fn flush_cache_writes(
 
     let write_ms = write_start.elapsed().as_millis();
     if let Err(e) = result {
-        tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
+        tracing::warn!(
+            "Failed to write cached responses for dataset '{dataset_name}', so those entries are not cached and the next query for them will be answered from the origin. Cause: {e}"
+        );
         health.record_failure(&e);
     } else if write_rows > 0 {
         health.record_success();
@@ -607,7 +674,7 @@ async fn flush_cache_writes(
 
     // Remove cache keys from in-flight tracking now that writes are persisted
     {
-        let mut in_flight = in_flight_revalidations.lock().await;
+        let mut in_flight = in_flight_revalidations.lock();
         for key in &cache_keys {
             in_flight.remove(key);
         }
@@ -841,6 +908,7 @@ impl CacheRefreshHelper {
         dataset_name: &str,
         ttl: Duration,
         accelerator_write_mutex: Arc<Mutex<()>>,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> DataFusionResult<usize> {
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -893,12 +961,32 @@ impl CacheRefreshHelper {
             let accelerator = Arc::clone(&accelerator);
             let dataset_name = dataset_name.to_string();
             let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
+            let in_flight_revalidations = Arc::clone(&in_flight_revalidations);
             let StaleCacheEntry {
                 filters: row_filters,
                 namespace,
             } = entry;
 
             async move {
+                // This path replaces the entry it refreshes, so it opens the
+                // same delete-then-append gap every other writer does and must
+                // hold the key for it. Without the claim a reader scanning in
+                // that gap reads a miss and appends its own copy beside this
+                // one. Held until the write below has landed; dropped with this
+                // future on any early return.
+                let namespace_id = namespace
+                    .as_deref()
+                    .unwrap_or_else(|| CacheNamespace::Public.storage_id());
+                let Some(_claim) = CacheKeyClaim::acquire(
+                    &in_flight_revalidations,
+                    compute_cache_key_from_filters_and_namespace(&row_filters, namespace_id),
+                ) else {
+                    tracing::debug!(
+                        "Skipping stale refresh for dataset {dataset_name}: a write for this entry is already pending"
+                    );
+                    return Ok::<usize, datafusion::error::DataFusionError>(0);
+                };
+
                 tracing::debug!(
                     "Refreshing stale data for dataset {} with {} filters",
                     dataset_name,
@@ -933,9 +1021,6 @@ impl CacheRefreshHelper {
                 // no namespace and no expiry — the latter reading as "no deadline
                 // to hold this to", which the eviction sweep removes on its next
                 // pass, so a refresh would undo itself.
-                let namespace_id = namespace
-                    .as_deref()
-                    .unwrap_or_else(|| CacheNamespace::Public.storage_id());
                 let storage_schema = accelerator.schema();
                 let batches = batches
                     .into_iter()
@@ -1002,11 +1087,8 @@ impl CacheRefreshHelper {
         filters: &[Expr],
         namespace: CacheNamespace,
         batch_write_tx: CacheWriteSender,
-        in_flight_revalidations: InFlightRevalidations,
+        claim: CacheKeyClaim,
     ) -> DataFusionResult<RevalidationOutcome> {
-        let cache_key =
-            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
-
         tracing::trace!(
             "Refreshing single cache entry for dataset {dataset_name} with {} filters",
             filters.len()
@@ -1015,21 +1097,17 @@ impl CacheRefreshHelper {
         // Fetch fresh data for this specific entry
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
 
-        // Skip cache writes if the source response contains transient HTTP errors.
+        // Skip cache writes if the source response contains transient HTTP
+        // errors. Returning here drops `claim`, releasing the key.
         if !cache::batches_cacheable(&batches) {
             tracing::debug!(
                 "Revalidation for dataset={dataset_name} found the origin failing (transient HTTP error response); keeping what is cached"
             );
-            // Remove from in-flight since no data to write
-            let mut in_flight = in_flight_revalidations.lock().await;
-            in_flight.remove(&cache_key);
             return Ok(RevalidationOutcome::OriginUnavailable);
         }
 
         if batches.is_empty() {
             tracing::debug!("No cacheable data for dataset={dataset_name} (source returned empty)");
-            let mut in_flight = in_flight_revalidations.lock().await;
-            in_flight.remove(&cache_key);
             return Ok(RevalidationOutcome::Empty);
         }
 
@@ -1042,15 +1120,18 @@ impl CacheRefreshHelper {
         let request = CacheWriteRequest {
             batches,
             filters: filters.to_vec(),
-            cache_key: cache_key.clone(),
+            cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
             replaces_existing: true,
         };
 
+        // The claim passes to the queued write only once the send has
+        // succeeded; on the error path it drops and releases here.
         batch_write_tx
             .send(request)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        claim.into_queued();
 
         tracing::trace!("Queued refresh for dataset={dataset_name}, {refreshed_rows} rows");
 
@@ -1295,7 +1376,23 @@ impl CacheRefreshHelper {
     /// The delete and the append are two statements, not one transaction, so a
     /// concurrent reader can see the entry briefly absent. That reads as a
     /// cache miss and refetches — it costs a request, and never serves a
-    /// partial entry, because the append that follows carries every row.
+    /// partial entry, because the append that follows carries every row. Such a
+    /// reader cannot write what it fetched: the key is claimed for the whole
+    /// replacement, including this gap (see [`CacheKeyClaim`]).
+    ///
+    /// **Deleting first is deliberate, and it is the order that fails safely.**
+    /// Without a transaction one of the two statements can land alone. If the
+    /// append fails after the delete, the entry is gone and the next read
+    /// re-fetches it — a cache miss, which is always a correct answer. Appending
+    /// first would instead leave the key holding both responses if the delete
+    /// failed, and a duplicated source row is a *wrong* answer that queries go
+    /// on returning until something else removes it. A cache may lose an entry;
+    /// it may not invent rows.
+    ///
+    /// What the deletion costs is the `caching_stale_if_error` fallback for that
+    /// entry: there is no longer an expired copy to serve if the origin is down
+    /// when the next read arrives. The failure is logged and recorded against
+    /// the dataset's health rather than passed over.
     ///
     /// # Errors
     ///
@@ -1722,8 +1819,11 @@ impl CacheRefreshHelper {
     /// * `io_runtime` - Tokio runtime handle for spawning background write tasks.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     /// * `batch_write_tx` - Channel sender for batched writes to the caching consumer.
-    /// * `in_flight_revalidations` - Keys with a write already pending, so two
-    ///   readers missing the same key do not each append the response.
+    /// * `in_flight_revalidations` - The keys a write is already pending for. A
+    ///   claim on this key is taken *before* the source is asked and held until
+    ///   the write lands, so a reader whose observation of the cache is made
+    ///   stale by a concurrent replacement cannot append beside it. See
+    ///   [`CacheKeyClaim`].
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -1740,6 +1840,13 @@ impl CacheRefreshHelper {
         namespace: CacheNamespace,
         in_flight_revalidations: InFlightRevalidations,
     ) -> SendableRecordBatchStream {
+        // Claimed before the origin is asked, not after: see [`CacheKeyClaim`]
+        // for why the window this covers has to include the fetch.
+        let claim = CacheKeyClaim::acquire(
+            &in_flight_revalidations,
+            compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id()),
+        );
+
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
                 let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1778,32 +1885,13 @@ impl CacheRefreshHelper {
                     return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
                 }
 
-                let cache_key =
-                    compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
-
-                // Claiming the key is what stops two readers that miss it
-                // concurrently from each appending the response, leaving the key
-                // holding it twice — which queries return as duplicated source
-                // rows.
-                //
-                // The claim is released by the flush that writes it, so it is
-                // taken only on the path that reaches a flush. Claiming for a
-                // response that is never enqueued would hold the key for the
-                // life of the process and refuse every later write and
-                // revalidation for it.
+                // Each arm that does not enqueue drops the claim, releasing
+                // the key for the next writer.
                 if !batches_cacheable {
                     tracing::debug!(
                         "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
                     );
-                } else if !in_flight_revalidations
-                    .lock()
-                    .await
-                    .insert(cache_key.clone())
-                {
-                    tracing::debug!(
-                        "A write for this key is already pending for dataset={dataset_name}; not enqueuing a second copy"
-                    );
-                } else {
+                } else if let Some(claim) = claim {
                     // `RecordBatch::clone` is cheap: it clones Arc pointers,
                     // not the underlying data.
                     let batches_for_propagate = batches.clone();
@@ -1819,18 +1907,20 @@ impl CacheRefreshHelper {
                     let write_request = CacheWriteRequest {
                         batches: batches.clone(),
                         filters: filters.to_vec(),
-                        cache_key: cache_key.clone(),
+                        cache_key: claim.key().to_string(),
                         namespace_id: namespace.storage_id().into(),
                         replaces_existing: is_expired,
                     };
+                    // The claim passes to the queued write only once the send
+                    // has succeeded. A failed send — or a cancellation while
+                    // waiting for capacity — drops it instead, so no flush is
+                    // owed a release that will never come.
                     if let Err(e) = batch_write_tx.send(write_request).await {
                         tracing::warn!(
                             "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
                         );
-                        // No flush will run for this key, so release the
-                        // claim here instead of holding it for good.
-                        in_flight_revalidations.lock().await.remove(&cache_key);
                     } else {
+                        claim.into_queued();
                         tracing::trace!(
                             "Enqueued cache write for dataset={dataset_name}, {cache_rows} rows",
                         );
@@ -1854,6 +1944,10 @@ impl CacheRefreshHelper {
 
                     tracing::debug!(
                         "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
+                    );
+                } else {
+                    tracing::debug!(
+                        "A write for this key is already pending for dataset={dataset_name}; not enqueuing a second copy"
                     );
                 }
 
@@ -1911,7 +2005,7 @@ impl CacheRefreshHelper {
     /// - `Stale`: Return cached data immediately, trigger background refresh (if not already in-flight)
     /// - `Expired`: This should not be called for expired data (handled as cache miss)
     #[expect(clippy::too_many_arguments)]
-    async fn handle_cache_hit(
+    fn handle_cache_hit(
         cached_batches: Vec<RecordBatch>,
         federated: &Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -1947,28 +2041,17 @@ impl CacheRefreshHelper {
                     );
                 }
                 CacheFreshness::Stale => {
-                    // Compute cache key to check for in-flight revalidation
-                    let cache_key = compute_cache_key_from_filters_and_namespace(
-                        filters,
-                        namespace.storage_id(),
+                    // One revalidation per key: the claim is held for the
+                    // whole refresh and released by the write that lands it.
+                    let claim = CacheKeyClaim::acquire(
+                        in_flight_revalidations,
+                        compute_cache_key_from_filters_and_namespace(
+                            filters,
+                            namespace.storage_id(),
+                        ),
                     );
 
-                    // Try to acquire the revalidation slot for this cache key
-                    // Use async lock since we're in an async context
-                    let should_revalidate = {
-                        let mut in_flight = in_flight_revalidations.lock().await;
-                        if in_flight.contains(&cache_key) {
-                            tracing::debug!(
-                                "Skipping background refresh for dataset={dataset_name}, cache_key={cache_key} - revalidation already in progress"
-                            );
-                            false
-                        } else {
-                            in_flight.insert(cache_key.clone());
-                            true
-                        }
-                    };
-
-                    if should_revalidate {
+                    if let Some(claim) = claim {
                         tracing::debug!(
                             "Data is stale for dataset={dataset_name}, triggering background refresh"
                         );
@@ -1983,11 +2066,9 @@ impl CacheRefreshHelper {
 
                         let federated_clone = Arc::clone(federated);
                         let dataset_name_clone = dataset_name.to_string();
-                        let in_flight_clone = Arc::clone(in_flight_revalidations);
                         let filters_for_refresh: Vec<Expr> = filters.to_vec();
-                        let batch_write_tx_clone = batch_write_tx.clone();
-                        let cache_key_clone = cache_key.clone();
-                        let namespace_clone = namespace.clone();
+                        let batch_write_tx_clone = batch_write_tx;
+                        let namespace_clone = namespace;
 
                         io_runtime.spawn(async move {
                             tracing::debug!(
@@ -1999,7 +2080,7 @@ impl CacheRefreshHelper {
                                 &filters_for_refresh,
                                 namespace_clone,
                                 batch_write_tx_clone,
-                                Arc::clone(&in_flight_clone),
+                                claim,
                             )
                             .await;
 
@@ -2018,13 +2099,11 @@ impl CacheRefreshHelper {
                                     tracing::debug!("Background refresh task completed for dataset={dataset_name_clone}, refreshed {rows} rows", rows = outcome.rows());
                                 }
                                 Err(e) => {
+                                    // The claim was dropped with the failed
+                                    // refresh, so the key is already released.
                                     tracing::error!(
                                         "Background refresh task failed for dataset={dataset_name_clone}: {e}"
                                     );
-                                    // Remove from in-flight only on failure
-                                    // On success, cache_key is removed by flush_cache_writes after write completes
-                                    let mut in_flight = in_flight_clone.lock().await;
-                                    in_flight.remove(&cache_key_clone);
                                 }
                             }
                         });
@@ -2339,7 +2418,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     batch_write_tx.clone(),
                     namespace,
                 )
-                .await
             } else {
                 // Cache miss - no data in accelerator - retrieve from source and store in accelerator
                 tracing::debug!(
@@ -3668,7 +3746,7 @@ mod tests {
         let max_age = Some(Duration::from_mins(1)); // 60 second TTL
         let stale_while_revalidate = Some(Duration::from_mins(5)); // 5 minute SWR window
         let in_flight_revalidations: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
         let (batch_write_tx, _consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
@@ -3691,8 +3769,7 @@ mod tests {
             &in_flight_revalidations,
             batch_write_tx,
             CacheNamespace::Public,
-        )
-        .await;
+        );
 
         // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
         tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
@@ -3735,7 +3812,7 @@ mod tests {
         );
 
         // Verify in-flight tracking was cleaned up
-        let in_flight = in_flight_revalidations.lock().await;
+        let in_flight = in_flight_revalidations.lock();
         assert!(
             in_flight.is_empty(),
             "In-flight revalidation set should be empty after refresh completes"
@@ -3788,7 +3865,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
         let (tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
@@ -3842,7 +3919,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
@@ -3970,7 +4047,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         let stale = stale_cached_batch(&schema, "last good response");
@@ -4016,7 +4093,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         let stale = stale_cached_batch(&schema, "last good response");
@@ -4051,7 +4128,7 @@ mod tests {
     async fn a_revalidation_reports_a_failing_origin_rather_than_zero_rows() {
         let http_source = Arc::new(MockHttpTableProvider::with_status(429, "slow down"));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
             http_source.schema(),
             vec![],
@@ -4064,7 +4141,7 @@ mod tests {
             &[col("content").eq(lit("test"))],
             CacheNamespace::Public,
             batch_write_tx,
-            Arc::clone(&in_flight),
+            CacheKeyClaim::acquire(&in_flight, "key".to_string()).expect("claim"),
         )
         .await
         .expect("revalidation should not error");
@@ -4091,7 +4168,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // Stand in for the first reader: its write for this key is already
@@ -4101,7 +4178,7 @@ mod tests {
             &filters,
             CacheNamespace::Public.storage_id(),
         );
-        in_flight.lock().await.insert(key);
+        in_flight.lock().insert(key);
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
             Arc::clone(&http_source) as Arc<dyn TableProvider>,
@@ -4137,6 +4214,125 @@ mod tests {
         );
     }
 
+    /// A claim that is never handed to a write releases its key when dropped.
+    #[tokio::test]
+    async fn a_dropped_claim_releases_its_key() {
+        // This is what makes a cancelled query safe. The miss path holds the
+        // claim across the fetch and across the enqueue, so a client that
+        // disconnects, or a send that blocks on a full write channel, drops the
+        // future somewhere in the middle. Without release-on-drop that key
+        // stays claimed for the life of the process and every later write and
+        // revalidation for it is refused.
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+        {
+            let claim = CacheKeyClaim::acquire(&in_flight, "k".to_string()).expect("claim");
+            assert_eq!(claim.key(), "k");
+            assert!(
+                CacheKeyClaim::acquire(&in_flight, "k".to_string()).is_none(),
+                "a claimed key must refuse a second claim"
+            );
+        }
+
+        assert!(
+            in_flight.lock().is_empty(),
+            "dropping a claim must release its key"
+        );
+        assert!(
+            CacheKeyClaim::acquire(&in_flight, "k".to_string()).is_some(),
+            "the key is claimable again"
+        );
+    }
+
+    /// A claim handed to a queued write is released by that write, not by the
+    /// scope that raised it.
+    #[tokio::test]
+    async fn a_queued_claim_outlives_the_scope_that_raised_it() {
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+        {
+            let claim = CacheKeyClaim::acquire(&in_flight, "k".to_string()).expect("claim");
+            claim.into_queued();
+        }
+
+        assert!(
+            in_flight.lock().contains("k"),
+            "the flush that writes this key is the one that releases it"
+        );
+    }
+
+    /// The periodic refresh replaces the entries it refreshes, so it opens the
+    /// same delete-then-append gap as every other writer and must hold the key.
+    #[tokio::test]
+    async fn the_periodic_refresh_skips_an_entry_whose_key_is_already_claimed() {
+        // Without the claim, a reader scanning that gap sees no rows, reads a
+        // miss, and appends its own copy beside this one — leaving the key
+        // holding the response twice.
+        let origin = Arc::new(MockHttpTableProvider::with_status(200, "fresh-body"));
+        let schema = origin.schema();
+
+        #[expect(clippy::cast_possible_truncation)]
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as i64;
+
+        let stale = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["/a"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["good-body"])) as ArrayRef,
+                Arc::new(arrow::array::UInt16Array::from(vec![200_u16])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![Some(fetched_long_ago)])) as ArrayRef,
+            ],
+        )
+        .expect("stale row");
+
+        // Claim the key exactly as the refresh will compute it.
+        let entries =
+            CacheRefreshHelper::extract_unique_stale_entries(std::slice::from_ref(&stale))
+                .expect("stale entries");
+        let entry = entries.first().expect("one stale entry");
+        let namespace_id = entry
+            .namespace
+            .as_deref()
+            .unwrap_or_else(|| CacheNamespace::Public.storage_id());
+        let in_flight: InFlightRevalidations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let _held = CacheKeyClaim::acquire(
+            &in_flight,
+            compute_cache_key_from_filters_and_namespace(&entry.filters, namespace_id),
+        )
+        .expect("claim");
+
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![stale]],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        let refreshed = CacheRefreshHelper::refresh_all_stale_rows(
+            Arc::clone(&origin) as Arc<dyn TableProvider>,
+            Arc::clone(&accelerator),
+            "test_dataset",
+            Duration::from_secs(1),
+            Arc::new(Mutex::new(())),
+            Arc::clone(&in_flight),
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(
+            refreshed, 0,
+            "an entry another writer already holds must be left to them"
+        );
+    }
+
     /// The claim a miss takes is released by the flush that writes it, so a
     /// response that is never enqueued must never claim.
     #[tokio::test]
@@ -4154,7 +4350,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         let mut stream = CacheRefreshHelper::handle_cache_miss(
@@ -4182,7 +4378,7 @@ mod tests {
         handle.abort();
 
         assert!(
-            in_flight.lock().await.is_empty(),
+            in_flight.lock().is_empty(),
             "a key whose response was never enqueued must not stay claimed"
         );
     }
@@ -4198,7 +4394,7 @@ mod tests {
         let schema = origin.schema();
 
         #[expect(clippy::cast_possible_truncation)]
-        let fetched_long_ago = (SystemTime::now() - Duration::from_secs(3600))
+        let fetched_long_ago = (SystemTime::now() - Duration::from_hours(1))
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos() as i64;
@@ -4229,6 +4425,7 @@ mod tests {
             "test_dataset",
             Duration::from_secs(1),
             Arc::new(Mutex::new(())),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         )
         .await
         .expect("refresh");
@@ -4282,7 +4479,7 @@ mod tests {
             vec![],
         ));
         let in_flight: InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
@@ -4755,7 +4952,7 @@ mod write_path_tests {
             Arc::clone(accelerator),
             TableReference::bare("test_dataset"),
             Arc::new(Mutex::new(())),
-            Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             Arc::new(AtomicI64::new(0)),
             RuntimeStatus::new(),
         );
