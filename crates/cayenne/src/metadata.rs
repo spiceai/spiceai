@@ -502,12 +502,11 @@ impl PkConflictDetection {
 #[serde(rename_all = "kebab-case")]
 pub enum DeletionMode {
     /// Resolve the mode from the table's configuration (the default). `Auto`
-    /// resolves to [`Self::Position`] — the merge-on-read path — for every table:
-    /// a primary-key table captures positions via the `row_idx()` read-back
-    /// (with key-based fallback for not-yet-captured rows), and a PK-less table
-    /// uses the long-standing `PositionBased` strategy. The presence of a primary
-    /// key selects the *mechanism*; the resolved *mode* is position either way.
-    /// Use [`Self::Key`] to explicitly opt out. See [`Self::resolved`].
+    /// resolves to [`Self::Key`] for tables with a primary key (key-based deletes
+    /// compact concurrently with writers and are pruned by seq-prefix bake),
+    /// and to [`Self::Position`] for PK-less tables (using the long-standing
+    /// `PositionBased` strategy). Use [`Self::Position`] to explicitly opt into
+    /// position deletes on a PK table. See [`Self::resolved`].
     #[default]
     Auto,
     /// Record deletions by primary-key bytes + sequence number and apply them
@@ -551,34 +550,25 @@ impl DeletionMode {
     /// Resolve `Auto` against the table's configuration, returning a concrete
     /// [`Self::Key`] or [`Self::Position`].
     ///
-    /// `Auto` resolves to **position** — the merge-on-read path that pushes
-    /// per-file position deletes into the Vortex scan. For a table **with** a
-    /// primary key, positions are captured by the `row_idx()` read-back after
-    /// each write (and any row whose position isn't yet known falls back to a
-    /// key-based delete, so this is always correct — under bursty back-to-back
-    /// writes the capture may not have run yet and the key path is used); for a
-    /// table **without** a primary key it is the long-standing `PositionBased`
-    /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
-    /// resolved *mode* is position either way.
+    /// For a table **with** a primary key, `Auto` resolves to [`Self::Key`] —
+    /// key-based deletions are recorded by PK bytes and sequence number, compact
+    /// concurrently with writers, and are garbage-collected by the seq-prefix bake
+    /// pass. For a table **without** a primary key, `Auto` resolves to
+    /// [`Self::Position`] (the long-standing `PositionBased` strategy).
     ///
-    /// NOTE: the Spice accelerator's auto-tune layer pre-resolves `Auto` to
-    /// [`Self::Key`] for `refresh_mode: changes` (CDC) tables that have a
-    /// primary key BEFORE the config reaches this engine-level resolution —
-    /// position-delete compaction must serialize with writers and starves
-    /// under continuous CDC, while key-delete compaction runs concurrently.
-    /// This function therefore only sees `Auto` for non-CDC tables (and PK-less
-    /// CDC tables), where position remains the right resolution.
+    /// [`Self::Position`] can be explicitly configured on a PK table to push
+    /// per-file position deletes into the Vortex scan.
     ///
-    /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
-    /// meaning with a PK; a PK-less table can only do position-based deletion, so
-    /// `Key` there resolves to `Position`.
+    /// [`Self::Key`] on a PK-less table has no key to record, so it resolves to
+    /// [`Self::Position`].
     #[must_use]
     pub const fn resolved(self, has_primary_key: bool) -> Self {
         match self {
             // `Key` is only honored when there is a key to record.
-            Self::Key if has_primary_key => Self::Key,
-            // Everything else is position-based: `Auto` and `Position` always,
-            // and `Key` on a PK-less table (there is no key to record).
+            // `Auto` resolves to `Key` for primary-key tables.
+            Self::Auto | Self::Key if has_primary_key => Self::Key,
+            // Everything else is position-based: `Position` always,
+            // and `Auto` or `Key` on a PK-less table (there is no key to record).
             Self::Auto | Self::Position | Self::Key => Self::Position,
         }
     }
@@ -957,11 +947,10 @@ pub struct VortexConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// Defaults to [`DeletionMode::Auto`], which resolves to `position`
-    /// (merge-on-read): deletes are pushed into the Vortex scan as per-file
-    /// row-position bitmaps, eliminating the per-row `RowConverter` deletion tax
-    /// above the scan. Set `cayenne_deletion_mode: key` to opt out and keep the
-    /// above-scan key-based filter.
+    /// Defaults to [`DeletionMode::Auto`], which resolves to `key` for PK tables
+    /// (key-based deletes compact concurrently and are pruned by seq-prefix bake)
+    /// and `position` for PK-less tables. Set `cayenne_deletion_mode: position` to
+    /// explicitly opt into merge-on-read position deletes on a PK table.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
@@ -1583,7 +1572,23 @@ impl Default for VortexConfig {
     reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
 )]
 mod tests {
-    use super::{PkConflictDetection, ScanConcurrency, VortexConfig};
+    use super::{DeletionMode, PkConflictDetection, ScanConcurrency, VortexConfig};
+
+    #[test]
+    fn test_deletion_mode_resolved() {
+        assert_eq!(DeletionMode::Auto.resolved(true), DeletionMode::Key);
+        assert_eq!(DeletionMode::Auto.resolved(false), DeletionMode::Position);
+        assert_eq!(DeletionMode::Key.resolved(true), DeletionMode::Key);
+        assert_eq!(DeletionMode::Key.resolved(false), DeletionMode::Position);
+        assert_eq!(
+            DeletionMode::Position.resolved(true),
+            DeletionMode::Position
+        );
+        assert_eq!(
+            DeletionMode::Position.resolved(false),
+            DeletionMode::Position
+        );
+    }
 
     /// `scan_concurrency` must survive a metastore round trip, and a config
     /// written before the field existed must still load.
