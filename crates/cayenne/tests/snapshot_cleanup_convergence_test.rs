@@ -53,6 +53,10 @@ const REPLACES: usize = 24;
 /// for one just-published successor.
 const MAX_RETAINED_DIRS: usize = 2;
 
+/// Rows each replace writes, so the final read can assert the surviving
+/// generation is complete rather than only counting directories.
+const ROWS_PER_REPLACE: i64 = 2_000;
+
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -63,7 +67,7 @@ fn schema() -> SchemaRef {
 /// Rows big enough that the replace writes Vortex files rather than riding in
 /// the metastore inline tier — the file tier is what accumulates.
 fn batch(generation: i64) -> RecordBatch {
-    let ids: Vec<i64> = (0..2_000).collect();
+    let ids: Vec<i64> = (0..ROWS_PER_REPLACE).collect();
     let values: Vec<i64> = ids.iter().map(|id| id + generation).collect();
     RecordBatch::try_new(
         schema(),
@@ -138,6 +142,7 @@ async fn repeated_replaces_converge_to_the_live_footprint() -> TestResult<()> {
         )
         .await?,
     );
+    ctx.register_table("replaced", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     let table_dir = tmp.path().join(table.table_id());
 
     // Drive the replaces as fast as they will go: the whole point is that the
@@ -163,13 +168,42 @@ async fn repeated_replaces_converge_to_the_live_footprint() -> TestResult<()> {
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let dirs = snapshot_dirs(&table_dir);
+        // Zero dirs is a failure, not convergence: it would mean the sweep took
+        // the live snapshot along with the superseded ones.
+        assert!(
+            !dirs.is_empty(),
+            "the sweep deleted every snapshot dir, including the live one"
+        );
         if dirs.len() <= MAX_RETAINED_DIRS {
+            let current = table_dir.join(&catalog.get_table("replaced").await?.current_snapshot_id);
+            assert!(
+                current.is_dir(),
+                "the live snapshot dir {} must survive the sweep; {} dir(s) remain",
+                current.display(),
+                dirs.len()
+            );
             let bytes = bytes_under(&table_dir);
             assert!(
                 bytes <= live_bytes * MAX_RETAINED_DIRS as u64,
                 "footprint {bytes} B should be within {MAX_RETAINED_DIRS}x the live \
                  {live_bytes} B after converging to {} dir(s)",
                 dirs.len()
+            );
+            // Scan the surviving generation: a sweep that unlinked live files
+            // would still leave the right directory count.
+            let scanned = ctx
+                .sql("SELECT count(*) AS n FROM replaced")
+                .await?
+                .collect()
+                .await?;
+            let rows = scanned
+                .first()
+                .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
+                .map(|counts| counts.value(0))
+                .expect("count(*) returns one Int64 row");
+            assert_eq!(
+                rows, ROWS_PER_REPLACE,
+                "the surviving snapshot must still scan its full generation"
             );
             return Ok(());
         }
