@@ -1692,14 +1692,6 @@ impl SqliteMetastore {
         tokio::fs::metadata(&wal_path).await.map_or(0, |m| m.len())
     }
 
-    /// Read the current database file size in bytes (cheap `stat()`), without
-    /// recording it. Best-effort: an unreadable or in-memory database reports 0.
-    async fn read_db_bytes(&self) -> u64 {
-        tokio::fs::metadata(self.db_path())
-            .await
-            .map_or(0, |m| m.len())
-    }
-
     /// Sample the metastore's on-disk footprint — the database file and its
     /// `-wal` — and publish both gauges.
     ///
@@ -1713,12 +1705,28 @@ impl SqliteMetastore {
     /// sample overwriting the others on one series — which is what the WAL gauge
     /// did before this.
     async fn sample_file_footprint(&self) {
+        // Both stats in ONE `spawn_blocking`. `tokio::fs` dispatches each call to
+        // the blocking pool individually, and this runs on the post-write
+        // maintenance loop's ~100 ms debounce — so two `tokio::fs::metadata`
+        // calls would be two task hops per pass under sustained CDC, for two
+        // numbers a scrape reads once a second.
+        let db_path = self.db_path().to_string();
+        let wal_path = format!("{db_path}-wal");
+        let Ok((db_bytes, wal_bytes)) = tokio::task::spawn_blocking(move || {
+            let size = |path: &str| std::fs::metadata(path).map_or(0, |m| m.len());
+            (size(&db_path), size(&wal_path))
+        })
+        .await
+        else {
+            return;
+        };
+
         let dimensions = [telemetry::KeyValue::new(
             "catalog",
             self.db_path().to_string(),
         )];
-        telemetry::cayenne::track_metastore_wal_bytes(self.read_wal_bytes().await, &dimensions);
-        telemetry::cayenne::track_metastore_db_bytes(self.read_db_bytes().await, &dimensions);
+        telemetry::cayenne::track_metastore_wal_bytes(wal_bytes, &dimensions);
+        telemetry::cayenne::track_metastore_db_bytes(db_bytes, &dimensions);
     }
 }
 

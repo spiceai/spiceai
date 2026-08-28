@@ -139,28 +139,22 @@ impl MetastoreImpl {
     /// best-effort observability path, and a backend that will not answer the
     /// pragma must not fail the maintenance pass that asked.
     pub(crate) async fn freelist_bytes(&self) -> CatalogResult<u64> {
-        let read_pragma = async |sql: &'static str| -> Option<i64> {
-            self.query_row_helper(
+        // One round trip: two `PRAGMA` statements would each acquire a pooled
+        // connection and hop to its thread for a single integer, and `page_size`
+        // is immutable for the life of the database anyway.
+        let bytes = self
+            .query_row_helper(
                 QueryRowParams {
-                    sql,
+                    sql: "SELECT (SELECT freelist_count FROM pragma_freelist_count()) \
+                          * (SELECT page_size FROM pragma_page_size())",
                     params: Vec::new(),
                 },
                 |row| row.get_i64(0),
             )
             .await
-            .ok()
-        };
+            .ok();
 
-        let (Some(pages), Some(page_size)) = (
-            read_pragma("PRAGMA freelist_count").await,
-            read_pragma("PRAGMA page_size").await,
-        ) else {
-            return Ok(0);
-        };
-
-        Ok(u64::try_from(pages)
-            .unwrap_or(0)
-            .saturating_mul(u64::try_from(page_size).unwrap_or(0)))
+        Ok(bytes.and_then(|b| u64::try_from(b).ok()).unwrap_or(0))
     }
 
     /// Bytes each metastore table occupies inside the database file, indexes
@@ -178,9 +172,16 @@ impl MetastoreImpl {
         let rows = self
             .query_helper(
                 QueryParams {
+                    // `dbstat('main', 1)` is AGGREGATE mode: one row per B-tree
+                    // rather than one per page. `dbstat` walks every page either
+                    // way, so the saving is the vtab round trips — measured at
+                    // 260ms -> 150ms on a 405 MB metastore, and this cost scales
+                    // with database size rather than table count. Available since
+                    // SQLite 3.31; the error path below already degrades to an
+                    // empty vector on a backend that lacks it.
                     sql: r"
                     SELECT COALESCE(m.tbl_name, d.name) AS owner, SUM(d.pgsize)
-                    FROM dbstat d
+                    FROM dbstat('main', 1) d
                     LEFT JOIN sqlite_master m ON m.name = d.name
                     WHERE owner LIKE 'cayenne_%'
                     GROUP BY owner
@@ -4296,22 +4297,37 @@ impl MetadataCatalog for CayenneCatalog {
             .metastore
             .query_row_helper(
                 QueryRowParams {
+                    // One scan per table, cross-joined — not one scalar subquery
+                    // per COLUMN. Three of these aggregates read
+                    // `cayenne_delete_file` with the same predicate, three read
+                    // `cayenne_cold_tier_file`, and so on; as separate subqueries
+                    // each is its own index scan. Measured 55ms -> 35ms on a
+                    // metastore with 50k delete files and 100k cold-tier files.
                     sql: r"
                     SELECT
-                        (SELECT COUNT(*) FROM cayenne_delete_file WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(file_size_bytes), 0) FROM cayenne_delete_file WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(delete_count), 0) FROM cayenne_delete_file WHERE table_id = ?1),
-                        (SELECT COUNT(*) FROM cayenne_cold_tier_file WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(file_size_bytes), 0) FROM cayenne_cold_tier_file WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(row_count), 0) FROM cayenne_cold_tier_file WHERE table_id = ?1),
+                        df.n, df.bytes, df.deletes,
+                        ctf.n, ctf.bytes, ctf.row_total,
                         (SELECT COUNT(*) FROM cayenne_snapshot_sequence WHERE table_id = ?1),
                         (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
                         (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
-                        (SELECT COUNT(*) FROM cayenne_inlined_data WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(record_count), 0) FROM cayenne_inlined_data WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(LENGTH(data_ipc)), 0) FROM cayenne_inlined_data WHERE table_id = ?1),
-                        (SELECT COUNT(*) FROM cayenne_inlined_delete WHERE table_id = ?1),
-                        (SELECT COALESCE(SUM(delete_count), 0) FROM cayenne_inlined_delete WHERE table_id = ?1)
+                        idt.n, idt.row_total, idt.bytes,
+                        idl.n, idl.deletes
+                    FROM
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_delete_file WHERE table_id = ?1) df,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(row_count), 0) AS row_total
+                         FROM cayenne_cold_tier_file WHERE table_id = ?1) ctf,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(record_count), 0) AS row_total,
+                                COALESCE(SUM(LENGTH(data_ipc)), 0) AS bytes
+                         FROM cayenne_inlined_data WHERE table_id = ?1) idt,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_inlined_delete WHERE table_id = ?1) idl
                     ",
                     params: vec![
                         MetastoreValue::Text(table_id.to_string()),

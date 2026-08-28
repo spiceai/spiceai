@@ -1496,7 +1496,7 @@ A resident figure far above `query_memory_pool_used_bytes` has two possible caus
 
 **Fleet ceilings.** A table whose index refuses to grow because the *process-global* budget is exhausted looks, in every per-table gauge, exactly like a table that is simply small:
 
-- `cayenne_fleet_budget_used_bytes{budget}` and `cayenne_fleet_budget_limit_bytes{budget}` — for `budget` ∈ `pk_keyset`, `mem_tier`. `used` at the ceiling is the reason a keyset degraded to a bloom.
+- `cayenne_pk_keyset_budget_used_bytes` / `_total_bytes` and the pre-existing `cayenne_mem_tier_budget_used_bytes` / `_total_bytes` — the two process-global ceilings. `used` at the total is the reason a keyset degraded to a bloom rather than growing.
 
 Together with `cayenne_pk_index_budget_bytes{table, site}` — the per-table budget the `auto` tier derived, which is what multiplies across tables into a large fleet total — that accounts for the whole PK-keyset hypothesis: how large each table's index is, what it is allowed to reach, whether the fleet is at its ceiling, and which format each table settled on.
 
@@ -1525,7 +1525,7 @@ Reported as a numeric gauge rather than a label for the reason `cayenne_data_sto
 
 - `cayenne_pk_index_bytes{table, site}` — approximate resident bytes of that cache, whichever representation it holds
 - `cayenne_pk_index_keys{table, site}` — DISTINCT keys that cache covers, published **only in exact mode**. A bloom cannot enumerate its members, so it reports `cayenne_pk_bloom_insertions` instead (see below); publishing a bloom's tally under a name that says "keys" made a hot-key workload look like unbounded cardinality growth
-- `cayenne_pk_index_budget_bytes{table, site}` — the *effective* budget for that cache: half the per-table figure on a sharded table, already clamped by whatever the fleet has left (the process-global ceiling itself is `cayenne_fleet_budget_limit_bytes{budget="pk_keyset"}`)
+- `cayenne_pk_index_budget_bytes{table, site}` — the *effective* budget for that cache: half the per-table figure on a sharded table, already clamped by whatever the fleet has left (the process-global ceiling itself is `cayenne_pk_keyset_budget_total_bytes`)
 
 The three are only interpretable together. Bytes alone cannot distinguish an **exact keyset growing toward its budget** (which will degrade to a bloom and give most of them back) from a **bloom already at its fixed size** (which will not shrink); the budget alone says nothing about how close the table is to that transition. `bytes / budget_bytes` at `format = 1` is the countdown to a format change.
 

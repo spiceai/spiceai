@@ -53,6 +53,16 @@ pub(crate) enum CompactionKind {
 }
 
 impl CompactionKind {
+    /// Every variant — see `CompactionOutcome::ALL`.
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Full,
+        Self::SubsetCurrent,
+        Self::ProtectedSubset,
+        Self::Bake,
+        Self::Datalake,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -124,6 +134,34 @@ pub(crate) enum CompactionOutcome {
 }
 
 impl CompactionOutcome {
+    /// Every variant. The uniqueness and `declined_`-prefix tests iterate this,
+    /// so a variant added without touching it would escape both — which is
+    /// exactly what those tests exist to prevent, and what a hand-maintained
+    /// list inside the test module cannot stop.
+    ///
+    /// `cfg(test)` because the tests are the only consumer; the list is a
+    /// testing aid, not part of the vocabulary the emitters use.
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Committed,
+        Self::NoOp,
+        Self::AbortedConcurrentChange,
+        Self::Failed,
+        Self::DeclinedStagingInflight,
+        Self::DeclinedBelowTrigger,
+        Self::DeclinedLockBusy,
+        Self::DeclinedWriterActive,
+        Self::DeclinedNotKeyMode,
+        Self::DeclinedNotConfigured,
+        Self::DeclinedApplyBackpressure,
+        Self::DeclinedNoCandidates,
+        Self::DeclinedAboveDeleteFence,
+        Self::DeclinedOverPassBudget,
+        Self::DeclinedNoQualifyingTier,
+        Self::DeclinedSizingFailed,
+        Self::DeclinedNoCleanPrefix,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Committed => "committed",
@@ -164,6 +202,16 @@ pub(crate) enum CompactionTrigger {
 }
 
 impl CompactionTrigger {
+    /// Every variant — see `CompactionOutcome::ALL`.
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::SmallFileCount,
+        Self::ProtectedSnapshotCount,
+        Self::ProtectedSnapshotAge,
+        Self::DeletionIndex,
+        Self::DeletionIndexMemoryCeiling,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::SmallFileCount => "small_file_count",
@@ -187,6 +235,12 @@ pub(crate) enum MaintenanceOp {
 }
 
 impl MaintenanceOp {
+    /// Every variant. Iterated by `register_all` as well as the tests, so this
+    /// one is not `cfg(test)` — a new operation is registered at zero the moment
+    /// it is added to the list.
+    pub(crate) const ALL: &'static [Self] =
+        &[Self::OrphanDvSweep, Self::Retention, Self::RetiredDirSweep];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OrphanDvSweep => "orphan_dv_sweep",
@@ -224,6 +278,19 @@ pub(crate) enum MaintenanceOutcome {
 }
 
 impl MaintenanceOutcome {
+    /// Every variant — see `CompactionOutcome::ALL`.
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Reclaimed,
+        Self::NoOp,
+        Self::Coalesced,
+        Self::DeclinedNotConfigured,
+        Self::DeclinedBelowThreshold,
+        Self::DeclinedManifestUnprovable,
+        Self::DeclinedNotDue,
+        Self::Failed,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Reclaimed => "reclaimed",
@@ -274,11 +341,7 @@ pub(crate) fn track_maintenance(table: &str, op: MaintenanceOp, outcome: Mainten
 /// the second being a reason to disbelieve the query. Idempotent: adding zero to
 /// a counter leaves its value alone, so the registration can ride any tick.
 pub(crate) fn register_all(table: &str) {
-    for op in [
-        MaintenanceOp::OrphanDvSweep,
-        MaintenanceOp::Retention,
-        MaintenanceOp::RetiredDirSweep,
-    ] {
+    for op in MaintenanceOp::ALL.iter().copied() {
         telemetry::cayenne::register_maintenance_counters(&[
             KeyValue::new("table", table.to_string()),
             KeyValue::new("op", op.as_str()),
@@ -306,43 +369,12 @@ mod tests {
     };
     use std::collections::HashSet;
 
-    const MAINTENANCE_OUTCOMES: [MaintenanceOutcome; 8] = [
-        MaintenanceOutcome::Reclaimed,
-        MaintenanceOutcome::NoOp,
-        MaintenanceOutcome::Coalesced,
-        MaintenanceOutcome::DeclinedNotConfigured,
-        MaintenanceOutcome::DeclinedBelowThreshold,
-        MaintenanceOutcome::DeclinedManifestUnprovable,
-        MaintenanceOutcome::DeclinedNotDue,
-        MaintenanceOutcome::Failed,
-    ];
-
-    const COMPACTION_OUTCOMES: [CompactionOutcome; 17] = [
-        CompactionOutcome::Committed,
-        CompactionOutcome::NoOp,
-        CompactionOutcome::AbortedConcurrentChange,
-        CompactionOutcome::Failed,
-        CompactionOutcome::DeclinedStagingInflight,
-        CompactionOutcome::DeclinedBelowTrigger,
-        CompactionOutcome::DeclinedLockBusy,
-        CompactionOutcome::DeclinedWriterActive,
-        CompactionOutcome::DeclinedNotKeyMode,
-        CompactionOutcome::DeclinedNotConfigured,
-        CompactionOutcome::DeclinedApplyBackpressure,
-        CompactionOutcome::DeclinedNoCandidates,
-        CompactionOutcome::DeclinedAboveDeleteFence,
-        CompactionOutcome::DeclinedOverPassBudget,
-        CompactionOutcome::DeclinedNoQualifyingTier,
-        CompactionOutcome::DeclinedSizingFailed,
-        CompactionOutcome::DeclinedNoCleanPrefix,
-    ];
-
     /// Two outcomes sharing a label would silently merge two different
     /// diagnoses into one time series.
     #[test]
     fn every_label_value_is_distinct() {
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for outcome in COMPACTION_OUTCOMES {
+        for outcome in CompactionOutcome::ALL.iter().copied() {
             assert!(
                 seen.insert(outcome.as_str()),
                 "duplicate compaction outcome label: {}",
@@ -351,7 +383,7 @@ mod tests {
         }
 
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for outcome in MAINTENANCE_OUTCOMES {
+        for outcome in MaintenanceOutcome::ALL.iter().copied() {
             assert!(
                 seen.insert(outcome.as_str()),
                 "duplicate maintenance outcome label: {}",
@@ -360,13 +392,7 @@ mod tests {
         }
 
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for kind in [
-            CompactionKind::Full,
-            CompactionKind::SubsetCurrent,
-            CompactionKind::ProtectedSubset,
-            CompactionKind::Bake,
-            CompactionKind::Datalake,
-        ] {
+        for kind in CompactionKind::ALL.iter().copied() {
             assert!(
                 seen.insert(kind.as_str()),
                 "duplicate compaction kind label: {}",
@@ -385,7 +411,7 @@ mod tests {
         // them: one unprefixed decline in either drops silently out of the
         // answer to "what is stopping maintenance". `not_configured` was exactly
         // that — a pass that never ran, invisible to the selector.
-        for outcome in MAINTENANCE_OUTCOMES {
+        for outcome in MaintenanceOutcome::ALL.iter().copied() {
             let is_decline = !matches!(
                 outcome,
                 MaintenanceOutcome::Reclaimed
@@ -400,7 +426,7 @@ mod tests {
                 outcome.as_str()
             );
         }
-        for outcome in COMPACTION_OUTCOMES {
+        for outcome in CompactionOutcome::ALL.iter().copied() {
             let is_decline = !matches!(
                 outcome,
                 CompactionOutcome::Committed
@@ -432,22 +458,12 @@ mod tests {
     #[test]
     fn trigger_and_op_labels_are_distinct() {
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for trigger in [
-            CompactionTrigger::SmallFileCount,
-            CompactionTrigger::ProtectedSnapshotCount,
-            CompactionTrigger::ProtectedSnapshotAge,
-            CompactionTrigger::DeletionIndex,
-            CompactionTrigger::DeletionIndexMemoryCeiling,
-        ] {
+        for trigger in CompactionTrigger::ALL.iter().copied() {
             assert!(seen.insert(trigger.as_str()));
         }
 
         let mut seen: HashSet<&'static str> = HashSet::new();
-        for op in [
-            MaintenanceOp::OrphanDvSweep,
-            MaintenanceOp::Retention,
-            MaintenanceOp::RetiredDirSweep,
-        ] {
+        for op in MaintenanceOp::ALL.iter().copied() {
             assert!(seen.insert(op.as_str()));
         }
     }

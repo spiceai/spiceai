@@ -858,9 +858,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// from `SQLite`'s `dbstat` virtual table, so it returns an empty vector on a
     /// backend that does not provide it — this is observability, and an
     /// unavailable figure must not fail the pass that asked.
-    async fn metastore_table_bytes(&self) -> CatalogResult<Vec<(String, i64)>> {
-        Ok(Vec::new())
-    }
+    async fn metastore_table_bytes(&self) -> CatalogResult<Vec<(String, i64)>>;
 
     /// Bytes on the metastore's free page list — space already released inside
     /// the database file that, under the default `auto_vacuum: none`, is reused
@@ -868,9 +866,7 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// `Ok(0)` when the backend cannot report it; this is observability, so an
     /// unavailable figure must not fail a maintenance pass.
-    async fn metastore_freelist_bytes(&self) -> CatalogResult<u64> {
-        Ok(0)
-    }
+    async fn metastore_freelist_bytes(&self) -> CatalogResult<u64>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;

@@ -42,7 +42,7 @@ limitations under the License.
 
 mod filter_exec;
 mod sink;
-mod vector_io;
+pub(crate) mod vector_io;
 
 // Public API - re-exported in provider/mod.rs
 pub use sink::CayenneDeletionSink;

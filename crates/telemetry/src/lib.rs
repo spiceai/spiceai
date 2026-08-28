@@ -2145,6 +2145,22 @@ pub mod cayenne {
     // `committed` / `no_op` / `failed`, or a `declined_*` reason — the prefix
     // makes "why is nothing being reclaimed" one PromQL selector.
 
+    /// `dimensions` plus one more label.
+    ///
+    /// Every gauge family here that splits by tier, kind, or reachability needs
+    /// this, and open-coding it made the same three lines appear six times in
+    /// one module.
+    fn with_label(
+        dimensions: &[KeyValue],
+        key: &'static str,
+        value: &'static str,
+    ) -> Vec<KeyValue> {
+        let mut labelled = Vec::with_capacity(dimensions.len() + 1);
+        labelled.extend_from_slice(dimensions);
+        labelled.push(KeyValue::new(key, value));
+        labelled
+    }
+
     static COMPACTION_OUTCOME: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Counts one compaction-family attempt and how it ended. `dimensions`
@@ -2210,9 +2226,7 @@ pub mod cayenne {
     /// observation instead of a gap. (Same technique as
     /// [`register_query_counter`], for the same reason.)
     pub fn register_maintenance_counters(dimensions: &[KeyValue]) {
-        let mut with_outcome = Vec::with_capacity(dimensions.len() + 1);
-        with_outcome.extend_from_slice(dimensions);
-        with_outcome.push(KeyValue::new("outcome", "reclaimed"));
+        let with_outcome = with_label(dimensions, "outcome", "reclaimed");
         MAINTENANCE_OUTCOME
             .get_or_init(build_maintenance_outcome)
             .add(0, &with_outcome);
@@ -2455,13 +2469,6 @@ pub mod cayenne {
                 .build()
         });
 
-        let with_tier = |tier: &'static str| {
-            let mut d = Vec::with_capacity(dimensions.len() + 1);
-            d.extend_from_slice(dimensions);
-            d.push(KeyValue::new("tier", tier));
-            d
-        };
-
         for (tier, f, b, r) in [
             (
                 "current",
@@ -2494,7 +2501,7 @@ pub mod cayenne {
                 storage.inlined_rows,
             ),
         ] {
-            let d = with_tier(tier);
+            let d = with_label(dimensions, "tier", tier);
             files.record(f, &d);
             bytes.record(b, &d);
             rows.record(r, &d);
@@ -2513,9 +2520,7 @@ pub mod cayenne {
             ("true", storage.manifest_rows_reachable),
             ("false", storage.manifest_rows_unreachable),
         ] {
-            let mut d = Vec::with_capacity(dimensions.len() + 1);
-            d.extend_from_slice(dimensions);
-            d.push(KeyValue::new("reachable", reachable));
+            let d = with_label(dimensions, "reachable", reachable);
             manifest_rows.record(value, &d);
         }
 
@@ -2556,9 +2561,7 @@ pub mod cayenne {
             ("cayenne_inlined_delete", storage.inlined_delete_entries),
             ("cayenne_cold_tier_file", storage.cold_files),
         ] {
-            let mut d = Vec::with_capacity(dimensions.len() + 1);
-            d.extend_from_slice(dimensions);
-            d.push(KeyValue::new("metastore_table", metastore_table));
+            let d = with_label(dimensions, "metastore_table", metastore_table);
             metastore_rows.record(value, &d);
         }
     }
@@ -2721,9 +2724,7 @@ pub mod cayenne {
             ("staging", usage.staging_files, usage.staging_bytes),
             ("other", usage.other_files, usage.other_bytes),
         ] {
-            let mut d = Vec::with_capacity(dimensions.len() + 1);
-            d.extend_from_slice(dimensions);
-            d.push(KeyValue::new("kind", kind));
+            let d = with_label(dimensions, "kind", kind);
             files.record(f, &d);
             bytes.record(b, &d);
         }
@@ -2856,9 +2857,7 @@ pub mod cayenne {
             ("deletion_index", deletion_bytes),
             ("cold_existence", cold_existence_bytes),
         ] {
-            let mut d = Vec::with_capacity(dimensions.len() + 1);
-            d.extend_from_slice(dimensions);
-            d.push(KeyValue::new("kind", kind));
+            let d = with_label(dimensions, "kind", kind);
             components.record(bytes, &d);
         }
 
@@ -2880,7 +2879,7 @@ pub mod cayenne {
     /// Records the resident bytes of one table's in-memory CDC tier.
     /// `dimensions` carries `table`.
     ///
-    /// The process-global figure (`cayenne_fleet_budget_used_bytes{budget="mem_tier"}`)
+    /// The process-global figure (`cayenne_mem_tier_budget_used_bytes`)
     /// says the tier is where the memory went; this says WHICH table put it
     /// there. On a `mode: memory` table the tier holds the whole dataset
     /// permanently, so the per-table split is what separates one such table from
@@ -2891,7 +2890,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_mem_tier_bytes")
                     .with_description(
-                        "Resident bytes of one Cayenne table's in-memory CDC tier — the per-table breakdown of `cayenne_fleet_budget_used_bytes{budget=\"mem_tier\"}`.",
+                        "Resident bytes of one Cayenne table's in-memory CDC tier — the per-table breakdown of `cayenne_mem_tier_budget_used_bytes`.",
                     )
                     .with_unit("By")
                     .build()
@@ -2959,43 +2958,6 @@ pub mod cayenne {
             .record(batches, dimensions);
     }
 
-    static FLEET_BUDGET_USED: OnceLock<Gauge<u64>> = OnceLock::new();
-    static FLEET_BUDGET_LIMIT: OnceLock<Gauge<u64>> = OnceLock::new();
-
-    /// Records one process-global Cayenne memory budget: how much of it is in use
-    /// and what its ceiling is. `dimensions` carries `budget`
-    /// (`pk_keyset` / `mem_tier`); there is no `table` label because these
-    /// ceilings are shared across every table in the process.
-    ///
-    /// The per-table gauges cannot answer "is the fleet at its ceiling", which is
-    /// the question behind a table whose index refuses to grow: a keyset that
-    /// stays small because the fleet budget is exhausted looks identical to one
-    /// that is small because the table is.
-    pub fn track_fleet_budget(used_bytes: u64, limit_bytes: u64, dimensions: &[KeyValue]) {
-        FLEET_BUDGET_USED
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_fleet_budget_used_bytes")
-                    .with_description(
-                        "Bytes in use against a process-global Cayenne memory budget (`pk_keyset`, `mem_tier`).",
-                    )
-                    .with_unit("By")
-                    .build()
-            })
-            .record(used_bytes, dimensions);
-        FLEET_BUDGET_LIMIT
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_fleet_budget_limit_bytes")
-                    .with_description(
-                        "Ceiling of a process-global Cayenne memory budget. A used figure at the ceiling is why a table's index refuses to grow.",
-                    )
-                    .with_unit("By")
-                    .build()
-            })
-            .record(limit_bytes, dimensions);
-    }
-
     static PK_INDEX_FORMAT: OnceLock<Gauge<u64>> = OnceLock::new();
     static PK_INDEX_KEYS: OnceLock<Gauge<u64>> = OnceLock::new();
     static PK_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -3040,7 +3002,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_budget_bytes")
                     .with_description(
-                        "Effective byte budget THIS primary-key cache is bounded by — half the per-table figure on a sharded table, and already clamped by whatever the fleet has left. An exact keyset crossing it degrades to a bloom (upsert) or is dropped (exact-answer tables). The process-global ceiling is `cayenne_fleet_budget_limit_bytes{budget=\"pk_keyset\"}`. 0 when unbounded.",
+                        "Effective byte budget THIS primary-key cache is bounded by — half the per-table figure on a sharded table, and already clamped by whatever the fleet has left. An exact keyset crossing it degrades to a bloom (upsert) or is dropped (exact-answer tables). The process-global ceiling is `cayenne_pk_keyset_budget_total_bytes`. 0 when unbounded.",
                     )
                     .with_unit("By")
                     .build()
