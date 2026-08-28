@@ -26046,8 +26046,11 @@ impl CayenneTableProvider {
                 "mem_tier_checkpoint",
                 checkpoint_start,
             );
-            self.fire_slot_advancer(flushed_epoch).await;
+            // Before the slot advance, for the reason given on the data-bearing exit:
+            // the tombstones are durable and the tier is cleared, so the request is
+            // already owed, and `fire_slot_advancer` awaits.
             self.arm_retention_after_checkpoint();
+            self.fire_slot_advancer(flushed_epoch).await;
             return Ok(0);
         }
 
@@ -26338,11 +26341,18 @@ impl CayenneTableProvider {
             elapsed_ms = u64::try_from(checkpoint_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             "Mem-tier checkpoint flushed a durable snapshot"
         );
+        // Armed BEFORE the slot advance: the snapshot is already durable and visible at
+        // this point, so the request is owed from here on, and `fire_slot_advancer`
+        // awaits real source committers — a caller dropped or stalled inside that await
+        // would otherwise leave `retention_sql` unapplied with nothing queued. Arming is
+        // a synchronous flag plus a debounced task that takes `write_lock` itself, so it
+        // orders behind this checkpoint either way and nothing here depends on the slot
+        // having moved.
+        self.arm_retention_after_checkpoint();
+
         // ONLY NOW — after the Vortex file + metastore pointer are durable — tell
         // the runtime it may advance the source slot to cover this epoch.
         self.fire_slot_advancer(flushed_epoch).await;
-
-        self.arm_retention_after_checkpoint();
 
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
