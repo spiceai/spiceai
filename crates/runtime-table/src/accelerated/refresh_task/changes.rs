@@ -661,9 +661,14 @@ pub struct CdcSchemaEvolution {
 ///
 /// That rebuild restores the *schema* under all three, but none of them restores the *rows*
 /// unconditionally, and the two reasons differ. `file_create` and `memory` are ephemeral to
-/// replication (`accelerator_is_ephemeral` matches Cayenne on `Memory | FileCreate`), so their
-/// resume snapshot is forced only when the connector's initial snapshot is already enabled —
-/// `disabled` is preserved as an explicit opt-out. `file_update` is classified *persistent*, so
+/// replication, but only `connector-postgres` acts on that: `accelerator_is_ephemeral` matches
+/// Cayenne on `Memory | FileCreate` and forces a resume snapshot, and only when the connector's
+/// initial snapshot is already enabled — `disabled` is preserved as an explicit opt-out. No other
+/// connector consults the acceleration mode. `connector-mysql` discards a resumable position under
+/// `always` and no other value (#13021), and `connector-dynamodb` `auto` reuses a persisted
+/// checkpoint the same way — so on those two an ephemeral acceleration comes back holding only
+/// later changes even under `auto`, which is why `always` is the portable answer below.
+/// `file_update` is classified *persistent*, so
 /// no resume snapshot is forced for it at all, while its recreate still empties the table: under
 /// `auto` it comes back holding only later changes (#13546). `always` is therefore the one
 /// setting that makes the restart row-safe under every mode *where the connector has it*, which
@@ -695,8 +700,11 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          Under all three that restart rebuilds the schema, but it reloads the rows only where the source can replay them. \
          Where the connector takes an initial-snapshot setting — `pg_replication_initial_snapshot`, \
          `mysql_replication_initial_snapshot` and `dynamodb_replication_initial_snapshot` — \
-         set it to `always` before restarting if the acceleration has to come back with its history, since `auto` skips the \
-         snapshot under `mode: file_update` and `disabled` skips it under every mode. Where it does not — Debezium, MongoDB \
+         set it to `always` before restarting if the acceleration has to come back with its history — it is the only value \
+         that snapshots under every mode on every one of them. `auto` skips the snapshot under `mode: file_update` on \
+         PostgreSQL, and skips it under every mode on MySQL and DynamoDB, which resume from their recorded position \
+         without consulting the acceleration mode; `disabled` skips it under every mode on all three. \
+         Where it does not — Debezium, MongoDB \
          and `cdc_ingest` have no such setting — the acceleration comes back holding only what the change stream delivers \
          from its resume position onward, and restoring its history means replaying the source from an earlier position or \
          reloading the dataset with a full refresh. \
@@ -4471,12 +4479,17 @@ mod tests {
                 && msg.contains("reloading the dataset with a full refresh"),
             "the no-setting arm needs a remedy, not just the bad news: {msg}"
         );
-        // No mode may be advertised as row-safe without the snapshot: `file_update` is classified
-        // persistent, so `auto` forces no resume snapshot for it while its recreate still empties
-        // the table (#13546).
+        // No mode may be advertised as row-safe without the snapshot, and the carve-out is not the
+        // same on every connector. `file_update` is classified persistent, so `auto` forces no
+        // resume snapshot for it while its recreate still empties the table (#13546) — and only
+        // `connector-postgres` forces one for the ephemeral modes at all, so on MySQL and DynamoDB
+        // `auto` leaves every mode holding later changes only. Asserting one arm alone let the
+        // message read as though `auto` were row-safe for `memory` and `file_create` everywhere.
         assert!(
-            msg.contains("`auto` skips the snapshot under `mode: file_update`"),
-            "`file_update` is not row-safe under `auto`, so the message must not carve it out: {msg}"
+            msg.contains("skips the snapshot under `mode: file_update` on PostgreSQL")
+                && msg.contains("skips it under every mode on MySQL and DynamoDB"),
+            "`file_update` is not row-safe under `auto` on PostgreSQL, and no mode is on MySQL or \
+             DynamoDB, so the message must carve out neither: {msg}"
         );
         assert!(
             msg.contains("Under `mode: file` a restart reopens the stored table and refuses again"),
