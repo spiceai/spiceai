@@ -677,7 +677,7 @@ pub struct CdcSchemaEvolution {
 /// `install_cdc_schema_evolution` keys on `RefreshMode::Changes` alone, and the refusal itself on
 /// `CayenneWriteTarget::Partitioned`, a property of the acceleration — so every changes-capable
 /// source reaches this string. Of the six, `connector-postgres`, `connector-mysql` and
-/// `connector-dynamodb` declare `replication_initial_snapshot`; Debezium, MongoDB and `cdc_ingest`
+/// `connector-dynamodb` declare `replication_initial_snapshot`; Debezium, `MongoDB` and `cdc_ingest`
 /// declare no initial-snapshot parameter at all. Naming the setting without that second arm would
 /// send half of them to a key their connector does not have, having promised their history back.
 // Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
