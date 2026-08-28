@@ -216,7 +216,7 @@ async fn get_or_create_cached<T: Clone>(
         return Ok(cached);
     }
 
-    let _creation_guard = lock.lock().await;
+    let creation_guard = lock.lock().await;
 
     // Re-checked under the lock: whoever held it before may have been creating this very value.
     if let Some(cached) = cached(cache)? {
@@ -224,11 +224,33 @@ async fn get_or_create_cached<T: Clone>(
     }
 
     let created = create.await?;
-    *cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("cache could not be locked"))? = Some(created.clone());
+    store_under_creation_lock(&creation_guard, cache, &created)?;
 
     Ok(created)
+}
+
+/// Caches `value`, taking the creation guard by reference so that it cannot be cached outside the
+/// lock.
+///
+/// The ordering is the whole point of the lock — see [`get_or_create_cached`] — and no test can
+/// establish it. `#[tokio::test]` builds a current-thread runtime and there is no `.await` between
+/// releasing the guard and storing, so a store moved after the release still lands before the
+/// waiting caller is polled: it finds the value either way and the run count is 1 either way. Nor
+/// does a probe at the store site help, because tokio's mutex is fair — releasing a guard with a
+/// caller already queued hands the permit straight to that caller, so the lock never *looks* free
+/// from here even when the store has escaped it.
+///
+/// So the guarantee is carried by this signature instead. Moving the store after the guard is
+/// dropped leaves nothing to pass, and it stops compiling rather than silently regressing.
+fn store_under_creation_lock<T: Clone>(
+    _creation_guard: &tokio::sync::MutexGuard<'_, ()>,
+    cache: &Mutex<Option<T>>,
+    value: &T,
+) -> Result<(), anyhow::Error> {
+    *cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("cache could not be locked"))? = Some(value.clone());
+    Ok(())
 }
 
 /// Reads `cache` without holding its lock past the read, so it is never held across an `.await`.
@@ -725,6 +747,11 @@ async fn creation_starts(ran: oneshot::Receiver<()>) -> bool {
 /// A caller that waits for the creation lock must find the value the winner cached, not create a
 /// second copy — for `local_phi3` a second copy is another set of model weights resident in the
 /// test process. That holds only because the value is cached *before* the lock is released.
+///
+/// This test does not establish that ordering, and cannot: see
+/// [`store_under_creation_lock`], whose signature is what holds it. What this covers is the
+/// behaviour on top of it — that a caller which waits is served the cached value rather than
+/// creating its own, and that it is served the *same* value.
 ///
 /// Uses a lock of its own rather than a fixture's: the registry's locks are shared with the model
 /// creations the rest of this binary performs, and blocking one for the duration of this test
