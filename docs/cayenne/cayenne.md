@@ -1381,6 +1381,7 @@ The non-compaction passes use the same grammar under `cayenne_maintenance_outcom
 
 - `declined_manifest_unprovable` — the current snapshot's manifest is empty while its directory is not, so the deletion-vector sweep cannot prove no live row is shadowed. **Every** pass returns here until that resolves, so deletion vectors accumulate with the sweep apparently running.
 - `coalesced` — a sweep was already in flight, so this request folded into it.
+- `declined_live_reference` vs `declined_not_due` — for the retired-directory sweep these look alike and have opposite prognoses. `not_due` means nothing had reached its grace window (or every candidate is pinned by an in-flight scan); it resolves itself. `live_reference` means candidates **were** examined and none could be removed, because their files are still referenced in place by a live snapshot or a non-data sidecar keeps the directory alive — which resolves only when the referencing snapshot is itself retired, possibly never. A directory reported `live_reference` indefinitely is space that is not coming back on its own.
 
 `cayenne_maintenance_reclaimed_{files,bytes,rows}_total{table, op}` is what each pass actually gave back. A footprint gauge that climbs while its reclaim counter stays flat is the signature of a reclamation path that is scheduled but doing nothing.
 

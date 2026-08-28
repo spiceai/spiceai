@@ -2900,6 +2900,16 @@ struct SampleGate {
 /// promptly without a persistently failing sample running every tick.
 const SAMPLE_RETRY_BACKOFF: Duration = Duration::from_mins(1);
 
+/// Milliseconds elapsed since `stamp`, where `0` means "never" and reports
+/// [`u64::MAX`] so a never-sampled gate is always due.
+const fn since_stamp(stamp: u64, now: u64) -> u64 {
+    if stamp == 0 {
+        u64::MAX
+    } else {
+        now.saturating_sub(stamp)
+    }
+}
+
 impl SampleGate {
     /// Claim this gate if a sample is due and none is running.
     ///
@@ -2908,13 +2918,7 @@ impl SampleGate {
     /// shut for the life of the process.
     fn try_enter(&self, min_interval: Duration) -> Option<SampleGuard<'_>> {
         let now = duration_millis_saturating(PROCESS_START.elapsed());
-        let since = |stamp: u64| {
-            if stamp == 0 {
-                u64::MAX
-            } else {
-                now.saturating_sub(stamp)
-            }
-        };
+        let since = |stamp: u64| since_stamp(stamp, now);
         if since(self.last_success_ms.load(Ordering::Relaxed))
             < duration_millis_saturating(min_interval)
         {
@@ -2928,6 +2932,18 @@ impl SampleGate {
         // caller observes `false` owns the sample, and the loser returns rather
         // than running a second copy.
         if self.in_flight.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // RE-READ after winning the flag. The checks above ran before the claim,
+        // so a caller can pass them, stall, and acquire only after a concurrent
+        // winner has already completed a sample and advanced `last_success` — then
+        // run a second expensive pass immediately on a pre-check that is no longer
+        // true. Prevented overlap is not the same as an enforced cadence.
+        let now = duration_millis_saturating(PROCESS_START.elapsed());
+        if since_stamp(self.last_success_ms.load(Ordering::Relaxed), now)
+            < duration_millis_saturating(min_interval)
+        {
+            self.in_flight.store(false, Ordering::Release);
             return None;
         }
         self.last_attempt_ms.store(now.max(1), Ordering::Relaxed);
@@ -3110,10 +3126,12 @@ const fn retired_dir_sweep_outcome(
     } else if reclaimed_files > 0 || reclaimed_dirs > 0 {
         MaintenanceOutcome::Reclaimed
     } else {
-        // Every candidate is still referenced in place by a live snapshot — the
-        // state that keeps directories on disk indefinitely and is invisible in a
-        // reclaim counter alone.
-        MaintenanceOutcome::DeclinedNotDue
+        // Examined candidates and removed none: their files are referenced in
+        // place by a live snapshot, or a non-data sidecar keeps the directory
+        // alive. NOT `declined_not_due` — that means nothing had reached its grace
+        // window, which resolves itself; this may never resolve, and conflating
+        // them turns "space that is not coming back" into "check again later".
+        MaintenanceOutcome::DeclinedLiveReference
     }
 }
 
@@ -5522,11 +5540,10 @@ impl CayenneTableProvider {
             .filter(|id| *id != current && !protected.contains_key(id) && !in_flight.contains(id))
             .collect();
         if due.is_empty() {
-            // Nothing due covers two very different states: an empty ledger
-            // (healthy) and a ledger whose every entry is pinned by a
-            // long-running scan or still inside its grace window (dirs
-            // accumulating). `cayenne_storage_*` distinguishes them by whether
-            // the footprint is growing while this stays flat.
+            // Nothing reached admission: an empty ledger (healthy), or every
+            // entry still inside its grace window or pinned by an in-flight scan.
+            // Distinct from `declined_live_reference`, which means candidates WERE
+            // examined and their files are held by a live snapshot.
             maintenance_metrics::track_maintenance(
                 self.table_metadata.table_name.as_str(),
                 MaintenanceOp::RetiredDirSweep,
@@ -46307,10 +46324,13 @@ mod tests {
             MaintenanceOutcome::Reclaimed,
             "removing directories is a reclaim even when no file needed unlinking"
         );
-        // Nothing unlinked, nothing failed: every candidate is still referenced.
+        // Examined candidates, removed nothing: their files are referenced in
+        // place. NOT `not_due` — that is the pre-admission state, and the two have
+        // opposite prognoses (a grace window elapses on its own; a live reference
+        // may never be released).
         assert_eq!(
             retired_dir_sweep_outcome(0, 0, 0),
-            MaintenanceOutcome::DeclinedNotDue
+            MaintenanceOutcome::DeclinedLiveReference
         );
     }
 

@@ -3013,6 +3013,16 @@ pub mod cayenne {
     /// Publishes which representation one primary-key cache holds and how many
     /// keys it covers. `dimensions` carries `table` and `site`.
     ///
+    /// `keys` is `None` in bloom mode — a bloom cannot enumerate its members, and
+    /// publishing its insertion tally under a name that says "keys" made a
+    /// hot-key workload report ever-growing cardinality. It goes out as
+    /// `cayenne_pk_bloom_insertions` instead, named for what it is. `None`
+    /// records ZERO rather than skipping the gauge: a skipped gauge retains its
+    /// previous value, so an exact index that degraded to a bloom would keep
+    /// publishing its last authoritative count. `format` is the validity signal
+    /// for the pair — `keys` means something only at
+    /// [`CayennePkIndexFormat::Exact`].
+    ///
     /// Reported per cache because the two caches transition independently, and
     /// because a divergence in their key counts is itself a signal: they are
     /// meant to cover the same key set in different layouts, so a gap between
@@ -3034,17 +3044,19 @@ pub mod cayenne {
                     .build()
             })
             .record(format.metric_code(), dimensions);
-        // `None` in bloom mode: publishing an insertion tally under a name that
-        // says "keys" made a hot-key workload report ever-growing cardinality.
-        let Some(keys) = keys else {
-            return;
-        };
+        // Zeroed, not skipped, when there is no authoritative count. A skipped
+        // gauge keeps its LAST value — the same reason the bloom density gauges
+        // are zeroed — so an exact index that degraded to a bloom would go on
+        // publishing its old distinct-key count beside `format = 2`, reading as
+        // authoritative cardinality a bloom cannot provide. `format` is the
+        // validity signal: `keys` is meaningful only at `format = 1`.
+        let keys = keys.unwrap_or(0);
         PK_INDEX_KEYS
             .get_or_init(|| {
                 operational_meter()
                     .u64_gauge("cayenne_pk_index_keys")
                     .with_description(
-                        "DISTINCT primary keys one Cayenne existence cache covers. Published only in exact mode, where the count is authoritative; a bloom cannot enumerate its members and reports `cayenne_pk_bloom_insertions` instead. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
+                        "DISTINCT primary keys one Cayenne existence cache covers. Meaningful ONLY at `cayenne_pk_index_format = 1` (exact), where the count is authoritative; ZERO in bloom mode, which cannot enumerate its members and reports `cayenne_pk_bloom_insertions` instead. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
                     )
                     .with_unit("keys")
                     .build()

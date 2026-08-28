@@ -270,9 +270,19 @@ pub(crate) enum MaintenanceOutcome {
     /// the sweep cannot prove no live row is shadowed and must not remove
     /// anything.
     DeclinedManifestUnprovable,
-    /// Every candidate directory is still referenced by an in-flight scan or is
-    /// inside its grace window.
+    /// No candidate had reached its grace window, or every one is still pinned by
+    /// an in-flight scan. Nothing was examined.
     DeclinedNotDue,
+    /// Candidates WERE examined and none could be removed: their files are still
+    /// referenced in place by a live snapshot, or a non-data sidecar keeps the
+    /// directory alive.
+    ///
+    /// Distinct from [`Self::DeclinedNotDue`] because the two have opposite
+    /// prognoses. Not-due resolves itself when the grace window elapses; a live
+    /// reference resolves only when the referencing snapshot is itself retired,
+    /// which may be never — so a directory reported this way indefinitely is
+    /// space that is not coming back on its own.
+    DeclinedLiveReference,
     /// The pass errored. The error is logged at the call site.
     Failed,
 }
@@ -288,6 +298,7 @@ impl MaintenanceOutcome {
         Self::DeclinedBelowThreshold,
         Self::DeclinedManifestUnprovable,
         Self::DeclinedNotDue,
+        Self::DeclinedLiveReference,
         Self::Failed,
     ];
 
@@ -300,6 +311,7 @@ impl MaintenanceOutcome {
             Self::DeclinedBelowThreshold => "declined_below_threshold",
             Self::DeclinedManifestUnprovable => "declined_manifest_unprovable",
             Self::DeclinedNotDue => "declined_not_due",
+            Self::DeclinedLiveReference => "declined_live_reference",
             Self::Failed => "failed",
         }
     }
