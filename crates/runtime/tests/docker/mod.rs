@@ -49,6 +49,28 @@ static CONTAINER_SEMAPHORE: LazyLock<Arc<Semaphore>> =
 /// Cleanup is best-effort, and a test process must never hang in it.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a container name is waited on before it is reused, once its
+/// removal has been requested.
+const NAME_RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the name is re-checked while waiting for it to be released.
+const NAME_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether a removal failed only because the daemon is already removing that
+/// container, which reaches the same end state this wanted.
+///
+/// Matched on the status code rather than the message, so a reworded daemon
+/// error cannot silently turn this back into a hard failure.
+fn is_removal_already_in_progress(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<bollard::errors::Error>(),
+        Some(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            ..
+        })
+    )
+}
+
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
@@ -301,9 +323,7 @@ impl<'a> ContainerRunner<'a> {
         self,
         start_timeout: Option<Duration>,
     ) -> Result<RunningContainer<'a>, anyhow::Error> {
-        if self.container_exist().await? {
-            remove(&self.docker, self.name).await?;
-        }
+        self.wait_for_name_release().await?;
 
         let permit = tokio::time::timeout(
             std::time::Duration::from_mins(5), // Timeout after 5min
@@ -347,6 +367,20 @@ impl<'a> ContainerRunner<'a> {
 
         let host_config = Some(HostConfig {
             port_bindings,
+            // Reap zombies inside the container, so it stays killable and its
+            // name and host port are actually released.
+            //
+            // Several of these images fork children that their PID 1 never
+            // reaps (mongod, the DynamoDB local JVM, the Kafka broker). Once a
+            // zombie accumulates, Docker cannot kill the container -- removal
+            // fails with `could not kill container: ... is zombie and can not
+            // be killed`, whose own remedy is this flag. The container then
+            // leaks under a name derived from a fixed port, so every later test
+            // reusing that name fails on a 409 (`name already in use`, or
+            // `removal ... already in progress`) and every later test needing
+            // that host port fails with it -- one unkillable container spraying
+            // failures across unrelated connectors.
+            init: Some(true),
             ..Default::default()
         });
 
@@ -442,6 +476,51 @@ impl<'a> ContainerRunner<'a> {
         Ok(())
     }
 
+    /// Frees `self.name` so a fresh container can take it, waiting out a
+    /// removal that the daemon has accepted but not yet finished.
+    ///
+    /// `remove_container` returns once the removal is *accepted*, not once it is
+    /// done, and the name stays taken until it is. Creating inside that window
+    /// fails with a 409 (`Conflict. The container name ... is already in use`),
+    /// so the name is polled until it is genuinely gone rather than assumed free
+    /// the moment the call returns.
+    ///
+    /// A concurrent remover answers a second removal with a 409 (`removal of
+    /// container ... is already in progress`) -- the previous test's `Drop`
+    /// cleanup is the usual one, since it joins its thread as soon as the daemon
+    /// accepts. That reports the end state this method wants, so it is waited
+    /// out rather than raised as a failure.
+    async fn wait_for_name_release(&self) -> Result<(), anyhow::Error> {
+        if !self.container_exist().await? {
+            return Ok(());
+        }
+
+        if let Err(e) = remove(&self.docker, self.name).await {
+            if !is_removal_already_in_progress(&e) {
+                return Err(e);
+            }
+            tracing::debug!(
+                "Docker container {} is already being removed; waiting for its name",
+                self.name
+            );
+        }
+
+        let start_time = std::time::Instant::now();
+        while self.container_exist().await? {
+            // An unkillable container never releases its name, so this reports
+            // that rather than waiting on it for the job's whole budget.
+            if start_time.elapsed() > NAME_RELEASE_TIMEOUT {
+                return Err(anyhow::anyhow!(
+                    "test container {} was still present {NAME_RELEASE_TIMEOUT:?} after its removal was requested, so a new one cannot take its name",
+                    self.name
+                ));
+            }
+            tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
+        }
+
+        Ok(())
+    }
+
     async fn container_exist(&self) -> Result<bool, anyhow::Error> {
         let containers = self
             .docker
@@ -503,4 +582,42 @@ pub async fn wait_for_tcp_port(
         timeout.as_secs(),
         last_error.unwrap_or_else(|| "none".to_string())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_removal_already_in_progress;
+
+    fn docker_error(status_code: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn a_concurrent_removal_is_waited_out() {
+        assert!(is_removal_already_in_progress(&docker_error(
+            409,
+            "removal of container runtime-integration-test-mysql-13306 is already in progress"
+        )));
+    }
+
+    #[test]
+    fn an_unkillable_container_stays_a_failure() {
+        // The zombie-reap case: nothing will release this name, so waiting on it
+        // would spend the whole poll budget and then fail anyway. It has to
+        // surface as the error it is.
+        assert!(!is_removal_already_in_progress(&docker_error(
+            500,
+            "cannot remove container: could not kill container: PID 4291 is zombie and can not be killed"
+        )));
+    }
+
+    #[test]
+    fn an_unrelated_error_stays_a_failure() {
+        assert!(!is_removal_already_in_progress(&anyhow::anyhow!(
+            "the daemon is not reachable"
+        )));
+    }
 }
