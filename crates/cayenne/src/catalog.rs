@@ -961,6 +961,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
 
+    /// Count the inlined delete entries (tombstone rows) held for a table.
+    ///
+    /// Reads the row count only, never the `delete_ipc` blobs, so the inline
+    /// checkpoint can ask "is there anything to reclaim?" without paying
+    /// [`Self::get_inlined_deletes`]'s decode and transfer cost. Tombstone rows
+    /// outlive the inline corpus they hide (an upsert whose prior copy lives in a
+    /// Vortex file still writes one, to mask the copy wherever it lives), so the
+    /// reclamation gate cannot be derived from
+    /// [`Self::get_inlined_data_stats`] alone.
+    async fn get_inlined_delete_count(&self, table_id: &str) -> CatalogResult<i64>;
+
     /// Get only the *published* inlined delete entries for a table.
     ///
     /// This is the hot read path's variant of [`get_inlined_deletes`]: it pushes

@@ -4821,6 +4821,20 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn get_inlined_delete_count(&self, table_id: &str) -> CatalogResult<i64> {
+        // Index-only range scan over `idx_cayenne_inlined_delete_table_seq`; the
+        // `delete_ipc` blobs are never read.
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_inlined_delete WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+    }
+
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {

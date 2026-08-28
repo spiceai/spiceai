@@ -1841,6 +1841,27 @@ pub struct CayenneTableProvider {
     /// high and the next inline insert reschedules the checkpoint, by which time
     /// the fast backgrounded finalize has published and decremented this.
     pending_inline_tombstones: Arc<AtomicU64>,
+    /// Inline tombstone rows (`cayenne_inlined_delete`) currently held for this
+    /// table.
+    ///
+    /// Tombstones are written for EVERY superseded PK — including one whose prior
+    /// copy lives only in a Vortex file, so the copy is masked wherever it lives
+    /// (`push_key_supersede`). Their only reader
+    /// (`filter_inlined_batch_for_deletions`, via `load_inlined_deletion_maps`)
+    /// applies them to inline entries alone, so on an upsert workload whose rows
+    /// never land inline they mask nothing and are pure metastore garbage. Nothing
+    /// in the corpus-sized counters above can see them: `inlined_row_count` and
+    /// `durable_inlined_row_count` both describe `cayenne_inlined_data`, which
+    /// stays at zero for exactly that workload.
+    ///
+    /// So this counter is what makes the reclamation reachable. Seeded from the
+    /// authoritative catalog count at open (so tombstones inherited from a prior
+    /// process are reclaimed too), incremented by `record_inline_tombstone_written`,
+    /// re-synced from the catalog on every checkpoint that inspects the corpus, and
+    /// zeroed by the clears that empty the table. Advisory only — a tombstone whose
+    /// transaction later rolls back leaves it high until the next re-sync, which
+    /// costs one extra reclamation attempt and never a wrong answer.
+    inlined_tombstone_count: Arc<AtomicI64>,
     /// Published inline-visibility watermark: the highest inlined-entry
     /// `sequence_number` whose in-memory visibility has been published.
     ///
@@ -6953,6 +6974,10 @@ impl CayenneTableProvider {
             Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
         let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
+        // Tombstones survive a process restart, and a table that has stopped
+        // upserting never writes another one — so seed from the durable count
+        // rather than from zero, or inherited garbage would never be reclaimed.
+        let inlined_tombstone_count = catalog.get_inlined_delete_count(&table_id).await?;
 
         // Every inlined entry persisted at open time is already published, and
         // all have `sequence_number <= current_sequence_number`. Seed the
@@ -7088,6 +7113,7 @@ impl CayenneTableProvider {
                 crate::provider::structural_version::StructuralVersion::new(),
             ),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
+            inlined_tombstone_count: Arc::new(AtomicI64::new(inlined_tombstone_count)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
@@ -8426,6 +8452,7 @@ impl CayenneTableProvider {
             scan_input_version: Arc::clone(&self.scan_input_version),
             structural_version: Arc::clone(&self.structural_version),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
+            inlined_tombstone_count: Arc::clone(&self.inlined_tombstone_count),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
             // monotone source (lever B2) — memory and the DB row never diverge.
@@ -13749,6 +13776,13 @@ impl CayenneTableProvider {
             self.bump_inlined_generation();
             self.pending_inline_tombstones
                 .fetch_sub(1, Ordering::AcqRel);
+            // The staged window is closed, so arm the tombstone reclamation here
+            // too. The schedule fired when this tombstone was written ran inside
+            // that window and could only defer; a stream that stops at this batch
+            // would otherwise strand its tombstones until some later write.
+            if self.inline_tombstone_reclaim_due() {
+                self.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+            }
         }
 
         // Threshold = the snapshot's OWN allocated `sequence_number` (reserved in
@@ -14256,6 +14290,11 @@ impl CayenneTableProvider {
 
     /// Trace + telemetry for a written inline tombstone, shared by the
     /// `add_inlined_delete` path and the folded staged-upsert transaction path.
+    /// Record that one inline tombstone row was written: trace it, count it for
+    /// telemetry, and arm the reclamation once enough of them have accumulated.
+    ///
+    /// The single funnel for both the synchronous and the staged on-conflict
+    /// path, which is why the reclamation is armed here.
     fn record_inline_tombstone_written(
         &self,
         delete_count: i64,
@@ -14282,6 +14321,28 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+
+        // A table whose rows never land inline reaches no other inline-checkpoint
+        // trigger: every one of them is gated on a non-empty corpus. The staged
+        // path is inside its own tombstone's unpublished window here, so that
+        // schedule defers and the publish step re-arms it.
+        self.inlined_tombstone_count.fetch_add(1, Ordering::Relaxed);
+        if self.inline_tombstone_reclaim_due() {
+            self.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+        }
+    }
+
+    /// Whether enough inline tombstone rows have accumulated to be worth a
+    /// reclamation pass.
+    ///
+    /// Thresholded on `inline_flush_max_segments` — the same "this many metastore
+    /// entries is too many" budget that governs the inline corpus — so the two
+    /// inline metastore tables are bounded by one knob. Below it the tombstones
+    /// are left alone: the reclamation takes `write_lock` and issues a metastore
+    /// write, which is not worth doing per burst.
+    fn inline_tombstone_reclaim_due(&self) -> bool {
+        self.inlined_tombstone_count.load(Ordering::Relaxed)
+            > self.context.inline_flush_max_segments()
     }
 
     /// Synchronously store a deferred on-conflict deletion-cache update into the
@@ -21568,6 +21629,9 @@ impl CayenneTableProvider {
         // The durable corpus was wiped atomically with the catalog operation
         // that triggered this invalidation.
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
+        // That same operation clears `cayenne_inlined_delete` (`commit_overwrite`
+        // deletes both inline tables in its transaction).
+        self.inlined_tombstone_count.store(0, Ordering::Relaxed);
         // cycle-5 TASK 1: the corpus was wiped/replaced, so pending tombstone
         // removals reference rows that no longer exist — drop them. The structural
         // bump below fences off any concurrent delta cache built against the old
@@ -27038,13 +27102,32 @@ impl CayenneTableProvider {
             self.durable_inlined_row_count
                 .store(stats.record_count, Ordering::Relaxed);
 
-            if stats.entry_count > 0 {
+            // `stats` describes `cayenne_inlined_data` ONLY, so it cannot decide
+            // this on its own: an upsert writes a tombstone for every superseded
+            // PK, including one whose prior copy lives in a Vortex file rather
+            // than inline, so `cayenne_inlined_delete` grows on workloads that
+            // leave the corpus permanently empty. Gating the clear on
+            // `entry_count` alone stranded those rows forever (#13621). Both
+            // tables are cleared together below, so ask both whether there is
+            // anything to clear.
+            let tombstone_count = self
+                .catalog
+                .get_inlined_delete_count(&self.table_metadata.table_id)
+                .await?;
+            // Authoritative read: re-sync the advisory counter that armed this
+            // pass, so a rolled-back tombstone write cannot leave it permanently
+            // over the reclamation threshold.
+            self.inlined_tombstone_count
+                .store(tombstone_count, Ordering::Relaxed);
+
+            if stats.entry_count > 0 || tombstone_count > 0 {
                 tracing::debug!(
                     table = %self.table_metadata.table_name,
                     rows = stats.record_count,
                     segments = stats.entry_count,
                     ipc_bytes = stats.ipc_bytes,
-                    "Clearing fully-deleted inline memtable"
+                    tombstones = tombstone_count,
+                    "Clearing inline memtable with no visible rows"
                 );
                 self.clear_inlined_metadata_after_checkpoint().await?;
             }
@@ -27181,6 +27264,8 @@ impl CayenneTableProvider {
 
     fn clear_inlined_state_after_checkpoint(&self) {
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        // `clear_inlined_data_and_deletes` emptied `cayenne_inlined_delete` too.
+        self.inlined_tombstone_count.store(0, Ordering::Relaxed);
         // The durable corpus is now empty: arm the zero-corpus rebuild fast
         // path (the structural bump below forces that rebuild).
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
@@ -27277,13 +27362,20 @@ impl CayenneTableProvider {
         // the safe-skip ends sooner — correctly — because they are closer to
         // the bytes threshold. After the fast path stops, we fall through
         // to the catalog for accurate stats including bytes.
+        //
+        // The skip is over the CORPUS only, so it must not suppress a tombstone
+        // reclamation: `cayenne_inlined_delete` grows on an upsert workload whose
+        // rows never land inline, and there `cached_rows` is 0 forever (#13621).
+        // `inline_tombstone_reclaim_due` reads one in-process atomic, so the
+        // round-trip-free property of this fast path is preserved.
+        let reclaim_tombstones = self.inline_tombstone_reclaim_due();
         let cached_rows = self.inlined_row_count.load(Ordering::Relaxed);
         let inline_max_bytes_i64 = i64::try_from(self.context.inline_max_bytes())
             .unwrap_or(i64::MAX)
             .max(1);
         let safe_skip_threshold: i64 =
             (self.context.inline_flush_max_bytes() / inline_max_bytes_i64).max(1);
-        if cached_rows < safe_skip_threshold {
+        if cached_rows < safe_skip_threshold && !reclaim_tombstones {
             return Ok(());
         }
 
@@ -27297,23 +27389,28 @@ impl CayenneTableProvider {
         self.durable_inlined_row_count
             .store(stats.record_count, Ordering::Relaxed);
 
-        let Some(pressure) = inline_memtable_pressure_with_thresholds(
+        let pressure = inline_memtable_pressure_with_thresholds(
             stats,
             self.context.inline_flush_max_rows(),
             self.context.inline_flush_max_segments(),
             self.context.inline_flush_max_bytes(),
-        ) else {
+        );
+        if pressure.is_none() && !reclaim_tombstones {
             return Ok(());
-        };
+        }
 
         tracing::debug!(
             table = %self.table_metadata.table_name,
             rows = stats.record_count,
             segments = stats.entry_count,
             ipc_bytes = stats.ipc_bytes,
-            reason = pressure.as_str(),
+            tombstones = self.inlined_tombstone_count.load(Ordering::Relaxed),
+            reason = pressure.map_or("inline_tombstones", InlineMemtablePressure::as_str),
             "Checkpointing inline memtable to Vortex"
         );
+        // With an empty corpus this takes the no-batches path, which reclaims the
+        // tombstones and writes no file; otherwise it flushes the corpus, which
+        // clears them as part of the same catalog call.
         self.checkpoint_inlined_data().await?;
         Ok(())
     }
