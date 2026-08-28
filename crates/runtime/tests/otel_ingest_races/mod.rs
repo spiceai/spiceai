@@ -19,24 +19,11 @@ limitations under the License.
 //! OTLP metric dataset shape (`refresh_mode: append`, `primary_key: time_unix_nano`,
 //! `on_schema_change: append_new_columns`, `access: read_write`).
 //!
-//! Five flows are covered:
-//!
-//! - **Concurrent first writes.** A sink dataset is registered by its first write. One
-//!   writer does that while the rest wait, instead of looking the table up before it exists
-//!   and failing.
-//! - **Concurrent exports adding different columns.** Adding a column replaces the table's
-//!   provider. An export whose batch predates that is rejected by the schema check, and must
-//!   rebuild and retry rather than lose its data points.
-//! - **A restart whose first export adds a column.** The dataset has no table until its
-//!   first write, so it must be registered from the acceleration checkpoint first.
-//! - **A first write that names the dataset differently.** A qualified name, as a Flight
-//!   `DoPut` produces, must still find and register the dataset.
-//! - **More exports adding columns at once than a write gets retries.** A write must not have
-//!   to retry once per column another write added behind its back.
-//!
-//! Each concurrent phase has a timeout, so a deadlock fails the test instead of hanging it.
+//! Each test says which flow it covers. Every concurrent phase has a timeout, so a deadlock
+//! fails the test instead of hanging it.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,8 +51,12 @@ use crate::{
 };
 
 /// The dataset shape production OTLP metrics use: a `sink` source with Cayenne file
-/// acceleration, keyed on the data point time, that accepts new columns.
-fn make_dataset(metric: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
+/// acceleration, keyed on the data point time, that accepts new columns. Its acceleration
+/// lives under `dir`, so a restart can be tested by starting a second runtime on the same
+/// directory.
+fn make_dataset(metric: &str, dir: &Path) -> Dataset {
+    let data_dir = dir.join("data").to_string_lossy().to_string();
+    let metadata_dir = dir.join("metadata").to_string_lossy().to_string();
     let mut ds = Dataset::new(format!("sink:{metric}"), metric.to_string());
     ds.access = AccessMode::ReadWrite;
     ds.on_schema_change = OnSchemaChange::AppendNewColumns;
@@ -78,17 +69,18 @@ fn make_dataset(metric: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
         refresh_mode: Some(RefreshMode::Append),
         primary_key: Some("time_unix_nano".to_string()),
         params: Some(Params::from_string_map(HashMap::from([
-            ("cayenne_file_path".to_string(), data_dir.to_string()),
-            ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
+            ("cayenne_file_path".to_string(), data_dir),
+            ("cayenne_metadata_dir".to_string(), metadata_dir),
         ]))),
         ..Acceleration::default()
     });
     ds
 }
 
-async fn start_runtime(ds: &Dataset) -> Arc<Runtime> {
+/// Starts a runtime serving `metric` out of `dir`, ready for exports.
+async fn start_runtime(metric: &str, dir: &Path) -> Arc<Runtime> {
     let app = AppBuilder::new("otel_ingest_races")
-        .with_dataset(ds.clone())
+        .with_dataset(make_dataset(metric, dir))
         .build();
 
     configure_test_datafusion();
@@ -103,6 +95,21 @@ async fn start_runtime(ds: &Dataset) -> Arc<Runtime> {
     }
     runtime_ready_check(&rt).await;
     rt
+}
+
+/// Waits for every spawned export, failing with `what` if they do not all finish — which is
+/// what a deadlock on the ingest path looks like from here.
+async fn join_exports(
+    tasks: tokio::task::JoinSet<Result<(), anyhow::Error>>,
+    what: &str,
+) -> Result<(), anyhow::Error> {
+    let results = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for {what} — possible deadlock"))?;
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 fn string_attr(key: &str, value: &str) -> KeyValue {
@@ -192,16 +199,9 @@ async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyho
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let temp_dir = tempfile::tempdir()?;
-    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
-    let metadata_dir = temp_dir
-        .path()
-        .join("metadata")
-        .to_string_lossy()
-        .to_string();
-    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
 
     register_test_connectors().await;
-    let rt = start_runtime(&ds).await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
 
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..WRITERS {
@@ -215,16 +215,11 @@ async fn concurrent_first_writes_to_a_parked_sink_all_land() -> Result<(), anyho
         });
     }
 
-    let results = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for concurrent first writes — possible deadlock in the sink registration path"
-            )
-        })?;
-    for result in results {
-        result?;
-    }
+    join_exports(
+        tasks,
+        "concurrent first writes in the sink registration path",
+    )
+    .await?;
 
     let n = u64::try_from(row_count(&rt, METRIC).await?)?;
     assert_eq!(
@@ -249,16 +244,9 @@ async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), 
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let temp_dir = tempfile::tempdir()?;
-    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
-    let metadata_dir = temp_dir
-        .path()
-        .join("metadata")
-        .to_string_lossy()
-        .to_string();
-    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
 
     register_test_connectors().await;
-    let rt = start_runtime(&ds).await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
 
     // Establish the base schema and register the sink.
     ingest(
@@ -292,16 +280,11 @@ async fn concurrent_exports_adding_distinct_dimensions_all_land() -> Result<(), 
                 .await
             });
         }
-        let results = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "timed out waiting for concurrent evolving exports — possible deadlock in the schema-evolution path"
-                )
-            })?;
-        for result in results {
-            result?;
-        }
+        join_exports(
+            tasks,
+            "concurrent evolving exports in the schema-evolution path",
+        )
+        .await?;
     }
 
     let n = u64::try_from(row_count(&rt, METRIC).await?)?;
@@ -336,19 +319,12 @@ async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow:
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let temp_dir = tempfile::tempdir()?;
-    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
-    let metadata_dir = temp_dir
-        .path()
-        .join("metadata")
-        .to_string_lossy()
-        .to_string();
-    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
 
     // Phase 1: establish the schema, then widen it once so the acceleration checkpoint is
     // persisted (schema evolution is what writes the checkpoint).
     {
         register_test_connectors().await;
-        let rt = start_runtime(&ds).await;
+        let rt = start_runtime(METRIC, temp_dir.path()).await;
 
         ingest(
             &rt,
@@ -376,7 +352,7 @@ async fn restart_first_export_with_a_new_dimension_lands() -> Result<(), anyhow:
     // checkpoint and widen it, landing the export.
     {
         register_test_connectors().await;
-        let rt = start_runtime(&ds).await;
+        let rt = start_runtime(METRIC, temp_dir.path()).await;
 
         ingest(
             &rt,
@@ -417,16 +393,9 @@ async fn qualified_reference_write_registers_a_parked_sink() -> Result<(), anyho
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let temp_dir = tempfile::tempdir()?;
-    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
-    let metadata_dir = temp_dir
-        .path()
-        .join("metadata")
-        .to_string_lossy()
-        .to_string();
-    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
 
     register_test_connectors().await;
-    let rt = start_runtime(&ds).await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
 
     // The dataset is registered as the bare `METRIC`; write through its fully-qualified
     // alias, exactly as a Flight `DoPut` does after normalizing the path it was given.
@@ -487,16 +456,9 @@ async fn many_concurrent_exports_adding_distinct_columns_all_land() -> Result<()
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let temp_dir = tempfile::tempdir()?;
-    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
-    let metadata_dir = temp_dir
-        .path()
-        .join("metadata")
-        .to_string_lossy()
-        .to_string();
-    let ds = make_dataset(METRIC, &data_dir, &metadata_dir);
 
     register_test_connectors().await;
-    let rt = start_runtime(&ds).await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
 
     // Establish the base schema and register the sink.
     ingest(
@@ -525,16 +487,11 @@ async fn many_concurrent_exports_adding_distinct_columns_all_land() -> Result<()
         });
     }
 
-    let results = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for concurrent evolving exports — possible deadlock in the schema-evolution path"
-            )
-        })?;
-    for result in results {
-        result?;
-    }
+    join_exports(
+        tasks,
+        "concurrent evolving exports in the schema-evolution path",
+    )
+    .await?;
 
     let n = u64::try_from(row_count(&rt, METRIC).await?)?;
     assert_eq!(

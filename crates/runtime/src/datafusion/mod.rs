@@ -74,7 +74,7 @@ use {
 };
 
 use crate::cluster::partition::service::PartitionService;
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
@@ -751,38 +751,6 @@ pub enum Table {
 struct PendingSinkRegistration {
     dataset: Arc<Dataset>,
     secrets: Arc<TokioRwLock<Secrets>>,
-}
-
-/// `target` with every column of `live` that it does not name added back.
-///
-/// A write builds its target schema from the schema it read. By the time it evolves, another
-/// write may have added a column, and a target that omits that column reads as a request to
-/// remove it — which classifies as incompatible and refuses an addition that is perfectly
-/// compatible. Each write would then have to retry once per column added behind its back, so a
-/// burst of writes each adding a different column could exhaust its retries and lose data.
-/// Restoring the live columns leaves only this write's own additions to classify, so it
-/// evolves in one step no matter how many other writes are in flight.
-///
-/// Keeps `live`'s column order, and for a column both name keeps the target's field, so a type
-/// or nullability change is still classified.
-fn merge_live_columns(live: &SchemaRef, target: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<FieldRef> = Vec::with_capacity(live.fields().len() + target.fields().len());
-    for live_field in live.fields() {
-        let field = target
-            .fields()
-            .iter()
-            .find(|target_field| target_field.name() == live_field.name())
-            .unwrap_or(live_field);
-        fields.push(Arc::clone(field));
-    }
-    fields.extend(
-        target
-            .fields()
-            .iter()
-            .filter(|target_field| live.field_with_name(target_field.name()).is_err())
-            .map(Arc::clone),
-    );
-    Arc::new(Schema::new_with_metadata(fields, target.metadata().clone()))
 }
 
 /// Removes `key` only while it still holds `claimed`.
@@ -2259,15 +2227,11 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        // A writer can name the dataset in more than one way: a Flight `DoPut` turns `foo`
-        // into `spice.public.foo`, and `is_writable` accepts that through `resolved_eq`.
-        // Match the entry the same way, or a write that was just accepted finds nothing to
-        // register and then fails against the unregistered table. The removal below reuses
-        // the matched key, since that is what the entry is stored under.
-        //
-        // A scan is fine: the map only holds sink datasets waiting for their first write.
-        // Keying by bare name would be faster, but would put two same-named sinks from
-        // different schemas in one entry and leave one of them unregistered forever.
+        // Match the entry the way `is_writable` matched the write, or a write it just
+        // accepted finds nothing to register and then fails against the unregistered table.
+        // `resolved_eq` is that match: a bare `foo` names a dataset in any schema. A scan is
+        // what it takes, since the key is not derivable from the write's name; the map only
+        // holds sink datasets awaiting their first write, so it stays short.
         //
         // Release the map guard before taking the entry mutex, so no writer holds the map
         // while waiting.
@@ -2298,54 +2262,43 @@ impl DataFusion {
         let secrets = Arc::clone(&pending_registration.secrets);
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
-        let registration = async {
-            let context = RuntimeConnectorContext::for_dataset(&dataset);
-            let read_provider = sink_connector
-                .read_provider(&context, &dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?;
-            let federated_table = FederatedTable::new_unchecked(read_provider);
-
-            tracing::info!("Dataset {} loading data...", dataset.name);
-            self.register_accelerated_table(
-                Arc::clone(&dataset),
-                Arc::clone(&sink_connector),
-                federated_table,
-                secrets,
-                BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-                None,                    // Sink datasets are not partition-scoped
-            )
+        let context = RuntimeConnectorContext::for_dataset(&dataset);
+        let read_provider = sink_connector
+            .read_provider(&context, &dataset)
             .await
-        }
-        .await;
+            .context(UnableToResolveTableProviderSnafu)?;
 
-        match registration {
-            Ok(_) => {
-                // The table exists now: empty the slot for the writers waiting on it, and
-                // drop the entry so later writers skip this path.
-                *slot = None;
-                remove_if_same(
-                    &mut *self.pending_sink_tables.write().await,
-                    &pending_key,
-                    &entry,
-                );
-                Ok(())
-            }
-            // Registration failed. The entry is still in the slot, so the next write
-            // retries it.
-            Err(e) => Err(e),
-        }
+        tracing::info!("Dataset {} loading data...", dataset.name);
+        // Returning early leaves the registration in the slot, so the next write retries it.
+        self.register_accelerated_table(
+            Arc::clone(&dataset),
+            sink_connector,
+            FederatedTable::new_unchecked(read_provider),
+            secrets,
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+            None,                    // Sink datasets are not partition-scoped
+        )
+        .await?;
+
+        // The table exists now: empty the slot for the writers waiting on it, and drop the
+        // entry so later writers skip this path.
+        *slot = None;
+        remove_if_same(
+            &mut *self.pending_sink_tables.write().await,
+            &pending_key,
+            &entry,
+        );
+        Ok(())
     }
 
     /// The lock that keeps this dataset's writes from overlapping a schema evolution's
     /// provider swap (see `schema_evolve_locks`), created on first use.
     ///
-    /// Keyed by the bare table name, because the same dataset is written under different
-    /// names: the OpenTelemetry ingest and the evolution path use the bare name, a Flight
-    /// `DoPut` uses the fully-qualified one. Separate keys would give them separate locks
-    /// and let a write overlap the swap. The bare name also stays the same before and after
-    /// the dataset registers, which a qualified name does not. Two datasets with the same
-    /// table name in different schemas share a lock, which only costs some parallelism.
+    /// Keyed by the bare table name, because one dataset is written under several names: the
+    /// OpenTelemetry ingest and the evolution path use the bare name, a Flight `DoPut` the
+    /// qualified one. Separate keys would give them separate locks and let a write overlap
+    /// the swap. Two same-named datasets in different schemas share a lock, which costs
+    /// parallelism; splitting them would risk the data loss the lock exists to prevent.
     async fn schema_evolve_lock(
         &self,
         table_reference: &TableReference,
@@ -3899,9 +3852,10 @@ impl DataFusion {
             constraint_columns: &constraint_columns,
         };
 
-        // Classify against the target with the live columns restored, so this write is judged
-        // on what it adds rather than on what it never saw. See `merge_live_columns`.
-        let target_schema = merge_live_columns(&current, target_schema);
+        // Restore the columns this write never saw, so it is judged on what it adds rather
+        // than on what it omits.
+        let target_schema =
+            arrow_tools::schema_evolution::retain_current_columns(&current, target_schema);
 
         match arrow_tools::schema_evolution::classify(&current, &target_schema, &ctx) {
             // Another export already evolved to a superset (or nothing changed): the
@@ -5316,6 +5270,24 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     None
 }
 
+/// Whether a write failed the schema check the runtime runs before inserting anything.
+///
+/// No rows were written, so the caller can rebuild its batch against the new schema and retry
+/// without duplicating rows. The wrapping this reads is applied by `write_data`'s
+/// [`QueryEngine`] impl, so the two must change together.
+#[must_use]
+pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> bool {
+    let runtime_query_engine::query_engine::Error::WriteData { source, .. } = error else {
+        return false;
+    };
+    let DataFusionError::External(inner) = source else {
+        return false;
+    };
+    inner
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
+}
+
 // Normalizes a table reference to a full table reference with catalog, schema, and table name
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
@@ -5778,61 +5750,6 @@ mod tests {
             Arc::ptr_eq(&held_lock, &same_lock),
             "a lock someone still holds must not be replaced"
         );
-    }
-
-    /// A write that never saw a column another write just added must still be judged on what
-    /// it adds. Without restoring the live columns, its target reads as removing that column,
-    /// which classifies as incompatible and refuses the addition.
-    #[test]
-    fn merge_live_columns_restores_columns_the_target_never_saw() {
-        let live = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, true),
-            Field::new("region", DataType::Utf8, true),
-            // Added by a concurrent write, after this target was built.
-            Field::new("tier", DataType::Utf8, true),
-        ]));
-        let target = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, true),
-            Field::new("region", DataType::Utf8, true),
-            // This write's own addition.
-            Field::new("zone", DataType::Utf8, true),
-        ]));
-
-        let merged = merge_live_columns(&live, &target);
-
-        assert_eq!(
-            merged
-                .fields()
-                .iter()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>(),
-            vec!["value", "region", "tier", "zone"],
-            "the live columns keep their order, and this write's addition goes last"
-        );
-
-        // Classifying that against the live schema is a plain addition, not a removal.
-        let constraint_columns: Vec<String> = Vec::new();
-        let ctx = EvolutionContext {
-            constraint_columns: &constraint_columns,
-        };
-        let evolution = arrow_tools::schema_evolution::classify(&live, &merged, &ctx);
-        assert!(
-            matches!(evolution, SchemaEvolution::Widening(_)),
-            "restoring the live columns must leave only the addition, got {evolution:?}"
-        );
-    }
-
-    /// A column both schemas name keeps the incoming field, so a type change is still seen.
-    #[test]
-    fn merge_live_columns_keeps_the_targets_field_for_a_shared_column() {
-        let live = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        let target = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
-
-        let merged = merge_live_columns(&live, &target);
-
-        let field = merged.field_with_name("n").expect("column is present");
-        assert_eq!(field.data_type(), &DataType::Int64);
-        assert!(field.is_nullable());
     }
 
     /// Reloading a dataset replaces its pending-registration entry. A registration finishing

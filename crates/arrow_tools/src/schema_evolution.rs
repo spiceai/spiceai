@@ -138,6 +138,42 @@ impl WideningPlan {
     }
 }
 
+/// `incoming` with every column of `current` that it does not name added back.
+///
+/// [`classify`] reads `incoming` as a full replacement schema, so a column it omits is a
+/// removal — and a removal is [`SchemaEvolution::Incompatible`]. A writer that builds its
+/// schema from the columns its own batch carries omits every column added since it read the
+/// schema, and would have its perfectly compatible addition refused. Restoring the current
+/// columns leaves only that writer's own additions to classify, so it evolves in one step no
+/// matter how many other writers are in flight.
+///
+/// Keeps `current`'s column order, and for a column in both keeps `incoming`'s field, so a
+/// type or nullability change is still classified.
+#[must_use]
+pub fn retain_current_columns(current: &Schema, incoming: &Schema) -> SchemaRef {
+    let mut fields: Vec<FieldRef> =
+        Vec::with_capacity(current.fields().len() + incoming.fields().len());
+    for current_field in current.fields() {
+        let field = incoming
+            .fields()
+            .iter()
+            .find(|incoming_field| incoming_field.name() == current_field.name())
+            .unwrap_or(current_field);
+        fields.push(Arc::clone(field));
+    }
+    fields.extend(
+        incoming
+            .fields()
+            .iter()
+            .filter(|incoming_field| current.field_with_name(incoming_field.name()).is_err())
+            .map(Arc::clone),
+    );
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        incoming.metadata().clone(),
+    ))
+}
+
 /// Classifies `incoming` against `current` using name-based field matching.
 ///
 /// Rules:
@@ -531,6 +567,57 @@ mod tests {
             SchemaEvolution::Incompatible { reason } => reason,
             other => panic!("expected Incompatible, got {other:?}"),
         }
+    }
+
+    /// A writer that never saw a column another writer just added must still be judged on
+    /// what it adds. Without restoring the current columns, its schema reads as removing
+    /// that column, which classifies as incompatible and refuses the addition.
+    #[test]
+    fn retain_current_columns_restores_columns_the_incoming_schema_never_saw() {
+        let current = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Added by a concurrent writer, after the incoming schema was built.
+            Field::new("tier", DataType::Utf8, true),
+        ]);
+        let incoming = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // This writer's own addition.
+            Field::new("zone", DataType::Utf8, true),
+        ]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        assert_eq!(
+            merged
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["value", "region", "tier", "zone"],
+            "the current columns keep their order, and the addition goes last"
+        );
+
+        // Classifying that against the current schema is a plain addition, not a removal.
+        let evolution = classify(&current, &merged, &NO_CONSTRAINTS);
+        assert!(
+            matches!(evolution, SchemaEvolution::Widening(_)),
+            "restoring the current columns must leave only the addition, got {evolution:?}"
+        );
+    }
+
+    /// A column both schemas name keeps the incoming field, so a type change is still seen.
+    #[test]
+    fn retain_current_columns_keeps_the_incoming_field_for_a_shared_column() {
+        let current = Schema::new(vec![Field::new("n", DataType::Int32, false)]);
+        let incoming = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        let field = merged.field_with_name("n").expect("column is present");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(field.is_nullable());
     }
 
     fn assert_identical(evolution: &SchemaEvolution) {
