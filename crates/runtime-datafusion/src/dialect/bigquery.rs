@@ -46,7 +46,6 @@ use datafusion::sql::unparser::dialect::{
 };
 
 pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
-pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
 
 /// The grammar Rust's `i64::FromStr` accepts, which is what
 /// `json_get_int` applies to a JSON **string** node.
@@ -55,19 +54,18 @@ pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
 /// hexadecimal literal, and trims surrounding whitespace — so extracting
 /// through this pattern first is what makes the string case exact. Everything
 /// it rejects, `json_get_int` also rejects, and returns NULL for.
-const INT64_FROM_STR: &str = r"^[+-]?[0-9]+$";
-
-/// The grammar Rust's `f64::FromStr` accepts, which is what `json_get_float`
-/// applies to a JSON **string** node: an optional sign, then `inf`,
-/// `infinity`, `nan` or a decimal with an optional exponent, case-insensitive.
-/// A bare `.5` and a trailing `5.` are both accepted, and whitespace is not.
 ///
-/// Every group is non-capturing. `REGEXP_EXTRACT` accepts **at most one**
+/// It also agrees at the boundaries: an integer too large for `i64` is NULL on
+/// both sides, because Rust's `i64::FromStr` fails rather than saturating.
+/// `json_get_float` is the opposite — Rust saturates an out-of-range magnitude
+/// to infinity where `SAFE_CAST` gives NULL — which is why only the integer
+/// form is translated. See [`SCALAR_OVERRIDES`].
+///
+/// Any group must be non-capturing. `REGEXP_EXTRACT` accepts **at most one**
 /// capturing group and errors on more, which would fail every federated call
 /// remotely; with none it returns the whole match, which is what this wants.
-/// [`tests::no_pattern_has_a_capturing_group`] holds both patterns to that.
-const FLOAT64_FROM_STR: &str =
-    r"(?i)^[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$";
+/// [`tests::no_pattern_has_a_capturing_group`] holds the patterns to that.
+const INT64_FROM_STR: &str = r"^[+-]?[0-9]+$";
 
 /// What `BigQuery` should be asked for, given a `json_get_*` call's path
 /// arguments.
@@ -191,18 +189,22 @@ pub(crate) struct ScalarOverride {
 /// Every function the `BigQuery` dialect rewrites, with what each consumer
 /// needs. [`crate::dialect`] derives the dialect's handlers, the deny-list
 /// carve-out, and the per-call check from this one table.
-pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
-    ScalarOverride {
-        name: JSON_GET_INT_NAME,
-        handler: json_get_int_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_GET_FLOAT_NAME,
-        handler: json_get_float_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-];
+///
+/// `json_get_float` is deliberately absent. Rust's `f64::FromStr` saturates an
+/// out-of-range magnitude to infinity and underflows to zero, where
+/// `SAFE_CAST(… AS FLOAT64)` returns NULL for a value it cannot represent — so
+/// a federated plan would answer NULL where the local function answers
+/// infinity, on the same rows. A `CASE` restoring the infinities would rest on
+/// `BigQuery` behaviour at both boundaries that nothing here can verify, so the
+/// float form stays denied until a real `BigQuery` settles it. The integer form
+/// has no such gap: both sides give up on an out-of-range integer.
+/// `json_get_float_saturates_an_out_of_range_magnitude_to_infinity` in
+/// `runtime-udfs-api` measures the local half.
+pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[ScalarOverride {
+    name: JSON_GET_INT_NAME,
+    handler: json_get_int_to_sql,
+    can_translate: json_path_is_renderable,
+}];
 
 /// `json_get_int(doc, path…)` →
 /// `SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(doc, '<path>'), r'^[+-]?[0-9]+$') AS INT64)`.
@@ -225,21 +227,6 @@ pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
     )
 }
 
-/// `json_get_float(doc, path…)` → the same shape as
-/// [`json_get_int_to_sql`], through [`FLOAT64_FROM_STR`] and `FLOAT64`.
-pub(crate) fn json_get_float_to_sql(
-    unparser: &Unparser,
-    args: &[Expr],
-) -> Result<Option<ast::Expr>> {
-    json_get_number_to_sql(
-        unparser,
-        args,
-        JSON_GET_FLOAT_NAME,
-        FLOAT64_FROM_STR,
-        ast::DataType::Float64,
-    )
-}
-
 fn json_get_number_to_sql(
     unparser: &Unparser,
     args: &[Expr],
@@ -255,8 +242,12 @@ fn json_get_number_to_sql(
         // emit `json_get_*` verbatim into BigQuery SQL, which is the wrong
         // answer dressed as a remote error. Fail where it can be read instead.
         return Err(DataFusionError::Plan(format!(
-            "Cannot push down '{function}' to BigQuery: its path arguments must all be literals. \
-             This plan should not have federated; the BigQuery function-support policy is missing. \
+            "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
+             cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
+             built only from plain keys: every path argument must be a literal, there must be at \
+             least one, and a key cannot contain a quote, a backslash or a control character. \
+             Rewrite the call to a constant path of plain keys, or set 'query_federation: disabled' \
+             on the dataset to evaluate it locally instead. \
              See: https://spiceai.org/docs/components/data-connectors/adbc"
         )));
     };
@@ -514,8 +505,7 @@ mod tests {
     use datafusion::sql::unparser::Unparser;
 
     use super::{
-        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_GET_FLOAT_NAME, JSON_GET_INT_NAME, JsonPath,
-        SpiceBigQueryDialect, can_translate, json_path,
+        INT64_FROM_STR, JSON_GET_INT_NAME, JsonPath, SpiceBigQueryDialect, can_translate, json_path,
     };
     use crate::dialect::new_bigquery_dialect;
     use datafusion::common::ScalarValue;
@@ -593,7 +583,7 @@ mod tests {
         // more; with none it returns the whole match. A capturing group added
         // here would fail every federated call at BigQuery, which no local test
         // can see.
-        for pattern in [INT64_FROM_STR, FLOAT64_FROM_STR] {
+        for pattern in [INT64_FROM_STR] {
             let mut chars = pattern.chars().peekable();
             while let Some(c) = chars.next() {
                 match c {
@@ -648,22 +638,17 @@ mod tests {
             JSON_GET_INT_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(can_translate(&call(
-            JSON_GET_FLOAT_NAME,
-            vec![col("doc"), lit("a")]
-        )));
         assert!(!can_translate(&call(
             JSON_GET_INT_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(!can_translate(&call(
-            JSON_GET_FLOAT_NAME,
-            vec![col("doc"), col("key")]
-        )));
-        assert!(
-            can_translate(&call("upper", vec![col("doc"), col("key")])),
-            "a function this dialect has no handler for is not this check's business"
-        );
+        for name in ["json_get_float", "upper"] {
+            assert!(
+                can_translate(&call(name, vec![col("doc"), col("key")])),
+                "{name} has no handler in this dialect, so it is not this check's business — \
+                 the deny-list has not carved it out and it cannot federate at all"
+            );
+        }
     }
 
     #[test]
@@ -675,10 +660,21 @@ mod tests {
     }
 
     #[test]
-    fn json_get_float_renders_as_a_guarded_safe_cast() {
+    fn an_index_in_the_path_renders_after_the_key() {
         assert_eq!(
-            render(JSON_GET_FLOAT_NAME, vec![col("doc"), lit("a"), lit(2_i64)]),
-            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"[2]'), R'(?i)^[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$') AS FLOAT64)"#
+            render(JSON_GET_INT_NAME, vec![col("doc"), lit("a"), lit(2_i64)]),
+            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"[2]'), R'^[+-]?[0-9]+$') AS INT64)"#
+        );
+    }
+
+    #[test]
+    fn json_get_float_is_not_translated_at_all() {
+        // Rust saturates an out-of-range float to infinity where SAFE_CAST
+        // gives NULL, so pushing it down would change results. It must not be
+        // in the carve-out, which is what would let it federate.
+        assert!(
+            !crate::dialect::bigquery_native_function_names().contains(&"json_get_float"),
+            "json_get_float must stay denied while its boundary behaviour is unverified"
         );
     }
 
@@ -688,15 +684,11 @@ mod tests {
             render(JSON_GET_INT_NAME, vec![col("doc"), lit(-1_i64)]),
             "CAST(NULL AS INT64)"
         );
-        assert_eq!(
-            render(JSON_GET_FLOAT_NAME, vec![col("doc"), lit(-1_i64)]),
-            "CAST(NULL AS FLOAT64)"
-        );
     }
 
     #[test]
     fn no_rendering_ever_contains_the_function_verbatim() {
-        for name in [JSON_GET_INT_NAME, JSON_GET_FLOAT_NAME] {
+        for name in [JSON_GET_INT_NAME] {
             for args in [
                 vec![col("doc"), lit("a")],
                 vec![col("doc"), lit("a"), lit(0_i64)],
@@ -723,9 +715,23 @@ mod tests {
                 vec![col("doc"), col("key")],
             )))
             .expect_err("a dynamic path has no BigQuery translation");
+        let message = error.to_string();
+        for expected in [
+            // The call shape that failed, not the policy that should have
+            // caught it: an internal cause is no help to whoever ran the query.
+            "must be a literal",
+            // The way out, and where to read about it.
+            "query_federation",
+            "https://spiceai.org/docs/components/data-connectors/adbc",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the error must carry {expected:?}: {message}"
+            );
+        }
         assert!(
-            error.to_string().contains("must all be literals"),
-            "the error must say what about the call cannot be pushed down: {error}"
+            !message.contains("policy"),
+            "the error must not name an internal mechanism: {message}"
         );
     }
 

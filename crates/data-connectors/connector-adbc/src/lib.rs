@@ -2316,7 +2316,7 @@ mod function_support_tests {
         assert!(
             federates(
                 "bigquery",
-                json_call("json_get_float", vec![lit("a"), lit(0_i64)])
+                json_call("json_get_int", vec![lit("a"), lit(0_i64)])
             )
             .await,
             "a literal path of any length is translatable"
@@ -2336,16 +2336,24 @@ mod function_support_tests {
         assert!(
             !federates(
                 "bigquery",
-                json_call("json_get_float", vec![lit("a"), col("val")])
+                json_call("json_get_int", vec![lit("a"), col("val")])
             )
             .await,
             "one non-literal element is enough to make the whole path untranslatable"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_int", vec![lit(r#"a"b"#)])).await,
+            "a key the SQL-literal and JSON-path layers quote differently is left local \
+             rather than escaped across both and silently turned into another path"
         );
     }
 
     #[tokio::test]
     async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
         for name in [
+            // Rust saturates an out-of-range float to infinity where BigQuery's
+            // SAFE_CAST gives NULL, so pushing this down would change results.
+            "json_get_float",
             "json_get_str",
             "json_get_bool",
             "json_get",

@@ -362,3 +362,37 @@ fn evaluate_over(doc: &str, expr: Expr) -> Option<String> {
         }
     }
 }
+
+/// Rust's `f64::FromStr` saturates an out-of-range magnitude to infinity
+/// rather than failing, so `json_get_float` returns an infinity where a
+/// NULL-on-overflow implementation would return NULL.
+///
+/// This is why `json_get_float` is not carved out for `BigQuery` pushdown:
+/// `SAFE_CAST(… AS FLOAT64)` yields NULL for a value it cannot represent, so a
+/// federated plan would answer NULL where this answers infinity. `json_get_int`
+/// has no such divergence — Rust and `BigQuery` both give up on an
+/// out-of-range integer — which is why only the integer form is pushed down.
+#[test]
+fn json_get_float_saturates_an_out_of_range_magnitude_to_infinity() {
+    for (value, expected) in [
+        (r#""1e400""#, f64::INFINITY),
+        (r#""-1e400""#, f64::NEG_INFINITY),
+        ("1e400", f64::INFINITY),
+        ("-1e400", f64::NEG_INFINITY),
+    ] {
+        assert_eq!(
+            get_float(&doc(value), &[Path::Key("a")]),
+            Some(expected),
+            "{value} must saturate, not become NULL"
+        );
+    }
+
+    // The other end collapses to zero rather than failing, for the same reason.
+    for value in [r#""1e-400""#, "1e-400"] {
+        assert_eq!(
+            get_float(&doc(value), &[Path::Key("a")]),
+            Some(0.0),
+            "{value} must underflow to zero"
+        );
+    }
+}
