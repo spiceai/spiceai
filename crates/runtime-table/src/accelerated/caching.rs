@@ -218,6 +218,15 @@ pub struct CacheWriteRequest {
     pub filters: Vec<Expr>,
     /// Cache key computed from filters, used to track in-flight writes
     pub cache_key: String,
+    /// Whether rows for this key are already stored, so the write must remove
+    /// them before appending.
+    ///
+    /// A key nothing holds yet is appended with no delete. That matters more
+    /// than it looks: on Cayenne a `delete_from` first checkpoints the inline
+    /// memtable to a file, so deleting on every write — including the
+    /// overwhelming majority that cannot collide with anything — collapsed
+    /// measured ingest from thousands of entries per second to about ten.
+    pub replaces_existing: bool,
     /// Stable storage id of the originating namespace (see
     /// [`runtime_request_context::CacheNamespace::storage_id`]). Stamped into
     /// `__spice_cache_namespace` on every row at flush time and added to the
@@ -508,19 +517,11 @@ async fn flush_cache_writes(
 
         all_batches.extend(batches);
 
-        // Every write replaces its key, whether or not the sender believed the
-        // key was already cached. A write raised as a fresh insert can still
-        // collide: replacing an entry is a delete followed by an append, and a
-        // reader scanning in between sees no rows, reads it as a miss, and
-        // enqueues its own insert for the same key. Appending that blindly
-        // would leave the key with two copies of the response, which queries
-        // then return as duplicated source rows. Deleting the key first makes
-        // the write idempotent, and for a genuinely new key the delete matches
-        // nothing.
-        //
-        // A write with no filters at all cannot be scoped to a replacement, so
-        // appending is all that is available for it.
-        if !filters.is_empty() {
+        // Only a write that replaces stored rows deletes first: a delete for a
+        // key nothing holds matches nothing and is not free. Two writes racing
+        // to insert the same fresh key are prevented where the miss is
+        // enqueued, by the in-flight key set, rather than by deleting here.
+        if req.replaces_existing && !filters.is_empty() {
             replace_filters.push(filters);
         }
     }
@@ -1000,6 +1001,7 @@ impl CacheRefreshHelper {
             filters: filters.to_vec(),
             cache_key: cache_key.clone(),
             namespace_id: namespace.storage_id().into(),
+            replaces_existing: true,
         };
 
         batch_write_tx
@@ -1677,6 +1679,8 @@ impl CacheRefreshHelper {
     /// * `io_runtime` - Tokio runtime handle for spawning background write tasks.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     /// * `batch_write_tx` - Channel sender for batched writes to the caching consumer.
+    /// * `in_flight_revalidations` - Keys with a write already pending, so two
+    ///   readers missing the same key do not each append the response.
     #[expect(clippy::too_many_arguments)]
     async fn handle_cache_miss(
         federated: Arc<dyn TableProvider>,
@@ -1691,6 +1695,7 @@ impl CacheRefreshHelper {
         synchronized_children: SynchronizedChildren,
         batch_write_tx: CacheWriteSender,
         namespace: CacheNamespace,
+        in_flight_revalidations: InFlightRevalidations,
     ) -> SendableRecordBatchStream {
         match Self::fetch_from_source(&federated, dataset_name, filters, limit).await {
             Ok(batches) if !batches.is_empty() => {
@@ -1741,7 +1746,22 @@ impl CacheRefreshHelper {
                 let cache_key =
                     compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
 
-                if batches_cacheable {
+                // Claim the key before enqueuing. Without this, two readers
+                // that miss the same key concurrently each append the response
+                // and the key ends up holding it twice — which queries return
+                // as duplicated source rows. The flush releases the claim once
+                // the write has landed.
+                let claimed = {
+                    let mut in_flight = in_flight_revalidations.lock().await;
+                    in_flight.insert(cache_key.clone())
+                };
+                if !claimed {
+                    tracing::debug!(
+                        "A write for this key is already pending for dataset={dataset_name}; not enqueuing a second copy"
+                    );
+                }
+
+                if batches_cacheable && claimed {
                     if batches.is_empty() {
                         tracing::debug!(
                             "Fetch returned no rows, skipping cache write for dataset={dataset_name}"
@@ -1760,6 +1780,7 @@ impl CacheRefreshHelper {
                             filters: filters.to_vec(),
                             cache_key,
                             namespace_id: namespace.storage_id().into(),
+                            replaces_existing: is_expired,
                         };
                         if let Err(e) = batch_write_tx.send(write_request).await {
                             tracing::warn!(
@@ -2259,6 +2280,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             Arc::clone(&synchronized_children),
                             batch_write_tx.clone(),
                             namespace,
+                            Arc::clone(&in_flight_revalidations),
                         )
                         .await;
                     }
@@ -2297,6 +2319,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     synchronized_children,
                     batch_write_tx,
                     namespace,
+                    Arc::clone(&in_flight_revalidations),
                 )
                 .await
             }
@@ -3742,6 +3765,7 @@ mod tests {
                 filters: vec![],
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
+                replaces_existing: false,
             })
             .await
             .expect("to send write request");
@@ -3797,6 +3821,7 @@ mod tests {
             Arc::new(vec![].into()),
             batch_write_tx.clone(),
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3835,6 +3860,7 @@ mod tests {
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3923,6 +3949,7 @@ mod tests {
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -3968,6 +3995,7 @@ mod tests {
             Arc::new(vec![].into()),
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -4010,6 +4038,66 @@ mod tests {
         assert_eq!(outcome.rows(), 0);
     }
 
+    /// The duplicate a fresh insert could cause is prevented where the miss is
+    /// enqueued, not by deleting on every write: two readers that miss the same
+    /// key concurrently must not each append the response.
+    #[tokio::test]
+    async fn a_second_reader_missing_the_same_key_does_not_enqueue_a_second_copy() {
+        use futures::StreamExt;
+
+        let http_source = Arc::new(MockHttpTableProvider::with_status(200, "body"));
+        let schema = http_source.schema();
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // Stand in for the first reader: its write for this key is already
+        // pending, so the claim is held.
+        let filters = vec![col("content").eq(lit("test"))];
+        let key = compute_cache_key_from_filters_and_namespace(
+            &filters,
+            CacheNamespace::Public.storage_id(),
+        );
+        in_flight.lock().await.insert(key);
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &filters,
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+            CacheNamespace::Public,
+            Arc::clone(&in_flight),
+        )
+        .await;
+
+        // The caller is still served the response it fetched.
+        let mut served = 0;
+        while let Some(batch) = stream.next().await {
+            served += batch.expect("stream").num_rows();
+        }
+        assert!(served > 0, "the reader still gets its data");
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
+        handle.abort();
+
+        assert!(
+            accelerator.get_data().is_empty(),
+            "the second reader must not write a second copy of the response"
+        );
+    }
+
     /// Test that 404 responses are cached.
     ///
     /// Simulates cache miss flow:
@@ -4048,6 +4136,7 @@ mod tests {
             Arc::new(vec![].into()), // synchronized_children
             batch_write_tx,
             CacheNamespace::Public,
+            Arc::clone(&in_flight),
         )
         .await;
 
@@ -4510,47 +4599,12 @@ mod write_path_tests {
     }
 
     #[tokio::test]
-    async fn a_write_raised_as_a_fresh_insert_still_replaces_its_key() {
-        // Replacing an entry is a delete followed by an append, so a reader
-        // scanning in between sees no rows for the key and reads it as a miss.
-        // The insert it then enqueues must not append a second copy beside the
-        // replacement — queries would return the response twice.
-        let (counting, accelerator) = accelerator_with(
-            vec![entry("/a", "already-cached")],
-            /* can_delete */ true,
-        );
-
-        let (tx, handle) = spawn_test_writer(&accelerator);
-        tx.send(CacheWriteRequest {
-            batches: vec![entry("/a", "raced-insert")],
-            filters: vec![col("request_path").eq(lit("/a"))],
-            // The sender believed this key was absent, because when it looked
-            // it was: the replacement's delete had landed and its append had
-            // not.
-            cache_key: "key".to_string(),
-            namespace_id: "public".into(),
-        })
-        .await
-        .expect("send");
-        drop(tx);
-        handle.await.expect("writer");
-
-        assert_eq!(
-            stored(&accelerator).await,
-            vec![("/a".to_string(), "raced-insert".to_string())],
-            "the key must hold one response, not two"
-        );
-        assert_eq!(
-            counting.deletes.load(Ordering::Relaxed),
-            1,
-            "an insert must still clear its key first"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_write_for_a_key_nothing_holds_yet_is_still_written() {
-        // The guard above must not cost a genuinely new entry its write.
-        let (_counting, accelerator) = accelerator_with(vec![], /* can_delete */ true);
+    async fn a_fresh_insert_appends_without_deleting() {
+        // A key nothing holds yet cannot collide, so the delete would match
+        // nothing — and on Cayenne a delete first checkpoints the inline
+        // memtable to a file, which collapsed measured ingest from thousands of
+        // entries per second to about ten when every write did one.
+        let (counting, accelerator) = accelerator_with(vec![], /* can_delete */ true);
 
         let (tx, handle) = spawn_test_writer(&accelerator);
         tx.send(CacheWriteRequest {
@@ -4558,6 +4612,7 @@ mod write_path_tests {
             filters: vec![col("request_path").eq(lit("/new"))],
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
+            replaces_existing: false,
         })
         .await
         .expect("send");
@@ -4565,8 +4620,43 @@ mod write_path_tests {
         handle.await.expect("writer");
 
         assert_eq!(
+            counting.deletes.load(Ordering::Relaxed),
+            0,
+            "a fresh key must not pay for a delete"
+        );
+        assert_eq!(counting.appends.load(Ordering::Relaxed), 1);
+        assert_eq!(
             stored(&accelerator).await,
             vec![("/new".to_string(), "first".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_entry_deletes_first() {
+        let (counting, accelerator) =
+            accelerator_with(vec![entry("/a", "old-a"), entry("/b", "b")], true);
+
+        let (tx, handle) = spawn_test_writer(&accelerator);
+        tx.send(CacheWriteRequest {
+            batches: vec![entry("/a", "new-a")],
+            filters: vec![col("request_path").eq(lit("/a"))],
+            cache_key: "key".to_string(),
+            namespace_id: "public".into(),
+            replaces_existing: true,
+        })
+        .await
+        .expect("send");
+        drop(tx);
+        handle.await.expect("writer");
+
+        assert_eq!(counting.deletes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stored(&accelerator).await,
+            vec![
+                ("/a".to_string(), "new-a".to_string()),
+                ("/b".to_string(), "b".to_string()),
+            ],
+            "the key holds the new response only"
         );
     }
 

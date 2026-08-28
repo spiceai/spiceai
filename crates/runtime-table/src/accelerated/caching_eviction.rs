@@ -70,8 +70,15 @@ use util::expr::combine_exprs_balanced;
 ///
 /// The predicate is an `OR` over per-entry equality tests, so it grows with the
 /// number of entries evicted; past some width the plan costs more than the
-/// eviction saves. Overflow is not dropped — it is simply evicted by the next
-/// sweep, and the shortfall is logged rather than passed over in silence.
+/// eviction saves. Overflow is not dropped — it is evicted by the next sweep,
+/// and the shortfall is logged rather than passed over in silence.
+///
+/// This bounds *predicate width*, which is a hard limit rather than a taste:
+/// DataFusion walks an expression tree recursively, and a 50,000-wide `OR`
+/// overflowed the stack and aborted the process outright. It is deliberately not
+/// the mechanism that keeps a large cache within its budget — see
+/// [`bulk_cutoff`], which evicts any number of entries in one small predicate
+/// whenever it is provably safe to do so. This cap only bounds the fallback.
 const MAX_ENTRIES_PER_SWEEP: usize = 512;
 
 /// The bounds a caching accelerator is held to, beyond its TTLs.
@@ -266,18 +273,16 @@ impl RetentionPredicate for CacheEvictionPredicate {
         .into_iter()
         .flatten()
         {
-            let Selection { keep, deferred } = select_doomed_refs(&survivors, budget);
+            let keep = select_doomed_refs(&survivors, budget);
             if keep == survivors.len() {
                 continue;
             }
-            if deferred > 0 {
-                tracing::info!(
-                    "Cache eviction for dataset '{dataset}' is evicting {evicting} entries to satisfy `{budget_name}`, leaving {deferred} more for the next sweep.",
-                    dataset = self.dataset_name,
-                    evicting = survivors.len() - keep,
-                    budget_name = budget.name(),
-                );
-            }
+            tracing::debug!(
+                "Cache eviction for dataset '{dataset}' is evicting {evicting} entries to satisfy `{budget_name}`.",
+                dataset = self.dataset_name,
+                evicting = survivors.len() - keep,
+                budget_name = budget.name(),
+            );
             // The evicted set is the tail, so the next budget sees exactly what
             // this one leaves behind without any recounting.
             doomed.extend(survivors.drain(keep..));
@@ -287,9 +292,28 @@ impl RetentionPredicate for CacheEvictionPredicate {
             return Ok(None);
         }
 
-        // One predicate naming every entry that goes, bounded to the rows each
-        // held when it was ranked.
-        let predicates: Vec<Expr> = doomed
+        // One range predicate when the doomed and surviving entries do not
+        // overlap in fetch time: exact, and not bounded by how many entries it
+        // covers.
+        if let Some(cutoff) = bulk_cutoff(&doomed, &survivors) {
+            return Ok(Some(
+                col(CACHE_REFRESHED_AT_COLUMN)
+                    .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(cutoff), None))),
+            ));
+        }
+
+        // Otherwise name each entry, bounded to the rows it held when ranked.
+        // Oldest first, since the cap may not reach all of them this sweep.
+        let (naming, deferred) = nameable(&doomed);
+        if deferred > 0 {
+            tracing::info!(
+                "Cache eviction for dataset '{dataset}' cannot separate {total} over-budget entries from the ones it keeps by fetch time, so it is naming {naming} individually and leaving {deferred} for the next sweep.",
+                dataset = self.dataset_name,
+                total = doomed.len(),
+                naming = naming.len(),
+            );
+        }
+        let predicates: Vec<Expr> = naming
             .iter()
             .filter_map(|entry| entry_predicate(&entry.key, entry.newest))
             .collect();
@@ -306,9 +330,7 @@ impl RetentionPredicate for CacheEvictionPredicate {
 /// there is no deadline to hold it to, and the read path already treats a null
 /// timestamp as expired.
 fn row_level_expiry_expr(cutoff: i64) -> Expr {
-    col(CACHE_REFRESHED_AT_COLUMN)
-        .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(cutoff), None)))
-        .or(col(CACHE_REFRESHED_AT_COLUMN).is_null())
+    col(CACHE_REFRESHED_AT_COLUMN).lt_eq(lit(ScalarValue::TimestampNanosecond(Some(cutoff), None)))
 }
 
 /// The instant before which an entry can no longer be served: `caching_ttl`
@@ -438,33 +460,59 @@ impl EntryCost {
     }
 }
 
-/// Where a budget cuts a ranked entry list.
+/// The slice of `doomed` one delete may name, and how many that leaves behind.
 ///
-/// An index rather than a second vector, because the evicted set is always a
-/// contiguous tail: the caller splits the list it already holds instead of
-/// re-deriving the boundary by comparing entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Selection {
-    /// How many of the most recent entries stay.
-    keep: usize,
-    /// How many the sweep left for the next tick, having capped the delete.
-    deferred: usize,
+/// Oldest first: `doomed` is ordered newest-first, so the tail is the oldest and
+/// the cap defers the *newest* of the doomed. Trimming the other end would keep
+/// the least valuable entries and re-doom the same ones every sweep.
+fn nameable<'a>(doomed: &'a [&'a EntryCost]) -> (&'a [&'a EntryCost], usize) {
+    let deferred = doomed.len().saturating_sub(MAX_ENTRIES_PER_SWEEP);
+    (&doomed[deferred..], deferred)
+}
+
+/// The `_fetched_at` cutoff that deletes exactly `doomed` and nothing else, when
+/// one exists.
+///
+/// Eviction normally names each entry by key, because a cached response can span
+/// rows with different fetch times and a range delete could cut one in half. But
+/// when every doomed entry's newest row is older than every survivor's oldest
+/// row, no entry straddles the boundary and `_fetched_at <= cutoff` selects the
+/// doomed set exactly — one small predicate instead of an `OR` per entry.
+///
+/// That matters because predicate width is capped by stack depth
+/// ([`MAX_ENTRIES_PER_SWEEP`]), so naming entries individually cannot evict
+/// faster than a few hundred per sweep — which a cache ingesting hundreds per
+/// second outruns forever. A workload that fetches new keys over time separates
+/// cleanly in fetch order, so this is the ordinary case and the per-key fallback
+/// is for the interleaved one.
+///
+/// Returns `None` if either side lacks a fetch time, or if the two overlap.
+fn bulk_cutoff(doomed: &[&EntryCost], survivors: &[&EntryCost]) -> Option<i64> {
+    let newest_doomed = doomed.iter().map(|e| e.newest).max().flatten()?;
+    if doomed.iter().any(|e| e.newest.is_none()) {
+        return None;
+    }
+    let oldest_survivor = survivors
+        .iter()
+        .try_fold(i64::MAX, |acc, e| e.oldest.map(|o| acc.min(o)))?;
+    (newest_doomed < oldest_survivor).then_some(newest_doomed)
 }
 
 /// Chooses which entries to evict from `entries`, which must be ordered
 /// most-recently-fetched first.
 ///
-/// Returns the doomed entries and how many more were left for the next sweep.
+/// Returns how many of the most recent entries stay; the rest are evicted. An
+/// index rather than a second vector, because the evicted set is always a
+/// contiguous tail.
 ///
 /// Eviction takes a contiguous *oldest* suffix rather than whatever happens not
 /// to fit, so the cache always holds the most recent entries it can afford. If
 /// more entries are doomed than one `DELETE` predicate should name, the
 /// **oldest** of them go first — trimming the other end would keep the least
 /// valuable entries and re-doom the same ones every sweep.
-fn select_doomed_refs(entries: &[&EntryCost], budget: Budget) -> Selection {
+fn select_doomed_refs(entries: &[&EntryCost], budget: Budget) -> usize {
     let allowance = budget.allowance();
     let mut spent: u64 = 0;
-    let mut first_doomed = entries.len();
 
     for (index, entry) in entries.iter().enumerate() {
         let cost = match budget {
@@ -472,19 +520,12 @@ fn select_doomed_refs(entries: &[&EntryCost], budget: Budget) -> Selection {
             Budget::Bytes(_) => entry.bytes,
         };
         if spent.saturating_add(cost) > allowance {
-            first_doomed = index;
-            break;
+            return index;
         }
         spent = spent.saturating_add(cost);
     }
 
-    // Take from the end: `entries` is newest-first, so the oldest are last, and
-    // the ones a capped sweep defers are the newest of the doomed.
-    let deferred = (entries.len() - first_doomed).saturating_sub(MAX_ENTRIES_PER_SWEEP);
-    Selection {
-        keep: first_doomed + deferred,
-        deferred,
-    }
+    entries.len()
 }
 
 /// Groups the stored rows into cache entries and orders them
@@ -578,9 +619,11 @@ async fn rank_entries(
 /// Builds `col = value AND ...` identifying exactly one cache entry, bounded to
 /// the rows that entry held when it was ranked.
 ///
-/// A NULL key component is matched with `IS NULL` rather than `= NULL`, which
-/// is never true and would leave the entry undeletable — an entry with no query
-/// string is the common case, not an edge one.
+/// An entry with a NULL key component is skipped rather than matched with
+/// `IS NULL`, because a delete naming many entries is one statement: an engine
+/// that rejects `IS NULL` rejects the whole thing, so emitting it would cost
+/// every entry's eviction to save one. HTTP metadata columns hold empty strings
+/// rather than NULLs, so this is an edge the shipped connectors do not reach.
 ///
 /// `ranked_newest` is what makes it safe to rank without holding the write
 /// lock. A refresh replaces an entry by deleting it and appending rows with a
@@ -591,31 +634,32 @@ async fn rank_entries(
 /// successfully refreshed response into a cache miss, which is precisely what
 /// `stale_if_error` exists to avoid during an origin outage.
 ///
-/// A row with no fetch time is included: it cannot have come from a refresh, and
-/// excluding it would leave part of the entry behind.
+/// Deliberately no `IS NULL` disjunct for a row with no fetch time: an
+/// accelerator's delete translator need not accept `IS NULL`, and the `DuckDB`
+/// one does not — emitting it failed every sweep with "Expression not
+/// supported" and evicted nothing at all. An entry whose rows *all* lack a
+/// fetch time is still removed whole, because it ranks with `newest = None`
+/// and gets the bare identity predicate. Only an entry mixing timestamped and
+/// untimestamped rows keeps the untimestamped ones, which one fetch cannot
+/// produce.
 fn entry_predicate(key: &[(String, Option<String>)], ranked_newest: Option<i64>) -> Option<Expr> {
     let identity = key
         .iter()
-        .map(|(name, value)| match value {
-            Some(value) => col(name).eq(lit(value.as_str())),
-            None => col(name).is_null(),
-        })
+        .map(|(name, value)| value.as_ref().map(|v| col(name).eq(lit(v.as_str()))))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
         .reduce(Expr::and)?;
 
     let Some(ranked_newest) = ranked_newest else {
         return Some(identity);
     };
 
-    Some(
-        identity.and(
-            col(CACHE_REFRESHED_AT_COLUMN)
-                .lt_eq(lit(ScalarValue::TimestampNanosecond(
-                    Some(ranked_newest),
-                    None,
-                )))
-                .or(col(CACHE_REFRESHED_AT_COLUMN).is_null()),
-        ),
-    )
+    Some(identity.and(
+        col(CACHE_REFRESHED_AT_COLUMN).lt_eq(lit(ScalarValue::TimestampNanosecond(
+            Some(ranked_newest),
+            None,
+        ))),
+    ))
 }
 
 /// The subset of [`REQUEST_KEY_COLUMNS`] this accelerator stores, plus the cache
@@ -762,16 +806,168 @@ mod tests {
         assert!(entry_key_columns(&schema).is_empty());
     }
 
+    fn cost(oldest: Option<i64>, newest: Option<i64>) -> EntryCost {
+        EntryCost {
+            key: vec![("request_path".to_string(), Some("/x".to_string()))],
+            rows: 1,
+            bytes: 1,
+            oldest,
+            newest,
+            matches_configured: false,
+        }
+    }
+
     #[test]
-    fn entry_predicate_matches_a_null_component_with_is_null() {
-        let key = vec![
+    fn a_clean_separation_in_fetch_time_yields_one_range_predicate() {
+        // The ordinary case: entries fetched over time do not overlap, so the
+        // whole doomed set goes in one predicate rather than one per entry.
+        let doomed = [cost(Some(10), Some(20)), cost(Some(5), Some(15))];
+        let survivors = [cost(Some(30), Some(40)), cost(Some(50), Some(60))];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+        assert_eq!(bulk_cutoff(&d, &s), Some(20));
+    }
+
+    #[test]
+    fn an_overlapping_survivor_refuses_the_range_predicate() {
+        // A survivor with a row older than the newest doomed row would be
+        // caught by `_fetched_at <= cutoff`, so the range delete is not exact
+        // and must not be used.
+        let doomed = [cost(Some(10), Some(30))];
+        let survivors = [cost(Some(20), Some(40))];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        let s: Vec<&EntryCost> = survivors.iter().collect();
+        assert_eq!(bulk_cutoff(&d, &s), None);
+    }
+
+    #[test]
+    fn a_missing_fetch_time_on_either_side_refuses_the_range_predicate() {
+        // Without a timestamp there is no boundary to reason about, and a row
+        // that cannot be placed must not be swept up by a range.
+        let d1 = [cost(Some(10), None)];
+        let s1 = [cost(Some(30), Some(40))];
+        assert_eq!(
+            bulk_cutoff(
+                &d1.iter().collect::<Vec<_>>(),
+                &s1.iter().collect::<Vec<_>>()
+            ),
+            None
+        );
+
+        let d2 = [cost(Some(10), Some(20))];
+        let s2 = [cost(None, Some(40))];
+        assert_eq!(
+            bulk_cutoff(
+                &d2.iter().collect::<Vec<_>>(),
+                &s2.iter().collect::<Vec<_>>()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn evicting_everything_still_yields_a_range_predicate() {
+        // No survivors means no boundary to violate.
+        let doomed = [cost(Some(1), Some(2)), cost(Some(3), Some(4))];
+        let d: Vec<&EntryCost> = doomed.iter().collect();
+        assert_eq!(bulk_cutoff(&d, &[]), Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_budget_evicts_far_more_entries_than_one_predicate_could_name() {
+        // The convergence property: naming entries individually is capped at
+        // MAX_ENTRIES_PER_SWEEP, so a cache well over budget could never catch
+        // up. With a clean fetch-time separation one sweep removes all of it.
+        let over = MAX_ENTRIES_PER_SWEEP * 3;
+        let rows: Vec<Row> = (0..over + 10)
+            .map(|i| Row {
+                path: Box::leak(format!("/e{i}").into_boxed_str()),
+                query: None,
+                // Distinct ages, newest last, so nothing overlaps.
+                age: Duration::from_secs((over + 10 - i) as u64),
+                content: "body",
+            })
+            .collect();
+        let (accelerator, federated) = cache_table(&rows);
+
+        let deleted = sweep(
+            &accelerator,
+            &federated,
+            CacheLimits {
+                max_items: Some(10),
+                ..no_expiry()
+            },
+        )
+        .await;
+
+        assert!(
+            deleted as usize > MAX_ENTRIES_PER_SWEEP,
+            "one sweep must be able to evict past the per-predicate cap, or a \
+             cache over budget never converges: deleted={deleted}"
+        );
+        assert_eq!(remaining(&accelerator).await.len(), 10);
+    }
+
+    /// Every predicate this module hands an accelerator must stay inside what a
+    /// real delete translator accepts.
+    ///
+    /// `MemTable`, which the tests above delete through, evaluates arbitrary
+    /// DataFusion expressions — so it accepted an `IS NULL` term that the DuckDB
+    /// accelerator rejects outright with "Expression not supported". A measured
+    /// run failed *every* sweep on that one term and evicted nothing at all,
+    /// while the suite was green. The test double being more capable than the
+    /// engine is what hid it, so this asserts on the predicate's shape rather
+    /// than on what a permissive double does with it.
+    #[test]
+    fn no_predicate_this_builds_contains_is_null() {
+        let schema = http_cache_schema();
+        let key: Vec<(String, Option<String>)> = entry_key_columns(&schema)
+            .into_iter()
+            .map(|name| (name, Some(String::new())))
+            .collect();
+
+        let mut rendered = vec![
+            entry_predicate(&key, None).expect("identity").to_string(),
+            entry_predicate(&key, Some(1_700_000_000))
+                .expect("ranked")
+                .to_string(),
+            row_level_expiry_expr(1_700_000_000).to_string(),
+        ];
+        if let Some(size) = payload_bytes_expr(&schema) {
+            rendered.push(size.to_string());
+        }
+
+        for expr in rendered {
+            assert!(
+                !expr.to_uppercase().contains("IS NULL"),
+                "an accelerator's delete translator need not accept IS NULL: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_predicate_never_emits_is_null() {
+        // A delete naming many entries is one statement, and an accelerator's
+        // delete translator need not accept `IS NULL` — the DuckDB one does not,
+        // and a single such term failed every sweep and evicted nothing at all.
+        // An entry with a NULL key component is therefore skipped rather than
+        // matched, which costs that entry's eviction instead of everyone's.
+        let with_null = vec![
             ("request_path".to_string(), Some("/users".to_string())),
             ("request_query".to_string(), None),
         ];
-        let rendered = entry_predicate(&key, None).unwrap().to_string();
+        assert!(entry_predicate(&with_null, None).is_none());
+
+        // The shape the HTTP connector actually stores: absent query and body
+        // are empty strings, so they match by equality.
+        let empty = vec![
+            ("request_path".to_string(), Some("/users".to_string())),
+            ("request_query".to_string(), Some(String::new())),
+        ];
+        let rendered = entry_predicate(&empty, Some(10)).unwrap().to_string();
         assert!(
-            rendered.contains("IS NULL"),
-            "a NULL key component must be matched with IS NULL, or the entry can never be evicted: {rendered}"
+            !rendered.contains("IS NULL"),
+            "no predicate this builds may contain IS NULL: {rendered}"
         );
     }
 
@@ -857,14 +1053,13 @@ mod tests {
             .collect()
     }
 
-    fn doomed_paths(entries: &[EntryCost], budget: Budget) -> (Vec<String>, usize) {
+    fn doomed_paths(entries: &[EntryCost], budget: Budget) -> Vec<String> {
         let refs: Vec<&EntryCost> = entries.iter().collect();
-        let Selection { keep, deferred } = select_doomed_refs(&refs, budget);
-        let paths = refs[keep..]
+        let keep = select_doomed_refs(&refs, budget);
+        refs[keep..]
             .iter()
             .filter_map(|e| e.key.first().and_then(|(_, v)| v.clone()))
-            .collect();
-        (paths, deferred)
+            .collect()
     }
 
     #[test]
@@ -872,15 +1067,14 @@ mod tests {
         // Entries are newest-first, so /0 is newest. A budget of 2 rows keeps
         // /0 and /1 and dooms the rest — not whichever happen to fit.
         let entries = ranked(&[(1, 10), (1, 10), (1, 10), (1, 10)]);
-        let (doomed, deferred) = doomed_paths(&entries, Budget::Items(2));
+        let doomed = doomed_paths(&entries, Budget::Items(2));
         assert_eq!(doomed, vec!["/2".to_string(), "/3".to_string()]);
-        assert_eq!(deferred, 0);
     }
 
     #[test]
     fn selection_charges_bytes_against_a_byte_budget() {
         let entries = ranked(&[(1, 100), (1, 100), (1, 100)]);
-        let (doomed, _) = doomed_paths(&entries, Budget::Bytes(250));
+        let doomed = doomed_paths(&entries, Budget::Bytes(250));
         assert_eq!(doomed, vec!["/2".to_string()]);
     }
 
@@ -888,14 +1082,8 @@ mod tests {
     fn selection_evicts_nothing_when_everything_fits() {
         let entries = ranked(&[(1, 10), (1, 10)]);
         let refs: Vec<&EntryCost> = entries.iter().collect();
-        assert_eq!(
-            select_doomed_refs(&refs, Budget::Items(10)).keep,
-            refs.len()
-        );
-        assert_eq!(
-            select_doomed_refs(&refs, Budget::Bytes(1024)).keep,
-            refs.len()
-        );
+        assert_eq!(select_doomed_refs(&refs, Budget::Items(10)), refs.len());
+        assert_eq!(select_doomed_refs(&refs, Budget::Bytes(1024)), refs.len());
     }
 
     #[test]
@@ -903,31 +1091,40 @@ mod tests {
         // Otherwise one oversized response would pin the cache over its budget
         // for good.
         let entries = ranked(&[(1, 5_000)]);
-        let (doomed, _) = doomed_paths(&entries, Budget::Bytes(1_000));
+        let doomed = doomed_paths(&entries, Budget::Bytes(1_000));
         assert_eq!(doomed, vec!["/0".to_string()]);
     }
 
     #[test]
-    fn an_overflowing_sweep_evicts_the_oldest_entries_first() {
-        // More entries are doomed than one DELETE should name. The ones that go
-        // must be the *oldest* — taking the other end would keep the least
-        // valuable entries and re-doom the same ones every sweep, so the cache
-        // would never converge on its budget.
+    fn selection_dooms_every_over_budget_entry_not_only_what_one_delete_can_name() {
+        // The cap belongs to how the delete is written, not to what is over
+        // budget. Capping here left over-budget entries among the survivors,
+        // where they overlapped the doomed in fetch time and forced the
+        // per-entry path forever — so a large cache could never converge.
         let count = MAX_ENTRIES_PER_SWEEP + 10;
         let entries = ranked(&vec![(1_u64, 10_u64); count]);
+        let doomed = doomed_paths(&entries, Budget::Items(0));
+        assert_eq!(doomed.len(), count, "every over-budget entry is doomed");
+    }
 
-        let (doomed, deferred) = doomed_paths(&entries, Budget::Items(0));
-        assert_eq!(doomed.len(), MAX_ENTRIES_PER_SWEEP);
+    #[test]
+    fn a_capped_delete_names_the_oldest_entries_first() {
+        // When entries cannot be separated by fetch time the delete names them
+        // individually, and the cap must trim the *newest* of the doomed:
+        // trimming the other end would keep the least valuable entries and
+        // re-doom the same ones every sweep.
+        let count = MAX_ENTRIES_PER_SWEEP + 10;
+        let entries = ranked(&vec![(1_u64, 10_u64); count]);
+        let refs: Vec<&EntryCost> = entries.iter().collect();
+
+        let (naming, deferred) = nameable(&refs);
+        assert_eq!(naming.len(), MAX_ENTRIES_PER_SWEEP);
         assert_eq!(deferred, 10);
+        let path = |e: &EntryCost| e.key[0].1.clone().unwrap_or_default();
+        assert_eq!(path(naming[naming.len() - 1]), format!("/{}", count - 1));
         assert_eq!(
-            doomed.last().map(String::as_str),
-            Some(format!("/{}", count - 1).as_str()),
-            "the oldest entry must be in this sweep"
-        );
-        assert_eq!(
-            doomed.first().map(String::as_str),
-            Some(format!("/{}", count - MAX_ENTRIES_PER_SWEEP).as_str()),
-            "the newest of the doomed entries are the ones deferred"
+            path(naming[0]),
+            format!("/{}", count - MAX_ENTRIES_PER_SWEEP)
         );
     }
 
@@ -974,9 +1171,11 @@ mod tests {
                     rows.iter().map(|r| r.path).collect::<Vec<_>>(),
                 )) as _,
                 Arc::new(StringArray::from(
-                    rows.iter().map(|r| r.query).collect::<Vec<_>>(),
+                    rows.iter()
+                        .map(|r| r.query.unwrap_or(""))
+                        .collect::<Vec<_>>(),
                 )) as _,
-                Arc::new(StringArray::from(vec![None::<&str>; rows.len()])) as _,
+                Arc::new(StringArray::from(vec![""; rows.len()])) as _,
                 Arc::new(StringArray::from(
                     rows.iter().map(|r| r.content).collect::<Vec<_>>(),
                 )) as _,
@@ -1011,7 +1210,9 @@ mod tests {
             for r in 0..batch.num_rows() {
                 out.push((
                     read_utf8(batch, "request_path", r).unwrap_or_default(),
-                    read_utf8(batch, "request_query", r),
+                    // The connector stores an absent query as an empty string;
+                    // report it as absent so assertions read as intent.
+                    read_utf8(batch, "request_query", r).filter(|q| !q.is_empty()),
                 ));
             }
         }
@@ -1077,8 +1278,8 @@ mod tests {
             Arc::new(http_cache_schema()),
             vec![
                 Arc::new(StringArray::from(vec![path])) as _,
-                Arc::new(StringArray::from(vec![None::<&str>])) as _,
-                Arc::new(StringArray::from(vec![None::<&str>])) as _,
+                Arc::new(StringArray::from(vec![""])) as _,
+                Arc::new(StringArray::from(vec![""])) as _,
                 Arc::new(StringArray::from(vec!["refreshed"])) as _,
                 Arc::new(TimestampNanosecondArray::from(vec![Some(nanos_ago(
                     Duration::ZERO,
@@ -1683,8 +1884,8 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["/live", "/dead"])) as _,
-                Arc::new(StringArray::from(vec![None::<&str>, None])) as _,
-                Arc::new(StringArray::from(vec![None::<&str>, None])) as _,
+                Arc::new(StringArray::from(vec!["", ""])) as _,
+                Arc::new(StringArray::from(vec!["", ""])) as _,
                 Arc::new(StringArray::from(vec!["a", "b"])) as _,
                 Arc::new(TimestampMicrosecondArray::from(vec![
                     Some(live_us),
