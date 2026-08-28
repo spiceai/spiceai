@@ -993,6 +993,39 @@ impl Builder {
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source.
+        //
+        // Built before ANY background task starts, because building it can fail: a
+        // key the worker could never deliver on refuses the table rather than
+        // letting it accept writes it would never carry to the source. Every
+        // `return` after this point abandons whatever tasks already exist, and
+        // dropping a `JoinHandle` detaches its task rather than aborting it — only
+        // `Drop for AcceleratedTable` aborts them, and that never runs for a table
+        // that was never built. `refresher.start` below is the first such task, so
+        // this has to come before it, not merely before `handlers`.
+        //
+        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
+        // further down.
+        let write_back_worker = if self.write_back && !self.dual_write {
+            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+                Some(write::CayenneWriteTarget::Staged(cayenne))
+                    if cayenne.is_durable_write_back() =>
+                {
+                    Some(write_back_worker::WriteBackWorker::new(
+                        *cayenne,
+                        Arc::clone(&self.federated),
+                        self.dataset_name.to_string(),
+                        self.write_back_deliverer.clone(),
+                    )?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
                 // Accelerated tables aren't loaded locally on the scheduler —
@@ -1022,36 +1055,6 @@ impl Builder {
                 )
             };
         let refresher = Arc::new(refresher);
-
-        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
-        // commit path marks dirty keys gets a per-table delivery worker that
-        // reconciles those keys to the federated source.
-        //
-        // Built HERE, before any background task is spawned, because building it
-        // can fail: a key the worker could never deliver on refuses the table
-        // rather than letting it accept writes it would never carry to the source.
-        // Returning that error after the refresh and CDC tasks existed would drop
-        // their `JoinHandle`s, which detaches rather than aborts them, leaving a
-        // refused dataset with live tasks still mutating its accelerator.
-        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
-        // below.
-        let write_back_worker = if self.write_back && !self.dual_write {
-            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
-                Some(write::CayenneWriteTarget::Staged(cayenne))
-                    if cayenne.is_durable_write_back() =>
-                {
-                    Some(write_back_worker::WriteBackWorker::new(
-                        *cayenne,
-                        Arc::clone(&self.federated),
-                        self.dataset_name.to_string(),
-                        self.write_back_deliverer.clone(),
-                    )?)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
 
         let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
