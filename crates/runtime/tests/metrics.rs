@@ -350,6 +350,11 @@ fn csv_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// The footprint sample runs on that tick, so the interval has to be short; its
 /// own 30-second floor does not suppress the FIRST sample, which is the one this
 /// test reads.
+///
+/// Not built on Windows: the engine crate is a `cfg(not(windows))`
+/// dev-dependency, so the `cayenne` accelerator is unregistered there and a
+/// dataset naming it could never load.
+#[cfg(not(windows))]
 fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     let csv = fixture_csv(dir, name);
     write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
@@ -390,6 +395,7 @@ fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
 /// families; the ones that need a specific event are in
 /// [`EVENT_GATED_CAYENNE_MAINTENANCE_METRICS`], and the test asserts they are
 /// *absent* so neither list can silently go stale.
+#[cfg(not(windows))]
 const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_compaction_outcome_total",
     "cayenne_maintenance_outcome_total",
@@ -438,6 +444,7 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
 /// Kept as a list rather than a comment because the test asserts they are absent:
 /// if one starts arriving without a workload it has become always-sampled, and
 /// leaving it here would mean nothing ever checks that its call site survives.
+#[cfg(not(windows))]
 const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     // Recorded when a threshold actually fires. This fixture holds one inline
     // file, so every pass declines before any trigger is evaluated.
@@ -687,6 +694,7 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
 /// The dataset sets a 250 ms compaction interval because the footprint sample
 /// rides that tick. Its own 30-second floor does not suppress the first sample,
 /// which is the one read here.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
     let registry = &*PROMETHEUS;
@@ -784,6 +792,7 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
 /// The table label is part of the key because the registry is shared across the
 /// tests in this file, so a sibling fixture's series must not satisfy an
 /// assertion about this one.
+#[cfg(not(windows))]
 fn compaction_outcomes(registry: &prometheus::Registry) -> HashMap<(String, String, String), f64> {
     registry
         .gather()
