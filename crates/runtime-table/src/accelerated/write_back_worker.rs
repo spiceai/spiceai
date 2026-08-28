@@ -199,24 +199,17 @@ pub(crate) struct WriteBackWorker {
 }
 
 impl WriteBackWorker {
-    /// Spawn the delivery loop; the returned handle is pushed onto the
-    /// accelerated table's `handlers` and aborted when the table drops.
+    /// Start the delivery loop; the returned handle is pushed onto the accelerated
+    /// table's `handlers` and aborted when the table drops.
     ///
-    /// # Errors
-    ///
-    /// As [`Self::new`]: a key this worker could never deliver on refuses to build
-    /// rather than serving writes it cannot carry to the source.
-    pub(crate) fn spawn(
-        provider: CayenneTableProvider,
-        federated: Arc<FederatedTable>,
-        dataset_name: String,
-        deliverer: Option<Arc<dyn WriteBackDeliverer>>,
-    ) -> Result<JoinHandle<()>, AcceleratedTableBuilderError> {
-        let mut worker = Self::new(provider, federated, dataset_name, deliverer)?;
+    /// Separate from [`Self::new`] so the fallible half runs before the table
+    /// starts any background task: a failure after that point returns from
+    /// `build`, and the accumulated handles detach rather than abort.
+    pub(crate) fn start(mut self) -> JoinHandle<()> {
         WRITE_BACK_GAUGE_OWNERS
             .lock()
-            .register(&worker.dataset_name, &worker.gauge_owner);
-        Ok(tokio::spawn(async move { worker.run().await }))
+            .register(&self.dataset_name, &self.gauge_owner);
+        tokio::spawn(async move { self.run().await })
     }
 
     /// Build the worker, or refuse a key it could never deliver on.
@@ -231,7 +224,7 @@ impl WriteBackWorker {
     /// accelerator resolved anything but a single primary-key column, and
     /// [`AcceleratedTableBuilderError::DurableWriteBackKeyMismatch`] when the
     /// deliverer would upsert on a different column than the one this worker marks.
-    fn new(
+    pub(crate) fn new(
         provider: CayenneTableProvider,
         federated: Arc<FederatedTable>,
         dataset_name: String,
@@ -1199,13 +1192,14 @@ mod deliverer_tests {
             ..FakeDeliverer::default()
         });
 
-        let error = WriteBackWorker::spawn(
+        let error = WriteBackWorker::new(
             provider,
             federated,
             "orders".to_string(),
             Some(deliverer as Arc<dyn WriteBackDeliverer>),
         )
-        .expect_err("a deliverer keyed on another column must refuse to build");
+        .err()
+        .expect("a deliverer keyed on another column must refuse to build");
 
         let message = error.to_string();
         for expected in ["orders", "'id'", "'name'", "second row"] {
@@ -1238,13 +1232,14 @@ mod deliverer_tests {
                 MemTable::try_new(orders_schema(), vec![vec![]]).expect("mem table"),
             )));
 
-            let error = WriteBackWorker::spawn(
+            let error = WriteBackWorker::new(
                 provider,
                 federated,
                 "orders".to_string(),
                 Some(FakeDeliverer::arc() as Arc<dyn WriteBackDeliverer>),
             )
-            .expect_err("a key that cannot be delivered on must refuse to build");
+            .err()
+            .expect("a key that cannot be delivered on must refuse to build");
 
             let message = error.to_string();
             assert!(

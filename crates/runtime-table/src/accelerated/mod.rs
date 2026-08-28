@@ -1023,6 +1023,36 @@ impl Builder {
             };
         let refresher = Arc::new(refresher);
 
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source.
+        //
+        // Built HERE, before any background task is spawned, because building it
+        // can fail: a key the worker could never deliver on refuses the table
+        // rather than letting it accept writes it would never carry to the source.
+        // Returning that error after the refresh and CDC tasks existed would drop
+        // their `JoinHandle`s, which detaches rather than aborts them, leaving a
+        // refused dataset with live tasks still mutating its accelerator.
+        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
+        // below.
+        let write_back_worker = if self.write_back && !self.dual_write {
+            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+                Some(write::CayenneWriteTarget::Staged(cayenne))
+                    if cayenne.is_durable_write_back() =>
+                {
+                    Some(write_back_worker::WriteBackWorker::new(
+                        *cayenne,
+                        Arc::clone(&self.federated),
+                        self.dataset_name.to_string(),
+                        self.write_back_deliverer.clone(),
+                    )?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let mut handlers = vec![];
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
@@ -1211,25 +1241,14 @@ impl Builder {
             WriteMode::WriteThrough
         };
 
-        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
-        // commit path marks dirty keys gets a per-table delivery worker that
-        // reconciles those keys to the federated source. Aborted on drop with
-        // the other handlers.
-        if matches!(write_mode, WriteMode::WriteBack)
-            && let Some(write::CayenneWriteTarget::Staged(cayenne)) =
-                write::dual_write::extract_cayenne_write_target(&self.accelerator)
-            && cayenne.is_durable_write_back()
-        {
-            // Fail closed: a table whose resolved key cannot be delivered on would
-            // accept writes, mark them, and never deliver one. Registration
-            // refuses that configuration over the declared key, so this is the
-            // resolved key disagreeing — refuse to build rather than serve it.
-            handlers.push(write_back_worker::WriteBackWorker::spawn(
-                *cayenne,
-                Arc::clone(&self.federated),
-                self.dataset_name.to_string(),
-                self.write_back_deliverer.clone(),
-            )?);
+        // Started here rather than where it was built, so it is aborted on drop
+        // with the other handlers.
+        if let Some(worker) = write_back_worker {
+            debug_assert!(
+                matches!(write_mode, WriteMode::WriteBack),
+                "a delivery worker was built for a table that did not resolve to write-back"
+            );
+            handlers.push(worker.start());
         }
 
         Ok(AcceleratedTable {

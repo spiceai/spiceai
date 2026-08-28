@@ -21,10 +21,9 @@ chbench CDC at scale (see the `accelerated/*-cdc-tuned-*` pods for m7a perf runs
 
 > **This fixture does not load as written.** Its write-back datasets (`district`,
 > `stock`, `oorder`) declare composite primary keys, and durable write-back keys each
-> delivery on a single column, so the runtime refuses them at registration. They never
-> delivered either — the worker saw the composite key, logged it, and exited, leaving
-> the markers to accumulate. Reviving this benchmark needs write-back datasets keyed on
-> one column, or composite-key delivery support.
+> delivery on a single column, so the runtime refuses them at registration. Reviving
+> this benchmark needs write-back datasets keyed on one column, or composite-key
+> delivery support.
 
 ## What it proves
 

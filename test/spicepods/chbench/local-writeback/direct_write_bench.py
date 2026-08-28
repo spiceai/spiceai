@@ -335,15 +335,11 @@ def main():
         print(f"  WARNING: {total_exhausted} round(s) exhausted {args.max_retries} "
               f"retries without committing — possible OCC starvation / stuck-degraded")
 
-    # NOTE: this spicepod's write-back datasets (district, stock, oorder) are keyed
-    # on composite primary keys, which durable write-back cannot deliver -- it keys
-    # each delivery on a single column -- so the runtime now refuses them at
-    # registration and this fixture does not load as written. It never delivered
-    # them either: the worker logged the composite key and exited, so the markers
-    # only accumulated. Running this benchmark again needs single-column-key tables
-    # or composite-key delivery support; the DELETE-refusal step that lived here is
-    # unreachable until then and has been removed rather than left asserting a path
-    # it cannot take.
+    # Durable write-back keys each delivery on a single primary-key column, and
+    # this spicepod's write-back datasets (district, stock, oorder) are keyed on
+    # composite ones, so the runtime refuses them at registration and the fixture
+    # does not load. Reviving this step needs write-back datasets keyed on one
+    # column, or composite-key delivery support.
     print("[4/5] (skipped: fixture needs single-column-key write-back datasets)")
 
     print("[5/5] checking invariants...")
