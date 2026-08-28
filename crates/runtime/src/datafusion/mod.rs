@@ -5780,9 +5780,6 @@ mod tests {
         );
     }
 
-    /// Reloading a dataset replaces its pending-registration entry. A registration finishing
-    /// against the old entry must leave the replacement alone, or the reloaded dataset can
-    /// never register on its first write.
     /// A write that never saw a column another write just added must still be judged on what
     /// it adds. Without restoring the live columns, its target reads as removing that column,
     /// which classifies as incompatible and refuses the addition.
@@ -5838,6 +5835,9 @@ mod tests {
         assert!(field.is_nullable());
     }
 
+    /// Reloading a dataset replaces its pending-registration entry. A registration finishing
+    /// against the old entry must leave the replacement alone, or the reloaded dataset can
+    /// never register on its first write.
     #[test]
     fn remove_if_same_leaves_a_replacement_entry_in_place() {
         let key = TableReference::bare("metric");

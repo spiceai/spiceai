@@ -1148,18 +1148,31 @@ fn attribute_value_type_name(value: &any_value::Value) -> &'static str {
     }
 }
 
-/// The name of a metric column's type, as an OTLP user would say it.
-fn column_type_name(data_type: &DataType) -> &'static str {
-    match data_type {
+/// The name of a metric column's type, for a message an operator has to act on.
+///
+/// Numeric widths are named, because when a value does not fit its column the width is the
+/// reason: a 32-bit column has no room for the number, whatever the attribute looked like. A
+/// type no attribute value maps onto has no such name, so its Arrow type is printed instead —
+/// it still tells the operator what the column holds.
+fn column_type_name(data_type: &DataType) -> Cow<'static, str> {
+    let name = match data_type {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
         DataType::Boolean => "boolean",
-        DataType::Int64 => "integer",
-        DataType::UInt64 => "unsigned integer",
-        DataType::Float64 => "double",
+        DataType::Int8 => "8-bit integer",
+        DataType::Int16 => "16-bit integer",
+        DataType::Int32 => "32-bit integer",
+        DataType::Int64 => "64-bit integer",
+        DataType::UInt8 => "8-bit unsigned integer",
+        DataType::UInt16 => "16-bit unsigned integer",
+        DataType::UInt32 => "32-bit unsigned integer",
+        DataType::UInt64 => "64-bit unsigned integer",
+        DataType::Float32 => "32-bit float",
+        DataType::Float64 => "64-bit float",
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes",
         DataType::List(_) => "list",
-        _ => "unsupported",
-    }
+        other => return Cow::Owned(other.to_string()),
+    };
+    Cow::Borrowed(name)
 }
 
 /// Merges the export's resource attributes into each data point's own attributes. Nothing is
@@ -2619,6 +2632,40 @@ mod tests {
             column(&batch, "observed_at").is_null(0),
             "the value cannot be stored in this column type, so it is NULL"
         );
+    }
+
+    /// When a value does not fit its column, the width is the reason, so the message has to
+    /// name it. A column type no attribute maps onto is named by its Arrow type rather than
+    /// called unsupported, which says nothing the operator can act on.
+    #[test]
+    fn column_type_names_identify_the_width_and_never_say_unsupported() {
+        for (data_type, expected) in [
+            (DataType::Int8, "8-bit integer"),
+            (DataType::Int16, "16-bit integer"),
+            (DataType::Int32, "32-bit integer"),
+            (DataType::Int64, "64-bit integer"),
+            (DataType::UInt8, "8-bit unsigned integer"),
+            (DataType::UInt16, "16-bit unsigned integer"),
+            (DataType::UInt32, "32-bit unsigned integer"),
+            (DataType::UInt64, "64-bit unsigned integer"),
+            (DataType::Float32, "32-bit float"),
+            (DataType::Float64, "64-bit float"),
+            (DataType::Utf8, "string"),
+            (DataType::Utf8View, "string"),
+            (DataType::Boolean, "boolean"),
+            (DataType::Binary, "bytes"),
+        ] {
+            assert_eq!(column_type_name(&data_type), expected);
+        }
+
+        // A type no attribute value maps onto is named, not dismissed.
+        let exotic = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
+        let name = column_type_name(&exotic);
+        assert!(
+            name.contains("Timestamp"),
+            "the column's own type must be named, got: {name}"
+        );
+        assert_ne!(name, "unsupported");
     }
 
     fn field_names(schema: &Schema) -> Vec<&str> {
