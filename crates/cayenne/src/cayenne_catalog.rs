@@ -836,8 +836,20 @@ impl CayenneCatalog {
         }
 
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        // Drop the merged-away inputs' non-authoritative manifest rows in the SAME
+        // transaction as the roster swap. Subset merge rewrites `P_new` into its own
+        // directory and holds no in-place reference to the inputs' files, so deleting
+        // the inputs' `cayenne_snapshot_file` rows here cannot orphan a file `P_new`
+        // still points at. The physical `.vortex` dirs are reclaimed LATER via
+        // retire+sweep (reader-scoped), but the manifest rows are non-authoritative
+        // (scans list the snapshot directory, not the manifest), so no in-flight
+        // reader needs them; deleting them at commit stops an unbounded metastore
+        // leak on subset-merge-dominated CDC tables whose current snapshot never
+        // rotates and so never hits the full-rewrite prune.
         let batch_sql = format!(
             "DELETE FROM cayenne_snapshot_sequence \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             DELETE FROM cayenne_snapshot_file \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              INSERT OR REPLACE INTO cayenne_snapshot_sequence \
                 (table_id, snapshot_id, sequence_number) \
@@ -8146,6 +8158,140 @@ mod tests {
             .expect("read preserved manifest");
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].file_path, old.file_path);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression: protected-snapshot subset compaction must delete the
+    /// merged-away inputs' `cayenne_snapshot_file` (manifest) rows in the SAME
+    /// transaction as the roster swap. Before the fix the swap deleted only the
+    /// inputs' `cayenne_snapshot_sequence` rows and left their manifest rows to
+    /// leak until an unrelated full rewrite pruned them.
+    #[tokio::test]
+    async fn test_swap_protected_snapshots_deletes_merged_away_manifest_rows() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_protected_swap_manifest_gc_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "protected_swap_manifest_gc".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // The subset merge folds `input_a` + `input_b` into `p_new`; `survivor`
+        // stays on the roster untouched. Each snapshot starts with one manifest
+        // row; the two inputs and the survivor also start on the roster.
+        let input_a = uuid::Uuid::now_v7().to_string();
+        let input_b = uuid::Uuid::now_v7().to_string();
+        let survivor = uuid::Uuid::now_v7().to_string();
+        let p_new = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+
+        for (snapshot_id, path, seq) in [
+            (&input_a, "a.vortex", 1),
+            (&input_b, "b.vortex", 2),
+            (&survivor, "s.vortex", 3),
+            (&p_new, "p_new.vortex", 4),
+        ] {
+            catalog
+                .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
+                .await
+                .expect("seed manifest row");
+        }
+        // `p_new` is placed on the roster by the swap itself, so it is not seeded here.
+        for (snapshot_id, seq) in [(&input_a, 1), (&input_b, 2), (&survivor, 3)] {
+            catalog
+                .set_snapshot_sequence(&table_id, snapshot_id, seq)
+                .await
+                .expect("seed roster row");
+        }
+
+        let swapped = catalog
+            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .await
+            .expect("swap protected snapshots");
+        assert!(
+            swapped,
+            "the CAS must commit when every input is still active"
+        );
+
+        // The merged-away inputs' manifest rows are gone (the leak this fix closes).
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &input_a)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "input_a manifest rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &input_b)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "input_b manifest rows must be deleted at the compaction commit"
+        );
+        // The rewrite output keeps its freshly-written manifest rows.
+        let p_new_files = catalog
+            .get_snapshot_files(&table_id, &p_new)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            p_new_files.len(),
+            1,
+            "the rewrite output's manifest rows must remain"
+        );
+        assert_eq!(p_new_files[0].file_path, "p_new.vortex");
+        // A protected snapshot outside the merge set is untouched.
+        let survivor_files = catalog
+            .get_snapshot_files(&table_id, &survivor)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            survivor_files.len(),
+            1,
+            "a snapshot outside the merge set must be untouched"
+        );
+        assert_eq!(survivor_files[0].file_path, "s.vortex");
+
+        // Roster invariant preserved: inputs off, survivor and p_new on.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read roster");
+        assert!(!sequences.contains_key(&input_a));
+        assert!(!sequences.contains_key(&input_b));
+        assert!(sequences.contains_key(&survivor));
+        assert_eq!(sequences.get(&p_new), Some(&4));
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
