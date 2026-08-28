@@ -7284,8 +7284,12 @@ impl CayenneTableProvider {
         // that then goes idle keeps them forever. One thresholded pass here repairs
         // that gap and drains the backlog of a table that predates the signal.
         // Recovery and the manifest backfill above have already run, so the state
-        // this reads is the final committed one. Throttled and lock-free: a table
-        // with no backlog costs two metastore reads on a background task.
+        // this reads is the final committed one. The pass runs on a background
+        // task and is throttled, so a table with no backlog costs its eligibility
+        // capture and nothing more: three catalog reads (current manifest,
+        // protected sequences, candidates), a fourth when the datalake tier is
+        // enabled, one directory listing only when the manifest reads back empty,
+        // and one `listing_fence` read acquisition across them.
         provider.schedule_orphan_dv_sweep();
 
         if let Err(error) = provider
