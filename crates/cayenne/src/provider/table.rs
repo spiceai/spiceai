@@ -9822,6 +9822,7 @@ impl CayenneTableProvider {
             // Main is the only source here, which is the case where a re-insert marker
             // does mean the row is live.
             InsertRecordHandling::Apply,
+            Arc::clone(&self.protected_snapshots),
             Arc::clone(self.context.runtime_env()),
             None,
             Arc::clone(&self.seq_allocator),
@@ -14009,6 +14010,7 @@ impl CayenneTableProvider {
                 // Persist-only path: it writes position vectors and never scans. Main is
                 // the only source regardless, so `Apply` states the rule correctly.
                 InsertRecordHandling::Apply,
+                Arc::clone(&self.protected_snapshots),
                 Arc::clone(self.context.runtime_env()),
                 None,
                 Arc::clone(&self.seq_allocator),
@@ -16052,17 +16054,32 @@ impl CayenneTableProvider {
                         );
                     }
                 }
-                Ok(RetentionPass::DeferredUntilCheckpoint) => {
+                Ok(RetentionPass::DeferredUntilCheckpoint) => match retention_failure_action {
                     // Deliberately NOT re-armed: a seal shadow stands until the next full
                     // checkpoint, so re-arming would poll at the debounce interval for
                     // seconds or longer and run this pass's metastore vacuum and WAL
                     // checkpoint tail every time. `checkpoint_mem_tier_inner` arms
                     // retention when it clears the shadow, which is the signal to wait on.
-                    tracing::debug!(
-                        table = self.table_metadata.table_name.as_str(),
-                        "Retention deferred until the next mem-tier checkpoint: a seal shadow is present"
-                    );
-                }
+                    RetentionFailureAction::Requeue => {
+                        tracing::debug!(
+                            table = self.table_metadata.table_name.as_str(),
+                            "Retention deferred until the next mem-tier checkpoint: a seal shadow is present"
+                        );
+                    }
+                    // The request was dequeued to get here, and this variant re-arms
+                    // nowhere. Returning `Ok` would tell a synchronous drain that
+                    // retention completed when it neither ran nor is owed to anyone —
+                    // and the checkpoint it is waiting for may not come before shutdown.
+                    RetentionFailureAction::ReturnError => {
+                        return Err(CatalogError::InvalidOperation {
+                            message: format!(
+                                "Retention for table '{}' was deferred: a mem-tier seal shadow is present and retention runs after the next checkpoint clears it.",
+                                self.table_metadata.table_name
+                            ),
+                            source: "retention deferred".into(),
+                        });
+                    }
+                },
                 Ok(RetentionPass::DeferredTransient) => match retention_failure_action {
                     // The background loop sleeps a debounce between passes, so re-arming
                     // retries once the in-flight write publishes — milliseconds away.
@@ -16075,7 +16092,7 @@ impl CayenneTableProvider {
                     RetentionFailureAction::ReturnError => {
                         return Err(CatalogError::InvalidOperation {
                             message: format!(
-                                "Retention for table '{}' was deferred: a staged inline-conflict tombstone, a mem-tier seal shadow, or an append finalization is still in flight.",
+                                "Retention for table '{}' was deferred: a staged inline-conflict tombstone or an append finalization is still in flight.",
                                 self.table_metadata.table_name
                             ),
                             source: "retention deferred".into(),
@@ -30937,6 +30954,7 @@ impl CayenneTableProvider {
             self.pk_column_indices.clone(),
             snapshot_tables,
             main_insert_records,
+            Arc::clone(&self.protected_snapshots),
             Arc::clone(self.context.runtime_env()),
             write_lock,
             Arc::clone(&self.seq_allocator),
@@ -31042,6 +31060,7 @@ impl CayenneTableProvider {
             // live. Position-based deletes address a row by (file, position) and never
             // consult this, but the value must still state the rule it is standing on.
             InsertRecordHandling::Apply,
+            Arc::clone(&self.protected_snapshots),
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
             Arc::clone(&self.seq_allocator),
@@ -47549,6 +47568,83 @@ mod tests {
             vec![(3, 60), (4, 70)],
             "retention must reach rows that arrived through the default \
              cdc_durability: memory path once their epoch is durable"
+        );
+    }
+
+    /// The main snapshot's re-insert handling is decided while the DELETE plan is built,
+    /// which is BEFORE the sink takes `write_lock` at execution. An ordinary upsert can
+    /// publish a protected snapshot in that gap, and scanning main with the captured
+    /// `Apply` once one exists is the resurrection case: main then holds only the
+    /// superseded version, so a predicate matching its retired value tombstones the KEY
+    /// and hides the replacement that never matched.
+    ///
+    /// The sink re-reads the live protected-snapshot map under that lock and downgrades
+    /// to `Ignore`. Only 0 -> non-empty is unsafe; a capture that already saw one is
+    /// `Ignore` and stays correct however many more appear.
+    #[tokio::test]
+    async fn a_protected_snapshot_published_after_the_plan_is_built_downgrades_main() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_capture_race_visibility",
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[10])).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        let _folded = provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("compaction pass ran");
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: the capture must see NO protected snapshot, so the sink \
+             captures `Apply` — the state whose staleness is under test"
+        );
+
+        // Build the sink while the capture still sees none.
+        let sink = provider
+            .build_deletion_vector_sink(
+                &[datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+                None,
+                DeletionRequestSource::User,
+            )
+            .await
+            .expect("deletion sink built");
+
+        // The upsert lands AFTER the capture, exactly as a concurrent write would.
+        insert_batch(&provider, id_value_batch(schema, &[7], &[60])).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        assert_eq!(
+            provider.protected_snapshots.load().len(),
+            1,
+            "precondition: the upsert must publish a protected snapshot after the capture"
+        );
+
+        sink.delete_from(ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60)],
+            "the live row does not match `value < 50`; a sink still scanning main with \
+             the captured `Apply` would tombstone key 7 from the superseded (7, 10) and \
+             take the replacement with it"
         );
     }
 

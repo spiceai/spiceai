@@ -254,6 +254,24 @@ impl PreparedOverwrite {
             )
             .await?;
 
+        // Arm retention the moment the flip commits, the same way an append does (see
+        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // source row, so a `retention_sql` / `retention_period` predicate has to run
+        // again over the new snapshot — otherwise the rows it deletes come straight back
+        // on each full refresh and the acceleration keeps data the user asked to be
+        // deleted.
+        //
+        // Scheduled HERE and not at the end: every step below this awaits, so a refresh
+        // cancelled part-way through them would drop this future after the new rows were
+        // already visible and leave the matching ones queryable until some later refresh
+        // happened to arm a pass. Only the flip has to have succeeded for the request to
+        // be owed. Arming is a synchronous flag plus a debounced task, and that task
+        // takes `write_lock` itself, so it simply waits out the guard still held here.
+        if self.table.has_retention_delete_filters() {
+            self.table
+                .schedule_post_write_maintenance(None, false, true, 0);
+        }
+
         // Drain the metastore WAL on the debounced maintenance tick. An inlined
         // overwrite's whole payload is an Arrow IPC BLOB written straight into
         // the metastore, and with the inline auto-checkpoint disabled by default
@@ -297,21 +315,9 @@ impl PreparedOverwrite {
             .reset_table_stats_after_overwrite(&self.write_stats_acc)
             .await;
 
-        // Drop the write guard before arming retention below, and after everything
-        // above it, so all visibility-related updates happen under exclusive table
-        // access while the retention pass — which takes this same lock — can proceed.
+        // All visibility-related updates above happen under exclusive table access; the
+        // retention pass takes this same lock, so it can only proceed once this drops.
         let _ = self.write_guard;
-
-        // Arm retention, the same way an append does (see
-        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
-        // source row, so a `retention_sql` / `retention_period` predicate has to run
-        // again over the new snapshot — otherwise the rows it deletes come straight
-        // back on each full refresh and the acceleration keeps data the user asked to
-        // be deleted.
-        if self.table.has_retention_delete_filters() {
-            self.table
-                .schedule_post_write_maintenance(None, false, true, 0);
-        }
 
         Ok(self.row_count)
     }

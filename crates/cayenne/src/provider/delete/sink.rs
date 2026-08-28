@@ -64,6 +64,7 @@ use crate::metadata::{DeleteFile, TableMetadata};
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
+use std::collections::HashMap;
 
 use crate::row_converter::RowConverter;
 use async_trait::async_trait;
@@ -452,6 +453,13 @@ pub struct CayenneDeletionSink {
     /// predicate matching only the retired value tombstone the KEY and take the
     /// replacement — which never matched the predicate — with it.
     main_insert_records: InsertRecordHandling,
+    /// The table's live protected-snapshot map, re-read under the execution-time
+    /// `write_lock` to catch the one transition `main_insert_records` cannot be captured
+    /// across: the plan is built before that lock is taken, so an ordinary upsert can
+    /// publish a protected snapshot in between and turn a captured `Apply` into the
+    /// resurrection case. Only 0 -> non-empty is unsafe; a capture that already saw one
+    /// is `Ignore` and stays correct however many more appear.
+    protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -491,6 +499,7 @@ impl CayenneDeletionSink {
         pk_column_indices: Vec<usize>,
         additional_scan_tables: Vec<DeleteScanSource>,
         main_insert_records: InsertRecordHandling,
+        protected_snapshots: Arc<ArcSwap<HashMap<String, i64>>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
@@ -507,6 +516,7 @@ impl CayenneDeletionSink {
             pk_column_indices,
             additional_scan_tables,
             main_insert_records,
+            protected_snapshots,
             runtime_env,
             write_lock,
             seq_allocator,
@@ -715,6 +725,26 @@ impl CayenneDeletionSink {
 
         let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
         Ok(pk_values)
+    }
+
+    /// How the main listing table must treat an upsert's re-insert marker, re-checked
+    /// against the live protected-snapshot map.
+    ///
+    /// `main_insert_records` is decided while the DELETE plan is built, which is before
+    /// the execution-time `write_lock` is held, so an ordinary upsert can publish a
+    /// protected snapshot in the gap. Scanning main with `Apply` once one exists is the
+    /// resurrection case: main then holds only the superseded version, a predicate
+    /// matching its retired value tombstones the KEY, and that tombstone hides the
+    /// replacement that never matched. Downgrading to `Ignore` costs at most an
+    /// under-delete of rows in a snapshot published after the capture — which the next
+    /// pass removes — and that is the safe direction to be wrong in.
+    fn live_main_insert_records(&self) -> InsertRecordHandling {
+        if self.main_insert_records == InsertRecordHandling::Apply
+            && !self.protected_snapshots.load().is_empty()
+        {
+            return InsertRecordHandling::Ignore;
+        }
+        self.main_insert_records
     }
 
     /// Whether an Int64-keyed row from a snapshot whose deletions are visible above
@@ -1018,7 +1048,7 @@ impl CayenneDeletionSink {
         let listing_table = self.listing_table.load_full();
         let mut all_tables = vec![DeleteScanSource {
             min_delete_seq: None,
-            insert_records: self.main_insert_records,
+            insert_records: self.live_main_insert_records(),
             table: Arc::clone(&listing_table),
         }];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
@@ -1269,7 +1299,7 @@ impl DeletionSink for CayenneDeletionSink {
         // (protected snapshots and, for cold-tier tables, the cold-tier files).
         let mut all_tables = vec![DeleteScanSource {
             min_delete_seq: None,
-            insert_records: self.main_insert_records,
+            insert_records: self.live_main_insert_records(),
             table: Arc::clone(&listing_table),
         }];
         all_tables.extend(self.additional_scan_tables.iter().cloned());
