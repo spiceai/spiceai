@@ -36,6 +36,10 @@ limitations under the License.
 //! copy differs from the committed one ([`create_bumping_table`]), and a
 //! sentinel row that orders the assertions behind the pump
 //! ([`wait_for_sentinel`]).
+//!
+//! The last test is the exception: it asserts a *read* path, because the query
+//! shape it pins only comes up on a durable-write-back dataset and so needs this
+//! file's fixture.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use app::AppBuilder;
+use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, WriteMode};
@@ -665,6 +670,89 @@ async fn a_transactions_echo_is_dropped_while_a_foreign_write_lands() -> Result<
                 "the accelerator must still hold the row it committed over an existing key",
             )
             .await?;
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+// ── a point lookup that filters and orders on the primary key ───────────────
+
+/// A point lookup that filters *and* orders on the primary key keeps planning
+/// after a transactional commit at the source (regression test for
+/// spiceai/spiceai#13554).
+///
+/// The commit gives the accelerator's scan a second union branch, and the equality
+/// filter each branch applies makes the primary key constant — which is what
+/// discharges the `ORDER BY` without a sort, leaving a merge that reads the
+/// ordering off the wrapper the accelerated table puts over every scan. `DESC` and
+/// a single-element `IN` reach the same shape, so all three are asserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pk_point_lookup_ordered_by_the_pk_plans_after_a_transactional_commit()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+            let source = connect(port).await?;
+            exec(
+                &source,
+                "CREATE TABLE public.wb_counter (id int PRIMARY KEY, value bigint NOT NULL)",
+            )
+            .await?;
+            exec(&source, "INSERT INTO public.wb_counter VALUES (1, 0)").await?;
+
+            let accel = tempfile::tempdir()?;
+            let rt = build_runtime(
+                "wb_counter",
+                vec![write_back_dataset(
+                    port,
+                    "wb_counter",
+                    "spice_wb_counter_slot",
+                    accel.path(),
+                )],
+            )
+            .await?;
+            wait_for_bootstrap(&rt, "wb_counter").await?;
+
+            // The shape plans before any transactional commit, so a failure below is
+            // the commit's doing and not the dataset's.
+            run_query(
+                &rt,
+                "SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id",
+            )
+            .await?;
+
+            exec(
+                &source,
+                "BEGIN; UPDATE public.wb_counter SET value = value + 1 WHERE id = 1; COMMIT;",
+            )
+            .await?;
+            wait_for("the transactional update", Some(1), || {
+                accel_scalar(&rt, "SELECT value FROM wb_counter WHERE id = 1")
+            })
+            .await?;
+
+            for sql in [
+                "SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id",
+                "SELECT id, value FROM wb_counter WHERE id IN (1) ORDER BY id",
+                "SELECT id, value FROM wb_counter WHERE id = 1 ORDER BY id DESC",
+            ] {
+                let batches = run_query(&rt, sql).await?;
+                assert_batches_eq!(
+                    [
+                        "+----+-------+",
+                        "| id | value |",
+                        "+----+-------+",
+                        "| 1  | 1     |",
+                        "+----+-------+",
+                    ],
+                    &batches
+                );
+            }
 
             rt.shutdown().await;
             Ok(())
