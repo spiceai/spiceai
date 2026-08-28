@@ -21213,7 +21213,7 @@ impl CayenneTableProvider {
             drop(guard);
             materialized.map_err(|err| CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to apply the retention policy to accelerated dataset '{}', so rows older than `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
                     self.table_metadata.table_name
                 ),
                 source: Box::new(err),
@@ -21248,7 +21248,7 @@ impl CayenneTableProvider {
             .await
             .map_err(|err| CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to apply the retention policy to accelerated dataset '{}', so rows older than `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
                     self.table_metadata.table_name
                 ),
                 source: Box::new(err),
