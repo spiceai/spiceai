@@ -15344,16 +15344,16 @@ impl CayenneTableProvider {
         // the commit so a failed commit leaves the old snapshot's rows intact, and
         // only when the new manifest was authored above (publish-before-clear).
         // Best-effort: a prune failure must not fail the compaction.
-        if manifest_authored {
-            if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
-                tracing::warn!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    new_snapshot_id = new_snapshot_id.as_str(),
-                    "Failed to prune stale snapshot manifest rows after subset small-file compaction commit"
-                );
-            }
+        if manifest_authored
+            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to prune stale snapshot manifest rows after subset small-file compaction commit"
+            );
         }
 
         // The per-file statistics cache (`cayenne_snapshot_file_statistics`) keys
