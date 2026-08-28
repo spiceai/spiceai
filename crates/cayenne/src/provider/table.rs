@@ -31019,12 +31019,26 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // rather than returning early. Track it so the final result still reports
         // work done even when the size-tier pass finds nothing more to do.
         let mut baked = false;
+        // Two separate questions decide whether the bake can run, and conflating
+        // them mis-gates this pass in both directions:
+        //   1. Does this table keep a KEY deletion index for the bake to prune?
+        //      That is PK presence — a PK-less table records only file-scoped
+        //      position tombstones, and `delete_len()` is 0 for it.
+        //   2. Are the tombstones file-scoped, so a merge racing a writer could
+        //      lose one? The bake holds no `write_lock`, so it must decline there
+        //      (see the resurrection note on `compact_protected_snapshots_subset`).
+        // A PK table under `deletion_mode: position` answers YES to both: it still
+        // records key tombstones for every row whose position is unknown, but the
+        // bake cannot safely merge its file-scoped ones, so it stays out of scope
+        // (issue #13676 covers giving that shape a reclamation path).
+        let has_key_deletion_index = !self.pk_deletion_strategy.is_position_based();
+        let key_mode = has_key_deletion_index && !self.should_capture_positions();
         // OOM backstop (P0): once the undroppable, over-committing deletion index
         // crosses a hard fraction of the query memory pool, the bake — its only
         // legitimate shrink — becomes MANDATORY: it overrides BOTH the count
-        // trigger and the apply-back-pressure defer below. Key-mode only (position
-        // mode is excluded, mirroring the count gate).
-        let key_mode = !self.should_capture_positions();
+        // trigger and the apply-back-pressure defer below. Gated on `key_mode`
+        // because the bake is the action it forces: on a table the bake cannot
+        // serve, forcing one only logs a warning for a pass that then declines.
         let over_mem_ceiling = key_mode && self.deletion_index_over_memory_ceiling();
         if key_mode
             && (deletion_index_len >= self.context.bake_deletion_index_trigger()
@@ -43302,6 +43316,186 @@ mod tests {
             provider.protected_snapshots.load_full().len() < before,
             "bake must fold older protected snapshots"
         );
+    }
+
+    /// MIGRATION SAFETY for resolving `auto` to `key` on primary-key tables: a
+    /// table that recorded per-file POSITION deletion vectors while configured
+    /// `deletion_mode: position` is reopened in key mode (what `auto` now
+    /// resolves to) and must still apply them. If the reopen dropped them, every
+    /// row those vectors mask would come back — a silent resurrection on upgrade
+    /// for any table that had run under position mode.
+    ///
+    /// The durable vectors are mode-independent by construction: they load into
+    /// `position_deletions` for both PK strategies, and `position_cache()` feeds
+    /// the access-plan provider that `create_listing_options` attaches to EVERY
+    /// snapshot scan.
+    ///
+    /// The two assertions after the reopen are NOT redundant, and only the first
+    /// is sensitive: dropping the loaded vectors entirely (verified by mutating
+    /// the loader) fails the count assertion while the row-visibility assertion
+    /// stays green — because a located upsert conflict is dual-encoded, so the
+    /// key twin masks the same prior version by sequence. The count assertion is
+    /// therefore what pins the load path; the row assertion is the end-to-end
+    /// guard that would catch a resurrection if the twin were ever dropped
+    /// (`table.rs`'s `FilePositioned` arm) or if the scan stopped attaching the
+    /// access plan.
+    #[tokio::test]
+    async fn position_deletion_vectors_still_apply_after_reopening_in_key_mode() {
+        const KEYS: i64 = 8;
+        let expected_keys = usize::try_from(KEYS).expect("KEYS fits usize");
+        let ctx = SessionContext::new();
+
+        // Inlining off so the seed lands in a Vortex file (position deletes
+        // apply to files, not the inline memtable); background compaction off so
+        // the phases below are the only maintenance that runs.
+        let position_config = VortexConfig {
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            inline_max_buffer_bytes: 0,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        };
+        let (provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_then_key",
+            ctx.runtime_env(),
+            position_config.clone(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let base_path = provider.table_metadata.path.clone();
+
+        // Seed, then compact: an upsert publishes a PROTECTED snapshot, which the
+        // read-back never lists (it scans only the CURRENT snapshot), so the full
+        // rewrite is what produces the shape where priors become
+        // `FilePositioned` (mirrors `total_superseded_counts_file_positioned_conflict_once`).
+        let ids: Vec<i64> = (0..KEYS).collect();
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &vec![100_i64; expected_keys]),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance after seed insert");
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await
+            .expect("compaction full rewrite into a fresh current snapshot");
+
+        // Compaction reset the keyset; rebuild cold and capture positions.
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("resolve pk indices")
+            .expect("table has a primary key");
+        let pk_converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("build pk converter");
+        let index = provider
+            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
+            .await
+            .expect("cold keyset rebuild");
+        provider.store_cached_pk_index(index);
+        provider
+            .run_position_capture()
+            .await
+            .expect("position capture succeeds");
+
+        // Upsert every key. Their priors are `FilePositioned`, so this commits
+        // per-file POSITION deletion vectors (alongside the key twins).
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &vec![200_i64; expected_keys]),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance after upsert");
+
+        // Scenario premise: position vectors exist, or the reopen below has
+        // nothing to preserve and the test proves nothing.
+        let positions_before: u64 = provider
+            .pk_deletion_strategy
+            .position_cache()
+            .load()
+            .values()
+            .map(|dv| dv.len())
+            .sum();
+        assert!(
+            positions_before > 0,
+            "premise: the positioned upsert must have written position deletion vectors"
+        );
+        let expected_rows: Vec<(i64, i64)> = ids.iter().map(|id| (*id, 200)).collect();
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "position_then_key").await,
+            expected_rows,
+            "under position mode each key shows only its upserted value"
+        );
+
+        // Quiesce this instance before another provider opens against the same
+        // catalog, so no in-flight maintenance from it mutates shared state.
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("quiesce the position-mode provider");
+
+        // Reopen the SAME table with `auto`, which now resolves to key mode. The
+        // context carries the config in production (the accelerator builds one
+        // from the spicepod params), so build it the same way here — the stored
+        // `vortex_config_json` still says `position`.
+        let key_config = VortexConfig {
+            deletion_mode: crate::metadata::DeletionMode::Auto,
+            ..position_config
+        };
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_context(CayenneContext::new(
+                &key_config,
+                ctx.runtime_env(),
+                "position_then_key",
+            ))
+            .create(CreateTableOptions {
+                table_name: "position_then_key".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path,
+                partition_column: None,
+                vortex_config: key_config,
+            })
+            .await
+            .expect("reopen the table in key mode");
+        assert!(
+            !reopened.should_capture_positions(),
+            "premise: `auto` on a PK table must resolve to key mode after reopen"
+        );
+
+        // The durable position vectors are still loaded…
+        let positions_after: u64 = reopened
+            .pk_deletion_strategy
+            .position_cache()
+            .load()
+            .values()
+            .map(|dv| dv.len())
+            .sum();
+        assert_eq!(
+            positions_after, positions_before,
+            "a key-mode reopen must load the table's existing position deletion vectors"
+        );
+
+        // …and still applied: no superseded prior version comes back.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "position_then_key").await,
+            expected_rows,
+            "reopening in key mode must not resurrect rows masked by position vectors"
+        );
+
+        drop(tmp);
     }
 
     /// STAGE-2 DELIVERABLE TEST (5). The clean-prefix gate SKIPS THE WHOLE BAKE
