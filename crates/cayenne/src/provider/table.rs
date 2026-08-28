@@ -21212,8 +21212,10 @@ impl CayenneTableProvider {
             drop(checkpoint_guard);
             drop(guard);
             materialized.map_err(|err| CatalogError::InvalidOperation {
-                message: "Failed to materialize inlined rows before applying retention filters."
-                    .to_string(),
+                message: format!(
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows older than `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    self.table_metadata.table_name
+                ),
                 source: Box::new(err),
             })?;
         }
@@ -21245,7 +21247,10 @@ impl CayenneTableProvider {
             )
             .await
             .map_err(|err| CatalogError::InvalidOperation {
-                message: "Failed to build the retention deletion sink.".to_string(),
+                message: format!(
+                    "Failed to apply the retention policy to accelerated dataset '{}', so rows older than `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                    self.table_metadata.table_name
+                ),
                 source: Box::new(err),
             })?;
         // Nothing on this path re-derives `num_rows` from the rows about to be removed,

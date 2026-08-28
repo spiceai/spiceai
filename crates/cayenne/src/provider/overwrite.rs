@@ -256,10 +256,12 @@ impl PreparedOverwrite {
 
         // Arm retention the moment the flip commits, the same way an append does (see
         // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
-        // source row, so a `retention_sql` / `retention_period` predicate has to run
-        // again over the new snapshot — otherwise the rows it deletes come straight back
-        // on each full refresh and the acceleration keeps data the user asked to be
-        // deleted.
+        // source row, so a `retention_sql` predicate has to run again over the new
+        // snapshot — otherwise the rows it deletes come straight back on each full
+        // refresh and the acceleration keeps data the user asked to be deleted.
+        // `retention_period` is untouched by this: it is a scan-time keep filter, so a
+        // reloaded expired row is hidden from every read without anything deleting it,
+        // and the gate below (`has_retention_delete_filters`) matches that split.
         //
         // Scheduled HERE and not at the end: every step below this awaits, so a refresh
         // cancelled part-way through them would drop this future after the new rows were
