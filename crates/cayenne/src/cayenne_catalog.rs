@@ -3663,6 +3663,33 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(results.into_iter().next())
     }
 
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Drop both sibling caches for the departed snapshot in ONE transaction
+        // so they can never drift apart (one deleted, the other left to leak).
+        let txn = self.begin_transaction().await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.commit().await
+    }
+
     async fn clear_snapshot_file_statistics_except(
         &self,
         table_id: &str,
@@ -8353,6 +8380,128 @@ mod tests {
         assert!(!sequences.contains_key(&input_b));
         assert!(sequences.contains_key(&survivor));
         assert_eq!(sequences.get(&p_new), Some(&4));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression test: time-based retention that fully empties a protected
+    /// snapshot must delete that snapshot's `cayenne_snapshot_file` manifest
+    /// rows AND its `cayenne_snapshot_file_statistics` stats-cache rows, not
+    /// only its roster row. The append maintenance lane writes those rows while
+    /// the snapshot is live and populated; once retention removes the physical
+    /// files nothing else reconciles them, so leaving them behind leaks
+    /// metastore rows. A snapshot outside the emptied set stays untouched.
+    #[tokio::test]
+    async fn test_clear_snapshot_cached_metadata_deletes_both_tables_for_target() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_retention_emptied_manifest_gc_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "retention_emptied_manifest_gc".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // Retention empties `emptied`; `survivor` stays live. Each starts with
+        // manifest rows written by the append maintenance lane.
+        let emptied = uuid::Uuid::now_v7().to_string();
+        let survivor = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![],
+        };
+
+        for (snapshot_id, path, seq) in [
+            (&emptied, "e1.vortex", 1),
+            (&emptied, "e2.vortex", 2),
+            (&survivor, "s.vortex", 3),
+        ] {
+            catalog
+                .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
+                .await
+                .expect("seed manifest row");
+            catalog
+                .upsert_snapshot_file_statistics(&seed_stats(snapshot_id, path))
+                .await
+                .expect("seed stats row");
+        }
+
+        catalog
+            .clear_snapshot_cached_metadata(&table_id, &emptied)
+            .await
+            .expect("clear emptied snapshot cached metadata");
+
+        // The emptied snapshot's manifest rows are gone (the leak this fix closes).
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &emptied)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "emptied snapshot manifest rows must be deleted by the cleanup"
+        );
+        // Its stats-cache rows are gone too.
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &emptied, "e1.vortex")
+                .await
+                .expect("read stats")
+                .is_none(),
+            "emptied snapshot stats-cache rows must be deleted by the cleanup"
+        );
+        // A snapshot outside the emptied set is untouched.
+        let survivor_files = catalog
+            .get_snapshot_files(&table_id, &survivor)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            survivor_files.len(),
+            1,
+            "a snapshot outside the emptied set must be untouched"
+        );
+        assert_eq!(survivor_files[0].file_path, "s.vortex");
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &survivor, "s.vortex")
+                .await
+                .expect("read stats")
+                .is_some(),
+            "a snapshot outside the emptied set must keep its stats-cache rows"
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
