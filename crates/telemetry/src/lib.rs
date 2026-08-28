@@ -2436,7 +2436,7 @@ pub mod cayenne {
             operational_meter()
                 .u64_gauge("cayenne_storage_files")
                 .with_description(
-                    "Files a Cayenne table holds, by storage tier (`current`, `protected`, `cold`, `delete_vector`, `inline`). On the warm tiers these are data-file PATHS: a manifest path is resolved against its own snapshot's directory, so a file a new snapshot inherited via a hard link counts under both. `cayenne_maintenance_reclaimed_bytes_total` is the physical counterpart.",
+                    "Files a Cayenne table holds, by storage tier (`current`, `protected`, `cold`, `delete_vector`). These are PATHS: a manifest path is resolved against its own snapshot's directory, so a file a new snapshot inherited via a hard link counts under both. `cayenne_maintenance_reclaimed_bytes_total` is the physical counterpart. The `inline` tier is deliberately absent — level-0 lives in metastore rows, not files, so its entry count belongs to `cayenne_metastore_table_rows` rather than a gauge measured in files.",
                 )
                 .with_unit("files")
                 .build()
@@ -2463,37 +2463,39 @@ pub mod cayenne {
         for (tier, f, b, r) in [
             (
                 "current",
-                storage.current_files,
+                Some(storage.current_files),
                 storage.current_bytes,
                 storage.current_rows,
             ),
             (
                 "protected",
-                storage.protected_files,
+                Some(storage.protected_files),
                 storage.protected_bytes,
                 storage.protected_rows,
             ),
             (
                 "cold",
-                storage.cold_files,
+                Some(storage.cold_files),
                 storage.cold_bytes,
                 storage.cold_rows,
             ),
             (
                 "delete_vector",
-                storage.delete_files,
+                Some(storage.delete_files),
                 storage.delete_file_bytes,
                 storage.delete_file_tombstones,
             ),
-            (
-                "inline",
-                storage.inlined_entries,
-                storage.inlined_bytes,
-                storage.inlined_rows,
-            ),
+            // The inline tier has no files: level-0 lives in metastore rows.
+            // Publishing its entry count under a gauge whose unit is `files`
+            // would mix units, so a sum across tiers would overstate the object
+            // count. That entry count is `cayenne_metastore_table_rows` for
+            // `cayenne_inlined_data`.
+            ("inline", None, storage.inlined_bytes, storage.inlined_rows),
         ] {
             let d = with_label(dimensions, "tier", tier);
-            files.record(f, &d);
+            if let Some(f) = f {
+                files.record(f, &d);
+            }
             bytes.record(b, &d);
             rows.record(r, &d);
         }

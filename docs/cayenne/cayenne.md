@@ -1348,10 +1348,11 @@ Every metric below is emitted on the `cayenne` OpenTelemetry meter and reaches `
 | `bake` | seq-prefix bake (consolidate the clean older prefix, prune the deletion index) |
 | `datalake` | cold-tier graduation |
 
-`outcome` has three classes, and the distinction between them is the point:
+`outcome` has four classes, and the distinction between them is the point:
 
 - **work happened** — `committed`, or `no_op` (the pass ran its selection and found nothing to merge)
 - **work was paid and thrown away** — `aborted_concurrent_change` (the merge finished, then a concurrent append, compaction, or overwrite invalidated its inputs at commit)
+- **the pass errored** — `failed`. Distinct from every decline: a decline is a decision, this is a fault, and it is the one class that warrants a page rather than a dashboard.
 - **the pass never ran** — a `declined_<reason>`
 
 `declined_*` is a single selector, which is how "what is stopping maintenance" becomes one query:
@@ -1403,7 +1404,7 @@ The bake's trigger compares two numbers, and both are exported so a `declined_be
 
 ## Footprint: what is growing, and where
 
-`cayenne_storage_{files,bytes,rows}{table, tier}` splits the table by the layer that produced it — `current`, `protected`, `cold`, `delete_vector`, `inline`. The split is what makes growth attributable: a rising `protected` file count is read amplification, a rising `delete_vector` byte count is a deletion set outgrowing the data it shadows, and a rising `inline` count is level-0 that no checkpoint has drained.
+`cayenne_storage_{files,bytes,rows}{table, tier}` splits the table by the layer that produced it — `current`, `protected`, `cold`, `delete_vector`, `inline`. The split is what makes growth attributable: a rising `protected` file count is read amplification, a rising `delete_vector` byte count is a deletion set outgrowing the data it shadows, and rising `inline` bytes are level-0 that no checkpoint has drained. The `inline` tier reports bytes and rows but **no** `files`: level-0 lives in metastore rows, and publishing its entry count under a gauge measured in files would make a sum across tiers overstate the object count. Its entry count is `cayenne_metastore_table_rows{metastore_table="cayenne_inlined_data"}`.
 
 `files` on the `current` and `protected` tiers counts data-file **paths**. A manifest `file_path` is resolved against its own snapshot's directory, so a filename appearing under two live snapshots is two paths and counts twice — even when subset compaction hard-linked them to one inode, which is the usual case for a file a new snapshot inherits. That matches `cayenne_data_dir_bytes`, which walks the filesystem the same way. For bytes actually returned to the disk, read `cayenne_maintenance_reclaimed_bytes_total`, which counts a file only when it removed the file's last link.
 
@@ -1456,7 +1457,7 @@ The samples differ by orders of magnitude in cost, so they run on separate clock
 | sample | cadence | cost |
 |---|---|---|
 | deletion index, PK index format/size, memory account, inline cache, fleet budgets, write shape | every tick | atomic loads plus one `try_lock`, and one `get_array_memory_size` per inline batch; nothing to throttle |
-| `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows`, freelist | ≥ 30 s per table | two aggregate queries over the table's own metastore rows; the `COUNT(DISTINCT file_path)` over a large manifest is the bulk of it |
+| `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows`, freelist | ≥ 30 s per table | two aggregate queries over the table's own metastore rows; the manifest scan, which is indexed on `table_id` and aggregates without grouping, is the bulk of it |
 | `cayenne_data_dir_*` | ≥ 5 min per table | one `stat` per file — cost scales with exactly the file count it measures |
 | `cayenne_metastore_table_bytes` | ≥ 10 min per **catalog** | `dbstat` walks every B-tree page in the database, so its cost scales with the whole metastore file rather than with one table |
 

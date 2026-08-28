@@ -1859,7 +1859,12 @@ impl DataFusion {
                         .await
                 {
                     telemetry::track_process_resident_memory_bytes(resident.total, &[]);
-                    telemetry::track_process_resident_split(resident.anon, resident.file, &[]);
+                    // Only where the platform supplies it: a zeroed split would
+                    // read as "this process holds no anonymous memory", which is
+                    // the misattribution these two gauges exist to prevent.
+                    if let Some(split) = resident.split {
+                        telemetry::track_process_resident_split(split.anon, split.file, &[]);
+                    }
                 }
             }
         });

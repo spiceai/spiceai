@@ -855,18 +855,24 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// This is the attribution the file size alone cannot give: the total says
     /// the metastore is growing, this says which table is growing it. Derived
-    /// from `SQLite`'s `dbstat` virtual table, so it returns an empty vector on a
-    /// backend that does not provide it — this is observability, and an
-    /// unavailable figure must not fail the pass that asked.
-    async fn metastore_table_bytes(&self) -> CatalogResult<Vec<(String, i64)>>;
+    /// from `SQLite`'s `dbstat` virtual table.
+    ///
+    /// `Ok(None)` means the backend cannot supply it at all — a permanent state
+    /// the caller can stop asking about. A transient failure is an `Err`: this is
+    /// observability and must not fail the pass that asked, but nor may it be
+    /// reported as an empty attribution, which reads as every metastore table
+    /// occupying no space.
+    async fn metastore_table_bytes(&self) -> CatalogResult<Option<Vec<(String, i64)>>>;
 
     /// Bytes on the metastore's free page list — space already released inside
     /// the database file that, under the default `auto_vacuum: none`, is reused
     /// but never returned to the OS.
     ///
-    /// `Ok(0)` when the backend cannot report it; this is observability, so an
-    /// unavailable figure must not fail a maintenance pass.
-    async fn metastore_freelist_bytes(&self) -> CatalogResult<u64>;
+    /// `Ok(None)` when the backend cannot report it, distinct from `Ok(Some(0))`
+    /// — a database with no free pages. A transient failure is an `Err`, since
+    /// zero from a failed query would claim the released churn had been
+    /// reclaimed.
+    async fn metastore_freelist_bytes(&self) -> CatalogResult<Option<u64>>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;

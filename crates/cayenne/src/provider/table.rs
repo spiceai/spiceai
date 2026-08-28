@@ -9117,7 +9117,11 @@ impl CayenneTableProvider {
         if let Some(guard) = clock.cheap.try_enter(FOOTPRINT_SAMPLE_MIN_INTERVAL) {
             match self.catalog.metastore_freelist_bytes().await {
                 Ok(bytes) => {
-                    telemetry::cayenne::track_metastore_freelist_bytes(bytes, &dimensions);
+                    // `None` is a backend that will never answer: nothing to
+                    // publish, and the gate advances so this stops being asked.
+                    if let Some(bytes) = bytes {
+                        telemetry::cayenne::track_metastore_freelist_bytes(bytes, &dimensions);
+                    }
                     guard.succeeded();
                 }
                 Err(error) => tracing::debug!(
@@ -9136,7 +9140,7 @@ impl CayenneTableProvider {
         };
         match self.catalog.metastore_table_bytes().await {
             Ok(per_table) => {
-                for (metastore_table, bytes) in per_table {
+                for (metastore_table, bytes) in per_table.into_iter().flatten() {
                     telemetry::cayenne::track_metastore_table_bytes(
                         u64::try_from(bytes).unwrap_or(0),
                         &[

@@ -379,13 +379,17 @@ fn cayenne_backed_dataset(dir: &std::path::Path, name: &str) -> Dataset {
     dataset
 }
 
-/// Cayenne's maintenance and footprint families, which answer "which pass is
-/// declining, and is the table growing while it does".
+/// Cayenne's maintenance and footprint families that a loaded dataset reports
+/// with no workload at all — every one reachable from the background sample or a
+/// decision the fixture's own tick makes.
 ///
-/// Presence is the whole assertion: each of these is emitted from a decision
-/// point or a sample that had no instrumentation at all, so a refactor that
-/// drops the call site leaves the operator back where they started — reading
-/// debug logs — with nothing failing.
+/// Presence is the whole assertion: each is emitted from a decision point or a
+/// sample that had no instrumentation at all, so a refactor that drops the call
+/// site leaves the operator back where they started — reading debug logs — with
+/// nothing failing. The list is therefore exhaustive over the always-sampled
+/// families; the ones that need a specific event are in
+/// [`EVENT_GATED_CAYENNE_MAINTENANCE_METRICS`], and the test asserts they are
+/// *absent* so neither list can silently go stale.
 const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_compaction_outcome_total",
     "cayenne_maintenance_outcome_total",
@@ -413,6 +417,38 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_data_dir_bytes",
     "cayenne_data_dir_files",
     "cayenne_data_dir_snapshot_dirs",
+    "cayenne_metastore_db_bytes",
+    "cayenne_metastore_wal_bytes",
+    "cayenne_metastore_freelist_bytes",
+    // `dbstat` is an optional SQLite module. The vendored build has it, so its
+    // absence here is a real regression rather than a portability caveat.
+    "cayenne_metastore_table_bytes",
+    "cayenne_autotune_bake_deletion_index_trigger",
+    // Zeroed rather than skipped while the index is exact, which is what makes
+    // them readable against `cayenne_pk_index_format` instead of retaining a
+    // stale bloom shape.
+    "cayenne_pk_bloom_bits",
+    "cayenne_pk_bloom_insertions",
+    "cayenne_pk_bloom_bits_per_insertion",
+];
+
+/// Families that need an event a freshly-loaded, unwritten dataset cannot
+/// produce, with what each one waits for.
+///
+/// Kept as a list rather than a comment because the test asserts they are absent:
+/// if one starts arriving without a workload it has become always-sampled, and
+/// leaving it here would mean nothing ever checks that its call site survives.
+const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
+    // Recorded when a threshold actually fires. This fixture holds one inline
+    // file, so every pass declines before any trigger is evaluated.
+    "cayenne_compaction_trigger_total",
+    // Recorded at an encode decision; the fixture's write takes the inline path.
+    "cayenne_write_shape_shards",
+    // Require a keyset to be dropped or carried across a compaction.
+    "cayenne_pk_index_discard_total",
+    "cayenne_pk_index_preserved_total",
+    // Requires a bloom-mode apply to split a batch.
+    "cayenne_pk_bloom_split_rows_total",
 ];
 
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
@@ -695,6 +731,22 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
         &reported,
         EXPECTED_CAYENNE_MAINTENANCE_METRICS,
         "a loaded Cayenne dataset did not report its maintenance and footprint families",
+    );
+
+    // The other half of completeness: every family this PR's instrumentation can
+    // emit is classified as either always-sampled (above) or event-gated (below),
+    // and an event-gated family appearing here means the classification has gone
+    // stale — the family is now always-sampled and belongs in the asserted set,
+    // where a dropped call site would fail.
+    let unexpectedly_present: Vec<&&str> = EVENT_GATED_CAYENNE_MAINTENANCE_METRICS
+        .iter()
+        .filter(|metric| reported.contains(**metric))
+        .collect();
+    assert!(
+        unexpectedly_present.is_empty(),
+        "these families are documented as needing an event this fixture cannot produce, but \
+         arrived anyway — move them into EXPECTED_CAYENNE_MAINTENANCE_METRICS so a dropped \
+         call site fails: {unexpectedly_present:?}"
     );
 
     // Presence of the family is not enough for the decision telemetry: its whole

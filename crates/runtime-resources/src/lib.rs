@@ -64,10 +64,24 @@ fn get_container_memory_limit() -> Option<u64> {
 /// climb a gigabyte while the total barely moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentMemory {
-    /// Total resident set size. `RssAnon + RssFile + RssShmem` on Linux, so
-    /// [`Self::anon`] and [`Self::file`] sum to slightly less than this whenever
-    /// the process maps shared memory (usually none).
+    /// Total resident set size. `RssAnon + RssFile + RssShmem` on Linux, so the
+    /// two halves of [`Self::split`] sum to slightly less than this whenever the
+    /// process maps shared memory (usually none).
     pub total: u64,
+    /// The reclaimability split, where the platform can supply it.
+    ///
+    /// `None` on a target with no portable source for it, and on a Linux kernel
+    /// older than 4.5, which reports `VmRSS` without `RssAnon`/`RssFile`. It is
+    /// an `Option` rather than a zeroed pair because a consumer cannot tell a
+    /// fabricated zero from a process that genuinely holds no anonymous memory,
+    /// and publishing one would put a false attribution in the time series —
+    /// which is what these gauges exist to correct.
+    pub split: Option<ResidentSplit>,
+}
+
+/// Resident bytes divided by what the kernel can reclaim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentSplit {
     /// Anonymous resident bytes: heap, stacks, and other pages with no backing
     /// file. Not reclaimable, and therefore the figure to alert on and the one a
     /// heap profiler can attribute.
@@ -95,8 +109,9 @@ pub fn process_resident_memory_bytes() -> Option<u64> {
 /// review and then misreads a footprint by three orders of magnitude.
 ///
 /// `RssAnon`/`RssFile` postdate `VmRSS` (Linux 4.5). On an older kernel the
-/// total is still reported and the split reads zero, rather than the whole
-/// sample failing and taking the total with it.
+/// total is still reported with no split, rather than the whole sample failing
+/// and taking the total with it. Both halves are required together: one without
+/// the other cannot be attributed, since neither is derivable from the total.
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_status_resident(status: &str) -> Option<ResidentMemory> {
     let field = |name: &str| -> Option<u64> {
@@ -111,8 +126,10 @@ fn parse_proc_status_resident(status: &str) -> Option<ResidentMemory> {
     };
     Some(ResidentMemory {
         total: field("VmRSS:")?,
-        anon: field("RssAnon:").unwrap_or(0),
-        file: field("RssFile:").unwrap_or(0),
+        split: match (field("RssAnon:"), field("RssFile:")) {
+            (Some(anon), Some(file)) => Some(ResidentSplit { anon, file }),
+            _ => None,
+        },
     })
 }
 
@@ -162,25 +179,23 @@ pub fn process_resident_memory() -> Option<ResidentMemory> {
         }
         Some(ResidentMemory {
             total: info.resident_size,
-            // `internal` is anonymous and `external` file-backed, the same split
-            // `vmmap -summary` prints.
-            anon: info.internal,
-            file: info.external,
+            split: Some(ResidentSplit {
+                // `internal` is anonymous and `external` file-backed, the same
+                // split `vmmap -summary` prints.
+                anon: info.internal,
+                file: info.external,
+            }),
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // No portable split; report the total and leave the halves at zero so a
-        // consumer sees "unsplit" rather than a fabricated attribution.
+        // No portable source for the split. The total is still worth having, so
+        // report it with `split: None` rather than inventing an attribution.
         let mut system = System::new();
         let pid = sysinfo::Pid::from_u32(std::process::id());
         system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
         let total = system.process(pid).map(sysinfo::Process::memory)?;
-        Some(ResidentMemory {
-            total,
-            anon: 0,
-            file: 0,
-        })
+        Some(ResidentMemory { total, split: None })
     }
 }
 
@@ -337,19 +352,25 @@ Threads:\t32
         let resident = parse_proc_status_resident(STATUS).expect("VmRSS is present");
 
         assert_eq!(resident.total, 5_940_216 * 1024);
-        assert_eq!(resident.anon, 2_451_968 * 1024);
-        assert_eq!(resident.file, 3_488_248 * 1024);
+        let split = resident
+            .split
+            .expect("this status carries both split lines");
+        assert_eq!(split.anon, 2_451_968 * 1024);
+        assert_eq!(split.file, 3_488_248 * 1024);
         // `VmRSS = RssAnon + RssFile + RssShmem`, and shmem is zero here, so the
         // two halves account for the whole total. A parse that read the wrong
         // column would still produce plausible-looking numbers but break this.
-        assert_eq!(resident.anon + resident.file, resident.total);
+        assert_eq!(split.anon + split.file, resident.total);
     }
 
     /// `RssAnon`/`RssFile` arrived in Linux 4.5. Older kernels must still report
     /// a total: failing the whole sample would lose the one figure that has
-    /// always been available.
+    /// always been available. The split must be `None` rather than a zeroed
+    /// pair — a caller publishing zeroes would claim this process holds no
+    /// anonymous memory, which is the false attribution the split exists to
+    /// prevent.
     #[test]
-    fn a_kernel_without_the_split_still_reports_the_total() {
+    fn a_kernel_without_the_split_reports_the_total_and_no_split() {
         let resident =
             parse_proc_status_resident("VmRSS:\t  5940216 kB\n").expect("VmRSS alone is enough");
 
@@ -357,10 +378,26 @@ Threads:\t32
             resident,
             ResidentMemory {
                 total: 5_940_216 * 1024,
-                anon: 0,
-                file: 0,
+                split: None,
             }
         );
+    }
+
+    /// One half without the other is not a split. Neither is derivable from the
+    /// total (`VmRSS` also counts shmem), so a partial read has to decline.
+    #[test]
+    fn one_half_of_the_split_is_not_a_split() {
+        for status in [
+            "VmRSS:\t  5940216 kB\nRssAnon:\t 2451968 kB\n",
+            "VmRSS:\t  5940216 kB\nRssFile:\t 3488248 kB\n",
+        ] {
+            let resident = parse_proc_status_resident(status).expect("VmRSS is present");
+            assert_eq!(resident.total, 5_940_216 * 1024);
+            assert!(
+                resident.split.is_none(),
+                "a half-populated split must not be published: {status:?}"
+            );
+        }
     }
 
     /// Without `VmRSS` there is no sample to report. Returning zero would enter
@@ -380,13 +417,16 @@ Threads:\t32
 
         assert!(resident.total > 0, "a running process has resident memory");
 
-        // The anon/file split only exists on the platforms that implement it;
-        // the fallback arm deliberately reports zero rather than fabricating an
-        // attribution, so asserting it unconditionally would fail on every other
-        // target.
+        // The split only exists on the platforms that implement it; elsewhere it
+        // is `None` rather than a fabricated attribution, so asserting it
+        // unconditionally would fail on every other target.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
-            resident.anon > 0,
+            resident
+                .split
+                .expect("Linux and macOS both supply the split")
+                .anon
+                > 0,
             "a running process has anonymous memory (heap and stacks)"
         );
     }
