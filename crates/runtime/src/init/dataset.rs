@@ -863,13 +863,15 @@ impl Runtime {
             && acceleration.resolves_to_durable_write_back()
             && !data_connector.supports_durable_write_back_delivery()
         {
+            // `supports_durable_write_back_delivery` is a synchronous capability
+            // flag, so this answer is the same on every attempt: refuse
+            // permanently rather than rebuilding the connector forever.
             let err = DurableWriteBackUnsupportedBySourceSnafu {
                 dataset_name: ds.name.to_string(),
                 connector: source.clone(),
             }
             .build();
-            warn_spaced!(spaced_tracer, "{}{err}", "");
-            return Err(err);
+            return Err(refuse_permanently(&ds, &self.status, &spaced_tracer, &err));
         }
 
         // Bypass the deferred-mismatch gate when the dataset recreates on a schema change, so
@@ -2061,7 +2063,8 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::DurableWriteBackRecreatingMode { .. }
         | Error::DurableWriteBackCompositePrimaryKey { .. }
         | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
-        | Error::DurableWriteBackPrerequisitesUnmet { .. } => true,
+        | Error::DurableWriteBackPrerequisitesUnmet { .. }
+        | Error::DurableWriteBackUnsupportedBySource { .. } => true,
         // Connector creation boxes its error, so recover the type the way the
         // catalog load path does before asking it to classify itself.
         Error::UnableToInitializeDataConnector { source } => {
@@ -2140,32 +2143,46 @@ fn preflight_dataset(
     let Err(err) = validate_dataset(ds) else {
         return Ok(());
     };
+    // Everything `validate_dataset` raises is a pure function of the Spicepod, so
+    // retrying cannot change the answer.
+    Err(refuse_permanently(ds, status, spaced_tracer, &err))
+}
 
+/// Report a refusal and return it as permanent.
+///
+/// A refusal a retry cannot change must not go back through `load_dataset`'s retry
+/// loop: that rebuilds the connector on every attempt for the life of the process
+/// and leaves the dataset stuck in `Initializing`, with only a periodic log line to
+/// show for it.
+///
+/// The log is keyed on the dataset rather than one shared slot, because a caller
+/// runs this once per dataset inside `initialize_datasets_accelerators`' fan-out —
+/// a shared key would let the first refusal of a startup suppress every other
+/// dataset's for the tracer's whole interval, leaving them refused with no line
+/// naming them.
+fn refuse_permanently(
+    ds: &Arc<Dataset>,
+    status: &status::RuntimeStatus,
+    spaced_tracer: &Arc<util::tracers::SpacedTracer>,
+    err: &Error,
+) -> Error {
     let ds_name = &ds.name;
     status.update_dataset(
         ds_name,
         status::ComponentStatus::error_with_message(err.to_string()),
     );
     metrics::datasets::LOAD_ERROR.add(1, &[]);
-    // Keyed on the dataset, not on one shared slot: this runs once per dataset
-    // inside `initialize_datasets_accelerators`' fan-out, so a shared key would
-    // let the first refusal of a startup suppress every other dataset's for the
-    // tracer's whole interval, leaving them refused with no log line naming them.
     error_spaced!(
         spaced_tracer,
         "Refusing to load dataset {}. {err}",
         ds_name.table()
     );
 
-    // Everything `validate_dataset` raises is a pure function of the Spicepod, so
-    // retrying cannot change the answer. Refuse permanently here rather than
-    // asking a second list whether this particular refusal counts, which a new
-    // refusal could be left out of — and be retried for the life of the process.
     PermanentDatasetFailureSnafu {
         dataset: ds_name.clone(),
         reason: err.to_string(),
     }
-    .fail()
+    .build()
 }
 
 #[expect(clippy::result_large_err)]
@@ -3223,6 +3240,11 @@ mod tests {
             connector: "postgres".to_string(),
         }
         .build();
+        let unsupported_source = DurableWriteBackUnsupportedBySourceSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "duckdb".to_string(),
+        }
+        .build();
         let prerequisites = DurableWriteBackPrerequisitesUnmetSnafu {
             dataset_name: "orders".to_string(),
             connector: "postgres".to_string(),
@@ -3243,6 +3265,7 @@ mod tests {
             &composite_key,
             &undeclared_key,
             &prerequisites,
+            &unsupported_source,
         ] {
             assert!(
                 is_permanent_dataset_failure(err),
