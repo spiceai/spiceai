@@ -687,17 +687,20 @@ mod tests {
         // Guards the refusal against over-reaching: the unsupported parameters are refused, and
         // the controls Anthropic does accept keep reaching it.
         //
-        // One control per request. Setting `temperature` and `top_p` together is a shape every
-        // Claude 4+ model rejects (#13579), so pairing them here would pin a request that cannot
-        // be served as though it were the supported case.
+        // One control per request: #13579 reports that setting `temperature` and `top_p` together
+        // is refused by the models this adapter reaches, so pairing them here would pin a request
+        // that cannot be served as though it were the supported case. Each request is also
+        // asserted to carry only the control it set, so neither can be cross-populated.
         let with_temperature = convert(request_with(|r| r.temperature = Some(0.25)))
             .expect("a supported sampling control should convert");
         assert_eq!(with_temperature.temperature, Some(0.25));
+        assert_eq!(with_temperature.top_p, None);
         assert_eq!(with_temperature.top_k, None);
 
         let with_top_p = convert(request_with(|r| r.top_p = Some(0.9)))
             .expect("a supported sampling control should convert");
         assert_eq!(with_top_p.top_p, Some(0.9));
+        assert_eq!(with_top_p.temperature, None);
         assert_eq!(with_top_p.top_k, None);
     }
 }
