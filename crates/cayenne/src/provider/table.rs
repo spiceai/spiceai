@@ -734,6 +734,17 @@ struct SnapshotSweepGuards<'a> {
     live_referenced: Option<&'a HashSet<String>>,
 }
 
+/// What one sweep decided about a single snapshot dir.
+enum SnapshotDirDisposition {
+    /// Unlink it (subject to the per-file manifest ref-count).
+    Delete,
+    /// Keep it permanently as far as this pass is concerned, for the given reason.
+    Keep(&'static str),
+    /// Keep it only because it is inside the grace; the caller re-arms so a
+    /// later pass reclaims it.
+    TooYoung,
+}
+
 struct SnapshotFilesForScan {
     file_groups: Vec<FileGroup>,
     statistics: Statistics,
@@ -2196,9 +2207,14 @@ pub struct CayenneTableProvider {
     /// so CDC catch-up bursts do not synchronously pay metastore/listing work
     /// on every append.
     post_write_maintenance: Arc<PostWriteMaintenance>,
-    /// Coalesces the superseded-snapshot-dir sweep: set before the task spawns
-    /// and cleared when it finishes, so a burst of commits produces one sweep.
+    /// Holds the single superseded-snapshot-dir sweep slot: set before the task
+    /// spawns and released when it finishes, so a burst of commits produces one
+    /// sweep.
     snapshot_cleanup_scheduled: Arc<AtomicBool>,
+    /// An unserved sweep request. Set by every commit and consumed by the pass
+    /// before it sweeps, so a commit arriving mid-pass earns another pass rather
+    /// than being dropped on the closed slot.
+    snapshot_cleanup_pending: Arc<AtomicBool>,
     /// Guards the single in-flight re-arm of [`Self::run_old_snapshot_cleanup`]
     /// for dirs it deferred on grace, so commit rate cannot multiply them.
     snapshot_cleanup_rearmed: Arc<AtomicBool>,
@@ -4656,26 +4672,62 @@ impl CayenneTableProvider {
     /// an id captured at schedule time would go stale and pin everything
     /// published after it.
     pub(crate) fn schedule_old_snapshot_cleanup(&self) {
+        // Record the request FIRST, so a commit that lands while a pass is
+        // already running is picked up by that pass's re-check instead of being
+        // dropped on the closed slot below.
+        self.snapshot_cleanup_pending
+            .store(true, Ordering::Release);
+
         if self.snapshot_cleanup_scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
 
         let table = self.clone_for_write();
         tokio::spawn(async move {
-            // Clear the coalescing flag on ANY exit so a stuck flag can never
-            // permanently suppress future sweeps or hang
-            // `drain_in_flight_maintenance`.
-            struct ClearOnDrop(Arc<AtomicBool>);
-            impl Drop for ClearOnDrop {
+            // Releases the runner slot on ANY exit — completion, early return,
+            // or a panic during unwind — so a stuck flag can never permanently
+            // suppress future sweeps or hang `drain_in_flight_maintenance`.
+            // Disarmed when the loop hands the slot to another task.
+            struct ReleaseSlot(Option<Arc<AtomicBool>>);
+            impl Drop for ReleaseSlot {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
+                    if let Some(flag) = &self.0 {
+                        flag.store(false, Ordering::Release);
+                    }
                 }
             }
-            let _clear = ClearOnDrop(Arc::clone(&table.snapshot_cleanup_scheduled));
+            let mut slot = ReleaseSlot(Some(Arc::clone(&table.snapshot_cleanup_scheduled)));
 
-            // Debounce so a burst of commits produces one sweep.
-            tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
-            table.run_old_snapshot_cleanup().await;
+            loop {
+                // Consume the request before sweeping: a commit publishing
+                // during the pass re-sets it and earns its own pass, rather
+                // than relying on this one having listed its dir.
+                table
+                    .snapshot_cleanup_pending
+                    .store(false, Ordering::Release);
+                // Debounce so a burst of commits produces one sweep.
+                tokio::time::sleep(POST_WRITE_MAINTENANCE_DEBOUNCE).await;
+                table.run_old_snapshot_cleanup().await;
+
+                // Open the slot, then re-check. A request after this store
+                // claims the slot itself; one before it is caught here. Either
+                // way no request is lost.
+                table
+                    .snapshot_cleanup_scheduled
+                    .store(false, Ordering::Release);
+                if !table.snapshot_cleanup_pending.load(Ordering::Acquire) {
+                    slot.0 = None;
+                    return;
+                }
+                if table
+                    .snapshot_cleanup_scheduled
+                    .swap(true, Ordering::AcqRel)
+                {
+                    // Another task owns the slot and will handle the request.
+                    slot.0 = None;
+                    return;
+                }
+            }
         });
     }
 
@@ -4872,14 +4924,9 @@ impl CayenneTableProvider {
     /// magnitude more than the live table.
     const SNAPSHOT_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Whether a superseded snapshot dir is old enough to unlink, judged on its
-    /// own uuid7 creation time. `false` when the id carries no uuid7 timestamp:
-    /// a dir we cannot date is never swept on age.
-    fn snapshot_dir_older_than(
-        snapshot_id: &str,
-        grace: std::time::Duration,
-        now: SystemTime,
-    ) -> bool {
+    /// A snapshot dir's creation time, from its uuid7 id. `None` for an id that
+    /// carries no uuid7 timestamp — a staging dir, or an imported id.
+    fn snapshot_dir_created(snapshot_id: &str) -> Option<SystemTime> {
         uuid::Uuid::parse_str(snapshot_id)
             .ok()
             .and_then(|id| id.get_timestamp())
@@ -4887,8 +4934,49 @@ impl CayenneTableProvider {
                 let (seconds, nanos) = ts.to_unix();
                 UNIX_EPOCH + std::time::Duration::new(seconds, nanos)
             })
-            .and_then(|created| now.duration_since(created).ok())
-            .is_some_and(|age| age >= grace)
+    }
+
+    /// Whether one snapshot dir may be unlinked, judged on identity and time.
+    /// Callers apply the manifest ref-count separately, per surviving file.
+    ///
+    /// Shared by the local and object-store sweeps so the two cannot drift on
+    /// what they consider safe.
+    fn classify_snapshot_dir(
+        snapshot_id: &str,
+        guards: &SnapshotSweepGuards<'_>,
+        current_created: Option<SystemTime>,
+        now: SystemTime,
+    ) -> SnapshotDirDisposition {
+        if snapshot_id == guards.current_snapshot_id
+            || snapshot_id == STAGING_DIR_NAME
+            || guards.skip_snapshot_ids.contains(snapshot_id)
+        {
+            return SnapshotDirDisposition::Keep("current, pinned, or staging");
+        }
+
+        // A dir we cannot date could be a write in flight; never sweep it.
+        let Some(created) = Self::snapshot_dir_created(snapshot_id) else {
+            return SnapshotDirDisposition::Keep("no uuid7 timestamp to date it by");
+        };
+
+        // A write populates its dir BEFORE the flip that makes it current or
+        // protected, so anything at or newer than the current snapshot may be
+        // in flight — unlinking it fails that writer. Undatable current id:
+        // keep everything, since nothing can be proven older.
+        if current_created.is_none_or(|current| created >= current) {
+            return SnapshotDirDisposition::Keep("at or newer than the current snapshot");
+        }
+
+        // A dir younger than the grace may still be opened by a plan that
+        // resolved its listing just before the flip.
+        if now
+            .duration_since(created)
+            .is_ok_and(|age| age >= guards.grace)
+        {
+            SnapshotDirDisposition::Delete
+        } else {
+            SnapshotDirDisposition::TooYoung
+        }
     }
 
     /// Record that the catalog no longer references these snapshot dirs (their
@@ -5520,6 +5608,13 @@ impl CayenneTableProvider {
         grace: Duration,
     ) -> Result<bool> {
         let now = SystemTime::now();
+        let current_created = Self::snapshot_dir_created(current_snapshot);
+        if current_created.is_none() {
+            tracing::warn!(
+                "Snapshot '{current_snapshot}' of table '{}' carries no uuid7 timestamp, so no old snapshot prefix can be proven older than it: none will be reclaimed",
+                self.table_metadata.table_name
+            );
+        }
         let mut deferred_on_grace = false;
         let config = self.require_object_store()?;
 
@@ -5558,36 +5653,40 @@ impl CayenneTableProvider {
             .get_all_snapshot_files(&self.table_metadata.table_id)
             .await
             .map_err(|source| Error::Catalog { source })?;
-        let manifest_populated = !all_rows.is_empty();
         let mut live_snapshot_ids = skip_snapshot_ids.clone();
         live_snapshot_ids.insert(current_snapshot.to_string());
-        let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+        let live_referenced = (!all_rows.is_empty())
+            .then(|| Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids));
+        let guards = SnapshotSweepGuards {
+            current_snapshot_id: current_snapshot,
+            skip_snapshot_ids,
+            grace,
+            live_referenced: live_referenced.as_ref(),
+        };
 
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().next_back() {
                 let snapshot_id_str = snapshot_id.as_ref();
-                // Skip the current snapshot, the staging directory, anything the
-                // caller pinned, and anything still inside the cleanup grace.
-                if snapshot_id_str == current_snapshot
-                    || skip_snapshot_ids.contains(snapshot_id_str)
-                    || snapshot_id_str == STAGING_DIR_NAME
-                {
-                    tracing::trace!(
-                        "Keeping snapshot: {snapshot_id_str} (current, pinned, or staging)"
-                    );
-                    continue;
+                match Self::classify_snapshot_dir(snapshot_id_str, &guards, current_created, now) {
+                    SnapshotDirDisposition::Keep(reason) => {
+                        tracing::trace!("Keeping snapshot: {snapshot_id_str} ({reason})");
+                        continue;
+                    }
+                    SnapshotDirDisposition::TooYoung => {
+                        tracing::trace!(
+                            "Keeping snapshot: {snapshot_id_str} (within cleanup grace)"
+                        );
+                        deferred_on_grace = true;
+                        continue;
+                    }
+                    SnapshotDirDisposition::Delete => {}
                 }
-                if !Self::snapshot_dir_older_than(snapshot_id_str, grace, now) {
-                    tracing::trace!("Keeping snapshot: {snapshot_id_str} (within cleanup grace)");
-                    deferred_on_grace = true;
-                    continue;
-                }
-                if manifest_populated {
+                if let Some(live_referenced) = guards.live_referenced {
                     let snapshot_id_owned = snapshot_id_str.to_string();
                     self.delete_prefix_refcounted(
                         &common_prefix,
                         &snapshot_id_owned,
-                        &live_referenced,
+                        live_referenced,
                     )
                     .await?;
                 } else {
@@ -6703,11 +6802,12 @@ impl CayenneTableProvider {
         guards: &SnapshotSweepGuards<'_>,
         mut invalidate: impl FnMut(HashSet<ObjectStorePath>),
     ) -> CatalogResult<bool> {
+        // `grace` is read by `classify_snapshot_dir` off `guards`.
         let SnapshotSweepGuards {
             current_snapshot_id,
             skip_snapshot_ids,
-            grace,
             live_referenced,
+            ..
         } = *guards;
         let now = SystemTime::now();
         let mut deferred_on_grace = false;
@@ -6725,18 +6825,10 @@ impl CayenneTableProvider {
             skip_snapshot_ids.len()
         );
 
-        // Parse the current snapshot UUID7 unix timestamp. Directories with a
-        // UUID7 timestamp >= this might be in-flight writes that started after compaction committed
-        // but haven't added themselves to `protected_snapshots` yet.
-        let current_snapshot_unix = uuid::Uuid::parse_str(current_snapshot_id)
-            .ok()
-            .and_then(|u| u.get_timestamp())
-            .map(|ts| ts.to_unix());
-
-        if current_snapshot_unix.is_none() {
+        let current_created = Self::snapshot_dir_created(current_snapshot_id);
+        if current_created.is_none() {
             tracing::warn!(
-                "Unable to extract UUID7 timestamp from current snapshot '{}'; in-flight write protection disabled",
-                current_snapshot_id
+                "Snapshot '{current_snapshot_id}' of table '{table_id}' carries no uuid7 timestamp, so no old snapshot directory can be proven older than it: none will be reclaimed"
             );
         }
 
@@ -6759,44 +6851,17 @@ impl CayenneTableProvider {
                 continue;
             };
 
-            // Skip the current snapshot, the staging directory, and anything
-            // the caller pinned (protected, in-flight scan, recently listed).
-            if snapshot_id == current_snapshot_id
-                || skip_snapshot_ids.contains(snapshot_id)
-                || snapshot_id == STAGING_DIR_NAME
-            {
-                tracing::trace!("Keeping snapshot: {snapshot_id} (current, pinned, or staging)");
-                continue;
-            }
-
-            // A dir younger than the grace may still be opened by a plan that
-            // resolved its listing just before the pointer flip.
-            if !Self::snapshot_dir_older_than(snapshot_id, grace, now) {
-                tracing::trace!("Keeping snapshot: {snapshot_id} (within cleanup grace)");
-                deferred_on_grace = true;
-                continue;
-            }
-
-            // Skip directories whose UUID7 timestamp is >= the current snapshot.
-            // These might be in-flight writes. Deleting them would cause the writer's final rename to fail with ENOENT.
-            if let Some(current_unix) = current_snapshot_unix {
-                let dir_unix = uuid::Uuid::parse_str(snapshot_id)
-                    .ok()
-                    .and_then(|u| u.get_timestamp())
-                    .map(|ts| ts.to_unix());
-
-                match dir_unix {
-                    Some(ts) if ts >= current_unix => {
-                        tracing::trace!("Keeping snapshot: {snapshot_id} (newer than current)");
-                        continue;
-                    }
-                    None => {
-                        tracing::warn!(
-                            "Unable to extract UUID7 timestamp from snapshot '{snapshot_id}'",
-                        );
-                    }
-                    _ => {}
+            match Self::classify_snapshot_dir(snapshot_id, guards, current_created, now) {
+                SnapshotDirDisposition::Keep(reason) => {
+                    tracing::trace!("Keeping snapshot: {snapshot_id} ({reason})");
+                    continue;
                 }
+                SnapshotDirDisposition::TooYoung => {
+                    tracing::trace!("Keeping snapshot: {snapshot_id} (within cleanup grace)");
+                    deferred_on_grace = true;
+                    continue;
+                }
+                SnapshotDirDisposition::Delete => {}
             }
 
             // Delete the old snapshot directory using blocking I/O. When the
@@ -7249,6 +7314,7 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             snapshot_cleanup_scheduled: Arc::new(AtomicBool::new(false)),
+            snapshot_cleanup_pending: Arc::new(AtomicBool::new(false)),
             snapshot_cleanup_rearmed: Arc::new(AtomicBool::new(false)),
             maintained_aggregates,
             filter_column_observations: Arc::new(
@@ -8572,6 +8638,7 @@ impl CayenneTableProvider {
             orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             snapshot_cleanup_scheduled: Arc::clone(&self.snapshot_cleanup_scheduled),
+            snapshot_cleanup_pending: Arc::clone(&self.snapshot_cleanup_pending),
             snapshot_cleanup_rearmed: Arc::clone(&self.snapshot_cleanup_rearmed),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             filter_column_observations: Arc::clone(&self.filter_column_observations),
@@ -44155,29 +44222,92 @@ mod tests {
         }
     }
 
-    /// The cleanup grace is judged from a dir's own uuid7 creation time, so a
-    /// just-published snapshot survives and one older than the grace does not.
+    /// The keep/delete decision both sweeps share. Covers the grace, the
+    /// in-flight-write guard (a dir at or newer than the current snapshot is
+    /// still being populated), and the pins.
     #[test]
-    fn snapshot_dir_older_than_gates_on_the_dirs_own_age() {
+    fn classify_snapshot_dir_keeps_pinned_in_flight_and_young_dirs() {
+        // Explicit uuid7 timestamps rather than `now_v7()`: v7 dates to the
+        // millisecond, so ids minted back to back are not reliably ordered.
+        let id_at = |secs: u64| {
+            uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, secs, 0)).to_string()
+        };
         let grace = Duration::from_secs(5);
-        let fresh = uuid::Uuid::now_v7().to_string();
-        let now = SystemTime::now();
+        let now_secs = 1_000_000_u64;
+        let now = UNIX_EPOCH + Duration::from_secs(now_secs);
+        let current = id_at(now_secs - 2);
+        let young = id_at(now_secs - 3);
+        let old = id_at(now_secs - 100);
+        let newer = id_at(now_secs - 1);
+        let current_created = CayenneTableProvider::snapshot_dir_created(&current);
+        let pinned: HashSet<String> = HashSet::from([old.clone()]);
+        let empty = HashSet::new();
+
+        let classify = |id: &str, skip: &HashSet<String>, grace, now| {
+            CayenneTableProvider::classify_snapshot_dir(
+                id,
+                &SnapshotSweepGuards {
+                    current_snapshot_id: &current,
+                    skip_snapshot_ids: skip,
+                    grace,
+                    live_referenced: None,
+                },
+                current_created,
+                now,
+            )
+        };
 
         assert!(
-            !CayenneTableProvider::snapshot_dir_older_than(&fresh, grace, now),
-            "a dir created now is inside the grace and must be kept"
+            matches!(
+                classify(&young, &empty, grace, now),
+                SnapshotDirDisposition::TooYoung
+            ),
+            "a superseded dir inside the grace is kept for a later pass"
         );
         assert!(
-            CayenneTableProvider::snapshot_dir_older_than(&fresh, Duration::ZERO, now),
-            "a zero grace makes every dated dir sweepable"
+            matches!(
+                classify(&old, &empty, grace, now),
+                SnapshotDirDisposition::Delete
+            ),
+            "past the grace, a superseded dir is swept"
         );
         assert!(
-            CayenneTableProvider::snapshot_dir_older_than(&fresh, grace, now + grace + grace),
-            "once the grace has elapsed the dir is sweepable"
+            matches!(
+                classify(&old, &pinned, grace, now),
+                SnapshotDirDisposition::Keep(_)
+            ),
+            "a pinned dir is kept regardless of age"
         );
         assert!(
-            !CayenneTableProvider::snapshot_dir_older_than("not-a-uuid", Duration::ZERO, now),
-            "a dir we cannot date is never swept on age"
+            matches!(
+                classify(&current, &empty, grace, now),
+                SnapshotDirDisposition::Keep(_)
+            ),
+            "the current snapshot is never swept"
+        );
+        // The in-flight-write guard: a writer populates its dir before the flip
+        // that makes it current or protected, so age alone must not sweep it.
+        assert!(
+            matches!(
+                classify(&newer, &empty, grace, now + grace + grace),
+                SnapshotDirDisposition::Keep(_)
+            ),
+            "a dir newer than the current snapshot may be a write in flight, so it is kept \
+             even once its own age clears the grace"
+        );
+        assert!(
+            matches!(
+                classify(STAGING_DIR_NAME, &empty, grace, now),
+                SnapshotDirDisposition::Keep(_)
+            ),
+            "the staging dir is never swept"
+        );
+        assert!(
+            matches!(
+                classify("not-a-uuid", &empty, grace, now),
+                SnapshotDirDisposition::Keep(_)
+            ),
+            "a dir with no uuid7 timestamp cannot be dated, so it is never swept"
         );
     }
 
