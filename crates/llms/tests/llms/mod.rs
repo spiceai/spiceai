@@ -25,6 +25,7 @@ use llms::{accumulate::accumulate, chat::Chat};
 use rstest::rstest;
 use serde_json::json;
 use std::{
+    collections::HashMap,
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -136,6 +137,34 @@ static MODEL_CACHES: LazyLock<Vec<(&'static str, ModelCache)>> = LazyLock::new(|
         .collect()
 });
 
+/// Hugging Face repos that back more than one fixture. `hf_phi3` and `local_phi3`
+/// are separate fixtures over the same repo, so their per-model caches guard
+/// different entries and do not serialize the artifact download they share.
+/// Creating them concurrently races on the repo's blob lock in the Hugging Face
+/// cache, and the loser fails the test instead of waiting for the download in
+/// flight (regression test for #13560). Serialize creation on the shared repo so
+/// the second fixture reads the warmed cache. Fixtures with no shared repo return
+/// `None` and never contend.
+fn shared_repo(model_name: &str) -> Option<&'static str> {
+    match model_name {
+        "hf_phi3" | "local_phi3" => Some("microsoft/Phi-3-mini-4k-instruct"),
+        _ => None,
+    }
+}
+
+/// One fetch lock per shared repo (see [`shared_repo`]). Held across model
+/// creation so the first fixture over a repo completes its download before the
+/// second starts.
+static REPO_FETCH_LOCKS: LazyLock<HashMap<&'static str, tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| {
+        let mut locks = HashMap::new();
+        locks.insert(
+            "microsoft/Phi-3-mini-4k-instruct",
+            tokio::sync::Mutex::new(()),
+        );
+        locks
+    });
+
 /// Get or create a model instance for the given name
 async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let (_, model_cache) = MODEL_CACHES
@@ -144,6 +173,31 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
         .ok_or_else(|| anyhow::anyhow!("model {model_name} not found in MODEL_CACHES"))?;
 
     // Check if model is already cached
+    {
+        let guard = model_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model cache could not be unlocked"))?;
+        if let Some(model) = guard.as_ref() {
+            return Ok(Arc::clone(model));
+        }
+    }
+
+    // Serialize the fetch of fixtures that share a Hugging Face repo, so a
+    // concurrent sibling waits for the download rather than racing on the repo's
+    // blob lock. Held across creation; `None` for fixtures with no shared repo.
+    let _repo_guard = match shared_repo(model_name) {
+        Some(repo) => Some(
+            REPO_FETCH_LOCKS
+                .get(repo)
+                .ok_or_else(|| anyhow::anyhow!("no fetch lock registered for repo {repo}"))?
+                .lock()
+                .await,
+        ),
+        None => None,
+    };
+
+    // Re-check the cache under the repo lock: a sibling over the same model may
+    // have finished creation while this call waited for the lock.
     {
         let guard = model_cache
             .lock()
