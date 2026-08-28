@@ -521,6 +521,28 @@ async fn wait_for_walsender_count(
     ))
 }
 
+/// Poll until the store holds a recorded position.
+///
+/// The watermark is published by the snapshot-boundary envelope's committer
+/// (`SnapshotWatermarkCommitter`), which hands it to the store to write rather
+/// than writing it inline — so the position lands shortly after that commit
+/// returns, not within it. Reading once races that write.
+async fn wait_for_recorded_position(
+    store: &Arc<InMemoryAppliedLsnStore>,
+    what: &str,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if matches!(store.load().await, Ok(RecordedPosition::At(_))) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow::anyhow!(
+        "{what} recorded no position, so this case would not exercise a surviving one"
+    ))
+}
+
 async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,
@@ -1646,15 +1668,20 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
         .await?
         .commit()
         .await?;
+    // The bootstrap stream is `snapshot.chain(boundary)`, and it is the zero-row
+    // boundary — not the data envelope above — whose committer publishes the
+    // watermark. Both rows fit one batch, so without polling this second envelope
+    // the stream is dropped before any position is recorded.
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
     drop(first);
     wait_for_walsender_count(&source, 0).await?;
 
     // The recorded position is the whole point of this case: without it the
     // rejoin below is the already-covered missing-record case.
-    anyhow::ensure!(
-        matches!(store.load().await, Ok(RecordedPosition::At(_))),
-        "the first start recorded no position, so this case would not exercise a surviving one"
-    );
+    wait_for_recorded_position(&store, "the first start").await?;
 
     // Rejoin on the SAME store — the position survived — while the acceleration
     // is observed empty, which is what the recreate left behind.
