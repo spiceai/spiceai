@@ -453,17 +453,27 @@ impl RuntimeBuilder {
                         .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
             }
             if let Some(av) = spicepod_rt.params.get(CAYENNE_METASTORE_AUTO_VACUUM_PARAM) {
-                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
-                    "none" => cayenne::SqliteAutoVacuum::None,
-                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
-                    "full" => cayenne::SqliteAutoVacuum::Full,
+                let mode = match av.to_lowercase().as_str() {
+                    "none" => Some(cayenne::SqliteAutoVacuum::None),
+                    "incremental" => Some(cayenne::SqliteAutoVacuum::Incremental),
+                    "full" => Some(cayenne::SqliteAutoVacuum::Full),
                     other => {
                         tracing::warn!(
-                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                            "Invalid `cayenne_metastore_auto_vacuum` value '{other}'; expected none|incremental|full. Keeping the default, so metastore page reclamation is unchanged. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
                         );
-                        cayenne::SqliteAutoVacuum::None
+                        None
                     }
                 };
+                // Like every sibling tunable in this block, an unusable value
+                // leaves `metastore_cfg` on the value it already holds — one
+                // source for the default, which cannot drift when it moves.
+                if let Some(mode) = mode {
+                    metastore_cfg.auto_vacuum = mode;
+                }
+                log_applied_cayenne_param(
+                    CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+                    mode.map(|_| av.to_lowercase()),
+                );
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,

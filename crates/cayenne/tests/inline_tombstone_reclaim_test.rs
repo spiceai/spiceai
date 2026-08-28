@@ -28,17 +28,17 @@ limitations under the License.
 //! Regression test for #13621: that garbage was unreclaimable. The clear was
 //! gated on `cayenne_inlined_data` being non-empty, and every path that could
 //! reach the clear was itself gated on a non-empty inline corpus — so on exactly
-//! the workload that produces the tombstones, nothing ever removed them.
+//! the workload that produces the tombstones, nothing ever removed them. The two
+//! tests below cover those two gates; each fails without its own half of the fix.
 
 mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{BinaryArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::writer::StreamWriter;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{CayenneTableProvider, InlinedDelete, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
@@ -50,6 +50,11 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 test_with_backends!(inline_tombstones_drain_when_corpus_is_empty);
 test_with_backends!(file_backed_upserts_reclaim_inline_tombstones);
 
+/// Tombstone budget for the reclamation test, in serialized bytes. One tombstone
+/// here holds three 8-byte keys behind a format tag, so a few rounds cross it —
+/// the shipped default is megabytes.
+const TOMBSTONE_BUDGET_BYTES: i64 = 64;
+
 fn table_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -58,20 +63,18 @@ fn table_schema() -> SchemaRef {
 }
 
 /// An Int64-PK upsert table whose writes always go to a Vortex file
-/// (`inline_max_rows: 0`) — the shape that produces inline tombstones against an
-/// inline corpus that is empty forever.
+/// (`inline_max_rows: 0`) and whose primary-key keyset is a bloom existence
+/// filter (`pk_keyset_cache_mb: 0`) — what an upsert table whose keyset outgrows
+/// its byte budget degrades to in production.
 ///
-/// `pk_keyset_cache_mb: Some(0)` degrades the primary-key keyset to a bounded
-/// bloom existence filter, which is what an upsert table whose keyset outgrows
-/// its byte budget does in production. A bloom hit has no row location, so the
-/// supersede is emitted to BOTH the file and the inline delete list — the
-/// tombstone masks the prior version wherever it lives. That is the write that
-/// #13621 could never reclaim.
+/// That combination is what writes inline tombstones against an inline corpus
+/// that is empty forever: a bloom hit has no row location, so the supersede goes
+/// to BOTH the file and the inline delete list, masking the prior version
+/// wherever it lives. Those are the rows #13621 could never reclaim.
 async fn create_file_backed_upsert_table(
     fixture: &common::TestFixture,
     name: &str,
-    inline_flush_max_segments: i64,
-    pk_keyset_cache_mb: Option<usize>,
+    inline_flush_max_bytes: i64,
 ) -> Result<(Arc<CayenneTableProvider>, SessionContext), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     let options = CreateTableOptions {
@@ -85,8 +88,8 @@ async fn create_file_backed_upsert_table(
         partition_column: None,
         vortex_config: VortexConfig {
             inline_max_rows: 0,
-            inline_flush_max_segments,
-            pk_keyset_cache_mb,
+            inline_flush_max_bytes,
+            pk_keyset_cache_mb: Some(0),
             ..VortexConfig::default()
         },
     };
@@ -103,28 +106,6 @@ async fn create_file_backed_upsert_table(
     Ok((table, ctx))
 }
 
-/// Serialize `keys` into the single-column `BinaryArray` IPC layout an inline
-/// tombstone carries.
-fn delete_ipc(keys: &[i64]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "row_key",
-        DataType::Binary,
-        false,
-    )]));
-    let key_bytes: Vec<[u8; 8]> = keys.iter().copied().map(i64::to_be_bytes).collect();
-    let key_slices: Vec<&[u8]> = key_bytes.iter().map(<[u8; 8]>::as_slice).collect();
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(BinaryArray::from_vec(key_slices))],
-    )?;
-
-    let mut ipc = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut ipc, &schema)?;
-    writer.write(&batch)?;
-    writer.finish()?;
-    Ok(ipc)
-}
-
 fn row_batch(ids: &[i64], names: &[&str]) -> Result<RecordBatch, Box<dyn std::error::Error>> {
     Ok(RecordBatch::try_new(
         table_schema(),
@@ -133,6 +114,43 @@ fn row_batch(ids: &[i64], names: &[&str]) -> Result<RecordBatch, Box<dyn std::er
             Arc::new(StringArray::from(names.to_vec())),
         ],
     )?)
+}
+
+/// Upsert `ids` with values tagged `round`, so each round supersedes the last.
+async fn upsert_round(
+    table: &CayenneTableProvider,
+    ids: &[i64],
+    round: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let names: Vec<String> = ids.iter().map(|id| format!("v{round}_{id}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    common::insert_batch(table, row_batch(ids, &name_refs)?).await?;
+    Ok(())
+}
+
+/// The value `upsert_round` leaves behind, for the assertion side.
+fn expected_rows(ids: &[i64], round: i64) -> Vec<(i64, String)> {
+    ids.iter()
+        .map(|id| (*id, format!("v{round}_{id}")))
+        .collect()
+}
+
+async fn tombstone_count(
+    fixture: &common::TestFixture,
+    table_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(fixture
+        .catalog
+        .get_inlined_data_stats(table_id)
+        .await?
+        .tombstone_entry_count)
+}
+
+async fn corpus_count(
+    fixture: &common::TestFixture,
+    table_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(fixture.catalog.get_inlined_data_count(table_id).await?)
 }
 
 /// Read `(id, name)` back, sorted by id.
@@ -165,57 +183,46 @@ async fn read_rows(
     Ok(rows)
 }
 
-/// The gate itself: a table holding inline tombstones over an EMPTY inline
-/// corpus must drain to zero tombstones on a checkpoint.
+/// The gate itself: a checkpoint over an EMPTY inline corpus must drain the
+/// tombstones the upserts left behind.
 ///
 /// Before #13621 the clear was gated on `get_inlined_data_stats().entry_count`,
-/// which counts `cayenne_inlined_data` only — so this checkpoint left every
-/// tombstone in place.
+/// which described `cayenne_inlined_data` alone — so this checkpoint left every
+/// tombstone in place. The budget here is the shipped default, far above what
+/// two rounds write, so nothing is reclaimed until the explicit checkpoint: this
+/// test isolates the gate from the trigger the next one covers.
 async fn inline_tombstones_drain_when_corpus_is_empty(fixture: common::TestFixture) -> TestResult {
     const TABLE: &str = "inline_tombstone_gate";
+    const ROUNDS: i64 = 2;
 
-    let (table, ctx) = create_file_backed_upsert_table(&fixture, TABLE, 64, None).await?;
+    let (table, ctx) = create_file_backed_upsert_table(
+        &fixture,
+        TABLE,
+        VortexConfig::default().inline_flush_max_bytes,
+    )
+    .await?;
     let table_id = fixture.catalog.get_table(TABLE).await?.table_id;
 
-    // Rows go straight to a Vortex file, so the inline corpus stays empty.
-    let inserted =
-        common::insert_batch(table.as_ref(), row_batch(&[1, 2, 3], &["a", "b", "c"])?).await?;
-    assert_eq!(inserted, 3);
+    let ids: Vec<i64> = (1..=3).collect();
+    for round in 0..=ROUNDS {
+        upsert_round(table.as_ref(), &ids, round).await?;
+    }
+
     assert_eq!(
-        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        corpus_count(&fixture, &table_id).await?,
         0,
         "inline_max_rows: 0 must keep the inline corpus empty"
     );
-
-    // Plant published tombstones over that empty corpus — the state an upsert
-    // reaches when the prior copy of a superseded PK lives in a file.
-    for (batch_index, keys) in [[10_i64, 11].as_slice(), [12, 13].as_slice()]
-        .iter()
-        .enumerate()
-    {
-        fixture
-            .catalog
-            .add_inlined_delete(InlinedDelete {
-                inlined_id: String::new(),
-                table_id: table_id.clone(),
-                delete_ipc: delete_ipc(keys)?,
-                delete_count: 2,
-                sequence_number: 100 + i64::try_from(batch_index)?,
-                created_at: String::new(),
-                published: true,
-            })
-            .await?;
-    }
     assert_eq!(
-        fixture.catalog.get_inlined_delete_count(&table_id).await?,
-        2,
-        "planted tombstones must be durable before the checkpoint"
+        tombstone_count(&fixture, &table_id).await?,
+        ROUNDS,
+        "each superseding round must leave one inline tombstone over that empty corpus"
     );
 
     table.checkpoint_inlined_data().await?;
 
     assert_eq!(
-        fixture.catalog.get_inlined_delete_count(&table_id).await?,
+        tombstone_count(&fixture, &table_id).await?,
         0,
         "a checkpoint over an empty inline corpus must reclaim the inline tombstones (#13621)"
     );
@@ -223,11 +230,7 @@ async fn inline_tombstones_drain_when_corpus_is_empty(fixture: common::TestFixtu
     // The tombstones masked nothing, so reclaiming them cannot change results.
     assert_eq!(
         read_rows(&ctx, TABLE).await?,
-        vec![
-            (1, "a".to_string()),
-            (2, "b".to_string()),
-            (3, "c".to_string())
-        ],
+        expected_rows(&ids, ROUNDS),
         "reclaiming inert tombstones must not disturb the visible rows"
     );
 
@@ -235,101 +238,55 @@ async fn inline_tombstones_drain_when_corpus_is_empty(fixture: common::TestFixtu
 }
 
 /// The reclamation must be REACHABLE from the workload that produces the
-/// garbage: repeated upserts over a table whose rows only ever live in Vortex
-/// files and whose keyset has degraded to a bloom.
+/// garbage, with no explicit checkpoint to help it.
 ///
 /// Before the fix every inline-checkpoint trigger was gated on a non-empty inline
 /// corpus, so on this workload the reclamation never ran at all and
 /// `cayenne_inlined_delete` grew by a row per upsert batch without bound.
 async fn file_backed_upserts_reclaim_inline_tombstones(fixture: common::TestFixture) -> TestResult {
     const TABLE: &str = "inline_tombstone_reclaim";
-    // Reclaim after a handful of tombstones so the test does not have to write
-    // the 64 of the shipped default.
-    const FLUSH_MAX_SEGMENTS: i64 = 2;
     const ROUNDS: i64 = 8;
 
     let (table, ctx) =
-        create_file_backed_upsert_table(&fixture, TABLE, FLUSH_MAX_SEGMENTS, Some(0)).await?;
+        create_file_backed_upsert_table(&fixture, TABLE, TOMBSTONE_BUDGET_BYTES).await?;
     let table_id = fixture.catalog.get_table(TABLE).await?.table_id;
 
     let ids: Vec<i64> = (1..=3).collect();
-    let seed: Vec<String> = ids.iter().map(|id| format!("v0_{id}")).collect();
-    let seed_refs: Vec<&str> = seed.iter().map(String::as_str).collect();
-    common::insert_batch(table.as_ref(), row_batch(&ids, &seed_refs)?).await?;
-    assert_eq!(
-        fixture.catalog.get_inlined_data_count(&table_id).await?,
-        0,
-        "inline_max_rows: 0 must keep the inline corpus empty"
-    );
-
-    // Each round supersedes the same PKs, whose prior copies live in files.
     let mut peak_tombstones = 0_i64;
-    for round in 1..=ROUNDS {
-        let names: Vec<String> = ids.iter().map(|id| format!("v{round}_{id}")).collect();
-        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        common::insert_batch(table.as_ref(), row_batch(&ids, &name_refs)?).await?;
-
-        peak_tombstones =
-            peak_tombstones.max(fixture.catalog.get_inlined_delete_count(&table_id).await?);
+    for round in 0..=ROUNDS {
+        upsert_round(table.as_ref(), &ids, round).await?;
+        peak_tombstones = peak_tombstones.max(tombstone_count(&fixture, &table_id).await?);
     }
 
     assert_eq!(
-        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        corpus_count(&fixture, &table_id).await?,
         0,
         "the whole point of the workload: the inline corpus is empty throughout"
     );
     assert!(
-        peak_tombstones > FLUSH_MAX_SEGMENTS,
-        "the workload must push inline tombstones past the reclamation threshold, \
-         or it does not cover #13621 (peaked at {peak_tombstones})"
+        peak_tombstones > 0,
+        "the workload must write inline tombstones, or it does not cover #13621"
     );
 
     // The reclamation runs in a background task scheduled from the write path,
     // so give it a bounded window — the same race the inline auto-checkpoint has.
-    let settled = poll_tombstone_count_at_most(
-        &fixture,
-        &table_id,
-        FLUSH_MAX_SEGMENTS,
-        std::time::Duration::from_secs(10),
-    )
-    .await?;
+    let settled =
+        common::poll_inlined_delete_count_at_most(&fixture.catalog, &table_id, peak_tombstones - 1)
+            .await?;
 
-    // Unreclaimed, the count is one row per round (ROUNDS); reclaimed, it cannot
-    // exceed the threshold plus the row that trips it.
+    // Unreclaimed, the count is one row per round and never falls.
     assert!(
-        settled <= FLUSH_MAX_SEGMENTS + 1,
-        "inline tombstones must be reclaimed once they pass the threshold, not accumulate: \
+        settled < peak_tombstones,
+        "inline tombstones must be reclaimed once they pass the budget, not accumulate: \
          peaked at {peak_tombstones}, settled at {settled} after {ROUNDS} upsert rounds (#13621)"
     );
 
     // Correctness gate: the reclamation must never change what the table returns.
-    let expected: Vec<(i64, String)> = ids
-        .iter()
-        .map(|id| (*id, format!("v{ROUNDS}_{id}")))
-        .collect();
     assert_eq!(
         read_rows(&ctx, TABLE).await?,
-        expected,
+        expected_rows(&ids, ROUNDS),
         "every PK must show its last upserted value, with nothing resurrected or lost"
     );
 
     Ok(())
-}
-
-/// Poll until the tombstone count settles at or below `limit`, returning the
-/// last count observed.
-async fn poll_tombstone_count_at_most(
-    fixture: &common::TestFixture,
-    table_id: &str,
-    limit: i64,
-    timeout: std::time::Duration,
-) -> Result<i64, Box<dyn std::error::Error>> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let count = fixture.catalog.get_inlined_delete_count(table_id).await?;
-        if count <= limit || std::time::Instant::now() >= deadline {
-            return Ok(count);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
 }

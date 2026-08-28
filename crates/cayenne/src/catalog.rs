@@ -825,7 +825,9 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
-    /// Get aggregate inline data size information for a table.
+    /// Get aggregate size information for a table's inline corpus AND its inline
+    /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
+    /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
@@ -960,17 +962,6 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
-
-    /// Count the inlined delete entries (tombstone rows) held for a table.
-    ///
-    /// Reads the row count only, never the `delete_ipc` blobs, so the inline
-    /// checkpoint can ask "is there anything to reclaim?" without paying
-    /// [`Self::get_inlined_deletes`]'s decode and transfer cost. Tombstone rows
-    /// outlive the inline corpus they hide (an upsert whose prior copy lives in a
-    /// Vortex file still writes one, to mask the copy wherever it lives), so the
-    /// reclamation gate cannot be derived from
-    /// [`Self::get_inlined_data_stats`] alone.
-    async fn get_inlined_delete_count(&self, table_id: &str) -> CatalogResult<i64>;
 
     /// Get only the *published* inlined delete entries for a table.
     ///

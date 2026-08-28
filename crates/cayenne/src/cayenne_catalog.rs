@@ -4096,11 +4096,19 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .query_row_helper(
                 QueryRowParams {
+                    // The tombstone aggregates ride the same round trip as the
+                    // corpus ones: both callers need both tables, and on a
+                    // network metastore a second query costs 10-50 ms. Each
+                    // subquery is an index-only range scan over
+                    // `idx_cayenne_inlined_delete_table_seq`, and `LENGTH` on a
+                    // BLOB reads the record header, never the payload.
                     sql: r"
                     SELECT
                         COALESCE(SUM(record_count), 0),
                         COUNT(*),
-                        COALESCE(SUM(LENGTH(data_ipc)), 0)
+                        COALESCE(SUM(LENGTH(data_ipc)), 0),
+                        (SELECT COUNT(*) FROM cayenne_inlined_delete WHERE table_id = ?1),
+                        (SELECT COALESCE(SUM(LENGTH(delete_ipc)), 0) FROM cayenne_inlined_delete WHERE table_id = ?1)
                     FROM cayenne_inlined_data
                     WHERE table_id = ?1
                     ",
@@ -4111,6 +4119,8 @@ impl MetadataCatalog for CayenneCatalog {
                         record_count: row.get_i64(0)?,
                         entry_count: row.get_i64(1)?,
                         ipc_bytes: row.get_i64(2)?,
+                        tombstone_entry_count: row.get_i64(3)?,
+                        tombstone_ipc_bytes: row.get_i64(4)?,
                     })
                 },
             )
@@ -4817,20 +4827,6 @@ impl MetadataCatalog for CayenneCatalog {
                         published: row.get_bool(6)?,
                     })
                 },
-            )
-            .await
-    }
-
-    async fn get_inlined_delete_count(&self, table_id: &str) -> CatalogResult<i64> {
-        // Index-only range scan over `idx_cayenne_inlined_delete_table_seq`; the
-        // `delete_ipc` blobs are never read.
-        self.metastore
-            .query_row_helper(
-                QueryRowParams {
-                    sql: "SELECT COUNT(*) FROM cayenne_inlined_delete WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
-                },
-                |row| row.get_i64(0),
             )
             .await
     }

@@ -2098,7 +2098,12 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
-/// Aggregate size information for inline data entries in the metastore.
+/// Aggregate size information for the metastore's two inline tables.
+///
+/// Both are reported together because the inline checkpoint clears both together
+/// and they do not fill together — see `CayenneTableProvider`'s
+/// `inlined_tombstone_bytes` for why `cayenne_inlined_delete` grows on a table
+/// whose `cayenne_inlined_data` stays empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinedDataStats {
     /// Total number of visible rows represented by inline entries.
@@ -2107,6 +2112,10 @@ pub struct InlinedDataStats {
     pub entry_count: i64,
     /// Total serialized Arrow IPC bytes stored inline.
     pub ipc_bytes: i64,
+    /// Number of inline tombstone rows (`cayenne_inlined_delete`).
+    pub tombstone_entry_count: i64,
+    /// Total serialized tombstone-key bytes stored inline.
+    pub tombstone_ipc_bytes: i64,
 }
 
 impl InlinedData {
