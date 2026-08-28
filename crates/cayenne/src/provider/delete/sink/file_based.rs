@@ -482,9 +482,14 @@ impl FileBasedDeletionSink {
     /// Clean up protected snapshots that were fully emptied by file-based retention.
     ///
     /// For each emptied snapshot:
-    /// 1. Remove the snapshot sequence from the catalog.
-    /// 2. Remove the entry from the in-memory `protected_snapshots` map.
-    /// 3. Delete the now-empty snapshot directory from disk.
+    /// 1. Remove the snapshot sequence (roster row) from the catalog.
+    /// 2. Delete the snapshot's `cayenne_snapshot_file` manifest rows and its
+    ///    `cayenne_snapshot_file_statistics` stats-cache rows from the catalog.
+    ///    The append maintenance lane wrote these rows while the snapshot was
+    ///    live and populated; nothing else reconciles them once retention has
+    ///    physically removed the files, so skipping this leaks metastore rows.
+    /// 3. Remove the entry from the in-memory `protected_snapshots` map.
+    /// 4. Delete the now-empty snapshot directory from disk.
     ///
     /// Errors are logged as warnings but do not fail the overall delete operation
     /// — the data files are already removed, so cleanup is best-effort.
@@ -503,14 +508,39 @@ impl FileBasedDeletionSink {
                 continue;
             }
 
-            // 2. Remove from in-memory map (copy-on-write atomic publish)
+            // 2. Delete the snapshot's manifest rows and stats-cache rows so
+            //    they do not leak once retention has removed the physical files.
+            //    Best-effort: on failure warn and continue, the roster row is
+            //    already gone.
+            if let Err(e) = self
+                .catalog
+                .clear_snapshot_files_for(&self.table_id, snapshot_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to clear snapshot manifest rows for snapshot {snapshot_id} in table {}: {e}",
+                    self.table_name
+                );
+            }
+            if let Err(e) = self
+                .catalog
+                .clear_snapshot_file_statistics_for(&self.table_id, snapshot_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to clear snapshot file statistics for snapshot {snapshot_id} in table {}: {e}",
+                    self.table_name
+                );
+            }
+
+            // 3. Remove from in-memory map (copy-on-write atomic publish)
             self.protected_snapshots.rcu(|current| {
                 let mut new_map = (**current).clone();
                 new_map.remove(snapshot_id);
                 Arc::new(new_map)
             });
 
-            // 3. Delete the empty snapshot directory
+            // 4. Delete the empty snapshot directory
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(&self.table_id)
                 .join(snapshot_id);

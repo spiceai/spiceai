@@ -686,6 +686,19 @@ pub trait MetadataCatalog: Send + Sync {
         file_path: &str,
     ) -> CatalogResult<Option<SnapshotFileStatistics>>;
 
+    /// Drop the per-file statistics rows for one specific snapshot.
+    ///
+    /// Runs `DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?
+    /// AND snapshot_id = ?`. The stats cache sits alongside the manifest; when a
+    /// single snapshot leaves the live set (for example when time-based
+    /// retention empties a protected snapshot) its stats rows must go too, or
+    /// they leak after the physical files are gone.
+    async fn clear_snapshot_file_statistics_for(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
     /// Drop per-file statistics rows for snapshots other than the current one.
     async fn clear_snapshot_file_statistics_except(
         &self,
@@ -726,6 +739,18 @@ pub trait MetadataCatalog: Send + Sync {
     /// snapshot's manifest references it. The caller filters these rows down to
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
+
+    /// Drop the manifest rows for one specific snapshot (snapshot GC).
+    ///
+    /// Runs `DELETE FROM cayenne_snapshot_file WHERE table_id = ? AND
+    /// snapshot_id = ?`. Used when a single snapshot leaves the live set — for
+    /// example when time-based retention empties a protected snapshot — so its
+    /// best-effort manifest rows do not leak after the physical files are gone.
+    async fn clear_snapshot_files_for(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Drop manifest rows for snapshots other than the given one (snapshot GC).
     async fn clear_snapshot_files_except(
