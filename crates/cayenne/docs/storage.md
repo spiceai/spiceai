@@ -285,7 +285,7 @@ The same primitives produce visibly different trees depending on whether the wor
 | Deletion mode | Schema | When |
 |---------------|--------|------|
 | **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or any table in `deletion_mode: position` |
-| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for `changes`-mode PK tables) |
+| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for PK tables) |
 
 **Staging WAL (`_wal.json`)** — makes a staged file list crash-safe via tmp + fsync + rename. On the next provider open, unreconciled WAL markers self-heal (atomic rename of staged Vortex files into the current snapshot, or rollback).
 

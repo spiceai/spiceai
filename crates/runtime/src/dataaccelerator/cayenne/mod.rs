@@ -1666,8 +1666,7 @@ impl CayenneAccelerator {
             // both cases. Gated strictly: only an unresolved `auto`, only the
             // changes/CDC refresh mode, and only when a primary key exists
             // (key mode requires one) — explicit `position`/`key` configs and
-            // every non-CDC profile keep today's position resolution
-            // (merge-on-read pushdown, zero per-row scan CPU).
+            // every non-CDC profile keep their config as-is.
             if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
                 && workload.has_primary_key
@@ -6182,10 +6181,9 @@ mod tests {
         assert_eq!(config.inline_max_rows, 0);
     }
 
-    /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
-    /// datasets whose workload has a primary key; explicit configs and every
-    /// other profile keep their value (and Auto's downstream position
-    /// resolution) untouched.
+    /// `deletion_mode: auto` is pre-resolved to `key` in runtime config for
+    /// `refresh_mode: changes` datasets whose workload has a primary key;
+    /// explicit configs and every other profile keep their value untouched.
     #[tokio::test]
     async fn test_deletion_mode_auto_resolves_to_key_for_cdc_pk_tables() {
         let app = Arc::new(AppBuilder::new("test").build());
@@ -6269,7 +6267,7 @@ mod tests {
         .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
-        // A non-CDC profile with a PK stays Auto (position downstream).
+        // A non-CDC profile with a PK stays Auto at config time (resolves downstream in Cayenne).
         let ds = build("full_pk", RefreshMode::Full, vec![], &app, &rt);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",
