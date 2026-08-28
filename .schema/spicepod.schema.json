@@ -9112,7 +9112,7 @@
           ]
         },
         "cayenne_deletion_mode": {
-          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for tables with a primary key (key-based deletes compact concurrently with writers and are pruned by the seq-prefix bake pass), and to 'position' (merge-on-read) for PK-less tables: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a PK table into merge-on-read position deletes.",
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.",
           "type": "string",
           "default": "auto",
           "enum": [
