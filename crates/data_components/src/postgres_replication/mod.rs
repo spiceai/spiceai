@@ -918,10 +918,11 @@ mod tests {
              position, and no reachable WAL will resend them"
         );
 
-        // Position 0 is still a position: it asserts nothing was applied, so an
-        // empty acceleration agrees with it and there is nothing to rebuild for.
-        // Guards against reading emptiness as a gap on a genuine first load that
-        // has already recorded its starting point.
+        // Position 0 is read like any other position, which is what this pins: an
+        // empty acceleration holding it is still missing every row below it, so
+        // the cause fires here too rather than being waived for a zero LSN. What
+        // decides whether another load is actually coming is the caller's
+        // `snapshotting` gate, not the LSN's value.
         assert_eq!(
             rebuild_cause(&at(0), Some(0), 0, true, true),
             Some(RebuildCause::EmptyWithUsablePosition),
