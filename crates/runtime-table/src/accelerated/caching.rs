@@ -129,7 +129,10 @@ pub fn stamp_namespace_column(
     fields.push(Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false));
 
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(vec![namespace_id; batch.num_rows()])) as ArrayRef);
+    columns.push(Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+        namespace_id,
+        batch.num_rows(),
+    ))) as ArrayRef);
 
     let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
     RecordBatch::try_new(new_schema, columns).map_err(|e| {
@@ -466,47 +469,42 @@ async fn flush_cache_writes(
 
     let flush_start = std::time::Instant::now();
 
+    let queued = buffer.len();
+
     // One key, one write. Two requests for the same key in a single flush would
     // share one OR'd delete and then each append their batches, leaving the key
     // holding the response twice — and a duplicated source row is a wrong query
-    // result, not a housekeeping problem. Only the newest survives; the older
-    // one is a response this key no longer holds.
+    // result, not a housekeeping problem. Walking newest-first keeps the latest
+    // write for each key; an older one is a response that key no longer holds.
     //
     // The in-flight key set makes this unreachable from the two paths that
     // enqueue today. It is enforced here as well so the flush does not depend
     // on its callers for it.
-    let superseded: Vec<bool> = {
-        let mut seen: HashSet<&str> = HashSet::with_capacity(buffer.len());
-        let mut flags: Vec<bool> = buffer
-            .iter()
-            .rev()
-            .map(|req| !seen.insert(req.cache_key.as_str()))
-            .collect();
-        flags.reverse();
-        flags
-    };
-    if superseded.iter().any(|superseded| *superseded) {
-        let dropped = superseded.iter().filter(|s| **s).count();
+    let mut seen: HashSet<String> = HashSet::with_capacity(queued);
+    let mut requests: Vec<CacheWriteRequest> = buffer
+        .drain(..)
+        .rev()
+        .filter(|req| seen.insert(req.cache_key.clone()))
+        .collect();
+    requests.reverse();
+
+    if requests.len() < queued {
         tracing::debug!(
-            "Dropping {dropped} superseded cache write(s) for dataset={dataset_name}: a later write for the same key is in this flush"
+            "Dropping {superseded} superseded cache write(s) for dataset={dataset_name}: a later write for the same key is in this flush",
+            superseded = queued - requests.len()
         );
-        let mut index = 0;
-        buffer.retain(|_| {
-            let keep = !superseded[index];
-            index += 1;
-            keep
-        });
     }
 
-    let request_count = buffer.len();
-    let total_rows: usize = buffer
+    let request_count = requests.len();
+    let total_rows: usize = requests
         .iter()
         .flat_map(|r| r.batches.iter())
         .map(RecordBatch::num_rows)
         .sum();
 
-    // Collect cache keys to remove after flushing
-    let cache_keys: Vec<String> = buffer.iter().map(|r| r.cache_key.clone()).collect();
+    // Every key claimed for this flush, including the superseded writes, whose
+    // claim is the same string and is released with it.
+    let cache_keys = seen;
 
     tracing::trace!(
         "Flushing {request_count} cache write requests ({total_rows} total rows) for dataset={dataset_name}"
@@ -526,7 +524,7 @@ async fn flush_cache_writes(
     let mut all_batches: Vec<RecordBatch> = Vec::new();
     let mut replace_filters: Vec<Vec<Expr>> = Vec::new();
 
-    for req in buffer.drain(..) {
+    for req in requests {
         let ns_id: &str = &req.namespace_id;
         let batches = match req
             .batches
@@ -1780,39 +1778,36 @@ impl CacheRefreshHelper {
                     return Box::pin(RecordBatchStreamAdapter::new(batch_schema, batch_stream));
                 }
 
-                // Clone batches for propagation to children.
-                // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
-                let batches_for_propagate = if batches_cacheable {
-                    batches.clone()
-                } else {
-                    Vec::new()
-                };
-                let filters_clone: Vec<Expr> = filters.to_vec();
                 let cache_key =
                     compute_cache_key_from_filters_and_namespace(filters, namespace.storage_id());
 
-                // Claim the key before enqueuing. Without this, two readers
-                // that miss the same key concurrently each append the response
-                // and the key ends up holding it twice — which queries return
-                // as duplicated source rows.
+                // Claiming the key is what stops two readers that miss it
+                // concurrently from each appending the response, leaving the key
+                // holding it twice — which queries return as duplicated source
+                // rows.
                 //
                 // The claim is released by the flush that writes it, so it is
                 // taken only on the path that reaches a flush. Claiming for a
                 // response that is never enqueued would hold the key for the
                 // life of the process and refuse every later write and
                 // revalidation for it.
-                let claimed = batches_cacheable
-                    && in_flight_revalidations
-                        .lock()
-                        .await
-                        .insert(cache_key.clone());
-                if batches_cacheable && !claimed {
+                if !batches_cacheable {
+                    tracing::debug!(
+                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
+                    );
+                } else if !in_flight_revalidations
+                    .lock()
+                    .await
+                    .insert(cache_key.clone())
+                {
                     tracing::debug!(
                         "A write for this key is already pending for dataset={dataset_name}; not enqueuing a second copy"
                     );
-                }
-
-                if claimed {
+                } else {
+                    // `RecordBatch::clone` is cheap: it clones Arc pointers,
+                    // not the underlying data.
+                    let batches_for_propagate = batches.clone();
+                    let filters_clone: Vec<Expr> = filters.to_vec();
                     let cache_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
                     // Send write request to batched consumer. The flush
@@ -1859,10 +1854,6 @@ impl CacheRefreshHelper {
 
                     tracing::debug!(
                         "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
-                    );
-                } else if !batches_cacheable {
-                    tracing::debug!(
-                        "Fetch returned transient HTTP error responses, skipping cache write for dataset={dataset_name}"
                     );
                 }
 

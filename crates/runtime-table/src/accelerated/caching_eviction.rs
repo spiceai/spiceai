@@ -44,6 +44,7 @@ limitations under the License.
 //! Expiry runs first because it is free capacity: evicting a live entry while
 //! an expired one still occupies the budget would be a straight loss.
 
+use std::ops::Not;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -58,7 +59,11 @@ use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use tokio::runtime::Handle;
 
-use super::RetentionPredicate;
+use datafusion::logical_expr::Operator;
+use util::timestamp_filter::TimestampFilterConvert;
+
+use super::{Retention, RetentionPredicate};
+use super::retention::create_timestamp_filter_converter;
 use super::caching::{
     CACHE_NAMESPACE_COLUMN, CACHE_REFRESHED_AT_COLUMN, REQUEST_KEY_COLUMNS, effective_max_age,
 };
@@ -73,13 +78,73 @@ use util::expr::combine_exprs_balanced;
 /// eviction saves. Overflow is not dropped — it is evicted by the next sweep,
 /// and the shortfall is logged rather than passed over in silence.
 ///
-/// This bounds *predicate width*, which is a hard limit rather than a taste:
-/// DataFusion walks an expression tree recursively, and a 50,000-wide `OR`
-/// overflowed the stack and aborted the process outright. It is deliberately not
-/// the mechanism that keeps a large cache within its budget — see
-/// [`bulk_cutoff`], which evicts any number of entries in one small predicate
-/// whenever it is provably safe to do so. This cap only bounds the fallback.
+/// The predicates are combined with [`combine_exprs_balanced`], so the tree is
+/// logarithmic in depth rather than linear — width, not nesting, is what this
+/// bounds. Raising it to 50,000 aborted a measured run with a stack overflow in
+/// a query worker; that was not root-caused to a specific frame, so the cap is
+/// kept as the conservative bound rather than on a mechanism this comment could
+/// name. Width is not free regardless: every term is translated and evaluated by
+/// the accelerator's own delete planner.
+///
+/// It is deliberately not the mechanism that keeps a large cache within its
+/// budget — see [`bulk_cutoff`], which evicts any number of entries in one small
+/// predicate whenever it is provably safe to do so. This cap only bounds the
+/// fallback.
 const MAX_ENTRIES_PER_SWEEP: usize = 512;
+
+/// The `Map` of response headers the HTTP connector stores beside every body.
+///
+/// Named here because [`unmeasurable_payload_columns`] has to recognise it to
+/// stay quiet about it; see that function for why.
+const RESPONSE_HEADERS_COLUMN: &str = "response_headers";
+
+/// The retention policy that bounds a caching accelerator.
+///
+/// Assembled here rather than in the accelerated-table builder because every
+/// rule in it is cache policy: which cadence wins, why the dataset's own
+/// `retention_check_enabled` does not gate it, and which configurations can
+/// only be partly enforced.
+///
+/// `dataset_retention` is the dataset's own `retention_period` /
+/// `retention_sql`, if it set any. Its filters are carried through and applied
+/// per entry rather than per row; see [`CacheEvictionPredicate`].
+pub fn retention(
+    limits: CacheLimits,
+    dataset_retention: Option<Retention>,
+    accelerator: &Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+    io_runtime: &Handle,
+) -> Retention {
+    let predicate = Arc::new(CacheEvictionPredicate::new(
+        dataset_name.clone(),
+        limits,
+        io_runtime.clone(),
+    ));
+
+    let sweep = sweep_interval(limits.ttl);
+    // Not built through `RetentionBuilder`, whose `enabled` flag governs the
+    // dataset's own retention rules: switching those off must not also switch
+    // off `caching_ttl`, `caching_max_size` and `caching_max_items`.
+    let (filters, check_interval) = match dataset_retention {
+        // Sweep at whichever cadence is tighter. The user's
+        // `retention_check_interval` must not slow the cache bounds down, and
+        // the cache's cadence must not make their retention rule run less often
+        // than they asked.
+        Some(retention) => (retention.filters, retention.check_interval.min(sweep)),
+        None => (Vec::new(), sweep),
+    };
+
+    // After the user's filters are known: a `retention_period` or
+    // `retention_sql` rule evicts entries too, so whether anything bounds the
+    // cache is not decidable from the cache's own limits.
+    predicate.warn_about_unenforceable(accelerator, !filters.is_empty());
+
+    Retention {
+        filters,
+        check_interval,
+        computed: Some(predicate),
+    }
+}
 
 /// The bounds a caching accelerator is held to, beyond its TTLs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -225,23 +290,36 @@ impl RetentionPredicate for CacheEvictionPredicate {
 
         let schema = accelerator.schema();
         let key_columns = entry_key_columns(&schema);
-        let has_fetched_at = schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_some();
+
+        // Every comparison against `_fetched_at` goes through the converter the
+        // retention loop's own time filter uses, so the predicate is built for
+        // the type the accelerator actually stores the column as. Cayenne keeps
+        // it in microseconds, and a `DuckDB` cast carrying a timezone has to be
+        // rendered as `AT TIME ZONE` (#12528) — neither is something a literal
+        // written here could know.
+        let refreshed_at =
+            create_timestamp_filter_converter(accelerator, CACHE_REFRESHED_AT_COLUMN, None, None, None);
+
+        // With `stale_if_error` an expired entry is deliberately kept as
+        // fallback for a failing origin, so there is no deadline to apply.
+        let cutoff = self
+            .limits
+            .stale_if_error
+            .not()
+            .then(|| expiry_cutoff(&self.limits))
+            .flatten()
+            .filter(|_| refreshed_at.is_some());
 
         if key_columns.is_empty() {
             // Nothing identifies an entry, so nothing can be evicted as one.
             // Expiry can still run row by row, safely: with no key there is no
             // entry to leave half of. The dataset's own retention predicate is
             // row-level already and passes through unchanged.
-            let expired = if self.limits.stale_if_error || !has_fetched_at {
-                None
-            } else {
-                expiry_cutoff(&self.limits).map(row_level_expiry_expr)
-            };
-            return Ok(match (configured, expired) {
-                (Some(a), Some(b)) => Some(a.or(b)),
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (None, None) => None,
-            });
+            let expired = cutoff.and_then(|cutoff| row_level_expiry_expr(&refreshed_at, cutoff));
+            return Ok(combine_exprs_balanced(
+                [configured, expired].into_iter().flatten().collect(),
+                Expr::or,
+            ));
         }
 
         let entries = rank_entries(
@@ -261,9 +339,6 @@ impl RetentionPredicate for CacheEvictionPredicate {
         //    past their window. Both are judged per entry: a row-level delete
         //    could take part of a multi-row response and leave the rest to be
         //    served as if it were whole.
-        let cutoff = (!self.limits.stale_if_error && has_fetched_at)
-            .then(|| expiry_cutoff(&self.limits))
-            .flatten();
         for entry in &entries {
             let retained_out = entry.matches_configured;
             let expired = cutoff.is_some_and(|cutoff| entry.expired_at(cutoff));
@@ -305,11 +380,10 @@ impl RetentionPredicate for CacheEvictionPredicate {
         // One range predicate when the doomed and surviving entries do not
         // overlap in fetch time: exact, and not bounded by how many entries it
         // covers.
-        if let Some(cutoff) = bulk_cutoff(&doomed, &survivors) {
-            return Ok(Some(
-                col(CACHE_REFRESHED_AT_COLUMN)
-                    .lt_eq(lit(ScalarValue::TimestampNanosecond(Some(cutoff), None))),
-            ));
+        if let Some(bulk) = bulk_cutoff(&doomed, &survivors)
+            && let Some(expr) = row_level_expiry_expr(&refreshed_at, bulk)
+        {
+            return Ok(Some(expr));
         }
 
         // Otherwise name each entry, bounded to the rows it held when ranked.
@@ -325,7 +399,7 @@ impl RetentionPredicate for CacheEvictionPredicate {
         }
         let predicates: Vec<Expr> = naming
             .iter()
-            .filter_map(|entry| entry_predicate(&entry.key, entry.newest))
+            .filter_map(|entry| entry_predicate(&entry.key, entry.newest, &refreshed_at))
             .collect();
         Ok(combine_exprs_balanced(predicates, Expr::or))
     }
@@ -339,8 +413,9 @@ impl RetentionPredicate for CacheEvictionPredicate {
 /// window is unservable on its own terms. A row with no fetch time goes too:
 /// there is no deadline to hold it to, and the read path already treats a null
 /// timestamp as expired.
-fn row_level_expiry_expr(cutoff: i64) -> Expr {
-    col(CACHE_REFRESHED_AT_COLUMN).lt_eq(lit(ScalarValue::TimestampNanosecond(Some(cutoff), None)))
+fn row_level_expiry_expr(refreshed_at: &Option<TimestampFilterConvert>, cutoff: i64) -> Option<Expr> {
+    let converter = refreshed_at.as_ref()?;
+    Some(converter.convert(u128::try_from(cutoff).ok()?, Operator::LtEq))
 }
 
 /// The instant before which an entry can no longer be served: `caching_ttl`
@@ -389,48 +464,59 @@ impl Budget {
 /// The caching accelerator's reserved columns are excluded, so the budget
 /// counts what was cached rather than the bookkeeping around it.
 fn payload_bytes_expr(schema: &arrow::datatypes::Schema) -> Option<Expr> {
+    payload_columns(schema)
+        .filter_map(|field| measured_bytes(&field))
+        .reduce(|acc, next| acc + next)
+}
+
+/// What one column contributes to an entry's measured size, or `None` if it
+/// cannot be weighed.
+///
+/// The single source for that rule: [`payload_bytes_expr`] sums what it returns
+/// and [`unmeasurable_payload_columns`] reports what it refuses, so the warning
+/// an operator reads cannot come to disagree with what the budget counts.
+fn measured_bytes(field: &arrow::datatypes::Field) -> Option<Expr> {
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            // `octet_length` is Int32 and NULL-propagating; widen it so a large
+            // cache cannot overflow the running sum, and give NULL a weight of
+            // zero rather than poisoning the row's total.
+            Some(coalesce(vec![
+                cast(octet_length(col(field.name())), DataType::Int64),
+                lit(0_i64),
+            ]))
+        }
+        other => other
+            .primitive_width()
+            .and_then(|width| i64::try_from(width).ok())
+            .map(lit),
+    }
+}
+
+/// The columns a budget is charged for: everything the cache stores except the
+/// accelerator's own bookkeeping.
+fn payload_columns(
+    schema: &arrow::datatypes::Schema,
+) -> impl Iterator<Item = arrow::datatypes::FieldRef> + '_ {
     schema
         .fields()
         .iter()
         .filter(|field| !super::caching::is_reserved_caching_column(field.name()))
-        .filter_map(|field| match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                // `octet_length` is Int32 and NULL-propagating; widen it so a
-                // large cache cannot overflow the running sum, and give NULL a
-                // weight of zero rather than poisoning the row's total.
-                Some(coalesce(vec![
-                    cast(octet_length(col(field.name())), DataType::Int64),
-                    lit(0_i64),
-                ]))
-            }
-            other => other
-                .primitive_width()
-                .and_then(|width| i64::try_from(width).ok())
-                .map(lit),
-        })
-        .reduce(|acc, next| acc + next)
+        .map(std::clone::Clone::clone)
 }
 
 /// Payload columns [`payload_bytes_expr`] cannot weigh, so `caching_max_size`
 /// under-counts by whatever they hold.
 ///
-/// `response_headers` is excluded deliberately: it is a `Map` on every HTTP
-/// response, it is small beside the body it accompanies, and reporting it would
-/// put a warning in the log of every ordinary caching dataset that sets a
+/// [`RESPONSE_HEADERS_COLUMN`] is excluded deliberately: it is a `Map` on every
+/// HTTP response, it is small beside the body it accompanies, and reporting it
+/// would put a warning in the log of every ordinary caching dataset that sets a
 /// budget — which is how a warning stops being read. Anything else nested is
 /// worth saying out loud, because it could be the payload itself.
 fn unmeasurable_payload_columns(schema: &arrow::datatypes::Schema) -> Vec<String> {
-    schema
-        .fields()
-        .iter()
-        .filter(|field| !super::caching::is_reserved_caching_column(field.name()))
-        .filter(|field| field.name() != "response_headers")
-        .filter(|field| {
-            !matches!(
-                field.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-            ) && field.data_type().primitive_width().is_none()
-        })
+    payload_columns(schema)
+        .filter(|field| field.name() != RESPONSE_HEADERS_COLUMN)
+        .filter(|field| measured_bytes(field).is_none())
         .map(|field| field.name().clone())
         .collect()
 }
@@ -498,10 +584,11 @@ fn nameable<'a>(doomed: &'a [&'a EntryCost]) -> (&'a [&'a EntryCost], usize) {
 ///
 /// Returns `None` if either side lacks a fetch time, or if the two overlap.
 fn bulk_cutoff(doomed: &[&EntryCost], survivors: &[&EntryCost]) -> Option<i64> {
-    let newest_doomed = doomed.iter().map(|e| e.newest).max().flatten()?;
-    if doomed.iter().any(|e| e.newest.is_none()) {
-        return None;
-    }
+    // `try_fold` on both sides: one pass each, and a missing fetch time on
+    // either stops it rather than being folded away.
+    let newest_doomed = doomed
+        .iter()
+        .try_fold(i64::MIN, |acc, e| e.newest.map(|n| acc.max(n)))?;
     let oldest_survivor = survivors
         .iter()
         .try_fold(i64::MAX, |acc, e| e.oldest.map(|o| acc.min(o)))?;
@@ -556,7 +643,6 @@ async fn rank_entries(
     // over the payload means reading every cached response body off disk, and
     // for a dataset with a TTL and no byte budget the figure is discarded.
     let size_expr = max_size_bytes.and_then(|_| payload_bytes_expr(schema));
-    let has_size = size_expr.is_some();
     let has_fetched_at = schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_some();
 
     let mut aggregates = vec![count(lit(1)).alias("rows")];
@@ -569,7 +655,6 @@ async fn rank_entries(
         aggregates.push(min(col(CACHE_REFRESHED_AT_COLUMN)).alias("oldest"));
         aggregates.push(max(col(CACHE_REFRESHED_AT_COLUMN)).alias("newest"));
     }
-    let has_configured = configured.is_some();
     if let Some(configured) = configured {
         aggregates.push(bool_or(configured).alias("configured"));
     }
@@ -600,25 +685,16 @@ async fn rank_entries(
                 .iter()
                 .map(|name| (name.clone(), read_utf8(batch, name, row)))
                 .collect();
+            // Every reader resolves its column by name and answers `None` for
+            // one the aggregate did not produce, so an absent aggregate needs
+            // no flag of its own here.
             entries.push(EntryCost {
                 key,
                 rows: read_u64_at(batch, "rows", row).unwrap_or(0),
-                bytes: if has_size {
-                    read_u64_at(batch, "bytes", row).unwrap_or(0)
-                } else {
-                    0
-                },
-                oldest: if has_fetched_at {
-                    read_timestamp_nanos(batch, "oldest", row)
-                } else {
-                    None
-                },
-                newest: if has_fetched_at {
-                    read_timestamp_nanos(batch, "newest", row)
-                } else {
-                    None
-                },
-                matches_configured: has_configured && read_bool(batch, "configured", row),
+                bytes: read_u64_at(batch, "bytes", row).unwrap_or(0),
+                oldest: read_timestamp_nanos(batch, "oldest", row),
+                newest: read_timestamp_nanos(batch, "newest", row),
+                matches_configured: read_bool(batch, "configured", row),
             });
         }
     }
@@ -652,7 +728,11 @@ async fn rank_entries(
 /// and gets the bare identity predicate. Only an entry mixing timestamped and
 /// untimestamped rows keeps the untimestamped ones, which one fetch cannot
 /// produce.
-fn entry_predicate(key: &[(String, Option<String>)], ranked_newest: Option<i64>) -> Option<Expr> {
+fn entry_predicate(
+    key: &[(String, Option<String>)],
+    ranked_newest: Option<i64>,
+    refreshed_at: &Option<TimestampFilterConvert>,
+) -> Option<Expr> {
     let identity = key
         .iter()
         .map(|(name, value)| value.as_ref().map(|v| col(name).eq(lit(v.as_str()))))
@@ -660,16 +740,12 @@ fn entry_predicate(key: &[(String, Option<String>)], ranked_newest: Option<i64>)
         .into_iter()
         .reduce(Expr::and)?;
 
-    let Some(ranked_newest) = ranked_newest else {
+    let Some(bound) = ranked_newest.and_then(|newest| row_level_expiry_expr(refreshed_at, newest))
+    else {
         return Some(identity);
     };
 
-    Some(identity.and(
-        col(CACHE_REFRESHED_AT_COLUMN).lt_eq(lit(ScalarValue::TimestampNanosecond(
-            Some(ranked_newest),
-            None,
-        ))),
-    ))
+    Some(identity.and(bound))
 }
 
 /// The subset of [`REQUEST_KEY_COLUMNS`] this accelerator stores, plus the cache
@@ -936,12 +1012,17 @@ mod tests {
             .map(|name| (name, Some(String::new())))
             .collect();
 
+        let converter = refreshed_at_converter();
         let mut rendered = vec![
-            entry_predicate(&key, None).expect("identity").to_string(),
-            entry_predicate(&key, Some(1_700_000_000))
+            entry_predicate(&key, None, &converter)
+                .expect("identity")
+                .to_string(),
+            entry_predicate(&key, Some(1_700_000_000), &converter)
                 .expect("ranked")
                 .to_string(),
-            row_level_expiry_expr(1_700_000_000).to_string(),
+            row_level_expiry_expr(&converter, 1_700_000_000)
+                .expect("expiry")
+                .to_string(),
         ];
         if let Some(size) = payload_bytes_expr(&schema) {
             rendered.push(size.to_string());
@@ -966,7 +1047,7 @@ mod tests {
             ("request_path".to_string(), Some("/users".to_string())),
             ("request_query".to_string(), None),
         ];
-        assert!(entry_predicate(&with_null, None).is_none());
+        assert!(entry_predicate(&with_null, None, &refreshed_at_converter()).is_none());
 
         // The shape the HTTP connector actually stores: absent query and body
         // are empty strings, so they match by equality.
@@ -974,7 +1055,9 @@ mod tests {
             ("request_path".to_string(), Some("/users".to_string())),
             ("request_query".to_string(), Some(String::new())),
         ];
-        let rendered = entry_predicate(&empty, Some(10)).unwrap().to_string();
+        let rendered = entry_predicate(&empty, Some(10), &refreshed_at_converter())
+            .unwrap()
+            .to_string();
         assert!(
             !rendered.contains("IS NULL"),
             "no predicate this builds may contain IS NULL: {rendered}"
@@ -985,7 +1068,7 @@ mod tests {
     fn entry_predicate_of_an_empty_key_is_none() {
         // Guards the delete path: an unconstrained predicate would delete the
         // whole cache.
-        assert!(entry_predicate(&[], None).is_none());
+        assert!(entry_predicate(&[], None, &refreshed_at_converter()).is_none());
     }
 
     #[test]
@@ -1169,6 +1252,19 @@ mod tests {
     /// Builds an in-memory accelerator holding `rows`. `MemTable` implements
     /// `delete_from`, so the sweep exercises the same delete path a `DuckDB` or
     /// Cayenne accelerator takes.
+    /// The `_fetched_at` converter [`CacheEvictionPredicate::delete_expr`]
+    /// builds, for tests that call the predicate builders directly.
+    fn refreshed_at_converter() -> Option<TimestampFilterConvert> {
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(
+                Arc::new(http_cache_schema()),
+                vec![],
+            )
+            .expect("mem table"),
+        ) as Arc<dyn TableProvider>;
+        create_timestamp_filter_converter(&accelerator, CACHE_REFRESHED_AT_COLUMN, None, None, None)
+    }
+
     fn cache_table(rows: &[Row]) -> (Arc<dyn TableProvider>, Arc<FederatedTable>) {
         use arrow::array::{StringArray, TimestampNanosecondArray};
         use data_components::arrow::write::MemTable;
@@ -1347,7 +1443,7 @@ mod tests {
         let expr = combine_exprs_balanced(
             doomed
                 .iter()
-                .filter_map(|entry| entry_predicate(&entry.key, entry.newest))
+                .filter_map(|entry| entry_predicate(&entry.key, entry.newest, &refreshed_at_converter()))
                 .collect(),
             Expr::or,
         )

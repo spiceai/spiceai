@@ -1064,48 +1064,25 @@ impl Builder {
             None
         };
 
-        // A caching accelerator is bounded by `caching_eviction` as a retention
-        // filter rather than by a loop of its own, so the cache is swept by the
-        // same ticker, write lock and index-aware delete every other dataset
-        // uses. Attached before the retention task is spawned below.
+        // A caching accelerator is bounded by `caching_eviction` as a computed
+        // retention policy rather than by a loop of its own, so the cache is
+        // swept by the same ticker, write lock and index-aware delete every
+        // other dataset uses. Attached before the retention task is spawned
+        // below.
         let retention = if refresh_mode == RefreshMode::Caching {
-            let limits = caching_eviction::CacheLimits {
-                max_size_bytes: self.caching_max_size_bytes,
-                max_items: self.caching_max_items,
-                ttl: self.caching_ttl,
-                stale_while_revalidate: self.caching_stale_while_revalidate_ttl,
-                stale_if_error: self.caching_stale_if_error,
-            };
-            let predicate = Arc::new(caching_eviction::CacheEvictionPredicate::new(
-                self.dataset_name.clone(),
-                limits,
-                self.io_runtime.clone(),
-            ));
-            // Built directly rather than through the builder's `enabled` gate:
-            // `retention_check_enabled` governs the dataset's own retention
-            // rules, and switching those off must not also switch off
-            // `caching_ttl`, `caching_max_size` and `caching_max_items`.
-            let sweep_interval = caching_eviction::sweep_interval(self.caching_ttl);
-            let (mut filters, check_interval) = match self.retention {
-                // Sweep at whichever cadence is tighter. The user's
-                // `retention_check_interval` must not slow the cache bounds
-                // down, and the cache's cadence must not make their retention
-                // rule run less often than they asked.
-                Some(retention) => (
-                    retention.filters,
-                    retention.check_interval.min(sweep_interval),
-                ),
-                None => (Vec::new(), sweep_interval),
-            };
-            // After the user's filters are known: a `retention_period` or
-            // `retention_sql` rule evicts entries too, so whether anything
-            // bounds the cache is not decidable from the cache's own limits.
-            predicate.warn_about_unenforceable(&self.accelerator, !filters.is_empty());
-            filters.push(DataRetentionFilter::Computed { predicate });
-            Some(Retention {
-                filters,
-                check_interval,
-            })
+            Some(caching_eviction::retention(
+                caching_eviction::CacheLimits {
+                    max_size_bytes: self.caching_max_size_bytes,
+                    max_items: self.caching_max_items,
+                    ttl: self.caching_ttl,
+                    stale_while_revalidate: self.caching_stale_while_revalidate_ttl,
+                    stale_if_error: self.caching_stale_if_error,
+                },
+                self.retention,
+                &self.accelerator,
+                &self.dataset_name,
+                &self.io_runtime,
+            ))
         } else {
             self.retention
         };
@@ -2339,11 +2316,6 @@ pub enum DataRetentionFilter {
     Expression {
         delete_expr: Box<Expr>,
     },
-    /// Decided per tick rather than at configuration time. Has the last word:
-    /// see [`RetentionPredicate`].
-    Computed {
-        predicate: Arc<dyn RetentionPredicate>,
-    },
 }
 
 pub struct RetentionBuilder {
@@ -2467,6 +2439,9 @@ impl RetentionBuilder {
         Some(Retention {
             filters,
             check_interval,
+            // The builder configures a dataset's own retention rules; a
+            // computed policy is attached by whatever owns it.
+            computed: None,
         })
     }
 }
@@ -2480,6 +2455,16 @@ impl Default for RetentionBuilder {
 pub struct Retention {
     pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
+    /// A policy decided per tick rather than at configuration time, which has
+    /// the last word on what `filters` resolved to: see [`RetentionPredicate`].
+    ///
+    /// A field rather than another `filters` variant, because it does not
+    /// compose the way they do. Every variant in that list is OR'd together;
+    /// this one is handed their combined result and may widen it, narrow it or
+    /// replace it. Putting it in the list would make "at most one, applied
+    /// last" a convention the loop has to enforce by hand, and a second one
+    /// would silently disable the first.
+    pub(crate) computed: Option<Arc<dyn RetentionPredicate>>,
 }
 
 impl Retention {

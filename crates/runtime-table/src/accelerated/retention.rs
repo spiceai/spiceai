@@ -17,7 +17,7 @@ limitations under the License.
 use std::{sync::Arc, time::SystemTime};
 
 use crate::accelerated::{
-    DataRetentionFilter, Retention, RetentionPredicate, refresh, refresh_task::collect_all_indexes,
+    DataRetentionFilter, Retention, refresh, refresh_task::collect_all_indexes,
 };
 use crate::federated::FederatedTable;
 use crate::filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert};
@@ -177,7 +177,6 @@ impl super::AcceleratedTable {
             interval_timer.tick().await;
 
             let mut exprs = Vec::new();
-            let mut computed: Option<&Arc<dyn RetentionPredicate>> = None;
 
             // convert retention filters into data eviction expressions
             for filter in &retention.filters {
@@ -185,12 +184,6 @@ impl super::AcceleratedTable {
                     DataRetentionFilter::Expression { delete_expr } => {
                         log_retention_action(&dataset_name, "using SQL expression");
                         exprs.push(delete_expr.clone());
-                    }
-                    DataRetentionFilter::Computed { predicate } => {
-                        // Resolved below, once the static filters have been
-                        // combined — it is given their result and has the last
-                        // word on it.
-                        computed = Some(predicate);
                     }
                     DataRetentionFilter::Time {
                         period,
@@ -261,7 +254,7 @@ impl super::AcceleratedTable {
             // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
             let configured = exprs.into_iter().map(|e| *e).reduce(Expr::or);
 
-            let expr = if let Some(predicate) = computed {
+            let expr = if let Some(predicate) = retention.computed.as_ref() {
                 match predicate.delete_expr(&accelerator, configured).await {
                     // Nothing to remove this tick is the ordinary case for a
                     // budget that is not yet exceeded, so it is not a warning.
@@ -312,7 +305,7 @@ impl super::AcceleratedTable {
     }
 }
 
-fn create_timestamp_filter_converter(
+pub(crate) fn create_timestamp_filter_converter(
     accelerator: &Arc<dyn TableProvider>,
     time_column: &str,
     time_format: Option<TimeFormat>,
