@@ -2205,7 +2205,7 @@ pub struct CayenneTableProvider {
     /// commit from the table — does not hold while the commit is still staged.
     /// Empty for every other append (they record after publishing, so the scan
     /// sees their rows).
-    inflight_staging_appends: Arc<ParkingMutex<HashMap<String, PkDigestSet>>>,
+    inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
     /// snapshot id → the instant it was retired. Deletion is deferred
@@ -4032,9 +4032,10 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn register_inflight_staging_append(&self, staging_snapshot_id: &str) {
-        self.inflight_staging_appends
-            .lock()
-            .insert(staging_snapshot_id.to_string(), PkDigestSet::default());
+        self.inflight_staging_appends.lock().insert(
+            staging_snapshot_id.to_string(),
+            Arc::new(PkDigestSet::default()),
+        );
     }
 
     pub(crate) fn unregister_inflight_staging_append(&self, staging_snapshot_id: &str) {
@@ -4056,6 +4057,12 @@ impl CayenneTableProvider {
     /// already read is a union of the same key, whereas retiring before the
     /// publish would reopen exactly the window this closes.
     ///
+    /// This is process-local, and so is the PK cache it backstops: it closes the
+    /// window against a rebuild in *this* process, not against a restart. A
+    /// cancellation whose catalog commit had already landed leaves a durable
+    /// append that no live registration describes, which recovery — not this
+    /// map — has to account for (#13643).
+    ///
     /// A no-op when the append is no longer registered, which is the caller
     /// racing its own retirement; the keys are then already covered by the
     /// table.
@@ -4067,12 +4074,18 @@ impl CayenneTableProvider {
         if keys.is_empty() {
             return;
         }
+        // Copy the batch's keys BEFORE taking the lock. `has_inflight_staging_appends`
+        // polls this mutex from the compaction and rewrite paths, and this runs on the
+        // CDC write path, so a batch-sized clone under it would make those polls wait
+        // on an allocation. Sharing the copy also keeps the rebuild's capture below to
+        // a refcount bump.
+        let keys = Arc::new(keys.clone());
         if let Some(slot) = self
             .inflight_staging_appends
             .lock()
             .get_mut(staging_snapshot_id)
         {
-            *slot = keys.clone();
+            *slot = keys;
         }
     }
 
@@ -4081,12 +4094,12 @@ impl CayenneTableProvider {
     /// the snapshot list, so an append is either still registered here or
     /// already published into the `current_snapshot_id` the same fence captured
     /// — never in neither.
-    fn snapshot_inflight_staged_pk_keys(&self) -> Vec<PkDigestSet> {
+    fn snapshot_inflight_staged_pk_keys(&self) -> Vec<Arc<PkDigestSet>> {
         self.inflight_staging_appends
             .lock()
             .values()
             .filter(|keys| !keys.is_empty())
-            .cloned()
+            .map(Arc::clone)
             .collect()
     }
 
@@ -10629,7 +10642,7 @@ impl CayenneTableProvider {
     /// upsert tombstone. `staged_keys` MUST be captured under the same listing
     /// fence as the snapshot list (see the caller).
     fn fold_inflight_staged_keys_into_keyset(
-        staged_keys: &[PkDigestSet],
+        staged_keys: &[Arc<PkDigestSet>],
         keyset: &mut BoundedShardedPkIndexBuilder,
     ) {
         for keys in staged_keys {
@@ -10644,7 +10657,7 @@ impl CayenneTableProvider {
     /// fast path, which reconstructs the index without the full-table scan and
     /// therefore has the same blind spot. Mirrors
     /// [`Self::fold_mem_tier_keys_into_bloom`].
-    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[PkDigestSet], bloom: &mut PkBloom) {
+    fn fold_inflight_staged_keys_into_bloom(staged_keys: &[Arc<PkDigestSet>], bloom: &mut PkBloom) {
         for keys in staged_keys {
             for key in keys.iter() {
                 bloom.insert(key.as_ref());
