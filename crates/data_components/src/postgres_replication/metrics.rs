@@ -83,6 +83,15 @@ pub struct MetricsCollector {
     /// datasets share one). Lets the analysis join the per-dataset view to the
     /// authoritative per-slot backlog and show grouping. Set at (shared) attach.
     slot_name: RwLock<Option<String>>,
+    /// Why this dataset's acceleration was rebuilt from the source instead of
+    /// resumed, as [`super::RebuildCause::label`], or `None` when it resumed.
+    ///
+    /// A rebuild is a full re-read nobody asked for, and the causes call for
+    /// different responses — a restored source, a repointed endpoint, a broken
+    /// sidecar, a slot lifecycle problem. Reporting only "rebuilt" would make
+    /// them indistinguishable without scraping log text. Set at attach; a member
+    /// classifies once, so this is a label rather than a counter.
+    rebuild_cause: RwLock<Option<&'static str>>,
     /// Cumulative seconds the shared-slot pump spent blocked trying to deliver
     /// committed changes into this member's mailbox because its sink was not
     /// draining. Non-zero means downstream backpressure stalled the pump (and
@@ -160,6 +169,22 @@ impl MetricsCollector {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(slot);
+    }
+
+    /// Record why this dataset's acceleration is being rebuilt, or clear the
+    /// cause on a resume. Called once per attach, with `None` on every path but
+    /// a rebuild — a collector is reused across reattaches, so a cause left set
+    /// from an earlier attach would otherwise keep exporting a stale
+    /// `replication_acceleration_rebuilt{cause=...}` after a later attach
+    /// resumes cleanly.
+    pub fn set_rebuild_cause(&self, cause: Option<&'static str>) {
+        // Recover through poisoning, as `set_slot_name` does: an unrelated panic must
+        // not leave a rebuild unattributed in the analysis.
+        let mut guard = self
+            .rebuild_cause
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = cause;
     }
 
     pub fn inc_insert(&self) {
@@ -517,6 +542,16 @@ impl Metrics {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+    /// Why this dataset's acceleration was rebuilt, or `None` when it resumed.
+    #[must_use]
+    pub fn rebuild_cause(&self) -> Option<&'static str> {
+        // Recover through poisoning, as `slot_name` does.
+        *self
+            .collector
+            .rebuild_cause
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     #[must_use]
     pub fn member_send_stalled_seconds_total(&self) -> u64 {

@@ -48,7 +48,7 @@ use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
-    logical_expr::{Expr, Operator, cast, col},
+    logical_expr::{Expr, Operator, col},
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
@@ -2162,7 +2162,7 @@ impl RefreshTask {
         // Extract the max timestamp value based on the column's data type.
         // - String columns (ISO8601): parse the ISO string back to nanos
         // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
-        // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
+        // - Timestamp and date columns: normalized to nanoseconds in memory
         // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
         let iso_str_value = col_array
             .as_any()
@@ -2249,18 +2249,23 @@ impl RefreshTask {
                 }
             }
         } else {
-            let array = col_array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-                })?;
+            // The query returns the column in the acceleration's own type, so normalize
+            // the unit here instead of asking the engine to CAST (see `max_timestamp_df`).
+            let nanos = temporal_scalar_as_nanos(col_array).map_err(|e| {
+                super::Error::FailedToFindLatestTimestamp {
+                    reason: format!(
+                        "Failed to read the latest value of time column '{column}' ({}) in dataset '{}', so the append refresh cannot resume: {e}",
+                        accelerated_field.data_type(),
+                        self.dataset_name
+                    ),
+                }
+            })?;
 
-            if array.is_empty() || array.is_null(0) {
+            let Some(nanos) = nanos else {
                 return Ok(None);
-            }
+            };
 
-            array.value(0) as u128
+            nanos as u128
         };
 
         if is_integer_time_column {
@@ -2661,36 +2666,45 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let schema = accelerator.schema();
-    let needs_cast = schema.column_with_name(column).is_some_and(|(_, f)| {
-        // Only CAST for native date/time/timestamp types that need precision normalization.
-        // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
-        // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
-        // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
-        matches!(
-            f.data_type(),
-            DataType::Date32
-                | DataType::Date64
-                | DataType::Time32(_)
-                | DataType::Time64(_)
-                | DataType::Timestamp(_, _)
-        )
-    });
-
-    let expr = if needs_cast {
-        cast(
-            ident(column),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        )
-        .alias("a")
-    } else {
-        ident(column).alias("a")
-    };
-
+    // Sort on the raw column. A cast would land on the sort key, where `TopK` turns it
+    // into a dynamic filter the scan has to evaluate against its own statistics — Vortex
+    // has no kernel for a timestamp cast, so the refresh fails (#13468).
+    // `timestamp_nanos_for_append_query` normalizes the one value it reads back instead.
     accelerator_df(accelerator, &ctx)?
-        .select(vec![expr])?
+        .select(vec![ident(column).alias("a")])?
         .sort(vec![col("a").sort(false, false)])?
         .limit(0, Some(1))
+}
+
+/// Read the single temporal value `max_timestamp_df` returned as epoch nanoseconds,
+/// whatever unit and timezone the acceleration stores it in.
+///
+/// `safe: false` reports an out-of-range value as an error rather than a NULL, which the
+/// caller would read as "no watermark" and re-append history.
+fn temporal_scalar_as_nanos(array: &dyn Array) -> Result<Option<i64>, ArrowError> {
+    let nanos = arrow::compute::kernels::cast::cast_with_options(
+        array,
+        &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        &arrow::compute::CastOptions {
+            safe: false,
+            ..arrow::compute::CastOptions::default()
+        },
+    )?;
+
+    let nanos = nanos
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| {
+            ArrowError::CastError(
+                "cast to Timestamp(ns) did not yield a nanosecond timestamp".into(),
+            )
+        })?;
+
+    if nanos.is_empty() || nanos.is_null(0) {
+        return Ok(None);
+    }
+
+    Ok(Some(nanos.value(0)))
 }
 
 fn accelerator_df(
@@ -3014,9 +3028,10 @@ mod tests {
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
-        Date32Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, UInt32Array, UInt64Array,
+        ArrayRef, Date32Array, Date64Array, Float16Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
+        UInt64Array,
     };
     use arrow::datatypes::{ArrowPrimitiveType, TimeUnit};
     use arrow_schema::{DataType, Field, Schema};
@@ -3563,9 +3578,8 @@ mod tests {
         );
     }
 
-    /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
     #[tokio::test]
-    async fn test_max_timestamp_df_timestamp_uses_cast() {
+    async fn test_max_timestamp_df_timestamp_sorts_without_cast() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time_col",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -3588,11 +3602,119 @@ mod tests {
         let ctx = SessionContext::new();
         let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
 
-        // Verify the plan uses Cast, not MAX
+        // A cast here would land on the sort key, where `TopK` turns it into a dynamic
+        // filter the scan cannot evaluate (#13468).
         let plan_str = format!("{:?}", df.logical_plan());
         assert!(
-            plan_str.contains("Cast("),
-            "timestamp column should use Cast, got: {plan_str}"
+            !plan_str.contains("Cast("),
+            "timestamp column should sort without a cast, got: {plan_str}"
+        );
+    }
+
+    /// Read a one-column accelerator through `max_timestamp_df` and the same
+    /// normalization `timestamp_nanos_for_append_query` applies to the value it returns.
+    async fn max_as_nanos(column: ArrayRef) -> i64 {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            column.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+        let mem_table =
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("mem table");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let df = max_timestamp_df(&accelerator, SessionContext::new(), "time_col")
+            .expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first().expect("one batch");
+
+        temporal_scalar_as_nanos(result.column(0))
+            .expect("normalizes to nanoseconds")
+            .expect("a non-null value")
+    }
+
+    /// 2023-11-14T22:13:20Z as nanoseconds.
+    const FIXED_INSTANT_NANOS: i64 = 1_700_000_000_000_000_000;
+
+    #[tokio::test]
+    async fn test_max_timestamp_normalizes_every_unit_and_timezone() {
+        // Every column holds the same instant in its own unit, so reading a microsecond
+        // column as if it were nanoseconds would give a watermark 1000x too small.
+        for tz in [None, Some("UTC"), Some("+05:30")] {
+            let cases: [ArrayRef; 4] = [
+                Arc::new(
+                    TimestampSecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000_000_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![FIXED_INSTANT_NANOS]).with_timezone_opt(tz),
+                ),
+            ];
+
+            for array in cases {
+                let data_type = array.data_type().clone();
+                assert_eq!(
+                    max_as_nanos(array).await,
+                    FIXED_INSTANT_NANOS,
+                    "{data_type} must normalize to the same instant"
+                );
+            }
+        }
+    }
+
+    /// The append path reads `None` as "no watermark" and starts over from the beginning,
+    /// so a value that cannot be scaled to nanoseconds has to be an error instead.
+    #[test]
+    fn test_temporal_scalar_as_nanos_rejects_an_out_of_range_value() {
+        let array: ArrayRef = Arc::new(TimestampSecondArray::from(vec![i64::MAX]));
+        assert!(
+            temporal_scalar_as_nanos(&array).is_err(),
+            "a seconds value too large to hold in nanoseconds must not read as no watermark"
+        );
+    }
+
+    #[test]
+    fn test_temporal_scalar_as_nanos_reads_null_and_empty_as_no_watermark() {
+        let null: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]));
+        assert_eq!(
+            temporal_scalar_as_nanos(&null).expect("a null value is not an error"),
+            None
+        );
+
+        let empty: ArrayRef = Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()));
+        assert_eq!(
+            temporal_scalar_as_nanos(&empty).expect("an empty array is not an error"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_normalizes_date_columns() {
+        // Midnight on the day of `FIXED_INSTANT_NANOS`.
+        const DAYS: i32 = 19_675;
+        const MIDNIGHT_NANOS: i64 = DAYS as i64 * 86_400 * 1_000_000_000;
+
+        assert_eq!(
+            max_as_nanos(Arc::new(Date32Array::from(vec![DAYS]))).await,
+            MIDNIGHT_NANOS,
+            "Date32 must normalize to midnight of that day"
+        );
+        assert_eq!(
+            max_as_nanos(Arc::new(Date64Array::from(vec![
+                i64::from(DAYS) * 86_400_000
+            ])))
+            .await,
+            MIDNIGHT_NANOS,
+            "Date64 must normalize to midnight of that day"
         );
     }
 

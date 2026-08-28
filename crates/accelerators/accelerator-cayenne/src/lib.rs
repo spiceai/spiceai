@@ -25,13 +25,18 @@ pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use cayenne::CayennePartitionCreator;
+// The by-name half of the metastore-collision check is shared with the Cayenne catalog
+// connector, so both configuration surfaces refuse the same overlap. The delete-path
+// half — a metastore on disk that no parameter names — stays in this file, beside the
+// teardown it guards.
+use cayenne::metastore_layout::{fs_probe_path, is_local_path, overlapping_metastore_dir};
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -998,189 +1003,6 @@ fn build_workload_profile(
     )
 }
 
-/// Returns true if the path is a local filesystem path (not a remote object store).
-///
-/// Local paths include:
-/// - Absolute paths: `/data/cayenne`
-/// - Relative paths: `./data`
-/// - file:// URIs: `file:///data/cayenne`
-///
-/// Remote paths (S3, etc.) return false.
-fn is_local_path(path: &str) -> bool {
-    !path.contains("://") || path.starts_with("file://")
-}
-
-/// Strip a `file:`/`file://` scheme (including an optional authority such as
-/// `localhost`) so on-disk storage detection receives a real filesystem path.
-/// `resolve_metadata_dir` can return such URIs (since `cayenne_file_path` accepts
-/// them); feeding `file:///x` or `file://localhost/x` into `Path::new` would make
-/// `Auto` storage detection misclassify it as `Unknown`. Returns a borrowed slice
-/// (no owned path), so callers can pass the result directly as `&str`.
-fn fs_probe_path(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("file://") {
-        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
-        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
-        // begins at the first '/'.
-        match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => rest,
-        }
-    } else {
-        path.strip_prefix("file:").unwrap_or(path)
-    }
-}
-
-/// Make a configured Cayenne directory absolute without resolving it, treating it as a
-/// filesystem path unconditionally.
-///
-/// `Err` when the path cannot be placed — a relative path whose `current_dir()` lookup
-/// fails. Everything downstream guards `remove_dir_all`, so a path this cannot place is
-/// a path whose overlap with the metastore is unknown, and the caller must refuse rather
-/// than assume.
-fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
-    let raw = Path::new(fs_probe_path(path));
-    if raw.is_absolute() {
-        Ok(raw.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(raw))
-    }
-}
-
-/// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
-/// object-store location (`s3://…`) — which can never contain the metastore, since
-/// `SQLite`/Turso cannot run on object storage.
-///
-/// The exemption belongs to the data path alone, because it is the data path a recursive
-/// delete walks. It must not be applied to a metadata path: [`is_local_path`] is a
-/// substring test, so a value merely *containing* `://` would be exempted while the
-/// catalog code goes on treating it as the filesystem path it creates `cayenne.db` at —
-/// disabling the guard on a directory that never reached an object store.
-///
-/// `Err`, never the exemption, when the path cannot be placed: the exemption waves the
-/// delete through, so "cannot possibly overlap" and "cannot tell" must stay
-/// distinguishable.
-fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
-    if !is_local_path(path) {
-        return Ok(None);
-    }
-    absolute_dir(path).map(Some)
-}
-
-/// Resolve `absolute` component by component, in the order the filesystem would.
-///
-/// The order is the whole point: `..` names the parent of the directory the preceding
-/// component *resolves to*, not its lexical parent. Collapsing `..` up front and
-/// canonicalizing afterwards gets this backwards — with `link -> /data/subdir`,
-/// `link/../catalog` is `/data/catalog`, but a lexical collapse yields `/catalog` and a
-/// containment check against `/data` then passes something it must refuse. Resolving in
-/// order keeps the accumulated path symlink-free, so `..` may simply pop it.
-///
-/// A component that does not exist yet resolves to itself — neither directory
-/// necessarily exists when this runs at open time. That is the *only* `canonicalize`
-/// failure this absorbs. Any other one (`PermissionDenied`, a transient filesystem
-/// error) means the component could not be resolved, so a symlink may still be
-/// unresolved and the containment check would run against a path the delete never walks;
-/// those propagate, so the caller refuses the delete instead of comparing a lexical
-/// path.
-async fn resolve_in_filesystem_order(absolute: &Path) -> std::io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Prefix(_) | Component::RootDir => resolved.push(component),
-            Component::Normal(name) => {
-                resolved.push(name);
-                match tokio::fs::canonicalize(&resolved).await {
-                    Ok(real) => resolved = real,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    Ok(resolved)
-}
-
-/// Every location a recursive delete of `path` could reach, or `Err` when the path
-/// cannot be resolved.
-///
-/// There is no object-store exemption here: this resolves a *metastore* directory, and
-/// the metastore is only ever local — see [`absolute_data_dir`] for why applying the
-/// exemption to this side disables the guard rather than skipping an impossible case.
-///
-/// Two forms, because a symlink is both a place and a name:
-///
-/// 1. **Fully resolved** — where the directory's contents actually live.
-/// 2. **The entry**: parent resolved, final component left literal. `remove_dir_all`
-///    unlinks the *entry* it walks onto rather than following it, so a metastore
-///    directory whose own last component is a symlink pointing out of the tree still
-///    loses its link — the catalog file survives with nothing naming it, and the
-///    connection pool keeps writing through handles nothing can reopen.
-async fn overlap_candidates(path: &str) -> std::io::Result<Vec<PathBuf>> {
-    let absolute = absolute_dir(path)?;
-
-    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await?];
-    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
-        let entry = resolve_in_filesystem_order(parent).await?.join(name);
-        if !candidates.contains(&entry) {
-            candidates.push(entry);
-        }
-    }
-    Ok(candidates)
-}
-
-/// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
-/// of `outer` takes `inner` with it. Compares whole components, so `…/meta` does not
-/// read as containing `…/metadata`.
-fn dir_contains(outer: &Path, inner: &Path) -> bool {
-    inner.starts_with(outer)
-}
-
-/// Detect the configuration in which a Cayenne recreate destroys the metastore.
-///
-/// One metastore holds the catalog — manifests, snapshot pointers, partition rows —
-/// for *every* Cayenne dataset sharing a `cayenne_metadata_dir`, and both recreate
-/// paths (`mode: file_create` in [`CayenneAccelerator::init`] and
-/// [`DataAccelerator::drop_table`] for a `file_update` schema rebuild) recursively
-/// delete a single dataset's data directory. When the metastore directory resolves
-/// onto or beneath that data directory the delete unlinks the shared catalog, and
-/// because the connection pool already holds handles to the now-unlinked file the run
-/// appears healthy while the metastore is simply gone on the next restart.
-///
-/// The stock defaults collide on their own for a dataset named `metadata`:
-/// `resolve_default_data_path` yields `{spice_data}/metadata/` and
-/// `resolve_metadata_dir` yields `{spice_data}/metadata`. An explicit
-/// `cayenne_metadata_dir` set beneath the data directory collides the same way.
-///
-/// Returns `Ok(Some((data_dir, metadata_dir)))` — resolved — when they overlap, naming
-/// whichever metastore location the delete would reach; `Ok(None)` when they provably
-/// cannot overlap — the data path is on object storage; and `Err` when either path
-/// cannot be resolved, which the caller must treat as a refusal rather than as `Ok(None)`.
-///
-/// The data directory is compared in its fully resolved form only, because that is where
-/// the recursive walk happens: `remove_dir_all` unlinks a final-component symlink rather
-/// than descending it (pinned by
-/// `remove_dir_all_unlinks_a_symlink_rather_than_descending_it`), so nothing beneath the
-/// target is deleted. What the unlink does cost is every *name* under the alias, and a
-/// metastore configured through one is not compared here — #13465.
-async fn overlapping_metastore_dir(
-    data_dir: &str,
-    metadata_dir: &str,
-) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
-    let Some(absolute_data) = absolute_data_dir(data_dir)? else {
-        return Ok(None);
-    };
-    let data = resolve_in_filesystem_order(&absolute_data).await?;
-    Ok(overlap_candidates(metadata_dir)
-        .await?
-        .into_iter()
-        .find(|candidate| dir_contains(&data, candidate))
-        .map(|metadata| (data, metadata)))
-}
-
 /// The `SQLite`/Turso database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
 const METASTORE_DB_FILE: &str = "cayenne.db";
@@ -1340,15 +1162,25 @@ static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl CayenneAccelerator {
-    /// Builds the engine with the footer-cache size the runtime published.
-    ///
-    /// This is the constructor the registration slice calls, and it takes no arguments,
-    /// which is why the setting arrives through
-    /// [`runtime_acceleration::memory_budget::publish_cayenne_footer_cache_mb`] rather
-    /// than as a parameter.
+    /// Builds the engine with no footer cache configured.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_footer_cache_mb(runtime_acceleration::memory_budget::cayenne_footer_cache_mb())
+        Self::with_footer_cache_mb(None)
+    }
+
+    /// Builds the engine for the `Runtime` whose settings these are.
+    ///
+    /// Total: the registration extracts this engine's own settings from the shared enum, so
+    /// by the time they reach here there is nothing left to reject.
+    #[must_use]
+    pub fn from_runtime_config(config: &data_accelerator_api::CayenneRuntimeConfig) -> Self {
+        Self::with_footer_cache_mb(config.footer_cache_mb)
+    }
+
+    /// The footer-cache size this engine was configured with.
+    #[must_use]
+    pub fn footer_cache_mb(&self) -> Option<usize> {
+        self.footer_cache_mb
     }
 
     #[must_use]
@@ -4486,11 +4318,14 @@ fn serialize_partition_child_writes(
     config.write_concurrency = Some(1);
 }
 
-data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
+data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Exercised only by the tests below; the delete-path guard reaches it through
+    // `overlapping_metastore_dir` rather than calling it directly.
+    use cayenne::metastore_layout::absolute_data_dir;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;
 
@@ -5051,6 +4886,107 @@ mod tests {
         assert!(dims.contains(&1536));
     }
 
+    /// The footer-cache size reaches the engine as a constructor argument, so it belongs
+    /// to the `Runtime` that supplied it.
+    ///
+    /// `usize::MAX` is asserted because `runtime.params.cayenne_footer_cache_mb` accepts
+    /// `max`: the largest cache an operator can ask for must arrive as written, and every
+    /// value in the range has to be distinguishable from an absent one.
+    #[test]
+    fn the_footer_cache_size_comes_from_the_runtime_config() {
+        use data_accelerator_api::CayenneRuntimeConfig;
+
+        let configured = |mb| {
+            CayenneAccelerator::from_runtime_config(&CayenneRuntimeConfig {
+                footer_cache_mb: mb,
+            })
+            .footer_cache_mb
+        };
+
+        assert_eq!(configured(Some(256)), Some(256));
+        assert_eq!(
+            configured(Some(0)),
+            Some(0),
+            "no footer cache at all is a real setting, distinct from an absent one"
+        );
+        assert_eq!(
+            configured(Some(usize::MAX)),
+            Some(usize::MAX),
+            "`cayenne_footer_cache_mb: max` must reach the engine as the operator wrote it"
+        );
+        assert_eq!(configured(None), None);
+
+        // Two `Runtime`s in one process configure independently: the value travels with
+        // the engine instance, so there is nothing for a concurrent build to overwrite.
+        assert_eq!(configured(Some(64)), Some(64));
+        assert_eq!(CayenneAccelerator::new().footer_cache_mb, None);
+    }
+
+    /// The registration the slice carries must be the *configured* form.
+    ///
+    /// Calling `from_runtime_config` directly cannot show this: the simple form of
+    /// `register_data_accelerator!` ignores its argument, so registering through it would
+    /// build the engine with `new()` and drop the operator's setting while every direct
+    /// test stayed green. This goes through the constructor the slice actually holds.
+    #[test]
+    fn the_registered_constructor_forwards_the_runtime_config() {
+        use data_accelerator_api::{
+            AcceleratorRuntimeConfig, CayenneRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS,
+        };
+
+        let registration = DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == Engine::Cayenne)
+            .expect("this crate registers the Cayenne engine");
+
+        let built =
+            (registration.constructor)(&AcceleratorRuntimeConfig::Cayenne(CayenneRuntimeConfig {
+                footer_cache_mb: Some(321),
+            }))
+            .expect("the Cayenne registration accepts Cayenne configuration");
+        let cayenne = built
+            .as_any()
+            .downcast_ref::<CayenneAccelerator>()
+            .expect("the Cayenne registration builds a CayenneAccelerator");
+
+        assert_eq!(
+            cayenne.footer_cache_mb(),
+            Some(321),
+            "the registered constructor must pass the runtime config to the engine"
+        );
+    }
+
+    /// Another engine's settings are refused rather than quietly treated as absent.
+    ///
+    /// The registration slice stores one function type for every engine, so this mismatch
+    /// cannot be a compile error; `register_all` and `build_with_defaults` both choose the
+    /// settings by engine, which is what keeps it from arising. This pins the remaining
+    /// behaviour of the case they prevent.
+    #[test]
+    fn another_engines_configuration_is_refused() {
+        use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
+
+        let registration = DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == Engine::Cayenne)
+            .expect("this crate registers the Cayenne engine");
+
+        let error = (registration.constructor)(&AcceleratorRuntimeConfig::DuckDB)
+            .err()
+            .expect("Cayenne must refuse DuckDB configuration rather than build from it");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("cayenne") && message.contains("duckdb"),
+            "the error must name both engines, got: {message}"
+        );
+
+        // Its own settings still build, so the refusal is about the mismatch and not about
+        // the engine being unbuildable.
+        (registration.constructor)(&AcceleratorRuntimeConfig::default_for(Engine::Cayenne))
+            .expect("the engine must still build from its own configuration");
+    }
+
     /// The write profile is the engine's answer about its *own* acceleration, so an
     /// acceleration naming another engine must get `None` rather than a Cayenne
     /// classification. The runtime filters by engine before asking, so only this test
@@ -5224,50 +5160,6 @@ mod tests {
             }
             other => panic!("expected UnsupportedDataTypes error, got: {other}"),
         }
-    }
-
-    #[test]
-    fn test_is_local_path() {
-        // Local absolute paths
-        assert!(is_local_path("/data/cayenne"));
-        assert!(is_local_path("/var/spice/data"));
-
-        // Local relative paths
-        assert!(is_local_path("./data"));
-        assert!(is_local_path("data/cayenne"));
-
-        // file:// URIs are local
-        assert!(is_local_path("file:///data/cayenne"));
-        assert!(is_local_path("file://localhost/data"));
-
-        // S3 paths are NOT local
-        assert!(!is_local_path("s3://bucket/prefix"));
-        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
-
-        // Other remote schemes are NOT local
-        assert!(!is_local_path("gs://bucket/prefix"));
-        assert!(!is_local_path("az://container/blob"));
-    }
-
-    #[test]
-    fn test_fs_probe_path_strips_file_scheme() {
-        // file:// URIs are reduced to their filesystem path for storage detection.
-        assert_eq!(
-            fs_probe_path("file:///data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
-        // An explicit authority (e.g. localhost) is dropped down to the path.
-        assert_eq!(
-            fs_probe_path("file://localhost/data/cayenne"),
-            "/data/cayenne"
-        );
-        // Plain paths pass through unchanged.
-        assert_eq!(
-            fs_probe_path("/data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
     }
 
     #[test]
