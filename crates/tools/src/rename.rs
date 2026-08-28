@@ -36,9 +36,14 @@ pub fn with_name(tool: &Arc<dyn SpiceModelTool>, name: &str) -> Arc<dyn SpiceMod
 /// Every method other than [`SpiceModelTool::name`] must forward to the wrapped
 /// tool. Inheriting a trait default here answers for the inner tool with the
 /// trait's fallback instead of the inner tool's real value, which compiles
-/// cleanly and is wrong at runtime; `renamed_tool_forwards_every_method`
-/// pins the forwarding so a method added to the trait fails a test here rather
-/// than silently defaulting.
+/// cleanly and is wrong at runtime.
+///
+/// `assert_answers_for_inner` holds that for the methods [`SpiceModelTool`]
+/// exposes today, and cannot hold it for one added later: a new method with a
+/// default impl is inherited here, asserted by nothing, and the test still
+/// passes. Adding a method to the trait therefore means forwarding it here and
+/// extending that helper — which is why the requirement is also recorded on
+/// the trait, where someone adding one would be looking.
 struct RenamedTool {
     name: String,
     tool: Arc<dyn SpiceModelTool>,
@@ -151,12 +156,14 @@ mod tests {
         }
     }
 
-    /// Assert `renamed` answers for `inner` on every method of the trait but
-    /// [`SpiceModelTool::name`].
+    /// Assert `renamed` answers for `inner` on every method [`SpiceModelTool`]
+    /// exposes today, other than [`SpiceModelTool::name`].
     ///
-    /// Kept in one place deliberately: a method added to [`SpiceModelTool`] has
-    /// to be forwarded for every wrapping shape at once, so it should have to be
-    /// asserted in only one.
+    /// This records the current trait surface; it does not grow with it. A
+    /// method added to the trait is inherited by the wrapper and checked by
+    /// nothing below, so extend this whenever the trait gains one. Keeping the
+    /// per-method assertions here rather than in each test is what makes that a
+    /// single edit instead of one per wrapping shape.
     async fn assert_answers_for_inner(
         renamed: &Arc<dyn SpiceModelTool>,
         inner: &Arc<dyn SpiceModelTool>,
