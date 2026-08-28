@@ -1001,16 +1001,22 @@ impl Runtime {
         // hot-swap (`SnapshotManager::restore_indexes_from_snapshot`, matching by
         // `Index::snapshot_identity()`) — applied once here, for the index's first
         // (cold-bootstrap) generation. See #7557.
+        let mut index_restore_failure: Option<String> = None;
         if let BootstrapStatus::Bootstrapped(info) = &bootstrap_status
             && !info.index_snapshots.is_empty()
             && let Some(table_provider) = federated_table.try_table_provider_sync()
             && let Some(acceleration_settings) = ds.acceleration.as_ref()
         {
+            // `LayerWalk::Index` also steps into a router's secondary stack, so a table with
+            // indexes attached at more than one layer (e.g. both vector and full-text search
+            // indexes) must have every layer's indexes collected here, not just the first.
+            let mut seen_indexes = std::collections::HashSet::new();
             let indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> =
                 spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
-                    .find(|node| !node.indexes().is_empty())
-                    .map(|node| node.indexes().to_vec())
-                    .unwrap_or_default();
+                    .flat_map(spice_table::SpiceTable::indexes)
+                    .filter(|index| seen_indexes.insert(Arc::as_ptr(index).cast::<()>()))
+                    .cloned()
+                    .collect();
             if !indexes.is_empty()
                 && let Ok(layout) = data_accelerator_api::get_acceleration_layout(
                     ds.as_ref(),
@@ -1032,10 +1038,19 @@ impl Runtime {
                     .restore_indexes_from_snapshot(&info.index_snapshots)
                     .await
                 {
+                    // A restored dataset with `refresh_mode: full` and no `refresh_check_interval`
+                    // takes `NextRefresh::Disabled` on startup, so nothing will rebuild this index
+                    // on its own. Surface the degraded status below rather than registering as
+                    // fully Ready with a silently empty or partial index.
+                    index_restore_failure = Some(format!(
+                        "Failed to restore the full-text search index for dataset '{}' from its snapshot: {error}. \
+                        Search results may be empty or incomplete until the index is rebuilt by a refresh.",
+                        ds.name
+                    ));
                     tracing::warn!(
                         dataset = %ds.name,
                         error = %error,
-                        "Failed to restore a snapshotted index; it will rebuild from the restored dataset"
+                        "Failed to restore a snapshotted index; search results may be empty or incomplete until the index is rebuilt by a refresh"
                     );
                 }
             }
@@ -1110,7 +1125,7 @@ impl Runtime {
                 );
                 metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
-                if let Some(message) = schema_change_failure {
+                if let Some(message) = schema_change_failure.or(index_restore_failure) {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(message),
