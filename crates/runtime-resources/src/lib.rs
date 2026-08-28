@@ -53,36 +53,134 @@ fn get_container_memory_limit() -> Option<u64> {
     telemetry::hardware::cgroup_memory_limit()
 }
 
+/// This process's resident memory, split by what the kernel can reclaim.
+///
+/// The split is the whole point. A cgroup counts file-backed pages toward
+/// `memory.max` but reclaims them under pressure; anonymous memory it cannot
+/// reclaim, so anonymous is what gets a pod OOM-killed. On a Cayenne file-mode
+/// workload roughly half of total RSS has been measured as file-backed — mapped
+/// `SQLite` metastore pages and Vortex data files — so a total-only figure both
+/// oversizes the pod and buries the growth that matters: the anonymous half can
+/// climb a gigabyte while the total barely moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentMemory {
+    /// Total resident set size. `RssAnon + RssFile + RssShmem` on Linux, so
+    /// [`Self::anon`] and [`Self::file`] sum to slightly less than this whenever
+    /// the process maps shared memory (usually none).
+    pub total: u64,
+    /// Anonymous resident bytes: heap, stacks, and other pages with no backing
+    /// file. Not reclaimable, and therefore the figure to alert on and the one a
+    /// heap profiler can attribute.
+    pub anon: u64,
+    /// File-backed resident bytes: mapped files and page cache the kernel will
+    /// evict on demand. Real RSS, invisible to every heap profiler, and NOT a
+    /// leak.
+    pub file: u64,
+}
+
 /// Resident set size of this process in bytes, or `None` where unavailable.
 ///
-/// On Linux, reads `VmRSS` from `/proc/self/status` — one small read, reported
-/// in kB and scaled to bytes here. Constructing a sysinfo `System` per sample
-/// (as the load-time memory warning does) refreshes far more state than a gauge
-/// needs, so that path is the off-Linux fallback only; `sysinfo::Process::memory`
-/// returns bytes, so both arms agree on the unit.
-///
-/// This blocks (filesystem read), so async callers must run it on the blocking
-/// pool rather than a runtime worker.
+/// The total half of [`process_resident_memory`], kept as its own entry point
+/// for callers that only report the sum.
 #[must_use]
 pub fn process_resident_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let kb: u64 = status
+    process_resident_memory().map(|memory| memory.total)
+}
+
+/// Parse `VmRSS`, `RssAnon`, and `RssFile` out of `/proc/self/status` contents.
+///
+/// Split from the read so the unit conversion and the missing-field behaviour
+/// are testable on any host: the values are reported in kB and every consumer
+/// wants bytes, which is exactly the kind of factor-of-1024 error that survives
+/// review and then misreads a footprint by three orders of magnitude.
+///
+/// `RssAnon`/`RssFile` postdate `VmRSS` (Linux 4.5). On an older kernel the
+/// total is still reported and the split reads zero, rather than the whole
+/// sample failing and taking the total with it.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_status_resident(status: &str) -> Option<ResidentMemory> {
+    let field = |name: &str| -> Option<u64> {
+        status
             .lines()
-            .find(|l| l.starts_with("VmRSS:"))?
+            .find(|line| line.starts_with(name))?
             .split_whitespace()
             .nth(1)?
-            .parse()
-            .ok()?;
-        Some(kb.saturating_mul(1024))
-    }
-    #[cfg(not(target_os = "linux"))]
+            .parse::<u64>()
+            .ok()
+            .map(|kb| kb.saturating_mul(1024))
+    };
+    Some(ResidentMemory {
+        total: field("VmRSS:")?,
+        anon: field("RssAnon:").unwrap_or(0),
+        file: field("RssFile:").unwrap_or(0),
+    })
+}
+
+/// This process's resident memory split into anonymous and file-backed, or
+/// `None` where unavailable.
+///
+/// On Linux this is one read of `/proc/self/status`: `VmRSS`, `RssAnon`, and
+/// `RssFile` are adjacent lines (present since Linux 4.5), so the split costs
+/// only the extra parse. `/proc/self/smaps_rollup` would break it down further
+/// but is materially more expensive to read, and these three separate the two
+/// cases that matter.
+///
+/// On macOS it is one `task_info(TASK_VM_INFO)` syscall, which is also what
+/// `vmmap` reports from — cheaper than the `sysinfo::System` this used to build
+/// per sample, and more informative.
+///
+/// This blocks (a filesystem read on Linux), so async callers must run it on the
+/// blocking pool rather than a runtime worker.
+#[must_use]
+pub fn process_resident_memory() -> Option<ResidentMemory> {
+    #[cfg(target_os = "linux")]
     {
+        parse_proc_status_resident(&std::fs::read_to_string("/proc/self/status").ok()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem::size_of;
+
+        let mut info = mach2::task_info::task_vm_info::default();
+        let mut count = u32::try_from(
+            size_of::<mach2::task_info::task_vm_info>() / size_of::<mach2::vm_types::natural_t>(),
+        )
+        .ok()?;
+        // SAFETY: `task_info` writes at most `count` `natural_t`-sized words into
+        // the buffer, and `count` is derived from the size of that exact struct.
+        // `mach_task_self` is always a valid task port for this process.
+        let status = unsafe {
+            mach2::task::task_info(
+                mach2::traps::mach_task_self(),
+                mach2::task_info::TASK_VM_INFO,
+                std::ptr::from_mut(&mut info).cast(),
+                &raw mut count,
+            )
+        };
+        if status != mach2::kern_return::KERN_SUCCESS {
+            return None;
+        }
+        Some(ResidentMemory {
+            total: info.resident_size,
+            // `internal` is anonymous and `external` file-backed, the same split
+            // `vmmap -summary` prints.
+            anon: info.internal,
+            file: info.external,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No portable split; report the total and leave the halves at zero so a
+        // consumer sees "unsplit" rather than a fabricated attribution.
         let mut system = System::new();
         let pid = sysinfo::Pid::from_u32(std::process::id());
         system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        system.process(pid).map(sysinfo::Process::memory)
+        let total = system.process(pid).map(sysinfo::Process::memory)?;
+        Some(ResidentMemory {
+            total,
+            anon: 0,
+            file: 0,
+        })
     }
 }
 
@@ -211,5 +309,79 @@ impl ResourceMonitor {
 impl Default for ResourceMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResidentMemory, parse_proc_status_resident, process_resident_memory};
+
+    /// A real `/proc/self/status` excerpt, in the order and units the kernel
+    /// writes them.
+    const STATUS: &str = "\
+Name:\tspiced
+VmPeak:\t 6291456 kB
+VmSize:\t 6291456 kB
+VmRSS:\t  5940216 kB
+RssAnon:\t 2451968 kB
+RssFile:\t 3488248 kB
+RssShmem:\t       0 kB
+Threads:\t32
+";
+
+    /// The kernel reports kB and every consumer wants bytes. A missed factor of
+    /// 1024 reads as a footprint three orders of magnitude off — large enough to
+    /// be obvious in a dashboard, small enough to be believed in a table.
+    #[test]
+    fn the_split_is_parsed_in_bytes_and_sums_to_the_total() {
+        let resident = parse_proc_status_resident(STATUS).expect("VmRSS is present");
+
+        assert_eq!(resident.total, 5_940_216 * 1024);
+        assert_eq!(resident.anon, 2_451_968 * 1024);
+        assert_eq!(resident.file, 3_488_248 * 1024);
+        // `VmRSS = RssAnon + RssFile + RssShmem`, and shmem is zero here, so the
+        // two halves account for the whole total. A parse that read the wrong
+        // column would still produce plausible-looking numbers but break this.
+        assert_eq!(resident.anon + resident.file, resident.total);
+    }
+
+    /// `RssAnon`/`RssFile` arrived in Linux 4.5. Older kernels must still report
+    /// a total: failing the whole sample would lose the one figure that has
+    /// always been available.
+    #[test]
+    fn a_kernel_without_the_split_still_reports_the_total() {
+        let resident =
+            parse_proc_status_resident("VmRSS:\t  5940216 kB\n").expect("VmRSS alone is enough");
+
+        assert_eq!(
+            resident,
+            ResidentMemory {
+                total: 5_940_216 * 1024,
+                anon: 0,
+                file: 0,
+            }
+        );
+    }
+
+    /// Without `VmRSS` there is no sample to report. Returning zero would enter
+    /// the time series as a process that suddenly uses no memory.
+    #[test]
+    fn a_status_without_vmrss_reports_nothing() {
+        assert!(parse_proc_status_resident("Name:\tspiced\nThreads:\t32\n").is_none());
+        assert!(parse_proc_status_resident("").is_none());
+    }
+
+    /// Exercises the real platform path — the procfs read on Linux, the
+    /// `task_info` syscall on macOS. CI runs Linux, so without this the `unsafe`
+    /// mach block would be compiled but never executed anywhere.
+    #[test]
+    fn the_live_reading_is_plausible() {
+        let resident = process_resident_memory().expect("this process is resident");
+
+        assert!(resident.total > 0, "a running process has resident memory");
+        assert!(
+            resident.anon > 0,
+            "a running process has anonymous memory (heap and stacks)"
+        );
     }
 }

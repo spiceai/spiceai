@@ -116,6 +116,8 @@ const EXPECTED_DATASET_METRICS: &[&str] = &[
 /// `RUSTFLAGS="--cfg tokio_unstable"`, which no Spice build sets.
 const EXPECTED_RUNTIME_GAUGES: &[&str] = &[
     "process_resident_memory_bytes",
+    "process_resident_anon_bytes",
+    "process_resident_file_bytes",
     "query_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_used_bytes",
     "cayenne_compaction_memory_pool_bytes",
@@ -469,6 +471,7 @@ async fn startup_registrations_export_the_process_and_runtime_gauges() {
     let registry = &*PROMETHEUS;
 
     telemetry::track_process_resident_memory_bytes(1_024, &[]);
+    telemetry::track_process_resident_split(640, 384, &[]);
     telemetry::cayenne::track_query_memory_pool_used_bytes(2_048, &[]);
     telemetry::cayenne::track_compaction_memory_pool_used_bytes(4_096, &[]);
     telemetry::cayenne::track_compaction_memory_pool_bytes(8_192, &[]);
@@ -728,9 +731,7 @@ async fn a_cayenne_dataset_reports_its_maintenance_and_footprint_families() {
 /// The table label is part of the key because the registry is shared across the
 /// tests in this file, so a sibling fixture's series must not satisfy an
 /// assertion about this one.
-fn compaction_outcomes(
-    registry: &prometheus::Registry,
-) -> HashMap<(String, String, String), f64> {
+fn compaction_outcomes(registry: &prometheus::Registry) -> HashMap<(String, String, String), f64> {
     registry
         .gather()
         .iter()

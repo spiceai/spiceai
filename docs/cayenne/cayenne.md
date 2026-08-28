@@ -1469,7 +1469,11 @@ The per-event counters (`cayenne_pk_index_discard_total` / `_preserved_total`, `
 
 ## Closing the resident-memory gap
 
-`process_resident_memory_bytes` describes fact; budgets and pool gauges describe intent. The gap between them is off-pool or unaccounted memory — and until it can be decomposed, a pod using far more RAM than its pool gauge admits is an unfalsifiable mystery. These gauges are what the gap is closed against.
+Budgets and pool gauges describe intent; resident memory describes fact. Until the gap can be decomposed, a pod using far more RAM than its pool gauge admits is an unfalsifiable mystery. These gauges are what the gap is closed against.
+
+**Take the gap against `process_resident_anon_bytes`, not against the total.** `process_resident_memory_bytes` includes file-backed pages — mapped metastore and Vortex files — which the kernel reclaims on demand and which no heap profiler can see. On a Cayenne file-mode workload that half has been measured at roughly half of total RSS, so the total overstates the instrumentation gap by more than a factor of two. `process_resident_file_bytes` is that half; it is real RSS and it is not a leak.
+
+Neither figure is the pod-sizing number: the kernel OOM-kills on cgroup accounting, which also charges kernel memory (slab, page tables, socket buffers) that no per-process metric sees. Use `container_memory_working_set_bytes` for capacity; this family is for attributing memory to what allocated it.
 
 **What Cayenne accounts for, and whether it lands.** Two gauges, and their relationship is the whole diagnosis:
 

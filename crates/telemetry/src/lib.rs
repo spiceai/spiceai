@@ -344,10 +344,68 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
 }
 
 static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static PROCESS_RESIDENT_ANON_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static PROCESS_RESIDENT_FILE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
-/// Records the process's resident set size — the number the kernel's OOM
-/// decision is made on. Budgets and pool gauges describe intent; this describes
-/// fact, and the gap between them is the off-pool/unaccounted memory.
+/// Records the process's resident memory split into anonymous and file-backed.
+///
+/// Separate metric names rather than a `kind` label on
+/// `process_resident_memory_bytes`: that gauge is published unlabelled as the
+/// total, so adding labelled series to the same family would make a bare
+/// `sum()` count the total AND its own halves.
+///
+/// **Anonymous is the one to watch.** It is the half that cannot be reclaimed,
+/// the half a heap profiler can attribute, and the half that gets a pod killed —
+/// and it moves independently of the total: measured on a Cayenne file-mode
+/// refresh workload, anonymous grew 1.4 GiB between two samples while
+/// file-backed did not move at all. Watching the sum hid that entirely.
+///
+/// On Linux `anon + file` can fall slightly below the total, which is
+/// `RssAnon + RssFile + RssShmem`; the remainder is shared memory, usually none.
+pub fn track_process_resident_split(anon: u64, file: u64, dimensions: &[KeyValue]) {
+    record_via_cached(
+        &PROCESS_RESIDENT_ANON_BYTES,
+        || {
+            global::meter("process")
+                .u64_gauge("process_resident_anon_bytes")
+                .with_description(
+                    "Anonymous resident bytes: heap and stacks, which the kernel cannot reclaim. The half of RSS that grows, that a profiler can attribute, and that triggers an OOM kill.",
+                )
+                .with_unit("By")
+                .build()
+        },
+        |gauge| gauge.record(anon, dimensions),
+    );
+    record_via_cached(
+        &PROCESS_RESIDENT_FILE_BYTES,
+        || {
+            global::meter("process")
+                .u64_gauge("process_resident_file_bytes")
+                .with_description(
+                    "File-backed resident bytes: mapped files and page cache the kernel evicts on demand. Real RSS, invisible to heap profilers, and not a leak.",
+                )
+                .with_unit("By")
+                .build()
+        },
+        |gauge| gauge.record(file, dimensions),
+    );
+}
+
+/// Records the process's total resident set size.
+///
+/// Budgets and pool gauges describe intent; this describes fact. But the gap
+/// between them is NOT all unaccounted memory: on a Cayenne file-mode workload
+/// roughly half of this figure has been measured as file-backed pages the kernel
+/// reclaims on demand — mapped metastore and Vortex files, real RSS, invisible
+/// to every heap profiler, and not a leak. Take the gap against
+/// `process_resident_anon_bytes` instead; the difference between anon and this
+/// total is page cache.
+///
+/// Nor is this the number a pod is killed on. The kernel OOM-kills on cgroup
+/// accounting, which also charges kernel memory (slab, page tables, socket
+/// buffers) that no per-process figure sees. For capacity planning use the
+/// cgroup's own `container_memory_working_set_bytes`; this family is for
+/// attributing memory to the process that allocated it.
 ///
 /// Resident memory is operator observability, not product-usage telemetry, so
 /// this binds to the OpenTelemetry **global** provider that `init_metrics`
