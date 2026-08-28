@@ -1721,6 +1721,91 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
     Ok(())
 }
 
+/// The same surviving position as
+/// [`an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed`], but
+/// reached with the acceleration's contents **unproven** rather than observed
+/// empty — the shape a failed probe leaves behind.
+///
+/// `probe_acceleration_contents` never fails the start: a scan it cannot run
+/// returns [`AccelerationContents::Unknown`]. That is not evidence the table
+/// holds rows, so it cannot license the resume — if the probe failed on a table a
+/// recreate had just emptied, resuming on the surviving position would leave every
+/// row below it missing exactly as it would in the case above, and the probe
+/// failure would be the only trace.
+///
+/// Covering it end-to-end is what stops the unsafe mapping from coming back
+/// silently. The decision is a `match` on all three states, so restoring
+/// `Unknown => resume` is a visible edit — but this case is what proves the live
+/// attach path actually reaches that match with the probe's own answer, which no
+/// unit test on the decision function alone can show.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "unprobed", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: records a real position, exactly as the empty-contents case
+    // does — the two differ only in what the rejoin below knows about the table.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "unprobed",
+        &store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    next_envelope(&mut first, "first-start snapshot boundary")
+        .await?
+        .commit()
+        .await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    wait_for_recorded_position(&store, "the first start").await?;
+
+    // Rejoin on the SAME store with the probe's failure answer.
+    let input = input_with_contents(port, "unprobed", &store, AccelerationContents::Unknown);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut rejoined, "first envelope after the failed probe").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an acceleration whose contents could not be read resumed from a position recorded before \
+         it may have been emptied. An unanswered probe is not proof the rows are still here, and \
+         the changes below that position will never be resent"
+    );
+    // Pinned to its own cause, not merely to "some rebuild happened": reporting
+    // this as `empty_with_usable_position` would attribute the rebuild to an
+    // observation nobody made and hide the probe failure worth investigating.
+    let cause = metrics.rebuild_cause();
+    anyhow::ensure!(
+        cause == Some("unproven_contents_with_usable_position"),
+        "the unreadable acceleration was loaded, but not by the arm this case covers: the rebuild \
+         cause was {cause:?}. Only \"unproven_contents_with_usable_position\" says the probe \
+         failed — \"empty_with_usable_position\" would claim the table was seen to be empty"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
 /// an acceleration that holds rows it cannot place must still be rebuilt.
 ///

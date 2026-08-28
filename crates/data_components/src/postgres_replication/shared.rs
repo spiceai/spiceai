@@ -2453,13 +2453,15 @@ async fn attach_member(
     // populate the table leaves no gap, and nothing else loading it makes the
     // rebuild the only thing that will.
     //
-    // Read through `may_be_empty`, not `is_provably_empty`, because inverting the
-    // question inverts which answer is the cautious one. Above, an unproven probe
-    // answering `false` keeps the rebuild; here it would *skip* one — so a probe
-    // that failed after the table was recreated would resume on the surviving
-    // watermark and leave every row below it missing, which is the hole this
-    // whole path exists to close. Only a positive `NonEmpty` licenses the resume.
-    let emptiness_implies_gap = params.acceleration.may_be_empty() && !snapshotting;
+    // Passed as the observed state, not as `is_provably_empty()`, because
+    // inverting the question inverts which answer is the cautious one. Above, an
+    // unproven probe answering `false` keeps the rebuild; here `false` would
+    // *skip* one — so a probe that failed after the table was recreated would
+    // resume on the surviving watermark and leave every row below it missing,
+    // which is the hole this whole path exists to close. Only a positive
+    // `NonEmpty` licenses the resume, and `rebuild_cause` reports `Empty` and
+    // `Unknown` as the different events they are.
+    let contents_implying_gap = (!snapshotting).then_some(params.acceleration);
     // The floor passed here is the one the member was *actually* seated at above,
     // not the snapshot `setup` was built from — see the registration comment for
     // why the difference is a silent skip rather than a rounding error.
@@ -2469,7 +2471,7 @@ async fn attach_member(
         setup.slot_restart_lsn,
         setup.slot.consistent_lsn.max(seated_floor),
         !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
-        emptiness_implies_gap,
+        contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();
     // A rebuild is a full re-read nobody asked for, and which cause fired is what

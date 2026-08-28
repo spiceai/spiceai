@@ -2743,9 +2743,11 @@ fn accelerator_df(
 /// [`AccelerationContents`].
 ///
 /// Never returns an error: a probe that cannot answer returns
-/// [`AccelerationContents::Unknown`], which callers must treat as
-/// [`AccelerationContents::NonEmpty`]. Failing to read the acceleration is
-/// grounds for doing the safe, expensive thing, not for skipping it.
+/// [`AccelerationContents::Unknown`], which is never proof of anything. Failing
+/// to read the acceleration is grounds for doing the safe, expensive thing, not
+/// for skipping it — but which observed state that coincides with depends on the
+/// direction the caller reads emptiness in, so callers match on the variant
+/// rather than assuming it stands in for one. See [`AccelerationContents`].
 ///
 /// Called once per dataset while the accelerated table is being registered,
 /// before its changes stream starts, so the answer cannot be raced by the CDC
@@ -2784,8 +2786,13 @@ pub async fn probe_acceleration_contents(
             // the rebuild in both: a caller reading emptiness as licence to skip
             // work treats this as populated, and one reading it as evidence of a
             // gap treats it as possibly empty. See `AccelerationContents`.
+            // States the probe's own result, not an outcome: this is the generic
+            // entry point for every CDC connector, several of which do not consult
+            // the answer at all, and even PostgreSQL may load the dataset through
+            // a snapshot instead — so what the unread result actually costs is the
+            // connector's to decide and to report.
             tracing::debug!(
-                "Dataset {dataset_name}: could not read the acceleration to check whether it is empty, so it will be rebuilt rather than resumed: {e}"
+                "Dataset {dataset_name}: could not read the acceleration to check whether it holds any rows, so it is treated as unproven: {e}"
             );
             AccelerationContents::Unknown
         }
