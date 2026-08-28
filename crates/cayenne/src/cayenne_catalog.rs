@@ -836,20 +836,16 @@ impl CayenneCatalog {
         }
 
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
-        // Drop the merged-away inputs' non-authoritative manifest rows in the SAME
-        // transaction as the roster swap. Subset merge rewrites `P_new` into its own
-        // directory and holds no in-place reference to the inputs' files, so deleting
-        // the inputs' `cayenne_snapshot_file` rows here cannot orphan a file `P_new`
-        // still points at. The physical `.vortex` dirs are reclaimed LATER via
-        // retire+sweep (reader-scoped), but the manifest rows are non-authoritative
-        // (scans list the snapshot directory, not the manifest), so no in-flight
-        // reader needs them; deleting them at commit stops an unbounded metastore
-        // leak on subset-merge-dominated CDC tables whose current snapshot never
-        // rotates and so never hits the full-rewrite prune.
+        // Drop the merged-away inputs' non-authoritative cached rows in the SAME
+        // transaction as the roster swap: the `cayenne_snapshot_file` manifest and
+        // the `cayenne_snapshot_file_statistics` per-file stats cache. The physical
+        // `.vortex` dirs are reclaimed LATER via retire+sweep.
         let batch_sql = format!(
             "DELETE FROM cayenne_snapshot_sequence \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              DELETE FROM cayenne_snapshot_file \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             DELETE FROM cayenne_snapshot_file_statistics \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              INSERT OR REPLACE INTO cayenne_snapshot_sequence \
                 (table_id, snapshot_id, sequence_number) \
@@ -8193,12 +8189,14 @@ mod tests {
     }
 
     /// Regression: protected-snapshot subset compaction must delete the
-    /// merged-away inputs' `cayenne_snapshot_file` (manifest) rows in the SAME
-    /// transaction as the roster swap. Before the fix the swap deleted only the
-    /// inputs' `cayenne_snapshot_sequence` rows and left their manifest rows to
-    /// leak until an unrelated full rewrite pruned them.
+    /// merged-away inputs' non-authoritative cached rows — both the
+    /// `cayenne_snapshot_file` manifest and the `cayenne_snapshot_file_statistics`
+    /// per-file stats cache — in the SAME transaction as the roster swap. Before
+    /// the fix the swap deleted only the inputs' `cayenne_snapshot_sequence` rows
+    /// and left both cached tables to leak until an unrelated full rewrite pruned
+    /// them.
     #[tokio::test]
-    async fn test_swap_protected_snapshots_deletes_merged_away_manifest_rows() {
+    async fn test_swap_protected_snapshots_deletes_merged_away_cached_rows() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_protected_swap_manifest_gc_{}.db",
@@ -8242,6 +8240,17 @@ mod tests {
             digest: None,
         };
 
+        // The per-file stats cache (`cayenne_snapshot_file_statistics`) is the
+        // sibling of the manifest and leaks on the same path, so seed it in lockstep.
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![1, 2, 3],
+        };
+
         for (snapshot_id, path, seq) in [
             (&input_a, "a.vortex", 1),
             (&input_b, "b.vortex", 2),
@@ -8252,6 +8261,10 @@ mod tests {
                 .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
                 .await
                 .expect("seed manifest row");
+            catalog
+                .upsert_snapshot_file_statistics(&seed_stats(snapshot_id, path))
+                .await
+                .expect("seed stats-cache row");
         }
         // `p_new` is placed on the roster by the swap itself, so it is not seeded here.
         for (snapshot_id, seq) in [(&input_a, 1), (&input_b, 2), (&survivor, 3)] {
@@ -8309,6 +8322,41 @@ mod tests {
             "a snapshot outside the merge set must be untouched"
         );
         assert_eq!(survivor_files[0].file_path, "s.vortex");
+
+        // The stats cache follows the manifest: the inputs' rows are gone, and the
+        // rewrite output's and the survivor's rows remain.
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_a, "a.vortex")
+                .await
+                .expect("read stats cache")
+                .is_none(),
+            "input_a stats-cache rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_b, "b.vortex")
+                .await
+                .expect("read stats cache")
+                .is_none(),
+            "input_b stats-cache rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &p_new, "p_new.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "the rewrite output's stats-cache rows must remain"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &survivor, "s.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "a snapshot outside the merge set must keep its stats-cache rows"
+        );
 
         // Roster invariant preserved: inputs off, survivor and p_new on.
         let sequences = catalog
@@ -8440,6 +8488,130 @@ mod tests {
                 .expect("read stats")
                 .is_some(),
             "a snapshot outside the emptied set must keep its stats-cache rows"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression: the merged-away-row deletes must stay INSIDE the CAS guard.
+    /// When one input is no longer active — a concurrent compaction already
+    /// consumed it — the swap must return `false` and mutate nothing: it must
+    /// not delete the still-active input's manifest or stats-cache rows, must
+    /// leave every roster row in place, and must not add the output snapshot to
+    /// the roster. This guards against a future reordering of the deletes ahead
+    /// of the guard, which would reintroduce the data loss the guard prevents.
+    #[tokio::test]
+    async fn test_swap_protected_snapshots_failed_cas_deletes_nothing() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_protected_swap_failed_cas_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "protected_swap_failed_cas".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // The swap is asked to fold `input_a` + `input_b` into `p_new`, but
+        // `input_b` is no longer active: a concurrent compaction already
+        // consumed it, so it is absent from the roster. `input_a` is still
+        // active with its manifest and stats-cache rows. The CAS must abort.
+        let input_a = uuid::Uuid::now_v7().to_string();
+        let input_b = uuid::Uuid::now_v7().to_string();
+        let p_new = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![1, 2, 3],
+        };
+
+        catalog
+            .upsert_snapshot_file(&seed_file(&input_a, "a.vortex", 1))
+            .await
+            .expect("seed manifest row");
+        catalog
+            .upsert_snapshot_file_statistics(&seed_stats(&input_a, "a.vortex"))
+            .await
+            .expect("seed stats-cache row");
+        catalog
+            .set_snapshot_sequence(&table_id, &input_a, 1)
+            .await
+            .expect("seed roster row");
+
+        let swapped = catalog
+            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .await
+            .expect("swap protected snapshots");
+        assert!(
+            !swapped,
+            "the CAS must abort when an input is no longer active"
+        );
+
+        // The still-active input's cached rows survive: the failed CAS deleted
+        // nothing.
+        assert_eq!(
+            catalog
+                .get_snapshot_files(&table_id, &input_a)
+                .await
+                .expect("read manifest")
+                .len(),
+            1,
+            "a failed CAS must not delete the still-active input's manifest rows"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_a, "a.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "a failed CAS must not delete the still-active input's stats-cache rows"
+        );
+
+        // The roster is unchanged: the input stays on, and the output is not
+        // added.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read roster");
+        assert_eq!(
+            sequences.get(&input_a),
+            Some(&1),
+            "a failed CAS must leave the still-active input on the roster"
+        );
+        assert!(
+            !sequences.contains_key(&p_new),
+            "a failed CAS must not add the output snapshot to the roster"
         );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
