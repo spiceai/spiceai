@@ -117,13 +117,31 @@ pub enum AccelerationContents {
 impl AccelerationContents {
     /// Whether the acceleration is *proven* to hold no rows.
     ///
-    /// The only safe direction to read this type in: everything that is not a
-    /// positive proof of emptiness — including [`Self::Unknown`] — answers
-    /// `false`, so a failed probe degrades to the conservative behavior instead
-    /// of silently skipping work that protects correctness.
+    /// The safe direction for a caller that reads emptiness as licence to skip
+    /// work: everything that is not a positive proof of emptiness — including
+    /// [`Self::Unknown`] — answers `false`, so a failed probe degrades to the
+    /// conservative behavior instead of silently skipping work that protects
+    /// correctness. A caller that instead reads emptiness as *evidence of a gap*
+    /// wants [`Self::may_be_empty`], where the cautious answer is the other one.
     #[must_use]
     pub fn is_provably_empty(self) -> bool {
         matches!(self, Self::Empty)
+    }
+
+    /// Whether the acceleration might hold no rows.
+    ///
+    /// The safe direction for a caller that reads emptiness as *evidence of a
+    /// gap* rather than as licence to skip work, which inverts which answer is
+    /// the cautious one. [`Self::is_provably_empty`] answers `false` for
+    /// [`Self::Unknown`], and `false` is conservative only where it means "do
+    /// the expensive thing"; where `false` means "resume", a failed probe would
+    /// resume onto a table that may have been recreated and leave every row
+    /// below the recorded position missing for good. So an unproven probe
+    /// answers `true` here, and only a positive observation of [`Self::NonEmpty`]
+    /// licenses the resume.
+    #[must_use]
+    pub fn may_be_empty(self) -> bool {
+        !matches!(self, Self::NonEmpty)
     }
 }
 
@@ -2249,6 +2267,34 @@ mod deferred_tests {
             !AccelerationContents::default().is_provably_empty(),
             "the default must be the conservative answer, so a caller that never probes cannot \
              accidentally opt out of the rebuild"
+        );
+    }
+
+    /// The mirror of the test above, for the caller that reads emptiness as
+    /// evidence of a gap. There `false` is what skips the rebuild, so the two
+    /// accessors have to disagree about `Unknown` — an unanswered probe is not
+    /// proof of emptiness, but it is not proof of the rows either, and only the
+    /// latter may license a resume.
+    #[test]
+    fn only_an_observed_non_empty_acceleration_rules_out_emptiness() {
+        assert!(AccelerationContents::Empty.may_be_empty());
+        assert!(!AccelerationContents::NonEmpty.may_be_empty());
+        assert!(
+            AccelerationContents::Unknown.may_be_empty(),
+            "an unanswered probe cannot license a resume; treating it as proof of rows would \
+             leave a recreated table missing everything below its recorded position"
+        );
+        assert!(
+            AccelerationContents::default().may_be_empty(),
+            "the default must be the conservative answer for this direction too, so a caller \
+             that never probes cannot accidentally opt out of the rebuild"
+        );
+        // The two accessors are not negations of one another: they agree on the
+        // observed cases and deliberately differ on `Unknown`, each answering
+        // toward the rebuild.
+        assert!(
+            !AccelerationContents::Unknown.is_provably_empty()
+                && AccelerationContents::Unknown.may_be_empty()
         );
     }
 }

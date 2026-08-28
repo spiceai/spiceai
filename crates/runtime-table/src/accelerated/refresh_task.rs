@@ -2779,8 +2779,13 @@ pub async fn probe_acceleration_contents(
         Err(e) => {
             // Debug, not warn: the conservative fallback is the same work the
             // caller would have done anyway, so this costs time, not correctness.
+            //
+            // "Conservative" is direction-dependent, and `Unknown` answers toward
+            // the rebuild in both: a caller reading emptiness as licence to skip
+            // work treats this as populated, and one reading it as evidence of a
+            // gap treats it as possibly empty. See `AccelerationContents`.
             tracing::debug!(
-                "Dataset {dataset_name}: could not read the acceleration to check whether it is empty, so it will be treated as populated: {e}"
+                "Dataset {dataset_name}: could not read the acceleration to check whether it is empty, so it will be rebuilt rather than resumed: {e}"
             );
             AccelerationContents::Unknown
         }

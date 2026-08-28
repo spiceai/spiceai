@@ -2452,7 +2452,14 @@ async fn attach_member(
     // the one above inverted for the same reason it is there: a snapshot going to
     // populate the table leaves no gap, and nothing else loading it makes the
     // rebuild the only thing that will.
-    let emptiness_implies_gap = acceleration_is_empty && !snapshotting;
+    //
+    // Read through `may_be_empty`, not `is_provably_empty`, because inverting the
+    // question inverts which answer is the cautious one. Above, an unproven probe
+    // answering `false` keeps the rebuild; here it would *skip* one — so a probe
+    // that failed after the table was recreated would resume on the surviving
+    // watermark and leave every row below it missing, which is the hole this
+    // whole path exists to close. Only a positive `NonEmpty` licenses the resume.
+    let emptiness_implies_gap = params.acceleration.may_be_empty() && !snapshotting;
     // The floor passed here is the one the member was *actually* seated at above,
     // not the snapshot `setup` was built from — see the registration comment for
     // why the difference is a silent skip rather than a rounding error.
