@@ -838,7 +838,7 @@ impl CayenneCatalog {
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         // Drop the merged-away inputs' non-authoritative cached rows in the SAME
         // transaction as the roster swap: the `cayenne_snapshot_file` manifest and
-        // the `cayenne_snapshot_file_statistics` per-file stats cache. The physical 
+        // the `cayenne_snapshot_file_statistics` per-file stats cache. The physical
         // `.vortex` dirs are reclaimed LATER via retire+sweep.
         let batch_sql = format!(
             "DELETE FROM cayenne_snapshot_sequence \
