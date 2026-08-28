@@ -241,10 +241,12 @@ rather than patch by patch.
 Two things would change that and mean giving each a table here: either fork being
 rebased onto a moved upstream, or upstream resuming releases we track.
 
-`datafusion-table-providers` is pinned to a change branch rather than `spiceai-54`
-because the branch head carries a second patch this workspace has not audited. Fold
-the pin back onto `spiceai-54` at the next bump, which is where that patch gets its
-own audit.
+`datafusion-table-providers` is pinned to a change branch rather than `spiceai-54`.
+The branch is the previously pinned `896356c3` plus the one commit below and
+nothing else: `spiceai-54` has since gained a DuckDB timestamp-literal patch that
+this workspace has not audited, and the pin deliberately does **not** reach it.
+Fold the pin back onto `spiceai-54` at the next bump, which is where that patch
+gets its own audit and guard.
 
 One patch here does have a repo-side guard, because losing it is a wrong answer
 rather than a build failure:

@@ -126,41 +126,25 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
     Arc::new(dialect) as Arc<dyn Dialect>
 }
 
-/// The scalar functions the `BigQuery` unparser dialect rewrites to native
-/// `BigQuery` SQL, paired with their handlers.
+/// Names of the functions [`new_bigquery_dialect`] rewrites to native
+/// `BigQuery` SQL. The federation deny-list derives its `BigQuery` carve-out
+/// from this list; see [`crate::function_support::deny_spice_functions_for_bigquery_table_providers`].
 ///
-/// The same single-source-of-truth rule as [`duckdb_scalar_overrides`], with
-/// one more consumer: [`bigquery_can_translate`] answers from the same path
-/// builder these handlers render with, so what the dialect can render, what the
-/// deny-list lets through, and what the per-call check refuses all come from one
-/// place.
+/// This, the dialect's handlers and [`bigquery_can_translate`] are all derived
+/// from `bigquery::SCALAR_OVERRIDES`, so the three cannot drift: a function
+/// cannot be allowed to federate that the dialect has no handler for, and a
+/// handler cannot be added without saying which call shapes it can render.
 ///
 /// The other JSON functions stay denied. `json_get_str` needs a string-type
 /// guard around `JSON_VALUE`, which renders a JSON number as its digits where
 /// `json_get_str` returns NULL, and `json_get_bool` would diverge because
 /// `BigQuery`'s cast to `BOOL` is case-insensitive and Rust's `bool::from_str`
 /// is not. `json_get` and its relatives return a union that has no SQL surface.
-fn bigquery_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
-    vec![
-        (
-            bigquery::JSON_GET_INT_NAME,
-            Box::new(bigquery::json_get_int_to_sql) as ScalarFnToSqlHandler,
-        ),
-        (
-            bigquery::JSON_GET_FLOAT_NAME,
-            Box::new(bigquery::json_get_float_to_sql) as ScalarFnToSqlHandler,
-        ),
-    ]
-}
-
-/// Names of the functions [`new_bigquery_dialect`] rewrites to native
-/// `BigQuery` SQL. The federation deny-list derives its `BigQuery` carve-out
-/// from this list; see [`crate::function_support::deny_spice_functions_for_bigquery_table_providers`].
 #[must_use]
 pub fn bigquery_native_function_names() -> Vec<&'static str> {
-    bigquery_scalar_overrides()
-        .into_iter()
-        .map(|(name, _)| name)
+    bigquery::SCALAR_OVERRIDES
+        .iter()
+        .map(|entry| entry.name)
         .collect()
 }
 
@@ -180,10 +164,12 @@ pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
 /// [`bigquery_native_function_names`] lists.
 #[must_use]
 pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
-    let dialect =
-        SpiceBigQueryDialect::new().with_custom_scalar_overrides(bigquery_scalar_overrides());
+    let handlers: Vec<(&str, ScalarFnToSqlHandler)> = bigquery::SCALAR_OVERRIDES
+        .iter()
+        .map(|entry| (entry.name, Box::new(entry.handler) as ScalarFnToSqlHandler))
+        .collect();
 
-    Arc::new(dialect) as Arc<dyn Dialect>
+    Arc::new(SpiceBigQueryDialect::new().with_custom_scalar_overrides(handlers)) as Arc<dyn Dialect>
 }
 
 #[cfg(test)]

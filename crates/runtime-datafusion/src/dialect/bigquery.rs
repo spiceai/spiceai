@@ -61,8 +61,13 @@ const INT64_FROM_STR: &str = r"^[+-]?[0-9]+$";
 /// applies to a JSON **string** node: an optional sign, then `inf`,
 /// `infinity`, `nan` or a decimal with an optional exponent, case-insensitive.
 /// A bare `.5` and a trailing `5.` are both accepted, and whitespace is not.
+///
+/// Every group is non-capturing. `REGEXP_EXTRACT` accepts **at most one**
+/// capturing group and errors on more, which would fail every federated call
+/// remotely; with none it returns the whole match, which is what this wants.
+/// [`tests::no_pattern_has_a_capturing_group`] holds both patterns to that.
 const FLOAT64_FROM_STR: &str =
-    r"(?i)^[+-]?(inf(inity)?|nan|([0-9]+\.?[0-9]*|\.[0-9]+)(e[+-]?[0-9]+)?)$";
+    r"(?i)^[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$";
 
 /// What `BigQuery` should be asked for, given a `json_get_*` call's path
 /// arguments.
@@ -105,10 +110,12 @@ pub(crate) fn json_path(args: &[Expr]) -> Option<JsonPath> {
             ScalarValue::Utf8(Some(key))
             | ScalarValue::LargeUtf8(Some(key))
             | ScalarValue::Utf8View(Some(key)) => {
-                // BigQuery's JSON_VALUE quotes a key with double quotes, and a
-                // `"` inside one is backslash-escaped.
-                let escaped = key.replace('\\', r"\\").replace('"', r#"\""#);
-                let _ = write!(rendered, r#"."{escaped}""#);
+                if !key_is_renderable(key) {
+                    return None;
+                }
+                // BigQuery quotes a key with double quotes, which is what lets
+                // a key containing `.` stay one key.
+                let _ = write!(rendered, r#"."{key}""#);
             }
             ScalarValue::Int64(Some(index)) if *index >= 0 => {
                 let _ = write!(rendered, "[{index}]");
@@ -131,16 +138,71 @@ pub(crate) fn json_path(args: &[Expr]) -> Option<JsonPath> {
     Some(JsonPath::Path(rendered))
 }
 
+/// Whether a key can be written into the path at all.
+///
+/// The path is emitted as a `BigQuery` **raw** string literal, so what is
+/// written is what the JSON path parser reads: nothing processes backslashes in
+/// between. That holds only while the key contains nothing either layer would
+/// read as structure — `\'` would end the literal, `"` would end the quoted
+/// field name, `\\` is an escape to the JSON path parser, and a control
+/// character has no agreed spelling in either. Escaping across two layers with
+/// different rules is how a key silently becomes a *different* path, so such a
+/// key is left for the local engine instead.
+fn key_is_renderable(key: &str) -> bool {
+    !key.contains(['\'', '"', '\\']) && !key.chars().any(char::is_control)
+}
+
+/// Whether the path arguments of a `json_get_*` call can be rendered. Reads
+/// [`json_path`], so it answers exactly the question the handlers can answer.
+fn json_path_is_renderable(args: &[Expr]) -> bool {
+    json_path(args).is_some()
+}
+
 /// Whether the `BigQuery` dialect can translate this call, for the pushdown
-/// policy to consult. Reads [`json_path`], so it answers exactly the question
-/// the handlers below can answer.
+/// policy to consult.
+///
+/// A function with no entry in [`SCALAR_OVERRIDES`] is not this check's
+/// business: the deny-list has not carved it out, so it is already denied.
 #[must_use]
 pub fn can_translate(call: &ScalarFunction) -> bool {
-    match call.func.name() {
-        JSON_GET_INT_NAME | JSON_GET_FLOAT_NAME => json_path(&call.args).is_some(),
-        _ => true,
-    }
+    let name = call.func.name();
+    SCALAR_OVERRIDES
+        .iter()
+        .find(|entry| entry.name == name)
+        .is_none_or(|entry| (entry.can_translate)(&call.args))
 }
+
+/// A function the `BigQuery` dialect rewrites into native SQL.
+///
+/// The handler and the per-call check are one entry because they are one fact:
+/// a handler that can only render some call shapes is safe only while the
+/// deny-list refuses the rest. Splitting them into a list and a separate match
+/// is what lets a later partial handler be carved out of the deny-list with
+/// nothing to refuse its untranslatable shapes, which puts the function name
+/// verbatim into the remote SQL.
+pub(crate) struct ScalarOverride {
+    pub(crate) name: &'static str,
+    /// Renders the call, or fails if it cannot — see [`json_get_number_to_sql`].
+    pub(crate) handler: fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>>,
+    /// Whether `handler` can render a call with these arguments.
+    pub(crate) can_translate: fn(&[Expr]) -> bool,
+}
+
+/// Every function the `BigQuery` dialect rewrites, with what each consumer
+/// needs. [`crate::dialect`] derives the dialect's handlers, the deny-list
+/// carve-out, and the per-call check from this one table.
+pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
+    ScalarOverride {
+        name: JSON_GET_INT_NAME,
+        handler: json_get_int_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_GET_FLOAT_NAME,
+        handler: json_get_float_to_sql,
+        can_translate: json_path_is_renderable,
+    },
+];
 
 /// `json_get_int(doc, path…)` →
 /// `SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(doc, '<path>'), r'^[+-]?[0-9]+$') AS INT64)`.
@@ -208,7 +270,7 @@ fn json_get_number_to_sql(
 
     let json_value = call_function(
         "JSON_VALUE",
-        vec![document, ast::Expr::Value(single_quoted(&path).into())],
+        vec![document, ast::Expr::Value(raw_string(&path).into())],
     );
     let matched = call_function(
         "REGEXP_EXTRACT",
@@ -254,12 +316,9 @@ fn call_function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     })
 }
 
-fn single_quoted(value: &str) -> ast::Value {
-    ast::Value::SingleQuotedString(value.to_string())
-}
-
-/// A `BigQuery` raw string literal, `r'…'`. Raw so a backslash in the pattern
-/// is a regex escape rather than a string escape.
+/// A `BigQuery` raw string literal, `r'…'`. Raw so a backslash in the value is
+/// the value's own, not something the SQL string layer consumes first — which
+/// matters for a regex escape and for a JSON path alike.
 fn raw_string(value: &str) -> ast::Value {
     ast::Value::SingleQuotedRawStringLiteral(value.to_string())
 }
@@ -455,8 +514,8 @@ mod tests {
     use datafusion::sql::unparser::Unparser;
 
     use super::{
-        JSON_GET_FLOAT_NAME, JSON_GET_INT_NAME, JsonPath, SpiceBigQueryDialect, can_translate,
-        json_path,
+        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_GET_FLOAT_NAME, JSON_GET_INT_NAME, JsonPath,
+        SpiceBigQueryDialect, can_translate, json_path,
     };
     use crate::dialect::new_bigquery_dialect;
     use datafusion::common::ScalarValue;
@@ -514,15 +573,42 @@ mod tests {
     }
 
     #[test]
-    fn a_key_containing_a_quote_or_a_backslash_is_escaped() {
-        assert_eq!(
-            json_path(&[col("doc"), lit(r#"a"b"#)]),
-            Some(JsonPath::Path(r#"$."a\"b""#.to_string()))
-        );
-        assert_eq!(
-            json_path(&[col("doc"), lit(r"a\b")]),
-            Some(JsonPath::Path(r#"$."a\\b""#.to_string()))
-        );
+    fn a_key_the_two_quoting_layers_disagree_about_is_not_translated() {
+        // A quote, a backslash or a control character means one of the SQL
+        // literal layer and the JSONPath layer would read the key as structure.
+        // Escaping across both is how a key silently becomes a different path,
+        // so these are left for the local engine.
+        for key in [r#"a"b"#, r"a\b", "a'b", "a\nb", "a\tb"] {
+            assert_eq!(
+                json_path(&[col("doc"), lit(key)]),
+                None,
+                "{key:?} cannot be written into a BigQuery JSON path unambiguously"
+            );
+        }
+    }
+
+    #[test]
+    fn no_pattern_has_a_capturing_group() {
+        // `REGEXP_EXTRACT` accepts at most one capturing group and errors on
+        // more; with none it returns the whole match. A capturing group added
+        // here would fail every federated call at BigQuery, which no local test
+        // can see.
+        for pattern in [INT64_FROM_STR, FLOAT64_FROM_STR] {
+            let mut chars = pattern.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '(' => assert_eq!(
+                        chars.peek(),
+                        Some(&'?'),
+                        "capturing group in {pattern}: every group must be `(?:…)`"
+                    ),
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]
@@ -584,7 +670,7 @@ mod tests {
     fn json_get_int_renders_as_a_guarded_safe_cast() {
         assert_eq!(
             render(JSON_GET_INT_NAME, vec![col("doc"), lit("a")]),
-            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, '$."a"'), R'^[+-]?[0-9]+$') AS INT64)"#
+            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"'), R'^[+-]?[0-9]+$') AS INT64)"#
         );
     }
 
@@ -592,7 +678,7 @@ mod tests {
     fn json_get_float_renders_as_a_guarded_safe_cast() {
         assert_eq!(
             render(JSON_GET_FLOAT_NAME, vec![col("doc"), lit("a"), lit(2_i64)]),
-            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, '$."a"[2]'), R'(?i)^[+-]?(inf(inity)?|nan|([0-9]+\.?[0-9]*|\.[0-9]+)(e[+-]?[0-9]+)?)$') AS FLOAT64)"#
+            r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"[2]'), R'(?i)^[+-]?(?:inf(?:inity)?|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$') AS FLOAT64)"#
         );
     }
 
