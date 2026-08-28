@@ -475,8 +475,33 @@ mod tests {
             "the column must be compared directly: {sql}"
         );
         assert!(
-            sql.contains(".000999"),
+            sql.contains("1767225600000999"),
             "the literal must keep its sub-millisecond digits: {sql}"
+        );
+    }
+
+    /// The microsecond count is rendered as an integer, so it must survive past
+    /// 2^53 — the point beyond which a `f64` can no longer hold consecutive
+    /// integers, and a literal routed through one names a neighbouring
+    /// microsecond instead. A comparison against that literal then keeps or
+    /// drops the wrong boundary row, with well-formed SQL either way.
+    #[test]
+    fn a_microsecond_count_past_the_double_bound_is_rendered_exactly() {
+        // One above 2^53, which is the first count a f64 cannot represent.
+        let micros = 9_007_199_254_740_993_i64;
+        let schema = docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+
+        let sql =
+            flat_sql(&schema, &col("ts").gt(micros_literal(micros))).expect("SQL should build");
+
+        assert!(
+            sql.contains(&micros.to_string()),
+            "the literal must name the microsecond it was given, not the nearest one a \
+             double can hold ({micros}): {sql}"
         );
     }
 

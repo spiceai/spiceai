@@ -246,7 +246,7 @@ build failure:
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | **GAP** — the fork's own execution tests cover it (they build rows one microsecond apart across the 2^53 boundary and assert which one a comparison keeps, under three session time zones); there is no repo-side equivalent. See [Open gaps](#open-gaps) |
+| DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, and `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 
 ## datafusion-functions-json
@@ -460,7 +460,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -484,42 +484,36 @@ They are not equal in consequence; this is the order to close them in.
 10. `mistral.rs` `tool_calls` chat-template handling.
 11. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
     from the reference implementation.
-12. `datafusion-table-providers` DuckDB timestamp literal exactness (fork PR #57) — a
-    pushed-down timestamp filter past 2^53 µs selects a neighbouring microsecond, so a
-    boundary row is silently kept or dropped. A repo-side guard needs a DuckDB dataset
-    holding two rows one microsecond apart across that boundary and a filter between
-    them; the fork's own execution tests already do exactly that, which is why this is
-    a coverage gap here rather than an unverified patch.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-13. `vortex` session lock re-entry in writer init (fork PR #29).
-14. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+12. `vortex` session lock re-entry in writer init (fork PR #29).
+13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-15. `async-openai` null-suppression in requests.
-16. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-17. `model2vec-rs` optional `config.json`.
-18. `snowflake-rs` async query response support — long-running queries time out.
+14. `async-openai` null-suppression in requests.
+15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+16. `model2vec-rs` optional `config.json`.
+17. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-22. `model2vec-rs` HF cache directory read from the environment — models are
+21. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-25. `graph-rs-sdk` tower middleware application.
+23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+24. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -527,7 +521,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
@@ -536,7 +530,7 @@ without becoming a flaky timing test:
 ## A patch that is present but incomplete
 
 Found while writing the guard for it, so it is a defect rather than a coverage gap,
-and it is not one of the 37 above.
+and it is not one of the 36 above.
 
 `vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
 `ExtensionArray`. A scan also evaluates a pushed-down predicate against *constant*
