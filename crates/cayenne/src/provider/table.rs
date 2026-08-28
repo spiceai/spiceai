@@ -17258,6 +17258,22 @@ impl CayenneTableProvider {
             return;
         }
 
+        // Published BEFORE the fallible catalog mutation, because the unlinks
+        // already happened and are not conditional on it. Held back until the
+        // mutation succeeded, a failure would lose them permanently: the rows
+        // survive, the next sweep re-examines the same files, and their paths now
+        // unlink as `NotFound`, which deliberately claims no bytes. The
+        // undercount would land on exactly the degraded pass an operator is
+        // trying to read. Rows are published separately, after the mutation that
+        // actually removes them.
+        maintenance_metrics::track_reclaimed(
+            table_name,
+            MaintenanceOp::OrphanDvSweep,
+            unlinked_files,
+            unlinked_bytes,
+            0,
+        );
+
         if let Err(e) = self
             .catalog
             .remove_delete_files(table_id, &removed_ids)
@@ -17284,8 +17300,8 @@ impl CayenneTableProvider {
         maintenance_metrics::track_reclaimed(
             table_name,
             MaintenanceOp::OrphanDvSweep,
-            unlinked_files,
-            unlinked_bytes,
+            0,
+            0,
             reclaimed_tombstones,
         );
         tracing::debug!(

@@ -4224,10 +4224,16 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
-        // Two queries, not one per table: the manifest split needs a join to
-        // resolve whether each row's snapshot is still live, while everything
-        // else is an independent per-table aggregate that scalar subqueries
-        // fold into a single round trip.
+        // ONE statement, deliberately. A row moves BETWEEN these tiers — an
+        // inline checkpoint drains level-0 into a Vortex file and a manifest row,
+        // a compaction retires manifest rows — and each of those commits is a
+        // single metastore transaction. Read as two queries, the sample could
+        // take its inline half before such a commit and its manifest half after,
+        // publishing the same rows twice (or, in the other order, neither), and
+        // that wrong value would stand until the next throttled sample. Two
+        // queries can also land on two pooled connections, so they need not even
+        // agree on a snapshot. A single statement runs in one implicit read
+        // transaction, so every tier below is read as of one instant.
         //
         // A snapshot is LIVE when it is the table's `current_snapshot_id` or it
         // carries a registered sequence. Rows naming anything else are
@@ -4250,7 +4256,18 @@ impl MetadataCatalog for CayenneCatalog {
         // same way, and it is the right figure for "what the manifest describes".
         // `cayenne_maintenance_reclaimed_bytes_total` is the physical
         // counterpart: it only counts a file whose last link it removed.
-        let manifest = self
+        //
+        // The non-manifest tiers are cross-joined derived tables rather than one
+        // scalar subquery per COLUMN: three of those aggregates read
+        // `cayenne_delete_file` with the same predicate, three read
+        // `cayenne_cold_tier_file`, and as separate subqueries each would be its
+        // own index scan. Measured 55ms -> 35ms on a metastore with 50k delete
+        // files and 100k cold-tier files.
+        //
+        // `cayenne_insert_record` keys `table_id` as the raw UUID bytes, so it
+        // takes its own parameter rather than the text id every other table
+        // stores.
+        let stats = self
             .metastore
             .query_row_helper(
                 QueryRowParams {
@@ -4288,50 +4305,7 @@ impl MetadataCatalog for CayenneCatalog {
                         COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN file_size_bytes ELSE 0 END) FROM live), 0),
                         COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN row_count ELSE 0 END) FROM live), 0),
                         (SELECT all_rows FROM rows_total),
-                        (SELECT reachable_rows FROM rows_total)
-                    ",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
-                },
-                |row| {
-                    Ok((
-                        row.get_i64(0)?,
-                        row.get_i64(1)?,
-                        row.get_i64(2)?,
-                        row.get_i64(3)?,
-                        row.get_i64(4)?,
-                        row.get_i64(5)?,
-                        row.get_i64(6)?,
-                        row.get_i64(7)?,
-                    ))
-                },
-            )
-            .await?;
-        let (
-            current_files,
-            current_bytes,
-            current_rows,
-            protected_files,
-            protected_bytes,
-            protected_rows,
-            manifest_rows,
-            reachable_manifest_rows,
-        ) = manifest;
-
-        // `cayenne_insert_record` keys `table_id` as the raw UUID bytes, so it
-        // takes its own parameter rather than the text id every other table
-        // stores.
-        let rest = self
-            .metastore
-            .query_row_helper(
-                QueryRowParams {
-                    // One scan per table, cross-joined — not one scalar subquery
-                    // per COLUMN. Three of these aggregates read
-                    // `cayenne_delete_file` with the same predicate, three read
-                    // `cayenne_cold_tier_file`, and so on; as separate subqueries
-                    // each is its own index scan. Measured 55ms -> 35ms on a
-                    // metastore with 50k delete files and 100k cold-tier files.
-                    sql: r"
-                    SELECT
+                        (SELECT reachable_rows FROM rows_total),
                         df.n, df.bytes, df.deletes,
                         ctf.n, ctf.bytes, ctf.row_total,
                         (SELECT COUNT(*) FROM cayenne_snapshot_sequence WHERE table_id = ?1),
@@ -4362,41 +4336,41 @@ impl MetadataCatalog for CayenneCatalog {
                     ],
                 },
                 |row| {
+                    let manifest_rows = row.get_i64(6)?;
+                    let reachable_manifest_rows = row.get_i64(7)?;
                     Ok(TableStorageStats {
-                        delete_files: row.get_i64(0)?,
-                        delete_file_bytes: row.get_i64(1)?,
-                        delete_file_tombstones: row.get_i64(2)?,
-                        cold_files: row.get_i64(3)?,
-                        cold_bytes: row.get_i64(4)?,
-                        cold_rows: row.get_i64(5)?,
-                        snapshot_sequences: row.get_i64(6)?,
-                        file_statistics_rows: row.get_i64(7)?,
-                        insert_records: row.get_i64(8)?,
-                        inlined_entries: row.get_i64(9)?,
-                        inlined_rows: row.get_i64(10)?,
-                        inlined_bytes: row.get_i64(11)?,
-                        inlined_delete_entries: row.get_i64(12)?,
-                        inlined_delete_rows: row.get_i64(13)?,
-                        ..TableStorageStats::default()
+                        current_files: row.get_i64(0)?,
+                        current_bytes: row.get_i64(1)?,
+                        current_rows: row.get_i64(2)?,
+                        protected_files: row.get_i64(3)?,
+                        protected_bytes: row.get_i64(4)?,
+                        protected_rows: row.get_i64(5)?,
+                        // Both counts come from the same statement, hence the
+                        // same snapshot, so the difference cannot be negative.
+                        // The clamp is what keeps that true if the query is ever
+                        // split again.
+                        unreachable_manifest_rows: (manifest_rows - reachable_manifest_rows).max(0),
+                        reachable_manifest_rows,
+                        delete_files: row.get_i64(8)?,
+                        delete_file_bytes: row.get_i64(9)?,
+                        delete_file_tombstones: row.get_i64(10)?,
+                        cold_files: row.get_i64(11)?,
+                        cold_bytes: row.get_i64(12)?,
+                        cold_rows: row.get_i64(13)?,
+                        snapshot_sequences: row.get_i64(14)?,
+                        file_statistics_rows: row.get_i64(15)?,
+                        insert_records: row.get_i64(16)?,
+                        inlined_entries: row.get_i64(17)?,
+                        inlined_rows: row.get_i64(18)?,
+                        inlined_bytes: row.get_i64(19)?,
+                        inlined_delete_entries: row.get_i64(20)?,
+                        inlined_delete_rows: row.get_i64(21)?,
                     })
                 },
             )
             .await?;
 
-        Ok(TableStorageStats {
-            current_files,
-            current_bytes,
-            current_rows,
-            protected_files,
-            protected_bytes,
-            protected_rows,
-            // `.max(0)` because the two counts come from one query but not one
-            // transaction snapshot; a concurrent prune between them must not
-            // produce a negative backlog.
-            unreachable_manifest_rows: (manifest_rows - reachable_manifest_rows).max(0),
-            reachable_manifest_rows,
-            ..rest
-        })
+        Ok(stats)
     }
 
     fn metastore_label(&self) -> String {
