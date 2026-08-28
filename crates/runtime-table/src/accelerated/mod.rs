@@ -1081,8 +1081,6 @@ impl Builder {
                 limits,
                 self.io_runtime.clone(),
             ));
-            predicate.warn_about_unenforceable(&self.accelerator);
-
             // Built directly rather than through the builder's `enabled` gate:
             // `retention_check_enabled` governs the dataset's own retention
             // rules, and switching those off must not also switch off
@@ -1099,6 +1097,10 @@ impl Builder {
                 ),
                 None => (Vec::new(), sweep_interval),
             };
+            // After the user's filters are known: a `retention_period` or
+            // `retention_sql` rule evicts entries too, so whether anything
+            // bounds the cache is not decidable from the cache's own limits.
+            predicate.warn_about_unenforceable(&self.accelerator, !filters.is_empty());
             filters.push(DataRetentionFilter::Computed { predicate });
             Some(Retention {
                 filters,

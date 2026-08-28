@@ -393,11 +393,15 @@ pub struct Acceleration {
     pub caching_stale_if_error: StaleIfError,
 
     /// Byte budget for a `refresh_mode: caching` accelerator, from
-    /// `caching_max_size`. `None` leaves the cache bounded only by its TTLs.
+    /// `caching_max_size`. `None` is no byte budget: what remains is expiry by
+    /// `caching_ttl` — and with `caching_stale_if_error: enabled` not even that,
+    /// since expired entries are deliberately kept as fallback for a failing
+    /// origin, leaving nothing to bound the acceleration.
     pub caching_max_size: Option<u64>,
 
     /// Row budget for a `refresh_mode: caching` accelerator, from
-    /// `caching_max_items`. `None` leaves the cache bounded only by its TTLs.
+    /// `caching_max_items`. `None` is no row budget; see [`Self::caching_max_size`]
+    /// for what is left bounding the acceleration.
     pub caching_max_items: Option<u64>,
 
     pub refresh_cron: Option<Arc<str>>,
