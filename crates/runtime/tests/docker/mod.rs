@@ -71,6 +71,40 @@ fn is_removal_already_in_progress(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Whether a removal failed because there is no such container, which is the
+/// end state this wanted rather than a failure to reach it.
+///
+/// Reachable between the existence check and the removal below: the previous
+/// test's `Drop` cleanup can finish in that window, and the daemon then answers
+/// the second removal with a 404 rather than the 409 above.
+fn is_already_gone(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<bollard::errors::Error>(),
+        Some(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        })
+    )
+}
+
+/// Whether a creation failed because the name is still taken.
+///
+/// The daemon frees a name as the last step of removing a container, *after* it
+/// has dropped it from the list [`ContainerRunner::container_exist`] reads, so
+/// the name can still be reserved when that check says it is gone. Matched on
+/// the status code, as above: 409 is the only conflict `create_container`
+/// reports, and a reworded daemon message must not turn a retryable creation
+/// into a hard failure.
+fn is_name_still_taken(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            ..
+        }
+    )
+}
+
 pub struct RunningContainer<'a> {
     name: &'a str,
     docker: Docker,
@@ -404,7 +438,35 @@ impl<'a> ContainerRunner<'a> {
             ..Default::default()
         };
 
-        let _ = self.docker.create_container(Some(options), config).await?;
+        // `wait_for_name_release` polls the container list, and the daemon drops
+        // a container from that list before it releases the name — so the list
+        // can report the name free while it is still reserved, and creation
+        // answers 409. Retry on exactly that, under the same bound, rather than
+        // failing the test for a window that closes on its own.
+        let create_deadline = std::time::Instant::now() + NAME_RELEASE_TIMEOUT;
+        loop {
+            match self
+                .docker
+                .create_container(Some(options.clone()), config.clone())
+                .await
+            {
+                Ok(_) => break,
+                Err(e) if is_name_still_taken(&e) => {
+                    if std::time::Instant::now() >= create_deadline {
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "the name of test container {} was still reserved {NAME_RELEASE_TIMEOUT:?} after its removal completed",
+                            self.name
+                        )));
+                    }
+                    tracing::debug!(
+                        "Docker still holds the name {}; retrying the creation",
+                        self.name
+                    );
+                    tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         // The container exists from here on, so hold it in the guard before
         // anything else can fail. Starting it, inspecting it, or waiting for it
@@ -491,11 +553,39 @@ impl<'a> ContainerRunner<'a> {
     /// accepts. That reports the end state this method wants, so it is waited
     /// out rather than raised as a failure.
     async fn wait_for_name_release(&self) -> Result<(), anyhow::Error> {
+        // Bounded around the whole operation, not just between polls. Checking
+        // the elapsed time after each Docker call only bounds a daemon that
+        // keeps answering; one that accepts the connection and then stops
+        // replying leaves any single `list_containers` or `remove_container`
+        // outstanding forever, and the stated bound would never be reached.
+        // `Drop` guards its own cleanup the same way.
+        tokio::time::timeout(NAME_RELEASE_TIMEOUT, self.release_name())
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "test container {} still held its name {NAME_RELEASE_TIMEOUT:?} after its removal was requested, so a new one cannot take it. Either the container cannot be killed or the Docker daemon stopped answering",
+                    self.name
+                ))
+            })
+    }
+
+    /// The body of [`Self::wait_for_name_release`], which supplies the deadline.
+    async fn release_name(&self) -> Result<(), anyhow::Error> {
         if !self.container_exist().await? {
             return Ok(());
         }
 
         if let Err(e) = remove(&self.docker, self.name).await {
+            // A 404 says the container is gone, which is the end state wanted;
+            // a 409 says someone else is removing it, which reaches that state.
+            // Anything else is a real failure.
+            if is_already_gone(&e) {
+                tracing::debug!(
+                    "Docker container {} was removed between the check and the removal",
+                    self.name
+                );
+                return Ok(());
+            }
             if !is_removal_already_in_progress(&e) {
                 return Err(e);
             }
@@ -505,16 +595,9 @@ impl<'a> ContainerRunner<'a> {
             );
         }
 
-        let start_time = std::time::Instant::now();
+        // No elapsed check here: the caller's timeout covers this loop and the
+        // requests inside it.
         while self.container_exist().await? {
-            // An unkillable container never releases its name, so this reports
-            // that rather than waiting on it for the job's whole budget.
-            if start_time.elapsed() > NAME_RELEASE_TIMEOUT {
-                return Err(anyhow::anyhow!(
-                    "test container {} was still present {NAME_RELEASE_TIMEOUT:?} after its removal was requested, so a new one cannot take its name",
-                    self.name
-                ));
-            }
             tokio::time::sleep(NAME_RELEASE_POLL_INTERVAL).await;
         }
 
@@ -586,7 +669,7 @@ pub async fn wait_for_tcp_port(
 
 #[cfg(test)]
 mod tests {
-    use super::is_removal_already_in_progress;
+    use super::{is_already_gone, is_name_still_taken, is_removal_already_in_progress};
 
     fn docker_error(status_code: u16, message: &str) -> anyhow::Error {
         anyhow::Error::new(bollard::errors::Error::DockerResponseServerError {
@@ -619,5 +702,56 @@ mod tests {
         assert!(!is_removal_already_in_progress(&anyhow::anyhow!(
             "the daemon is not reachable"
         )));
+    }
+
+    #[test]
+    fn a_container_removed_between_the_check_and_the_removal_is_already_released() {
+        // The previous test's `Drop` cleanup finishing in that window: the name
+        // is free, which is what the caller wanted, so this is not a failure.
+        assert!(is_already_gone(&docker_error(
+            404,
+            "No such container: runtime-integration-test-mysql-13306"
+        )));
+    }
+
+    #[test]
+    fn a_removal_that_fails_for_any_other_reason_is_not_already_gone() {
+        assert!(!is_already_gone(&docker_error(
+            409,
+            "removal of container runtime-integration-test-mysql-13306 is already in progress"
+        )));
+        assert!(!is_already_gone(&anyhow::anyhow!(
+            "the daemon is not reachable"
+        )));
+    }
+
+    #[test]
+    fn a_creation_refused_for_the_name_is_retried() {
+        // The window the container list cannot see: the daemon has dropped the
+        // container but not yet released its name.
+        assert!(is_name_still_taken(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "Conflict. The container name \"/runtime-integration-test-mysql-13306\" is already in use".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn a_creation_refused_for_any_other_reason_is_not_retried() {
+        // Retrying these would spend the whole name-release budget and then
+        // report the same failure, so they have to surface immediately.
+        assert!(!is_name_still_taken(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "No such image: mysql:9".to_string(),
+            }
+        ));
+        assert!(!is_name_still_taken(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "server error".to_string(),
+            }
+        ));
     }
 }
