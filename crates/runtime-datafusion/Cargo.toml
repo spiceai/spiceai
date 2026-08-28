@@ -14,6 +14,7 @@ arrow-schema.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
 datafusion-catalog.workspace = true
@@ -46,7 +47,6 @@ util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true

@@ -261,7 +261,7 @@ datafusion-functions = "54.1.0"
 datafusion-functions-aggregate = "54.1.0"
 datafusion-functions-aggregate-common = "54.1.0"
 datafusion-functions-nested = "54.1.0"
-datafusion-functions-json = "0.54"
+datafusion-functions-json = { git = "https://github.com/spiceai/datafusion-functions-json.git", rev = "ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc" } # branch: spiceai-54
 datafusion-physical-expr = "54.1.0"
 datafusion-physical-expr-adapter = "54.1.0"
 datafusion-physical-expr-common = "54.1.0"
@@ -271,7 +271,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "896356c3f7af9db5b6da3f2379196b420eee1b2b" } # branch: spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b9ea24c3101a24e8b3186a6a552362cf0a91bc03" } # branch: spiceai-54-expression-aware-function-support
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",

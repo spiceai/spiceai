@@ -1,6 +1,6 @@
 # Fork patches and their guards
 
-Spice builds against forks of 29 upstream crates. Some of those forks carry Spice
+Spice builds against forks of 30 upstream crates. Some of those forks carry Spice
 patches; the rest are pinned for a version or dependency reason and carry no
 behaviour of ours at all.
 
@@ -95,7 +95,8 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `859621d612511efb93a7f3e020f8baae8e33e3b4` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `896356c3f7af9db5b6da3f2379196b420eee1b2b` | `spiceai-54` |
+| [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b9ea24c3101a24e8b3186a6a552362cf0a91bc03` | `spiceai-54-expression-aware-function-support` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `7229b20daf24765c84d294c52cf4b4165ca79073` | `spiceai-1.5.5` |
@@ -239,6 +240,40 @@ rather than patch by patch.
 
 Two things would change that and mean giving each a table here: either fork being
 rebased onto a moved upstream, or upstream resuming releases we track.
+
+`datafusion-table-providers` is pinned to a change branch rather than `spiceai-54`
+because the branch head carries a second patch this workspace has not audited. Fold
+the pin back onto `spiceai-54` at the next bump, which is where that patch gets its
+own audit.
+
+One patch here does have a repo-side guard, because losing it is a wrong answer
+rather than a build failure:
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
+
+## datafusion-functions-json
+
+Upstream
+[datafusion-contrib/datafusion-functions-json](https://github.com/datafusion-contrib/datafusion-functions-json),
+branch `spiceai-54`.
+
+**No Spice patches.** The branch is upstream `main` unmodified. It is pinned rather
+than taken from crates.io because three correctness fixes landed upstream after
+`v0.54.2` and have not been published; the pin exists only to carry them, and should
+be dropped for a plain version requirement as soon as a release contains them.
+
+Every one of the three returns a wrong answer rather than an error, so the loss mode
+if the pin is dropped early is silent. All three guards live in one file, and the
+`json_get_int`/`json_get_float` rows cover the sign and type matrix rather than only
+the case named:
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| `json_get_int` / `json_get_float` read negative numbers (upstream PR #125) | Every negative JSON number reads as NULL — `json_get_int('{"a": -1}', 'a')` is NULL, not `-1`. No error, no warning | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_int_reads_negative_numbers`, `::json_get_float_reads_negative_numbers` |
+| Integers outside jiter's `i64` fast path (upstream PR #124) | `json_get` panics on an in-range integer jiter hands back as a big integer, taking the query down; `json_get_int` reads the same value as NULL | silent (panic, and wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_reads_an_integer_outside_the_fast_path_without_panicking`, `::json_get_int_spans_the_whole_i64_range` |
+| Nested `json_as_text` is not flattened (upstream PR #121) | `json_as_text(json_as_text(x, 'a'), 'b')` folds into one two-element path, which reads the wrong value whenever the inner result is itself a JSON document | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::a_json_string_holding_json_is_read_one_level_at_a_time` |
 
 ## duckdb-rs
 

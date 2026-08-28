@@ -74,7 +74,19 @@ pub fn build_db_options(
     opts
 }
 
-/// Returns the SQL dialect for a given ADBC driver name, if a non-default one is needed.
+/// Returns the SQL dialect for a given ADBC driver name, if a non-default one is
+/// needed.
+///
+/// These are the stock `DataFusion` dialects, which rewrite no Spice function.
+/// That is what makes them safe for a caller that installs no federation
+/// function-support policy — the ADBC **catalog** connector, which installs
+/// none at all ([#13664](https://github.com/spiceai/spiceai/issues/13664)).
+///
+/// The ADBC *dataset* connector has its own, in `connector-adbc`, which
+/// rewrites the JSON extraction functions into `BigQuery` SQL. **Do not reach
+/// for that one from here.** It renders only the call shapes `BigQuery` can
+/// express, and the policy paired with it is what keeps the rest from reaching
+/// the unparser; without that policy those calls fail the query instead.
 #[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
