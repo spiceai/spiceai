@@ -285,9 +285,7 @@ impl PreparedOverwrite {
             );
         }
 
-        self.table
-            .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
-            .await;
+        self.table.schedule_old_snapshot_cleanup();
 
         // Invalidate the in-memory optimizer cache so a zero-row overwrite
         // leaves the cache empty rather than stale; `persist_table_stats`
