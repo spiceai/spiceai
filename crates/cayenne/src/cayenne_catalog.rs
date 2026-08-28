@@ -4098,10 +4098,13 @@ impl MetadataCatalog for CayenneCatalog {
                 QueryRowParams {
                     // The tombstone aggregates ride the same round trip as the
                     // corpus ones: both callers need both tables, and on a
-                    // network metastore a second query costs 10-50 ms. Each
-                    // subquery is an index-only range scan over
-                    // `idx_cayenne_inlined_delete_table_seq`, and `LENGTH` on a
-                    // BLOB reads the record header, never the payload.
+                    // network metastore a second query costs 10-50 ms. Both
+                    // subqueries seek through `idx_cayenne_inlined_delete_table_seq`
+                    // rather than scanning the table; only the `COUNT(*)` is
+                    // answered from the index alone, since `delete_ipc` is not in
+                    // it and `LENGTH` has to visit each row — though it reads the
+                    // size out of the record header without loading the blob's
+                    // overflow pages.
                     sql: r"
                     SELECT
                         COALESCE(SUM(record_count), 0),
