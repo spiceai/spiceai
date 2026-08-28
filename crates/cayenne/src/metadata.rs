@@ -1580,8 +1580,14 @@ mod tests {
         assert_eq!(DeletionMode::Auto.resolved(false), DeletionMode::Position);
         assert_eq!(DeletionMode::Key.resolved(true), DeletionMode::Key);
         assert_eq!(DeletionMode::Key.resolved(false), DeletionMode::Position);
-        assert_eq!(DeletionMode::Position.resolved(true), DeletionMode::Position);
-        assert_eq!(DeletionMode::Position.resolved(false), DeletionMode::Position);
+        assert_eq!(
+            DeletionMode::Position.resolved(true),
+            DeletionMode::Position
+        );
+        assert_eq!(
+            DeletionMode::Position.resolved(false),
+            DeletionMode::Position
+        );
     }
 
     /// `scan_concurrency` must survive a metastore round trip, and a config
