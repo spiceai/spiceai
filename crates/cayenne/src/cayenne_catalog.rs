@@ -838,15 +838,8 @@ impl CayenneCatalog {
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         // Drop the merged-away inputs' non-authoritative cached rows in the SAME
         // transaction as the roster swap: the `cayenne_snapshot_file` manifest and
-        // the `cayenne_snapshot_file_statistics` per-file stats cache. Subset merge
-        // rewrites `P_new` into its own directory and holds no in-place reference to
-        // the inputs' files, so deleting the inputs' cached rows here cannot orphan a
-        // file `P_new` still points at. The physical `.vortex` dirs are reclaimed
-        // LATER via retire+sweep (reader-scoped), but both cached tables are
-        // non-authoritative (scans list the snapshot directory, not these rows), so no
-        // in-flight reader needs them; deleting them at commit stops an unbounded
-        // metastore leak on subset-merge-dominated CDC tables whose current snapshot
-        // never rotates and so never hits the full-rewrite prune.
+        // the `cayenne_snapshot_file_statistics` per-file stats cache. The physical 
+        // `.vortex` dirs are reclaimed LATER via retire+sweep.
         let batch_sql = format!(
             "DELETE FROM cayenne_snapshot_sequence \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
