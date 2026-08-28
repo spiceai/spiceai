@@ -945,7 +945,7 @@ impl Builder {
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
@@ -968,6 +968,7 @@ impl Builder {
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
+        refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
