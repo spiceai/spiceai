@@ -9345,7 +9345,8 @@ impl CayenneTableProvider {
     /// safe: `create_table` is create-or-reuse, and an empty install over
     /// existing rows would turn conflict validation into duplicates. The
     /// emptiness proof therefore covers every place a live row can sit:
-    /// mem-tier, inlined, any snapshot's manifest, and the cold tier. Any
+    /// mem-tier, inlined, any snapshot's manifest, the cold tier, and a staged
+    /// append's private staging directory — which no listing here can see. Any
     /// doubt (unreadable listing) keeps the lazy rebuild. Probes once per
     /// cache lifetime; `clear_cached_pk_keyset` re-arms it, so a delete-all's
     /// next write re-installs. Both call sites hold the per-table write
@@ -9408,6 +9409,18 @@ impl CayenneTableProvider {
         }
         // A registered protected snapshot means rows outside the current manifest.
         if !self.protected_snapshots.load().is_empty() {
+            return false;
+        }
+        // A staged append holds rows in a private staging directory that no
+        // listing here can see, and its Stage A does not register the target in
+        // `protected_snapshots`, so the checks above all read empty while a live
+        // primary key exists. Installing an empty cache over it means validation
+        // answers from that cache and never rebuilds — so neither the mem-tier
+        // fold nor the staged fold runs, and the next write of that key reads it
+        // as new and leaves two live rows for it. This is the emptiness proof's
+        // fifth place a live row can sit; a false `false` only costs the lazy
+        // rebuild the probe exists to skip.
+        if self.has_inflight_staging_appends() {
             return false;
         }
         self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
@@ -49509,6 +49522,85 @@ mod tests {
             1,
             "two live rows for one primary key: the persisted-bloom index did not \
              carry the staged append's key (rows for {STAGED_KEY}: {staged_rows:?})"
+        );
+    }
+
+    /// The two guards above seed published rows first, which is what makes the
+    /// rebuild run at all. On an **empty** table the write-path warm-cache probe
+    /// fires instead: `clear_cached_pk_keyset` re-arms it, and a staged append is
+    /// invisible to every branch of its emptiness proof — its files sit in a
+    /// private staging directory and its Stage A does not register the target in
+    /// `protected_snapshots`. The probe would then install an empty exact cache
+    /// over a live primary key, and validation answers from that cache without
+    /// ever rebuilding — so the staged fold never runs and the key reads as new.
+    ///
+    /// Zero seed on purpose: seeding anything is exactly what hides this path.
+    #[tokio::test]
+    async fn warm_empty_cache_probe_defers_to_an_inflight_staged_append() {
+        const STAGED_KEY: i64 = 6464;
+        let table = "warm_empty_probe_staged_unpublished";
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table(table, Arc::clone(&runtime_env)).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged insert should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "precondition: the key must be staged, not published"
+        );
+        assert!(
+            provider.protected_snapshots.load().is_empty(),
+            "precondition: Stage A must NOT have registered the target — that is \
+             what leaves the emptiness proof reading empty over a live key"
+        );
+
+        provider.clear_cached_pk_keyset();
+
+        let update = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[STAGED_KEY], &[999])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("update of the staged key should prepare");
+
+        staged.finish().await.expect("finalize staged insert");
+        update.finish().await.expect("finalize update");
+
+        let staged_rows: Vec<i64> = collect_id_value_pairs(&ctx, &provider, table)
+            .await
+            .into_iter()
+            .filter(|(id, _)| *id == STAGED_KEY)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            staged_rows,
+            vec![999],
+            "two live rows for one primary key: the warm-empty probe installed an \
+             empty cache over a staged append's key, so validation never rebuilt \
+             and recorded no supersede tombstone (rows for {STAGED_KEY}: \
+             {staged_rows:?})"
+        );
+
+        // Durable, not just the live view: an over-count here has no tombstone,
+        // so compaction could never heal it.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open(table)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            query_count_star(&ctx, &reopened, table).await,
+            1,
+            "reopened durable state over-counts"
         );
     }
 
