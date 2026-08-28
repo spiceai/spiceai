@@ -17822,6 +17822,7 @@ dependencies = [
  "object_store 0.13.2",
  "opentelemetry",
  "parking_lot",
+ "regex",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",

@@ -52,6 +52,7 @@ datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
 insta.workspace = true
 object_store.workspace = true
+regex.workspace = true
 tokio.workspace = true
 
 [lints]

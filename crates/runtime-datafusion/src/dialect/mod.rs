@@ -135,11 +135,14 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
 /// cannot be allowed to federate that the dialect has no handler for, and a
 /// handler cannot be added without saying which call shapes it can render.
 ///
-/// The other JSON functions stay denied. `json_get_str` needs a string-type
-/// guard around `JSON_VALUE`, which renders a JSON number as its digits where
-/// `json_get_str` returns NULL, and `json_get_bool` would diverge because
-/// `BigQuery`'s cast to `BOOL` is case-insensitive and Rust's `bool::from_str`
-/// is not. `json_get` and its relatives return a union that has no SQL surface.
+/// The rest stay denied, each for something `BigQuery` cannot be talked out of.
+/// `json_get_json` and `json_as_text` return the matched node's own bytes,
+/// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
+/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
+/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
+/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
+/// union, which has no SQL type to unparse into.
 #[must_use]
 pub fn bigquery_native_function_names() -> Vec<&'static str> {
     bigquery::SCALAR_OVERRIDES

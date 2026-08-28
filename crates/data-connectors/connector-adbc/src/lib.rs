@@ -2314,6 +2314,28 @@ mod function_support_tests {
             "the BigQuery dialect rewrites this into JSON_VALUE, so it must push down"
         );
         assert!(
+            federates("bigquery", json_call("json_get_str", vec![lit("a")])).await,
+            "the BigQuery dialect guards JSON_VALUE with JSON_QUERY for the string \
+             form, so it must push down too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_bool", vec![lit("a")])).await,
+            "the BigQuery dialect compares JSON_VALUE's rendering for the bool form"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_float", vec![lit("a")])).await,
+            "BigQuery's SAFE_CAST saturates exactly as Rust's f64::FromStr does, so the \
+             float form is translatable too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_length", vec![lit("a")])).await,
+            "an array's and an object's counts each have a BigQuery equivalent"
+        );
+        assert!(
+            federates("bigquery", json_call("json_object_keys", vec![lit("a")])).await,
+            "JSON_KEYS at depth 1 is the object's own keys, which is what this returns"
+        );
+        assert!(
             federates(
                 "bigquery",
                 json_call("json_get_int", vec![lit("a"), lit(0_i64)])
@@ -2346,19 +2368,30 @@ mod function_support_tests {
             "a key the SQL-literal and JSON-path layers quote differently is left local \
              rather than escaped across both and silently turned into another path"
         );
+        // The check is per call, not per function: every translated name owes
+        // the same refusals, or the newest handler is the one that federates a
+        // shape it cannot render.
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![col("val")])).await,
+            "a per-row path has no BigQuery translation for the string form either"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![lit(r#"a"b"#)])).await,
+            "an unquotable key is left local for the string form too"
+        );
     }
 
     #[tokio::test]
     async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
         for name in [
-            // Rust saturates an out-of-range float to infinity where BigQuery's
-            // SAFE_CAST gives NULL, so pushing this down would change results.
-            "json_get_float",
-            "json_get_str",
-            "json_get_bool",
+            // Returns a union of every JSON scalar type, which has no SQL type
+            // to unparse into.
             "json_get",
+            // Returns the matched node's own bytes; JSON_QUERY re-renders it.
             "json_as_text",
-            "json_length",
+            // A JSON `null` and a missing key are indistinguishable in
+            // BigQuery, and json_contains tells them apart.
+            "json_contains",
         ] {
             assert!(
                 !federates("bigquery", json_call(name, vec![lit("a")])).await,
@@ -2371,7 +2404,12 @@ mod function_support_tests {
     async fn a_driver_without_a_spice_dialect_denies_every_json_function() {
         // The carve-out is BigQuery's, not ADBC's: another driver gets the
         // plain deny-list and evaluates these locally.
-        for name in ["json_get_int", "json_get_float", "json_get_str"] {
+        for name in [
+            "json_get_int",
+            "json_get_float",
+            "json_get_str",
+            "json_get_bool",
+        ] {
             assert!(
                 !federates("sqlite", json_call(name, vec![lit("a")])).await,
                 "{name} must not push down to a driver whose dialect cannot rewrite it"

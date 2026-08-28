@@ -44,7 +44,9 @@ use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF};
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion_functions_json::functions::json_as_text;
-use datafusion_functions_json::udfs::{json_get_float_udf, json_get_int_udf, json_get_udf};
+use datafusion_functions_json::udfs::{
+    json_get_float_udf, json_get_int_udf, json_get_str_udf, json_get_udf,
+};
 use datafusion_functions_json::{JSON_UNION_DATA_TYPE, JsonUnionEncoder, JsonUnionValue};
 
 /// One element of a `json_get_*` path. The functions take a variadic path, not
@@ -90,6 +92,13 @@ fn get_int(json: &str, path: &[Path]) -> Option<i64> {
     match call(&json_get_int_udf(), json, path, DataType::Int64) {
         ScalarValue::Int64(value) => value,
         other => panic!("json_get_int returned {other:?}, not an Int64"),
+    }
+}
+
+fn get_str(json: &str, path: &[Path]) -> Option<String> {
+    match call(&json_get_str_udf(), json, path, DataType::Utf8) {
+        ScalarValue::Utf8(value) => value,
+        other => panic!("json_get_str returned {other:?}, not a Utf8"),
     }
 }
 
@@ -139,6 +148,60 @@ fn json_get_float_reads_negative_numbers() {
             "json_get_float over {value}"
         );
     }
+}
+
+#[test]
+fn json_get_str_answers_only_for_a_string_node() {
+    // The BigQuery translation guards `JSON_VALUE` with a test for the node's
+    // own JSON token precisely because of this: `JSON_VALUE` renders a number
+    // as its digits and a bool as `true`/`false`, where `json_get_str` is NULL.
+    // If this list ever gains a non-string that answers, that guard is wrong.
+    for value in [
+        "1",
+        "-1",
+        "0",
+        "1.5",
+        "-1e3", // every number shape
+        "true",
+        "false", // and both bools
+        "null",
+        "{}",
+        "[]",
+        r#"{"b": "c"}"#,
+        r#"["a"]"#,
+    ] {
+        assert_eq!(
+            get_str(&doc(value), A),
+            None,
+            "json_get_str over the non-string {value}"
+        );
+    }
+
+    for (value, expected) in [
+        (r#""abc""#, "abc"),
+        (r#""-42""#, "-42"),   // a numeric string is still a string
+        (r#""""#, ""),         // including an empty one
+        (r#""a\"b""#, "a\"b"), // escapes come back decoded
+        (r#""a\\b""#, "a\\b"),
+        (r#""\u00e9""#, "\u{e9}"),
+    ] {
+        assert_eq!(
+            get_str(&doc(value), A).as_deref(),
+            Some(expected),
+            "json_get_str over the string {value}"
+        );
+    }
+}
+
+#[test]
+fn json_get_str_is_null_for_a_miss_not_an_error() {
+    assert_eq!(
+        get_str(&doc(r#""abc""#), &[Path::Key("b")]),
+        None,
+        "wrong key"
+    );
+    assert_eq!(get_str("[1]", A), None, "key on a non-object");
+    assert_eq!(get_str("{", A), None, "malformed document");
 }
 
 #[test]
