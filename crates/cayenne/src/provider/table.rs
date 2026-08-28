@@ -17205,6 +17205,10 @@ impl CayenneTableProvider {
         let mut unlinked_files = 0_u64;
         let mut unlinked_bytes = 0_u64;
         let mut reclaimed_tombstones = 0_u64;
+        // A file this pass could not unlink stays on disk until some later sweep
+        // succeeds, so it outranks whatever the pass did reclaim when naming the
+        // outcome: the file that will not go away is the actionable half.
+        let mut failed_unlinks = 0_usize;
         let mut record_unlinked = |df: &crate::metadata::DeleteFile| {
             unlinked_files = unlinked_files.saturating_add(1);
             unlinked_bytes =
@@ -17240,6 +17244,7 @@ impl CayenneTableProvider {
                 }
                 Err(e) => {
                     // Leave the row so a later sweep retries the unlink.
+                    failed_unlinks += 1;
                     tracing::warn!(
                         table = self.table_metadata.table_name.as_str(),
                         path = %df.path,
@@ -17295,7 +17300,15 @@ impl CayenneTableProvider {
         maintenance_metrics::track_maintenance(
             table_name,
             MaintenanceOp::OrphanDvSweep,
-            MaintenanceOutcome::Reclaimed,
+            // Mixed success is `failed`, matching the retired-directory sweep:
+            // the reclaim totals say what came back, and this says whether
+            // anything was left behind. Reporting `reclaimed` because the
+            // majority succeeded would hide a file that never goes away.
+            if failed_unlinks > 0 {
+                MaintenanceOutcome::Failed
+            } else {
+                MaintenanceOutcome::Reclaimed
+            },
         );
         maintenance_metrics::track_reclaimed(
             table_name,
@@ -17311,6 +17324,7 @@ impl CayenneTableProvider {
             unlinked_files,
             unlinked_bytes,
             reclaimed_tombstones,
+            failed_unlinks,
             "Orphaned-DV sweep: reclaimed {} orphaned key-based deletion vector(s)",
             removed_ids.len()
         );
