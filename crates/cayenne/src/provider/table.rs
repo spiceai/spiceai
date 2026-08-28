@@ -9407,20 +9407,35 @@ impl CayenneTableProvider {
         if self.sharded_pk_keyset_cache.lock().is_some() {
             return false;
         }
-        // A registered protected snapshot means rows outside the current manifest.
-        if !self.protected_snapshots.load().is_empty() {
-            return false;
-        }
         // A staged append holds rows in a private staging directory that no
         // listing here can see, and its Stage A does not register the target in
-        // `protected_snapshots`, so the checks above all read empty while a live
+        // `protected_snapshots`, so every other check reads empty while a live
         // primary key exists. Installing an empty cache over it means validation
         // answers from that cache and never rebuilds — so neither the mem-tier
         // fold nor the staged fold runs, and the next write of that key reads it
         // as new and leaves two live rows for it. This is the emptiness proof's
         // fifth place a live row can sit; a false `false` only costs the lazy
         // rebuild the probe exists to skip.
+        //
+        // THIS CHECK MUST PRECEDE the `protected_snapshots` read below, and the
+        // order is the whole of what makes the pair sound without a lock held
+        // across both. These are two separate atomic reads, so a Stage B publish
+        // can land between them — it needs only the visibility lock and the
+        // listing fence, not `write_lock`, so holding `write_lock` here does not
+        // exclude it. Publishing registers the protected snapshot BEFORE it
+        // unregisters the in-flight append (`apply_under_barrier`, then
+        // `finish` → `mark_inflight_complete`), so reading in-flight first means
+        // an empty read here implies that append either has not registered yet
+        // (it cannot publish before it does, and the table is genuinely empty
+        // now) or has already published — in which case its protected snapshot
+        // was registered before this read and the check below sees it. Reading
+        // protected first inverts that: the publish can slip between the two
+        // reads and leave both looking empty over live rows.
         if self.has_inflight_staging_appends() {
+            return false;
+        }
+        // A registered protected snapshot means rows outside the current manifest.
+        if !self.protected_snapshots.load().is_empty() {
             return false;
         }
         self.mem_tier.is_empty() && self.inlined_row_count.load(Ordering::Acquire) == 0
