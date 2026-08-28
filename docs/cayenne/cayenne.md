@@ -555,7 +555,7 @@ Deletes never rewrite data. They are recorded as **deletion vectors** — Arrow-
 | Mode | Schema | When |
 |------|--------|------|
 | **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or any table in `deletion_mode: position` |
-| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for `changes`-mode PK tables) |
+| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for PK tables) |
 
 At scan time three strategies are wired up in `PkDeletionStrategyWithCache`:
 
@@ -1293,7 +1293,7 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 | `cayenne_metastore` | `sqlite` (default) or `turso` | `sqlite` |
 | `cayenne_file_path` | data path (local or `s3://…--x-s3/…`) | `{spice_data}/{dataset}/` |
 | `cayenne_pk_conflict_detection` | `auto` (resolve upserts) or `none` (blind append) | `auto` |
-| `cayenne_deletion_mode` | `auto` / `key` / `position` (`auto` ⇒ key for `changes` PK tables) | `auto` |
+| `cayenne_deletion_mode` | `auto` / `key` / `position` (`auto` ⇒ key for PK tables) | `auto` |
 | `cayenne_cdc_durability` | `memory` (default, eligibility-gated) or `file` | `memory` |
 | `cayenne_integrity_checksums` | opt-in end-to-end integrity checks — XXH3-64 envelope per staging-WAL record + `xxh3-128` digest per Vortex data file, verified before first scan; off is byte-identical to the pre-feature format (enabled by any value other than `false`) | off |
 | `cayenne_target_file_size_mb` | Vortex file target size | `256` |
