@@ -15548,8 +15548,17 @@ impl CayenneTableProvider {
             // A worker that ends abnormally — a panic during unwind, or the task
             // being dropped on abort — never reaches the exchange below, so
             // republish idle here or a stuck state would permanently suppress
-            // future sweeps on a long-lived provider. Disarmed on the clean exit
-            // path so this cannot stomp a state a LATER worker already owns.
+            // future sweeps on a long-lived provider AND hang
+            // `drain_in_flight_maintenance`. Disarmed on the clean exit path so
+            // this cannot stomp a state a LATER worker already owns.
+            //
+            // This deliberately drops a signal that arrived before the abnormal
+            // exit rather than re-arming a worker from `Drop`: the abort case IS
+            // runtime shutdown, where spawning panics inside an unwind. Losing one
+            // edge is bounded — the startup pass replays it on the next open, which
+            // is the same repair a crash between a publication and its signal
+            // needs — whereas leaving the state dirty with no worker wedges the
+            // sweep permanently.
             struct ResetOnAbnormalExit {
                 state: Arc<AtomicU8>,
                 armed: bool,
@@ -15718,17 +15727,17 @@ impl CayenneTableProvider {
     /// OLDEST rows there, so their sequences sit below every warm one. Leaving the
     /// tier out overstates the floor and marks DVs that still hide superseded
     /// cold-resident rows orphan-eligible — deleting them durably resurrects those
-    /// rows on the next load. Cold files record the original commit sequences of
-    /// the rows they hold, so their minimum bounds the floor exactly as a warm
-    /// snapshot's manifest does.
+    /// rows on the next load. A cold file's manifest `min_sequence` is a LOWER
+    /// BOUND on the commit sequences it holds, not an exact range, so its minimum
+    /// bounds the floor the same way a warm snapshot's manifest does.
     ///
-    /// Promotion records a conservative `min_sequence` of `0` (it re-materializes
-    /// the whole table, so a per-file lower bound is not meaningful), which pins
-    /// the floor to `0` for any table holding cold files — no key DV is reclaimed
-    /// there. That is the correct outcome as well as the safe one: a promotion
-    /// clears every delete-file row it applied, so each DV recorded afterwards
-    /// carries a sequence above every cold row and genuinely hides one, until the
-    /// next promotion applies and clears it in turn.
+    /// Promotion records that bound as `0` — it re-materializes the whole table, so
+    /// a per-file lower bound is not meaningful — which pins the floor to `0` for
+    /// any table holding cold files, and no key DV is reclaimed there. That is the
+    /// correct outcome as well as the safe one: a promotion clears every
+    /// delete-file row it applied, so each DV recorded afterwards carries a
+    /// sequence above every cold row and genuinely hides one, until the next
+    /// promotion applies and clears it in turn.
     async fn cold_snapshot_floor(
         catalog: &dyn MetadataCatalog,
         table_id: &str,
@@ -15903,7 +15912,11 @@ impl CayenneTableProvider {
                     tracing::warn!(
                         table = self.table_metadata.table_name.as_str(),
                         path = %df.path,
-                        "Orphaned-DV sweep: failed to unlink DV file: {e}"
+                        "Failed to delete the reclaimable deletion vector '{}' of table '{}', so \
+                         it keeps using disk; its catalog row is kept and a later sweep retries \
+                         the delete. Cause: {e}",
+                        df.path,
+                        self.table_metadata.table_name
                     );
                 }
             }
@@ -15920,8 +15933,11 @@ impl CayenneTableProvider {
         {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
-                "Orphaned-DV sweep: failed to remove {} delete-file row(s): {e}",
-                removed_ids.len()
+                "Failed to drop {} reclaimed deletion-vector row(s) of table '{}' after deleting \
+                 their files, so the rows dangle until the next provider restart self-heals \
+                 them; no data is lost. Cause: {e}",
+                removed_ids.len(),
+                self.table_metadata.table_name
             );
             return OrphanDvSweepPass::Complete;
         }
@@ -15929,8 +15945,9 @@ impl CayenneTableProvider {
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             floor,
-            "Orphaned-DV sweep: reclaimed {} orphaned key-based deletion vector(s)",
-            removed_ids.len()
+            "Reclaimed {} orphaned deletion vector(s) of table '{}'",
+            removed_ids.len(),
+            self.table_metadata.table_name
         );
 
         // Saturated ONLY when this pass reclaimed a full batch: that is strict,
@@ -15989,7 +16006,10 @@ impl CayenneTableProvider {
             Err(e) => {
                 tracing::warn!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to read current snapshot manifest: {e}"
+                    "Failed to read the current snapshot manifest of table '{}', so no orphaned \
+                     deletion vector is reclaimed this pass and their '.arrow' files keep using \
+                     disk; the next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
                 );
                 return None;
             }
@@ -16003,7 +16023,10 @@ impl CayenneTableProvider {
                 Err(e) => {
                     tracing::warn!(
                         table = self.table_metadata.table_name.as_str(),
-                        "Orphaned-DV sweep: failed to list current snapshot files: {e}"
+                        "Failed to list the current snapshot files of table '{}', so no orphaned \
+                         deletion vector is reclaimed this pass and their '.arrow' files keep \
+                         using disk; the next compaction or provider restart retries. Cause: {e}",
+                        self.table_metadata.table_name
                     );
                     return None;
                 }
@@ -16019,8 +16042,10 @@ impl CayenneTableProvider {
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 snapshot_id = %current_snapshot_id,
-                "Orphaned-DV sweep: current snapshot manifest empty but directory non-empty; \
-                 skipping this pass (cannot prove no live row is shadowed)"
+                "Declined to reclaim orphaned deletion vectors on table '{}': its current \
+                 snapshot manifest is empty while the directory holds files, so no live row can \
+                 be proven unshadowed; the next compaction or provider restart retries",
+                self.table_metadata.table_name
             );
             None
         })?;
@@ -16029,7 +16054,10 @@ impl CayenneTableProvider {
             Err(e) => {
                 tracing::warn!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to compute surviving-sequence floor: {e}"
+                    "Failed to read the protected-snapshot sequences of table '{}', so no \
+                     orphaned deletion vector is reclaimed this pass and their '.arrow' files \
+                     keep using disk; the next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
                 );
                 return None;
             }
@@ -16045,7 +16073,10 @@ impl CayenneTableProvider {
             Err(e) => {
                 tracing::warn!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to read the cold manifest: {e}"
+                    "Failed to read the datalake manifest of table '{}', so no orphaned deletion \
+                     vector is reclaimed this pass and their '.arrow' files keep using disk; the \
+                     next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
                 );
                 return None;
             }
@@ -16061,7 +16092,10 @@ impl CayenneTableProvider {
             Err(e) => {
                 tracing::warn!(
                     table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to list orphan-eligible delete files: {e}"
+                    "Failed to list the reclaimable deletion vectors of table '{}', so none is \
+                     reclaimed this pass and their '.arrow' files keep using disk; the next \
+                     compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
                 );
                 return None;
             }
