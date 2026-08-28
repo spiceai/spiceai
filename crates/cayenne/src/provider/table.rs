@@ -15387,6 +15387,46 @@ impl CayenneTableProvider {
             )?
         };
 
+        // Author the new snapshot's manifest BEFORE the commit, so the
+        // publish-before-clear invariant holds when the post-commit prune drops
+        // the old current snapshot's rows (a crash between commit and prune then
+        // leaves the new file set already recorded). This subset rewrite carries
+        // exactly `source_snapshot_id`'s live files forward (unpicked hardlinks +
+        // the re-encoded candidate), so its true range is the merged commit-seq
+        // range over `source_snapshot_id`; fall back to the conservative
+        // `[0, current table sequence]` when the source manifest is unavailable,
+        // which keeps the output always bake-eligible (`min = 0`). Best-effort:
+        // a manifest failure must not fail the compaction, so log and continue —
+        // the scan still resolves files from the directory listing.
+        let source_ids = [source_snapshot_id.to_string()];
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&source_ids)
+            .await
+            .unwrap_or((0, self.table_metadata.current_sequence_number));
+        let manifest_authored = match self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author snapshot manifest before subset small-file compaction commit; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
@@ -15427,6 +15467,44 @@ impl CayenneTableProvider {
             self.new_files_since_last_compaction
                 .store(0, Ordering::Release);
             drop(listing_guard);
+        }
+
+        // Commit succeeded: `new_snapshot_id` is now the only live snapshot (the
+        // subset path runs only when there are no protected snapshots, per
+        // `can_subset_rewrite_current_small_files`), so every other snapshot's
+        // manifest rows — including `source_snapshot_id`'s — are dead. Without
+        // this prune those rows leak on every subset pass, unbounded. Run it AFTER
+        // the commit so a failed commit leaves the old snapshot's rows intact, and
+        // only when the new manifest was authored above (publish-before-clear).
+        // Best-effort: a prune failure must not fail the compaction.
+        if manifest_authored
+            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to prune stale snapshot manifest rows after subset small-file compaction commit"
+            );
+        }
+
+        // The per-file statistics cache (`cayenne_snapshot_file_statistics`) keys
+        // by snapshot, so the old current snapshot's stats rows are now dead too.
+        // `_except(new)` deletes exactly them: after the flip `new_snapshot_id` is
+        // the only live snapshot. Best-effort, mirroring the manifest prune.
+        if let Err(error) = self
+            .catalog
+            .clear_snapshot_file_statistics_except(&self.table_metadata.table_id, &new_snapshot_id)
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to clear stale per-file snapshot statistics after subset small-file compaction commit"
+            );
         }
 
         self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
@@ -33014,6 +33092,163 @@ mod tests {
             ids,
             (0..200).collect::<Vec<i64>>(),
             "the subset rewrite must preserve every row"
+        );
+    }
+
+    /// A committed subset small-file rewrite must delete the old current
+    /// snapshot's catalog rows at the commit — both its manifest
+    /// (`cayenne_snapshot_file`) and its per-file stats cache
+    /// (`cayenne_snapshot_file_statistics`). Without the prune, every subset pass
+    /// on a repeatedly-compacted table leaks those rows unbounded, because the
+    /// subset path only flips the current pointer and never clears the snapshot
+    /// it leaves behind. Safe to prune to the single new snapshot because the
+    /// subset path runs only when there are no protected snapshots.
+    #[tokio::test]
+    async fn subset_rewrite_deletes_old_snapshot_manifest_and_stats_rows() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_manifest_gc",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        let source_snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&source_snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to rewrite, listed {} file(s)",
+            files.len()
+        );
+
+        // Author the source snapshot's manifest and seed a stats-cache row so the
+        // precondition is a populated old snapshot; the fix must delete both.
+        provider.rebuild_live_snapshot_manifests().await;
+        let table_id = provider.table_metadata.table_id.clone();
+        provider
+            .catalog
+            .upsert_snapshot_file_statistics(&crate::metadata::SnapshotFileStatistics {
+                table_id: table_id.clone(),
+                snapshot_id: source_snapshot_id.clone(),
+                file_path: files[0].0.clone(),
+                file_size_bytes: i64::try_from(files[0].1).unwrap_or(i64::MAX),
+                num_rows: 50,
+                statistics_blob: Vec::new(),
+            })
+            .await
+            .expect("seed source stats-cache row");
+
+        assert!(
+            !provider
+                .catalog
+                .get_snapshot_files(&table_id, &source_snapshot_id)
+                .await
+                .expect("read source manifest")
+                .is_empty(),
+            "precondition: the source snapshot must have manifest rows before the rewrite"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_file_statistics(&table_id, &source_snapshot_id, &files[0].0)
+                .await
+                .expect("read source stats cache")
+                .is_some(),
+            "precondition: the source snapshot must have a stats-cache row before the rewrite"
+        );
+
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &source_snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite succeeds");
+        assert!(committed, "the subset rewrite must commit");
+
+        let new_snapshot_id = provider.get_current_snapshot_id();
+        assert_ne!(
+            new_snapshot_id, source_snapshot_id,
+            "a committed subset rewrite must publish a new snapshot"
+        );
+
+        // The leak this fix closes: the old current snapshot's catalog rows must
+        // be gone after the commit.
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(&table_id, &source_snapshot_id)
+                .await
+                .expect("read source manifest after commit")
+                .is_empty(),
+            "the source snapshot's manifest rows must be deleted at the subset commit"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_file_statistics(&table_id, &source_snapshot_id, &files[0].0)
+                .await
+                .expect("read source stats cache after commit")
+                .is_none(),
+            "the source snapshot's stats-cache rows must be deleted at the subset commit"
+        );
+
+        // The new snapshot keeps its freshly authored manifest rows.
+        assert!(
+            !provider
+                .catalog
+                .get_snapshot_files(&table_id, &new_snapshot_id)
+                .await
+                .expect("read new manifest after commit")
+                .is_empty(),
+            "the new snapshot must keep its authored manifest rows"
         );
     }
 
