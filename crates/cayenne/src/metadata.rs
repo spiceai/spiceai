@@ -2118,6 +2118,29 @@ pub struct InlinedDataStats {
     pub tombstone_ipc_bytes: i64,
 }
 
+/// Metastore bytes a `cayenne_inlined_delete` row costs beyond its `delete_ipc`
+/// payload: the `inlined_id` and `table_id` UUID text, the sequence number, the
+/// timestamp, the activation flag, the row header, and the
+/// `(table_id, sequence_number)` index entry.
+///
+/// Charged so a budget spent against tombstone size bounds their ROW count too.
+/// A single-key `Int64` tombstone's payload is 9 bytes — one format tag plus one
+/// big-endian key — so a payload-only budget would admit on the order of ten
+/// times the metastore it accounts for.
+pub const INLINED_DELETE_ROW_OVERHEAD_BYTES: i64 = 128;
+
+impl InlinedDataStats {
+    /// Metastore bytes the inline tombstones occupy: payload plus per-row
+    /// overhead. What the reclamation budget is spent against.
+    #[must_use]
+    pub fn tombstone_metastore_bytes(&self) -> i64 {
+        self.tombstone_ipc_bytes.saturating_add(
+            self.tombstone_entry_count
+                .saturating_mul(INLINED_DELETE_ROW_OVERHEAD_BYTES),
+        )
+    }
+}
+
 impl InlinedData {
     /// Build an inline data row whose identity, sequence number, and timestamp
     /// are assigned by `MetadataCatalog::commit_inlined_mutation`.

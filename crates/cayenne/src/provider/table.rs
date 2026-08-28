@@ -701,13 +701,18 @@ fn inline_memtable_pressure_with_thresholds(
         return Some(InlineMemtablePressure::IpcBytes);
     }
     // The checkpoint is also the only reclaimer of `cayenne_inlined_delete`, and
-    // that table grows on workloads that leave the corpus empty (#13621), so a
-    // corpus under every threshold above is not on its own a reason to skip.
-    // Gated on an EMPTY corpus because that is the only case the thresholds above
-    // cannot already reach: with entries present the next flush clears both
-    // tables in the same call, and checkpointing early would write a needless
-    // small file that compaction then has to merge back.
-    if stats.entry_count == 0 && stats.tombstone_ipc_bytes >= max_bytes {
+    // that table grows on workloads that leave the corpus below every threshold
+    // above (#13621), so a corpus under them is not on its own a reason to skip.
+    //
+    // Deliberately NOT gated on an empty corpus. A table that retains even one
+    // small inline entry — including one whose rows are already tombstoned —
+    // sits under the row, segment and byte thresholds forever while file-backed
+    // upserts keep appending tombstones, so an empty-corpus gate would leave
+    // exactly the unbounded growth this reclamation exists to stop. The cost of
+    // not gating is that a small corpus is occasionally flushed early, writing a
+    // small file for compaction to merge; that happens at most once per budget
+    // and is the cheaper side of the trade by a wide margin.
+    if stats.tombstone_metastore_bytes() >= max_bytes {
         return Some(InlineMemtablePressure::Tombstones);
     }
     None
@@ -1869,7 +1874,11 @@ pub struct CayenneTableProvider {
     /// Bytes rather than rows so the reclamation tracks metastore growth instead
     /// of write rate: one row can hold a single key or tens of thousands, and a
     /// row-count trigger would fire every N writes on a table whose tombstones are
-    /// tiny while letting a few enormous ones sit.
+    /// tiny while letting a few enormous ones sit. Each row is charged
+    /// [`crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES`] on top of its
+    /// payload, so the same budget also bounds how MANY rows accumulate — a
+    /// single-key tombstone's payload is 9 bytes and would otherwise be nearly
+    /// free.
     ///
     /// Seeded from the authoritative catalog read at open (so tombstones inherited
     /// from a prior process are reclaimed on this table's first write rather than
@@ -7131,7 +7140,9 @@ impl CayenneTableProvider {
                 crate::provider::structural_version::StructuralVersion::new(),
             ),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
-            inlined_tombstone_bytes: Arc::new(AtomicI64::new(inlined_stats.tombstone_ipc_bytes)),
+            inlined_tombstone_bytes: Arc::new(AtomicI64::new(
+                inlined_stats.tombstone_metastore_bytes(),
+            )),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
@@ -14335,7 +14346,9 @@ impl CayenneTableProvider {
         // A table whose rows never land inline reaches no other inline-checkpoint
         // trigger: every one of them is gated on a non-empty corpus.
         self.inlined_tombstone_bytes.fetch_add(
-            i64::try_from(ipc_bytes).unwrap_or(i64::MAX),
+            i64::try_from(ipc_bytes)
+                .unwrap_or(i64::MAX)
+                .saturating_add(crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES),
             Ordering::Relaxed,
         );
         // Only for a tombstone that is already active. The staged path writes an
@@ -14355,9 +14368,20 @@ impl CayenneTableProvider {
     /// Cheap enough to call from a write path: one relaxed atomic load, and the
     /// schedule itself coalesces to at most one in-flight pass per table.
     fn arm_inline_tombstone_reclaim(&self) {
-        if self.inline_tombstone_reclaim_due() {
-            self.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+        if !self.inline_tombstone_reclaim_due() {
+            return;
         }
+        // Reachable from `PreparedOnConflictDeletionPublish`'s destructor, which
+        // is supported outside a Tokio runtime — it falls back to a plain thread
+        // for its own file cleanup. `tokio::spawn` panics with no runtime
+        // entered, and a panic in a destructor that is already unwinding aborts
+        // the process. The arm is best-effort by construction (the next release
+        // or tombstone write re-arms), so skip it rather than reach for a runtime
+        // that may not be there.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        self.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
     }
 
     /// Whether the inline tombstone table has grown past the budget that makes a
@@ -14380,9 +14404,17 @@ impl CayenneTableProvider {
     /// checkpoint defers inside this window, so the release is the seam that has
     /// to re-arm it.
     fn release_pending_inline_tombstone(&self) {
-        self.pending_inline_tombstones
-            .fetch_sub(1, Ordering::AcqRel);
-        self.arm_inline_tombstone_reclaim();
+        // `fetch_sub` returns the PREVIOUS value, so this arms only on the
+        // release that empties the window. An earlier release still leaves a
+        // staged tombstone in flight, and a pass spawned then could only defer on
+        // it — burning the coalescing slot to do nothing.
+        if self
+            .pending_inline_tombstones
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.arm_inline_tombstone_reclaim();
+        }
     }
 
     /// Synchronously store a deferred on-conflict deletion-cache update into the
@@ -15948,11 +15980,34 @@ impl CayenneTableProvider {
             }
             .await;
 
-            if let Err(e) = result {
+            let failed = if let Err(e) = result {
                 tracing::warn!(
                     table = table.table_metadata.table_name.as_str(),
                     "Auto-checkpoint of inline memtable failed: {e}"
                 );
+                true
+            } else {
+                false
+            };
+
+            // Release the coalescing slot HERE rather than leaving it to
+            // `ClearOnDrop`, then re-check. Without this an arm that raced this
+            // pass is lost: a `release_pending_inline_tombstone` firing while the
+            // pass is still running loses its `swap(true)` and schedules nothing,
+            // and the clear that follows leaves no task behind — so a table that
+            // goes idle right there stays over budget until its next write.
+            // Storing `false` twice is harmless.
+            table
+                .inline_checkpoint_scheduled
+                .store(false, Ordering::Release);
+
+            // Re-arm only where a fresh pass would make progress, so this cannot
+            // spin: a pass that deferred on an unpublished staged tombstone would
+            // just defer again (its release arms once the window closes), and one
+            // that failed would fail again. Otherwise the next pass reclaims and
+            // re-syncs the budget, after which the arm is a no-op.
+            if !failed && table.pending_inline_tombstones.load(Ordering::Acquire) == 0 {
+                table.arm_inline_tombstone_reclaim();
             }
         });
     }
@@ -27148,7 +27203,7 @@ impl CayenneTableProvider {
             // rolled-back tombstone write cannot leave it permanently over the
             // threshold.
             self.inlined_tombstone_bytes
-                .store(stats.tombstone_ipc_bytes, Ordering::Relaxed);
+                .store(stats.tombstone_metastore_bytes(), Ordering::Relaxed);
 
             // Ask BOTH inline tables whether there is anything to clear — the
             // clear below empties both, and they do not empty together (see
@@ -27428,7 +27483,7 @@ impl CayenneTableProvider {
         // consulted, so a rolled-back tombstone write cannot leave it permanently
         // over the threshold and re-arm this pass forever.
         self.inlined_tombstone_bytes
-            .store(stats.tombstone_ipc_bytes, Ordering::Relaxed);
+            .store(stats.tombstone_metastore_bytes(), Ordering::Relaxed);
 
         let Some(pressure) = inline_memtable_pressure_with_thresholds(
             stats,
@@ -34486,8 +34541,8 @@ mod tests {
             }),
             Some(InlineMemtablePressure::IpcBytes)
         );
-        // Tombstones over budget against an EMPTY corpus: the reclaim-only
-        // checkpoint #13621 added, which no corpus threshold can reach.
+        // Tombstones over budget: the reclaim-only checkpoint #13621 added,
+        // which no corpus threshold can reach.
         assert_eq!(
             inline_memtable_pressure(InlinedDataStats {
                 tombstone_ipc_bytes: INLINE_FLUSH_MAX_BYTES,
@@ -34497,15 +34552,56 @@ mod tests {
         );
     }
 
-    /// With inline entries present the corpus thresholds already bound both
-    /// tables — the next flush clears them together — so tombstones alone must
-    /// NOT pull the checkpoint forward and emit a needless small file.
+    /// A retained inline entry must NOT switch the tombstone reclamation off.
+    ///
+    /// One small segment — including one whose rows are all tombstoned — sits
+    /// under the row, segment and byte thresholds indefinitely, so gating the
+    /// tombstone term on an empty corpus would let `cayenne_inlined_delete` grow
+    /// without bound on any table that keeps a single inline entry while
+    /// file-backed upserts append tombstones.
     #[test]
-    fn inline_memtable_pressure_ignores_tombstones_while_the_corpus_is_occupied() {
+    fn inline_memtable_pressure_reports_tombstones_while_the_corpus_is_occupied() {
         assert_eq!(
             inline_memtable_pressure(InlinedDataStats {
+                record_count: 1,
                 entry_count: 1,
-                tombstone_ipc_bytes: INLINE_FLUSH_MAX_BYTES * 100,
+                ipc_bytes: 64,
+                tombstone_ipc_bytes: INLINE_FLUSH_MAX_BYTES,
+                tombstone_entry_count: 1,
+            }),
+            Some(InlineMemtablePressure::Tombstones)
+        );
+    }
+
+    /// The budget bounds tombstone ROW count too, via the per-row overhead
+    /// charge. A single-key `Int64` tombstone's payload is 9 bytes, so a
+    /// payload-only budget would admit ~930K rows at the 8 MiB default — far more
+    /// metastore than the budget names.
+    #[test]
+    fn inline_memtable_pressure_charges_tombstone_rows_their_metastore_overhead() {
+        let rows_to_fill =
+            INLINE_FLUSH_MAX_BYTES / crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES;
+
+        // Payload bytes alone are negligible at this row count...
+        let stats = InlinedDataStats {
+            tombstone_entry_count: rows_to_fill,
+            tombstone_ipc_bytes: 9 * rows_to_fill,
+            ..InlinedDataStats::default()
+        };
+        assert!(
+            stats.tombstone_ipc_bytes < INLINE_FLUSH_MAX_BYTES,
+            "the point of this test is that the payloads alone stay under budget"
+        );
+        // ...but the rows themselves are what fills the metastore.
+        assert_eq!(
+            inline_memtable_pressure(stats),
+            Some(InlineMemtablePressure::Tombstones)
+        );
+
+        // One row short of the budget stays quiet.
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                tombstone_entry_count: rows_to_fill - 1,
                 ..InlinedDataStats::default()
             }),
             None
@@ -50511,6 +50607,64 @@ mod tests {
     /// writer's `apply_under_barrier` (which is the future code path that
     /// will replace `refresh_listing_table` for cross-partition commits) is
     /// fenced out.
+    /// Arming the tombstone reclamation must never panic when there is no Tokio
+    /// runtime entered.
+    ///
+    /// `PreparedOnConflictDeletionPublish`'s destructor reaches this through
+    /// `restore_aborted_inline_tombstone_bookkeeping`, and that destructor is
+    /// supported with no runtime — it falls back to a plain thread for its own
+    /// file cleanup. A bare `tokio::spawn` there panics, and a panic in a
+    /// destructor that is already unwinding aborts the whole process.
+    #[tokio::test]
+    async fn arming_the_tombstone_reclaim_is_safe_with_no_runtime() {
+        let temp_dir = tempfile::TempDir::new().expect("create tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("create data dir");
+
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "tombstone_arm_no_runtime".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let catalog_dyn: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let table = CayenneTableProvider::create_table(catalog_dyn, options, runtime_env)
+            .await
+            .expect("create table");
+
+        // Over budget, so the arm would reach the scheduler if it were not
+        // guarded — without this the test would pass for the wrong reason.
+        table
+            .inlined_tombstone_bytes
+            .store(i64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            table.inline_tombstone_reclaim_due(),
+            "the arm must actually be due, or this proves nothing"
+        );
+
+        // A plain thread has no runtime entered, exactly like a destructor run
+        // during shutdown. `join` reports a panic as `Err`.
+        let table_for_thread = table.clone_for_write();
+        std::thread::spawn(move || table_for_thread.arm_inline_tombstone_reclaim())
+            .join()
+            .expect("arming the tombstone reclaim must not panic without a runtime");
+    }
+
     #[tokio::test]
     async fn read_fence_blocks_write_fence_acquisition() {
         let temp_dir = tempfile::TempDir::new().expect("create tempdir");
