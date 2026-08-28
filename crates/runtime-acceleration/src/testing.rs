@@ -74,6 +74,15 @@ impl TestAccelerationSource {
         }
     }
 
+    /// The app this source belongs to. Load-bearing for any engine that derives a path
+    /// or a name from it — Cayenne's S3 bucket names embed the app name — so a test that
+    /// asserts on one must supply its own app rather than take the default.
+    #[must_use]
+    pub fn with_app(mut self, app: impl Into<Arc<app::App>>) -> Self {
+        self.app = app.into();
+        self
+    }
+
     #[must_use]
     pub fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
         self.acceleration = Some(acceleration);
@@ -98,6 +107,18 @@ impl TestAccelerationSource {
     pub fn with_on_schema_change(mut self, on_schema_change: OnSchemaChange) -> Self {
         self.on_schema_change = Some(on_schema_change);
         self
+    }
+
+    /// Sets the acceleration after construction, for a test that builds the source
+    /// first and configures it later — the shape `Dataset`'s public field allowed.
+    pub fn set_acceleration(&mut self, acceleration: Acceleration) {
+        self.acceleration = Some(acceleration);
+    }
+
+    /// Sets the schema-change policy after construction, for the same reason as
+    /// [`Self::set_acceleration`].
+    pub fn set_on_schema_change(&mut self, on_schema_change: OnSchemaChange) {
+        self.on_schema_change = Some(on_schema_change);
     }
 
     /// Whether the source takes writes of its own; `true` unless set otherwise, matching

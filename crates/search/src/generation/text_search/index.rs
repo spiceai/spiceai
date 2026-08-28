@@ -34,12 +34,14 @@ use tantivy::schema::{
     TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
-use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
+use tantivy_datafusion_filter::{
+    array_to_terms, is_tokenized, set_document_values, text_tokenizer,
+};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
-use crate::generation::text_search::util::with_json_subset_column;
+use crate::generation::text_search::util::{with_json_subset_column, without_columns};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
@@ -56,6 +58,17 @@ pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 /// Tantivy's built-in English Snowball-stemmed tokenizer.
 static EN_STEM_TOKENIZER_NAME: &str = "en_stem";
+
+/// Whether primary-key deletion needs the derived `INDEX_UNIQUE_FIELD_NAME` addressing field
+/// rather than an exact-match term on the primary key column(s) directly.
+///
+/// This is true whenever a primary key column's own tantivy field is tokenized: a single
+/// primary key column that also appears in `search_fields` is indexed as `TEXT`, not `STRING`
+/// (see `create_tantivy_schema`), so a delete term built from its raw, untokenized value would
+/// never match the tokenized postings actually written for it.
+fn needs_unique_field(primary_key: &[String], search_fields: &[String]) -> bool {
+    primary_key.len() > 1 || primary_key.iter().any(|p| search_fields.contains(p))
+}
 
 /// A [`TextOptions`] for [`tantivy::schema::TEXT`] with [`EN_STEM_TOKENIZER_NAME`] tokenization.
 fn tokenized_text_options() -> TextOptions {
@@ -307,28 +320,39 @@ impl Index for FullTextDatabaseIndex {
         // index state, so surface the error and leave `defer_commit` unset (the
         // writer keeps its per-write commit behavior rather than deferring on a
         // writer in an unknown state).
-        let mut index_writer = self.writer.lock().await;
-        rollback_writer(&mut index_writer)
-            .context(TextSearchIndexingSnafu)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // The writer operations below (rollback, delete_all_documents) are
+        // synchronous tantivy work, so run them off the async runtime thread. The
+        // writer lock is taken and the flag stored inside the blocking task, so the
+        // reset + clear + flag store stay atomic w.r.t. `compute_index` exactly as
+        // before.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        let is_replace_all = window == WriteWindow::ReplaceAll;
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            rollback_writer(&mut index_writer).context(TextSearchIndexingSnafu)?;
 
-        // A replacing write reproduces the table's whole contents, so every document this index
-        // already holds is either re-sent by this window or belongs to a row the source dropped.
-        // Stage the clear *inside* the window that is about to open: `delete_all_documents`
-        // needs a commit to take effect, so the wipe and the repopulation land in the single
-        // `on_write_complete` commit and a searcher never observes an empty index (#12066).
-        //
-        // Ordering matters. The rollback above discards operations staged by an abandoned
-        // window, and it must happen before the clear so it cannot revert it.
-        if window == WriteWindow::ReplaceAll {
-            index_writer
-                .delete_all_documents()
-                .context(TextSearchIndexingSnafu)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        }
+            // A replacing write reproduces the table's whole contents, so every document this
+            // index already holds is either re-sent by this window or belongs to a row the source
+            // dropped. Stage the clear *inside* the window that is about to open:
+            // `delete_all_documents` needs a commit to take effect, so the wipe and the
+            // repopulation land in the single `on_write_complete` commit and a searcher never
+            // observes an empty index (#12066).
+            //
+            // Ordering matters. The rollback above discards operations staged by an abandoned
+            // window, and it must happen before the clear so it cannot revert it.
+            if is_replace_all {
+                index_writer
+                    .delete_all_documents()
+                    .context(TextSearchIndexingSnafu)?;
+            }
 
-        self.defer_commit.store(true, Ordering::Release);
-        Ok(())
+            defer_commit.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
@@ -338,29 +362,40 @@ impl Index for FullTextDatabaseIndex {
         // and commit the staged window before it is finalized here; clearing it under
         // the lock also ensures a later CDC write is never stuck deferring. Committing
         // when nothing was staged (e.g. an empty refresh) is a harmless no-op.
-        let mut index_writer = self.writer.lock().await;
-        self.defer_commit.store(false, Ordering::Release);
+        // `commit()` fsyncs the file-backed index and the reader reload remaps
+        // segments — both synchronous. Run them off the async runtime thread. The
+        // flag is cleared under the writer lock inside the task, preserving the
+        // ordering guarantee w.r.t. a concurrent `compute_index`.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            defer_commit.store(false, Ordering::Release);
 
-        let commit_result = index_writer
-            .commit()
-            .map(|_| ())
-            .context(FailedToInsertDataIntoIndexSnafu);
-        if let Err(e) = &commit_result {
-            tracing::warn!("Rolling back full-text index writer after failed commit: {e}");
-            if let Err(rb_err) = rollback_writer(&mut index_writer) {
-                tracing::error!("Failed to rollback full-text index writer: {rb_err}");
+            let commit_result = index_writer
+                .commit()
+                .map(|_| ())
+                .context(FailedToInsertDataIntoIndexSnafu);
+            if let Err(e) = &commit_result {
+                tracing::warn!("Rolling back full-text index writer after failed commit: {e}");
+                if let Err(rb_err) = rollback_writer(&mut index_writer) {
+                    tracing::error!("Failed to rollback full-text index writer: {rb_err}");
+                }
             }
-        }
-        drop(index_writer);
-        commit_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            drop(index_writer);
+            commit_result?;
 
-        self.reader
-            .reload()
-            .boxed()
-            .context(InvalidIndexingSnafu {
-                context: "Full-text index committed, but failed to reload the reader to the latest revision. Queries will be served from the previous revision until the next update.".to_string(),
-            })
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            reader
+                .reload()
+                .boxed()
+                .context(InvalidIndexingSnafu {
+                    context: "Full-text index committed, but failed to reload the reader to the latest revision. Queries will be served from the previous revision until the next update.".to_string(),
+                })
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -369,15 +404,23 @@ impl Index for FullTextDatabaseIndex {
         // the flag: otherwise a concurrent `compute_index` could observe the cleared
         // flag, acquire the lock first, and commit the staged partial refresh — making
         // a failed write visible to queries.
-        let mut index_writer = self.writer.lock().await;
-        self.defer_commit.store(false, Ordering::Release);
+        // Rollback is synchronous tantivy work; run it off the async runtime
+        // thread. The flag is cleared under the writer lock inside the task,
+        // preserving the ordering guarantee w.r.t. a concurrent `compute_index`.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            defer_commit.store(false, Ordering::Release);
 
-        // A rollback failure must reach the caller: staged operations that could not
-        // be discarded may leak into a later commit and make a partial refresh
-        // visible.
-        rollback_writer(&mut index_writer)
-            .context(TextSearchIndexingSnafu)
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            // A rollback failure must reach the caller: staged operations that could not
+            // be discarded may leak into a later commit and make a partial refresh
+            // visible.
+            rollback_writer(&mut index_writer).context(TextSearchIndexingSnafu)
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
 
@@ -466,7 +509,8 @@ impl FullTextDatabaseIndex {
     }
 
     /// Given a [`RecordBatch`] of new data, find all [`Term`]s we need to delete. These terms are
-    /// an exact match on either a primary key (if one primary key column), or `INDEX_UNIQUE_FIELD_NAME`.
+    /// an exact match on either a primary key (if one untokenized primary key column), or
+    /// `INDEX_UNIQUE_FIELD_NAME`.
     fn existing_terms_to_delete(
         &self,
         index_schema: &tantivy::schema::Schema,
@@ -477,24 +521,26 @@ impl FullTextDatabaseIndex {
             return Ok(vec![]);
         };
 
-        let (pk_field, pk) = if self.primary_key.len() == 1 {
+        let (pk_field, pk) = if needs_unique_field(&self.primary_key, &self.search_fields) {
+            // Either multiple primary key columns, or the single primary key column is also a
+            // tokenized search field: neither can be addressed with an exact-match term, so
+            // tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME` instead.
+            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
+                return Err(super::Error::InvalidIndexingError {
+                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
+                    context: format!(
+                        "Full text search requires the column '{INDEX_UNIQUE_FIELD_NAME}' for this primary key configuration, but is not present.",
+                    ),
+                });
+            };
+            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
+        } else {
             let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
                 return Err(super::Error::FailedToRetrieveDataFromIndex {
                     source: TantivyError::FieldNotFound(pk.clone()),
                 });
             };
             (pk_field, pk.clone())
-        } else {
-            // Primary key has multiple columns. Therefore tantivy::Index has derived field `INDEX_UNIQUE_FIELD_NAME`.
-            let Some((pk_field, _)) = index_schema.find_field(INDEX_UNIQUE_FIELD_NAME) else {
-                return Err(super::Error::InvalidIndexingError {
-                    source: Box::from(TantivyError::FieldNotFound(pk.clone())),
-                    context: format!(
-                        "Full text search has multiple primary key columns, so the column '{INDEX_UNIQUE_FIELD_NAME}' should be present, but is not.",
-                    ),
-                });
-            };
-            (pk_field, INDEX_UNIQUE_FIELD_NAME.to_string())
         };
 
         Ok(rb
@@ -513,10 +559,13 @@ impl FullTextDatabaseIndex {
     /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
     /// columns present will be ignored.
     ///
-    /// If there is a multi-column primary key (as specified by [`Self::primary_key`]), an additional column is used in the [`tantivy::Index`] for unique lookup (required since updates = deletion -> insertion).
+    /// If there is a multi-column primary key, or a single primary key column that is also a
+    /// tokenized search field (as specified by [`Self::primary_key`] and [`Self::search_fields`]),
+    /// an additional column is used in the [`tantivy::Index`] for unique lookup (required since
+    /// updates = deletion -> insertion).
     async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
-        let rb = if self.primary_key.len() > 1 {
+        let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             rb.iter()
                 .map(|r| with_json_subset_column(r, &self.primary_key, INDEX_UNIQUE_FIELD_NAME))
                 .collect::<Result<Vec<RecordBatch>, _>>()
@@ -531,64 +580,117 @@ impl FullTextDatabaseIndex {
         // Prepare documents to insert/delete with read lock.
         let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&index_schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
 
-        let mut index_writer = self.writer.lock().await;
-        // Read the deferral flag while holding the writer lock so the decision to
-        // commit is serialized with `on_write_complete`/`on_write_failed` closing the
-        // window. Reading it before acquiring the lock would allow this call to observe
-        // a cleared flag and commit a window the hooks have not finalized yet.
-        let defer_commit = self.defer_commit.load(Ordering::Acquire);
-        // Deletion.
-        for t in terms_to_delete {
-            index_writer.delete_term(t);
-        }
-        // Insertion. In a sink-driven full refresh or append, `on_write_start` has
-        // set `defer_commit`, so documents are staged and the single commit happens
-        // once in `on_write_complete` — one fsync barrier per refresh instead of one
-        // per record batch. Otherwise (the CDC path, which drives `compute_index`
-        // directly without the lifecycle hooks) commit immediately. On failure,
-        // rollback to discard staged operations so they don't leak into a later commit.
-        let write_result = (|| {
-            for doc in docs {
-                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+        // Convert to tantivy documents one record batch at a time. Encoding all
+        // batches into a single JSON string and parsing it into one Vec<Map> held
+        // the whole document set in memory three times over (JSON string + maps +
+        // documents); decoding per batch bounds the intermediate footprint to a
+        // single batch while the documents accumulate.
+        //
+        // Primary-key columns are excluded from this JSON pipeline and set directly
+        // on the parsed documents afterwards, through the same encoding used to build
+        // `terms_to_delete` above. Arrow-json's JSON representation for Float32/Float16,
+        // Binary, and view types does not always parse back through tantivy's JSON
+        // deserializer into the same value `array_to_terms` produces for the delete
+        // term, so an update on those types could delete nothing (stale duplicate) or
+        // fail to parse at all (#12235).
+        let mut docs = Vec::new();
+        for batch in &rb {
+            let non_pk_batch = without_columns(batch, &self.primary_key).map_err(|e| {
+                super::Error::FailedToRetrieveDataFromSource {
+                    source: DataFusionError::ArrowError(Box::new(e), None),
+                }
+            })?;
+            let doc_json = write_to_json_string(slice::from_ref(&non_pk_batch)).context(
+                InvalidIndexingSnafu {
+                    context: "Failed to write data to intermediate JSON string for indexing"
+                        .to_string(),
+                },
+            )?;
+            let mut batch_docs = parse_json_array(&index_schema, doc_json.as_str())
+                .context(FailedToInsertDataIntoIndexSnafu)?;
+
+            for pk in &self.primary_key {
+                let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
+                    return Err(super::Error::FailedToRetrieveDataFromIndex {
+                        source: TantivyError::FieldNotFound(pk.clone()),
+                    });
+                };
+                if let Some(arr) = batch.column_by_name(pk.as_str()) {
+                    set_document_values(pk_field, arr, &mut batch_docs).map_err(|e| {
+                        super::Error::FailedToRetrieveDataFromSource {
+                            source: DataFusionError::ArrowError(Box::new(e), None),
+                        }
+                    })?;
+                }
             }
+
+            docs.append(&mut batch_docs);
+        }
+
+        // The writer operations (delete_term, add_document, commit) and the reader
+        // reload are synchronous tantivy work — commit fsyncs the file-backed index —
+        // so run them off the async runtime thread. The deferral flag is read while
+        // holding the writer lock inside the task so the decision to commit stays
+        // serialized with `on_write_complete`/`on_write_failed` closing the window.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit_flag = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            let defer_commit = defer_commit_flag.load(Ordering::Acquire);
+            // Deletion.
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
+            }
+            // Insertion. In a sink-driven full refresh or append, `on_write_start` has
+            // set `defer_commit`, so documents are staged and the single commit happens
+            // once in `on_write_complete` — one fsync barrier per refresh instead of one
+            // per record batch. Otherwise (the CDC path, which drives `compute_index`
+            // directly without the lifecycle hooks) commit immediately. On failure,
+            // rollback to discard staged operations so they don't leak into a later commit.
+            let write_result = (|| {
+                for doc in docs {
+                    index_writer.add_document(doc).context(IndexCreationSnafu)?;
+                }
+                if defer_commit {
+                    Ok(())
+                } else {
+                    index_writer
+                        .commit()
+                        .map(|_| ())
+                        .context(FailedToInsertDataIntoIndexSnafu)
+                }
+            })();
+            if let Err(e) = &write_result {
+                tracing::warn!("Rolling back index writer after failed write: {e}");
+                if let Err(rb_err) = rollback_writer(&mut index_writer) {
+                    tracing::error!("Failed to rollback index writer: {rb_err}");
+                }
+            }
+            drop(index_writer);
+            write_result?;
+
             if defer_commit {
-                Ok(())
-            } else {
-                index_writer
-                    .commit()
-                    .map(|_| ())
-                    .context(FailedToInsertDataIntoIndexSnafu)
+                // The reader is reloaded once in `on_write_complete`, after the commit.
+                return Ok(());
             }
-        })();
-        if let Err(e) = &write_result {
-            tracing::warn!("Rolling back index writer after failed write: {e}");
-            if let Err(rb_err) = rollback_writer(&mut index_writer) {
-                tracing::error!("Failed to rollback index writer: {rb_err}");
-            }
-        }
-        drop(index_writer);
-        write_result?;
 
-        if defer_commit {
-            // The reader is reloaded once in `on_write_complete`, after the commit.
-            return Ok(());
-        }
-
-        self.reader.reload().boxed().context(InvalidIndexingSnafu {
-            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+            })
         })
+        .await
+        .map_err(|e| super::Error::InvalidIndexingError {
+            source: Box::new(e),
+            context: "The full-text index write task failed to complete".to_string(),
+        })?
     }
 
     /// Deletes every document whose primary key matches a row of `keys` — the tantivy
     /// counterpart of `update_index`'s delete-then-insert, minus the insert.
     async fn delete_terms_for(&self, keys: &RecordBatch) -> Result<(), super::Error> {
-        let rb = if self.primary_key.len() > 1 {
+        let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             vec![with_json_subset_column(
                 keys,
                 &self.primary_key,
@@ -607,36 +709,49 @@ impl FullTextDatabaseIndex {
             return Ok(());
         }
 
-        let mut index_writer = self.writer.lock().await;
-        // Read the deferral flag under the writer lock, exactly as `update_index` does. A sink
-        // write window shares this one writer, so committing here would publish whatever that
-        // window has staged: a partially rewritten table, or the whole-index clear that
-        // `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the deletes and let the
-        // window's own `on_write_complete` commit publish them together.
-        let defer_commit = self.defer_commit.load(Ordering::Acquire);
-        for t in terms_to_delete {
-            index_writer.delete_term(t);
-        }
-        if defer_commit {
-            // The reader is reloaded once in `on_write_complete`, after the commit.
-            return Ok(());
-        }
-
-        let commit_result = index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu);
-        if let Err(e) = &commit_result {
-            tracing::warn!("Rolling back index writer after failed delete commit: {e}");
-            if let Err(rb_err) = index_writer.rollback() {
-                tracing::error!("Failed to rollback index writer: {rb_err}");
+        // delete_term/commit and the reader reload are synchronous tantivy work
+        // (commit fsyncs), so run them off the async runtime thread. The deferral
+        // flag is read under the writer lock inside the task, exactly as
+        // `update_index` does.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit_flag = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            // A sink write window shares this one writer, so committing here would publish
+            // whatever that window has staged: a partially rewritten table, or the whole-index
+            // clear that `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the
+            // deletes and let the window's own `on_write_complete` commit publish them together.
+            let defer_commit = defer_commit_flag.load(Ordering::Acquire);
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
             }
-        }
-        drop(index_writer);
-        commit_result?;
+            if defer_commit {
+                // The reader is reloaded once in `on_write_complete`, after the commit.
+                return Ok(());
+            }
 
-        self.reader.reload().boxed().context(InvalidIndexingSnafu {
-            context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
+            let commit_result = index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu);
+            if let Err(e) = &commit_result {
+                tracing::warn!("Rolling back index writer after failed delete commit: {e}");
+                if let Err(rb_err) = index_writer.rollback() {
+                    tracing::error!("Failed to rollback index writer: {rb_err}");
+                }
+            }
+            drop(index_writer);
+            commit_result?;
+
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
+            })
         })
+        .await
+        .map_err(|e| super::Error::InvalidIndexingError {
+            source: Box::new(e),
+            context: "The full-text index delete task failed to complete".to_string(),
+        })?
     }
 
     #[must_use]
@@ -777,7 +892,7 @@ impl FullTextDatabaseIndex {
         }
 
         // If we need `INDEX_UNIQUE_FIELD_NAME`, add to schema.
-        if primary_key.len() > 1 {
+        if needs_unique_field(primary_key, search_fields) {
             schema_builder.add_text_field(INDEX_UNIQUE_FIELD_NAME, tantivy::schema::STRING);
         }
 
@@ -1695,6 +1810,52 @@ mod tests {
         }
     }
 
+    /// When a single-column primary key is also configured as a search field, its tantivy
+    /// field is tokenized (see `create_tantivy_schema`), so a delete term built from its raw,
+    /// untokenized value would never match the tokenized postings actually indexed. An update
+    /// on that primary key must still delete the superseded document rather than leave a
+    /// stale duplicate behind.
+    #[tokio::test]
+    async fn test_updates_overwrite_when_primary_key_is_also_a_tokenized_search_field() {
+        let pk_value = "hello world";
+        let batch =
+            record_batch!(("title", Utf8, [pk_value])).expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["title".to_string()],
+            Some(vec!["title".to_string()]),
+            None,
+            &[],
+            false,
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        index
+            .compute_index(vec![batch.clone()])
+            .await
+            .expect("failed to compute_index");
+        assert_eq!(bm25_collection_size(&index), 1);
+
+        // Re-index the exact same primary key value. This is a delete-then-insert of the
+        // same row: if the delete term fails to match the tokenized postings, the old
+        // document lingers as a stale duplicate alongside the new one.
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+        wait_for_superseded_docs_expunged(&index).await;
+
+        assert_eq!(
+            bm25_collection_size(&index),
+            1,
+            "updating a tokenized primary key should replace the document, not duplicate it"
+        );
+    }
+
     /// A segment big enough to sit alone at its size level still has to be rewritten once
     /// most of its documents have been superseded. Otherwise tantivy keeps counting those
     /// documents in BM25's collection size and the index scores every query against rows
@@ -2377,16 +2538,18 @@ mod tests {
                 .expect("failed to create the index"),
         );
 
-        // Configuring `title` as a search column asks for it tokenized instead, so the terms
-        // the persisted index holds for it are no longer the ones a delete would address.
+        // Configuring `title` as a search column asks for it tokenized instead, which also
+        // requires the derived `INDEX_UNIQUE_FIELD_NAME` addressing column (see
+        // `needs_unique_field`) that the persisted index — built before `title` became a
+        // search column — does not have.
         let error = file_backed_index(directory.path(), &["content", "title"], &["title"])
             .expect_err(
                 "a persisted index whose primary key is indexed differently must be rejected",
             );
         let message = error.to_string();
         assert!(
-            message.contains("(untokenized)") && message.contains("(tokenized)"),
-            "the error must say how the column's indexing changed, got: {message}"
+            message.contains(INDEX_UNIQUE_FIELD_NAME),
+            "the error must name the missing addressing column, got: {message}"
         );
         assert!(
             error.is_user_error(),

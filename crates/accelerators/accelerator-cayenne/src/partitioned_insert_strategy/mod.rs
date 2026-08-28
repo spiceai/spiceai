@@ -339,6 +339,11 @@ impl CayennePartitionedInsertStrategy {
     /// set, every pointer must either equal its recorded target (committed) or
     /// differ (not committed). A mixed set is impossible under an atomic
     /// catalog transaction and is rejected rather than guessed at.
+    /// # Errors
+    ///
+    /// Returns an error when a partition's staging WAL cannot be read or replayed. A
+    /// failure here is not recoverable by skipping: the WAL holds writes the table has
+    /// already acknowledged.
     pub async fn recover_partitioned_wals(
         &self,
         providers: &[Arc<dyn datafusion::catalog::TableProvider>],

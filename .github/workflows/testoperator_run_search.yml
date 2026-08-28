@@ -36,6 +36,8 @@ on:
           - 'scifact_retrieval'
           - 'nfcorpus_retrieval'
           - 'touche2020_retrieval'
+          - 'msmarco_retrieval'
+          - 'stackoverflow_qa_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false

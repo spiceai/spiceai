@@ -33,6 +33,7 @@ use data_connector_api::accelerated::{
     AcceleratorSetup, RefreshRequestError, RefreshRequester, RegisteredAcceleratedTable,
     TableGoneSnafu,
 };
+use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -61,12 +62,13 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod federation;
 pub mod refresh;
+pub mod refresh_completion;
 pub mod refresh_task;
 pub mod refresh_task_runner;
 pub mod retention;
@@ -79,6 +81,9 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use refresh_completion::{
+    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter,
+};
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
 
@@ -404,6 +409,10 @@ pub struct Builder {
     write_to_accelerator_only: bool,
     dual_write: bool,
     write_back: bool,
+    /// Connector-owned durable write-back delivery, when the source provides it.
+    /// Threaded into the delivery worker; `None` keeps the worker's
+    /// `TableProvider` delivery path.
+    write_back_deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -464,6 +473,7 @@ impl Builder {
             write_to_accelerator_only: false,
             dual_write: false,
             write_back: false,
+            write_back_deliverer: None,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -572,6 +582,16 @@ impl Builder {
     /// then asynchronously persist to the federated source.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
+        self
+    }
+
+    /// Provide a connector-owned durable write-back deliverer for the delivery
+    /// worker. `None` (the default) keeps the worker's `TableProvider` delivery.
+    pub fn write_back_deliverer(
+        &mut self,
+        deliverer: Option<Arc<dyn WriteBackDeliverer>>,
+    ) -> &mut Self {
+        self.write_back_deliverer = deliverer;
         self
     }
 
@@ -777,7 +797,7 @@ impl Builder {
             return ExpectedAppendModeForAppendStreamSnafu.fail();
         }
 
-        let on_complete_notification = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
@@ -932,7 +952,7 @@ impl Builder {
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         );
-        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
@@ -976,10 +996,12 @@ impl Builder {
                 // `refresh_trigger` is None because the receiver will be
                 // dropped (refresher.start() is not called).
                 //
-                // Notify completion waiters so the schedule-creation path
-                // doesn't block waiting on a refresh that won't run here —
-                // dataset readiness is a separate concern handled above.
-                on_complete_notification.notify_waiters();
+                // No refresh will ever be recorded for this table here, so
+                // close the completion signal: the schedule-creation path and
+                // every other caller resolves at once instead of waiting on a
+                // refresh that cannot arrive. Dataset readiness is a separate
+                // concern handled above.
+                refresh_completion.close();
                 (None, None)
             } else {
                 (
@@ -1018,10 +1040,11 @@ impl Builder {
             let consumer_handle = caching::spawn_batched_cache_write_task(
                 rx,
                 Arc::clone(&self.accelerator),
-                self.dataset_name.to_string(),
+                self.dataset_name.clone(),
                 Arc::clone(&self.accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
+                Arc::clone(&self.runtime_status),
             );
             // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
             handlers.push(consumer_handle);
@@ -1189,6 +1212,7 @@ impl Builder {
                 *cayenne,
                 Arc::clone(&self.federated),
                 self.dataset_name.to_string(),
+                self.write_back_deliverer.clone(),
             ));
         }
 
@@ -2375,6 +2399,67 @@ mod tests {
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::prelude::{col, lit};
     use datafusion_functions_json::udfs::json_get_str_udf;
+
+    /// Build an accelerated table over an empty in-memory source in the given
+    /// cluster role, returning its refresh-completion signal.
+    async fn built_table_completion(
+        cluster_role: Option<ClusterRole>,
+        refresh_mode: RefreshMode,
+    ) -> RefreshCompletion {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source table builds"),
+        );
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator table builds"),
+        ) as Arc<dyn TableProvider>;
+
+        let mut builder = Builder::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("test"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "mem_table".to_string(),
+            accelerator,
+            refresh::Refresh::new(refresh_mode),
+            Handle::current(),
+        );
+        builder.cluster_role(cluster_role);
+
+        let table = builder.build().await.expect("accelerated table builds");
+        table
+            .refresher()
+            .refresh_completion()
+            .expect("the table carries a refresh-completion signal")
+    }
+
+    /// Regression test for #13086. A cluster scheduler runs no refresh locally,
+    /// so a caller waiting on one must be released rather than left holding a
+    /// wait that nothing can ever satisfy.
+    #[tokio::test]
+    async fn test_a_scheduler_releases_refresh_completion_waiters() {
+        let completion =
+            built_table_completion(Some(ClusterRole::Scheduler), RefreshMode::Full).await;
+
+        // Taken after the build, which is the only order a caller can manage:
+        // the table has to exist before its refresher can be reached.
+        tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
+            .await
+            .expect("a scheduler must release a waiter for a refresh it will never run");
+    }
+
+    /// The contrast that keeps the test above honest: off the scheduler path a
+    /// table with no refresh scheduled leaves its waiters pending, so the
+    /// release is the scheduler branch's doing and not the default.
+    #[tokio::test]
+    async fn test_a_table_with_no_refresh_scheduled_leaves_waiters_pending() {
+        let completion = built_table_completion(None, RefreshMode::Disabled).await;
+
+        tokio::time::timeout(Duration::from_millis(200), completion.next().wait())
+            .await
+            .expect_err("a table that is not a scheduler must not release the waiter itself");
+    }
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![

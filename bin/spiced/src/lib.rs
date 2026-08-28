@@ -100,6 +100,8 @@ use connector_spark as _;
 
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
 #[cfg(feature = "duckdb")]
 use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
@@ -132,7 +134,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
+use util::{in_tracing_context, in_tracing_context_async};
 use yaml::Value;
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -844,7 +846,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         }
     }
 
-    let rt = builder.build().await;
+    // The global subscriber cannot be installed before this call: its
+    // task-history layer is built from the `DataFusion` the runtime returns.
+    // Without a window subscriber the build's own warnings — the coordinated
+    // accelerator memory budget, invalid `runtime.query.*` values — are dropped.
+    let rt = in_tracing_context_async(builder.build()).await;
 
     spiced_tracing::init_tracing(
         app.as_ref(),
@@ -1085,7 +1091,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
+        // Gated like the dependency itself: `accelerator-cayenne` is a
+        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
+        #[cfg(not(windows))]
+        accelerator_cayenne::register_cayenne_telemetry();
     }
 
     // The global meter provider is now final: either `init_metrics` replaced the
@@ -1385,9 +1394,10 @@ enum DeploymentNote {
         error: String,
         local_error: String,
     },
-    /// `--pods-watcher-enabled` was passed on an instance serving a deployment.
-    /// The watcher is not installed: reconciling the local spicepod into a
-    /// deployed app would swap the deployed configuration out from under it.
+    /// `--pods-watcher-enabled` was passed on a Cloud Connect managed instance.
+    /// The watcher is not installed: reconciling the local spicepod into an app
+    /// that arrives by deployment would swap that configuration out from under
+    /// the control plane.
     PodsWatcherDeclined,
     /// A cloud-managed instance found no spicepod — neither deployed nor local —
     /// and started on an empty one.
@@ -1402,6 +1412,13 @@ enum DeploymentNote {
 }
 
 impl DeploymentNote {
+    /// Why a Cloud Connect managed instance does not watch the local spicepod.
+    ///
+    /// Names no deployment: this note also reaches an instance whose first
+    /// deployment has not landed, one whose deployment did not build, and one
+    /// with no spicepod at all.
+    const PODS_WATCHER_DECLINED_MESSAGE: &str = "Spice Cloud Connect: `--pods-watcher-enabled` was ignored because this instance is Cloud Connect managed, so it will not reload when the local `spicepod.yaml` changes. Edit the app in Spice Cloud and deploy it there instead. See: https://spiceai.org/docs";
+
     fn log(&self) {
         match self {
             Self::Loaded { path } => tracing::info!(
@@ -1420,9 +1437,12 @@ impl DeploymentNote {
                 "Spice Cloud Connect: this instance started with no configuration — the deployed spicepod at {} could not be loaded ({error}), and neither could the local one ({local_error}). It serves nothing until a deployment replaces the file; the runtime stays reachable so that deployment can land.",
                 path.display()
             ),
-            Self::PodsWatcherDeclined => tracing::warn!(
-                "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
-            ),
+            // `spice run` passes `--pods-watcher-enabled` on every runtime it
+            // launches, so reaching this arm does not mean the operator asked
+            // for the watcher.
+            Self::PodsWatcherDeclined => {
+                tracing::debug!("{}", Self::PODS_WATCHER_DECLINED_MESSAGE);
+            }
             Self::NoSpicepod => {
                 tracing::warn!("No existing spicepod was found. Starting Runtime without one.");
             }
@@ -2230,6 +2250,20 @@ mod tests {
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("will be replaced by Spice Cloud"));
         assert!(!message.contains("Copy it to the project's Spicepod in Spice Cloud"));
+        assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn the_declined_pods_watcher_note_claims_no_deployment() {
+        let message = DeploymentNote::PODS_WATCHER_DECLINED_MESSAGE;
+        assert!(message.contains("`--pods-watcher-enabled`"));
+        assert!(message.contains("Cloud Connect managed"));
+        assert!(message.contains("`spicepod.yaml`"));
+        let lowercase = message.to_lowercase();
+        assert!(!lowercase.contains("deployed"));
+        assert!(!lowercase.contains("deployment"));
+        assert!(message.contains("Edit the app in Spice Cloud and deploy it there instead"));
         assert!(message.contains("https://spiceai.org/docs"));
         assert!(!message.contains('\n'));
     }

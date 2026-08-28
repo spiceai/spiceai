@@ -75,12 +75,13 @@ use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
 };
 use crate::provider::sink::CayenneDataSink;
-use crate::provider::{Error, Result};
+use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
+use snafu::ensure;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
@@ -955,6 +956,23 @@ struct CachedTableStatistics {
     count_exact: bool,
 }
 
+/// The outcome of reading a table's persisted statistics record.
+///
+/// `Option<TableStatistics>` cannot carry this distinction, and the two absent
+/// cases are not interchangeable: a genuinely absent record is a valid baseline
+/// — a first write merges onto nothing, and a legacy table's count is trusted
+/// exact once — while an unreadable one is no baseline at all. Treating an
+/// unreadable record as absent lets a merge publish a single write's rows as the
+/// table's whole count and mark that partial total exact, which is a wrong
+/// `COUNT(*)` answer on the distributed fold rather than a costing miss.
+enum PersistedTableStatistics {
+    Present(TableStatistics),
+    /// The table has no statistics row yet.
+    Absent,
+    /// The row could not be read, so nothing is known about the table's count.
+    Unreadable,
+}
+
 /// Block size for the in-memory sequence allocator (lever B2). Each metastore
 /// `UPDATE … += BLOCK … RETURNING` refill durably reserves this many sequence
 /// numbers in one writer acquisition; they are then served from memory until
@@ -1547,7 +1565,12 @@ pub struct CayenneTableProvider {
     /// Contains the deletion caches specific to each strategy variant.
     pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
-    /// Only set for tables with composite or non-integer primary keys.
+    ///
+    /// `None` is load-bearing for the single-`Int64` strategy: deletion-vector
+    /// tombstone keys use raw big-endian encoding there, while every
+    /// `RowConverterBased` strategy uses `OwnedRow` encoding. Callers that need
+    /// marker encoding rather than deletion-vector decoding must construct a
+    /// separate converter.
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
@@ -3025,14 +3048,18 @@ fn range_bounds_from_statistics(
     let min = column_stats.min_value.get_value()?;
     let max = column_stats.max_value.get_value()?;
 
-    // Interpolate over the value domain. Only the integer and date families are
-    // covered: they are the CDC key shapes that matter (a monotonic id, a day
-    // bucket), and each divides exactly. Floats and decimals are deliberately
-    // left out rather than approximated into bounds that could collapse.
+    // Interpolate over the value domain. Covered families are the ones backed by a
+    // fixed-width integer whose ordering IS the integer ordering, so a value
+    // interpolated between two of them is one the column can hold: the integers,
+    // `Date32`/`Date64`, `Time32`/`Time64`, the four `Timestamp` units, and
+    // `Decimal128` (whose scale makes it a scaled integer). Floats are excluded --
+    // their ordering is fine, but interpolating through `i128` would collapse a
+    // narrow range to one cut -- as are strings, which the sink compares as
+    // scalars rather than by byte prefix. See `scalar_to_i128`.
     //
-    // Both ends must be the same variant, or the interpolation would compare
-    // across two different domains and produce bounds that match neither.
-    if std::mem::discriminant(min) != std::mem::discriminant(max) {
+    // Both ends must describe the same value domain, or the interpolation would
+    // compare across two of them and produce bounds that match neither.
+    if !scalars_share_a_domain(min, max) {
         return None;
     }
     let (lo, hi) = (scalar_to_i128(min)?, scalar_to_i128(max)?);
@@ -3058,11 +3085,379 @@ fn range_bounds_from_statistics(
     (!bounds.is_empty()).then_some(bounds)
 }
 
-/// Widen an integer or date scalar to `i128` for bound interpolation, or `None`
-/// for any other type.
+/// Whether a range split is worth taking over hashing.
+///
+/// A partial split — fewer cuts than shards, because the domain could not be
+/// divided further — is accepted for a single-column key, which is the behavior
+/// that shipped: it trades some encode width for the clustering the key was
+/// chosen for.
+///
+/// A composite key does not get that trade, and needs more than a cut count to
+/// earn it. Only its leading column is split, and a wide RANGE on that column says
+/// nothing about how many values actually occur in it: a tenant id taking five
+/// values spread across a billion still yields a full set of equal-width cuts, so
+/// counting cuts would pass it while the rows pile onto the few shards those five
+/// values reach — where hashing the whole key would have spread the trailing
+/// column across every writer. Cayenne's Vortex statistics carry no
+/// `distinct_count` to test that directly (`stats.rs` leaves it `Absent`).
+///
+/// What does carry the evidence is the histogram: its bands are gated to be no
+/// wider than a shard, so bands that thin only exist where rows actually are, and
+/// cuts derived from them follow occupancy rather than the outer range. So a
+/// composite key takes its leading column only when the bounds came from the
+/// histogram AND still fill every shard; an equal-width split over the raw range
+/// is not evidence, and hashes.
+#[must_use]
+const fn range_split_is_worth_taking(
+    bounds: usize,
+    shards: usize,
+    key_is_composite: bool,
+    from_histogram: bool,
+) -> bool {
+    !key_is_composite || (from_histogram && bounds + 1 >= shards)
+}
+
+/// Statistics describing the merge inputs at the finest granularity the plans
+/// expose, for [`range_bounds_from_histogram`] to read as bands.
+///
+/// Per PARTITION, not per plan. A snapshot written by a range-sharded rewrite
+/// holds several files that each cover a narrow slice of the key domain, but the
+/// snapshot's aggregate statistic spans all of them — so one band per input would
+/// hand the histogram back exactly the outer range it is trying to see past, and
+/// the layout would never compound across merges. Partition statistics keep those
+/// slices apart, and they are the same file metadata Cayenne already holds.
+///
+/// Falls back to one band per input when a partition statistic is unavailable
+/// (a partial set of fine bands would bias the cuts toward the inputs that did
+/// report) or when there are more partitions than the histogram's interval walk
+/// should scan.
+fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistics>> {
+    use datafusion_physical_plan::ExecutionPlanProperties;
+
+    /// The walk is quadratic in the band count, so cap the fine granularity
+    /// rather than let a many-file merge pay for it at plan time.
+    const MAX_BANDS: usize = 2_048;
+
+    // All-or-nothing, for the same reason the fine path is: a set missing one
+    // plan's rows is not a smaller distribution, it is a WRONG one, and the
+    // histogram cannot tell the difference. Dropping the failures instead would
+    // let two surviving plans look like the whole merge and bias every cut, which
+    // is exactly the partial-input bias the band collection refuses. An empty
+    // vector leaves fewer than two bands, so the histogram declines and the
+    // caller takes its merged-range fallback.
+    let aggregates = || -> Vec<Arc<Statistics>> {
+        plans
+            .iter()
+            .map(|plan| plan.partition_statistics(None).ok())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    };
+
+    let partitions: usize = plans
+        .iter()
+        .map(|plan| plan.output_partitioning().partition_count())
+        .sum();
+    if partitions == 0 || partitions > MAX_BANDS {
+        return aggregates();
+    }
+
+    let mut bands = Vec::with_capacity(partitions);
+    for plan in plans {
+        for partition in 0..plan.output_partitioning().partition_count() {
+            let Ok(stats) = plan.partition_statistics(Some(partition)) else {
+                return aggregates();
+            };
+            bands.push(stats);
+        }
+    }
+    bands
+}
+
+/// One merge input's contribution to the key histogram: the key range that input
+/// covers, and how many rows it holds.
+#[derive(Clone, Copy)]
+struct KeyBand {
+    lo: i128,
+    hi: i128,
+    rows: f64,
+}
+
+/// Ascending split points that range-partition `column` across `shards` writers,
+/// derived from the *distribution* the merge inputs describe rather than from the
+/// single range they span.
+///
+/// Each statistic contributes one band — its min/max for the key, and its row
+/// count — read as a uniform density over that range, except where min equals max
+/// and the band is a point whose rows all share one key. Summing the bands gives a
+/// piecewise-uniform estimate of where the rows actually are, and cutting it at
+/// equal cumulative mass puts roughly `rows / shards` on every writer. The
+/// statistics are ones the merge already loads, so this costs no extra I/O and no
+/// sampling pass. See [`merge_input_statistics`] for why the bands are gathered
+/// per partition rather than per input.
+///
+/// # Why this is gated rather than preferred unconditionally
+///
+/// A band says how many rows lie in a range, never how they sit inside it, so
+/// reading it as uniform can invent mass where there is none. Given a wide band
+/// that is really two clusters at its ends, equal-mass cuts land in the empty
+/// middle and can be MATERIALLY WORSE than equal-width ones. Two 500-row bands
+/// over `[0,100]` and `[40,60]`, each holding its rows at its endpoints, cut at
+/// `[41,50,58]` and route `[500,0,0,500]`, where equi-width's `[25,50,75]` routes
+/// `[250,250,250,250]`. The same shape lets unequal row-count error — an old
+/// snapshot whose rows are mostly superseded still reports them — drag every cut
+/// toward a band that no longer holds what it claims.
+///
+/// So the model is used ONLY where its error is bounded: **every band must be no
+/// wider than one shard's share of the key domain**. Then a band's rows, however
+/// they truly sit inside it, cannot move mass further than a single shard's width,
+/// and the estimate cannot be wrong by more than the granularity it is choosing
+/// at. Both shapes above are declined by that rule, as is the flat case where
+/// every band spans the whole domain — which loses nothing, since equal mass over
+/// a flat density IS the equal-width split, and delegating reproduces it exactly
+/// instead of re-deriving it through floating point.
+///
+/// The rule holds exactly when the inputs are range-clustered — bands narrower
+/// than a shard is precisely what that means — which is the state this function's
+/// own output creates on the next merge.
+///
+/// `None` whenever the inputs cannot describe a distribution the model can be
+/// trusted on: fewer than two usable bands, an unreadable input, a degenerate
+/// range, a band wider than a shard, or a type the interpolation does not cover.
+/// The caller then falls back to the range interpolation, and past that to
+/// hashing.
+fn range_bounds_from_histogram(
+    inputs: &[Arc<Statistics>],
+    column: usize,
+    shards: usize,
+) -> Option<Vec<ScalarValue>> {
+    if shards < 2 || inputs.len() < 2 {
+        return None;
+    }
+
+    // EVERY non-empty input must be readable, or the histogram is declined
+    // outright. Skipping one is arithmetically identical to declaring it empty,
+    // which drags every cut toward the inputs that did report — a silent bias
+    // that is worse than not using the histogram at all, because the caller's
+    // merged-range fallback at least weighs the whole merge evenly.
+    //
+    // `Inexact` is accepted, but only in company with the band-width gate below.
+    // On this path the child is a Cayenne Vortex scan whose row counts and min/max
+    // come exactly from file metadata; the deletion filter demotes them because it
+    // removes a subset it cannot enumerate, and passes `net_deletions = 0` for
+    // protected-snapshot scans (`provider/delete/filter_exec.rs`), so a band's
+    // count is a pre-deletion upper bound. That error does NOT cancel in general —
+    // it cancels only if every band is inflated by the same factor, and an older
+    // snapshot usually has more of its rows superseded than a newer one. What
+    // bounds it is the same thing that bounds the uniformity error: a band no
+    // wider than a shard can only misplace mass within a shard.
+    //
+    // The first min doubles as the template every cut is rebuilt against, so the
+    // bounds carry the column's own unit / timezone / scale.
+    let mut template: Option<ScalarValue> = None;
+    let mut bands: Vec<KeyBand> = Vec::with_capacity(inputs.len());
+    for stats in inputs {
+        let &rows = stats.num_rows.get_value()?;
+        if rows == 0 {
+            // A genuinely empty input contributes no mass and biases nothing.
+            continue;
+        }
+        let column_stats = stats.column_statistics.get(column)?;
+        let (Some(min), Some(max)) = (
+            column_stats.min_value.get_value(),
+            column_stats.max_value.get_value(),
+        ) else {
+            return None;
+        };
+        if !scalars_share_a_domain(min, max) {
+            return None;
+        }
+        let (lo, hi) = (scalar_to_i128(min)?, scalar_to_i128(max)?);
+        if hi < lo {
+            return None;
+        }
+        if let Some(existing) = template.as_ref() {
+            // Mixed domains across inputs would interpolate across two number
+            // lines; the merged schema makes this unreachable, so decline rather
+            // than guess which one the bounds should speak.
+            if !scalars_share_a_domain(existing, min) {
+                return None;
+            }
+        } else {
+            template = Some(min.clone());
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts weight a density estimate; f64 is exact to 2^53 \
+                      rows and beyond that the estimate's own error dominates"
+        )]
+        bands.push(KeyBand {
+            lo,
+            hi,
+            rows: rows as f64,
+        });
+    }
+
+    let template = template?;
+    if bands.len() < 2 {
+        return None;
+    }
+
+    let domain_lo = bands.iter().map(|band| band.lo).min()?;
+    let domain_hi = bands.iter().map(|band| band.hi).max()?;
+    let domain = domain_hi.checked_sub(domain_lo)?;
+    if domain <= 0 {
+        return None;
+    }
+
+    // The gate. A band wider than one shard's share of the domain can misplace
+    // mass by more than the split's own granularity, so the model is not trusted
+    // and the caller takes the exact equal-width path instead.
+    let shard_width = domain / i128::try_from(shards).ok()?;
+    if shard_width <= 0 || bands.iter().any(|band| band.hi - band.lo > shard_width) {
+        return None;
+    }
+
+    // Two kinds of mass, kept separate because they cut differently.
+    //
+    // A band spanning a range spreads its rows uniformly across it, so a cut may
+    // land anywhere inside. A band whose min equals its max is a POINT: every one
+    // of its rows carries the same key, so no cut can divide them and they must
+    // all reach one shard. That case is not hypothetical — an input holding only a
+    // hot upsert key has exactly this shape, and it is the shape this whole
+    // function exists to place correctly, so its rows cannot be dropped.
+    //
+    // Point mass is emitted as a zero-width interval at its own value, ordered
+    // ahead of the span interval that starts there, so a cut landing inside one
+    // interpolates over a width of zero and lands exactly on the key.
+    let mut edges: Vec<i128> = Vec::with_capacity(bands.len() * 2);
+    for band in &bands {
+        edges.push(band.lo);
+        edges.push(band.hi);
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    if edges.len() < 2 {
+        return None;
+    }
+
+    let mut intervals: Vec<(i128, i128, f64)> = Vec::with_capacity(edges.len() * 2);
+    let mut total = 0.0_f64;
+    for (index, &edge) in edges.iter().enumerate() {
+        let point_mass: f64 = bands
+            .iter()
+            .filter(|band| band.lo == band.hi && band.lo == edge)
+            .map(|band| band.rows)
+            .sum();
+        if point_mass > 0.0 {
+            total += point_mass;
+            intervals.push((edge, edge, point_mass));
+        }
+
+        let Some(&next) = edges.get(index + 1) else {
+            continue;
+        };
+        let mut mass = 0.0_f64;
+        for band in &bands {
+            if band.lo == band.hi || band.hi < edge || band.lo > next {
+                continue;
+            }
+            let overlap_lo = edge.max(band.lo);
+            let overlap_hi = next.min(band.hi);
+            if overlap_hi <= overlap_lo {
+                continue;
+            }
+            // Checked throughout: `Decimal128` admits bands wide enough to
+            // overflow an `i128` difference, and a wrapped width would silently
+            // invert the density. Declining hands the caller its fallback.
+            let overlap = overlap_hi.checked_sub(overlap_lo)?;
+            let width = band.hi.checked_sub(band.lo)?;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a ratio of two key-domain offsets; the quotient is what \
+                          matters and it is well within f64 precision"
+            )]
+            let share = overlap as f64 / width as f64;
+            mass += band.rows * share;
+        }
+        if mass > 0.0 {
+            total += mass;
+        }
+        intervals.push((edge, next, mass));
+    }
+    if total <= 0.0 {
+        return None;
+    }
+
+    // Walk the cumulative mass once, taking the `shards - 1` quantile targets in
+    // order. Counting TARGETS rather than emitted bounds is what keeps a collapsed
+    // duplicate from advancing the walk past the last real quantile: a hot point
+    // that swallows several targets must cost those shards, not push the final cut
+    // out to the domain maximum, which would leave the top shard unreachable.
+    let mut bounds: Vec<ScalarValue> = Vec::with_capacity(shards - 1);
+    let mut cumulative = 0.0_f64;
+    let mut interval = 0_usize;
+    let mut previous: Option<i128> = None;
+    for step in 1..shards {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "shard counts are small; the quotient is exact for every \
+                      value `snapshot_shard_count` can produce"
+        )]
+        let target = total * (step as f64) / (shards as f64);
+        while interval < intervals.len() {
+            let (start, end, mass) = intervals[interval];
+            // A gap carries no rows, so no quantile can fall inside it.
+            if mass <= 0.0 || cumulative + mass < target {
+                cumulative += mass;
+                interval += 1;
+                continue;
+            }
+            let fraction = ((target - cumulative) / mass).clamp(0.0, 1.0);
+            // `start`/`end` bracket an interval of a band, and the gate caps a
+            // band at one shard's width, so this interpolates inside at most one
+            // shard of the domain — far too narrow for the `f64` step to matter.
+            let span = end.checked_sub(start)?;
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "an offset inside one interval of the key domain, \
+                          truncated back to the integer domain the column holds"
+            )]
+            let offset = ((span as f64) * fraction) as i128;
+            let cut = start.checked_add(offset)?;
+            // A cut at the domain maximum leaves the top shard unreachable, and a
+            // repeated cut leaves its shard unreachable. Both cost a shard, which
+            // is the honest price of rows that cannot be divided — but neither may
+            // be emitted as a bound.
+            if cut < domain_hi && previous != Some(cut) {
+                previous = Some(cut);
+                bounds.push(rebuild_scalar_like(&template, cut)?);
+            }
+            break;
+        }
+    }
+
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// Widen a scalar to `i128` for bound interpolation, or `None` for a type the
+/// interpolation does not cover.
+///
+/// Every covered family is backed by a fixed-width integer whose ordering is the
+/// integer ordering, so interpolating between two of them lands on a value the
+/// column can actually hold. Floats are excluded: their ordering is fine but the
+/// interpolation would round through `i128` and collapse a narrow range to a
+/// single cut. Strings are excluded because the sink compares scalars, not byte
+/// prefixes.
+///
+/// The timestamp, time and decimal families carry a unit / timezone / scale
+/// alongside the integer. That parameter is NOT consulted here — the caller
+/// compares two ends of the SAME column, so it is identical on both — and
+/// [`rebuild_scalar_like`] copies it back from `like` so a bound compares against
+/// the column without a cast.
 #[expect(
     clippy::match_same_arms,
-    reason = "each arm widens a DIFFERENT integer type; the bodies are textually \
+    reason = "each arm widens a DIFFERENT scalar type; the bodies are textually \
               identical but cannot be merged, because the binding's type differs \
               per variant"
 )]
@@ -3077,12 +3472,29 @@ fn scalar_to_i128(value: &ScalarValue) -> Option<i128> {
         ScalarValue::UInt32(Some(v)) => i128::from(*v),
         ScalarValue::UInt64(Some(v)) => i128::from(*v),
         ScalarValue::Date32(Some(v)) => i128::from(*v),
+        ScalarValue::Date64(Some(v)) => i128::from(*v),
+        ScalarValue::Time32Second(Some(v)) | ScalarValue::Time32Millisecond(Some(v)) => {
+            i128::from(*v)
+        }
+        ScalarValue::Time64Microsecond(Some(v)) | ScalarValue::Time64Nanosecond(Some(v)) => {
+            i128::from(*v)
+        }
+        ScalarValue::TimestampSecond(Some(v), _)
+        | ScalarValue::TimestampMillisecond(Some(v), _)
+        | ScalarValue::TimestampMicrosecond(Some(v), _)
+        | ScalarValue::TimestampNanosecond(Some(v), _) => i128::from(*v),
+        ScalarValue::Decimal128(Some(v), _, _) => *v,
         _ => return None,
     })
 }
 
 /// Rebuild `value` as the same `ScalarValue` variant as `like`, so the bounds
 /// compare against the key column without a cast.
+///
+/// The unit, timezone, precision and scale are copied from `like` rather than
+/// defaulted: a `TimestampMicrosecond` bound carrying no timezone would not
+/// compare against a timezone-carrying column, and a `Decimal128` bound rebuilt
+/// at a different scale would compare against a different number.
 fn rebuild_scalar_like(like: &ScalarValue, value: i128) -> Option<ScalarValue> {
     Some(match like {
         ScalarValue::Int8(_) => ScalarValue::Int8(Some(i8::try_from(value).ok()?)),
@@ -3094,8 +3506,69 @@ fn rebuild_scalar_like(like: &ScalarValue, value: i128) -> Option<ScalarValue> {
         ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(u32::try_from(value).ok()?)),
         ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
         ScalarValue::Date32(_) => ScalarValue::Date32(Some(i32::try_from(value).ok()?)),
+        ScalarValue::Date64(_) => ScalarValue::Date64(Some(i64::try_from(value).ok()?)),
+        ScalarValue::Time32Second(_) => ScalarValue::Time32Second(Some(i32::try_from(value).ok()?)),
+        ScalarValue::Time32Millisecond(_) => {
+            ScalarValue::Time32Millisecond(Some(i32::try_from(value).ok()?))
+        }
+        ScalarValue::Time64Microsecond(_) => {
+            ScalarValue::Time64Microsecond(Some(i64::try_from(value).ok()?))
+        }
+        ScalarValue::Time64Nanosecond(_) => {
+            ScalarValue::Time64Nanosecond(Some(i64::try_from(value).ok()?))
+        }
+        ScalarValue::TimestampSecond(_, tz) => {
+            ScalarValue::TimestampSecond(Some(i64::try_from(value).ok()?), tz.clone())
+        }
+        ScalarValue::TimestampMillisecond(_, tz) => {
+            ScalarValue::TimestampMillisecond(Some(i64::try_from(value).ok()?), tz.clone())
+        }
+        ScalarValue::TimestampMicrosecond(_, tz) => {
+            ScalarValue::TimestampMicrosecond(Some(i64::try_from(value).ok()?), tz.clone())
+        }
+        ScalarValue::TimestampNanosecond(_, tz) => {
+            ScalarValue::TimestampNanosecond(Some(i64::try_from(value).ok()?), tz.clone())
+        }
+        ScalarValue::Decimal128(_, precision, scale) => {
+            ScalarValue::Decimal128(Some(value), *precision, *scale)
+        }
         _ => return None,
     })
+}
+
+/// Whether two ends of a key range describe the same value domain, so
+/// interpolating between their widened integers is meaningful.
+///
+/// The discriminant settles the family. The parameterized families need more:
+/// two `Decimal128`s at different scales, or two timestamps in different units,
+/// are different domains whose raw integers must not be compared. Min and max of
+/// one column always agree, so this rejects nothing in practice — it is here so a
+/// future caller that pairs ends from two sources cannot silently produce bounds
+/// that match neither.
+fn scalars_share_a_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
+    if std::mem::discriminant(min) != std::mem::discriminant(max) {
+        return false;
+    }
+    match (min, max) {
+        (
+            ScalarValue::Decimal128(_, min_precision, min_scale),
+            ScalarValue::Decimal128(_, max_precision, max_scale),
+        ) => min_precision == max_precision && min_scale == max_scale,
+        (ScalarValue::TimestampSecond(_, min_tz), ScalarValue::TimestampSecond(_, max_tz))
+        | (
+            ScalarValue::TimestampMillisecond(_, min_tz),
+            ScalarValue::TimestampMillisecond(_, max_tz),
+        )
+        | (
+            ScalarValue::TimestampMicrosecond(_, min_tz),
+            ScalarValue::TimestampMicrosecond(_, max_tz),
+        )
+        | (
+            ScalarValue::TimestampNanosecond(_, min_tz),
+            ScalarValue::TimestampNanosecond(_, max_tz),
+        ) => min_tz == max_tz,
+        _ => true,
+    }
 }
 
 /// Write policy for a snapshot rewrite, chosen by whether the rewrite actually
@@ -4090,8 +4563,7 @@ impl CayenneTableProvider {
         // exactly the successfully absent objects after the physical sweep so
         // superseded generations cannot occupy the bounded segment cache, which
         // is process-wide: what they hold is taken from every other table too.
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -4198,7 +4670,7 @@ impl CayenneTableProvider {
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
             let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
-            let file_format = Arc::clone(self.context.file_format());
+            let context = Arc::clone(&self.context);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4219,7 +4691,7 @@ impl CayenneTableProvider {
                     current_snapshot,
                     protected_snapshot_ids,
                     catalog,
-                    file_format,
+                    context,
                 )
                 .await
                 {
@@ -4235,7 +4707,7 @@ impl CayenneTableProvider {
         current_snapshot: String,
         protected_snapshot_ids: HashSet<String>,
         catalog: Arc<dyn MetadataCatalog>,
-        file_format: Arc<VortexFormat>,
+        context: Arc<CayenneContext>,
     ) -> Result<()> {
         let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
             Ok(rows) => rows,
@@ -4272,7 +4744,10 @@ impl CayenneTableProvider {
         // The blocking cleanup has finished unlinking every reported path, so
         // no valid scan can insert another segment after this exact-key sweep.
         let paths = std::mem::take(&mut *retired_cache_paths.lock());
-        file_format.invalidate_segment_cache_paths(paths).await;
+        context
+            .file_format()
+            .invalidate_cached_paths(context.runtime_env(), &task_table, paths)
+            .await;
         cleanup_result
             .map_err(|source| Error::TaskPanicked {
                 table: task_table,
@@ -4308,7 +4783,7 @@ impl CayenneTableProvider {
             current_snapshot.to_string(),
             protected_snapshot_ids,
             Arc::clone(&self.catalog),
-            Arc::clone(self.context.file_format()),
+            Arc::clone(&self.context),
         )
         .await
     }
@@ -4710,7 +5185,9 @@ impl CayenneTableProvider {
                 // Physical cleanup is complete before exact-key invalidation;
                 // the same scan-ref gate above excludes a later cache reinsert.
                 let paths = std::mem::take(&mut *retired_cache_paths.lock());
-                file_format.invalidate_segment_cache_paths(paths).await;
+                file_format
+                    .invalidate_cached_paths(&runtime_env, &table_id, paths)
+                    .await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -4879,10 +5356,21 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
-    pub(crate) async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+    /// Releases everything the Vortex caches still hold for files this table has
+    /// retired: their decoded segments and their footers.
+    ///
+    /// Callers pass paths whose objects are confirmed absent. The footer cache
+    /// tracks the live file set only because retirement tells it to — nothing
+    /// else does, so a path that skips this call keeps its footer resident for
+    /// the life of the process.
+    pub(crate) async fn invalidate_retired_paths(&self, paths: HashSet<ObjectStorePath>) {
         self.context
             .file_format()
-            .invalidate_segment_cache_paths(paths)
+            .invalidate_cached_paths(
+                self.context.runtime_env(),
+                &self.table_metadata.table_id,
+                paths,
+            )
             .await;
     }
 
@@ -4924,8 +5412,7 @@ impl CayenneTableProvider {
                 Err(_) => {}
             }
         }
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -6004,7 +6491,7 @@ impl CayenneTableProvider {
         } else {
             cache_paths
         };
-        self.invalidate_segment_cache_paths(absent_paths).await;
+        self.invalidate_retired_paths(absent_paths).await;
         if let Some(source) = deletion_error {
             return Err(Error::IoError { source });
         }
@@ -6426,13 +6913,11 @@ impl CayenneTableProvider {
             context.file_format(),
             &pk_deletion_strategy,
         )?;
-        let loaded_table_statistics = Self::load_table_statistics(&catalog, &table_metadata).await;
         // Legacy/absent stats are trusted exact once (see the migration note); the
-        // next mem-tier checkpoint delta taints a drifted one.
-        let table_statistics_count_exact = loaded_table_statistics
-            .as_ref()
-            .is_none_or(|(_, exact)| *exact);
-        let table_statistics = loaded_table_statistics.map(|(df, _)| df);
+        // next mem-tier checkpoint delta taints a drifted one. A record that could
+        // not be read is not trusted at all.
+        let (table_statistics, table_statistics_count_exact) =
+            Self::load_table_statistics(&catalog, &table_metadata).await;
         // An empty `pk_column_indices` (no primary key) yields the legacy
         // insert-only behavior. Runtime configuration rejects no-PK MIN/MAX, and
         // direct callers remain bounded by the provider-level retained-index cap.
@@ -6867,16 +7352,23 @@ impl CayenneTableProvider {
     /// point-scan filter and the source delivery key.
     ///
     /// # Errors
-    /// Returns an error if the table has no PK converter or the bytes are
+    /// Returns an error if the table has no primary key, or if the bytes are
     /// malformed for its key schema.
     pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
-        let converter = self
-            .pk_row_converter
-            .as_ref()
-            .ok_or_else(|| Error::Internal {
+        ensure!(
+            !self.pk_column_indices.is_empty(),
+            InternalSnafu {
                 table: self.table_name().to_string(),
-                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
-            })?;
+                message: "decode_pk_keys requires a primary key".to_string(),
+            }
+        );
+        let converter = self.pk_row_converter.as_ref().map_or_else(
+            || {
+                self.build_pk_converter(&self.pk_column_indices)
+                    .map(Arc::new)
+            },
+            |converter| Ok(Arc::clone(converter)),
+        )?;
         let rows = pk_bytes
             .iter()
             .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
@@ -7700,23 +8192,41 @@ impl CayenneTableProvider {
     }
 
     /// Split points for range-partitioning a merge on its shard key, or `None`
-    /// when the key or its range cannot be resolved — in which case the write
-    /// hashes, exactly as it did before range partitioning existed.
+    /// when the key or its distribution cannot be resolved — in which case the
+    /// write hashes, exactly as it did before range partitioning existed.
     ///
-    /// Restricted to a single key column, because ordering a composite key needs
-    /// a lexicographic comparison the sink's range split does not implement.
+    /// Splits on ONE column. A composite key uses its LEADING column, which needs
+    /// no lexicographic comparison — rows sharing a leading value stay together on
+    /// one shard, and the shards still tile the domain in order — and is what lets
+    /// the feature reach the tables that most need it: the large fact tables carry
+    /// composite keys (`lineitem(l_orderkey, l_linenumber)`,
+    /// `store_sales(ss_item_sk, ss_ticket_number)`), and a single-column
+    /// restriction hashes every one of them.
+    ///
+    /// `inputs` carries one [`Statistics`] per merge input, so the split can be
+    /// cut at equal row mass rather than equal width; `merged` supplies the
+    /// whole-merge range the interpolation falls back to.
     fn merge_range_bounds(
         &self,
-        plan: &Arc<dyn ExecutionPlan>,
+        inputs: &[Arc<Statistics>],
+        merged: &Arc<dyn ExecutionPlan>,
         shards: usize,
     ) -> Option<Vec<ScalarValue>> {
         let key = self.resolved_shard_key_columns();
-        let [column] = key.as_slice() else {
-            return None;
-        };
+        let (column, rest) = key.split_first()?;
         let index = self.table_schema().index_of(column).ok()?;
-        let stats = plan.partition_statistics(None).ok()?;
-        range_bounds_from_statistics(&stats, index, shards)
+
+        let histogram = range_bounds_from_histogram(inputs, index, shards);
+        let from_histogram = histogram.is_some();
+        let bounds = if let Some(bounds) = histogram {
+            bounds
+        } else {
+            let stats = merged.partition_statistics(None).ok()?;
+            range_bounds_from_statistics(&stats, index, shards)?
+        };
+
+        range_split_is_worth_taking(bounds.len(), shards, !rest.is_empty(), from_histogram)
+            .then_some(bounds)
     }
 
     /// The intra-write shard configuration this write earns, or `None` for a
@@ -7755,13 +8265,24 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
+        // The sink builds `ShardSpec::Range` only for a SINGLE key expression
+        // (`vortex::persistent::format`), so a composite key must be narrowed to
+        // the column the bounds actually describe — its leading one — or the
+        // bounds are computed, passed down, and then silently ignored in favour
+        // of hashing. The full key is preserved whenever there are no bounds, so
+        // the hash fallback keeps clustering on everything it always did.
+        let mut shard_key_columns = self.resolved_shard_key_columns();
+        let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
+        if range_bounds.is_some() {
+            shard_key_columns.truncate(1);
+        }
         Some(WriteShardConfig {
             write_concurrency: shard_count,
-            shard_key_columns: self.resolved_shard_key_columns(),
-            // Ascending split points, when the caller could derive them for a
-            // single key column. Their absence is not a failure: the write
-            // hashes the key instead, which is what every write did before
-            // range partitioning existed.
+            shard_key_columns,
+            // Ascending split points, when the caller could derive them for the
+            // key's leading column. Their absence is not a failure: the write
+            // hashes the key instead, which is what every write did before range
+            // partitioning existed.
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
         })
     }
@@ -8024,35 +8545,63 @@ impl CayenneTableProvider {
         self.seq_allocator.lock().await.next - 1
     }
 
-    /// Load the persisted optimizer statistics AND their exactness flag
-    /// ([`TableStatistics::num_rows_exact`]) at open. The flag rides alongside the
-    /// derived `Statistics` so the cache can serve the count `Inexact` when it is
-    /// not a provably-exact live count.
-    async fn load_table_statistics(
+    /// Read a table's persisted statistics record, keeping "there is no record"
+    /// distinct from "the record could not be read" (see
+    /// [`PersistedTableStatistics`]). Every reader that needs that distinction goes
+    /// through here, so neither case can be reintroduced as the other by one of them.
+    ///
+    /// It is deliberately not the only path to the record.
+    /// [`Self::load_persisted_table_statistics`] reads the catalog directly and
+    /// collapses both cases to `None`, which is sound there: it amends a maintained
+    /// count, and an absent record and an unreadable one both mean it has no count to
+    /// amend. A reader that would act differently on the two belongs here instead.
+    async fn read_persisted_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
-    ) -> Option<(Statistics, bool)> {
-        let stats = match catalog.get_table_statistics(&table_metadata.table_id).await {
-            Ok(stats) => stats?,
+    ) -> PersistedTableStatistics {
+        match catalog.get_table_statistics(&table_metadata.table_id).await {
+            Ok(Some(stats)) => PersistedTableStatistics::Present(stats),
+            Ok(None) => PersistedTableStatistics::Absent,
             Err(e) => {
                 tracing::warn!(
                     "Failed to load table stats for {}: {e}",
                     table_metadata.table_name
                 );
-                return None;
+                PersistedTableStatistics::Unreadable
             }
-        };
+        }
+    }
 
-        let num_rows_exact = stats.num_rows_exact;
-        Self::table_statistics_to_df(&table_metadata.schema, &stats)
-            .map(|df| (df, num_rows_exact))
-            .or_else(|| {
-                tracing::warn!(
-                    "Failed to deserialize table stats for {}",
-                    table_metadata.table_name
-                );
-                None
-            })
+    /// Load the persisted optimizer statistics an opening provider serves, with
+    /// whether its maintained count ([`TableStatistics::num_rows_exact`]) may be
+    /// served as a provably-exact live count. The flag rides alongside the derived
+    /// `Statistics` so the cache can serve the count `Inexact` when it is not.
+    ///
+    /// An unreadable record yields `false` — nothing is known about the count, so
+    /// it must not be folded into a `COUNT(*)` answer — matching the
+    /// schema-evolution re-derivation, which likewise refuses to trust a count it
+    /// cannot read. Only a genuinely absent record keeps the documented
+    /// trusted-exact-once migration behaviour.
+    async fn load_table_statistics(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_metadata: &TableMetadata,
+    ) -> (Option<Statistics>, bool) {
+        match Self::read_persisted_table_statistics(catalog, table_metadata).await {
+            PersistedTableStatistics::Present(stats) => {
+                let num_rows_exact = stats.num_rows_exact;
+                let df_stats = Self::table_statistics_to_df(&table_metadata.schema, &stats)
+                    .or_else(|| {
+                        tracing::warn!(
+                            "Failed to deserialize table stats for {}",
+                            table_metadata.table_name
+                        );
+                        None
+                    });
+                (df_stats, num_rows_exact)
+            }
+            PersistedTableStatistics::Absent => (None, true),
+            PersistedTableStatistics::Unreadable => (None, false),
+        }
     }
 
     fn table_statistics_to_df(
@@ -8126,8 +8675,11 @@ impl CayenneTableProvider {
         // Serve the Inexact view when either (a) uncheckpointed visibility changes
         // mean the persisted count over-counts live rows, OR (b) the maintained
         // count itself is not a provably-exact live count (`count_exact == false`,
-        // set by the mem-tier checkpoint's best-effort delta and cleared by a
-        // full-rewrite `Set`). (b) is what stops a drifted count from being served
+        // set by the mem-tier checkpoint's best-effort delta, by an abandoned update
+        // via `arm_row_count_taint_retry` — which also drops `raw`, so no later
+        // re-derivation can resurrect exactness from the pre-gap record — and cleared
+        // by a full-rewrite `Set`).
+        // (b) is what stops a drifted count from being served
         // `Exact` to the COUNT(*) fold once no deletions are pending — the fold then
         // declines and a real scan answers, fixing the distributed over-count.
         let serve_inexact = has_pending_visibility_changes || !cache.count_exact;
@@ -18815,18 +19367,54 @@ impl CayenneTableProvider {
             plans.push(filtered);
         }
 
+        // Captured before `UnionExec` consumes `plans`: the inputs' own statistics
+        // are a histogram of the key, where the union's merged statistic is only
+        // its outer range. Cutting at equal row mass instead of equal width is
+        // what keeps every encoder fed when the key is skewed.
+        let input_statistics = merge_input_statistics(&plans);
+
         let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
             plans.remove(0)
         } else {
             UnionExec::try_new(plans)?
         };
-        // Range-partition the merge on its shard key when the plan can say what
-        // range it holds. This is the rewrite that produces the long-lived
-        // layout, and it is the only write with that view: a streaming CDC
-        // write knows nothing about the keys still to arrive, so it hashes.
-        // Hashing here would spread every key across every output file and
-        // leave a predicate on the key nothing to prune.
-        let range_bounds = self.merge_range_bounds(&merged_plan, target_partitions_hint);
+        // The shard count the write will ACTUALLY use, resolved before the bounds
+        // so they are cut for the encoders that exist.
+        //
+        // Splitting on the session's `target_partitions` instead is silently
+        // destructive: the sink keeps the ascending PREFIX of the bounds it is
+        // handed (`take(num_shards - 1)`), so bounds cut for 48 shards handed to 4
+        // writers keep the 1/48, 2/48 and 3/48 quantiles and leave 45/48 of the
+        // rows on the last one. The hint is not the writer count — the unset
+        // default is `DEFAULT_WRITE_CONCURRENCY`, and a table may configure its
+        // own — so on any host with more cores than that default they disagree.
+        let target_size_bytes = self.context.target_file_size_bytes();
+        let keeps_positions_serial =
+            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            keeps_positions_serial,
+            target_partitions_hint,
+            total_input_bytes,
+        );
+        let write_policy = if keeps_positions_serial {
+            super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
+        } else {
+            super::delta_encoding::WritePolicy::MAINTENANCE
+        };
+        let write_shards = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            write_policy.fan_out,
+        );
+
+        // Range-partition the merge on its shard key when the inputs can say where
+        // the rows are. This is the rewrite that produces the long-lived layout,
+        // and it is the only write with that view: a streaming CDC write knows
+        // nothing about the keys still to arrive, so it hashes. Hashing here would
+        // spread every key across every output file and leave a predicate on the
+        // key nothing to prune.
+        let range_bounds = self.merge_range_bounds(&input_statistics, &merged_plan, write_shards);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
@@ -18838,7 +19426,6 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        let target_size_bytes = self.context.target_file_size_bytes();
         // Size-aware parallel merge encode (EFF-1 / Pattern 12). Passing the
         // selected inputs' total bytes lets `snapshot_shard_count` size the
         // encoder fan-out as floor(bytes / target_file_size), min 1 — a
@@ -18866,13 +19453,9 @@ impl CayenneTableProvider {
         //   single-WRITER shape explicitly (even a serial writer still rolls
         //   multiple files past the target size — see the
         //   `subset_merge_write_shape` docs).
-        let keeps_positions_serial =
-            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
-        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
-            keeps_positions_serial,
-            target_partitions_hint,
-            total_input_bytes,
-        );
+        // `keeps_positions_serial`, the write shape and `write_policy` are
+        // resolved above, where the shard count they produce is needed to cut the
+        // range bounds for the encoders the write will actually create.
         let write_start = std::time::Instant::now();
         let write_result = self
             .write_to_snapshot_range_partitioned(
@@ -18890,11 +19473,11 @@ impl CayenneTableProvider {
                 // the position bake-in assumes one output sequence, so this
                 // merge must not fan out however the table is configured. The
                 // partition hint alone cannot say that.
-                if keeps_positions_serial {
-                    super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
-                } else {
-                    super::delta_encoding::WritePolicy::MAINTENANCE
-                },
+                //
+                // The SAME value the shard count above was derived from, so the
+                // bounds cannot be cut for a different number of encoders than
+                // this write creates.
+                write_policy,
                 range_bounds.as_deref(),
             )
             .await;
@@ -21625,6 +22208,36 @@ impl CayenneTableProvider {
             .await;
     }
 
+    /// Abandon a statistics update, arming the row-count taint on the way out.
+    ///
+    /// Every failing exit of [`Self::persist_table_stats_locked`] returns through
+    /// here, so the demotion is a property of "the update was abandoned" rather
+    /// than of any one branch — a fourth bail-out cannot silently skip it.
+    ///
+    /// It is what makes abandoning safe. The post-write maintenance drain reads the
+    /// returned `bool` and keeps its live-rows delta outstanding, which holds the
+    /// count `Inexact` on its own; the mem-tier checkpoint does not — it discards
+    /// the `bool`, the `Delta { exact: false }` it passes is the very update being
+    /// abandoned, and it has already cleared the in-memory proxies (resident inline
+    /// rows, mem-tier tombstones) that would otherwise demote the stats. Without
+    /// this, that path serves an `Exact` count no persisted record describes.
+    ///
+    /// [`Self::arm_row_count_taint_retry`] is exactly the right primitive and is
+    /// reused rather than duplicated: an abandoned update and a failed exactness
+    /// taint leave the same defect — a durable `num_rows_exact` that over-claims
+    /// relative to what is visible to scans — so they need the same three effects.
+    /// It demotes the served count, drops `raw` so no later re-derivation can
+    /// resurrect exactness from the pre-gap record, and leaves the correction owed
+    /// so a later `DELETE` retries it durably, which a cache-only flag cannot do.
+    fn abandon_table_stats_update(&self, reason: &str) -> bool {
+        tracing::warn!(
+            "Could not record the row count for table '{}', so queries against it now report an estimated row count instead of an exact one until the next write or DELETE re-establishes it. Cause: {reason}. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            self.table_metadata.table_name
+        );
+        self.arm_row_count_taint_retry();
+        false
+    }
+
     /// Read the persisted statistics record, preferring the in-memory raw blob so
     /// the common case costs no catalog round-trip. `None` means the table has no
     /// statistics row (nothing serves a count) or the read failed.
@@ -21832,10 +22445,14 @@ impl CayenneTableProvider {
     /// merges this write into it. `num_rows_update` sets the live count relative
     /// to the previous aggregate (`Delta`), to an authoritative value (`Set`), or
     /// leaves it (`Unchanged`).
-    /// Returns whether the update reached the metastore and the cache. Both
-    /// bail-outs below abandon `num_rows_update` while leaving `count_exact`
-    /// as it was, so a caller that folds the failure into "the count is current"
-    /// would serve a drifted count as `Exact`.
+    ///
+    /// Returns whether the update reached the metastore and the cache. Every
+    /// bail-out abandons `num_rows_update` and leaves the durable record as it
+    /// was, so each one goes through [`Self::abandon_table_stats_update`] to
+    /// demote the cached exactness — a caller that discards the returned `bool`
+    /// would otherwise fold the failure into "the count is current" and serve a
+    /// drifted count as `Exact`. The one exception is an accumulator with no
+    /// rows: it has nothing to describe, so there is nothing to abandon.
     async fn persist_table_stats_locked(
         &self,
         accumulator: &ColumnStatsAccumulator,
@@ -21844,7 +22461,14 @@ impl CayenneTableProvider {
     ) -> bool {
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
-            return false;
+            // A zero-row accumulator abandons nothing, so the cached exactness
+            // still describes the corpus. Any other failure here (serialization,
+            // a poisoned mutex) drops rows that ARE already visible to scans.
+            if accumulator.row_count() == 0 {
+                return false;
+            }
+            return self
+                .abandon_table_stats_update("this write's statistics blob could not be built");
         };
         let new_ndv = accumulator.to_ndv_sketches();
 
@@ -21861,18 +22485,18 @@ impl CayenneTableProvider {
             if let Some(raw) = cached_raw {
                 Some(raw)
             } else {
-                match self
-                    .catalog
-                    .get_table_statistics(&self.table_metadata.table_id)
+                match Self::read_persisted_table_statistics(&self.catalog, &self.table_metadata)
                     .await
                 {
-                    Ok(stats) => stats,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load existing table stats for {} before merge: {e}",
-                            self.table_metadata.table_name
+                    PersistedTableStatistics::Present(stats) => Some(stats),
+                    PersistedTableStatistics::Absent => None,
+                    // A merge needs a baseline; see
+                    // [`PersistedTableStatistics::Unreadable`] for what merging
+                    // without one publishes.
+                    PersistedTableStatistics::Unreadable => {
+                        return self.abandon_table_stats_update(
+                            "the existing statistics record could not be read, so this write has no baseline to merge onto",
                         );
-                        None
                     }
                 }
             }
@@ -21929,11 +22553,9 @@ impl CayenneTableProvider {
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
-            tracing::warn!(
-                "Failed to persist table stats for {}: {e}",
-                self.table_metadata.table_name
-            );
-            return false;
+            return self.abandon_table_stats_update(&format!(
+                "the statistics record could not be written: {e}"
+            ));
         }
 
         // An authoritative exact count settles anything a failed taint left owed:
@@ -32504,6 +33126,79 @@ mod tests {
         );
     }
 
+    /// Waits, holding the caller's compaction lock, for the detached post-write
+    /// compaction pass to reach that lock, find it held, and exit.
+    ///
+    /// `flush_pending_maintenance` drains the maintenance lane but only
+    /// *schedules* this pass, and the task opens with a yield — so it can first
+    /// reach for the lock after the caller releases it and consume the tier the
+    /// caller is arranging. `drain_in_flight_maintenance` cannot be used here:
+    /// it ends by taking the same lock.
+    ///
+    /// The flag is set before the task spawns and cleared on any exit, so once
+    /// it reads false with the lock still held, no scheduled pass remains.
+    async fn park_post_write_compaction(provider: &CayenneTableProvider) {
+        for _ in 0..1_000 {
+            if !provider
+                .post_write_compaction_scheduled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "the detached post-write compaction pass never parked; it would race the \
+             assertions below for the protected tier"
+        );
+    }
+
+    /// Brings a freshly-written table to the state the budget assertions below
+    /// describe: every insert registered as a protected snapshot, and no pending
+    /// mem-tier delete left to cap the merge fence.
+    ///
+    /// Both matter because `compact_protected_snapshots_subset` has two
+    /// independent reasons to decline. Without this, a pass that declined
+    /// because the fence excluded every input looks exactly like one that
+    /// declined on the pass budget — which makes the finite case pass
+    /// vacuously and the unbounded control fail outright, since a CDC upsert
+    /// stamps each snapshot with a delete sequence above the durable max until
+    /// a checkpoint folds it down.
+    ///
+    /// Returns the settled protected-snapshot count.
+    async fn settle_protected_tier(provider: &CayenneTableProvider, min_runs: usize) -> usize {
+        // Protected-snapshot registration can lag the awaited insert under
+        // parallel test load (see `subset_compaction_excludes_inputs_above_delete_fence`).
+        let mut count = 0;
+        for _ in 0..100 {
+            count = provider.protected_snapshots.load_full().len();
+            if count >= min_runs {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Fold the upserts' still-pending deletes into the durable index so the
+        // fence stops capping below every snapshot's threshold. Left pending,
+        // the eligibility filter drops all of them and the pass declines for a
+        // reason these assertions do not mean to exercise.
+        if provider.min_pending_mem_tier_delete_sequence().is_some() {
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("checkpoint the mem tier so no pending delete caps the fence");
+        }
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            None,
+            "precondition: a pending mem-tier delete would cap the merge fence below \
+             every snapshot threshold, so the pass would decline on the fence rather \
+             than on the pass budget"
+        );
+
+        count
+    }
+
     /// End-to-end regression for #12013 on the real compaction path: under a finite
     /// pool the subset merge must decline a tier whose runs cannot be paired within
     /// the per-pass budget, instead of unioning up to
@@ -32551,15 +33246,29 @@ mod tests {
             create_cdc_upsert_table_with_vortex_config("subset_budget_finite", finite_rt, config())
                 .await;
         // Six one-row upserts publish six small, same-tier protected snapshots.
-        for i in 0..ROWS {
-            insert_batch(
-                &finite,
-                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-            )
-            .await;
+        // Hold the compaction lock across them so the debounced post-write pass
+        // cannot merge the tier this test is arranging (same rationale as
+        // `subset_compaction_excludes_inputs_above_delete_fence`) — a tier it
+        // already consolidated has nothing left for the assertions below to
+        // decline or merge.
+        {
+            let setup_guard = finite.compaction_lock.lock().await;
+            for i in 0..ROWS {
+                insert_batch(
+                    &finite,
+                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+                )
+                .await;
+            }
+            finite
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&finite).await;
+            drop(setup_guard);
         }
 
-        let before = finite.protected_snapshots.load_full().len();
+        let before = settle_protected_tier(&finite, TRIGGER).await;
         assert!(
             before >= TRIGGER,
             "precondition: need >= {TRIGGER} protected snapshots to arm the tier, got {before}"
@@ -32618,13 +33327,28 @@ mod tests {
             config(),
         )
         .await;
-        for i in 0..ROWS {
-            insert_batch(
-                &unbounded,
-                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-            )
-            .await;
+        {
+            let setup_guard = unbounded.compaction_lock.lock().await;
+            for i in 0..ROWS {
+                insert_batch(
+                    &unbounded,
+                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+                )
+                .await;
+            }
+            unbounded
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&unbounded).await;
+            drop(setup_guard);
         }
+        let unbounded_before = settle_protected_tier(&unbounded, TRIGGER).await;
+        assert!(
+            unbounded_before >= TRIGGER,
+            "precondition: the control needs >= {TRIGGER} protected snapshots to arm the \
+             tier, got {unbounded_before}"
+        );
         assert_eq!(
             unbounded.protected_merge_input_budget_bytes(),
             None,
@@ -38752,6 +39476,81 @@ mod tests {
         );
     }
 
+    /// Bounds describe ONE column, and the sink builds `ShardSpec::Range` only for
+    /// a single key expression. A composite key must therefore be narrowed to its
+    /// leading column when bounds are present, or they are computed, passed down
+    /// and then silently dropped in favour of hashing — the feature would look
+    /// wired up and do nothing.
+    #[tokio::test]
+    async fn test_write_shard_format_narrows_a_composite_key_to_carry_range_bounds() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("o_id", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_for_sharding(
+            "composite_key_range_write",
+            Arc::clone(&schema),
+            vec![],
+            vec!["o_id".to_string(), "line".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+
+        // No bounds: the whole composite key still clusters the hash, exactly as
+        // it did before range partitioning existed.
+        let hashed = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, None)
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            hashed.shard_key_columns,
+            vec!["o_id".to_string(), "line".to_string()],
+            "hashing keeps every key column"
+        );
+        assert!(hashed.range_bounds.is_none());
+
+        // With bounds: narrowed to the leading column, which is the one the
+        // bounds speak about and the only shape the sink range-partitions.
+        let bounds = vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(20)),
+            ScalarValue::Int64(Some(30)),
+        ];
+        let ranged = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, Some(&bounds))
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            ranged.shard_key_columns,
+            vec!["o_id".to_string()],
+            "range bounds describe the leading column only, so the key narrows to it"
+        );
+        assert_eq!(
+            ranged.range_bounds.as_deref(),
+            Some(bounds.as_slice()),
+            "the bounds must survive to the sink"
+        );
+
+        // An empty bound list is not a split; it must not narrow the hash key.
+        let empty = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, Some(&[]))
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            empty.shard_key_columns,
+            vec!["o_id".to_string(), "line".to_string()],
+            "no usable bounds means hashing, which keeps every key column"
+        );
+        assert!(empty.range_bounds.is_none());
+    }
+
     #[tokio::test]
     async fn test_write_shard_format_configured_shard_key_overrides_primary_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -38971,6 +39770,539 @@ mod tests {
         let mut sorted = narrow.clone();
         sorted.dedup();
         assert_eq!(sorted, narrow, "bounds must be strictly ascending");
+    }
+
+    /// Build one merge input's statistics: the key range it covers and its rows.
+    #[cfg(test)]
+    fn band_stats(min: i64, max: i64, rows: usize) -> Arc<Statistics> {
+        use datafusion_common::stats::Precision;
+
+        let mut column = datafusion_common::ColumnStatistics::new_unknown();
+        column.min_value = Precision::Exact(ScalarValue::Int64(Some(min)));
+        column.max_value = Precision::Exact(ScalarValue::Int64(Some(max)));
+        let mut stats =
+            Statistics::new_unknown(&Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        stats.column_statistics = vec![column];
+        stats.num_rows = Precision::Exact(rows);
+        Arc::new(stats)
+    }
+
+    /// Route `keys` through `bounds` the way the sink's range split does — a row
+    /// lands on shard `i` when its key is greater than exactly `i` of them — and
+    /// report the rows per shard.
+    #[cfg(test)]
+    fn route_to_shards(keys: &[i64], bounds: &[ScalarValue]) -> Vec<usize> {
+        let cuts: Vec<i64> = bounds
+            .iter()
+            .map(|bound| match bound {
+                ScalarValue::Int64(Some(value)) => *value,
+                other => panic!("test bounds must be Int64, got {other:?}"),
+            })
+            .collect();
+        let mut counts = vec![0_usize; cuts.len() + 1];
+        for key in keys {
+            let shard = cuts.iter().filter(|cut| key > cut).count();
+            counts[shard] += 1;
+        }
+        counts
+    }
+
+    /// Every bound set the split produces must be usable: strictly ascending (a
+    /// repeat leaves a shard no row can reach) and no wider than the shard count.
+    #[cfg(test)]
+    fn assert_bounds_are_sound(bounds: &[ScalarValue], shards: usize, context: &str) {
+        assert!(
+            bounds.len() < shards,
+            "{context}: {} bounds address more than {shards} shards",
+            bounds.len()
+        );
+        for pair in bounds.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{context}: bounds must be strictly ascending, saw {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// An input holding a single hot key is a point, not a range, and its rows
+    /// must still steer the cuts. Spreading a zero-width band over its own (zero)
+    /// width would drop it entirely — and that shape is exactly the hot-key upsert
+    /// this split exists to place, so dropping it would defeat the change on its
+    /// own headline case.
+    ///
+    /// A point also cannot be divided: rows sharing one key must all reach one
+    /// shard, so a point holding more than a shard's worth of mass costs the
+    /// shards its duplicates would have cut.
+    #[test]
+    fn a_single_valued_input_contributes_its_rows_and_earns_its_own_boundary() {
+        // 90% of the rows carry one key; the rest tile the domain in bands narrow
+        // enough for the gate to trust them.
+        let mut inputs = vec![band_stats(100, 100, 9_000)];
+        inputs.extend((0..4).map(|index| band_stats(index * 50, index * 50 + 50, 250)));
+
+        let bounds = range_bounds_from_histogram(&inputs, 0, 4)
+            .expect("a point among narrow spans describes a distribution");
+        assert_bounds_are_sound(&bounds, 4, "point mass");
+        assert!(
+            bounds.contains(&ScalarValue::Int64(Some(100))),
+            "the hot key must earn a boundary of its own, got {bounds:?}"
+        );
+
+        // Every row still lands somewhere, and the rows sharing the hot key all
+        // reach ONE shard — they carry the same key, so no split can divide them.
+        let keys: Vec<i64> = (0_i64..200)
+            .chain(std::iter::repeat_n(100, 9_000))
+            .collect();
+        let counts = route_to_shards(&keys, &bounds);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            keys.len(),
+            "every row must land on exactly one shard"
+        );
+        assert!(
+            counts.iter().any(|&count| count >= 9_000),
+            "the 9,000 rows on the hot key cannot be divided, so one shard holds them all: {counts:?}"
+        );
+    }
+
+    /// `Decimal128` admits bands wide enough to overflow an `i128` difference. The
+    /// split must decline and let the caller fall back, never wrap into an
+    /// inverted density or panic under overflow checks.
+    #[test]
+    fn an_unrepresentable_key_span_declines_instead_of_overflowing() {
+        use datafusion_common::stats::Precision;
+
+        fn decimal_stats(min: i128, max: i128, rows: Option<usize>) -> Statistics {
+            let mut column = datafusion_common::ColumnStatistics::new_unknown();
+            column.min_value = Precision::Exact(ScalarValue::Decimal128(Some(min), 38, 0));
+            column.max_value = Precision::Exact(ScalarValue::Decimal128(Some(max), 38, 0));
+            let mut stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "k",
+                DataType::Decimal128(38, 0),
+                false,
+            )]));
+            stats.column_statistics = vec![column];
+            if let Some(rows) = rows {
+                stats.num_rows = Precision::Exact(rows);
+            }
+            stats
+        }
+
+        assert!(
+            range_bounds_from_histogram(
+                &[
+                    Arc::new(decimal_stats(i128::MIN, i128::MAX, Some(1_000))),
+                    Arc::new(decimal_stats(0, 1_000, Some(1_000))),
+                ],
+                0,
+                4,
+            )
+            .is_none(),
+            "a span that cannot be represented declines rather than wrapping"
+        );
+        assert!(
+            range_bounds_from_statistics(&decimal_stats(i128::MIN, i128::MAX, None), 0, 4)
+                .is_none(),
+            "the range interpolation declines the same span"
+        );
+    }
+
+    /// The shape the composite gate exists to refuse: a sparse leading column.
+    ///
+    /// `(tenant_id, sequence)` where `tenant_id` takes two values a million apart.
+    /// Splitting on it can reach only two shards however many cuts are produced,
+    /// while hashing the whole key spreads the varying `sequence` across every
+    /// writer. Both ways the inputs can present that column must decline, and the
+    /// bound COUNT is what carries the evidence in each: an equal-width guess over
+    /// the outer range is not admitted at all, and the band walk cannot manufacture
+    /// cuts where no rows are.
+    #[test]
+    fn a_sparse_composite_leading_column_declines_however_its_inputs_are_written() {
+        const SHARDS: usize = 8;
+        const FAR: i64 = 1_000_000;
+
+        // (a) Hash-written inputs: every band reports the whole span, so there is
+        // no occupancy information anywhere in the set. The walk declines on band
+        // width, so the split is not offered histogram evidence at all.
+        let hashed: Vec<Arc<Statistics>> = (0..8).map(|_| band_stats(1, FAR, 10_000)).collect();
+        assert!(
+            range_bounds_from_histogram(&hashed, 0, SHARDS).is_none(),
+            "bands spanning the domain carry no distribution, so they decline"
+        );
+        // Equal-width over that range WOULD produce a full set of cuts — and this
+        // is exactly the trap: the cuts exist, the rows to fill them do not.
+        let equi_width = range_bounds_from_statistics(&hashed[0], 0, SHARDS)
+            .expect("a wide range interpolates a full set of cuts");
+        assert_eq!(equi_width.len(), SHARDS - 1);
+        assert!(
+            !range_split_is_worth_taking(equi_width.len(), SHARDS, true, false),
+            "a full set of cuts over an empty range must not pass the composite gate"
+        );
+
+        // (b) Range-written inputs: each partition holds one tenant, so the bands
+        // are points. They clear the width gate, but the walk can only cut where
+        // mass is, so it yields one bound rather than seven.
+        let clustered = vec![band_stats(1, 1, 50_000), band_stats(FAR, FAR, 50_000)];
+        let bounds = range_bounds_from_histogram(&clustered, 0, SHARDS)
+            .expect("two points still describe where the rows are");
+        assert!(
+            bounds.len() + 1 < SHARDS,
+            "two occupied values cannot fill eight shards, got {bounds:?}"
+        );
+        assert!(
+            !range_split_is_worth_taking(bounds.len(), SHARDS, true, true),
+            "histogram evidence that reaches two shards must still decline"
+        );
+
+        // A single-column key keeps its shipped trade in the same situation:
+        // clustering on the key it was chosen for beats scattering it.
+        assert!(range_split_is_worth_taking(
+            bounds.len(),
+            SHARDS,
+            false,
+            true
+        ));
+    }
+
+    /// A composite key takes its leading column only on evidence: bounds from the
+    /// histogram, whose bands are gated narrow enough to reflect where rows
+    /// actually are, and still filling every shard. An equal-width split over the
+    /// raw range is not evidence — a leading column with five values spread across
+    /// a wide domain yields a full set of cuts while the rows reach only five
+    /// shards, where hashing the whole key would have used them all.
+    #[test]
+    fn a_composite_key_takes_its_leading_column_only_on_histogram_evidence() {
+        // Composite key, bounds from the histogram, full split: take it.
+        assert!(range_split_is_worth_taking(7, 8, true, true));
+
+        // Composite key, full split, but the bounds are an equal-width guess over
+        // the outer range: no occupancy evidence, so hash.
+        assert!(
+            !range_split_is_worth_taking(7, 8, true, false),
+            "a wide range is not evidence of where the leading column's rows are"
+        );
+
+        // Composite key, histogram bounds, but too few cuts to fill the shards.
+        assert!(
+            !range_split_is_worth_taking(1, 8, true, true),
+            "a leading column that reaches two of eight writers would idle six"
+        );
+
+        // A single-column key keeps the shipped trade either way: clustering on
+        // the key it was chosen for, at the cost of some encode width.
+        assert!(range_split_is_worth_taking(1, 8, false, false));
+        assert!(range_split_is_worth_taking(7, 8, false, false));
+        assert!(range_split_is_worth_taking(1, 8, false, true));
+    }
+
+    /// A flat density — every band spanning the whole domain, which is the shape
+    /// hash-partitioned inputs have, since a hash scatters every key across every
+    /// file — carries no distribution the equal-width split does not already have.
+    ///
+    /// It DELEGATES rather than re-deriving: equal mass over a flat density is the
+    /// equal-width split, so declining hands the caller a result that is exactly
+    /// right at any magnitude, where recomputing it through floating point would
+    /// only introduce a way to be off by one.
+    #[test]
+    fn histogram_declines_a_flat_density_and_leaves_the_exact_split_to_equi_width() {
+        let inputs: Vec<Arc<Statistics>> = (0..8).map(|_| band_stats(0, 1_000, 10_000)).collect();
+
+        for shards in [2_usize, 4, 8, 16] {
+            assert!(
+                range_bounds_from_histogram(&inputs, 0, shards).is_none(),
+                "a flat density adds nothing at {shards} shards, so it declines"
+            );
+            assert!(
+                range_bounds_from_statistics(&inputs[0], 0, shards).is_some(),
+                "and the caller's fallback still splits it"
+            );
+        }
+    }
+
+    /// A band says how many rows lie in a range, never where they sit inside it.
+    /// Read as uniform, a band that is really two endpoint clusters sends
+    /// equal-mass cuts into the empty middle — strictly worse than equal width.
+    /// The band-width gate is what keeps that model from being trusted, so these
+    /// are the shapes it must decline.
+    ///
+    /// Both cases are drawn from an adversarial review of the ungated version.
+    #[test]
+    fn histogram_declines_bands_too_wide_for_their_model_to_be_trusted() {
+        // Endpoint-clustered bands. Uniform-model cuts would be [41,50,58] and
+        // route [500,0,0,500]; equi-width's [25,50,75] routes [250,250,250,250].
+        assert!(
+            range_bounds_from_histogram(&[band_stats(0, 100, 500), band_stats(40, 60, 500)], 0, 4,)
+                .is_none(),
+            "a band spanning the whole domain cannot be modelled as uniform"
+        );
+
+        // Unequal deletion inflation. Three old snapshots report a million rows
+        // each over a tenth of the domain that newer tombstones have removed; the
+        // live snapshot spans the rest. Trusting the counts cuts at [3,6,9] and
+        // routes [250_000,0,0,750_000].
+        assert!(
+            range_bounds_from_histogram(
+                &[
+                    band_stats(0, 10, 1_000_000),
+                    band_stats(0, 10, 1_000_000),
+                    band_stats(0, 10, 1_000_000),
+                    band_stats(0, 100, 1_000_000),
+                ],
+                0,
+                4,
+            )
+            .is_none(),
+            "row-count error only cancels when it is shared, so wide bands decline"
+        );
+
+        // The gate admits bands narrower than one shard's share of the domain,
+        // which is what a range-clustered input looks like.
+        let clustered: Vec<Arc<Statistics>> = (0..16)
+            .map(|index| band_stats(index * 100, index * 100 + 90, 1_000))
+            .collect();
+        assert!(
+            range_bounds_from_histogram(&clustered, 0, 4).is_some(),
+            "bands thinner than a shard are exactly the case the model is for"
+        );
+    }
+
+    /// Once the inputs are range-clustered — narrow, disjoint bands, which is what
+    /// this function's own output produces on the next merge — the histogram sees
+    /// where the rows are and the equi-width interpolation does not.
+    ///
+    /// The distribution here is the CDC steady state: a hot-key upsert stream, so
+    /// most rows sit in a small part of a wide key domain.
+    #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the assertion is a ratio of row counts; f64 is exact far beyond \
+                  the 100k rows this test routes"
+    )]
+    fn histogram_bounds_balance_a_skewed_key_that_equi_width_piles_onto_one_shard() {
+        const SHARDS: usize = 8;
+
+        // 90% of the rows live in the bottom tenth of the domain. Every band is
+        // narrower than one shard's share (100_000), so the gate admits them.
+        let mut inputs: Vec<Arc<Statistics>> = (0..36)
+            .map(|index| band_stats(index * 25, index * 25 + 20, 2_500))
+            .collect();
+        inputs.extend(
+            (0..12)
+                .map(|index| band_stats(900 + index * 66_000, 900 + index * 66_000 + 60_000, 833)),
+        );
+
+        let keys: Vec<i64> = (0_i64..90_000)
+            .map(|index| index % 900)
+            .chain((0_i64..10_000).map(|index| 900 + index * 79))
+            .collect();
+
+        let histogram = range_bounds_from_histogram(&inputs, 0, SHARDS)
+            .expect("narrow disjoint bands describe a distribution");
+        assert_bounds_are_sound(&histogram, SHARDS, "histogram");
+
+        let merged = band_stats(0, 900 + 9_999 * 79, 100_000);
+        let equi_width = range_bounds_from_statistics(&merged, 0, SHARDS)
+            .expect("the merged range splits by interpolation");
+        assert_bounds_are_sound(&equi_width, SHARDS, "equi-width");
+
+        let imbalance = |counts: &[usize]| {
+            let ideal = keys.len() as f64 / SHARDS as f64;
+            counts.iter().copied().max().unwrap_or(0) as f64 / ideal
+        };
+        let histogram_imbalance = imbalance(&route_to_shards(&keys, &histogram));
+        let equi_width_imbalance = imbalance(&route_to_shards(&keys, &equi_width));
+
+        assert!(
+            equi_width_imbalance > 3.0,
+            "equi-width is expected to pile this key onto one shard, saw {equi_width_imbalance:.2}x"
+        );
+        assert!(
+            histogram_imbalance < equi_width_imbalance,
+            "the histogram must improve on it, saw {histogram_imbalance:.2}x against \
+             {equi_width_imbalance:.2}x"
+        );
+    }
+
+    /// Routing must lose no row and must keep the shards in key order, whichever
+    /// strategy produced the bounds — the split is a reordering of rows across
+    /// files, never a filter.
+    #[test]
+    fn histogram_bounds_tile_the_domain_without_losing_rows() {
+        const SHARDS: usize = 6;
+        // Twelve bands of width 50 over [-500, 100): half a shard's share each.
+        let inputs: Vec<Arc<Statistics>> = (0..12)
+            .map(|index| {
+                let lo = -500 + index * 50;
+                band_stats(lo, lo + 50, if index % 3 == 0 { 3_000 } else { 500 })
+            })
+            .collect();
+        let keys: Vec<i64> = (-500..100).collect();
+
+        let bounds = range_bounds_from_histogram(&inputs, 0, SHARDS)
+            .expect("narrow tiled bands describe a splittable distribution");
+        assert_bounds_are_sound(&bounds, SHARDS, "histogram");
+
+        let counts = route_to_shards(&keys, &bounds);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            keys.len(),
+            "every row must land on exactly one shard"
+        );
+    }
+
+    /// Inputs that cannot describe a distribution decline, so the caller falls
+    /// back to the range interpolation and past that to hashing. Declining is
+    /// always safe; a bad split is not.
+    #[test]
+    fn histogram_bounds_decline_when_the_inputs_describe_nothing() {
+        use datafusion_common::stats::Precision;
+
+        /// Bands narrow enough to clear the width gate, so these cases fail for
+        /// the reason each one names rather than incidentally on band width.
+        fn tiled(count: i64) -> Vec<Arc<Statistics>> {
+            (0..count)
+                .map(|index| band_stats(index * 10, index * 10 + 10, 10))
+                .collect()
+        }
+
+        assert!(
+            range_bounds_from_histogram(&[band_stats(0, 100, 10)], 0, 4).is_none(),
+            "one input is only a range, which the interpolation already handles"
+        );
+        assert!(
+            range_bounds_from_histogram(&tiled(4), 0, 1).is_none(),
+            "one shard needs no bounds"
+        );
+        assert!(
+            range_bounds_from_histogram(&[band_stats(7, 7, 10), band_stats(7, 7, 10)], 0, 4)
+                .is_none(),
+            "a single-valued domain cannot be split"
+        );
+        assert!(
+            range_bounds_from_histogram(&tiled(4), 9, 4).is_none(),
+            "a column index outside the statistics declines"
+        );
+
+        // An input whose row count is unknown declines the WHOLE histogram rather
+        // than being skipped: skipping is arithmetically identical to calling it
+        // empty, which drags every cut toward the inputs that did report.
+        let mut unknown_rows =
+            Statistics::new_unknown(&Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let mut column = datafusion_common::ColumnStatistics::new_unknown();
+        column.min_value = Precision::Exact(ScalarValue::Int64(Some(0)));
+        column.max_value = Precision::Exact(ScalarValue::Int64(Some(10)));
+        unknown_rows.column_statistics = vec![column];
+        let mut with_unknown = vec![Arc::new(unknown_rows)];
+        with_unknown.extend(tiled(4));
+        assert!(
+            range_bounds_from_histogram(&with_unknown, 0, 4).is_none(),
+            "one unreadable input declines the whole histogram, not just itself"
+        );
+
+        // Likewise an input that reports rows but no key range.
+        let mut no_range =
+            Statistics::new_unknown(&Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        no_range.num_rows = Precision::Exact(500);
+        no_range.column_statistics = vec![datafusion_common::ColumnStatistics::new_unknown()];
+        let mut with_no_range = vec![Arc::new(no_range)];
+        with_no_range.extend(tiled(4));
+        assert!(
+            range_bounds_from_histogram(&with_no_range, 0, 4).is_none(),
+            "a non-empty input with no key range declines the whole histogram"
+        );
+
+        // An input that is genuinely EMPTY biases nothing, so it is passed over
+        // and the remaining inputs still describe a distribution.
+        let mut with_empty = vec![band_stats(0, 10, 0)];
+        with_empty.extend(tiled(4));
+        assert!(
+            range_bounds_from_histogram(&with_empty, 0, 4).is_some(),
+            "an empty input carries no mass, so it cannot bias the cuts"
+        );
+    }
+
+    /// The interpolation covers every integer-backed key family, and rebuilds each
+    /// bound carrying the column's own unit, timezone and scale — a bound that
+    /// dropped them would not compare against the column it splits.
+    #[test]
+    fn range_bounds_carry_the_key_column_unit_timezone_and_scale() {
+        use datafusion_common::stats::Precision;
+
+        fn split(min: ScalarValue, max: ScalarValue) -> Option<Vec<ScalarValue>> {
+            let mut column = datafusion_common::ColumnStatistics::new_unknown();
+            column.min_value = Precision::Exact(min);
+            column.max_value = Precision::Exact(max);
+            let mut stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "k",
+                DataType::Int64,
+                false,
+            )]));
+            stats.column_statistics = vec![column];
+            range_bounds_from_statistics(&stats, 0, 2)
+        }
+
+        let utc: Option<Arc<str>> = Some(Arc::from("UTC"));
+        assert_eq!(
+            split(
+                ScalarValue::TimestampMicrosecond(Some(0), utc.clone()),
+                ScalarValue::TimestampMicrosecond(Some(2_000), utc.clone()),
+            ),
+            Some(vec![ScalarValue::TimestampMicrosecond(
+                Some(1_000),
+                utc.clone()
+            )]),
+            "a timestamp key splits and keeps its timezone"
+        );
+        assert_eq!(
+            split(
+                ScalarValue::Date64(Some(0)),
+                ScalarValue::Date64(Some(1_000)),
+            ),
+            Some(vec![ScalarValue::Date64(Some(500))]),
+            "a Date64 key splits, as Date32 already did"
+        );
+        assert_eq!(
+            split(
+                ScalarValue::Time64Nanosecond(Some(0)),
+                ScalarValue::Time64Nanosecond(Some(400)),
+            ),
+            Some(vec![ScalarValue::Time64Nanosecond(Some(200))]),
+            "a time-of-day key splits"
+        );
+        assert_eq!(
+            split(
+                ScalarValue::Decimal128(Some(0), 20, 4),
+                ScalarValue::Decimal128(Some(1_000), 20, 4),
+            ),
+            Some(vec![ScalarValue::Decimal128(Some(500), 20, 4)]),
+            "a decimal key splits and keeps its precision and scale"
+        );
+
+        // Ends from two different domains must not be interpolated across.
+        assert!(
+            !scalars_share_a_domain(
+                &ScalarValue::Decimal128(Some(0), 20, 4),
+                &ScalarValue::Decimal128(Some(1_000), 20, 2),
+            ),
+            "two scales are two different numbers"
+        );
+        assert!(
+            !scalars_share_a_domain(
+                &ScalarValue::TimestampMicrosecond(Some(0), utc),
+                &ScalarValue::TimestampMicrosecond(Some(1_000), None),
+            ),
+            "two timezones are two different instants"
+        );
+        assert!(
+            split(
+                ScalarValue::Float64(Some(0.0)),
+                ScalarValue::Float64(Some(100.0)),
+            )
+            .is_none(),
+            "a float key is not interpolated; it hashes"
+        );
     }
 
     /// A sorted rewrite must declare a serial fan-out; an unsorted one must not.
@@ -39359,6 +40691,17 @@ mod tests {
         insert_batch_with_context(&ctx, provider, batch).await;
     }
 
+    /// The schema [`make_listing_parity_batch`] builds: it hard-codes
+    /// `Int64Array / StringArray / Int64Array` in this order and panics on any other
+    /// shape, so the two belong together.
+    fn listing_parity_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]))
+    }
+
     fn make_listing_parity_batch(schema: SchemaRef, start: i64, row_count: usize) -> RecordBatch {
         use arrow::array::StringArray;
         let row_count = i64::try_from(row_count).expect("test row count fits in i64");
@@ -39464,11 +40807,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_snapshot_scan_matches_listing_table_scan_behavior() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let config = SessionConfig::new()
             .with_target_partitions(2)
             .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
@@ -39919,11 +41258,7 @@ mod tests {
     /// listing (so an unpopulated manifest can never make a scan miss a file).
     #[tokio::test]
     async fn scan_from_manifest_listing_equals_directory_listing() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let config = SessionConfig::new()
             .with_target_partitions(2)
             .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
@@ -40162,6 +41497,678 @@ mod tests {
         (provider, catalog, temp_dir)
     }
 
+    /// Open the metastore `SQLite` file directly, bypassing the catalog. The path
+    /// layout is the one `create_reopenable_append_table` and its siblings build.
+    fn open_metastore_db(temp_dir: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(temp_dir.join("metadata").join("cayenne.db"))
+            .expect("open metastore db directly");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy timeout");
+        conn
+    }
+
+    /// Make the statistics READ fail while leaving the write leg working.
+    ///
+    /// The blob column is `NOT NULL`, but it has BLOB affinity, so `SQLite` stores
+    /// a text value in it unconverted — and the row mapper's blob accessor
+    /// rejects a text value, so `get_table_statistics` returns `Err`. The UPSERT
+    /// a merge performs afterwards still succeeds. That asymmetry is what makes a
+    /// merge onto a missing baseline durable, so it is what the fixture has to
+    /// reproduce: dropping the whole table would fail the write too, and prove
+    /// nothing.
+    fn make_table_statistics_unreadable(temp_dir: &std::path::Path, table_id: &str) {
+        let conn = open_metastore_db(temp_dir);
+        let updated = conn
+            .execute(
+                "UPDATE cayenne_table_statistics SET statistics_blob = 'unreadable'
+                 WHERE table_id = ?1",
+                [table_id],
+            )
+            .expect("store an unreadable statistics blob");
+        assert_eq!(
+            updated, 1,
+            "the fixture must corrupt exactly the one statistics row under test"
+        );
+    }
+
+    /// The durable statistics row, read directly — the catalog's own reader is
+    /// the thing the fixture has broken.
+    struct DurableStatsRow {
+        num_rows: i64,
+        num_rows_exact: bool,
+        /// Whether the blob is still the fixture's text sentinel. Distinguishes
+        /// "left alone" from "rewritten": only a real write replaces it with a
+        /// blob.
+        blob_is_text: bool,
+    }
+
+    fn read_durable_stats_row(temp_dir: &std::path::Path, table_id: &str) -> DurableStatsRow {
+        let conn = open_metastore_db(temp_dir);
+        conn.query_row(
+            "SELECT num_rows, num_rows_exact, typeof(statistics_blob) = 'text'
+             FROM cayenne_table_statistics WHERE table_id = ?1",
+            [table_id],
+            |row| {
+                Ok(DurableStatsRow {
+                    num_rows: row.get::<_, i64>(0)?,
+                    num_rows_exact: row.get::<_, i64>(1)? != 0,
+                    blob_is_text: row.get::<_, i64>(2)? != 0,
+                })
+            },
+        )
+        .expect("read the durable statistics row")
+    }
+
+    /// Regression for #13010: a statistics read that FAILS must not be treated as
+    /// "this table has no statistics row yet".
+    ///
+    /// The merge reads an absent record as a zero baseline that is trusted exact,
+    /// so routing a failed read into that branch rewrites the durable record to
+    /// hold only the current write's rows and flags that partial total exact. An
+    /// exact `num_rows` is folded straight into a distributed `COUNT(*)` answer
+    /// instead of costing a scan, and the rewritten record survives restart
+    /// looking like a legitimate exact baseline, so nothing later corrects it.
+    #[tokio::test]
+    async fn an_unreadable_stats_record_must_not_publish_a_partial_count_as_exact() {
+        const BASELINE_ROWS: usize = 24;
+        const SECOND_WRITE_ROWS: usize = 8;
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_partial_count",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Baseline: a persisted, exact count describing every row written.
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, BASELINE_ROWS),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        let baseline = catalog
+            .get_table_statistics(&table_id)
+            .await
+            .expect("baseline stats query")
+            .expect("baseline stats row present");
+        assert_eq!(
+            baseline.num_rows,
+            i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+            "precondition: the baseline count describes every row written"
+        );
+        assert!(
+            baseline.num_rows_exact,
+            "precondition: a pure-append table's maintained count starts exact"
+        );
+
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+
+        // Reopen: the in-memory `raw` blob starts cold, which is the only state
+        // that reaches the catalog read on the next write (#13010's reachability).
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_partial_count")
+                .await
+                .expect("reopen over an unreadable statistics record");
+
+        insert_batch_with_context(
+            &ctx,
+            &reopened,
+            make_listing_parity_batch(
+                Arc::clone(&schema),
+                i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+                SECOND_WRITE_ROWS,
+            ),
+        )
+        .await;
+        reopened
+            .flush_pending_maintenance()
+            .await
+            .expect("the maintenance pass must succeed even when it abandons the stats update");
+
+        // State first, so a regression names the harm rather than the mechanism.
+        let durable = read_durable_stats_row(temp_dir.path(), &table_id);
+        assert_eq!(
+            durable.num_rows,
+            i64::try_from(BASELINE_ROWS).expect("row count fits in i64"),
+            "a failed statistics read must leave the durable count alone; rewriting it to this \
+             write's {SECOND_WRITE_ROWS} rows publishes a partial count as the table's total"
+        );
+        assert!(
+            durable.num_rows_exact,
+            "the untouched record keeps its own exactness; the fix must not rewrite it at all"
+        );
+        assert!(
+            durable.blob_is_text,
+            "the aggregate blob must be left as-is: merging without a baseline would replace the \
+             accumulated min/max and NDV with this single write's"
+        );
+
+        // Only the statistics update was abandoned. The abandoned delta stays
+        // outstanding, and that is what holds the served count at `Inexact`.
+        assert!(
+            reopened
+                .post_write_maintenance
+                .has_unapplied_live_rows_delta(),
+            "an abandoned statistics update must leave its live-rows delta outstanding, which is \
+             what stops the count being served Exact over the gap"
+        );
+        assert!(
+            reopened
+                .optimizer_table_statistics()
+                .is_none_or(|stats| !matches!(
+                    stats.num_rows,
+                    datafusion_common::stats::Precision::Exact(_)
+                )),
+            "no Exact row count may be served while a statistics update is outstanding"
+        );
+    }
+
+    /// Regression for #13010, open-time half: a statistics record that cannot be
+    /// read must not leave the maintained count flagged exact.
+    ///
+    /// On its own this is masked — the same failure also leaves `optimizer`
+    /// unset, so nothing is served from it — but it is what establishes
+    /// `count_exact = true` over a cold `raw` blob, which is the precondition the
+    /// durable rewrite above needs.
+    #[tokio::test]
+    async fn reopening_over_an_unreadable_stats_record_does_not_trust_the_count_as_exact() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_open_exactness",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        // Control: with the record intact, a reopen still trusts the persisted
+        // exactness — proving the fixture reaches this gate, and that the fix
+        // narrows the trust rather than removing it.
+        let intact =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_open_exactness")
+                .await
+                .expect("reopen over an intact statistics record");
+        assert!(
+            intact.table_statistics.read().count_exact,
+            "control: a readable exact record must still reopen as exact"
+        );
+        drop(intact);
+
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_open_exactness")
+                .await
+                .expect("reopen over an unreadable statistics record");
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "a statistics record that could not be read says nothing about the count, so it must \
+             not reopen flagged exact"
+        );
+    }
+
+    /// Regression for #13010: abandoning the update must also stop the *cached*
+    /// count being served exact, for the callers that discard the returned bool.
+    ///
+    /// The maintenance drain reads that bool and keeps its live-rows delta
+    /// outstanding, which holds the count `Inexact` on its own. The mem-tier
+    /// checkpoint does not: it discards the bool, the `Delta { exact: false }` it
+    /// passes is the very update being abandoned, and the checkpoint clears the
+    /// in-memory proxies (resident rows, tombstones) that would otherwise demote
+    /// the stats. Without an explicit demotion that path serves an `Exact` count
+    /// which does not describe the corpus.
+    #[tokio::test]
+    async fn abandoning_a_stats_update_demotes_the_cached_exactness() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_unreadable_cached_exactness",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        // Reopen over the INTACT record: `optimizer` is populated and
+        // `count_exact` is true, while `raw` starts cold — the one state that
+        // reaches the catalog read on the next persist.
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_unreadable_cached_exactness")
+                .await
+                .expect("reopen over an intact statistics record");
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "precondition: the reopened provider serves the persisted count as exact"
+        );
+
+        // A non-empty accumulator: an empty one bails before the read, which would
+        // pass this test without ever exercising the failure under test.
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
+        assert!(
+            accumulator.row_count() > 0,
+            "precondition: the accumulator must produce a blob, or the persist bails early"
+        );
+
+        // Control: with the record readable, this same call persists and the count
+        // stays exact — so the demotion below is the read failure's doing, not this
+        // call shape's.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "control: a readable record must let the update through"
+        );
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "control: a successful exact delta leaves the count exact"
+        );
+
+        // Now break the read, and clear the cached `raw` the successful persist
+        // just populated so the next one has to reach the catalog again.
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+        reopened.table_statistics.write().raw = None;
+
+        assert!(
+            !reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: false
+                    }
+                )
+                .await,
+            "an unreadable record must abandon the update"
+        );
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "an abandoned update must demote the cached exactness: its rows are already visible \
+             to scans and no persisted count describes them, so a caller that discards the \
+             returned bool must not go on serving an Exact count"
+        );
+    }
+
+    /// Regression for #13010: the demotion must survive the *next* successful
+    /// incremental persist, and clear only on an authoritative `Set`.
+    ///
+    /// A one-shot `count_exact = false` does not hold. The next persist derives
+    /// `prev_num_rows_exact` from the record it reads — the pre-gap baseline, still
+    /// flagged exact — and then writes that back over the demotion, so a mem-tier
+    /// checkpoint that abandons its delta (its caller discards the bool) followed
+    /// by a staged append's `Delta { exact: true }` republishes a short count as
+    /// exact, durably. Only compaction/overwrite materializes the live rows and can
+    /// honestly re-baseline.
+    #[tokio::test]
+    async fn an_abandoned_update_keeps_the_count_inexact_until_a_set_rebaselines_it() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, catalog, temp_dir) = create_reopenable_append_table(
+            "stats_abandoned_gap_outlives_next_persist",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+        drop(provider);
+
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("stats_abandoned_gap_outlives_next_persist")
+                .await
+                .expect("reopen over an intact statistics record");
+
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 16, 4));
+        assert!(
+            accumulator.row_count() > 0,
+            "precondition: the accumulator must produce a blob, or the persist bails early"
+        );
+
+        // Warm the cache with an intact baseline, and keep a copy of it: the
+        // steady-state path merges onto this cached blob without a catalog read, so
+        // restoring it below is what makes the post-abandon persist SUCCEED. That
+        // success is the whole point — a failing one proves nothing about whether
+        // the demotion survives.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "precondition: an intact record persists and warms the cache"
+        );
+        let intact_raw = reopened.table_statistics.read().raw.clone();
+        assert!(
+            intact_raw.as_ref().is_some_and(|raw| raw.num_rows_exact),
+            "precondition: the warmed baseline is flagged exact — that is what a later \
+             delta would otherwise inherit"
+        );
+
+        // Abandon one update, exactly as a mem-tier checkpoint would: break the read
+        // and force the cold-`raw` path that has to reach the catalog.
+        make_table_statistics_unreadable(temp_dir.path(), &table_id);
+        reopened.table_statistics.write().raw = None;
+        assert!(
+            !reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: false
+                    }
+                )
+                .await,
+            "precondition: an unreadable record must abandon the update"
+        );
+
+        // The gap is now open: 4 rows are visible to scans that no persisted count
+        // includes. Restore the warm cache and let a later exact delta through.
+        reopened.table_statistics.write().raw = intact_raw;
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "the later persist must succeed — the gap is carried, not the failure"
+        );
+        assert!(
+            !reopened.table_statistics.read().count_exact,
+            "a successful exact delta over a gapped baseline must NOT restore exactness: it \
+             merged onto a count that is short by the abandoned update's rows"
+        );
+        let durable = read_durable_stats_row(temp_dir.path(), &table_id);
+        assert!(
+            !durable.blob_is_text,
+            "precondition: the later persist really rewrote the record"
+        );
+        assert!(
+            !durable.num_rows_exact,
+            "the short count must be recorded Inexact durably, or a restart re-declares it exact"
+        );
+
+        // A full rewrite materializes exactly the live rows, so it — and only it —
+        // may re-baseline.
+        reopened
+            .replace_table_stats_after_rewrite(&accumulator)
+            .await;
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "an authoritative Set must clear the gap, or the table is stuck Inexact forever"
+        );
+        assert!(
+            read_durable_stats_row(temp_dir.path(), &table_id).num_rows_exact,
+            "the re-baselined count must be durably exact"
+        );
+
+        // The `Set` writing `true` proves nothing on its own — it does that whether
+        // or not the gap was closed. What proves it is the NEXT incremental delta:
+        // a gap left open would veto it, and the table would be Inexact forever.
+        assert!(
+            reopened
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 4,
+                        exact: true
+                    }
+                )
+                .await,
+            "the post-rebaseline delta must persist"
+        );
+        assert!(
+            reopened.table_statistics.read().count_exact,
+            "once re-baselined, an ordinary exact delta must be trusted again — a gap that \
+             never clears leaves the table permanently Inexact"
+        );
+    }
+
+    /// Break the statistics WRITE while leaving the read leg working, so a persist
+    /// bails at the UPSERT with its cached `raw` still warm.
+    ///
+    /// That combination is what puts the re-derivation hole in reach: the persist
+    /// fails with a warm pre-gap record still flagged exact, which is precisely
+    /// what a later re-derivation of `count_exact` would read exactness back out
+    /// of. Whether it can is the property under test — `arm_row_count_taint_retry`
+    /// drops `raw` as part of abandoning, so that pass finds nothing to trust.
+    fn hide_table_statistics_table(temp_dir: &std::path::Path) {
+        open_metastore_db(temp_dir)
+            .execute_batch(
+                "ALTER TABLE cayenne_table_statistics RENAME TO cayenne_table_statistics_hidden;",
+            )
+            .expect("hide the statistics table");
+    }
+
+    fn restore_table_statistics_table(temp_dir: &std::path::Path) {
+        open_metastore_db(temp_dir)
+            .execute_batch(
+                "ALTER TABLE cayenne_table_statistics_hidden RENAME TO cayenne_table_statistics;",
+            )
+            .expect("restore the statistics table");
+    }
+
+    /// Regression for #13010: a schema evolution after an abandoned persist must
+    /// not resurrect the exact, short count.
+    ///
+    /// `evolve_schema_live`'s width pass re-derives `count_exact` from the cached
+    /// `raw` record, and a persist only replaces `raw` on success — so an abandoned
+    /// one would otherwise leave the pre-gap record there, still flagged exact, for
+    /// the re-derivation to trust. What prevents that is `arm_row_count_taint_retry`
+    /// dropping `raw` as part of abandoning: the re-derivation then has nothing to
+    /// trust and yields `false`. This pins that behaviour, because the demotion is
+    /// only as good as the assignment sites that cannot undo it.
+    #[tokio::test]
+    async fn a_schema_evolution_after_an_abandoned_persist_does_not_resurrect_exactness() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = listing_parity_schema();
+        let (provider, _catalog, temp_dir) = create_reopenable_append_table(
+            "stats_gap_survives_schema_evolution",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        let ctx = SessionContext::new();
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            make_listing_parity_batch(Arc::clone(&schema), 0, 16),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("persist the baseline statistics");
+
+        // An authoritative `Set`: `raw` is now an exact record and no gap is open.
+        let accumulator = ColumnStatsAccumulator::new(&schema);
+        accumulator.update(&make_listing_parity_batch(Arc::clone(&schema), 0, 16));
+        provider
+            .replace_table_stats_after_rewrite(&accumulator)
+            .await;
+        assert!(
+            provider
+                .table_statistics
+                .read()
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.num_rows_exact),
+            "precondition: the warm record is flagged exact — that is what a re-derivation reads"
+        );
+
+        // A widening that relaxes nullability: no added column and no type change, so
+        // the cached blob still deserializes against the evolved schema and `optimizer`
+        // stays populated. An ADDED column does not reach the hole — the blob fails to
+        // deserialize at the new width, `optimizer` goes `None`, and nothing is served.
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let plan = match classify(
+            &schema,
+            &evolved_schema,
+            &EvolutionContext {
+                constraint_columns: &provider.table_metadata.primary_key,
+            },
+        ) {
+            SchemaEvolution::Widening(plan) => plan,
+            other => panic!("relaxed nullability must classify as a widening, got {other:?}"),
+        };
+
+        // CONTROL: with no gap open, the same evolution leaves the count Exact.
+        // Without this the assertion below could pass because nothing ever serves
+        // Exact on this fixture.
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("control: schema evolution succeeds");
+        assert!(
+            matches!(
+                provider
+                    .optimizer_table_statistics()
+                    .expect("control: statistics are served after evolution")
+                    .num_rows,
+                datafusion_common::stats::Precision::Exact(_)
+            ),
+            "control: with no outstanding gap, a re-derived exact count IS served Exact — so the \
+             assertion below is about the gap, not about this fixture never serving Exact"
+        );
+
+        // Open a gap the way a failed mem-tier persist does: the UPSERT fails while
+        // the cached `raw` stays warm, so `raw` keeps its pre-gap exact record.
+        hide_table_statistics_table(temp_dir.path());
+        assert!(
+            !provider
+                .persist_table_stats(
+                    &accumulator,
+                    RowCountUpdate::Delta {
+                        delta: 16,
+                        exact: false
+                    }
+                )
+                .await,
+            "precondition: a failed write must abandon the update"
+        );
+        restore_table_statistics_table(temp_dir.path());
+        assert!(
+            provider.table_statistics.read().raw.is_none(),
+            "precondition: abandoning drops the cached record, so the re-derivation below has no \
+             pre-gap baseline to resurrect exactness from"
+        );
+
+        // Re-derive exactly as the schema-width pass does. With `raw` dropped by the
+        // abandon there is no pre-gap record left to read exactness back out of, and
+        // the armed gap must veto it independently of that.
+        let widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let second_plan = match classify(
+            &evolved_schema,
+            &widened_schema,
+            &EvolutionContext {
+                constraint_columns: &provider.table_metadata.primary_key,
+            },
+        ) {
+            SchemaEvolution::Widening(plan) => plan,
+            other => panic!("the second relaxation must classify as a widening, got {other:?}"),
+        };
+        provider
+            .evolve_schema_live(&second_plan)
+            .await
+            .expect("schema evolution succeeds with a gap open");
+        assert!(
+            !provider.table_statistics.read().count_exact,
+            "the re-derivation must not restore exactness after an abandoned persist"
+        );
+        assert!(
+            provider
+                .optimizer_table_statistics()
+                .is_none_or(|stats| !matches!(
+                    stats.num_rows,
+                    datafusion_common::stats::Precision::Exact(_)
+                )),
+            "a schema evolution after an abandoned persist must not serve an Exact count: the \
+             durable record over-claims exactness relative to what is visible to scans, so \
+             handing it to the COUNT(*) fold answers short"
+        );
+    }
+
     /// Phase 5: a table whose live snapshot has on-disk data files but NO
     /// manifest rows (it predates manifest population) must have its manifest
     /// backfilled from the directory listing on open — completely, so the
@@ -40171,11 +42178,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_on_open_populates_empty_manifest_from_directory() {
         let runtime_env = SessionContext::new().runtime_env();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = listing_parity_schema();
         let (provider, catalog, _temp_dir) = create_reopenable_append_table(
             "manifest_backfill_on_open",
             Arc::clone(&schema),
@@ -42845,8 +44848,22 @@ mod tests {
         );
     }
 
+    /// Retirement releases both of the caches a Vortex file occupies, in one
+    /// call: its decoded segments and its footer. The footer cache has no TTL
+    /// and no invalidation of its own — an entry leaves only when another `put`
+    /// pushes it out under capacity pressure — and every Cayenne file is written
+    /// once under a fresh uuid7 directory, so a footer that outlives its file
+    /// can never be looked up again yet keeps a share of a budget that live
+    /// metadata for every other table on the same environment, Parquet
+    /// included, competes for.
+    ///
+    /// "on the same environment" is the sharing boundary, and it is narrower
+    /// than the process: the cache hangs off the `RuntimeEnv`. This test runs
+    /// against one environment, so it covers what a deployment without a
+    /// dedicated Cayenne compaction environment sees; the second cache such a
+    /// deployment has is spiceai/spiceai#13497.
     #[tokio::test]
-    async fn committed_compaction_invalidates_retired_segments_after_cleanup() {
+    async fn committed_compaction_invalidates_retired_segments_and_footers_after_cleanup() {
         use arrow::array::Int64Array;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -42862,6 +44879,18 @@ mod tests {
             ctx.runtime_env(),
         )
         .await;
+        // Footer-cache keys are the files' object-store locations, and a Cayenne
+        // file's location carries the id of the snapshot that wrote it, so the
+        // resident footers can be attributed to a snapshot by name.
+        let footers_under = |snapshot: &str| {
+            ctx.runtime_env()
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(snapshot))
+                .count()
+        };
         insert_batch(
             &provider,
             RecordBatch::try_new(
@@ -42890,6 +44919,10 @@ mod tests {
             "the source scan must populate the cache"
         );
         let old_snapshot = provider.get_current_snapshot_id();
+        assert!(
+            footers_under(&old_snapshot) > 0,
+            "the source scan must cache the written snapshot's footers"
+        );
 
         assert!(
             provider
@@ -42922,6 +44955,16 @@ mod tests {
         );
 
         let current_snapshot = provider.get_current_snapshot_id();
+        let retired_footers_before = footers_under(&old_snapshot);
+        assert!(
+            retired_footers_before > 0,
+            "the compaction inputs' footers are still resident before cleanup"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the replacement scan must cache the live snapshot's footers"
+        );
+
         provider.protected_snapshots.store(Arc::new(HashMap::new()));
         provider
             .snapshot_scan_refs
@@ -42941,6 +44984,11 @@ mod tests {
             "in-flight compaction inputs must remain cached"
         );
         assert_eq!(
+            footers_under(&old_snapshot),
+            retired_footers_before,
+            "a snapshot an in-flight scan still holds is not retired, so its footers must stay"
+        );
+        assert_eq!(
             provider.snapshot_scan_refs.lock().remove(&old_snapshot),
             Some(1),
             "the test must release the old snapshot's in-flight guard"
@@ -42958,6 +45006,15 @@ mod tests {
         assert!(
             entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
             "cleanup must remove retired compaction inputs while preserving the output cache"
+        );
+        assert_eq!(
+            footers_under(&old_snapshot),
+            0,
+            "retiring a file must drop its footer: the deleted snapshot's {retired_footers_before} footers are still pinned in the shared cache, and nothing else will ever release them"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the live snapshot's footers must survive cleanup"
         );
     }
 
@@ -43108,8 +45165,29 @@ mod tests {
         vortex_config: VortexConfig,
         on_conflict: OnConflict,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            schema,
+            vec!["id".to_string()],
+            vortex_config,
+            on_conflict,
+        )
+        .await
+    }
 
+    async fn create_cdc_table_with_schema(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        schema: SchemaRef,
+        primary_key: Vec<String>,
+        vortex_config: VortexConfig,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
         let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
@@ -43120,15 +45198,10 @@ mod tests {
             as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema,
-            primary_key: vec!["id".to_string()],
+            primary_key,
             on_conflict: Some(on_conflict),
             base_path: data_dir,
             partition_column: None,
@@ -43140,6 +45213,109 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Build an upsert table keyed by `pk_columns` (name, type), in key order.
+    async fn create_table_with_pk_columns(
+        table_name: &str,
+        pk_columns: &[(&str, DataType)],
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        let key_names: Vec<String> = pk_columns
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        let mut fields: Vec<Field> = pk_columns
+            .iter()
+            .map(|(name, data_type)| Field::new(*name, data_type.clone(), false))
+            .collect();
+        fields.push(Field::new("value", DataType::Int64, false));
+
+        let on_conflict = OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                key_names.clone(),
+            ),
+        );
+        let (provider, _catalog, temp_dir) = create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            Arc::new(Schema::new(fields)),
+            key_names,
+            VortexConfig::default(),
+            on_conflict,
+        )
+        .await;
+        (provider, temp_dir)
+    }
+
+    /// Whether `pk_row_converter` is cached is the deletion-vector key-encoding
+    /// discriminator: an `Int64Pk` table's tombstone keys are raw big-endian,
+    /// every other shape's are `RowConverter` `OwnedRow` encodings (see
+    /// `partition_cold_manifest_for_promotion`). Caching a converter for a
+    /// single-`Int64` primary key would decode those raw-BE keys through a
+    /// `RowConverter`, corrupting carry-forward classification and cold-file
+    /// partitioning — so pin which shape caches one.
+    #[tokio::test]
+    async fn pk_row_converter_is_none_exactly_for_the_int64_pk_strategy() {
+        let ctx = SessionContext::new();
+
+        let (int64_pk, _tmp_int64) = create_table_with_pk_columns(
+            "pk_guard_int64",
+            &[("id", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int64_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::Int64Pk { .. }
+            ),
+            "a single-Int64 primary key selects the Int64Pk deletion strategy"
+        );
+        assert!(
+            int64_pk.pk_row_converter.is_none(),
+            "the Int64Pk strategy must cache no RowConverter: its deletion-vector \
+             tombstone keys are raw big-endian, not OwnedRow encodings"
+        );
+
+        let (int32_pk, _tmp_int32) = create_table_with_pk_columns(
+            "pk_guard_int32",
+            &[("id", DataType::Int32)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int32_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "an Int32 primary key selects the RowConverterBased deletion strategy"
+        );
+        assert!(
+            int32_pk.pk_row_converter.is_some(),
+            "the RowConverterBased strategy must cache its RowConverter"
+        );
+
+        // `Int64Pk` is selected only for one Int64 column; a composite of two
+        // uses `RowConverterBased` and caches a converter.
+        let (composite_pk, _tmp_composite) = create_table_with_pk_columns(
+            "pk_guard_composite",
+            &[("id", DataType::Int64), ("part", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                composite_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "a composite primary key selects the RowConverterBased deletion strategy \
+             even when every column is Int64"
+        );
+        assert!(
+            composite_pk.pk_row_converter.is_some(),
+            "a composite Int64 primary key must cache its RowConverter"
+        );
     }
 
     fn id_value_batch(schema: SchemaRef, ids: &[i64], values: &[i64]) -> RecordBatch {
@@ -44985,10 +47161,7 @@ mod tests {
 
         // Poison the metastore read path: any `get_inlined_data` round trip
         // from here on errors with `no such table`.
-        let db_path = tmp.path().join("metadata").join("cayenne.db");
-        let conn = rusqlite::Connection::open(&db_path).expect("open metastore db directly");
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy timeout");
+        let conn = open_metastore_db(tmp.path());
         conn.execute_batch(
             "ALTER TABLE cayenne_inlined_data RENAME TO cayenne_inlined_data_hidden;",
         )
