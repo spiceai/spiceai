@@ -28,13 +28,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::ducklake::provider::DuckLakeCatalogProvider;
+use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
@@ -322,9 +323,7 @@ impl CatalogConnector for DuckLakeCatalog {
             writable,
             ddl_enabled,
             table_selector(catalog),
-            // The DuckDB-flavored deny-list: every Spice-only UDF except the
-            // ones the DuckDB dialect rewrites into native SQL. See #13664.
-            deny_spice_functions_for_duckdb_table_providers(),
+            ducklake_federation(),
         ));
 
         // Initial refresh to populate schemas and tables
@@ -338,6 +337,19 @@ impl CatalogConnector for DuckLakeCatalog {
             })?;
 
         Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}
+
+/// The dialect and deny-list a `DuckLake` catalog federates with.
+///
+/// `DuckLake` is `DuckDB`, so there is one correct answer here and it is built in
+/// one place: the deny-list carves out exactly the functions
+/// [`new_duckdb_dialect`] rewrites into native `DuckDB` SQL, and both are derived
+/// from the same override list. See #13664.
+fn ducklake_federation() -> DuckLakeFederation {
+    DuckLakeFederation {
+        dialect: new_duckdb_dialect(),
+        function_support: deny_spice_functions_for_duckdb_table_providers(),
     }
 }
 
@@ -375,5 +387,91 @@ mod tests {
                 .map(ExposeSecret::expose_secret),
             Some("FwoSessionToken")
         );
+    }
+}
+
+#[cfg(test)]
+mod federation_tests {
+    use super::*;
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, Volatility, create_udf, expr::ScalarFunction,
+    };
+    use datafusion::prelude::col;
+    use datafusion::sql::unparser::Unparser;
+    use datafusion::sql::unparser::dialect::Dialect as _;
+    use runtime_datafusion::dialect::duckdb_native_function_names;
+
+    fn stub_udf(name: &str, arity: usize) -> Expr {
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; arity],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf,
+            (0..arity).map(|i| col(format!("c{i}"))).collect(),
+        ))
+    }
+
+    /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
+    /// `DataFusion` evaluates them locally instead of unparsing them into the
+    /// statement sent to `DuckDB`. See issue #13664.
+    #[test]
+    fn the_catalog_denies_the_spice_functions_duckdb_cannot_run() {
+        let support = ducklake_federation().function_support;
+        assert!(
+            !support.supports(&stub_udf("json_get_str", 2)),
+            "json_get_str must be denied so federation falls back to local DataFusion"
+        );
+        assert!(
+            support.supports(&stub_udf("upper", 1)),
+            "a non-Spice function like upper() must still federate"
+        );
+    }
+
+    /// The half of the pairing a deny-list alone cannot express: every name the
+    /// carve-out *allows* through must be one the dialect this catalog installs
+    /// actually has a handler for. Pair the `DuckDB`-flavored deny-list with the
+    /// stock dialect and `cosine_distance` federates and is then emitted
+    /// verbatim -- the unknown-function failure the deny-list exists to prevent,
+    /// reached through the functions it deliberately allowed.
+    ///
+    /// `scalar_function_to_sql_overrides` answers `Ok(None)` exactly when the
+    /// dialect has no handler for the name, which is what the stock dialect
+    /// returns for all of these. `Err` still means a handler ran, so it counts as
+    /// installed here; whether a handler may refuse a call shape at all is #13665.
+    #[test]
+    fn every_carved_out_function_is_one_the_installed_dialect_handles() {
+        let federation = ducklake_federation();
+        let unparser = Unparser::new(federation.dialect.as_ref());
+
+        let carved_out = duckdb_native_function_names();
+        assert!(
+            !carved_out.is_empty(),
+            "the carve-out list must not be empty, or this test proves nothing"
+        );
+
+        for name in carved_out {
+            let expr = stub_udf(name, 2);
+            assert!(
+                federation.function_support.supports(&expr),
+                "{name} is rewritten by the dialect, so the deny-list must carve it out"
+            );
+            let args = [col("c0"), col("c1")];
+            let handled = !matches!(
+                federation
+                    .dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args),
+                Ok(None)
+            );
+            assert!(
+                handled,
+                "the deny-list lets {name} federate, so the installed dialect must have a \
+                 handler for it -- the stock DuckDB dialect does not, and would emit it verbatim"
+            );
+        }
     }
 }
