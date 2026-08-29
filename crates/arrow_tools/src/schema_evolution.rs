@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 
-use crate::type_rewrite::normalize_dictionary_types;
+use crate::type_rewrite::{DictionaryUnwrap, MapEntriesNonNullable, apply_rules};
 
 /// The result of classifying an incoming schema against the current stored schema.
 #[derive(Debug)]
@@ -138,6 +138,25 @@ impl WideningPlan {
     }
 }
 
+/// The form of a schema this classifier compares: the representations that carry no schema
+/// change of their own, normalized away so a difference that survives is a real one.
+///
+/// - Dictionary encoding is transparent for evolution, so the value type is what is compared
+///   (mirrored in [`widen_type`], which unwraps a dictionary again for the same reason).
+/// - A `Map` whose `entries` field is declared nullable is not a different type but an invalid
+///   one: the Arrow layout forbids it and `MapArray::try_new` refuses it, so no engine can hold
+///   a column declared that way. Left in, it is a difference that never resolves — a source
+///   declaring it that way differs from every conforming stored schema on every comparison, and
+///   [`widen_type`] has no `Map` arm, so the verdict is `Incompatible`: under
+///   `on_schema_change: fail` a dataset stops replicating over a schema that never changed.
+///   Normalizing it here also means no [`WideningPlan::evolved_schema`] can carry the forbidden
+///   declaration into whatever persists or installs it.
+///
+/// Both rules are applied in one pass so a schema needing neither is shared by refcount.
+fn normalize_for_comparison(schema: &Schema) -> Schema {
+    apply_rules(schema, &[&DictionaryUnwrap, &MapEntriesNonNullable])
+}
+
 /// Classifies `incoming` against `current` using name-based field matching.
 ///
 /// Rules:
@@ -152,8 +171,8 @@ impl WideningPlan {
 ///   [`EvolutionContext::constraint_columns`] is [`SchemaEvolution::Incompatible`].
 #[must_use]
 pub fn classify(current: &Schema, incoming: &Schema, ctx: &EvolutionContext) -> SchemaEvolution {
-    let current = normalize_dictionary_types(current);
-    let incoming = normalize_dictionary_types(incoming);
+    let current = normalize_for_comparison(current);
+    let incoming = normalize_for_comparison(incoming);
 
     let mut incompatibilities: Vec<String> = Vec::new();
     let mut evolved_fields: Vec<FieldRef> = Vec::with_capacity(incoming.fields().len());
@@ -1485,6 +1504,119 @@ mod tests {
                 plan.describe(),
                 "1 added column (c), 1 nullability relaxed (b)"
             );
+        }
+    }
+
+    /// The Arrow map layout forbids a nullable `entries` field, and `MapArray::try_new` refuses
+    /// one, so no engine can hold a column declared that way. Left in the comparison it is a
+    /// difference that never resolves — a source that keeps declaring it that way differs from
+    /// every conforming stored schema on every comparison, and `widen_type` has no `Map` arm, so
+    /// the verdict is `Incompatible`. Under `on_schema_change: fail` that stops a dataset
+    /// replicating over a schema that never changed.
+    mod map_entries {
+        use super::*;
+
+        fn map_of(entries_nullable: bool) -> DataType {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        }
+
+        fn schema_with(entries_nullable: bool) -> Schema {
+            Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("m", map_of(entries_nullable), true),
+            ])
+        }
+
+        fn entries_nullability(schema: &Schema, column: &str) -> bool {
+            match schema.field_with_name(column).expect("column").data_type() {
+                DataType::Map(entries, _) => entries.is_nullable(),
+                other => panic!("expected a Map, got {other:?}"),
+            }
+        }
+
+        /// The declaration the layout forbids is not a schema change, whichever side carries
+        /// it: a stored schema conformed on the way in is compared against a source that still
+        /// declares it the old way, and a checkpoint written before the conformance is compared
+        /// against a source that now declares it correctly.
+        #[test]
+        fn an_entries_nullability_difference_is_not_a_change() {
+            assert_identical(&classify(
+                &schema_with(false),
+                &schema_with(true),
+                &NO_CONSTRAINTS,
+            ));
+            assert_identical(&classify(
+                &schema_with(true),
+                &schema_with(false),
+                &NO_CONSTRAINTS,
+            ));
+        }
+
+        /// Whatever the plan is handed to — a metastore write, a live schema swap — must not be
+        /// able to reintroduce the forbidden declaration, so it cannot survive into the evolved
+        /// schema on either the added-column or the carried-over-column path.
+        #[test]
+        fn an_evolved_schema_never_carries_the_forbidden_declaration() {
+            let current = schema_with(true);
+            let incoming = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("m", map_of(true), true),
+                Field::new("added", map_of(true), true),
+            ]);
+            let plan = expect_widening(classify(&current, &incoming, &NO_CONSTRAINTS));
+            assert_eq!(plan.describe(), "1 added column (added)");
+            assert!(
+                !entries_nullability(&plan.evolved_schema, "added"),
+                "an added Map column must be conformed"
+            );
+            assert!(
+                !entries_nullability(&plan.evolved_schema, "m"),
+                "a carried-over Map column must be conformed too"
+            );
+        }
+
+        /// The normalization is one bit of one type node, so every real difference still
+        /// reaches the classifier: a renamed entries child is a genuine type change and must
+        /// stay `Incompatible` rather than being flattened into the pair above.
+        #[test]
+        fn a_real_difference_inside_the_entries_struct_still_refuses() {
+            let renamed = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "m",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    Field::new("keys", DataType::Utf8, false),
+                                    Field::new("payload", DataType::Utf8, true),
+                                ]
+                                .into(),
+                            ),
+                            true,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+            ]);
+            let reason =
+                expect_incompatible(classify(&schema_with(false), &renamed, &NO_CONSTRAINTS));
+            assert!(reason.contains("`m`"), "unexpected reason: {reason}");
         }
     }
 }

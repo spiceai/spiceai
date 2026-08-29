@@ -25,7 +25,6 @@ use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
@@ -2690,15 +2689,6 @@ impl RefreshTask {
                 self.engine_type_rewrites,
             ))
         };
-        // An illegal `MAP` declaration is not a schema change. The Arrow map layout forbids a
-        // nullable `entries` field and no engine can store one, so a source that declares it
-        // that way differs from every accelerator's stored declaration on every batch — and
-        // `widen_type` has no `Map` arm, so that difference classifies `Incompatible`, which
-        // under `on_schema_change: fail` stops replication over a schema that never changed.
-        // Conforming the incoming declaration first is the same move the engine type rewrites
-        // above make for a permanent engine-side representation, and it leaves the batch itself
-        // to the cast against the accelerator's own schema.
-        let normalized_incoming = conforming_schema(normalized_incoming);
         let incoming_data_schema = &normalized_incoming;
         let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
         let ctx = EvolutionContext {

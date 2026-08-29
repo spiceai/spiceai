@@ -1829,13 +1829,16 @@ mod tests {
 
     /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
     /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
-    /// refuses. Adding such a column under `append_new_columns` would otherwise persist that
-    /// declaration and swap it into the live table, leaving a column no kernel can rebuild on a
-    /// table that was readable a moment earlier. The metastore write and the in-memory swap are
-    /// asserted separately: they are two different stores, and a repair applied to one of them
-    /// leaves the other advertising a type its own catalog disagrees with.
+    /// refuses. Adding such a column under `append_new_columns` must not leave a column no
+    /// kernel can rebuild on a table that was readable a moment earlier.
+    ///
+    /// This is the Cayenne end of the normalization `classify` applies, exercised the way
+    /// production reaches it — the CDC path hands `evolve_schema_live` a plan the classifier
+    /// built. The metastore write and the in-memory swap are asserted separately: they are two
+    /// different stores, and a declaration that reaches only one of them leaves the other
+    /// advertising a type its own catalog disagrees with.
     #[tokio::test]
-    async fn schema_evolution_live_conforms_an_added_map_entries_declaration() {
+    async fn schema_evolution_live_installs_a_conforming_map_entries_declaration() {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_map.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
@@ -1897,10 +1900,13 @@ mod tests {
         let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
         assert!(
             matches!(
-                plan.evolved_schema.field_with_name("headers").expect("headers").data_type(),
-                DataType::Map(entries, _) if entries.is_nullable()
+                plan.evolved_schema
+                    .field_with_name("headers")
+                    .expect("headers")
+                    .data_type(),
+                DataType::Map(entries, _) if !entries.is_nullable()
             ),
-            "the plan under test must carry the declaration the Arrow map layout forbids"
+            "the classifier must not hand on a plan carrying the declaration the Arrow map layout forbids"
         );
 
         provider
