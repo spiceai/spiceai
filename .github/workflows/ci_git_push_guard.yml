@@ -1,0 +1,65 @@
+---
+name: CI Git-Push Guard
+
+# A `git push` in CI that can consult a credential helper can block on an interactive
+# prompt that never gets an answer on a headless runner. Nothing bounds that wait, so the
+# job runs to GitHub's 360-minute limit -- and when the pushing step exists only to report
+# a result (snapshot updates, generated schemas), the timeout destroys the very test
+# verdict the run had already produced hours earlier.
+#
+# Neither direction is observable until it is already wrong in production: a guarded push
+# and an unguarded one look identical on a runner whose helper happens to stay quiet.
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'scripts/check_ci_git_push_noninteractive.py'
+      - 'scripts/test_check_ci_git_push_noninteractive.py'
+      # Any workflow or action manifest: a push that can hang is added at a call site, not
+      # in the guard. Composite actions count -- one shared action carried the push for
+      # eight call sites across six workflows.
+      - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'scripts/check_ci_git_push_noninteractive.py'
+      - 'scripts/test_check_ci_git_push_noninteractive.py'
+      - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-git-push-noninteractive:
+    name: Every CI git push is non-interactive
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue behind the
+    # self-hosted pool whose credential helpers it is about.
+    runs-on: ubuntu-24.04
+    # A checkout plus a local Python script over the manifests -- the job reads the
+    # repository and nothing else.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The guard's parser is exercised first: the live-tree scan only covers the shapes
+      # today's `.github/` happens to contain, so a parser that stopped recognising
+      # `git push` would report a clean tree and pass unnoticed.
+      - name: Test the guard's parser
+        run: python3 scripts/test_check_ci_git_push_noninteractive.py
+
+      - name: Check every CI git push disables interactive credentials
+        run: python3 scripts/check_ci_git_push_noninteractive.py

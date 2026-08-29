@@ -58,7 +58,13 @@ runs:
         git remote set-url origin "${AUTHENTICATED_REMOTE_URL}"
         git checkout -b "${BRANCH_NAME}"
         git commit -m "${PR_TITLE}"
-        git push origin "HEAD:${BRANCH_NAME}"
+        # Disable any credential helper configured on the (self-hosted) runner so
+        # git authenticates with the URL-embedded token only. Otherwise a helper
+        # (osxkeychain / git-credential-manager) can intercept the push and block on
+        # an interactive credential prompt, hanging the job until the 360-minute
+        # limit and discarding the test result this step was reporting on.
+        git -c credential.helper='' -c credential.interactive=false \
+          push origin "HEAD:${BRANCH_NAME}"
 
         BODY="${PR_DESCRIPTION}"
         if [[ -z "${BODY}" ]]; then
@@ -89,9 +95,15 @@ runs:
         ' "${EXISTING_PR_JSON}" | while IFS=$'\t' read -r OLD_PR_NUMBER OLD_BRANCH; do
           echo "Closing superseded snapshot update PR #${OLD_PR_NUMBER}"
           gh pr close "${OLD_PR_NUMBER}" --comment "Superseded by ${PR_URL} (fresher snapshot diff against current ${BASE_BRANCH})." || true
-          git push origin --delete "${OLD_BRANCH}" || true
+          # `|| true` bounds the exit status, not the wall clock: the same credential
+          # helper can block this push too, so it needs the same guard.
+          git -c credential.helper='' -c credential.interactive=false \
+            push origin --delete "${OLD_BRANCH}" || true
         done
       env:
         GH_TOKEN: ${{ inputs.token }}
         PR_TITLE: ${{ inputs.title }}
+        # Never fall back to an interactive prompt; fail fast if auth is rejected.
+        GIT_TERMINAL_PROMPT: '0'
+        GCM_INTERACTIVE: 'never'
         PR_DESCRIPTION: ${{ inputs.description }}

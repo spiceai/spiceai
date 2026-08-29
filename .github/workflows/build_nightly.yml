@@ -520,6 +520,13 @@ jobs:
       - name: Update nightly tag
         run: |
           git tag -f nightly
-          git push origin nightly --force
+          # Disable any credential helper configured on the runner: a helper can
+          # intercept the push and block on an interactive credential prompt,
+          # hanging the job.
+          git -c credential.helper='' -c credential.interactive=false \
+            push origin nightly --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
