@@ -15036,7 +15036,11 @@ impl CayenneTableProvider {
             return None;
         }
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
-        let trigger_len = self.context.bake_deletion_index_trigger();
+        // The CONFIGURED trigger, not the adaptive one: the controller lowers that
+        // to bake more often, a trade priced against the incremental bake's write
+        // amplification, and this path is a full rewrite instead. See
+        // `CayenneContext::configured_deletion_index_trigger`.
+        let trigger_len = self.context.configured_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
         (deletion_index_len >= trigger_len || over_memory_ceiling).then_some(
             SnapshotMaintenanceTrigger::DeletionIndexSize {

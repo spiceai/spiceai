@@ -64,7 +64,7 @@ const RECLAIM_TRIGGER: usize = 2_000;
 /// catch — a position-delete pass that holds `write_lock` while waiting for it
 /// wedges the table for every writer — so each pass is bounded and a breach is
 /// reported as a failure rather than left to hang the suite.
-const PASS_TIMEOUT: Duration = Duration::from_secs(120);
+const PASS_TIMEOUT: Duration = Duration::from_mins(2);
 
 fn pk_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
