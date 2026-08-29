@@ -366,6 +366,42 @@ async fn create_table(
     Ok(())
 }
 
+/// Drives one non-blocking poll past the bootstrap boundary, so the
+/// `bootstrap_finished` link runs.
+///
+/// The stream a member yields is `snapshot.chain(boundary).chain(bootstrap_finished)`
+/// chained onto the live receiver. `bootstrap_finished` is the link that calls
+/// `snapshot_finished` and marks the member live, and it is only reached on the
+/// poll *after* the boundary: committing the boundary envelope does not reach it,
+/// because that poll returned as soon as `boundary` yielded. A caller that drops
+/// the stream there leaves the member `SNAPSHOTTING`, so its detach tears the
+/// table back out of the publication and the next start re-snapshots instead of
+/// resuming on the position it recorded. For a case whose whole subject is what
+/// the *rejoin* decides, that silently substitutes a different fixture.
+///
+/// One poll is enough and one poll is all this does. `Chain` consumes
+/// `boundary`'s `None` and polls `bootstrap_finished` within the same call, so
+/// the hook has fired by the time this returns. It must not `await` the stream's
+/// next item: past the hook the chain continues into the live receiver, which
+/// stays open and yields `Pending` until WAL traffic or a keepalive arrives.
+/// Anything the receiver could produce — `Pending`, a heartbeat, an envelope —
+/// happens strictly after the hook, so all of them mean "the hook ran". Only a
+/// stream error is worth failing on, since it says the member did not survive its
+/// own bootstrap.
+async fn finish_bootstrap(stream: &mut ChangesStream, what: &str) -> Result<(), anyhow::Error> {
+    let polled =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_next_unpin(cx))).await;
+
+    if let std::task::Poll::Ready(Some(Err(e))) = polled {
+        anyhow::bail!(
+            "the bootstrap stream for {what} errored on the poll that runs its \
+             snapshot-finished hook: {e}"
+        );
+    }
+
+    Ok(())
+}
+
 async fn next_envelope(
     stream: &mut ChangesStream,
     what: &str,
@@ -1668,14 +1704,19 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
         .await?
         .commit()
         .await?;
-    // The bootstrap stream is `snapshot.chain(boundary)`, and it is the zero-row
-    // boundary — not the data envelope above — whose committer publishes the
-    // watermark. Both rows fit one batch, so without polling this second envelope
-    // the stream is dropped before any position is recorded.
+    // The bootstrap stream is `snapshot.chain(boundary).chain(bootstrap_finished)`,
+    // and it is the zero-row boundary — not the data envelope above — whose
+    // committer publishes the watermark. Both rows fit one batch, so without
+    // polling this second envelope the stream is dropped before any position is
+    // recorded.
     next_envelope(&mut first, "first-start snapshot boundary")
         .await?
         .commit()
         .await?;
+    // And one poll further, so the member is left live rather than snapshotting —
+    // see `finish_bootstrap`. Without it the rejoin below re-snapshots and never
+    // reaches the arm this case is about.
+    finish_bootstrap(&mut first, "the first start").await?;
     drop(first);
     wait_for_walsender_count(&source, 0).await?;
 
@@ -1767,6 +1808,7 @@ async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resu
         .await?
         .commit()
         .await?;
+    finish_bootstrap(&mut first, "the first start").await?;
     drop(first);
     wait_for_walsender_count(&source, 0).await?;
 

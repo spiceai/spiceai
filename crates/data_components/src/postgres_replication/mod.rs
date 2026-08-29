@@ -297,7 +297,7 @@ pub struct AppliedLsn {
 /// start finds an empty table and a perfectly usable position. Restoring an older
 /// accelerator file, or clearing the table by hand, lands in the same state.
 ///
-/// Emptiness alone is not the gap — `emptiness_implies_gap` is false whenever a
+/// Emptiness alone is not the gap — `contents_implying_gap` is `None` whenever a
 /// snapshot is going to populate the table, which is the ordinary first load and
 /// every re-snapshot after it. What makes it one is nothing else loading the
 /// table, exactly as for a missing watermark.
@@ -307,9 +307,18 @@ pub struct AppliedLsn {
 /// rather than an accepted false positive: the two states are indistinguishable
 /// from here, the rebuild of a genuinely empty source reads nothing, and this
 /// path already prefers a needless re-read to an unproven resume everywhere else.
-/// Only a *positive* observation of emptiness counts
-/// ([`crate::cdc::AccelerationContents::is_provably_empty`]), so a probe that
-/// could not answer resumes exactly as it does today.
+///
+/// For the same reason, only a positive
+/// [`AccelerationContents::NonEmpty`](crate::cdc::AccelerationContents::NonEmpty)
+/// licenses the resume: a probe that could not answer rebuilds as well, under
+/// [`RebuildCause::UnprovenContentsWithUsablePosition`] rather than
+/// [`RebuildCause::EmptyWithUsablePosition`]. Against a *missing* watermark the
+/// cautious answer to an unanswered probe is the opposite one — there,
+/// `absence_implies_gap` treats "not provably empty" as reason to rebuild — and
+/// carrying that direction across to a watermark that is present would resume on
+/// the strength of a question nobody managed to ask. The two causes stay separate
+/// because the follow-up differs: one names an acceleration someone can go and
+/// look at, the other names a probe worth fixing.
 ///
 /// The slot-health causes keep their precedence over this one: a rebuild that
 /// fires today keeps reporting the cause it reports today, and this arm only ever
