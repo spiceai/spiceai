@@ -15,7 +15,7 @@ use arrow::{
     compute::concat,
 };
 
-use crate::index::primary_key_projection;
+use crate::index::{coalesce, primary_key_projection};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chunking::Chunker;
@@ -83,9 +83,13 @@ impl Index for ChunkedSearchIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        // Duplicate primary keys in one batch resolve to the last change — see [`coalesce`].
+        let primary_key = self.primary_fields();
+        let futs = batches.into_iter().map(|rb| {
+            coalesce::write_last_write_wins(&primary_key, rb, |b| async {
+                self.write(b).await.map_err(DataFusionError::External)
+            })
+        });
         try_join_all(futs).await
     }
 
@@ -1165,6 +1169,8 @@ mod tests {
         listed: Option<Vec<RecordBatch>>,
         /// Key batches handed to [`Index::delete_by_keys`].
         deleted: std::sync::Mutex<Vec<RecordBatch>>,
+        /// The chunk rows handed to [`SearchIndex::write`] — what this index would hold.
+        written: std::sync::Mutex<Vec<RecordBatch>>,
     }
 
     impl RecordingInner {
@@ -1179,6 +1185,7 @@ mod tests {
                 primary_fields: vec![Field::new("id", DataType::Int64, false)],
                 listed: None,
                 deleted: std::sync::Mutex::new(Vec::new()),
+                written: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1208,6 +1215,48 @@ mod tests {
                 listed: Some(listed),
                 ..Self::new("content")
             }
+        }
+
+        /// The chunk rows this index was asked to hold, as `(primary key, chunk id, text)`
+        /// across every [`SearchIndex::write`] call.
+        fn holds(&self) -> Vec<(i64, u64, String)> {
+            self.written
+                .lock()
+                .expect("mutex")
+                .iter()
+                .flat_map(|batch| {
+                    let ids = batch
+                        .column_by_name("id")
+                        .expect("the chunked batch carries the base key")
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id is Int64")
+                        .values()
+                        .to_vec();
+                    let chunk_ids = batch
+                        .column_by_name(CHUNKED_INDEX_CHUNK_KEY)
+                        .expect("the chunked batch carries the chunk key")
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .expect("chunk id is UInt64")
+                        .values()
+                        .to_vec();
+                    let text = batch
+                        .column_by_name(&self.search_column)
+                        .expect("the chunked batch carries the search column")
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("the search column is Utf8")
+                        .iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<_>>();
+                    ids.into_iter()
+                        .zip(chunk_ids)
+                        .zip(text)
+                        .map(|((id, chunk), text)| (id, chunk, text))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         }
 
         /// The key batches passed to [`Index::delete_by_keys`], as
@@ -1315,6 +1364,7 @@ mod tests {
                 .lock()
                 .expect("mutex")
                 .push(record.num_rows());
+            self.written.lock().expect("mutex").push(record.clone());
 
             // Build a synthetic embedding column matching the row count. The first element
             // encodes the row's position within this call so tests can verify ordering
@@ -1386,6 +1436,86 @@ mod tests {
             ],
         )
         .expect("valid batch")
+    }
+
+    /// Regression test for #13713. A CDC change envelope carries every change the source
+    /// produced in one poll, so one batch can hold two changes for the same row. Chunking each
+    /// row independently then put two rows under the chunk-keyed primary key `(1, 0)` and left
+    /// the superseded text's `(1, 1)` chunk in the index, where it kept the row searchable by a
+    /// word its current text does not contain.
+    ///
+    /// Asserts what the inner index was asked to hold, not what the write returned.
+    #[tokio::test]
+    async fn a_row_changed_twice_in_one_batch_is_chunked_only_from_its_last_change() {
+        let inner = Arc::new(RecordingInner::new("content"));
+        let chunked = ChunkedSearchIndex::new(
+            Arc::clone(&inner) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>,
+        );
+
+        let out = chunked
+            .compute_index(vec![build_input(&[("aaa bbb", 1), ("ddd", 2), ("ccc", 1)])])
+            .await
+            .expect("the batch is indexed");
+
+        assert_eq!(
+            inner.holds(),
+            vec![(2, 0, "ddd".to_string()), (1, 0, "ccc".to_string()),],
+            "only the last change for row 1 may be chunked: 'aaa'/'bbb' belong to the text it \
+             superseded, and 'bbb' would never be overwritten by the shorter 'ccc'"
+        );
+
+        let held = inner.holds();
+        let mut keys: Vec<(i64, u64)> = held.iter().map(|(id, chunk, _)| (*id, *chunk)).collect();
+        let before = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            before,
+            "the chunk-keyed primary key must be unique in what the inner index holds"
+        );
+
+        assert_eq!(
+            out.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            3,
+            "the batch handed back keeps every change, so the accelerator still applies all three"
+        );
+    }
+
+    /// The same shape without the duplicate: the last change clears the search value, so the
+    /// superseded text must not be chunked into the index either.
+    #[tokio::test]
+    async fn a_search_value_cleared_later_in_the_batch_is_not_chunked_from_its_old_text() {
+        let inner = Arc::new(RecordingInner::new("content"));
+        let chunked = ChunkedSearchIndex::new(
+            Arc::clone(&inner) as Arc<dyn SearchIndex>,
+            Arc::new(DelimChunker { delim: ' ' }) as Arc<dyn Chunker>,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1])),
+                Arc::new(StringArray::from(vec![Some("value"), None])),
+            ],
+        )
+        .expect("valid batch");
+
+        chunked
+            .compute_index(vec![input])
+            .await
+            .expect("the batch is indexed");
+
+        assert!(
+            inner.holds().is_empty(),
+            "row 1 ends the batch with no search value, so nothing may be indexed for it: {:?}",
+            inner.holds()
+        );
     }
 
     /// The chunking layer must not downgrade a fatal inner index to best-effort — a

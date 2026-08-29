@@ -49,6 +49,7 @@ use crate::generation::text_search::{
 };
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
+use crate::index::coalesce;
 
 /// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
 /// A larger budget reduces the number of segment flushes and subsequent merges,
@@ -263,7 +264,15 @@ impl Index for FullTextDatabaseIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if let Err(e) = self.update_index(batches.as_slice()).await {
+        // A batch can carry more than one change for the same primary key, which the table this
+        // indexes resolves to the last one. `update_index` deletes each key's existing terms and
+        // then adds every document it was given, so without this the collection would hold a
+        // second document for the superseded content — see [`coalesce`]. Only what is indexed is
+        // reduced; the caller's batches are handed back untouched.
+        let primary_key = self.primary_fields();
+        let reduced = coalesce::reduce_batches(&primary_key, batches.as_slice())?;
+        let indexed = reduced.as_deref().unwrap_or(batches.as_slice());
+        if let Err(e) = self.update_index(indexed).await {
             tracing::error!("Failed to update full text search index: {e}");
             return Err(DataFusionError::External(Box::new(e)));
         }
@@ -1210,6 +1219,64 @@ mod tests {
             .expect("Failed to collect search results");
 
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    /// How many documents a query matches.
+    async fn search_hits(idx: &FullTextSearchFieldIndex, query: &str) -> usize {
+        let rb: Vec<RecordBatch> = idx
+            .search(query.to_string(), vec![], 1000)
+            .expect("Failed to search")
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+        rb.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Regression test for #13713. A CDC change envelope carries every change the source
+    /// produced in one poll, so one batch can hold two changes for the same row. Indexing is a
+    /// delete of each key's existing terms followed by an add of every document handed over, so
+    /// both changes became documents and the row stayed findable by words its current content
+    /// does not contain.
+    ///
+    /// Asserts what the collection holds after the write, not what the write returned.
+    #[tokio::test]
+    async fn a_row_changed_twice_in_one_batch_is_indexed_once_as_its_last_change() {
+        let index = new_test_index();
+
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 1]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple superseded", "banana", "cherry current"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        assert_eq!(
+            search_hits(&search_index, "apple").await,
+            0,
+            "row 1's superseded content must not be searchable"
+        );
+        assert_eq!(
+            search_hits(&search_index, "cherry").await,
+            1,
+            "row 1 must be one document, carrying the change that supersedes the other"
+        );
+        assert_eq!(
+            search_hits(&search_index, "banana").await,
+            1,
+            "the row the batch changed once is untouched"
+        );
     }
 
     /// Verifies that an exact filter is included in the tantivy query before the top-K limit is

@@ -26,6 +26,7 @@ use datafusion::{
 use spice_table::Index;
 
 pub mod chunking;
+pub(crate) mod coalesce;
 pub mod compound;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;

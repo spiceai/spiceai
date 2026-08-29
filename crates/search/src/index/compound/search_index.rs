@@ -26,7 +26,7 @@ use datafusion::{
 use futures::future::try_join_all;
 use spice_table::{Index, WriteWindow};
 
-use crate::index::{SearchIndex, VectorIndex};
+use crate::index::{SearchIndex, VectorIndex, coalesce};
 
 use super::{
     COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
@@ -98,9 +98,13 @@ impl Index for CompoundSearchIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        // Duplicate primary keys in one batch resolve to the last change — see [`coalesce`].
+        let primary_key = self.primary_fields();
+        let futs = batches.into_iter().map(|rb| {
+            coalesce::write_last_write_wins(&primary_key, rb, |b| async {
+                self.write(b).await.map_err(DataFusionError::External)
+            })
+        });
         try_join_all(futs).await
     }
 

@@ -54,7 +54,9 @@ use spice_table::Index;
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
 use crate::index::write_util::extract_and_format_primary_key;
-use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
+use crate::index::{
+    MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, coalesce, embedding_col,
+};
 use crate::metadata::MetadataColumns;
 use datafusion::{
     common::Column,
@@ -381,9 +383,13 @@ impl Index for S3Vector {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        // Duplicate primary keys in one batch resolve to the last change — see [`coalesce`].
+        let primary_key = self.primary_fields();
+        let futs = batches.into_iter().map(|rb| {
+            coalesce::write_last_write_wins(&primary_key, rb, |b| async {
+                self.write(b).await.map_err(DataFusionError::External)
+            })
+        });
         futures::stream::iter(futs)
             .buffered(MAX_CONCURRENT_INDEX_WRITES)
             .try_collect()

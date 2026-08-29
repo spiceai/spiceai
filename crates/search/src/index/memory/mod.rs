@@ -44,7 +44,7 @@ use snafu::{ResultExt, Snafu, ensure};
 use spice_table::{Index, WriteWindow};
 
 use crate::index::{
-    SearchIndex, VectorIndex, embedding_col,
+    SearchIndex, VectorIndex, coalesce, embedding_col,
     memory::{
         provider::{MemoryVectorListTable, MemoryVectorQueryTable},
         store::MemoryVectorStore,
@@ -321,9 +321,13 @@ impl Index for MemoryVectorIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
+        // Duplicate primary keys in one batch resolve to the last change — see [`coalesce`].
+        let primary_key = self.primary_fields();
+        let futs = batches.into_iter().map(|rb| {
+            coalesce::write_last_write_wins(&primary_key, rb, |b| async {
+                self.write(b).await.map_err(DataFusionError::External)
+            })
+        });
         try_join_all(futs).await
     }
 
@@ -492,7 +496,7 @@ impl VectorIndex for MemoryVectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, StringArray};
     use datafusion_expr::{Volatility, create_udf};
     use llms::embeddings::EmbeddingInput;
 
@@ -609,6 +613,94 @@ mod tests {
             .on_write_complete()
             .await
             .expect("the write window closes");
+    }
+
+    /// The embeddings the store holds, paired with their primary key, ascending by key.
+    fn indexed_vectors(index: &MemoryVectorIndex) -> Vec<(i64, Vec<f32>)> {
+        let mut rows: Vec<(i64, Vec<f32>)> = index
+            .store
+            .read()
+            .batches()
+            .iter()
+            .flat_map(|b| {
+                let (id_idx, _) = b
+                    .schema()
+                    .column_with_name("id")
+                    .expect("the stored schema carries the primary key");
+                let ids = b
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64")
+                    .values()
+                    .to_vec();
+                let (emb_idx, _) = b
+                    .schema()
+                    .column_with_name(&embedding_col("content"))
+                    .expect("the stored schema carries the embedding");
+                let embeddings = b
+                    .column(emb_idx)
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .expect("the embedding is a FixedSizeList");
+                ids.into_iter()
+                    .enumerate()
+                    .map(|(row, id)| {
+                        let values = embeddings.value(row);
+                        let values = values
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .expect("the embedding is Float32");
+                        (id, values.values().to_vec())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    }
+
+    /// Regression test for #13713. A CDC change envelope carries every change the source
+    /// produced in one poll, so one batch can hold two changes for the same row. The store's
+    /// upsert deletes the batch's keys and then appends the batch, so both changes survived and
+    /// one primary key ended up with two stored rows — one of them the superseded content.
+    ///
+    /// Asserts what the store holds after the write, not what the write returned.
+    #[tokio::test]
+    async fn a_row_changed_twice_in_one_batch_is_stored_once_as_its_last_change() {
+        let index = memory_index();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        let record = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 1])),
+                Arc::new(StringArray::from(vec![
+                    "superseded",
+                    "other row",
+                    "current",
+                ])),
+            ],
+        )
+        .expect("valid test batch");
+
+        index
+            .compute_index(vec![record])
+            .await
+            .expect("the rows are indexed");
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 2],
+            "one primary key must have one entry, whatever the batch carried for it"
+        );
+        assert_eq!(
+            indexed_vectors(&index),
+            vec![(1, byte_vector("current")), (2, byte_vector("other row")),],
+            "row 1 must be stored as the change that supersedes the other, not the one it replaced"
+        );
     }
 
     /// The regression test. A `refresh_mode: full` refresh removes a row by not re-sending
