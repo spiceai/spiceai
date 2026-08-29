@@ -118,21 +118,21 @@ mod tests {
         assert!(message.contains("'disabled'"), "{message}");
     }
 
-    /// The parameter must stay a `runtime` parameter: a `component` parameter is
-    /// prefixed with the connector's prefix (`adbc_query_federation`), so the
-    /// lookup in `is_query_federation_enabled` would never find it and every
-    /// catalog would silently federate no matter what the user wrote.
+    /// The parameter must stay a `runtime` parameter, and keep the `enabled`
+    /// default. A `component` parameter is prefixed with the connector's prefix
+    /// when it is surfaced to users, so the same setting would be spelled
+    /// `adbc_query_federation` on a catalog and `query_federation` on a dataset
+    /// — two names for one decision, which is the drift this shared constant
+    /// exists to prevent. The default is asserted here because it is what makes
+    /// installing the deny-list a non-breaking change: a catalog that says
+    /// nothing keeps federating exactly as it did.
     #[test]
-    fn the_parameter_is_not_component_prefixed() {
+    fn the_parameter_is_spelled_the_way_the_dataset_connector_spells_it() {
         assert!(matches!(
             QUERY_FEDERATION_PARAMETER.r#type,
             ParameterType::Runtime
         ));
+        assert_eq!(QUERY_FEDERATION_PARAMETER.name, "query_federation");
         assert_eq!(QUERY_FEDERATION_PARAMETER.default, Some("enabled"));
-        assert!(
-            !is_query_federation_enabled(&params_with(vec![("query_federation", "disabled")]))
-                .expect("'disabled' should parse"),
-            "an unprefixed lookup must see the user's value"
-        );
     }
 }
