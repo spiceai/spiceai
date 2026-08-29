@@ -58,10 +58,10 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
-    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
-    PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
-    serialize_pk_bloom_sidecar, shard_of_pk,
+    CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
+    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
+    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -8454,23 +8454,17 @@ impl CayenneTableProvider {
     /// [`PendingPkKeys`] window over that gap: keys committed meanwhile are held
     /// there and merged back by [`Self::store_cached_pk_index`].
     ///
-    /// Returns `None` when no index is cached — the caller then rebuilds one from
+    /// The window is returned as a [`PkCheckoutGuard`] the caller must carry until
+    /// the store, so a validation that fails or is cancelled closes it on the way
+    /// out instead of latching the log (see [`PkCheckoutGuard`]).
+    ///
+    /// The index is `None` when none is cached — the caller then rebuilds one from
     /// the table, which is equally a checkout: the rebuild reads a snapshot of the
     /// table and every key committed after it must still reach the restored index.
-    fn take_cached_pk_index(&self) -> Option<CachedPkIndex> {
+    fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        self.pk_keyset_pending.lock().begin_checkout();
-        guard.take()
-    }
-
-    /// Close a checkout opened by [`Self::take_cached_pk_index`] without restoring
-    /// an index (the validation never got one — it failed while rebuilding). The
-    /// cache stays empty, so the next validation rebuilds and sees every committed
-    /// key; holding the log open past that point would only accumulate keys nothing
-    /// will replay.
-    fn abandon_cached_pk_index_checkout(&self) {
-        let _guard = self.pk_keyset_cache.lock();
-        let _ = self.pk_keyset_pending.lock().end_checkout();
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        (guard.take(), checkout)
     }
 
     /// Existence view over the keys committed while the table-wide index has been
@@ -8588,13 +8582,13 @@ impl CayenneTableProvider {
     /// keys are gone, and the index is dropped instead of cached — an index missing
     /// a live key answers "absent" for it, which reads as a new primary key and
     /// duplicates the row.
-    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
+    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
         let max_bytes = self.effective_single_keyset_budget();
         // Held from closing the checkout window through the store, so no writer can
         // slip a key in between: it would find the cell empty, see no checkout, and
         // drop the key.
         let mut guard = self.pk_keyset_cache.lock();
-        let restored = self.pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -9128,12 +9122,13 @@ impl CayenneTableProvider {
     /// keys committed while the index was out (the sharded twin of
     /// `store_cached_pk_index` — see there for why an index that is missing a live
     /// key must be dropped rather than cached).
-    fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
+    fn store_sharded_pk_index(&self, checked_out: CheckedOutShardedPkIndex) {
+        let (index, checkout) = checked_out.into_parts();
         let max_bytes = self.effective_sharded_keyset_budget();
         // Held from closing the checkout window through the store — see
         // `store_cached_pk_index`.
         let mut guard = self.sharded_pk_keyset_cache.lock();
-        let restored = self.sharded_pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -10597,32 +10592,36 @@ impl CayenneTableProvider {
 
         let converter = self.build_pk_converter(&pk_indices)?;
         // Off-lock staging must NOT take/store the shared cache (it runs without
-        // `write_lock`); it builds a private keyset every time. The ordinary path
-        // reuses the shared cache and stores it back on finish.
-        let existing_keys = if offlock {
-            self.load_pk_index_for_validation(&pk_indices, &converter)
-                .await?
-        } else if let Some(existing_keys) = self.take_cached_pk_index() {
-            tracing::trace!(
-                "prepare_stream_for_insert: reused {} cached existing keys for table {}",
-                existing_keys.len(),
-                self.table_metadata.table_name
-            );
-            existing_keys
+        // `write_lock`); it builds a private keyset every time, and so opens no
+        // checkout window. The ordinary path reuses the shared cache and carries the
+        // window it opened into the validation stream, which stores the keyset back
+        // and closes the window however the stream ends.
+        let (existing_keys, pk_checkout) = if offlock {
+            (
+                self.load_pk_index_for_validation(&pk_indices, &converter)
+                    .await?,
+                None,
+            )
         } else {
-            // `take_cached_pk_index` already opened the checkout window, so close it
-            // if the rebuild fails: nothing will restore an index, and the keys it
-            // would hold are read from the table by the next validation's rebuild.
-            match self
-                .load_pk_index_for_validation(&pk_indices, &converter)
-                .await
-            {
-                Ok(existing_keys) => existing_keys,
-                Err(error) => {
-                    self.abandon_cached_pk_index_checkout();
-                    return Err(error);
+            let (cached, checkout) = self.take_cached_pk_index();
+            let existing_keys = match cached {
+                Some(existing_keys) => {
+                    tracing::trace!(
+                        "prepare_stream_for_insert: reused {} cached existing keys for table {}",
+                        existing_keys.len(),
+                        self.table_metadata.table_name
+                    );
+                    existing_keys
                 }
-            }
+                // Dropping `checkout` on the way out closes the window the take
+                // opened: nothing will restore an index, and the keys it would hold
+                // are read from the table by the next validation's rebuild.
+                None => {
+                    self.load_pk_index_for_validation(&pk_indices, &converter)
+                        .await?
+                }
+            };
+            (existing_keys, Some(checkout))
         };
 
         let on_conflict = self
@@ -10641,9 +10640,7 @@ impl CayenneTableProvider {
             existing_keys,
             on_conflict,
             Arc::clone(&post_validation),
-            // Ordinary path returns the keyset to the shared cache; off-lock
-            // staging drops its private keyset (never publishes it).
-            !offlock,
+            pk_checkout,
         );
 
         Ok(PreparedInsertStream::deferred(
@@ -10835,7 +10832,7 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         n: usize,
-    ) -> Result<ShardedPkIndex> {
+    ) -> Result<CheckedOutShardedPkIndex> {
         let n = n.max(1);
 
         // Reuse the per-shard cache if present (the sharded analog of
@@ -10843,21 +10840,22 @@ impl CayenneTableProvider {
         // the single source of truth restored after validation by
         // `store_sharded_pk_index` (before the appends), then grown per shard UNDER
         // `locks[s]` by the kept-key insert inside `append_to_shard` (§5 Phase 6).
-        let cached = {
+        // Open the checkout window over the gap this leaves in the cache, so a key
+        // committed before the index is restored is held rather than dropped (see
+        // `take_cached_pk_index`). Opened for the rebuild below too: it reads a
+        // snapshot of the table, and a key committed after that snapshot must still
+        // reach the restored index. Held in a guard so the `?`s below — and every
+        // exit between here and `store_sharded_pk_index` — close it.
+        let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            // Open the checkout window over the gap this leaves in the cache, so a
-            // key committed before the index is restored is held rather than dropped
-            // (see `take_cached_pk_index`). Opened for the rebuild below too: it
-            // reads a snapshot of the table, and a key committed after that snapshot
-            // must still reach the restored index.
-            self.sharded_pk_keyset_pending.lock().begin_checkout();
-            guard.take()
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            (guard.take(), checkout)
         };
         if let Some(cached) = cached {
             // The stored shard count is fixed at the table's `cdc_mem_tier_shards`
             // and never changes for the table's lifetime, so it always matches `n`.
             if cached.shard_count() == n {
-                return Ok(cached);
+                return Ok(CheckedOutShardedPkIndex::new(cached, checkout));
             }
             // Defensive: a mismatch (shouldn't happen) → rebuild below.
             tracing::debug!(
@@ -10931,7 +10929,7 @@ impl CayenneTableProvider {
                 "keyset_rebuild",
                 keyset_rebuild_start,
             );
-            return Ok(index);
+            return Ok(CheckedOutShardedPkIndex::new(index, checkout));
         }
 
         let index = self
@@ -10942,7 +10940,7 @@ impl CayenneTableProvider {
             "keyset_rebuild",
             keyset_rebuild_start,
         );
-        Ok(index)
+        Ok(CheckedOutShardedPkIndex::new(index, checkout))
     }
 
     pub(crate) fn apply_on_conflict_to_batch(
@@ -11622,7 +11620,7 @@ impl CayenneTableProvider {
     pub(crate) async fn validate_and_append_sharded(
         &self,
         batches: Vec<RecordBatch>,
-        mut sharded_index: Option<ShardedPkIndex>,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
@@ -11696,7 +11694,7 @@ impl CayenneTableProvider {
             // while still eliding the spawn for the small, frequent transactions
             // that dominate the apply rate — and thus replication lag.
             const SMALL_APPLY_INLINE_ROWS: usize = 32;
-            let index_ref = sharded_index.as_ref();
+            let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
             // sub-batches are dropped), so the incoming batches sum to the same
@@ -50322,11 +50320,12 @@ mod tests {
         let pk_converter = provider
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
+        let (_, checkout) = provider.take_cached_pk_index();
         let index = provider
             .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
             .await
             .expect("cold keyset rebuild");
-        provider.store_cached_pk_index(index);
+        provider.store_cached_pk_index(index, checkout);
         assert!(
             provider.should_capture_positions(),
             "deletion_mode: position on a PK table must enable the position read-back"
@@ -54500,7 +54499,8 @@ mod tests {
         let mut keyset = CachedPkKeyset::with_capacity(1);
         keyset.insert(key.clone(), RowLocation::FileUnlocated);
         keyset.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset), checkout);
 
         let footprint: HashSet<u128> = HashSet::from([digest]);
         let empty_write_set = crate::provider::pk_index::PkDigestSet::with_capacity(0);
@@ -54547,7 +54547,8 @@ mod tests {
         let mut delta_updated = CachedPkKeyset::with_capacity(1);
         delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
         delta_updated.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated), checkout);
         assert!(
             !provider.transaction_has_conflict(
                 stage_seq,
@@ -54571,7 +54572,8 @@ mod tests {
         floor_stamped.insert(key, RowLocation::FileUnlocated);
         floor_stamped.record_sequence(digest, 5);
         floor_stamped.stamp_all_sequences_min(current_high_water);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped), checkout);
         assert!(
             provider.transaction_has_conflict(
                 stage_seq,
@@ -54633,9 +54635,8 @@ mod tests {
 
         // Seed one row so the table has a live keyset to check out.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // The concurrent writer commits id=7 while the keyset is out.
         let committed = pk_digest_set_for_ids(&converter, &[7]);
@@ -54657,7 +54658,7 @@ mod tests {
         );
 
         // The writer finishes and returns the keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
@@ -54701,9 +54702,8 @@ mod tests {
             .expect("primary key converter");
 
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, _checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
         provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
 
         let pending = provider.pending_pk_existence();
@@ -54771,15 +54771,14 @@ mod tests {
 
         // A mainline write starts validating: it holds the keyset for its whole
         // lazily-consumed stream.
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // Another writer commits id=7 in that window.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[70])).await;
 
         // The first write finishes and returns its keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         // A later upsert of the same key must replace the committed row.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[71])).await;
@@ -54843,5 +54842,157 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+    /// A checked-out index that is never restored must not blind the checkout
+    /// mechanism for the rest of the process — regression test for #13267.
+    ///
+    /// `build_sharded_pk_index` opens the window before the fallible work that
+    /// produces the index, and the index then travels through the raw-stream
+    /// drain, the per-table cap spill, and the global byte-budget wait before
+    /// `store_sharded_pk_index` closes it. Every one of those can exit first: an
+    /// error propagates, and sustained overload diverts the whole apply to the
+    /// durable path and abandons the index outright.
+    ///
+    /// A window left open latches the log: the next `begin_checkout` sees one
+    /// already outstanding and marks its index invalid, and `outstanding` never
+    /// returns to zero to clear it. From then on the log records nothing, so every
+    /// restore discards its index — a full keyset rebuild on every write — and an
+    /// in-flight validation stops seeing concurrent commits, reads a live key as
+    /// new, and writes a second row under a primary key that already exists.
+    ///
+    /// Abandoning the index is the cheapest faithful stand-in for those exits: it
+    /// is exactly what each of them does to the window.
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply that checks the index out and never restores it.
+        drop(
+            provider
+                .build_sharded_pk_index(&pk_indices, &converter, 4)
+                .await
+                .expect("the warm per-shard index is checked out"),
+        );
+
+        // The next apply must be unaffected: it checks the index out, a concurrent
+        // writer commits id=7 into that window, and the restore replays it.
+        provider.maybe_install_warm_pk_caches().await;
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard index is checked out again");
+
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_sharded_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the per-shard index: missing it reads id=7 as new and leaves two live \
+             rows for one declared primary key"
+        );
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert!(
+                    keysets
+                        .iter()
+                        .any(|keyset| keyset.location_by_digest(committed_digest).is_some()),
+                    "the restored per-shard index must know id=7"
+                );
+            }
+            other => panic!(
+                "an earlier abandoned checkout must not force this index to be \
+                 discarded (which rebuilds the whole keyset on every later write); \
+                 present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide keyset has the same window and the same latch — regression
+    /// test for #13267 on the serial path, where a validation stream dropped or
+    /// cancelled part-way (rather than an error before it starts) is what abandons
+    /// the checkout.
+    #[tokio::test]
+    async fn an_abandoned_serial_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        // A validation that takes the keyset and is then cancelled: nothing stores
+        // it back, so the cache is left empty and the window has to close here.
+        drop(provider.take_cached_pk_index());
+
+        // The next validation opens its own window over the gap and rebuilds.
+        let (rebuilt, checkout) = provider.take_cached_pk_index();
+        assert!(
+            rebuilt.is_none(),
+            "the abandoned checkout took the cached keyset with it"
+        );
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the keyset: missing it reads id=7 as new and leaves two live rows for \
+             one declared primary key"
+        );
+        drop(checkout);
+
+        // And an ordinary write restores its keyset to the cache rather than
+        // discarding it.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_some(),
+            "an earlier abandoned checkout must not force every later restore to \
+             discard its keyset, which rebuilds the whole keyset on every write"
+        );
     }
 }
