@@ -735,17 +735,33 @@ impl CayenneDeletionSink {
     /// protected snapshot in the gap. Scanning main with `Apply` once one exists is the
     /// resurrection case: main then holds only the superseded version, a predicate
     /// matching its retired value tombstones the KEY, and that tombstone hides the
-    /// replacement that never matched. Downgrading to `Ignore` costs at most an
-    /// under-delete of rows in a snapshot published after the capture — which the next
-    /// pass removes — and that is the safe direction to be wrong in.
+    /// replacement that never matched.
+    ///
+    /// Downgrading to `Ignore` leaves a residual, and it is the safe direction to be
+    /// wrong in. The snapshot published after the capture is not in
+    /// `additional_scan_tables` either, so a key whose superseded version matched is
+    /// left undeleted rather than destroyed. The resulting STATE is the one the serial
+    /// order "this DELETE, then that upsert" produces — the key survives at the
+    /// replacement value, which is where the upsert put it — so no row is lost or
+    /// resurrected. What diverges is the `rows affected` handed back to the client: it
+    /// under-reports those keys, and a user `DELETE` has no later pass to correct that
+    /// (retention, which re-runs, does). The next `DELETE` captures the snapshot and
+    /// sees them.
+    ///
+    /// Rebuilding the scan sources here against the live map would narrow that window
+    /// but not close it: `write_lock` is not the boundary that orders protected-snapshot
+    /// publication. A mem-tier checkpoint drops `write_lock` right after its capture and
+    /// publishes under `listing_fence.write()` alone (see `RewriteScope`), so a snapshot
+    /// can still appear while this DELETE holds `write_lock`, and mid-scan.
     fn live_main_insert_records(&self) -> InsertRecordHandling {
         if self.main_insert_records == InsertRecordHandling::Apply
             && !self.protected_snapshots.load().is_empty()
         {
-            // Counted, because the trade this makes is only sound while it stays rare:
-            // a rate that climbs with ingest load means DELETEs are routinely leaving
-            // rows behind for a later pass, and the capture belongs under the
-            // execution-time lock instead. Without the counter that is unanswerable.
+            // Counted, because the trade is only sound while it stays rare: a rate that
+            // climbs with ingest load means user DELETEs routinely under-report the rows
+            // they affected, which is the point at which rebuilding the scan sources
+            // against the live map — and paying a fence for the residual race above —
+            // buys something. Without the counter that is unanswerable.
             telemetry::cayenne::track_delete_main_visibility_downgrade(&[
                 telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
             ]);
