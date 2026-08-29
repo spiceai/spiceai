@@ -52,7 +52,7 @@ make lint-rust-fix      # Auto-fix lint issues
 
 ## Rust standards
 
-Workspace is edition 2024, rust-version 1.96.1 — use stable features and modern std APIs through 1.96; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
+Workspace is edition 2024, rust-version 1.97.1 — use stable features and modern std APIs through 1.97; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
 
 ### Error handling (critical)
 
