@@ -84,6 +84,7 @@ use hash_index::PrehashedBuildHasher;
 use snafu::ensure;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
+use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
@@ -3717,8 +3718,18 @@ impl CayenneTableProvider {
     /// fail to drain within [`STAGED_WRITE_DRAIN_TIMEOUT`], or when a
     /// flush/metastore step fails.
     pub async fn evolve_schema_live(&self, plan: &WideningPlan) -> Result<()> {
+        // A plan is built from a source schema, and a source is free to declare a `MAP`'s
+        // `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
+        // refuses. Bringing the evolved schema in line here is what keeps the stored-schema
+        // invariant a property of Cayenne rather than of whoever built the plan: an added
+        // column carrying that declaration would otherwise be persisted and swapped in, leaving
+        // the live table advertising a column no kernel can rebuild. The conformed schema is
+        // used for the comparison, the metastore write and the in-memory swap alike, so those
+        // three can never disagree.
+        let evolved_schema = conforming_schema(Arc::clone(&plan.evolved_schema));
+
         let current = self.table_schema();
-        if current.as_ref() == plan.evolved_schema.as_ref() {
+        if current.as_ref() == evolved_schema.as_ref() {
             return Ok(());
         }
 
@@ -3727,7 +3738,7 @@ impl CayenneTableProvider {
         let ctx = EvolutionContext {
             constraint_columns: &self.table_metadata.primary_key,
         };
-        match classify(&current, &plan.evolved_schema, &ctx) {
+        match classify(&current, &evolved_schema, &ctx) {
             SchemaEvolution::Widening(_) => {}
             // Reorder-only difference: the live schema stays canonical.
             SchemaEvolution::Identical => return Ok(()),
@@ -3785,10 +3796,10 @@ impl CayenneTableProvider {
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
-                .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
+                .update_table_schema(&self.table_metadata.table_id, &evolved_schema)
                 .await
                 .map_err(|source| Error::Catalog { source })?;
-            self.table_schema.store(Arc::clone(&plan.evolved_schema));
+            self.table_schema.store(Arc::clone(&evolved_schema));
             {
                 // Cached optimizer statistics are column-indexed against the
                 // old schema width (DataFusion expects column_statistics.len()
@@ -3799,7 +3810,7 @@ impl CayenneTableProvider {
                 let df_stats = stats_cache
                     .raw
                     .as_ref()
-                    .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
+                    .and_then(|raw| Self::table_statistics_to_df(&evolved_schema, raw));
                 stats_cache.optimizer_inexact = df_stats
                     .as_ref()
                     .map(|s| Self::statistics_to_inexact(s.clone()));

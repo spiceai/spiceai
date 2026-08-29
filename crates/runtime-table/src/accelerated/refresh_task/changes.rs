@@ -25,6 +25,7 @@ use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
@@ -2689,6 +2690,15 @@ impl RefreshTask {
                 self.engine_type_rewrites,
             ))
         };
+        // An illegal `MAP` declaration is not a schema change. The Arrow map layout forbids a
+        // nullable `entries` field and no engine can store one, so a source that declares it
+        // that way differs from every accelerator's stored declaration on every batch — and
+        // `widen_type` has no `Map` arm, so that difference classifies `Incompatible`, which
+        // under `on_schema_change: fail` stops replication over a schema that never changed.
+        // Conforming the incoming declaration first is the same move the engine type rewrites
+        // above make for a permanent engine-side representation, and it leaves the batch itself
+        // to the cast against the accelerator's own schema.
+        let normalized_incoming = conforming_schema(normalized_incoming);
         let incoming_data_schema = &normalized_incoming;
         let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
         let ctx = EvolutionContext {
@@ -4949,6 +4959,69 @@ mod tests {
             e.to_string().contains("incompatible schema change"),
             "unexpected error: {e}"
         );
+    }
+
+    /// A source that declares a `MAP`'s `entries` field nullable — which the Arrow map layout
+    /// forbids — is not reporting a schema change, but it differs from the accelerator's stored
+    /// declaration on every batch, and `widen_type` has no `Map` arm, so the difference
+    /// classifies `Incompatible`. Under `on_schema_change: fail` that stopped replication over a
+    /// schema that never changed; the surrounding `Map` pair is otherwise identical, so the
+    /// entries flag is the only thing under test.
+    #[tokio::test]
+    async fn cdc_schema_evolution_accepts_a_nonconforming_map_entries_declaration() {
+        use crate::accelerated::refresh_task::RefreshTaskBuilder;
+        use crate::federated::FederatedTable;
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+
+        let accelerator: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema_with(false), vec![vec![]]).expect("mem table"));
+        let dataset = datafusion::sql::TableReference::bare("cdc_map_entries_accepted".to_string());
+        install_cdc_schema_evolution(
+            &dataset,
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::Fail,
+                constraint_columns: vec![],
+            },
+        );
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            dataset,
+            federated,
+            None,
+            accelerator,
+            tokio::runtime::Handle::current(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .build();
+
+        task.maybe_evolve_schema_for_cdc(&schema_with(true))
+            .await
+            .expect(
+                "an entries declaration the Arrow map layout forbids is not a schema change and must not fail the write",
+            );
     }
 
     #[tokio::test]

@@ -1827,6 +1827,124 @@ mod tests {
         );
     }
 
+    /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
+    /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
+    /// refuses. Adding such a column under `append_new_columns` would otherwise persist that
+    /// declaration and swap it into the live table, leaving a column no kernel can rebuild on a
+    /// table that was readable a moment earlier. The metastore write and the in-memory swap are
+    /// asserted separately: they are two different stores, and a repair applied to one of them
+    /// leaves the other advertising a type its own catalog disagrees with.
+    #[tokio::test]
+    async fn schema_evolution_live_conforms_an_added_map_entries_declaration() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_map.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+
+        let table_name = "evolution_map_entries";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        // The source adds a nullable `headers` MAP whose `entries` it declares nullable.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("headers", map_of(true), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        assert!(
+            matches!(
+                plan.evolved_schema.field_with_name("headers").expect("headers").data_type(),
+                DataType::Map(entries, _) if entries.is_nullable()
+            ),
+            "the plan under test must carry the declaration the Arrow map layout forbids"
+        );
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the live provider must not advertise a column no kernel can rebuild"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the metastore must hold the conforming declaration too"
+        );
+    }
+
     /// Live evolution sequencing: rows pending in the inline corpus written
     /// PRE-evolution are flushed to a Vortex file before the schema swap (the
     /// inline branch is unioned projection-only, so a swap with pending inline
