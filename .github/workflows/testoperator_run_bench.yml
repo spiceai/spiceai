@@ -619,9 +619,9 @@ jobs:
             if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
               git pull --rebase origin ${BRANCH_NAME}
             fi
-            # Disable any credential helper configured on the (self-hosted) runner:
-            # a helper (osxkeychain / git-credential-manager) can intercept the push
-            # and block on an interactive credential prompt, hanging the job.
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
             git -c credential.helper='' -c credential.interactive=false \
               push origin ${BRANCH_NAME}
 

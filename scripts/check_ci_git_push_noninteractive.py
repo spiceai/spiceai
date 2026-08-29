@@ -32,8 +32,9 @@ import sys
 ROOTS = (pathlib.Path(".github/workflows"), pathlib.Path(".github/actions"))
 
 # `git push`, allowing any `-c key=value` / `--flag` between `git` and the subcommand, and
-# tolerating a line continuation before it. `\bgit\b` so `gh` or `legit` never matches.
-GIT_PUSH = re.compile(r"\bgit\b(?P<opts>(?:\s+(?:-c\s+\S+|--?[\w-]+(?:=\S+)?))*)\s*\\?\s*\n?\s*push\b")
+# tolerating a line continuation before it (`\s` already spans the newline it escapes).
+# `\bgit\b` so `gh` or `legit` never matches.
+GIT_PUSH = re.compile(r"\bgit\b(?P<opts>(?:\s+(?:-c\s+\S+|--?[\w-]+(?:=\S+)?))*)\s*\\?\s*push\b")
 
 # `-c credential.helper=` with an empty value: bare, '' or "". A NON-empty value would name
 # a helper to use, which is the opposite of what is wanted, so it must not satisfy this.
@@ -92,7 +93,7 @@ def run_block(step):
                 if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
                     break
                 body.append(nxt)
-        return "".join(l for l in body if not l.lstrip().startswith("#"))
+        return "".join(b for b in body if not b.lstrip().startswith("#"))
     return ""
 
 

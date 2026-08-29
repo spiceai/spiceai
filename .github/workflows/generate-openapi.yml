@@ -90,10 +90,9 @@ jobs:
           else
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
-            # Disable any credential helper configured on the (self-hosted) runner
-            # so git authenticates with the URL-embedded token only. Otherwise a
-            # helper (osxkeychain / git-credential-manager) can intercept the push
-            # and block on an interactive credential prompt, hanging the job.
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
             git -c credential.helper='' -c credential.interactive=false \
               push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:openapi/${GITHUB_RUN_ID}
             gh pr create \

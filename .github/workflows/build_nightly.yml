@@ -520,9 +520,9 @@ jobs:
       - name: Update nightly tag
         run: |
           git tag -f nightly
-          # Disable any credential helper configured on the runner: a helper can
-          # intercept the push and block on an interactive credential prompt,
-          # hanging the job.
+          # Non-interactive: a credential helper on the runner can otherwise intercept
+          # this push and block on a prompt forever. See
+          # scripts/check_ci_git_push_noninteractive.py.
           git -c credential.helper='' -c credential.interactive=false \
             push origin nightly --force
         env:
