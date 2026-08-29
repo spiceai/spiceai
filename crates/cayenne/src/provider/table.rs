@@ -33372,6 +33372,79 @@ mod tests {
         );
     }
 
+    /// Waits, holding the caller's compaction lock, for the detached post-write
+    /// compaction pass to reach that lock, find it held, and exit.
+    ///
+    /// `flush_pending_maintenance` drains the maintenance lane but only
+    /// *schedules* this pass, and the task opens with a yield — so it can first
+    /// reach for the lock after the caller releases it and consume the tier the
+    /// caller is arranging. `drain_in_flight_maintenance` cannot be used here:
+    /// it ends by taking the same lock.
+    ///
+    /// The flag is set before the task spawns and cleared on any exit, so once
+    /// it reads false with the lock still held, no scheduled pass remains.
+    async fn park_post_write_compaction(provider: &CayenneTableProvider) {
+        for _ in 0..1_000 {
+            if !provider
+                .post_write_compaction_scheduled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "the detached post-write compaction pass never parked; it would race the \
+             assertions below for the protected tier"
+        );
+    }
+
+    /// Brings a freshly-written table to the state the budget assertions below
+    /// describe: every insert registered as a protected snapshot, and no pending
+    /// mem-tier delete left to cap the merge fence.
+    ///
+    /// Both matter because `compact_protected_snapshots_subset` has two
+    /// independent reasons to decline. Without this, a pass that declined
+    /// because the fence excluded every input looks exactly like one that
+    /// declined on the pass budget — which makes the finite case pass
+    /// vacuously and the unbounded control fail outright, since a CDC upsert
+    /// stamps each snapshot with a delete sequence above the durable max until
+    /// a checkpoint folds it down.
+    ///
+    /// Returns the settled protected-snapshot count.
+    async fn settle_protected_tier(provider: &CayenneTableProvider, min_runs: usize) -> usize {
+        // Protected-snapshot registration can lag the awaited insert under
+        // parallel test load (see `subset_compaction_excludes_inputs_above_delete_fence`).
+        let mut count = 0;
+        for _ in 0..100 {
+            count = provider.protected_snapshots.load_full().len();
+            if count >= min_runs {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Fold the upserts' still-pending deletes into the durable index so the
+        // fence stops capping below every snapshot's threshold. Left pending,
+        // the eligibility filter drops all of them and the pass declines for a
+        // reason these assertions do not mean to exercise.
+        if provider.min_pending_mem_tier_delete_sequence().is_some() {
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("checkpoint the mem tier so no pending delete caps the fence");
+        }
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            None,
+            "precondition: a pending mem-tier delete would cap the merge fence below \
+             every snapshot threshold, so the pass would decline on the fence rather \
+             than on the pass budget"
+        );
+
+        count
+    }
+
     /// End-to-end regression for #12013 on the real compaction path: under a finite
     /// pool the subset merge must decline a tier whose runs cannot be paired within
     /// the per-pass budget, instead of unioning up to
@@ -33419,15 +33492,29 @@ mod tests {
             create_cdc_upsert_table_with_vortex_config("subset_budget_finite", finite_rt, config())
                 .await;
         // Six one-row upserts publish six small, same-tier protected snapshots.
-        for i in 0..ROWS {
-            insert_batch(
-                &finite,
-                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-            )
-            .await;
+        // Hold the compaction lock across them so the debounced post-write pass
+        // cannot merge the tier this test is arranging (same rationale as
+        // `subset_compaction_excludes_inputs_above_delete_fence`) — a tier it
+        // already consolidated has nothing left for the assertions below to
+        // decline or merge.
+        {
+            let setup_guard = finite.compaction_lock.lock().await;
+            for i in 0..ROWS {
+                insert_batch(
+                    &finite,
+                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+                )
+                .await;
+            }
+            finite
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&finite).await;
+            drop(setup_guard);
         }
 
-        let before = finite.protected_snapshots.load_full().len();
+        let before = settle_protected_tier(&finite, TRIGGER).await;
         assert!(
             before >= TRIGGER,
             "precondition: need >= {TRIGGER} protected snapshots to arm the tier, got {before}"
@@ -33486,13 +33573,28 @@ mod tests {
             config(),
         )
         .await;
-        for i in 0..ROWS {
-            insert_batch(
-                &unbounded,
-                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
-            )
-            .await;
+        {
+            let setup_guard = unbounded.compaction_lock.lock().await;
+            for i in 0..ROWS {
+                insert_batch(
+                    &unbounded,
+                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+                )
+                .await;
+            }
+            unbounded
+                .flush_pending_maintenance()
+                .await
+                .expect("drain pending post-write maintenance");
+            park_post_write_compaction(&unbounded).await;
+            drop(setup_guard);
         }
+        let unbounded_before = settle_protected_tier(&unbounded, TRIGGER).await;
+        assert!(
+            unbounded_before >= TRIGGER,
+            "precondition: the control needs >= {TRIGGER} protected snapshots to arm the \
+             tier, got {unbounded_before}"
+        );
         assert_eq!(
             unbounded.protected_merge_input_budget_bytes(),
             None,
