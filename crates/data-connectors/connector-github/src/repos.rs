@@ -214,6 +214,13 @@ fn stamp_identity(row: &mut Map<String, Value>, owner: &str, repo: Option<&str>)
 
 /// Rewrites `topics`, which GitHub returns as `[{"topic": {"name": "sql"}}]`,
 /// to the plain `["sql"]` the schema declares.
+///
+/// Nulls the list when fewer names come back than `topics_count` says the
+/// repository has, the way `releases` and `pull_requests` null their own
+/// derived values. A short list is indistinguishable from a complete one, so
+/// `topics @> ARRAY['sql']` would answer "no" for a repository that does carry
+/// the topic; a null reads as "unknown", and `topics_count` still records how
+/// many there really are.
 fn flatten_topics(repo: &mut Map<String, Value>) {
     let topics = repo
         .get("topics")
@@ -227,7 +234,18 @@ fn flatten_topics(repo: &mut Map<String, Value>) {
         })
         .unwrap_or_default();
 
-    repo.insert("topics".to_string(), Value::Array(topics));
+    let topics_count = repo.get("topics_count").and_then(Value::as_i64);
+    let truncated =
+        topics_count.is_some_and(|count| count > i64::try_from(topics.len()).unwrap_or(i64::MAX));
+
+    repo.insert(
+        "topics".to_string(),
+        if truncated {
+            Value::Null
+        } else {
+            Value::Array(topics)
+        },
+    );
 }
 
 fn gql_schema() -> SchemaRef {
@@ -374,6 +392,24 @@ mod tests {
         assert!(query.contains("repository(owner: \"spiceai\", name: \"spiceai\")"));
         assert!(!query.contains("pageInfo"));
         assert_eq!(params.json_pointer, Some(REPOSITORY_JSON_POINTER));
+    }
+
+    /// A repository with more topics than one page — or a topic node GitHub
+    /// returns as null — leaves a list that reads as complete, so
+    /// `topics @> ARRAY['sql']` would answer "no" for a repository that does
+    /// carry the topic. `topics_count` still records the real total.
+    #[test]
+    fn a_short_topics_list_is_nulled_rather_than_left_looking_complete() {
+        let mut node = repository_node();
+        node["topics_wrapper"] = json!({
+            "topics_count": 3,
+            "topics": [{"topic": {"name": "sql"}}, {"topic": {"name": "ai"}}]
+        });
+
+        let row = unnest_one(&owner_level_args(), &node);
+
+        assert_eq!(row["topics_count"], json!(3));
+        assert_eq!(row["topics"], Value::Null);
     }
 
     #[test]

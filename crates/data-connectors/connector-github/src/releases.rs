@@ -151,12 +151,18 @@ fn add_total_download_count(release: &mut Map<String, Value>, owner: &str, repo:
     let assets = release.remove("assets");
     let assets = assets.as_ref().and_then(Value::as_array);
 
+    // Counts the assets that actually reached the sum, not the entries that
+    // arrived. A connection node GitHub returns as null — or one missing
+    // `download_count` — contributes nothing, so counting it as returned would
+    // let the truncation check below pass and publish a total that is knowably
+    // short.
     let (total, returned) = assets.map_or((0_i64, 0_usize), |assets| {
-        let total = assets
+        assets
             .iter()
             .filter_map(|asset| asset.get("download_count").and_then(Value::as_i64))
-            .fold(0_i64, i64::saturating_add);
-        (total, assets.len())
+            .fold((0_i64, 0_usize), |(total, counted), downloads| {
+                (total.saturating_add(downloads), counted + 1)
+            })
     });
 
     let assets_count = release.get("assets_count").and_then(Value::as_i64);
@@ -312,6 +318,24 @@ mod tests {
         let row = unnest_one(&release(150, &[1, 2]));
 
         assert_eq!(row["assets_count"], json!(150));
+        assert_eq!(row["total_download_count"], Value::Null);
+    }
+
+    /// A connection node GitHub returns as null contributes nothing to the sum,
+    /// so counting it as an asset that arrived would make `assets_count` match
+    /// and publish a total missing that asset's downloads as if it were the
+    /// whole figure.
+    #[test]
+    fn a_null_asset_node_nulls_the_total_rather_than_passing_the_count_check() {
+        let mut node = release(3, &[4, 29]);
+        node["assets_wrapper"]["assets"]
+            .as_array_mut()
+            .expect("assets to be an array")
+            .push(Value::Null);
+
+        let row = unnest_one(&node);
+
+        assert_eq!(row["assets_count"], json!(3));
         assert_eq!(row["total_download_count"], Value::Null);
     }
 

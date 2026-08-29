@@ -1553,29 +1553,42 @@ impl GraphQLClient {
     }
 }
 
-/// The health check's only claim on the payload: the data path the query declares
-/// has to be present in the response.
+/// The health check's claim on the payload: the data path the query declares has
+/// to be present, and it has to name something.
 ///
-/// A path that does not resolve means the query and the pointer disagree, which
-/// no response will ever fix, so it is reported rather than left for the first
-/// refresh to hit. A path that resolves to `null` is left alone: that is the API
-/// answering "no such resource", which the row query reports against the dataset
-/// the user actually named.
+/// The two ways it can fail are different faults and are reported as such. A path
+/// that does not resolve means the query and the pointer disagree — a
+/// misconfiguration no response will ever fix. A path that resolves to `null` is
+/// the API answering "no such resource", and it has to fail here: the row query
+/// reads a null payload as an empty page, so a name that does not exist would
+/// otherwise attach as a valid, permanently empty dataset instead of telling the
+/// user their path is wrong.
 fn check_health_payload(json_pointer: &str, response: &Value) -> Result<()> {
-    if response.pointer(json_pointer).is_some() {
-        return Ok(());
+    match response.pointer(json_pointer) {
+        Some(Value::Null) => {
+            tracing::debug!(
+                "Health check resolved '{json_pointer}' to null. Full response: {}",
+                serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}"))
+            );
+
+            Err(Error::ResourceNotFound {
+                message: "The API answered with no such resource. Verify every name in the dataset's 'from' path exists and the credentials can see it. For details, visit: https://spiceai.org/docs/components/data-connectors/graphql".to_string(),
+            })
+        }
+        Some(_) => Ok(()),
+        None => {
+            tracing::error!(
+                "Health check response has no data at '{json_pointer}'. Full response: {}",
+                serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}"))
+            );
+
+            Err(Error::InvalidJsonPointer {
+                pointer: format!(
+                    "Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response."
+                ),
+            })
+        }
     }
-
-    tracing::error!(
-        "Health check response has no data at '{json_pointer}'. Full response: {}",
-        serde_json::to_string_pretty(response).unwrap_or_else(|_| format!("{response:?}"))
-    );
-
-    Err(Error::InvalidJsonPointer {
-        pointer: format!(
-            "Invalid JSON pointer: '{json_pointer}'. The expected data path was not found in the response."
-        ),
-    })
 }
 
 /// Resolve the schema a page's rows are parsed with: per-query override, then the schema
@@ -1849,16 +1862,22 @@ mod tests {
             .expect("a resolved probe is a healthy resource");
         }
 
-        /// A `null` there is the API answering "no such resource". The row query
-        /// runs next and reports it against the dataset the user named, which is
-        /// the message worth showing.
+        /// A `null` there is the API answering "no such resource", and it has to
+        /// fail here: the row path reads a null payload as an empty page, so a
+        /// name that does not exist would otherwise attach as a valid,
+        /// permanently empty dataset.
         #[test]
-        fn a_null_probe_is_left_for_the_row_query_to_report() {
-            check_health_payload(
+        fn a_null_probe_is_a_resource_that_does_not_exist() {
+            let err = check_health_payload(
                 "/data/healthCheckProbe",
                 &json!({"data": {"healthCheckProbe": null}}),
             )
-            .expect("a null probe is not this check's to report");
+            .expect_err("a name that resolves to nothing is not a healthy dataset");
+
+            assert!(
+                matches!(err, super::super::Error::ResourceNotFound { .. }),
+                "a missing resource is reported as such, not as a pointer fault: {err}"
+            );
         }
 
         /// A path that does not resolve means the query and the pointer disagree,

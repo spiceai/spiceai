@@ -533,10 +533,19 @@ fn null_truncated_closing_issues(pull_request: &mut Map<String, Value>) {
         return;
     };
 
+    // Counts the entries that carry a `number`, not the entries that arrived. The
+    // query asks for `nodes { number }`, so a node GitHub returns as null yields
+    // no issue number; counting it as delivered would let the check below pass on
+    // a list that cannot produce every linked issue.
     let returned = wrapper
         .get("closing_issues_references")
         .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+        .map_or(0, |issues| {
+            issues
+                .iter()
+                .filter(|issue| issue.get("number").is_some_and(|n| !n.is_null()))
+                .count()
+        });
     let total = wrapper
         .get("closing_issues_count")
         .and_then(Value::as_i64)
@@ -913,6 +922,23 @@ mod tests {
         let row = unnest_one(&args(PullRequestCommentType::None, 25), &node);
 
         assert_eq!(row["closing_issues_count"], json!(40));
+        assert_eq!(row["closing_issues_references"], Value::Null);
+    }
+
+    /// A node GitHub returns as null yields no issue number, so counting it as
+    /// delivered would make `closing_issues_count` match and leave a list that
+    /// cannot produce every linked issue looking complete.
+    #[test]
+    fn a_null_linked_issue_node_nulls_the_list_rather_than_passing_the_count_check() {
+        let mut node = pull_request_node(&json!("2026-08-25T00:00:00Z"));
+        node["closing_issues_wrapper"] = json!({
+            "closing_issues_count": 2,
+            "closing_issues_references": [{"number": 1}, null]
+        });
+
+        let row = unnest_one(&args(PullRequestCommentType::None, 25), &node);
+
+        assert_eq!(row["closing_issues_count"], json!(2));
         assert_eq!(row["closing_issues_references"], Value::Null);
     }
 
