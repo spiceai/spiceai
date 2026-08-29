@@ -742,6 +742,13 @@ impl CayenneDeletionSink {
         if self.main_insert_records == InsertRecordHandling::Apply
             && !self.protected_snapshots.load().is_empty()
         {
+            // Counted, because the trade this makes is only sound while it stays rare:
+            // a rate that climbs with ingest load means DELETEs are routinely leaving
+            // rows behind for a later pass, and the capture belongs under the
+            // execution-time lock instead. Without the counter that is unanswerable.
+            telemetry::cayenne::track_delete_main_visibility_downgrade(&[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            ]);
             return InsertRecordHandling::Ignore;
         }
         self.main_insert_records

@@ -3194,6 +3194,34 @@ fn ignored_indexes_warning(table_name: &str) -> String {
     )
 }
 
+/// Whether a `retention_period` acceleration warrants
+/// [`retention_period_never_reclaimed_warning`].
+///
+/// `retention_period` is only ever a scan-time KEEP filter in Cayenne: expired rows are
+/// excluded from every read, but nothing on the engine's own write, checkpoint, or
+/// compaction paths deletes them, so their storage is never reclaimed. The DELETE that
+/// would reclaim it comes from the runtime's periodic retention check, and
+/// `Retention::build` returns `None` unless BOTH `retention_check_enabled` is true and
+/// `retention_check_interval` is set — the interval has no default, so enabling the flag
+/// alone is not enough. Keyed on both for that reason.
+///
+/// `retention_sql` is deliberately absent from this condition: Cayenne applies it through
+/// its own engine-level maintenance, armed by every write, overwrite, and mem-tier
+/// checkpoint, so it runs whatever the periodic check is set to.
+const fn retention_period_never_reclaimed_warning_applies(
+    has_retention_period: bool,
+    retention_check_enabled: bool,
+    has_retention_check_interval: bool,
+) -> bool {
+    has_retention_period && !(retention_check_enabled && has_retention_check_interval)
+}
+
+fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but nothing deletes them, so the accelerated table keeps growing. Reclaiming that storage needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -3976,6 +4004,16 @@ impl DataAccelerator for CayenneAccelerator {
             .is_some_and(|acceleration| !acceleration.indexes.is_empty())
         {
             tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        }
+
+        if source.acceleration().is_some_and(|acceleration| {
+            retention_period_never_reclaimed_warning_applies(
+                acceleration.retention_period.is_some(),
+                acceleration.retention_check_enabled,
+                acceleration.retention_check_interval.is_some(),
+            )
+        }) {
+            tracing::warn!("{}", retention_period_never_reclaimed_warning(&table_name));
         }
 
         // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
@@ -5008,6 +5046,7 @@ mod tests {
         for warning in [
             memory_mode_retention_warning("events"),
             ignored_indexes_warning("events"),
+            retention_period_never_reclaimed_warning("events"),
         ] {
             assert!(
                 warning.contains("'events'"),
@@ -5022,6 +5061,56 @@ mod tests {
                 "log messages stay on one line: {warning}"
             );
         }
+    }
+
+    /// The periodic check needs BOTH the flag and an interval — `Retention::build`
+    /// returns `None` without either, and `retention_check_interval` has no default — so
+    /// warning on the flag alone would stay silent for the config that most looks
+    /// enabled: `retention_check_enabled: true` with no interval set.
+    #[test]
+    fn retention_period_reclaim_warning_needs_both_the_flag_and_the_interval() {
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, false),
+            "neither set: nothing reclaims the rows"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, true, false),
+            "enabled but no interval: `Retention::build` still returns None"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, true),
+            "interval but not enabled: the check never runs"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(true, true, true),
+            "both set: the periodic check reclaims, so the warning would be wrong"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(false, false, false),
+            "no `retention_period`: nothing to reclaim and nothing to warn about"
+        );
+    }
+
+    /// `retention_sql` must not trigger this warning: Cayenne applies it through its own
+    /// engine-level maintenance, armed by every write, overwrite, and mem-tier
+    /// checkpoint, so it runs regardless of the periodic check. Warning about it would
+    /// tell the operator their retention is inert when it is not.
+    #[test]
+    fn retention_period_reclaim_warning_states_the_impact_and_both_settings() {
+        let warning = retention_period_never_reclaimed_warning("events");
+        assert!(
+            warning.contains("retention_check_enabled")
+                && warning.contains("retention_check_interval"),
+            "the fix needs both settings named, or it does not work: {warning}"
+        );
+        assert!(
+            warning.contains("keeps growing"),
+            "the impact is unreclaimed storage, not exposed rows — the rows ARE hidden: {warning}"
+        );
+        assert!(
+            warning.contains("retention_sql"),
+            "the alternative that does run on every write is the actionable escape: {warning}"
+        );
     }
 
     #[test]

@@ -2594,6 +2594,31 @@ impl CayenneTableProviderBuilder {
 /// grew (q20's correlated rescans paid it per outer group).
 pub(crate) type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
+/// The error a synchronous retention drain gets when the pass is waiting on a recent
+/// write to become durable ([`RetentionPass::DeferredUntilCheckpoint`]).
+///
+/// Says how long the wait is in terms the operator can act on — the next durability
+/// checkpoint, not a debounce — because that is the difference between the two deferrals
+/// and the only part of it they can do anything about. The internal reason (a mem-tier
+/// seal shadow) is deliberately absent: it is not a thing they can see, set, or clear.
+fn retention_deferred_until_durable_message(table_name: &str) -> String {
+    format!(
+        "Failed to apply the retention policy to accelerated dataset '{table_name}': a recent write is still being made durable, so rows matching `retention_sql` stay queryable until the acceleration next writes its in-memory rows to storage. It is applied automatically after that; retry a manual drain then. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The error a synchronous retention drain gets when the pass is waiting on a write that
+/// is mid-publish ([`RetentionPass::DeferredTransient`]).
+///
+/// Distinguished from [`retention_deferred_until_durable_message`] by the wait: this one
+/// closes in milliseconds, so "retry" is genuine advice rather than a wait for a
+/// checkpoint that may not come before shutdown.
+fn retention_deferred_transient_message(table_name: &str) -> String {
+    format!(
+        "Failed to apply the retention policy to accelerated dataset '{table_name}': a write to this dataset is still being published, so rows matching `retention_sql` stay queryable for the moment. The next pass applies it; retry a manual drain in a few seconds. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
     let elapsed = start.elapsed();
     tracing::debug!(
@@ -16072,9 +16097,8 @@ impl CayenneTableProvider {
                     // and the checkpoint it is waiting for may not come before shutdown.
                     RetentionFailureAction::ReturnError => {
                         return Err(CatalogError::InvalidOperation {
-                            message: format!(
-                                "Retention for table '{}' was deferred: a mem-tier seal shadow is present and retention runs after the next checkpoint clears it.",
-                                self.table_metadata.table_name
+                            message: retention_deferred_until_durable_message(
+                                &self.table_metadata.table_name,
                             ),
                             source: "retention deferred".into(),
                         });
@@ -16091,9 +16115,8 @@ impl CayenneTableProvider {
                     // needs to know the deletion did not run, not to loop until it can.
                     RetentionFailureAction::ReturnError => {
                         return Err(CatalogError::InvalidOperation {
-                            message: format!(
-                                "Retention for table '{}' was deferred: a staged inline-conflict tombstone or an append finalization is still in flight.",
-                                self.table_metadata.table_name
+                            message: retention_deferred_transient_message(
+                                &self.table_metadata.table_name,
                             ),
                             source: "retention deferred".into(),
                         });
@@ -27360,11 +27383,12 @@ impl CayenneTableProvider {
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
         // The catalog `clear_inlined_data_and_deletes` above deleted every inline
         // row for this table, INCLUDING any unpublished seal shadow — so the bake
-        // no longer needs to force the clear. Reset the flag (Release, paired with
-        // the bake/seal Acquire loads). A seal cannot race this: seals and bakes
-        // are serialized by `mem_checkpoint_lock`.
-        self.mem_tier_shadow_present
-            .store(false, std::sync::atomic::Ordering::Release);
+        // no longer needs to force the clear. Reset the flag (`AcqRel`: the result is
+        // read below, and it pairs with the bake/seal Acquire loads). A seal cannot race
+        // this: seals and bakes are serialized by `mem_checkpoint_lock`.
+        let cleared_seal_shadow = self
+            .mem_tier_shadow_present
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         // b1★ (cycle-4): the catalog `DELETE FROM cayenne_inlined_delete` above
         // removed EVERY tombstone for this table, including any whose durable
         // `published = 1` flip was still deferred (recorded in
@@ -27377,6 +27401,22 @@ impl CayenneTableProvider {
         // read filter drops back to its fast `published = 1`-only SQL path.
         self.inlined_locally_published.lock().clear();
         self.pending_durable_tombstone_flips.lock().clear();
+        // Clearing a seal shadow discharges the exact condition a
+        // `RetentionPass::DeferredUntilCheckpoint` was waiting on, and that pass
+        // consumed its request without re-arming. Every route here — the mem-tier
+        // checkpoint, the inline auto-checkpoint, and the DELETE-path corpus flush —
+        // must therefore re-queue it, or a table that goes idle after one of them keeps
+        // serving rows its `retention_sql` should have deleted. Armed at the clear
+        // itself rather than at each caller, because the callers are what was missed.
+        //
+        // Gated on having ACTUALLY cleared a shadow, which is also what keeps the
+        // retention pass from re-arming itself: it flushes the corpus through this same
+        // function, but only ever reaches that flush when no shadow is present (it
+        // defers otherwise), so `cleared_seal_shadow` is false on its own path and
+        // `flush_pending_maintenance` cannot spin.
+        if cleared_seal_shadow {
+            self.arm_retention_after_checkpoint();
+        }
         // cycle-5 TASK 1: the corpus is gone, so every pending tombstone removal
         // is moot — drop them all (the `seq` stays monotonic so future deltas
         // stay globally ordered). Runs under the same held listing fence as the
@@ -47284,6 +47324,138 @@ mod tests {
         );
     }
 
+    /// Both deferral errors reach an operator through a synchronous maintenance drain, so
+    /// they follow the user-facing message rules: name the dataset, state what is still
+    /// queryable, say when it resolves, link the docs — and carry no internal vocabulary.
+    /// A seal shadow, a staged inline-conflict tombstone, and an append finalization are
+    /// not things an operator can see, set, or clear, so naming them describes a problem
+    /// they cannot act on.
+    #[test]
+    fn retention_deferral_errors_are_actionable_and_carry_no_internal_vocabulary() {
+        let until_durable = retention_deferred_until_durable_message("events");
+        let transient = retention_deferred_transient_message("events");
+
+        for message in [&until_durable, &transient] {
+            assert!(
+                message.contains("'events'"),
+                "the message must name the dataset: {message}"
+            );
+            assert!(
+                message.contains("retention_sql"),
+                "it must say WHICH rows stay queryable: {message}"
+            );
+            assert!(
+                message.contains("https://spiceai.org/docs"),
+                "the message must link the docs: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "log and error messages stay on one line: {message}"
+            );
+            for internal in [
+                "seal shadow",
+                "mem-tier",
+                "tombstone",
+                "inline-conflict",
+                "staged",
+                "in flight",
+            ] {
+                assert!(
+                    !message.contains(internal),
+                    "'{internal}' is an internal concept the operator cannot act on: {message}"
+                );
+            }
+        }
+
+        // The two differ in the ONE thing the caller can act on: how long the wait is.
+        // Collapsing them back into a single message would lose that.
+        assert_ne!(
+            until_durable, transient,
+            "the deferrals differ in when they clear, which is the actionable part"
+        );
+    }
+
+    /// Clearing a seal shadow must re-queue the retention that shadow deferred.
+    ///
+    /// `RetentionPass::DeferredUntilCheckpoint` consumes its request and re-arms nowhere,
+    /// on the promise that whatever clears the shadow arms it again. The mem-tier
+    /// checkpoint is not the only route: the inline auto-checkpoint and the DELETE-path
+    /// corpus flush reach the same clear, and neither armed anything — so a table that
+    /// went idle after one of them kept serving rows `retention_sql` should have deleted.
+    ///
+    /// Drives the inline-checkpoint route specifically, and asserts the effect rather
+    /// than the request flag, which the debounced pass consumes.
+    #[tokio::test]
+    async fn clearing_a_seal_shadow_re_arms_the_retention_it_stranded() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (plain, catalog, _tmp) =
+            create_inlining_table("retention_shadow_rearm", Arc::clone(&runtime_env)).await;
+        let table_name = plain.table_metadata.table_name.clone();
+        let schema = Arc::clone(&plain.table_metadata.schema);
+        drop(plain);
+
+        // Seeded through a handle WITHOUT retention, so making these durable arms
+        // nothing and only the shadow clear below can account for the deletion.
+        let seeded =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open(&table_name)
+                .await
+                .expect("reopen without retention");
+        insert_batch(&seeded, id_value_batch(schema, &[1, 2], &[10, 60])).await;
+        drop(seeded);
+
+        let provider = CayenneTableProvider::new_with_retention(
+            &table_name,
+            catalog,
+            vec![retention_predicate()],
+            runtime_env,
+        )
+        .await
+        .expect("reopen with retention");
+
+        provider
+            .mem_tier_shadow_present
+            .store(true, Ordering::Release);
+        assert_eq!(
+            provider
+                .apply_retention_filters()
+                .await
+                .expect("retention defers rather than failing"),
+            RetentionPass::DeferredUntilCheckpoint,
+            "precondition: the shadow must defer the pass, which is what consumes the \
+             request without re-arming it"
+        );
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(1, 10), (2, 60)],
+            "precondition: the deferral means the expired row is still there"
+        );
+
+        // The inline auto-checkpoint route — NOT `checkpoint_mem_tier`. This is one of
+        // the clears that armed nothing.
+        let _flushed = provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("inline checkpoint");
+        assert!(
+            !provider.mem_tier_shadow_present.load(Ordering::Acquire),
+            "precondition: this route must actually clear the shadow, or it is not the \
+             path under test"
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("the retention the shadow clear owes");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(2, 60)],
+            "clearing the shadow discharges what the deferral was waiting on, so it must \
+             re-queue retention: otherwise an idle table serves the expired row forever"
+        );
+    }
+
     /// Retention deletes rows that nothing on this path re-derives `num_rows` from, so
     /// the maintained count must not be served `Exact` afterwards — on the distributed
     /// path an `Exact` count is folded straight into a `COUNT(*)` ANSWER rather than
@@ -47583,6 +47755,78 @@ mod tests {
             vec![(3, 60), (4, 70)],
             "retention must reach rows that arrived through the default \
              cdc_durability: memory path once their epoch is durable"
+        );
+    }
+
+    /// The resurrection scenario under `deletion_mode: position` on a table that HAS a
+    /// primary key — the configuration where both deletion kinds are in play.
+    ///
+    /// A PK table never becomes `PkDeletionStrategyWithCache::PositionBased`; it stays
+    /// `Int64Pk`/`RowConverterBased`, and a `FilePositioned` conflict is dual-encoded:
+    /// `apply_on_conflict_to_batch` writes a per-file position delete AND a key-based
+    /// twin covering the paths position vectors never reach (see `total_superseded`).
+    /// Every other test on this path pins `DeletionMode::Key`, so this combination ran
+    /// the same key-delete code with no coverage at all.
+    ///
+    /// What it does NOT do is discriminate on the main-snapshot visibility rules —
+    /// verified, not assumed: with `main_insert_records` pinned back to `Apply` this test
+    /// still passes. The position delete masks the superseded `(7, 10)` inside the Vortex
+    /// scan, so the predicate DELETE never matches it and never writes a key tombstone
+    /// off it. Position masking is an independent second defense here, and this test
+    /// guards the combination end to end rather than that rule; the rule itself is
+    /// covered under `DeletionMode::Key` by
+    /// `predicate_delete_must_not_hide_a_live_row_superseding_a_main_snapshot_version`.
+    #[tokio::test]
+    async fn predicate_delete_must_not_hide_a_live_row_under_position_mode_with_a_primary_key() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "delete_position_mode_pk_visibility",
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(
+            !provider.pk_deletion_strategy.is_position_based(),
+            "precondition: a PK table must keep a key-based strategy under \
+             `deletion_mode: position` — if it were `PositionBased` the delete would take \
+             the position-only path and this would not exercise the key rules at all"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[10])).await;
+        insert_batch(&provider, id_value_batch(schema, &[7], &[60])).await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain maintenance");
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60)],
+            "precondition: the upsert superseded the old version, so only (7, 60) is live"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("value").lt(datafusion_expr::lit(50_i64))],
+            )
+            .await
+            .expect("delete plan");
+        datafusion::physical_plan::collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+
+        assert_eq!(
+            scan_id_values(&provider).await,
+            vec![(7, 60)],
+            "the live row does not match `value < 50`; a key tombstone written from the \
+             superseded (7, 10) hides it under position mode exactly as under key mode"
         );
     }
 
