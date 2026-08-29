@@ -25,7 +25,7 @@ datasets:
       engine: cayenne
       mode: file
       refresh_mode: append
-      refresh_append_overlap: 5m
+      # refresh_append_overlap: 5m  # not yet supported for cayenne
       refresh_check_interval: 1h
       refresh_jitter_enabled: true
       refresh_jitter_max: 5m
