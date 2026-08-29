@@ -1898,14 +1898,12 @@ mod tests {
             Field::new("headers", map_of(true), true),
         ]);
         let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
-        assert!(
-            matches!(
-                plan.evolved_schema
-                    .field_with_name("headers")
-                    .expect("headers")
-                    .data_type(),
-                DataType::Map(entries, _) if !entries.is_nullable()
-            ),
+        assert_eq!(
+            plan.evolved_schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &map_of(false),
             "the classifier must not hand on a plan carrying the declaration the Arrow map layout forbids"
         );
 
@@ -1914,20 +1912,7 @@ mod tests {
             .await
             .expect("live schema evolution");
 
-        let expected = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Field::new("keys", DataType::Utf8, false),
-                        Field::new("values", DataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        );
+        let expected = map_of(false);
         assert_eq!(
             provider
                 .schema()

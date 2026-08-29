@@ -27,9 +27,10 @@ use arrow_schema::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 ///
 /// Two kinds of rule live here, and only one belongs in an engine's rule list. Most describe
 /// what a storage engine *can hold* — `DuckDB` has no Arrow Dictionary, no Null type — and are
-/// named in that engine's static list. [`MapEntriesNonNullable`] instead describes what a
-/// *source got wrong*, so it is applied where that source's data enters and belongs to no
-/// engine's list.
+/// named in that engine's static list. [`MapEntriesNonNullable`] instead describes a
+/// declaration the Arrow layout itself forbids, so it is no engine's to opt into: it is applied
+/// wherever a foreign declaration is taken at face value — where that source's data enters, and
+/// where two schemas are compared (see [`normalize_for_comparison`]).
 ///
 /// `Debug` is required so a rule list can sit in a `#[derive(Debug)]` struct; the unit
 /// structs below satisfy it by name.
@@ -61,8 +62,10 @@ impl TypeRewriteRule for DictionaryUnwrap {
 /// part of the type and not of any buffer, so the correction is metadata-only — pair it with
 /// [`relabel_array_data`] to carry the arrays over unchanged.
 ///
-/// This is a source-conformance rule, not an engine-capability one: do not add it to an
-/// accelerator's rule list by analogy with the rules above it.
+/// This is a layout-conformance rule, not an engine-capability one: do not add it to an
+/// accelerator's rule list by analogy with the rules above it. Its homes are the decode points
+/// where foreign data enters and [`normalize_for_comparison`], which two schemas are compared
+/// through.
 #[derive(Debug)]
 pub struct MapEntriesNonNullable;
 impl TypeRewriteRule for MapEntriesNonNullable {
@@ -212,6 +215,25 @@ pub fn apply_rules(schema: &Schema, rules: &[&dyn TypeRewriteRule]) -> Schema {
 #[must_use]
 pub fn normalize_dictionary_types(schema: &Schema) -> Schema {
     apply_rules(schema, &[&DictionaryUnwrap])
+}
+
+/// The form of a schema to compare another schema against: the representations that carry no
+/// difference of their own, normalized away so a difference that survives is a real one.
+///
+/// - Dictionary encoding is transparent, so the value type is what is compared (mirrored in
+///   `schema_evolution::widen_type`, which unwraps a dictionary again for the same reason).
+/// - A `Map` whose `entries` field is declared nullable is not a different type but an invalid
+///   one: the Arrow layout forbids it and `MapArray::try_new` refuses it, so no engine can hold
+///   a column declared that way. Left in, it is a difference that never resolves — a source
+///   declaring it that way differs from every conforming schema on every comparison, and no
+///   widening rule can reconcile the two, so it reads as an unevolvable change to a schema that
+///   never changed.
+///
+/// Both rules are applied in one pass, and a field needing neither is shared by refcount rather
+/// than deep-copied.
+#[must_use]
+pub fn normalize_for_comparison(schema: &Schema) -> Schema {
+    apply_rules(schema, &[&DictionaryUnwrap, &MapEntriesNonNullable])
 }
 
 /// Post-order recursive type rewriter: children are rewritten before the parent.

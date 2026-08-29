@@ -22,17 +22,21 @@ limitations under the License.
 //! widening in place, and appends added columns at the end — accelerator engines can only
 //! `ADD COLUMN`, so the canonical order must never interleave new columns mid-schema.
 //!
-//! Both input schemas are dictionary-normalized (`Dictionary(_, v)` → `v`, recursively, via
-//! [`crate::type_rewrite::normalize_dictionary_types`]) before comparison, matching how the
-//! runtime normalizes schemas before registration; the returned
-//! [`WideningPlan::evolved_schema`] is therefore dictionary-free.
+//! Both input schemas go through [`crate::type_rewrite::normalize_for_comparison`] first, so a
+//! representation carrying no difference of its own cannot read as one: dictionary encoding is
+//! unwrapped (`Dictionary(_, v)` → `v`, recursively), matching how the runtime normalizes
+//! schemas before registration, and a `Map` declaring its `entries` field nullable — which the
+//! Arrow layout forbids and `MapArray::try_new` refuses — is brought into line. The returned
+//! [`WideningPlan::evolved_schema`] is built from those, so it is dictionary-free and carries
+//! no forbidden map declaration: what persists or installs a plan inherits both guarantees
+//! rather than re-deriving them.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 
-use crate::type_rewrite::{DictionaryUnwrap, MapEntriesNonNullable, apply_rules};
+use crate::type_rewrite::normalize_for_comparison;
 
 /// The result of classifying an incoming schema against the current stored schema.
 #[derive(Debug)]
@@ -136,25 +140,6 @@ impl WideningPlan {
             parts.join(", ")
         }
     }
-}
-
-/// The form of a schema this classifier compares: the representations that carry no schema
-/// change of their own, normalized away so a difference that survives is a real one.
-///
-/// - Dictionary encoding is transparent for evolution, so the value type is what is compared
-///   (mirrored in [`widen_type`], which unwraps a dictionary again for the same reason).
-/// - A `Map` whose `entries` field is declared nullable is not a different type but an invalid
-///   one: the Arrow layout forbids it and `MapArray::try_new` refuses it, so no engine can hold
-///   a column declared that way. Left in, it is a difference that never resolves — a source
-///   declaring it that way differs from every conforming stored schema on every comparison, and
-///   [`widen_type`] has no `Map` arm, so the verdict is `Incompatible`: under
-///   `on_schema_change: fail` a dataset stops replicating over a schema that never changed.
-///   Normalizing it here also means no [`WideningPlan::evolved_schema`] can carry the forbidden
-///   declaration into whatever persists or installs it.
-///
-/// Both rules are applied in one pass so a schema needing neither is shared by refcount.
-fn normalize_for_comparison(schema: &Schema) -> Schema {
-    apply_rules(schema, &[&DictionaryUnwrap, &MapEntriesNonNullable])
 }
 
 /// Classifies `incoming` against `current` using name-based field matching.
@@ -1507,12 +1492,8 @@ mod tests {
         }
     }
 
-    /// The Arrow map layout forbids a nullable `entries` field, and `MapArray::try_new` refuses
-    /// one, so no engine can hold a column declared that way. Left in the comparison it is a
-    /// difference that never resolves — a source that keeps declaring it that way differs from
-    /// every conforming stored schema on every comparison, and `widen_type` has no `Map` arm, so
-    /// the verdict is `Incompatible`. Under `on_schema_change: fail` that stops a dataset
-    /// replicating over a schema that never changed.
+    /// Covers the `Map` rule of [`normalize_for_comparison`], which explains why the
+    /// declaration is normalized rather than reported. Regression tests for #13549.
     mod map_entries {
         use super::*;
 

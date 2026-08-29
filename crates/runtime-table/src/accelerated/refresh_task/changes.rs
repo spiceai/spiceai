@@ -4951,17 +4951,12 @@ mod tests {
         );
     }
 
-    /// A source that declares a `MAP`'s `entries` field nullable — which the Arrow map layout
-    /// forbids — is not reporting a schema change, but it differs from the accelerator's stored
-    /// declaration on every batch, and `widen_type` has no `Map` arm, so the difference
-    /// classifies `Incompatible`. Under `on_schema_change: fail` that stopped replication over a
-    /// schema that never changed; the surrounding `Map` pair is otherwise identical, so the
-    /// entries flag is the only thing under test.
+    /// Regression test for #13549, CDC leg. A source that declares a `MAP`'s `entries` field
+    /// nullable — which the Arrow map layout forbids — is not reporting a schema change, so
+    /// `on_schema_change: fail` must not reject the batch. The surrounding `Map` pair is
+    /// otherwise identical, so the entries flag is the only thing under test.
     #[tokio::test]
     async fn cdc_schema_evolution_accepts_a_nonconforming_map_entries_declaration() {
-        use crate::accelerated::refresh_task::RefreshTaskBuilder;
-        use crate::federated::FederatedTable;
-
         let map_of = |entries_nullable: bool| {
             DataType::Map(
                 Arc::new(Field::new(
@@ -4985,27 +4980,18 @@ mod tests {
             ]))
         };
 
-        let accelerator: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(schema_with(false), vec![vec![]]).expect("mem table"));
-        let dataset = datafusion::sql::TableReference::bare("cdc_map_entries_accepted".to_string());
+        let dataset = "cdc_map_entries_accepted";
         install_cdc_schema_evolution(
-            &dataset,
+            &datafusion::sql::TableReference::bare(dataset.to_string()),
             CdcSchemaEvolution {
                 policy: OnSchemaChange::Fail,
                 constraint_columns: vec![],
             },
         );
-        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-        let task = RefreshTaskBuilder::new(
-            runtime_status::RuntimeStatus::new(),
+        let task = make_refresh_task_named(
             dataset,
-            federated,
-            None,
-            accelerator,
-            tokio::runtime::Handle::current(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        )
-        .build();
+            Arc::new(MemTable::try_new(schema_with(false), vec![vec![]]).expect("mem table")),
+        );
 
         task.maybe_evolve_schema_for_cdc(&schema_with(true))
             .await

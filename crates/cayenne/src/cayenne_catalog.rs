@@ -2342,34 +2342,14 @@ impl MetadataCatalog for CayenneCatalog {
                     let vortex_config_json = row.get_optional_string(9)?;
                     let current_sequence_number = row.get_optional_i64(10)?.unwrap_or(0);
 
-                    // Deserialize schema using Arrow IPC format
-                    let schema = {
-                        use base64::Engine;
-                        use bytes::Bytes;
-
-                        let schema_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(&schema_json)
-                            .map_err(|e| CatalogError::InvalidOperation {
-                                message: "Failed to decode schema from base64".to_string(),
-                                source: Box::new(e),
-                            })?;
-
-                        let ipc_message = arrow_flight::IpcMessage(Bytes::from(schema_bytes));
-                        arrow_schema::Schema::try_from(ipc_message).map_err(|e| {
-                            CatalogError::InvalidOperation {
-                                message: "Failed to deserialize schema from IPC".to_string(),
-                                source: Box::new(e),
-                            }
-                        })?
-                    };
-
-                    // A schema persisted before the correction above — or by a Spice that
-                    // predates it — still declares its `MAP` entries the way its producer did,
-                    // and nothing else will ever repair it: the retention rule that keeps a
-                    // stored schema canonical across a nullability difference is what holds it
-                    // in place. Repairing it on the way out heals such a table on its next load
-                    // without rewriting a single file.
-                    let schema = conforming_schema(Arc::new(schema));
+                    // A schema persisted before `create_table` began conforming its input —
+                    // or by a Spice that predates it — still declares its `MAP` entries the way
+                    // its producer did, and nothing else will ever repair it: the retention rule
+                    // that keeps a stored schema canonical across a nullability difference is
+                    // what holds it in place. Repairing it on the way out heals such a table on
+                    // its next load without rewriting a single file.
+                    let schema =
+                        conforming_schema(Arc::new(deserialize_schema_ipc_base64(&schema_json)?));
 
                     // Parse primary key
                     let primary_key = if let Some(pk_json) = primary_key_json {
@@ -5062,6 +5042,31 @@ fn constraint_violation_message_contains_all(message: &str, required_parts: &[&s
 
 fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Deserialize the base64 Arrow-IPC form stored in `cayenne_table.schema_json` back into an
+/// Arrow schema — the exact inverse of [`serialize_schema_ipc_base64`], and the only place the
+/// stored encoding is read.
+///
+/// It hands back the declaration as it is stored, without the map-layout repair `get_table`
+/// applies on top, so a caller that needs to know what is actually on disk can ask.
+fn deserialize_schema_ipc_base64(schema_json: &str) -> CatalogResult<arrow_schema::Schema> {
+    use base64::Engine;
+    use bytes::Bytes;
+
+    let schema_bytes = base64::engine::general_purpose::STANDARD
+        .decode(schema_json)
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to decode schema from base64".to_string(),
+            source: Box::new(e),
+        })?;
+
+    arrow_schema::Schema::try_from(arrow_flight::IpcMessage(Bytes::from(schema_bytes))).map_err(
+        |e| CatalogError::InvalidOperation {
+            message: "Failed to deserialize schema from IPC".to_string(),
+            source: Box::new(e),
+        },
+    )
 }
 
 /// Serialize an Arrow schema to the base64 Arrow-IPC form stored in
@@ -9245,25 +9250,6 @@ mod tests {
         ]))
     }
 
-    /// Every `MAP` in `schema`, nested ones included, declares its `entries` non-nullable.
-    fn every_map_conforms(schema: &arrow_schema::Schema) -> bool {
-        fn conforms(data_type: &arrow_schema::DataType) -> bool {
-            match data_type {
-                arrow_schema::DataType::Map(entries, _) => {
-                    !entries.is_nullable() && conforms(entries.data_type())
-                }
-                arrow_schema::DataType::Struct(fields) => {
-                    fields.iter().all(|f| conforms(f.data_type()))
-                }
-                arrow_schema::DataType::List(field)
-                | arrow_schema::DataType::LargeList(field)
-                | arrow_schema::DataType::FixedSizeList(field, _) => conforms(field.data_type()),
-                _ => true,
-            }
-        }
-        schema.fields().iter().all(|f| conforms(f.data_type()))
-    }
-
     fn map_test_catalog(name: &str) -> (Arc<CayenneCatalog>, String) {
         let test_db = format!("sqlite://./.test_{name}_{}.db", uuid::Uuid::now_v7());
         let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
@@ -9284,9 +9270,6 @@ mod tests {
         catalog: &CayenneCatalog,
         table_name: &str,
     ) -> arrow_schema::Schema {
-        use base64::Engine;
-        use bytes::Bytes;
-
         let schema_json = catalog
             .metastore
             .query_row_helper(
@@ -9298,11 +9281,30 @@ mod tests {
             )
             .await
             .expect("read the stored schema_json");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&schema_json)
-            .expect("decode base64");
-        arrow_schema::Schema::try_from(arrow_flight::IpcMessage(Bytes::from(bytes)))
-            .expect("deserialize IPC schema")
+        deserialize_schema_ipc_base64(&schema_json).expect("deserialize the stored schema")
+    }
+
+    /// Put the pre-conformance declaration back under `table_name`, the way a metastore
+    /// written by an earlier Spice already holds it.
+    async fn store_legacy_declaration(catalog: &CayenneCatalog, table_name: &str) {
+        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
+            .expect("serialize the legacy declaration");
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
+                params: vec![
+                    MetastoreValue::Text(legacy),
+                    MetastoreValue::Text(table_name.to_string()),
+                ],
+            })
+            .await
+            .expect("store the legacy declaration");
+        assert_eq!(
+            stored_schema_bytes(catalog, table_name).await,
+            *map_entries_schema(true),
+            "the test must start from a genuinely non-conforming stored declaration"
+        );
     }
 
     fn map_table_options(
@@ -9343,15 +9345,10 @@ mod tests {
             .await
             .expect("create table");
 
-        let persisted = stored_schema_bytes(&catalog, "map_create").await;
-        assert!(
-            every_map_conforms(&persisted),
-            "the persisted declaration must conform to the Arrow map layout, got: {persisted:?}"
-        );
         assert_eq!(
-            persisted,
+            stored_schema_bytes(&catalog, "map_create").await,
             *map_entries_schema(false),
-            "only the entries nullability may change; every other field, type and metadata is carried across"
+            "the persisted declaration must conform to the Arrow map layout, and only the entries nullability may change — every other field, type and metadata is carried across"
         );
 
         remove_test_db(&test_db);
@@ -9378,33 +9375,17 @@ mod tests {
             .await
             .expect("create table");
 
-        // Put the pre-correction declaration back, the way a metastore written by an earlier
-        // Spice already holds it.
-        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
-            .expect("serialize the legacy declaration");
-        catalog
-            .metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
-                params: vec![
-                    MetastoreValue::Text(legacy),
-                    MetastoreValue::Text("map_legacy".to_string()),
-                ],
-            })
-            .await
-            .expect("store the legacy declaration");
-        assert!(
-            !every_map_conforms(&stored_schema_bytes(&catalog, "map_legacy").await),
-            "the test must start from a genuinely non-conforming stored declaration"
-        );
+        store_legacy_declaration(&catalog, "map_legacy").await;
 
-        let metadata = catalog.get_table("map_legacy").await.expect("get table");
-        assert!(
-            every_map_conforms(&metadata.schema),
-            "a stored declaration that violates the Arrow map layout must be repaired on read, got: {:?}",
-            metadata.schema
+        assert_eq!(
+            *catalog
+                .get_table("map_legacy")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
+            "a stored declaration that violates the Arrow map layout must be repaired on read"
         );
-        assert_eq!(*metadata.schema, *map_entries_schema(false));
 
         remove_test_db(&test_db);
     }
@@ -9430,19 +9411,7 @@ mod tests {
             .await
             .expect("create table");
 
-        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
-            .expect("serialize the legacy declaration");
-        catalog
-            .metastore
-            .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
-                params: vec![
-                    MetastoreValue::Text(legacy),
-                    MetastoreValue::Text("map_revalidate".to_string()),
-                ],
-            })
-            .await
-            .expect("store the legacy declaration");
+        store_legacy_declaration(&catalog, "map_revalidate").await;
 
         let reopened = catalog
             .create_table(map_table_options(
@@ -9456,16 +9425,58 @@ mod tests {
             reopened, table_id,
             "the table must be reopened rather than treated as reconfigured"
         );
-        assert!(
-            every_map_conforms(
-                &catalog
-                    .get_table("map_revalidate")
-                    .await
-                    .expect("get table")
-                    .schema
-            ),
+        assert_eq!(
+            *catalog
+                .get_table("map_revalidate")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
             "the reopened table must be planned against a readable declaration"
         );
+
+        remove_test_db(&test_db);
+    }
+
+    /// Why the conform sits at the *entry* of `create_table` rather than where the schema is
+    /// serialized: `options.schema` is compared against the stored one long before anything is
+    /// persisted, by `configuration_matches` — which is not the widening classifier and does
+    /// not normalize. Handed the producer's own declaration it reports a reconfiguration, so a
+    /// producer that never stops sending it would look like one on every load.
+    #[tokio::test]
+    async fn configuration_matching_does_not_normalize_a_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_requested");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_requested",
+                map_entries_schema(false),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        // The source still declares `entries` nullable, as it did before the ingress
+        // correction reached it.
+        let raw = map_table_options("map_requested", map_entries_schema(true), base_path.clone());
+        assert!(
+            matches!(
+                catalog
+                    .validate_existing_table_configuration("map_requested", &raw)
+                    .await,
+                Err(CatalogError::ChangedConfiguration { .. })
+            ),
+            "this comparison is what the entry-of-create_table conform exists to get ahead of"
+        );
+
+        // Conformed first — which is what `create_table` does — it is not a change at all.
+        let conformed = map_table_options("map_requested", map_entries_schema(false), base_path);
+        catalog
+            .validate_existing_table_configuration("map_requested", &conformed)
+            .await
+            .expect("a declaration the Arrow map layout forbids is not a configuration change");
 
         remove_test_db(&test_db);
     }
