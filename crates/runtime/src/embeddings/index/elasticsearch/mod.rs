@@ -234,6 +234,7 @@ pub async fn try_from_table(
             metadata_columns: &metadata_columns,
             index_settings: index_settings.as_ref(),
             chunk_key: chunked.then_some(CHUNKED_INDEX_CHUNK_KEY),
+            primary_key: &primary_key,
         },
     )
     .await?;
@@ -309,6 +310,7 @@ async fn ensure_index_with_mapping(
         metadata_columns,
         index_settings,
         chunk_key,
+        primary_key,
     } = mapping;
 
     if dims <= 0 {
@@ -417,8 +419,12 @@ async fn ensure_index_with_mapping(
                 existing mapping will be used): {e}"
             );
         }
+        add_missing_primary_key_mappings(client, es_index, primary_key).await;
         return Ok(());
     }
+
+    // Last, so every mapping the user asked for above keeps precedence over this default.
+    add_primary_key_mappings(&mut properties, primary_key);
 
     let mut create_body = serde_json::json!({ "mappings": { "properties": properties } });
     if let Some(settings) = index_settings
@@ -445,6 +451,7 @@ async fn ensure_index_with_mapping(
                     "Elasticsearch index '{es_index}' exists after concurrent creation but mapping update failed (continuing; existing mapping will be used): {mapping_error}"
                 );
             }
+            add_missing_primary_key_mappings(client, es_index, primary_key).await;
             Ok(())
         }
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
@@ -462,6 +469,102 @@ struct VectorIndexMapping<'a> {
     /// non-indexed `long` so `_source` retrieval works with clear intent (it is a primary-key
     /// ordering field, never filtered on).
     chunk_key: Option<&'a str>,
+    /// The index's primary-key fields, mapped exactly so a `term` filter on them matches the
+    /// stored value — see [`add_primary_key_mappings`].
+    primary_key: &'a [arrow_schema::Field],
+}
+
+/// Map every primary-key column that nothing above has already mapped, so an exact-match filter
+/// on it matches the value the write path stored.
+///
+/// Without this, a key column is left to dynamic mapping, which makes a string `text` — an
+/// inverted index of *analyzed* tokens that an unanalyzed `term` query cannot match. A delete
+/// that has to filter on the key columns rather than address documents by `_id` (the chunked
+/// index, whose stored key carries a chunk ordinal the deleting side does not know) then removes
+/// nothing while reporting success, leaving documents searchable for rows the dataset no longer
+/// has (#13714).
+///
+/// A column another mapping already claimed keeps that mapping: it is either the user's declared
+/// intent or a search field that has to stay analyzable, and the delete path resolves such a
+/// column to its `keyword` multi-field instead.
+fn add_primary_key_mappings(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    primary_key: &[arrow_schema::Field],
+) {
+    for field in primary_key {
+        if properties.contains_key(field.name()) {
+            continue;
+        }
+        properties.insert(field.name().clone(), primary_key_mapping(field.data_type()));
+    }
+}
+
+/// Map the primary-key columns an existing index does not map yet, in a request of their own.
+///
+/// Only the ones it does not map: Elasticsearch cannot change an existing field's type, so
+/// sending a column it already mapped can only be rejected — and a rejected `put_mapping` takes
+/// the whole body with it, which would cost the other mapping updates in that request. An index
+/// that already mapped a key column as `text` keeps it, and the delete path resolves that column
+/// to its exact-match sub-field instead.
+///
+/// Best-effort throughout: this improves how exactly a later delete can address documents, and it
+/// is not worth failing an index the runtime has otherwise finished preparing.
+async fn add_missing_primary_key_mappings(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    primary_key: &[arrow_schema::Field],
+) {
+    if primary_key.is_empty() {
+        return;
+    }
+
+    let response = match client.get_mapping(es_index).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::debug!(
+                "Elasticsearch index '{es_index}': could not read the existing mapping, so its key columns were left as they are: {e}"
+            );
+            return;
+        }
+    };
+    let Some(existing) = elasticsearch::index_properties(&response, es_index) else {
+        return;
+    };
+
+    let mut properties = serde_json::Map::new();
+    for field in primary_key {
+        if existing.contains_key(field.name()) {
+            continue;
+        }
+        properties.insert(field.name().clone(), primary_key_mapping(field.data_type()));
+    }
+    if properties.is_empty() {
+        return;
+    }
+
+    if let Err(e) = client
+        .put_mapping(es_index, &serde_json::json!({ "properties": properties }))
+        .await
+    {
+        tracing::debug!(
+            "Elasticsearch index '{es_index}': its key columns could not be mapped for exact matching, so a delete addressing part of the key may not be able to reach them: {e}"
+        );
+    }
+}
+
+/// The Elasticsearch mapping for a primary-key column of Arrow type `dt`.
+///
+/// A string key maps to bare `keyword` rather than the `text` + `keyword` multi-field
+/// [`arrow_type_to_es_mapping`] gives other string columns: a key is matched, never searched, and
+/// the multi-field's `ignore_above: 256` would leave a longer key unindexed and so unreachable by
+/// the filter that has to delete it. Every other type is already exact under the shared mapping.
+fn primary_key_mapping(dt: &DataType) -> serde_json::Value {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            serde_json::json!({ "type": "keyword" })
+        }
+        other => arrow_type_to_es_mapping(other),
+    }
 }
 
 /// Check whether an error from `create_index` indicates the index already exists
@@ -557,6 +660,7 @@ pub(crate) async fn ensure_index_with_text_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
     text_fields: &[String],
+    primary_key: &[arrow_schema::Field],
     index_settings: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut properties = serde_json::Map::new();
@@ -583,8 +687,13 @@ pub(crate) async fn ensure_index_with_text_mapping(
                 "Elasticsearch FTS index '{es_index}' exists but mapping update failed (continuing): {e}"
             );
         }
+        add_missing_primary_key_mappings(client, es_index, primary_key).await;
         return Ok(());
     }
+
+    // Same reason as the vector index: this index's deletes filter on the key columns whenever
+    // they address a chunked row, so the key columns have to be exactly matchable.
+    add_primary_key_mappings(&mut properties, primary_key);
 
     let mut create_body = serde_json::json!({ "mappings": { "properties": properties } });
     if let Some(settings) = index_settings
@@ -597,7 +706,10 @@ pub(crate) async fn ensure_index_with_text_mapping(
             tracing::info!("Created Elasticsearch FTS index '{es_index}'.");
             Ok(())
         }
-        Err(e) if is_index_already_exists_error(&e) => Ok(()),
+        Err(e) if is_index_already_exists_error(&e) => {
+            add_missing_primary_key_mappings(client, es_index, primary_key).await;
+            Ok(())
+        }
         Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
     }
 }
@@ -651,5 +763,93 @@ fn derive_primary_keys(
         Ok(ChunkedSearchIndex::augment_primary_key(primary_key))
     } else {
         Ok(primary_key)
+    }
+}
+
+#[cfg(test)]
+mod primary_key_mapping_tests {
+    use super::*;
+
+    fn field(name: &str, data_type: DataType) -> arrow_schema::Field {
+        arrow_schema::Field::new(name, data_type, true)
+    }
+
+    /// A string key column must be mapped `keyword`, not the `text` + `keyword` multi-field other
+    /// string columns get: `text` indexes analyzed tokens, which is what made a chunked index's
+    /// key-column delete match nothing and report success (#13714).
+    #[test]
+    fn a_string_key_column_is_mapped_keyword() {
+        let mut properties = serde_json::Map::new();
+        add_primary_key_mappings(&mut properties, &[field("id", DataType::Utf8)]);
+
+        assert_eq!(
+            properties.get("id"),
+            Some(&serde_json::json!({ "type": "keyword" })),
+        );
+    }
+
+    /// No `ignore_above`: the multi-field's 256-character limit would leave a longer key
+    /// unindexed, and so unreachable by the filter that has to delete it.
+    #[test]
+    fn a_string_key_mapping_declares_no_length_limit() {
+        let mut properties = serde_json::Map::new();
+        add_primary_key_mappings(&mut properties, &[field("id", DataType::LargeUtf8)]);
+
+        let mapping = properties.get("id").expect("id should be mapped");
+        assert!(
+            mapping.get("ignore_above").is_none(),
+            "a key column must index at any length, got: {mapping}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_key_column_keeps_its_native_mapping() {
+        let mut properties = serde_json::Map::new();
+        add_primary_key_mappings(&mut properties, &[field("id", DataType::Int64)]);
+
+        assert_eq!(
+            properties.get("id"),
+            Some(&serde_json::json!({ "type": "long" })),
+        );
+    }
+
+    /// A column another mapping already claimed — a declared metadata column, a search field, the
+    /// chunk key — keeps it. That mapping is the user's intent or a searchability requirement,
+    /// and the delete path resolves such a column to its exact-match sub-field instead.
+    #[test]
+    fn an_already_mapped_key_column_is_left_alone() {
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "id".to_string(),
+            serde_json::json!({ "type": "text", "index": false }),
+        );
+        add_primary_key_mappings(&mut properties, &[field("id", DataType::Utf8)]);
+
+        assert_eq!(
+            properties.get("id"),
+            Some(&serde_json::json!({ "type": "text", "index": false })),
+        );
+    }
+
+    /// Every component of a composite key is filtered on, so every component has to be mapped.
+    #[test]
+    fn every_column_of_a_composite_key_is_mapped() {
+        let mut properties = serde_json::Map::new();
+        add_primary_key_mappings(
+            &mut properties,
+            &[
+                field("tenant", DataType::Utf8),
+                field("id", DataType::Int32),
+            ],
+        );
+
+        assert_eq!(
+            properties.get("tenant"),
+            Some(&serde_json::json!({ "type": "keyword" })),
+        );
+        assert_eq!(
+            properties.get("id"),
+            Some(&serde_json::json!({ "type": "integer" })),
+        );
     }
 }

@@ -89,10 +89,59 @@ pub struct FieldMapping {
     pub field_type: Option<String>,
     #[serde(default)]
     pub properties: Option<HashMap<String, FieldMapping>>,
+    /// Multi-fields: the same value indexed a second way under `<field>.<name>`. A string with
+    /// no explicit mapping is dynamically mapped `text` with a `keyword` multi-field, and that
+    /// sub-field is the only exact-match path to it.
+    #[serde(default)]
+    pub fields: Option<HashMap<String, FieldMapping>>,
+    /// Strings longer than this are stored but not indexed, so no exact-match filter reaches
+    /// them. Dynamic mapping sets it to 256 on the `keyword` multi-field it derives for a string.
+    pub ignore_above: Option<i64>,
+    /// Whether the field is searchable at all. Held untyped because Elasticsearch has spelled it
+    /// both as a boolean and as a quoted boolean across versions, and a mapping that fails to
+    /// parse is worse than one whose `index` needs interpreting — see [`FieldMapping::is_indexed`].
+    #[serde(default)]
+    pub index: Option<serde_json::Value>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).
     pub similarity: Option<String>,
+}
+
+/// The field mappings `GET /<index>/_mapping` returned for `index`.
+///
+/// The body is keyed by the *concrete* index name, which is `index` itself unless `index` is an
+/// alias — in which case the single entry it resolved to is the one to read. `None` means the
+/// response named no mapping that can be attributed to `index`, which is not the same as an index
+/// whose mapping is empty.
+#[must_use]
+pub fn index_properties<'a>(
+    response: &'a MappingResponse,
+    index: &str,
+) -> Option<&'a HashMap<String, FieldMapping>> {
+    match response.get(index) {
+        Some(index_mapping) => Some(&index_mapping.mappings.properties),
+        None if response.len() == 1 => response.values().next().map(|m| &m.mappings.properties),
+        None => None,
+    }
+}
+
+impl FieldMapping {
+    /// Whether a query can match on this field. `index: false` stores the value in `_source` and
+    /// indexes nothing, so no filter — however exact — reaches it.
+    ///
+    /// Absent means indexed: that is Elasticsearch's default for every field type.
+    #[must_use]
+    pub fn is_indexed(&self) -> bool {
+        match &self.index {
+            None => true,
+            Some(serde_json::Value::Bool(indexed)) => *indexed,
+            Some(serde_json::Value::String(indexed)) => indexed != "false",
+            // Anything else is not a value Elasticsearch produces here; read it the safe way,
+            // which is the default rather than a guess that the field is unsearchable.
+            Some(_) => true,
+        }
+    }
 }
 
 /// A search request body sent to `POST /<index>/_search`.

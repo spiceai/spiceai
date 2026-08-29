@@ -18,7 +18,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use elasticsearch::Elasticsearch;
+use elasticsearch::{Elasticsearch, FieldMapping};
 use serde_json::{Value, json};
 use snafu::Snafu;
 
@@ -48,6 +48,35 @@ pub enum Error {
         field: &'static str,
         shape: String,
     },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): its field mapping could not be read, so it is not known which field an exact-match filter on the key columns {columns} has to name; the delete was not issued. Cause: {source}"
+    ))]
+    KeyColumnMappingUnreadable {
+        index: String,
+        columns: String,
+        source: elasticsearch::Error,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): key column '{column}' is mapped `{mapped_as}`, which no exact-match filter can address — a `text` mapping indexes analyzed tokens rather than the value, and an unsearchable mapping indexes nothing — and it has no exact-match sub-field either, so the delete was not issued. Map '{column}' as a searchable `keyword` and re-create the index; Elasticsearch cannot change an existing field's type. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyColumnNotExactlyMatchable {
+        index: String,
+        column: String,
+        mapped_as: String,
+    },
+
+    #[snafu(display(
+        "Failed to delete rows from the search index '{index}' (elasticsearch): a key in column '{column}' is {length} characters, past the `ignore_above: {ignore_above}` of the '{path}' field it is matched on, so Elasticsearch never indexed it and no filter can address its documents; the delete was not issued. Re-create the index so the runtime maps its key columns as `keyword` with no `ignore_above`. See: https://spiceai.org/docs/features/search"
+    ))]
+    KeyValueNotIndexed {
+        index: String,
+        column: String,
+        path: String,
+        length: usize,
+        ignore_above: i64,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -74,13 +103,11 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// `key_columns` covers every `primary_key` column, a prefix delete when it's a strict subset
 /// (the chunked-index case).
 ///
-/// The two cases address documents differently, because filtering on a key *column* is not
-/// reliable. Nothing maps the primary-key columns: the index mapping the runtime creates covers
-/// the vector field, the configured text fields, and declared metadata columns only, so a string
-/// key is dynamically mapped `text` and its inverted index holds *analyzed* tokens. A `term`
-/// query is not analyzed, so `{"term": {"id": "ORDER-1024"}}` looks for one token in an index
-/// holding `[order, 1024]` and matches nothing — a delete that reports success having removed
-/// no documents (#12267).
+/// The two cases address documents differently, because filtering on a key *column* depends on
+/// how that column is mapped. A string column with no mapping of its own is dynamically mapped
+/// `text`, whose inverted index holds *analyzed* tokens; a `term` query is not analyzed, so
+/// `{"term": {"id": "ORDER-1024"}}` looks for one token in an index holding `[order, 1024]` and
+/// matches nothing — a delete that reports success having removed no documents (#12267, #13714).
 ///
 /// So when `key_columns` covers the whole primary key, this addresses documents by `_id` via an
 /// `ids` query. `_id` is the value the write path already stores for the row, derived by the
@@ -88,8 +115,13 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// the write produced — no field mapping, no analysis, and no dependence on the key's type.
 ///
 /// A strict subset of the key (the chunked-index case) cannot use `_id`, because the chunk id is
-/// part of it and is unknown at delete time; that case still filters on the key columns and so
-/// remains subject to the mapping gap above.
+/// part of it and is unknown at delete time. That case filters on the key columns, so it first
+/// reads the index mapping and resolves each key column to the field path a `term` matches the
+/// stored value on — the column itself when it is mapped to an exact-match type, its `keyword`
+/// multi-field when the column is `text` (which is what dynamic mapping gives an unmapped string,
+/// and what the runtime maps a key column that is also a search field to). A column that resolves
+/// to neither is refused by name rather than filtered on: the filter would match nothing, and
+/// reporting that as a successful delete is the failure this addressing exists to avoid (#13714).
 ///
 /// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
 /// shaped by [`spice_table::Index::required_columns`] (a superset of the primary
@@ -120,6 +152,26 @@ pub async fn delete_by_keys(
             .iter()
             .all(|f| key_columns.iter().any(|c| c == f.name()));
 
+    // An empty batch addresses nothing, so it must not reach out to the index at all — including
+    // for the mapping read below, whose failure would report a delete of no rows as failed.
+    if keys.num_rows() == 0 {
+        return Ok(());
+    }
+
+    // Resolve once for the whole batch, before the first request: every chunk filters on the same
+    // columns, and a key column with no exact-match field path fails the delete outright rather
+    // than per chunk.
+    let key_paths = if addresses_whole_key {
+        Vec::new()
+    } else {
+        match resolve_term_exact_paths(client, es_index, key_columns).await {
+            Ok(Some(paths)) => paths,
+            // No document carries these columns, so there is nothing this delete can address.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(DataFusionError::External(Box::new(e))),
+        }
+    };
+
     // Hold the first failure and keep going. Each chunk is an independent `_delete_by_query` over
     // its own slice of `keys`, so returning at the first one would leave every later chunk
     // unissued, turning a report of a partial delete into a cause of a larger one.
@@ -134,7 +186,7 @@ pub async fn delete_by_keys(
         let query = if addresses_whole_key {
             build_ids_query(primary_key, es_index, &chunk)?
         } else {
-            build_or_of_row_term_queries(key_columns, &chunk)?
+            build_or_of_row_term_queries(es_index, &key_paths, &chunk)?
         };
         let Some(query) = query else {
             continue;
@@ -362,29 +414,35 @@ fn build_ids_query(
 }
 
 /// Builds `{"bool": {"should": [{"bool": {"filter": [{"term": {...}}, ...]}}, ...], "minimum_should_match": 1}}`
-/// — one `should` clause (`key_columns` ANDed) per row of `keys`, rows ORed together.
+/// — one `should` clause (the key columns ANDed) per row of `keys`, rows ORed together.
+///
+/// Each term names the field path [`resolve_term_exact_paths`] resolved for that column, which is
+/// not always the column's own name: a `text`-mapped column is matched on its `keyword`
+/// multi-field, since the column itself holds analyzed tokens.
 fn build_or_of_row_term_queries(
-    key_columns: &[String],
+    es_index: &str,
+    key_paths: &[KeyFieldPath],
     keys: &RecordBatch,
 ) -> DataFusionResult<Option<Value>> {
-    if keys.num_rows() == 0 || key_columns.is_empty() {
+    if keys.num_rows() == 0 || key_paths.is_empty() {
         return Ok(None);
     }
 
-    let arrays: Vec<_> = key_columns
+    let arrays: Vec<_> = key_paths
         .iter()
-        .map(|name| keys.column_by_name(name).cloned())
+        .map(|p| keys.column_by_name(&p.column).cloned())
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
+            let columns: Vec<&str> = key_paths.iter().map(|p| p.column.as_str()).collect();
             DataFusionError::Plan(format!(
-                "delete key batch is missing one of the requested key columns: {key_columns:?}"
+                "delete key batch is missing one of the requested key columns: {columns:?}"
             ))
         })?;
 
     let mut row_clauses = Vec::with_capacity(keys.num_rows());
     for row in 0..keys.num_rows() {
-        let mut terms = Vec::with_capacity(key_columns.len());
-        for (name, array) in key_columns.iter().zip(&arrays) {
+        let mut terms = Vec::with_capacity(key_paths.len());
+        for (key_path, array) in key_paths.iter().zip(&arrays) {
             let value = ScalarValue::try_from_array(array.as_ref(), row)?;
             let Some(json_value) = scalar_to_term_value(&value) else {
                 // A NULL/unsupported key column can never equal anything via `term` — skip this
@@ -392,7 +450,24 @@ fn build_or_of_row_term_queries(
                 terms.clear();
                 break;
             };
-            terms.push(json!({ "term": { name.as_str(): json_value } }));
+            // A value Elasticsearch declined to index is unreachable by any filter, so the delete
+            // has to say so rather than issue a clause that matches nothing and reports success.
+            if let Some(json_string) = json_value.as_str()
+                && let Some(ignore_above) = key_path.ignore_above
+                && let Ok(length) = i64::try_from(json_string.chars().count())
+                && length > ignore_above
+            {
+                return Err(DataFusionError::External(Box::new(
+                    Error::KeyValueNotIndexed {
+                        index: es_index.to_string(),
+                        column: key_path.column.clone(),
+                        path: key_path.path.clone(),
+                        length: json_string.chars().count(),
+                        ignore_above,
+                    },
+                )));
+            }
+            terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
         }
         if !terms.is_empty() {
             row_clauses.push(json!({ "bool": { "filter": terms } }));
@@ -409,6 +484,162 @@ fn build_or_of_row_term_queries(
             "minimum_should_match": 1
         }
     })))
+}
+
+/// The Elasticsearch field a key column's values are matched on, and the length past which that
+/// field stops indexing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyFieldPath {
+    /// The key column, as it is named in the delete-key batch.
+    column: String,
+    /// The field path a `term` query has to name to match that column's stored value — `column`
+    /// itself, or one of its multi-fields (`column.keyword`).
+    path: String,
+    /// `path`'s `ignore_above`, when it declares one: a longer string is stored but not indexed,
+    /// so no filter reaches it.
+    ignore_above: Option<i64>,
+}
+
+/// Elasticsearch field types whose indexed form is the value itself, so an unanalyzed `term`
+/// query matches what the write path stored.
+///
+/// `text` (and its variants) is deliberately absent: it holds the value's *analyzed* tokens, so a
+/// `term` for `ORDER-1024` searches an index holding `[order, 1024]` and matches nothing. Being
+/// one of these types is necessary but not sufficient — see [`is_term_exact`].
+const TERM_EXACT_FIELD_TYPES: &[&str] = &[
+    "boolean",
+    "byte",
+    "constant_keyword",
+    "date",
+    "date_nanos",
+    "double",
+    "float",
+    "half_float",
+    "integer",
+    "ip",
+    "keyword",
+    "long",
+    "scaled_float",
+    "short",
+    "unsigned_long",
+    "version",
+    "wildcard",
+];
+
+/// Whether a `term` on this field matches the value the write path stored: an exact type, and
+/// searchable at all. A field mapped `index: false` — which is what a column the user declared
+/// non-filterable gets — is stored in `_source` and indexed nowhere, so a filter naming it
+/// matches nothing however exact its type is.
+fn is_term_exact(mapping: &FieldMapping) -> bool {
+    mapping.is_indexed()
+        && mapping
+            .field_type
+            .as_deref()
+            .is_some_and(|t| TERM_EXACT_FIELD_TYPES.contains(&t))
+}
+
+/// Resolves each of `key_columns` to the field path an exact-match `term` query has to name, by
+/// reading `es_index`'s live mapping.
+///
+/// The runtime maps a key column as `keyword` when it creates the index, but the index may
+/// predate that, may have been created by the user, or may map the column as a search field — so
+/// what a `term` has to name is a property of the index in front of us, not of our own intent.
+/// Three outcomes, and the third is the point:
+///
+/// - the column is mapped to an exact type — name the column;
+/// - the column is `text` with an exact multi-field (`keyword`, which dynamic mapping derives for
+///   every unmapped string) — name that sub-field;
+/// - neither — return [`Error::KeyColumnNotExactlyMatchable`]. No filter can address the
+///   documents, and issuing one anyway is what let a delete remove nothing and report success.
+///
+/// Returns `Ok(None)` when a key column is absent from the mapping entirely: Elasticsearch maps a
+/// field the first time a document carries it, so no document holds that column and the delete
+/// has nothing to address. That is a delete of rows the index does not have, not a failure.
+async fn resolve_term_exact_paths(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    key_columns: &[String],
+) -> Result<Option<Vec<KeyFieldPath>>> {
+    if key_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let response =
+        client
+            .get_mapping(es_index)
+            .await
+            .map_err(|source| Error::KeyColumnMappingUnreadable {
+                index: es_index.to_string(),
+                columns: key_columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source,
+            })?;
+
+    let Some(properties) = elasticsearch::index_properties(&response, es_index) else {
+        // An index with no mapping of its own holds no documents to delete.
+        return Ok(None);
+    };
+
+    let mut paths = Vec::with_capacity(key_columns.len());
+    for column in key_columns {
+        let Some(mapping) = properties.get(column) else {
+            return Ok(None);
+        };
+
+        if is_term_exact(mapping) {
+            paths.push(KeyFieldPath {
+                column: column.clone(),
+                path: column.clone(),
+                ignore_above: mapping.ignore_above,
+            });
+            continue;
+        }
+
+        // Multi-fields index the same value a second way. `keyword` is the one dynamic mapping
+        // derives and the one to prefer; any other exact sub-field is still exact, and taking the
+        // lowest name keeps the choice stable across runs rather than following hash order.
+        let sub_fields = mapping.fields.as_ref();
+        let exact_sub = sub_fields
+            .and_then(|fields| {
+                fields
+                    .get("keyword")
+                    .filter(|m| is_term_exact(m))
+                    .map(|m| ("keyword", m))
+            })
+            .or_else(|| {
+                let mut exact: Vec<_> = sub_fields
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, m)| is_term_exact(m))
+                    .collect();
+                exact.sort_by(|(a, _), (b, _)| a.cmp(b));
+                exact.into_iter().next().map(|(n, m)| (n.as_str(), m))
+            });
+
+        let Some((sub_name, sub_mapping)) = exact_sub else {
+            return KeyColumnNotExactlyMatchableSnafu {
+                index: es_index.to_string(),
+                column: column.clone(),
+                mapped_as: mapping
+                    .field_type
+                    .as_deref()
+                    .unwrap_or("object")
+                    .to_string(),
+            }
+            .fail();
+        };
+
+        paths.push(KeyFieldPath {
+            column: column.clone(),
+            path: format!("{column}.{sub_name}"),
+            ignore_above: sub_mapping.ignore_above,
+        });
+    }
+
+    Ok(Some(paths))
 }
 
 fn scalar_to_term_value(value: &ScalarValue) -> Option<Value> {
@@ -438,7 +669,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Schema};
     use elasticsearch::{
-        Error as EsError, MappingResponse, Result as EsResult, SearchRequest, SearchResponse,
+        Error as EsError, IndexMapping, MappingResponse, Mappings, Result as EsResult,
+        SearchRequest, SearchResponse,
     };
     use std::sync::Arc;
 
@@ -484,6 +716,10 @@ mod tests {
         /// carries a status, so it stands for the kind Elasticsearch itself raised — the request
         /// reached the index, and the delete's fate there is unknown.
         erroring: Vec<usize>,
+        /// The body `get_mapping` answers with. `None` — the default — errors instead, so a test
+        /// of the whole-key path fails loudly if that path ever reads the mapping it does not
+        /// need.
+        mapping: Option<MappingResponse>,
     }
 
     impl RecordingClient {
@@ -504,6 +740,15 @@ mod tests {
         fn answering_in_turn(responses: Vec<Value>) -> Self {
             Self {
                 responses,
+                ..Self::default()
+            }
+        }
+
+        /// Answers `get_mapping` for index `idx` with `fields`, so a partial-key delete can
+        /// resolve the field path to filter on.
+        fn mapped(fields: Vec<(&str, FieldMapping)>) -> Self {
+            Self {
+                mapping: Some(mapping_of("idx", fields)),
                 ..Self::default()
             }
         }
@@ -585,7 +830,10 @@ mod tests {
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
-            Err(unexpected("get_mapping"))
+            match &self.mapping {
+                Some(mapping) => Ok(mapping.clone()),
+                None => Err(unexpected("get_mapping")),
+            }
         }
         async fn search(&self, _index: &str, _body: &SearchRequest) -> EsResult<SearchResponse> {
             Err(unexpected("search"))
@@ -632,6 +880,47 @@ mod tests {
             _docs: &[(Option<String>, Value)],
         ) -> EsResult<Value> {
             Err(unexpected("bulk_index"))
+        }
+    }
+
+    /// A `GET /<index>/_mapping` body naming `fields` under `index`.
+    fn mapping_of(index: &str, fields: Vec<(&str, FieldMapping)>) -> MappingResponse {
+        MappingResponse::from([(
+            index.to_string(),
+            IndexMapping {
+                mappings: Mappings {
+                    properties: fields
+                        .into_iter()
+                        .map(|(name, mapping)| (name.to_string(), mapping))
+                        .collect(),
+                },
+            },
+        )])
+    }
+
+    fn field_mapping(field_type: &str) -> FieldMapping {
+        FieldMapping {
+            field_type: Some(field_type.to_string()),
+            properties: None,
+            fields: None,
+            ignore_above: None,
+            index: None,
+            dims: None,
+            similarity: None,
+        }
+    }
+
+    /// What dynamic mapping gives an unmapped string column: `text` holding analyzed tokens, plus
+    /// a `keyword` multi-field that indexes the value itself up to `ignore_above`.
+    fn dynamic_string_mapping() -> FieldMapping {
+        let mut keyword = field_mapping("keyword");
+        keyword.ignore_above = Some(256);
+        FieldMapping {
+            fields: Some(std::collections::HashMap::from([(
+                "keyword".to_string(),
+                keyword,
+            )])),
+            ..field_mapping("text")
         }
     }
 
@@ -725,7 +1014,7 @@ mod tests {
     /// chunk id is part of it and unknown at delete time — that path still filters on columns.
     #[tokio::test]
     async fn partial_key_falls_back_to_term_filters() {
-        let client = RecordingClient::default();
+        let client = RecordingClient::mapped(vec![("id", field_mapping("keyword"))]);
 
         delete_by_keys(
             &client,
@@ -745,6 +1034,301 @@ mod tests {
             vec![json!({
                 "bool": {
                     "should": [{"bool": {"filter": [{"term": {"id": "ORDER-1024"}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// The reported bug (#13714) on the half `_id` addressing cannot reach: a chunked index's
+    /// delete filters on the key column, and a string column the runtime did not map exactly is
+    /// `text` — analyzed tokens an unanalyzed `term` never matches. Filtering on the column name
+    /// removed nothing and reported success; the delete must name the `keyword` multi-field that
+    /// holds the value itself.
+    #[tokio::test]
+    async fn a_text_mapped_key_column_is_filtered_on_its_keyword_sub_field() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": "ORDER-1024"}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+            "a `text`-mapped key column holds analyzed tokens, so the filter has to name the \
+             exact-match sub-field instead"
+        );
+    }
+
+    /// A `text` column with no exact sub-field cannot be filtered on at all. Issuing the filter
+    /// anyway is what made a delete of nothing look like a delete of everything asked for, so the
+    /// delete has to refuse — and refuse before issuing a request, not after.
+    #[tokio::test]
+    async fn a_key_column_with_no_exact_match_field_refuses_instead_of_deleting_nothing() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("text"))]);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("a key column with no exact-match field must fail the delete");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'id'") && message.contains("text"),
+            "the error must name the key column and how it is mapped, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued for a key the filter cannot address"
+        );
+    }
+
+    /// A key column the user declared non-filterable is mapped `index: false` — an exact type
+    /// that is searchable nowhere. Its documents are unreachable by any filter, so the delete has
+    /// to refuse rather than issue a `term` that cannot match.
+    #[tokio::test]
+    async fn an_unsearchable_key_column_refuses_despite_an_exact_type() {
+        let mut unsearchable = field_mapping("keyword");
+        unsearchable.index = Some(serde_json::Value::Bool(false));
+        let client = RecordingClient::mapped(vec![("id", unsearchable)]);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unsearchable key column must fail the delete");
+
+        assert!(err.to_string().contains("'id'"), "got: {err}");
+        assert!(client.queries().is_empty());
+    }
+
+    /// Elasticsearch maps a field the first time a document carries it, so a key column absent
+    /// from the mapping means no document holds it — a delete of rows the index does not have.
+    /// That is success with no request, not a refusal.
+    #[tokio::test]
+    async fn a_key_column_absent_from_the_mapping_issues_no_request() {
+        let client = RecordingClient::mapped(vec![("other", field_mapping("keyword"))]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("an index holding no such column has nothing to delete");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// The `keyword` multi-field dynamic mapping derives stops indexing past `ignore_above`, so a
+    /// longer key is stored but unreachable — the same silent no-op one layer down. The delete
+    /// has to say so rather than issue a filter that cannot match.
+    #[tokio::test]
+    async fn a_key_longer_than_ignore_above_refuses_rather_than_filtering_on_it() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let long_key = "x".repeat(257);
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(long_key.as_str())]),
+        )
+        .await
+        .expect_err("a key Elasticsearch never indexed must fail the delete");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ignore_above") && message.contains("id.keyword"),
+            "the error must name the limit and the field it applies to, got: {message}"
+        );
+        assert!(
+            client.queries().is_empty(),
+            "no _delete_by_query may be issued for a key the filter cannot address"
+        );
+    }
+
+    /// A key at the limit is indexed, so it must still be deleted — the refusal above is a
+    /// boundary, not a rounding-down of what the index holds.
+    #[tokio::test]
+    async fn a_key_exactly_at_ignore_above_is_still_deleted() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let key = "x".repeat(256);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(key.as_str())]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": key}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// `ignore_above` counts characters, not bytes, so a key of multi-byte characters that is
+    /// within the limit is indexed and must be deleted rather than refused.
+    #[tokio::test]
+    async fn a_multi_byte_key_within_ignore_above_is_measured_in_characters() {
+        let client = RecordingClient::mapped(vec![("id", dynamic_string_mapping())]);
+        let key = "é".repeat(200);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some(key.as_str())]),
+        )
+        .await
+        .expect("a 200-character key is inside a 256-character limit");
+
+        assert_eq!(client.queries().len(), 1);
+    }
+
+    /// An unreadable mapping leaves it unknown which field an exact-match filter has to name, and
+    /// filtering on the column name regardless is the silent no-op this addressing exists to
+    /// avoid. Report it instead — the callers log this rather than assuming the delete applied.
+    #[tokio::test]
+    async fn an_unreadable_mapping_fails_the_delete_rather_than_guessing() {
+        // No mapping configured, so the stub's `get_mapping` errors.
+        let client = RecordingClient::default();
+
+        let err = delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect_err("an unreadable mapping must fail the delete");
+
+        assert!(err.to_string().contains("could not be read"), "got: {err}");
+        assert!(client.queries().is_empty());
+    }
+
+    /// A numeric key column was never broken by the mapping gap — `long` is exact — so it must
+    /// keep being filtered on the column itself, with no sub-field detour.
+    #[tokio::test]
+    async fn a_numeric_key_column_is_filtered_on_the_column_itself() {
+        let client = RecordingClient::mapped(vec![("id", field_mapping("long"))]);
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let keys = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7_i64]))])
+            .expect("int key batch should build");
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Int64),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &keys,
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id": 7}}]}}],
+                    "minimum_should_match": 1
+                }
+            })],
+        );
+    }
+
+    /// `GET /<alias>/_mapping` keys its body by the concrete index the alias resolves to, not by
+    /// the name asked for, so the single entry is the one to read.
+    #[tokio::test]
+    async fn a_mapping_returned_under_another_index_name_is_still_read() {
+        let client = RecordingClient {
+            mapping: Some(mapping_of(
+                "idx-000001",
+                vec![("id", dynamic_string_mapping())],
+            )),
+            ..RecordingClient::default()
+        };
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[
+                pk("id", DataType::Utf8),
+                pk(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+            ],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1024")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({
+                "bool": {
+                    "should": [{"bool": {"filter": [{"term": {"id.keyword": "ORDER-1024"}}]}}],
                     "minimum_should_match": 1
                 }
             })],
@@ -1490,6 +2074,20 @@ mod tests {
         .expect("valid batch")
     }
 
+    /// The field paths a delete resolves for `columns` against an index that maps each of them
+    /// exactly — which is what the runtime's own mapping produces. These tests are about *which*
+    /// columns a query filters on, not about resolving the path to filter them on.
+    fn exact_paths(columns: &[String]) -> Vec<KeyFieldPath> {
+        columns
+            .iter()
+            .map(|column| KeyFieldPath {
+                column: column.clone(),
+                path: column.clone(),
+                ignore_above: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn document_key_columns_leaves_a_plain_primary_key_alone() {
         assert_eq!(document_key_columns(&[id_field()]), vec!["id".to_string()]);
@@ -1507,9 +2105,13 @@ mod tests {
     #[test]
     fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
         let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
-        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &base_keys(&[7]))
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query = build_or_of_row_term_queries(
+            "idx",
+            &exact_paths(&document_key_columns(&chunked)),
+            &base_keys(&[7]),
+        )
+        .expect("query builds")
+        .expect("non-empty batch produces a query");
 
         let clauses = query["bool"]["should"]
             .as_array()
@@ -1531,7 +2133,7 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
 
-        let err = build_or_of_row_term_queries(&full, &base_keys(&[7]))
+        let err = build_or_of_row_term_queries("idx", &exact_paths(&full), &base_keys(&[7]))
             .expect_err("the chunk id is not in the batch");
         assert!(
             err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
@@ -1552,9 +2154,13 @@ mod tests {
         )
         .expect("valid batch");
 
-        let query = build_or_of_row_term_queries(&document_key_columns(&chunked), &keys)
-            .expect("query builds")
-            .expect("non-empty batch produces a query");
+        let query = build_or_of_row_term_queries(
+            "idx",
+            &exact_paths(&document_key_columns(&chunked)),
+            &keys,
+        )
+        .expect("query builds")
+        .expect("non-empty batch produces a query");
 
         assert_eq!(
             query["bool"]["should"][0]["bool"]["filter"],
