@@ -37,9 +37,9 @@ use async_openai::types::chat::{
     CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, ReasoningEffort,
     ResponseFormat, ResponseFormatJsonSchema, Role, StopConfiguration, ToolChoiceOptions,
 };
+use futures::StreamExt;
 use serde_json::json;
 
-use super::Anthropic;
 use super::types::{
     AnthropicModelVariant, CacheControlEphemeral, ContentBlock, ContentParam, MessageCreateParams,
     MessageCreateResponse, MessageParam, MessageRole, MetadataParam, ResponseContentBlock,
@@ -47,6 +47,7 @@ use super::types::{
     ToolUseBlockParam, default_max_tokens, tool_from_completion_tools,
 };
 use super::types_stream::transform_stream;
+use super::{Anthropic, explain_model_not_found};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -69,7 +70,19 @@ impl Chat for Anthropic {
             .create_stream_byot(anth_req)
             .await?;
 
-        Ok(transform_stream(stream))
+        // A streaming request naming a model Anthropic does not serve still returns 200 from
+        // `create_stream_byot` and delivers the `not_found_error` as a stream item, so the
+        // explanation is mapped over the items rather than over this call — and upstream of
+        // `transform_stream`, which rewrites the error type its own way.
+        let model = self.model.clone();
+        let model_from_default = self.model_from_default;
+        let endpoint_from_default = self.endpoint_from_default;
+
+        Ok(transform_stream(Box::pin(stream.map(move |item| {
+            item.map_err(|e| {
+                explain_model_not_found(&model, model_from_default, endpoint_from_default, e)
+            })
+        }))))
     }
 
     async fn chat_request(
@@ -84,7 +97,15 @@ impl Chat for Anthropic {
             .path("/messages")
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
             .create_byot(anth_req)
-            .await?;
+            .await
+            .map_err(|e| {
+                explain_model_not_found(
+                    &self.model,
+                    self.model_from_default,
+                    self.endpoint_from_default,
+                    e,
+                )
+            })?;
 
         CreateChatCompletionResponse::try_from(inner_resp)
     }

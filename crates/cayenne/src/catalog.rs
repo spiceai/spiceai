@@ -836,7 +836,9 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
-    /// Get aggregate inline data size information for a table.
+    /// Get aggregate size information for a table's inline corpus AND its inline
+    /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
+    /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
