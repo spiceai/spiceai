@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
-use crate::accelerated::refresh_completion::RefreshCompletion;
+use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
 use crate::accelerated::refresh_task::RefreshTask;
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
@@ -1071,7 +1071,8 @@ impl Refresher {
                 select! {
                     () = scheduled_refresh_future => {
                         tracing::debug!("Starting scheduled refresh");
-                        if let Err(err) = start_refresh.send(None).await {
+                        let request_id = issue_refresh_request(refresh_completion.as_ref());
+                        if let Err(err) = start_refresh.send((request_id, None)).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
@@ -1085,12 +1086,17 @@ impl Refresher {
                             sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
                         }
 
-                        if let Err(err) = start_refresh.send(overrides_opt).await {
+                        // Numbered here rather than at the trigger: a caller
+                        // takes its waiter before triggering, so an id issued
+                        // now is one the waiter has not seen and a refresh
+                        // already running cannot claim.
+                        let request_id = issue_refresh_request(refresh_completion.as_ref());
+                        if let Err(err) = start_refresh.send((request_id, overrides_opt)).await {
                             tracing::error!("Failed to execute refresh: {err}");
                         }
                     },
-                    Some(res) = on_refresh_complete.recv() => {
-                        tracing::debug!("Received refresh task completion callback: {res:?}");
+                    Some((request_id, res)) = on_refresh_complete.recv() => {
+                        tracing::debug!("Received refresh task completion callback for request {request_id}: {res:?}");
 
                         let refresh_succeeded = matches!(&res, Ok(()));
                         // A retention failure can happen after a successful write, so cached
@@ -1104,7 +1110,7 @@ impl Refresher {
                             // this way (`RefreshTask::signal_dataset_ready`).
                             initial_load_completed.store(true, Ordering::Relaxed);
                             if let Some(refresh_completion) = &refresh_completion {
-                                record_refresh_done(&dataset_name, &refresh, refresh_completion).await;
+                                record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
                             }
                         }
 
@@ -1270,14 +1276,24 @@ fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
     )
 }
 
-/// Records a completed refresh: releases the callers waiting on it, then
-/// publishes the refresh-time metric.
+/// Numbers a refresh about to be requested, so its completion can be told from
+/// that of a refresh already running.
+///
+/// A table with no completion signal has nobody waiting on it, so the id is
+/// unused and any value will do.
+fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> RefreshRequestId {
+    refresh_completion.map_or(0, RefreshCompletion::issue)
+}
+
+/// Records a completed refresh under the request that started it: releases the
+/// callers waiting on that request, then publishes the refresh-time metric.
 async fn record_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
     refresh_completion: &RefreshCompletion,
+    request_id: RefreshRequestId,
 ) {
-    refresh_completion.record();
+    refresh_completion.record(request_id);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1516,6 +1532,59 @@ mod tests {
             trigger,
             refresh_handle,
         )
+    }
+
+    /// Poll the request counter rather than sleeping, so a waiter taken after
+    /// this is taken while the triggered refresh is in flight.
+    async fn await_request_issued(refresh_completion: &RefreshCompletion) {
+        timeout(Duration::from_secs(5), async {
+            while refresh_completion.issued_requests() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresher requests the refresh it was triggered for");
+    }
+
+    /// Regression test for #13544. A refresh that was already requested when a
+    /// waiter was taken must not answer it: on the partition-assignment path
+    /// that completion acked `PartitionsLoaded` for partitions the refresh
+    /// carrying their filters had not yet loaded, so the scheduler routed
+    /// queries to an executor that answered them incompletely.
+    ///
+    /// Both halves are asserted from one refresher, because the property is a
+    /// pair: the in-flight refresh must not answer, and the next one must.
+    #[tokio::test]
+    async fn test_a_refresh_already_requested_does_not_answer_a_later_waiter() {
+        let (refresher, refresh_completion, trigger, refresh_handle) =
+            started_full_refresher(status::RuntimeStatus::new()).await;
+
+        trigger.send(None).await.expect("trigger is accepted");
+        await_request_issued(&refresh_completion).await;
+
+        // Independent waiters, both taken with the first refresh in flight: one
+        // to prove that refresh does not answer them, one left to be answered by
+        // the refresh triggered afterwards.
+        let in_flight_waiter = refresh_completion.next();
+        let next_request_waiter = refresh_completion.next();
+        assert_eq!(
+            refresh_completion.completed_requests(),
+            0,
+            "the first refresh completed before the waiters were taken, so this run raced past the interleaving it exists to cover"
+        );
+
+        await_initial_load(&refresher).await;
+
+        let _ = timeout(Duration::from_millis(500), in_flight_waiter.wait())
+            .await
+            .expect_err("a refresh requested before the waiter was taken must not answer it");
+
+        trigger.send(None).await.expect("trigger is accepted");
+        timeout(Duration::from_secs(5), next_request_waiter.wait())
+            .await
+            .expect("the refresh requested after the waiter must answer it");
+
+        drop(refresh_handle);
     }
 
     /// Poll `initial_load_completed` rather than sleeping, so the refresh is

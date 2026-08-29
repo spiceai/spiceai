@@ -2603,7 +2603,7 @@ mod tests {
             let waiter = completion.any();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                completion.record();
+                completion.record_untriggered();
             });
 
             let started = tokio::time::Instant::now();
@@ -2630,7 +2630,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_completion_that_predates_the_wait_ends_it_immediately() {
             let completion = RefreshCompletion::new();
-            completion.record();
+            completion.record_untriggered();
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
@@ -2712,7 +2712,7 @@ mod tests {
             let completion = RefreshCompletion::new();
             let waiter = completion.any();
             let records_then_reports_unloaded = move || {
-                completion.record();
+                completion.record_untriggered();
                 false
             };
 
