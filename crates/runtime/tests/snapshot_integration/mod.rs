@@ -621,6 +621,49 @@ fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+/// Appends `count` copies of the CSV's last data row, growing the source without
+/// changing its schema so a rebuild from the source is distinguishable from a
+/// restore of a snapshot taken before those rows existed.
+async fn grow_csv_source(path: &Path, count: usize) -> Result<()> {
+    let mut contents = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("Reading dataset source {}", path.display()))?;
+    let last_row = contents
+        .lines()
+        .last()
+        .ok_or_else(|| anyhow!("Dataset source {} has no rows to duplicate", path.display()))?
+        .to_string();
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    for _ in 0..count {
+        contents.push_str(&last_row);
+        contents.push('\n');
+    }
+    fs::write(path, contents)
+        .await
+        .with_context(|| format!("Growing dataset source {}", path.display()))
+}
+
+async fn count_rows(runtime: &Arc<Runtime>) -> Result<i64> {
+    let batches = run_query(
+        runtime,
+        &format!("SELECT COUNT(*) FROM {TAXI_TRIPS_DATASET_NAME}"),
+    )
+    .await
+    .context("Counting rows in the accelerated dataset")?;
+
+    batches
+        .first()
+        .filter(|batch| batch.num_rows() > 0)
+        .ok_or_else(|| anyhow!("COUNT(*) returned no rows: {batches:?}"))?
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .map(|counts| counts.value(0))
+        .ok_or_else(|| anyhow!("COUNT(*) column is not a BIGINT"))
+}
+
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
@@ -1859,7 +1902,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1867,7 +1910,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1875,7 +1918,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1883,7 +1926,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -1981,7 +2024,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1989,7 +2032,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1997,7 +2040,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -2014,6 +2057,118 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 
             runtime.shutdown().await;
             context.cleanup().await
+        })
+        .await
+}
+
+/// Rows appended to the source between the two arms of
+/// `snapshot_int_test14_file_create_skips_snapshot_bootstrap`, which is what makes a
+/// bootstrap and a rebuild-from-source land on different row counts.
+#[cfg(feature = "duckdb")]
+const FILE_CREATE_EXTRA_ROWS: usize = 5;
+
+/// `mode: file_create` must not bootstrap the snapshot it just discarded.
+///
+/// `file_create` snapshots the outgoing acceleration and deletes it so the next
+/// refresh rebuilds from the source. Bootstrapping the snapshot back would
+/// restore the data and the stored schema the operator asked to drop, leaving
+/// the mode with no effect (fixes #13005).
+///
+/// The first arm establishes the counterfactual: with `mode: file` the very same
+/// snapshot is bootstrapped, and because the restored acceleration carries its
+/// checkpoint, `refresh_on_startup: auto` skips the startup refresh. The second
+/// arm grows the source and switches to `file_create`, so a bootstrap and a
+/// rebuild-from-source produce different row counts.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test14_file_create_skips_snapshot_bootstrap() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            let fixture = prepare_duckdb_fixture("snapshot_int_test14").await?;
+            let source_path = PathBuf::from(
+                fixture
+                    .dataset_from
+                    .strip_prefix("file://")
+                    .ok_or_else(|| {
+                        anyhow!("Dataset source is not a file:// URI: {}", fixture.dataset_from)
+                    })?,
+            );
+
+            remove_existing_local_files(&fixture.local_db_path);
+
+            let snapshot_rows = {
+                let dataset = fixture.dataset(
+                    DatasetSnapshotBehavior::Enabled,
+                    RefreshOnStartup::Auto,
+                    &[],
+                    &[],
+                );
+                let app = AppBuilder::new("snapshot_int_test14_file")
+                    .with_snapshots(fixture.snapshots_config(BootstrapOnFailureBehavior::Warn))
+                    .with_dataset(dataset)
+                    .build();
+
+                configure_test_datafusion();
+
+                let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+                load_runtime(Arc::clone(&runtime)).await?;
+                let rows = count_rows(&runtime)
+                    .await
+                    .context("Counting rows bootstrapped by mode: file")?;
+                runtime.shutdown().await;
+                rows
+            };
+            assert!(
+                snapshot_rows > 0,
+                "mode: file should have bootstrapped the fixture's snapshot, but the dataset is empty"
+            );
+            assert!(
+                fixture.local_db_path.exists(),
+                "mode: file should have restored the acceleration file from the snapshot"
+            );
+
+            // Grow the source so restoring the snapshot and rebuilding from the
+            // source no longer agree on the row count.
+            grow_csv_source(&source_path, FILE_CREATE_EXTRA_ROWS)
+                .await
+                .context("Growing the dataset source before the file_create restart")?;
+
+            let mut dataset = fixture.dataset(
+                DatasetSnapshotBehavior::Enabled,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
+            );
+            dataset
+                .acceleration
+                .as_mut()
+                .ok_or_else(|| anyhow!("Fixture dataset is missing its acceleration"))?
+                .mode = Mode::FileCreate;
+
+            let app = AppBuilder::new("snapshot_int_test14_file_create")
+                .with_snapshots(fixture.snapshots_config(BootstrapOnFailureBehavior::Warn))
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+            let rebuilt_rows = count_rows(&runtime)
+                .await
+                .context("Counting rows after the file_create restart")?;
+            runtime.shutdown().await;
+
+            assert_eq!(
+                rebuilt_rows,
+                snapshot_rows + i64::try_from(FILE_CREATE_EXTRA_ROWS)?,
+                "file_create should have rebuilt the acceleration from the grown source; \
+                 {snapshot_rows} rows means the snapshot it deleted was bootstrapped back"
+            );
+
+            fixture.cleanup().await
         })
         .await
 }

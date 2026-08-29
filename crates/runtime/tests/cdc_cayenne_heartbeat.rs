@@ -35,6 +35,12 @@ limitations under the License.
 #![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -58,12 +64,13 @@ use datafusion_table_providers::util::{
 };
 use futures::StreamExt;
 use runtime::accelerated::refresh::Refresh;
+use runtime::accelerated::refresh_completion::RefreshCompletion;
 use runtime::accelerated::refresh_task::RefreshTaskBuilder;
 use runtime::federated::FederatedTable;
 use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex as TokioMutex, Notify, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /// All-nullable data schema, matching what CDC sources produce (and what the
 /// heartbeat envelope normalizes to), so heartbeats and change batches share
@@ -238,33 +245,29 @@ async fn heartbeat_must_not_force_mem_tier_checkpoint_or_ack_deferred_commits() 
 
     let commits: Arc<TokioMutex<Vec<i64>>> = Arc::new(TokioMutex::new(Vec::new()));
     let initial_load = Arc::new(AtomicBool::new(false));
-    let ready_notify = Arc::new(Notify::new());
+    let refresh_completion = RefreshCompletion::new();
+    // Taken before the stream runs: the waiter is level-triggered, so a ready
+    // signal landing before the assertion below still resolves it.
+    let ready_waiter = refresh_completion.next();
 
     // Channel-driven stream so envelope timing is under test control.
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<ChangeEnvelope, StreamError>>();
 
     let stream_task = {
-        let notify = Arc::clone(&ready_notify);
+        let completion = refresh_completion.clone();
         let load = Arc::clone(&initial_load);
         let refresh = Arc::new(RwLock::new(Refresh::default()));
         tokio::spawn(async move {
-            task.start_changes_stream(refresh, rx.boxed(), None, Some(notify), load)
+            task.start_changes_stream(refresh, rx.boxed(), None, Some(completion), load)
                 .await
         })
     };
 
-    // Subscribe to the ready notification BEFORE the heartbeat is sent so the
-    // notify_waiters signal cannot be missed.
-    let ready_seen = {
-        let notify = Arc::clone(&ready_notify);
-        tokio::spawn(async move {
-            let waiter = notify.notified();
-            tokio::pin!(waiter);
-            tokio::time::timeout(Duration::from_secs(10), &mut waiter)
-                .await
-                .is_ok()
-        })
-    };
+    let ready_seen = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), ready_waiter.wait())
+            .await
+            .is_ok()
+    });
     tokio::task::yield_now().await;
 
     // 1. A real change lands in the mem tier; its committer is DEFERRED

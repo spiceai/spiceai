@@ -28,6 +28,7 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 opentelemetry.workspace = true
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 telemetry = { path = "../telemetry" }
@@ -42,7 +43,7 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tar = "0.4"
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
 url.workspace = true
@@ -56,6 +57,8 @@ duckdb = ["dep:duckdb"]
 openapi = ["dep:utoipa"]
 snapshots = []
 sqlite = ["dep:rusqlite"]
+# An `AccelerationSource` the engine crates can build in their own tests.
+test-support = []
 turso = ["dep:turso"]
 
 [dev-dependencies]

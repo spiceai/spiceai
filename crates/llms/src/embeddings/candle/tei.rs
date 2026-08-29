@@ -22,7 +22,7 @@ use std::{
 
 use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-    candle::util::link_files_into_tmp_dir, encode_embedding,
+    candle::util::link_files_into_tmp_dir_blocking, encode_embedding,
 };
 use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
@@ -37,13 +37,12 @@ use tei_core::{
     TextEmbeddingsError,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
-    tokenization::{EncodingInput, Tokenization},
+    tokenization::EncodingInput,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
 use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,
-    max_seq_length_from_st_config, pool_from_str, position_offset,
+    LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
 };
 
 #[derive(Debug)]
@@ -88,7 +87,7 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files)?;
+        let model_root = link_files_into_tmp_dir_blocking(files).await?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root
@@ -152,35 +151,13 @@ impl TeiEmbed {
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let tokenizer = load_tokenizer(root)?;
-        let config = load_config(root)?;
-
-        // Load [`Tokenization`]
-        let position_offset = position_offset(&config);
-
-        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
-            max_seq_length
-        } else {
-            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
-            match max_seq_length_from_st_config(root) {
-                Ok(max_seq_length_opt) => {
-                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
-                    config.max_position_embeddings - position_offset
-                }
-            }
-        };
-
-        let token = Tokenization::new(
-            1,
-            tokenizer.clone(),
-            max_input_length,
-            position_offset,
-            None,
-            None,
-        );
+        // Reads config.json / the sentence-transformers config and parses
+        // tokenizer.json on a blocking thread (see `load_tokenization`).
+        let LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization: token,
+        } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174

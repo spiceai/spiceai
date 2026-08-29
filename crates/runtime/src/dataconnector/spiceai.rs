@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
+use app::App;
 use std::any::Any;
 use std::borrow::Borrow;
 use std::future::Future;
@@ -50,9 +52,11 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
+use arrow_tools::map_entries::StreamNormalizer;
 use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
+    CommitError,
 };
 use data_components::flight::{FlightFactory, FlightTable};
 use data_components::{Read, ReadWrite};
@@ -381,10 +385,11 @@ impl DataConnectorFactory for SpiceAIFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let url = get_endpoint(&params)?;
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
@@ -444,7 +449,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                     .await
                     .context(UnableToCreateFlightClientSnafu)?;
 
-            flight_client = configure_max_message_size(flight_client, &params)?;
+            flight_client = configure_max_message_size(flight_client, &context.app())?;
 
             let flight_factory = FlightFactory::new(
                 "spice.ai",
@@ -466,12 +471,8 @@ impl DataConnectorFactory for SpiceAIFactory {
 }
 
 /// Configures flight client's message size based on app parameters
-fn configure_max_message_size(
-    mut flight_client: FlightClient,
-    params: &ConnectorParams,
-) -> Result<FlightClient> {
-    if let Some(app) = params.app()
-        && let Some(flight) = app.runtime.flight.as_ref()
+fn configure_max_message_size(mut flight_client: FlightClient, app: &App) -> Result<FlightClient> {
+    if let Some(flight) = app.runtime.flight.as_ref()
         && let Some(max_message_size) =
             flight
                 .max_message_size_bytes()
@@ -493,7 +494,8 @@ impl DataConnector for SpiceAI {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -535,7 +537,8 @@ impl DataConnector for SpiceAI {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -567,10 +570,12 @@ impl DataConnector for SpiceAI {
         false
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }
@@ -620,7 +625,7 @@ impl SpiceAI {
     ///
     /// Spice AI datasets have the following format for `dataset.path()`:
     /// `<org>/<app>/datasets/<dataset_name>`.
-    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
+    fn spice_dataset_path<T: Borrow<DatasetSpec>>(dataset: T) -> Result<SpiceAIDatasetPath> {
         let dataset = dataset.borrow();
         let path = dataset.path();
         if is_flight_endpoint_path(path) {
@@ -655,6 +660,10 @@ pub fn subscribe_to_append_stream(
     table_reference: String,
 ) -> impl Stream<Item = Result<ChangeEnvelope, cdc::StreamError>> {
     stream! {
+        // The subscription carries one schema per stream, so the normalizer is resolved from the
+        // first batch and reused for the rest. Without it an accelerated dataset that started on
+        // the conformed scan schema would ingest the producer's non-conforming MAP declaration.
+        let mut normalizer = StreamNormalizer::new();
         match client.subscribe(&table_reference).await {
             Ok(mut stream) => {
                 while let Some(decoded_data) = stream.next().await {
@@ -662,6 +671,20 @@ pub fn subscribe_to_append_stream(
                         Ok(decoded_data) => match decoded_data.payload {
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
+                                let batch = match normalizer.normalize(batch) {
+                                    Ok(batch) => batch,
+                                    Err(source) => {
+                                        yield Err(cdc::StreamError::Arrow(format!(
+                                            "Failed to read the change stream from Arrow Flight for dataset '{table_reference}' ({source}), so the dataset stops receiving updates. Remove the null map entries at the source, or expose the column as a string with `to_json(<column>)`. See: https://spiceai.org/docs/components/data-connectors"
+                                        )));
+                                        // End the subscription rather than resuming it. The CDC
+                                        // apply loop keeps running after a fatal stream error, so
+                                        // a resumed subscription would apply every later envelope
+                                        // on top of the change this one dropped and leave the
+                                        // acceleration permanently diverged from its source.
+                                        break;
+                                    }
+                                };
                                 match ChangeBatch::try_new(batch).map(|rb| {
                                     ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
@@ -738,7 +761,6 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: None,
             io_runtime: Handle::current(),
         }
     }
@@ -863,7 +885,8 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-            let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
+            let dataset_path =
+                SpiceAI::spice_dataset_path(&dataset.spec).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }
     }

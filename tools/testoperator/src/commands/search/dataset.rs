@@ -26,6 +26,7 @@ use test_framework::{
     spicetest::search::{SearchConfig, SearchResult},
 };
 
+use super::harness;
 use super::mteb::{self, MtebRepo};
 
 const QUORA_RETRIEVAL_REPOSITORY: MtebRepo =
@@ -42,15 +43,37 @@ const TOUCHE2020_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
     "mteb/touche2020",
     &["corpus/corpus/0000.parquet", "corpus/corpus/0001.parquet"],
 );
+const MSMARCO_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
+    "mteb/msmarco",
+    &[
+        "corpus/corpus/0000.parquet",
+        "corpus/corpus/0001.parquet",
+        "corpus/corpus/0002.parquet",
+        "corpus/corpus/0003.parquet",
+        "corpus/corpus/0004.parquet",
+        "corpus/corpus/0005.parquet",
+        "corpus/corpus/0006.parquet",
+    ],
+);
+const STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/stackoverflow-qa");
 
-/// The search benchmark dataset to run against. Each variant owns its own dataset
-/// preparation, search-config construction, relevance-judgment loading, and result
-/// transform, so adding a new dataset means adding a variant here rather than
-/// threading a new string through `search/mod.rs`.
+/// The search dataset to run against. Each built-in variant owns its own MTEB data preparation,
+/// while `Custom` tests a customer-supplied spicepod as-is. Search-config construction,
+/// relevance-judgment loading, and result mapping are shared by [`harness`], since every run
+/// exposes the same fixed `corpus`/`test_queries`/`relevance_data` schema (each of which may be a
+/// dataset or a view in a custom spicepod).
+pub(crate) enum SearchDataset {
+    Builtin(BuiltinDataset),
+    /// A customer-supplied spicepod. No MTEB data is downloaded: the harness tests whatever the
+    /// `--spicepod-path` spicepod defines for `corpus`, `test_queries`, and `relevance_data`.
+    Custom,
+}
+
+/// A built-in MTEB retrieval benchmark dataset.
 // The shared `Retrieval` suffix names the MTEB task type and mirrors each variant's
 // `*_retrieval` name, so it is intentional rather than a redundant repeated affix.
 #[expect(clippy::enum_variant_names)]
-pub(crate) enum SearchDataset {
+pub(crate) enum BuiltinDataset {
     QuoraRetrieval,
     MiraclEnRetrieval,
     FiqaRetrieval,
@@ -60,20 +83,67 @@ pub(crate) enum SearchDataset {
     ScifactRetrieval,
     NfcorpusRetrieval,
     Touche2020Retrieval,
+    MsmarcoRetrieval,
+    StackoverflowQaRetrieval,
 }
 
-impl From<SearchDatasetArg> for SearchDataset {
+impl From<Option<SearchDatasetArg>> for SearchDataset {
+    fn from(arg: Option<SearchDatasetArg>) -> Self {
+        match arg {
+            None => SearchDataset::Custom,
+            Some(arg) => SearchDataset::Builtin(BuiltinDataset::from(arg)),
+        }
+    }
+}
+
+impl From<SearchDatasetArg> for BuiltinDataset {
     fn from(arg: SearchDatasetArg) -> Self {
         match arg {
-            SearchDatasetArg::QuoraRetrieval => SearchDataset::QuoraRetrieval,
-            SearchDatasetArg::MiraclEnRetrieval => SearchDataset::MiraclEnRetrieval,
-            SearchDatasetArg::FiqaRetrieval => SearchDataset::FiqaRetrieval,
-            SearchDatasetArg::TrecCovidRetrieval => SearchDataset::TrecCovidRetrieval,
-            SearchDatasetArg::ArguanaRetrieval => SearchDataset::ArguanaRetrieval,
-            SearchDatasetArg::ScidocsRetrieval => SearchDataset::ScidocsRetrieval,
-            SearchDatasetArg::ScifactRetrieval => SearchDataset::ScifactRetrieval,
-            SearchDatasetArg::NfcorpusRetrieval => SearchDataset::NfcorpusRetrieval,
-            SearchDatasetArg::Touche2020Retrieval => SearchDataset::Touche2020Retrieval,
+            SearchDatasetArg::QuoraRetrieval => BuiltinDataset::QuoraRetrieval,
+            SearchDatasetArg::MiraclEnRetrieval => BuiltinDataset::MiraclEnRetrieval,
+            SearchDatasetArg::FiqaRetrieval => BuiltinDataset::FiqaRetrieval,
+            SearchDatasetArg::TrecCovidRetrieval => BuiltinDataset::TrecCovidRetrieval,
+            SearchDatasetArg::ArguanaRetrieval => BuiltinDataset::ArguanaRetrieval,
+            SearchDatasetArg::ScidocsRetrieval => BuiltinDataset::ScidocsRetrieval,
+            SearchDatasetArg::ScifactRetrieval => BuiltinDataset::ScifactRetrieval,
+            SearchDatasetArg::NfcorpusRetrieval => BuiltinDataset::NfcorpusRetrieval,
+            SearchDatasetArg::Touche2020Retrieval => BuiltinDataset::Touche2020Retrieval,
+            SearchDatasetArg::MsmarcoRetrieval => BuiltinDataset::MsmarcoRetrieval,
+            SearchDatasetArg::StackoverflowQaRetrieval => BuiltinDataset::StackoverflowQaRetrieval,
+        }
+    }
+}
+
+impl BuiltinDataset {
+    fn repository(&self) -> &'static MtebRepo {
+        match self {
+            BuiltinDataset::QuoraRetrieval => &QUORA_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::MiraclEnRetrieval => &MIRACL_EN_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::FiqaRetrieval => &FIQA_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::TrecCovidRetrieval => &TREC_COVID_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::ArguanaRetrieval => &ARGUANA_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::ScidocsRetrieval => &SCIDOCS_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::ScifactRetrieval => &SCIFACT_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::NfcorpusRetrieval => &NFCORPUS_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::Touche2020Retrieval => &TOUCHE2020_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::MsmarcoRetrieval => &MSMARCO_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::StackoverflowQaRetrieval => &STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            BuiltinDataset::QuoraRetrieval => "quora_retrieval",
+            BuiltinDataset::MiraclEnRetrieval => "miracl_en_retrieval",
+            BuiltinDataset::FiqaRetrieval => "fiqa_retrieval",
+            BuiltinDataset::TrecCovidRetrieval => "trec_covid_retrieval",
+            BuiltinDataset::ArguanaRetrieval => "arguana_retrieval",
+            BuiltinDataset::ScidocsRetrieval => "scidocs_retrieval",
+            BuiltinDataset::ScifactRetrieval => "scifact_retrieval",
+            BuiltinDataset::NfcorpusRetrieval => "nfcorpus_retrieval",
+            BuiltinDataset::Touche2020Retrieval => "touche2020_retrieval",
+            BuiltinDataset::MsmarcoRetrieval => "msmarco_retrieval",
+            BuiltinDataset::StackoverflowQaRetrieval => "stackoverflow_qa_retrieval",
         }
     }
 }
@@ -81,31 +151,19 @@ impl From<SearchDatasetArg> for SearchDataset {
 impl SearchDataset {
     pub(crate) fn name(&self) -> &'static str {
         match self {
-            SearchDataset::QuoraRetrieval => "quora_retrieval",
-            SearchDataset::MiraclEnRetrieval => "miracl_en_retrieval",
-            SearchDataset::FiqaRetrieval => "fiqa_retrieval",
-            SearchDataset::TrecCovidRetrieval => "trec_covid_retrieval",
-            SearchDataset::ArguanaRetrieval => "arguana_retrieval",
-            SearchDataset::ScidocsRetrieval => "scidocs_retrieval",
-            SearchDataset::ScifactRetrieval => "scifact_retrieval",
-            SearchDataset::NfcorpusRetrieval => "nfcorpus_retrieval",
-            SearchDataset::Touche2020Retrieval => "touche2020_retrieval",
+            SearchDataset::Builtin(dataset) => dataset.name(),
+            SearchDataset::Custom => "custom",
         }
     }
 
     pub(crate) async fn prepare(&self, spicepod_dir: &Path) -> anyhow::Result<()> {
-        let dataset = match self {
-            SearchDataset::QuoraRetrieval => &QUORA_RETRIEVAL_REPOSITORY,
-            SearchDataset::MiraclEnRetrieval => &MIRACL_EN_RETRIEVAL_REPOSITORY,
-            SearchDataset::FiqaRetrieval => &FIQA_RETRIEVAL_REPOSITORY,
-            SearchDataset::TrecCovidRetrieval => &TREC_COVID_RETRIEVAL_REPOSITORY,
-            SearchDataset::ArguanaRetrieval => &ARGUANA_RETRIEVAL_REPOSITORY,
-            SearchDataset::ScidocsRetrieval => &SCIDOCS_RETRIEVAL_REPOSITORY,
-            SearchDataset::ScifactRetrieval => &SCIFACT_RETRIEVAL_REPOSITORY,
-            SearchDataset::NfcorpusRetrieval => &NFCORPUS_RETRIEVAL_REPOSITORY,
-            SearchDataset::Touche2020Retrieval => &TOUCHE2020_RETRIEVAL_REPOSITORY,
-        };
-        mteb::prepare_dataset(dataset, spicepod_dir).await
+        match self {
+            // A custom run tests the user's spicepod as-is, so there is nothing to download.
+            SearchDataset::Custom => Ok(()),
+            SearchDataset::Builtin(dataset) => {
+                mteb::prepare_dataset(dataset.repository(), spicepod_dir).await
+            }
+        }
     }
 
     pub(crate) async fn init_search_config(
@@ -113,40 +171,16 @@ impl SearchDataset {
         spiced_instance: &SpicedInstance,
         search_limit: Option<usize>,
     ) -> anyhow::Result<SearchConfig> {
-        // Every MTEB dataset exposes the same `_id`/`text` query columns, so the shared loader
-        // builds the search config for all variants.
-        match self {
-            SearchDataset::QuoraRetrieval
-            | SearchDataset::MiraclEnRetrieval
-            | SearchDataset::FiqaRetrieval
-            | SearchDataset::TrecCovidRetrieval
-            | SearchDataset::ArguanaRetrieval
-            | SearchDataset::ScidocsRetrieval
-            | SearchDataset::ScifactRetrieval
-            | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => {
-                mteb::init_search_config(spiced_instance, search_limit).await
-            }
-        }
+        // Both built-in and custom runs expose `test_queries` with `_id`/`text`, so the shared
+        // loader builds the search config for either.
+        harness::init_search_config(spiced_instance, search_limit).await
     }
 
     pub(crate) async fn query_relevance_data(
         &self,
         spiced_instance: &SpicedInstance,
     ) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
-        match self {
-            SearchDataset::QuoraRetrieval
-            | SearchDataset::MiraclEnRetrieval
-            | SearchDataset::FiqaRetrieval
-            | SearchDataset::TrecCovidRetrieval
-            | SearchDataset::ArguanaRetrieval
-            | SearchDataset::ScidocsRetrieval
-            | SearchDataset::ScifactRetrieval
-            | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => {
-                mteb::get_query_relevance_data(spiced_instance).await
-            }
-        }
+        harness::get_query_relevance_data(spiced_instance).await
     }
 
     pub(crate) fn transform_results(
@@ -154,15 +188,30 @@ impl SearchDataset {
         search: &BTreeMap<String, SearchResult>,
     ) -> HashMap<String, HashMap<String, f64>> {
         match self {
-            SearchDataset::QuoraRetrieval
-            | SearchDataset::MiraclEnRetrieval
-            | SearchDataset::FiqaRetrieval
-            | SearchDataset::TrecCovidRetrieval
-            | SearchDataset::ArguanaRetrieval
-            | SearchDataset::ScidocsRetrieval
-            | SearchDataset::ScifactRetrieval
-            | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => mteb::transform_search_results_for_eval(search),
+            // Every built-in MTEB corpus declares `row_id: [_id]`, so the corpus id is the `_id`
+            // primary-key field.
+            SearchDataset::Builtin(_) => harness::transform_search_results_for_eval(search),
+            // A custom corpus names its own `row_id` column, so read the sole primary-key field.
+            SearchDataset::Custom => harness::transform_custom_search_results_for_eval(search),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SearchDataset, SearchDatasetArg};
+
+    #[test]
+    fn none_arg_maps_to_custom_run() {
+        let dataset = SearchDataset::from(None);
+        assert!(matches!(dataset, SearchDataset::Custom));
+        assert_eq!(dataset.name(), "custom");
+    }
+
+    #[test]
+    fn some_arg_maps_to_named_builtin() {
+        let dataset = SearchDataset::from(Some(SearchDatasetArg::FiqaRetrieval));
+        assert!(matches!(dataset, SearchDataset::Builtin(_)));
+        assert_eq!(dataset.name(), "fiqa_retrieval");
     }
 }

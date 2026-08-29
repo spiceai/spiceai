@@ -21,7 +21,7 @@ limitations under the License.
 //! and confirm that the HNSW index exists on the correct underlying table.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use app::AppBuilder;
@@ -40,15 +40,10 @@ use spicepod::component::view::View;
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use spicepod::vector::VectorStore;
-use tokio::sync::Mutex;
 
 use crate::models::create_api_bindings_config;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
-
-/// Serializes HNSW tests because `Runtime::shutdown()` calls `unregister_all()`,
-/// which clears the global connector registry and breaks parallel tests.
-static HNSW_TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn cleanup_db_path(db_path: &str) {
     for suffix in ["", ".wal"] {
@@ -145,7 +140,7 @@ async fn refresh_table(rt: &Arc<Runtime>, table_name: &str) -> Result<(), anyhow
         .await?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("No refresh notifier returned for {table_name}"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }
@@ -208,7 +203,6 @@ async fn query_native_duckdb_indexes(
 /// internal data table.
 #[tokio::test]
 async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Error> {
-    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));
@@ -296,7 +290,6 @@ async fn test_hnsw_index_created_after_full_refresh() -> Result<(), anyhow::Erro
 /// Uses a local JSONL file (with a `created_at` timestamp for `time_column`).
 #[tokio::test]
 async fn test_hnsw_index_created_after_append_refresh() -> Result<(), anyhow::Error> {
-    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));
@@ -372,7 +365,6 @@ async fn test_hnsw_index_created_after_append_refresh() -> Result<(), anyhow::Er
 /// Verifies HNSW index survives multiple consecutive full refreshes.
 #[tokio::test]
 async fn test_hnsw_index_survives_multiple_refreshes() -> Result<(), anyhow::Error> {
-    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));
@@ -486,7 +478,6 @@ fn hnsw_view(view_name: &str, source_ds: &str, db_path: &str) -> View {
 /// and survives a full (overwrite) refresh.
 #[tokio::test]
 async fn test_hnsw_index_on_view_created_after_full_refresh() -> Result<(), anyhow::Error> {
-    let _test_lock = HNSW_TEST_MUTEX.lock().await;
     let _tracing = init_tracing(Some(
         "integration_models=debug,runtime=debug,search=debug,info",
     ));

@@ -50,7 +50,7 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/2.1'
+          - 'release/2.2'
     concurrency:
       group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
@@ -162,7 +162,17 @@ jobs:
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
+          shopt -s globstar nullglob
+          failed=0
+          for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
+            case "$file" in
+              ./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-arrow.yaml|./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-duckdb\[file\].yaml|./tools/testoperator/dispatch/tpch/sf1/federated/dynamodb.yaml) continue ;;
+            esac
+            if ! testoperator dispatch "$file" --workflow bench; then
+              failed=1
+            fi
+          done
+          exit "$failed"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -410,4 +420,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
-

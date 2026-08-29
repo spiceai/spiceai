@@ -39,6 +39,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::prepared_statement_query::{
     PreparedStatement, decode_param_values, encode_single_row_parameters, error_to_status,
+    param_error_to_status,
 };
 
 /// Static schema for `affected_rows` result to avoid allocation on each request.
@@ -114,7 +115,7 @@ pub(crate) async fn do_get(
         parameter_schema: _,
     } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
 
-    let parameters = decode_param_values(&parameters).map_err(error_to_status)?;
+    let parameters = decode_param_values(&parameters).map_err(param_error_to_status)?;
 
     // Execute through the standard query path, which handles DELETE and UPDATE
     // via the runtime's DML interception in Query::run().
@@ -181,6 +182,7 @@ pub(crate) async fn do_put_update(
     query: CommandPreparedStatementUpdate,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let _start = metrics::track_flight_request("do_put", Some("prepared_statement_update")).await;
     let streaming_flight = streaming_flight
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
 

@@ -23,20 +23,58 @@ use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRe
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
-/// The type rewrites Cayenne always applies when it creates a table, because Vortex
-/// cannot represent the incoming type.
+/// The type rewrites Cayenne applies when it creates a table, because Vortex cannot
+/// represent the incoming type.
 ///
-/// This is the definition [`transform_schema_for_vortex`] itself applies, published so
-/// callers that need only the always-applied part — the acceleration write path, which
-/// must tell an engine-imposed type from a schema that has genuinely drifted — can reuse
-/// it without the unsupported-type handling.
+/// This is what [`transform_schema_for_vortex`] applies. It is deliberately narrower
+/// than [`CAYENNE_TYPE_REWRITE_RULES`]: a rewrite belongs here only while the engine
+/// still performs it.
+static CAYENNE_CREATION_REWRITE_RULES: TypeRewriteRules = &[&Float16ToFloat32];
+
+/// The stored types the acceleration write path must recognize as Cayenne's own, so it
+/// can tell a type the engine produced from a schema that has genuinely drifted.
+///
+/// This is a superset of [`CAYENNE_CREATION_REWRITE_RULES`], because a table keeps the
+/// types it was created with. [`TimestampToMicrosecond`] is here and *not* in the
+/// creation rules: Cayenne once normalized every timestamp to microseconds, and a table
+/// created then still stores microseconds even though a table created now keeps its
+/// source's unit. Without it, an existing microsecond table fed by a nanosecond source
+/// — every `PostgreSQL` `timestamptz`, which infers as `Timestamp(ns, "UTC")` — reads as
+/// an incompatible schema change on the first batch after upgrade, which stops CDC
+/// replication under `on_schema_change: fail` for a schema that never changed.
+///
+/// The list is accelerator-wide, so it cannot tell a microsecond column an older build
+/// normalized from one whose source is itself microsecond. A table of the second kind
+/// whose source later widens to nanoseconds reports the cast as the engine's own rather
+/// than as the source schema change it is, so `on_schema_change` does not act on it —
+/// the behavior every Cayenne table had while creation normalized unconditionally.
+/// Telling the two apart needs per-table provenance, which the metastore does not
+/// record today.
 pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
     &[&Float16ToFloat32, &TimestampToMicrosecond];
 
+/// The Arrow types Vortex has no array encoding for.
+///
+/// Deliberately a frozen list rather than a question put to Vortex during the walk. Probing
+/// per node would track Vortex exactly and, done bottom-up, would still attribute a failure
+/// to the nested field at fault - so accuracy is not the argument. The argument is that which
+/// columns a table will accept stays reviewable and moves only when someone edits this line,
+/// and that a Vortex-side regression then costs a red test rather than a table that will not
+/// create.
+///
+/// What freezing costs is drift, and this list has drifted: `Map` support was lost across a
+/// Vortex fork re-cut, the list went on claiming Vortex could store it, and every write to an
+/// accelerated table with a `Map` column failed after the table had been created
+/// (spiceai/spiceai#13524). `vortex_encodes_exactly_the_types_not_listed_as_unsupported` is
+/// the tripwire: it probes Vortex per type family and fails when the two disagree.
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
     !matches!(
         data_type,
-        DataType::Interval(_) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
+        DataType::Interval(_)
+            | DataType::Duration(_)
+            | DataType::FixedSizeBinary(_)
+            | DataType::Union(..)
+            | DataType::RunEndEncoded(..)
     )
 }
 
@@ -70,9 +108,9 @@ fn transform_data_type_for_vortex(
 ) -> Option<DataType> {
     // The always-applied rewrites. These are leaf rules (never a container type), so
     // consulting them before the nested walk below is what `apply_rules` would do too -
-    // which is what lets `CAYENNE_TYPE_REWRITE_RULES` be published as an equivalent
-    // description of this step rather than a second copy of it.
-    for rule in CAYENNE_TYPE_REWRITE_RULES {
+    // which is what lets `CAYENNE_CREATION_REWRITE_RULES` describe this step rather
+    // than be a second copy of it.
+    for rule in CAYENNE_CREATION_REWRITE_RULES {
         if let Some(rewritten) = rule.rewrite(data_type) {
             tracing::debug!(
                 "Converting field '{path}' from {data_type:?} to {rewritten:?} for Vortex compatibility"
@@ -160,32 +198,6 @@ fn transform_data_type_for_vortex(
                 .collect();
             Some(DataType::Struct(fields.into()))
         }
-        DataType::Union(fields, mode) => Some(DataType::Union(
-            fields
-                .iter()
-                .map(|(type_id, field)| {
-                    (
-                        type_id,
-                        transform_nested_field(
-                            field,
-                            &format!("{path}.{}", field.name()),
-                            unsupported_type_action,
-                            unsupported_fields,
-                        ),
-                    )
-                })
-                .collect(),
-            *mode,
-        )),
-        DataType::RunEndEncoded(run_ends, values) => Some(DataType::RunEndEncoded(
-            Arc::clone(run_ends),
-            transform_nested_field(
-                values,
-                &format!("{path}.{}", values.name()),
-                unsupported_type_action,
-                unsupported_fields,
-            ),
-        )),
         _ => Some(data_type.clone()),
     }
 }
@@ -249,12 +261,16 @@ fn handle_unsupported_type(
 ///
 /// Always applies:
 /// - `Float16` → `Float32`
-/// - Non-microsecond `Timestamp` → `Timestamp(Microsecond, tz)`
 ///
-/// Truly unsupported types (`Interval`, `Duration`, `FixedSizeBinary`) are
-/// handled according to `unsupported_type_action` at the top level. Nested
-/// unsupported types error unless the action is `warn`, because schema-only
-/// string conversion or field removal would not preserve nested data correctly.
+/// `Timestamp` passes through with its time unit and timezone intact: Vortex
+/// represents second, millisecond, microsecond and nanosecond timestamps, so a
+/// table stores the precision its source reports.
+///
+/// Types Vortex has no encoding for (`Interval`, `Duration`, `FixedSizeBinary`,
+/// `Union`, `RunEndEncoded`) are handled according to `unsupported_type_action`
+/// at the top level. Nested unsupported types error unless the action is `warn`,
+/// because schema-only string conversion or field removal would not preserve
+/// nested data correctly.
 ///
 /// # Errors
 ///
@@ -299,10 +315,261 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::new_empty_array;
+    use arrow::datatypes::{
+        DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode,
+    };
+    use arrow_tools::type_rewrite::apply_rules;
     use datafusion_table_providers::UnsupportedTypeAction;
+    use vortex::VortexSessionDefault;
+    use vortex::array::ArrayRef as VortexArrayRef;
+    use vortex::array::VortexSessionExecute;
+    use vortex::arrow::{ArrowSessionExt, FromArrowArray};
+    use vortex_session::VortexSession;
 
-    use super::transform_schema_for_vortex;
+    use super::{
+        CAYENNE_CREATION_REWRITE_RULES, is_vortex_supported_type, transform_schema_for_vortex,
+    };
+
+    fn union_fields() -> UnionFields {
+        UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Arc::new(Field::new("text", DataType::Utf8, true)),
+                Arc::new(Field::new("n", DataType::Int32, true)),
+            ],
+        )
+        .expect("valid union fields")
+    }
+
+    /// Names every Arrow `DataType` variant, with no `_` arm.
+    ///
+    /// A variant added to `arrow-rs` stops this compiling, which is the moment to add a
+    /// representative of it to [`arrow_type_families`]. Without this, a new variant escapes
+    /// both that fixture and the list it pins, and the drift the tests exist to catch
+    /// happens silently again - the way `Map` did.
+    fn every_variant_is_named(data_type: &DataType) {
+        match data_type {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(..)
+            | DataType::Time64(..)
+            | DataType::Duration(..)
+            | DataType::Interval(..)
+            | DataType::Binary
+            | DataType::FixedSizeBinary(..)
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::List(..)
+            | DataType::ListView(..)
+            | DataType::FixedSizeList(..)
+            | DataType::LargeList(..)
+            | DataType::LargeListView(..)
+            | DataType::Struct(..)
+            | DataType::Union(..)
+            | DataType::Dictionary(..)
+            | DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Map(..)
+            | DataType::RunEndEncoded(..) => {}
+        }
+    }
+
+    /// One representative of every Arrow type family.
+    ///
+    /// Container types carry rewrite-sensitive payloads - a `Float16`, a nanosecond
+    /// timestamp - so the creation rewrite rules are exercised where they apply, and the
+    /// four timestamp units appear so unit preservation is covered. Shared by the two tests
+    /// that pin Cayenne's type handling: one list cannot drift from itself.
+    fn arrow_type_families() -> Vec<DataType> {
+        let list_item = Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ));
+        let map_entries = Arc::new(Field::new_struct(
+            "entries",
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Float16, true)),
+            ],
+            false,
+        ));
+        let families = vec![
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Duration(TimeUnit::Second),
+            DataType::Interval(IntervalUnit::DayTime),
+            DataType::Binary,
+            DataType::FixedSizeBinary(4),
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::List(Arc::clone(&list_item)),
+            DataType::ListView(Arc::clone(&list_item)),
+            DataType::FixedSizeList(Arc::clone(&list_item), 2),
+            DataType::LargeList(Arc::clone(&list_item)),
+            DataType::LargeListView(Arc::clone(&list_item)),
+            DataType::Struct(
+                vec![
+                    Field::new("score", DataType::Float16, true),
+                    Field::new(
+                        "at",
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            DataType::Union(union_fields(), UnionMode::Sparse),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float16)),
+            DataType::Decimal32(5, 2),
+            DataType::Decimal64(10, 2),
+            DataType::Decimal128(20, 2),
+            DataType::Decimal256(40, 2),
+            DataType::Map(map_entries, false),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                )),
+            ),
+        ];
+        for family in &families {
+            every_variant_is_named(family);
+        }
+        families
+    }
+
+    /// Ask Vortex, for one representative of every Arrow type family, whether it can
+    /// actually store a column of that type, and require the answer to match
+    /// [`is_vortex_supported_type`] exactly.
+    ///
+    /// The probe is the pair of conversions a write and a read go through - import the Arrow
+    /// array into Vortex, then execute it back to the same Arrow type - run on an empty
+    /// array. Both conversions are type-level, so an empty array answers the same question a
+    /// full batch does. It stops short of the file writer, so it answers "can Vortex encode
+    /// this type", not "does a flush succeed"; `map_column_roundtrips_through_a_vortex_file`
+    /// in `vortex-datafusion` covers the whole path.
+    ///
+    /// This exists because the list is the only thing standing between a user and a table
+    /// that is created successfully and can then never be written to. Vortex's `Map` support
+    /// lives in the `spiceai/vortex` fork and has already been lost once across a re-cut,
+    /// silently, leaving the list claiming support Vortex no longer had
+    /// (spiceai/spiceai#13524). If that happens again this test goes red before a release
+    /// does.
+    #[test]
+    fn vortex_encodes_exactly_the_types_not_listed_as_unsupported() {
+        // One session for the whole sweep: building it registers nine session components and
+        // a file cache, none of which vary by type.
+        let session = VortexSession::default();
+
+        let mut disagreements = Vec::new();
+        for data_type in arrow_type_families() {
+            let claimed = is_vortex_supported_type(&data_type);
+            match (claimed, vortex_can_encode(&session, &data_type)) {
+                (true, Err(why)) => disagreements.push(format!(
+                    "{data_type} is listed as supported but Vortex cannot encode it: {why}"
+                )),
+                (false, Ok(())) => disagreements.push(format!(
+                    "{data_type} is listed as unsupported but Vortex encodes it, so Cayenne \
+                     rejects a column it could store"
+                )),
+                _ => {}
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "`is_vortex_supported_type` no longer matches Vortex:\n  {}",
+            disagreements.join("\n  ")
+        );
+    }
+
+    /// Round-trip an empty array of `data_type` through Vortex's Arrow conversions.
+    fn vortex_can_encode(session: &VortexSession, data_type: &DataType) -> Result<(), String> {
+        let empty = new_empty_array(data_type);
+        let array = VortexArrayRef::from_arrow(empty.as_ref(), true)
+            .map_err(|e| format!("writing it fails: {e}"))?;
+        session
+            .arrow()
+            .execute_arrow(
+                array,
+                Some(&Field::new("probe", data_type.clone(), true)),
+                &mut session.create_execution_ctx(),
+            )
+            .map_err(|e| format!("reading it back fails: {e}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
+        // Only the families Cayenne accepts: the rest are refused before any rewrite runs.
+        let types: Vec<DataType> = arrow_type_families()
+            .into_iter()
+            .filter(is_vortex_supported_type)
+            .collect();
+        let schema = Schema::new(
+            types
+                .into_iter()
+                .enumerate()
+                .map(|(index, data_type)| Field::new(format!("column_{index}"), data_type, true))
+                .collect::<Vec<_>>(),
+        );
+
+        let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("supported types should transform for Vortex");
+        let creation_rules = apply_rules(&schema, CAYENNE_CREATION_REWRITE_RULES);
+
+        assert_eq!(
+            creation_rules, transformed,
+            "creation rewrite rules must normalize every supported Cayenne type exactly as table creation does"
+        );
+    }
 
     #[test]
     fn float16_converts_to_float32() {
@@ -312,18 +579,57 @@ mod tests {
         assert_eq!(out.field(0).data_type(), &DataType::Float32);
     }
 
+    /// Vortex represents all four Arrow timestamp units, so a table stores the
+    /// precision its source reports. Coercing to microseconds instead left a
+    /// Postgres `timestamptz` (inferred as ns) permanently unable to match its
+    /// own accelerated schema — regression test for
+    /// <https://github.com/spiceai/spiceai/issues/13014>.
     #[test]
-    fn non_microsecond_timestamp_converted() {
-        let schema = Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        )]);
-        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+    fn timestamp_units_are_preserved() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            for tz in [None, Some("UTC".into()), Some("+05:30".into())] {
+                let data_type = DataType::Timestamp(unit, tz);
+                let schema = Schema::new(vec![Field::new("ts", data_type.clone(), false)]);
+                let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                    .expect("should succeed");
+                assert_eq!(
+                    out.field(0).data_type(),
+                    &data_type,
+                    "timestamp unit and timezone must pass through unchanged"
+                );
+            }
+        }
+    }
+
+    /// The compatibility rules must keep explaining a stored microsecond timestamp
+    /// while creation preserves nanoseconds. Folding the two lists back together
+    /// breaks one side or the other: creation would down-convert again (#13018), or
+    /// an existing microsecond table would read as drifted and stop CDC (#13014).
+    #[test]
+    fn creation_preserves_units_while_the_compatibility_rules_still_explain_microseconds() {
+        use arrow_tools::type_rewrite::rewrite_data_type;
+
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let us = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+        let schema = Schema::new(vec![Field::new("ts", ns.clone(), false)]);
+        let created = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect("should succeed");
         assert_eq!(
-            out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            created.field(0).data_type(),
+            &ns,
+            "a table created now stores the source's unit"
+        );
+
+        assert_eq!(
+            rewrite_data_type(&ns, super::CAYENNE_TYPE_REWRITE_RULES),
+            us,
+            "the write path must still recognize the microseconds a pre-existing table stores"
         );
     }
 
@@ -358,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn field_metadata_preserved_on_timestamp_conversion() {
+    fn field_metadata_preserved_on_timestamp_passthrough() {
         let mut field_metadata = HashMap::new();
         field_metadata.insert("logicalType".to_string(), "TIMESTAMP_NTZ".to_string());
 
@@ -370,7 +676,7 @@ mod tests {
 
         assert_eq!(
             out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(out.field(0).metadata(), &field_metadata);
     }
@@ -429,7 +735,8 @@ mod tests {
         };
         assert_eq!(
             item.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            "a nested timestamp keeps its unit, like a top-level one"
         );
         assert_eq!(item.metadata(), &nested_metadata);
     }
@@ -512,34 +819,31 @@ mod tests {
         );
     }
 
+    /// Vortex cannot encode `Union` or `RunEndEncoded` at all, so a column of either type
+    /// has to be refused while the table is being created. Accepting it produces a table
+    /// that reports itself created and then fails every write to it - the shape of
+    /// spiceai/spiceai#13524.
     #[test]
-    fn run_end_encoded_nested_unsupported_type_errors_with_values_path() {
-        let schema = Schema::new(vec![Field::new(
-            "encoded",
+    fn types_vortex_cannot_encode_are_refused_by_name_and_type() {
+        for data_type in [
             DataType::RunEndEncoded(
                 Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                Arc::new(Field::new(
-                    "values",
-                    DataType::Struct(
-                        vec![Field::new(
-                            "duration",
-                            DataType::Duration(TimeUnit::Second),
-                            true,
-                        )]
-                        .into(),
-                    ),
-                    true,
-                )),
+                Arc::new(Field::new("values", DataType::Utf8, true)),
             ),
-            true,
-        )]);
-
-        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
-            .expect_err("nested run-end encoded values duration should be unsupported");
-        let message = err.to_string();
-        assert!(
-            message.contains("encoded.values.duration"),
-            "error should include run-end encoded values field path, got: {message}"
-        );
+            DataType::Union(union_fields(), UnionMode::Sparse),
+        ] {
+            let schema = Schema::new(vec![Field::new("encoded", data_type.clone(), true)]);
+            let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                .expect_err("a type Vortex cannot encode should be refused at creation");
+            let message = err.to_string();
+            assert!(
+                message.contains("'encoded'"),
+                "error should name the column, got: {message}"
+            );
+            assert!(
+                message.contains(&format!("{data_type:?}")),
+                "error should name the type that cannot be stored, got: {message}"
+            );
+        }
     }
 }

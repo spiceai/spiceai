@@ -21,8 +21,9 @@ inputs:
       dorny/paths-filter `filters` YAML; must define a `code_changes` group.
       Defaults to the standard repo-wide code paths.
     required: false
-    # The Rust-gate config files below (clippy/rustfmt/nextest/layers,
-    # the two lint guards) must COVER every path in RUST_AFFECTING_PATH_PATTERN
+    # Every tracked `.rs` file, and the Rust-gate config files below
+    # (clippy/rustfmt/nextest/layers, the lint guards), must be COVERED by some
+    # glob here — together they are every path in RUST_AFFECTING_PATH_PATTERN
     # (scripts/signoff). This list stays a deliberate superset — it is the shared
     # "did any code change" default, so it also gates integration and E2E — but a
     # Rust-gate path missing here lets the merge queue report `Rust Lint` and
@@ -36,16 +37,20 @@ inputs:
         - 'bin/**'
         - 'test/**'
         - 'tools/**'
+        # Tracked Rust sources compiled into the workspace through a
+        # `[patch.crates-io]` entry, so a change here is a change to what the
+        # runtime links.
+        - 'vendor/**'
         - 'install/**'
         - 'Cargo.toml'
         - 'Cargo.lock'
         - 'go.mod'
         - 'go.sum'
         - 'Makefile'
-        # Dot-prefixed directories are spelled out literally rather than left to
-        # `**`, which only descends into them when picomatch runs with
-        # `dot: true` — `.ci/clippy.toml` is the config the lint gate actually
-        # reads, so it must match either way.
+        # Dot-prefixed directories are spelled out literally even though
+        # dorny/paths-filter runs picomatch with `dot: true`, so `**` would
+        # reach them: `.ci/clippy.toml` is the config the lint gate actually
+        # reads, and naming it keeps that explicit rather than incidental.
         - '.ci/**'
         - '.config/**'
         - '.cargo/**'
@@ -58,10 +63,14 @@ inputs:
         - 'scripts/check_crate_layers.py'
         - 'scripts/check_table_layers.py'
         - 'scripts/check_rust_gate_paths.py'
+        - 'scripts/test_check_rust_gate_paths.py'
         - 'scripts/check_module_reachability.py'
         # The reachability guard's own regression harness runs in `lint-rust`,
         # so a change to it changes what the Rust gate enforces.
         - 'scripts/test_check_module_reachability.py'
+        - 'scripts/check_fork_patches.py'
+        - 'scripts/test_check_fork_patches.py'
+        - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'
 

@@ -5,7 +5,18 @@ on:
     branches:
       - trunk
     paths:
+      # Every manifest that declares or forwards the CUDA/candle dependency
+      # surface this build compiles: `crates/llms/Cargo.toml` owns `mistralrs`,
+      # `tei_candle` and `cudarc` plus the `cuda`/`flash-attn`/`ring` features,
+      # and the model-contract crates beneath it can shift feature unification
+      # for that graph. Keep this list moving with the dependencies — when the
+      # local-inference stack is split into its own crate, this filter must name
+      # that crate's manifest, or it will still be here pointing at a file that
+      # no longer declares anything CUDA.
       - 'crates/llms/Cargo.toml'
+      - 'crates/chat-api/Cargo.toml'
+      - 'crates/embed-api/Cargo.toml'
+      - 'crates/rerank-api/Cargo.toml'
   push:
     tags:
       - v*
@@ -282,10 +293,13 @@ jobs:
             --tag "v${{ env.REL_VERSION }}" \
             "${RELEASE_ARTIFACTS[@]}"
 
+          # Pass the notes by path, not by value: a release body over 128 KiB
+          # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
+          # after every build has already succeeded.
           if [ "$LATEST_RELEASE" = "true" ]; then
-            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+            BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
-            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+            BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")
           fi
 
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
@@ -293,6 +307,6 @@ jobs:
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "v${{ env.REL_VERSION }}" \
-            --body "${RELEASE_BODY}" \
+            "${BODY_ARGS[@]}" \
             --prerelease "$PRE_RELEASE" \
             "${RELEASE_ARTIFACTS[@]}"

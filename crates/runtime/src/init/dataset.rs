@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     future::Future,
@@ -22,15 +23,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
     OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
     UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
@@ -42,9 +43,7 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
-    dataaccelerator::{
-        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
-    },
+    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -106,7 +105,7 @@ impl Runtime {
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -832,6 +831,42 @@ impl Runtime {
             return Err(err);
         }
 
+        // A `drasi` block only takes effect through the change stream, so a
+        // dataset without one forwards nothing. Silently publishing no changes
+        // to a configured Drasi source is worse than refusing the dataset: the
+        // continuous queries downstream would simply never fire, with nothing to
+        // point at.
+        if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
+            let refresh_mode = ds
+                .acceleration
+                .as_ref()
+                .map(|a| data_connector.resolve_refresh_mode(a.refresh_mode));
+
+            let reason = match refresh_mode {
+                None => Some("not accelerated".to_string()),
+                // Lowercased to match the value as it is spelled in the
+                // Spicepod, which is what the operator has to change.
+                Some(mode) if mode != RefreshMode::Changes => Some(format!(
+                    "accelerated with 'refresh_mode: {}'",
+                    format!("{mode:?}").to_lowercase()
+                )),
+                Some(_) if !data_connector.supports_changes_stream() => Some(format!(
+                    "backed by the {source} connector, which does not support change data capture"
+                )),
+                Some(_) => None,
+            };
+
+            if let Some(reason) = reason {
+                let err = DrasiWithoutChangeStreamSnafu {
+                    dataset_name: ds.name.to_string(),
+                    reason,
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
+
         // Durable write-back delivers each committed row to the source. Unless
         // the connector can do that atomically, delivery has to emulate an
         // upsert as a standalone delete plus a separate insert — and because the
@@ -846,6 +881,29 @@ impl Runtime {
             let err = DurableWriteBackUnsupportedBySourceSnafu {
                 dataset_name: ds.name.to_string(),
                 connector: source.clone(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
+        // The delivery worker keys each committed row on a SINGLE primary-key
+        // column (`write_back_worker.rs` returns early for `pk_columns.len() != 1`,
+        // because a composite key can't be turned into the `pk IN (...)` filter it
+        // delivers with). A composite-key dataset would otherwise register and
+        // then silently never deliver — the markers accumulate undelivered. Reject
+        // it here so the limitation surfaces as a loud, actionable error instead of
+        // silent data non-delivery.
+        if let Some(acceleration) = &ds.acceleration
+            && acceleration.resolves_to_durable_write_back()
+            && let Some(primary_key) = &acceleration.primary_key
+            && primary_key.columns.len() > 1
+        {
+            let err = DurableWriteBackCompositePrimaryKeySnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.clone(),
+                primary_key: primary_key.columns.join(", "),
+                pk_columns: primary_key.columns.len(),
             }
             .build();
             warn_spaced!(spaced_tracer, "{}{err}", "");
@@ -877,7 +935,10 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+        {
             Ok(provider) => {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
@@ -1223,12 +1284,15 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
-            UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .build()
-        })?;
+        let read_table = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+            .map_err(|_| {
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .build()
+            })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -1276,14 +1340,13 @@ impl Runtime {
         );
 
         let refresher = accelerated_table.refresher();
-        let notifier = refresher.on_complete_notification();
 
         // wait for accelerated table to be ready
-        if let Some(notifier) = notifier {
+        if let Some(completion) = refresher.refresh_completion() {
             await_hot_reload_initial_refresh(
                 &ds.name,
                 &|| refresher.initial_load_completed(),
-                &notifier,
+                completion.any(),
                 &self.status.shutdown_token(),
                 HOT_RELOAD_INITIAL_REFRESH_TIMEOUT,
             )
@@ -1381,14 +1444,40 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector =
-            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
-                dc.context(UnableToInitializeDataConnectorSnafu {})?
-            } else {
-                // Only reachable if the connector is deregistered between the check above and
-                // this lookup; report the same error rather than a second, blunter one.
-                return Err(unknown_data_connector(source).await);
-            };
+        let mut data_connector = if let Some(dc) = dataconnector::create_new_connector(
+            source,
+            params,
+            &RuntimeConnectorContext::for_dataset(&ds),
+        )
+        .await
+        {
+            dc.context(UnableToInitializeDataConnectorSnafu {})?
+        } else {
+            // Only reachable if the connector is deregistered between the check above and
+            // this lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_data_connector(source).await);
+        };
+
+        // Innermost of the stream decorators, so the properties Drasi receives
+        // are the source table's own columns. Wrapping outside the embedding
+        // decorator would instead publish every computed embedding vector as a
+        // node property.
+        if let Some(drasi) = ds.drasi.clone().filter(is_drasi_forwarding) {
+            tracing::warn!(
+                "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+            );
+
+            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi)
+                .await
+                .map_err(|e| crate::Error::UnableToInitializeDataConnector {
+                    source: Box::new(e),
+                })?;
+
+            data_connector = Arc::new(crate::drasi::connector::DrasiConnector::new(
+                data_connector,
+                delivery,
+            ));
+        }
 
         if ds.has_embeddings() {
             data_connector = Arc::new(EmbeddingConnector::new(
@@ -1568,10 +1657,10 @@ impl Runtime {
                 crate::datafusion::SPICE_DEFAULT_SCHEMA,
             );
             tokio::task::spawn(async move {
-                // Wait for the dataset's status to reach `Ready` rather than
-                // relying on the `Notify`-based completion handle (which is
-                // edge-triggered and can race with this spawn for fast
-                // initial refreshes).
+                // Gate on the dataset's status reaching `Ready` rather than on
+                // the refresh completion: the ack reports the partitions this
+                // executor serves, and the dataset is only servable once its
+                // status has been published.
                 // A shutdown before the dataset became ready means the initial
                 // load never finished: there is no partition state worth acking.
                 if runtime_status
@@ -1645,7 +1734,7 @@ impl Runtime {
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -1846,12 +1935,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -1919,59 +2007,54 @@ pub struct RegisterDatasetContext {
 /// loaded yet.
 ///
 /// The wait is bounded because `apply_app` holds `apply_app_lock` across it, and
-/// three shapes never deliver a notification the caller can see:
+/// one shape never delivers a completion at all: a `refresh_mode: changes` stream
+/// that never produces a ready envelope, since the completion is recorded only
+/// when one is applied.
 ///
-/// - a `refresh_mode: changes` stream that never produces a ready envelope — the
-///   notifier fires only when one is applied;
-/// - a refresh completing before this wait is entered at all.
-///   [`tokio::sync::Notify::notify_waiters`] stores no permit, so that wakeup is
-///   gone, and a `RefreshMode::Full` dataset with no `check_interval` never fires
-///   a second one;
-/// - a cluster scheduler, which notifies waiters from inside the builder —
-///   before any caller holds the notifier — precisely because it runs no refresh.
+/// A refresh that finished before this call is not that shape. The waiter is
+/// level-triggered and satisfied by a completion recorded before it was taken, and
+/// `initial_load_completed` — stored before the completion is recorded — is read
+/// both before the bound and after it, so a load that lands either side of the
+/// wait resolves as success instead of discarding a table that is loaded.
 ///
-/// Only the second is recoverable here, and only via `initial_load_completed`:
-/// the refresher sets that flag just *after* it notifies (`Refresher::start`), so
-/// the flag is what remains once the edge is gone. It is read after the bound as
-/// well as before it, so a wakeup that predates this call resolves as success
-/// instead of discarding a table that is loaded.
-///
-/// The scheduler shape is not recoverable here — nothing local ever sets the flag
-/// on a scheduler — so it spends the bound and then takes the full reload. That is
-/// still strictly better than the unbounded wait it replaces, which never
-/// returned at all; removing the edge at its source is #13086.
+/// On a cluster scheduler no refresh runs locally, so the table's completion
+/// signal is closed when it is built and the waiter resolves at once rather than
+/// spending the bound.
 ///
 /// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
-/// [`Error::HotReloadRefreshTimedOut`] when the bound expires with the table
-/// still unloaded, which drops the in-place swap in favour of a full reload.
+/// [`Error::HotReloadRefreshTimedOut`] when the table is still unloaded once
+/// there is nothing left to wait for, which drops the in-place swap in favour of
+/// a full reload. That is either the bound expiring or the new table being
+/// dropped before its first refresh: waiting out the rest of the bound on a
+/// table nobody can refresh only delays the same verdict.
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
-    notifier: &tokio::sync::Notify,
+    completion: RefreshCompletionWaiter,
     shutdown_token: &tokio_util::sync::CancellationToken,
     timeout: Duration,
 ) -> Result<()> {
-    // Built before the check below, not after: a `Notified` "is guaranteed to
-    // receive wakeups from `notify_waiters()` as soon as it has been created,
-    // even if it has not yet been polled" (`tokio::sync::Notify::notified`), and
-    // `notify_waiters` is what both producers call. So a refresh completing
-    // between here and the `select!` still wakes this wait; constructing after
-    // the check would drop it and cost the whole bound.
-    let refresh_notified = notifier.notified();
-
     if initial_load_completed() {
         return Ok(());
     }
 
     tokio::select! {
-        () = refresh_notified => return Ok(()),
+        // A `RefreshCompletionWaiter` for any completion is satisfied by a
+        // refresh that finished before this wait began, so the load cannot be
+        // missed by arriving here late. An abandoned wait falls through to the
+        // flag re-check below rather than returning: every recorder is gone, so
+        // no refresh is coming, but a load that landed before they went still
+        // counts.
+        outcome = completion.wait() => if outcome.is_answered() {
+            return Ok(());
+        },
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
     }
 
-    // The bound is a backstop, not the verdict: a wakeup that fired before this
-    // wait was even entered leaves a table that is loaded and must not be
-    // discarded.
+    // The bound is a backstop, not the verdict: the flag is stored before the
+    // completion is recorded, so a load that finished as the bound expired
+    // leaves a table that must not be discarded.
     if initial_load_completed() {
         return Ok(());
     }
@@ -2091,39 +2174,37 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at().await {
-                if is_shutdown_cancellation(&e) {
-                    tracing::debug!(
-                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                        dataset.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Failed to update _fetched_at for cached dataset {}: {e}",
-                        dataset.name
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "Updated _fetched_at for all records in cached dataset {}",
-                    dataset.name
-                );
-            }
+    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
+        Ok(()) => {
+            tracing::info!(
+                "Updated _fetched_at for all records in cached dataset {}",
+                dataset.name
+            );
+        }
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(
+                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                dataset.name
+            );
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to initialize caching engine for {}: {e}",
+                "Failed to update _fetched_at for cached dataset {}: {e}",
                 dataset.name
             );
         }
     }
 }
 
+/// Whether a dataset's `drasi:` block is live.
+fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
+    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
         register_connector_factory,
@@ -2145,10 +2226,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             let creates = Arc::clone(&self.creates);
             Box::pin(async move {
                 creates.fetch_add(1, Ordering::SeqCst);
@@ -2167,7 +2249,7 @@ mod tests {
         fn static_schema(
             &self,
             _params: &ConnectorParams,
-            dataset: &crate::component::dataset::Dataset,
+            dataset: &DatasetSpec,
         ) -> Option<arrow_schema::SchemaRef> {
             crate::component::dataset::declared_schema::declared_schema_for(dataset)
                 .ok()
@@ -2186,7 +2268,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
         }
@@ -2311,10 +2394,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
         }
 
@@ -2338,7 +2422,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "id",
@@ -2368,10 +2453,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
 
@@ -2466,8 +2552,18 @@ mod tests {
     /// #12862: it was untimed, and `apply_app_lock` is held across it.
     mod hot_reload_initial_refresh {
         use super::*;
-        use tokio::sync::Notify;
+        use crate::accelerated::refresh_completion::RefreshCompletion;
         use tokio_util::sync::CancellationToken;
+
+        /// A completion signal no refresh ever reports on. The recorder comes
+        /// back with the waiter and has to be held for the length of the wait:
+        /// dropping it releases the waiter, which is the opposite of what these
+        /// arms are asking for.
+        fn silent() -> (RefreshCompletion, RefreshCompletionWaiter) {
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
+            (completion, waiter)
+        }
 
         /// The production bound, so these arms cannot drift from it. A paused
         /// clock makes its size irrelevant to how long they take.
@@ -2481,16 +2577,17 @@ mod tests {
         /// the refresh finished before the reload got here.
         #[tokio::test(start_paused = true)]
         async fn an_already_loaded_table_does_not_wait() {
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| true,
-                &Notify::new(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a table that has already loaded needs no notification");
+            .expect("a table that has already loaded needs no completion");
 
             assert_eq!(
                 started.elapsed(),
@@ -2499,43 +2596,97 @@ mod tests {
             );
         }
 
-        /// The ordinary case: the refresh completes and notifies.
+        /// The ordinary case: the refresh completes and reports it.
         #[tokio::test(start_paused = true)]
-        async fn a_completion_notification_ends_the_wait() {
-            let notifier = Arc::new(Notify::new());
-            let notify_from = Arc::clone(&notifier);
+        async fn a_reported_completion_ends_the_wait() {
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                notify_from.notify_waiters();
+                completion.record();
             });
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| false,
-                &notifier,
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a notified refresh completes the wait");
+            .expect("a reported refresh completes the wait");
 
             assert!(
                 started.elapsed() < TIMEOUT,
-                "the wait must end on the notification, not on the bound"
+                "the wait must end on the completion, not on the bound"
+            );
+        }
+
+        /// Regression test for #13086. A refresh that finished before the reload
+        /// reached this wait must end it at once. The edge-triggered signal this
+        /// replaced had nothing left to report by then, so the reload spent the
+        /// whole bound and then discarded a table that was loaded.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_that_predates_the_wait_ends_it_immediately() {
+            let completion = RefreshCompletion::new();
+            completion.record();
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a refresh that already completed must end the wait");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a completion recorded before the wait must be observed, not waited out"
+            );
+        }
+
+        /// Regression test for #13086. A cluster scheduler runs no refresh
+        /// locally and closes the table's completion signal instead, which must
+        /// end the wait rather than spend the bound on every hot reload.
+        #[tokio::test(start_paused = true)]
+        async fn a_closed_completion_signal_ends_the_wait() {
+            let completion = RefreshCompletion::new();
+            completion.close();
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a signal that will never report again must end the wait");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a closed signal must be recognised immediately, not at the bound"
             );
         }
 
         /// A `refresh_mode: changes` stream that never produces a ready envelope
-        /// never fires the notifier. Before #12862 this held the apply lock for
-        /// the life of the process.
+        /// never reports a completion. Before #12862 this held the apply lock
+        /// for the life of the process.
         #[tokio::test(start_paused = true)]
         async fn a_refresh_that_never_completes_gives_up_at_the_bound() {
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
             let err = await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| false,
-                &Notify::new(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
@@ -2553,58 +2704,56 @@ mod tests {
             );
         }
 
-        /// A completion landing between the `Notified`'s construction and the
-        /// `select!` must still wake the wait, which is why the future is built
-        /// before the loaded-check rather than after it. Build it after and this
-        /// notification is dropped, costing the whole bound. The closure is the
-        /// seam: it runs in exactly that window.
+        /// A completion landing between the loaded-check and the `select!` must
+        /// still end the wait. The closure is the seam: it runs in exactly that
+        /// window.
         #[tokio::test(start_paused = true)]
         async fn a_completion_racing_the_loaded_check_is_not_missed() {
-            let notifier = Arc::new(Notify::new());
-            let notify_from = Arc::clone(&notifier);
-            let notifies_then_reports_unloaded = move || {
-                notify_from.notify_waiters();
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
+            let records_then_reports_unloaded = move || {
+                completion.record();
                 false
             };
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
-                &notifies_then_reports_unloaded,
-                &notifier,
+                &records_then_reports_unloaded,
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a completion racing the wait setup must wake it, not be missed");
+            .expect("a completion racing the wait setup must end it, not be missed");
 
             assert_eq!(
                 started.elapsed(),
                 Duration::ZERO,
-                "a registered waiter must be woken immediately, not at the bound"
+                "a waiter must be released immediately, not at the bound"
             );
         }
 
-        /// `Notify::notify_waiters` stores no permit, so a completion landing
-        /// before the waiter is registered is lost. The table is loaded
-        /// regardless, and must not be discarded.
+        /// The bound and the completion can become ready together, and
+        /// `select!` picks between ready branches at random. The table is loaded
+        /// either way, so the backstop check must not let the bound discard it.
         #[tokio::test(start_paused = true)]
-        async fn a_lost_wakeup_resolves_as_loaded_at_the_bound() {
+        async fn a_load_landing_at_the_bound_is_not_discarded() {
             // False for the pre-wait check, true for the backstop check: the
-            // refresh completed while nothing was subscribed, and the refresher
-            // sets the flag just after it notifies.
+            // refresh completed while the wait was outstanding.
             let checks = AtomicUsize::new(0);
             let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
 
+            let (_recorder, waiter) = silent();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &loaded,
-                &Notify::new(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a wakeup lost before the wait must not discard a loaded table");
+            .expect("a load that lands at the bound must not discard the table");
         }
 
         /// Shutdown ends the wait without reporting a reload failure.
@@ -2617,16 +2766,11 @@ mod tests {
                 cancel.cancel();
             });
 
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
-            await_hot_reload_initial_refresh(
-                &reloading(),
-                &|| false,
-                &Notify::new(),
-                &token,
-                TIMEOUT,
-            )
-            .await
-            .expect("a runtime shutting down is not a failed reload");
+            await_hot_reload_initial_refresh(&reloading(), &|| false, waiter, &token, TIMEOUT)
+                .await
+                .expect("a runtime shutting down is not a failed reload");
 
             assert!(
                 started.elapsed() < TIMEOUT,

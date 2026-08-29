@@ -132,12 +132,9 @@ struct Cli {
 
     /// Spice.ai Cloud runtime endpoint region used with --cloud.
     ///
-    /// Not declared `requires = "cloud"`, because clap's generic
-    /// missing-required-argument error is the wrong diagnosis on
-    /// `spice connect`: there the flag is a confusion with `--region` (where
-    /// the instance runs) or `--endpoint` (which control plane to enroll
-    /// against), and the command says so itself. The `--cloud` requirement is
-    /// enforced for every other command by [`validate_cloud_region_usage`].
+    /// The `--cloud` requirement is enforced by
+    /// [`validate_cloud_region_usage`] so the CLI can provide a specific
+    /// diagnosis.
     #[arg(long, global = true, value_parser = parse_cloud_region)]
     cloud_region: Option<String>,
 
@@ -310,31 +307,55 @@ fn main() {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
-    // The subscriber writes to stdout, so stdout's terminal-ness decides colour.
-    // The builder default would honour `NO_COLOR` but still paint a redirected
-    // stdout; this is the same decision the CLI's own painted output already uses.
-    tracing_subscriber::fmt()
+    // Whether stdout is reserved for one JSON document. Decided before the
+    // subscriber is built, because it decides where log output may go.
+    let json_stdout = is_json_output(&mut cli.command);
+
+    // A JSON run must leave stdout parseable, so every log line goes to stderr
+    // instead — including the final error, which a command that has already
+    // written its report would otherwise append to the JSON. Otherwise the
+    // subscriber writes to stdout, so stdout's terminal-ness decides colour:
+    // the builder default would honour `NO_COLOR` but still paint a redirected
+    // stdout, and this is the same decision the CLI's own painted output uses.
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
-        .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
-        .init();
+        .without_time();
+    if json_stdout {
+        subscriber
+            .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stderr))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        subscriber
+            .with_ansi(ansi_colors::colors_enabled_for(ansi_colors::Target::Stdout))
+            .init();
+    }
 
     // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
     // Suppressed for commands that produce JSON (scripting) or where it's just noise.
     if std::io::stderr().is_terminal()
         && !cli.machine
         && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
-        && !is_json_output(&mut cli.command)
+        && !json_stdout
     {
         eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }
 
     // Run the CLI
     let machine = cli.machine;
+    let cloud_service_command = matches!(
+        &cli.command,
+        Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Service(_),
+            ..
+        })
+    );
     if let Err(e) = run_cli(cli) {
         if machine {
             write_machine_error(&e);
+        } else if cloud_service_command {
+            eprintln!("{e}");
         } else {
             tracing::error!("{e}");
         }
@@ -344,23 +365,11 @@ fn main() {
 
 /// Exit code for a failed command.
 ///
-/// Authentication failures get their own code so automation can re-authenticate
-/// and retry without parsing the message, matching the convention `gh` uses
-/// (<https://cli.github.com/manual/gh_help_exit-codes>).
+/// The mapping lives on the error type so every caller — this dispatcher and
+/// the machine-mode writer — reports the same code. See
+/// [`spice::error::Error::exit_code`] for the contract.
 fn exit_code_for(error: &spice::error::Error) -> i32 {
-    use spice::error::CloudErrorCode;
-
-    match error.cloud_code() {
-        Some(
-            CloudErrorCode::NotAuthenticated
-            | CloudErrorCode::TokenExpired
-            | CloudErrorCode::OrgCredentialMissing,
-        ) => 4,
-        _ => match error {
-            spice::error::Error::Unauthorized => 4,
-            _ => 1,
-        },
-    }
+    error.exit_code()
 }
 
 fn normalize_direct_command_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
@@ -546,14 +555,10 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 
 /// Reject `--cloud-region` on commands that have no cloud to apply it to.
 ///
-/// This is the guard clap used to enforce with `requires = "cloud"`. It moved
-/// here so `spice connect` can diagnose the flag itself: on that command
-/// `--cloud-region` is a confusion with `--region` or `--endpoint`, and
-/// "the following required arguments were not provided: --cloud" points at
-/// none of it. `connect` is therefore exempt here and refuses the flag in
-/// `connect::execute`, with a message naming the two flags that do apply.
+/// This is kept outside clap's `requires = "cloud"` relationship so the CLI
+/// can explain what the region selects and how to correct the invocation.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
-    if cli.cloud_region.is_none() || cli.cloud || matches!(cli.command, Commands::Connect(_)) {
+    if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
     Err(spice::error::Error::InvalidArgument {
@@ -673,6 +678,7 @@ fn apply_machine_mode(command: &mut Commands) {
         Commands::Chat(args) => args.output = OutputFormat::Json,
         Commands::Refresh(args) => args.output = OutputFormat::Json,
         Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
+        Commands::Login(args) => args.output = login::LoginOutput::Json,
         // `Nsql` is intentionally excluded: it is always an interactive REPL with
         // no one-shot/non-interactive mode, so there is no JSON output format to apply.
         // The remaining commands are lifecycle/manifest-editing commands with no
@@ -700,7 +706,6 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Snapshots(_)
         | Commands::Extension(_)
         | Commands::Metadata(_)
-        | Commands::Login(_)
         | Commands::Cluster(_)
         | Commands::Completions(_)
         | Commands::Feedback(_) => {}
@@ -733,6 +738,10 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
 }
 
 fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
+    if let cloud::CloudCommands::Login(args) = command {
+        args.output = login::LoginOutput::Json;
+        return;
+    }
     if let Some(output) = command.output_mut() {
         *output = OutputFormat::Json;
     }
@@ -810,7 +819,9 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::RuntimeExecution { .. } => "runtime_execution",
         spice::error::Error::RuntimeVersion { .. } => "runtime_version",
         spice::error::Error::Environment { .. } => "environment",
-        spice::error::Error::InvalidArgument { .. } => "invalid_argument",
+        spice::error::Error::InvalidArgument { .. } | spice::error::Error::InvalidUsage { .. } => {
+            "invalid_argument"
+        }
         spice::error::Error::Cloud { code, .. } => code.as_str(),
         spice::error::Error::DeviceAuthorizationDenied => "device_authorization_denied",
         spice::error::Error::HomeDirectoryNotFound => "home_directory_not_found",
@@ -821,6 +832,11 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::NoModelsConfigured => "no_models_configured",
         spice::error::Error::CloudConnectIo { .. } => "cloud_connect_io",
         spice::error::Error::CloudConnectEnroll { .. } => "cloud_connect_enroll",
+        spice::error::Error::CloudConnectProject { .. } => "cloud_connect_project",
+        spice::error::Error::ServiceNotInstalled { .. } => "service_not_installed",
+        spice::error::Error::ServiceUnavailable { .. } => "service_unavailable",
+        spice::error::Error::Interrupted => "interrupted",
+        spice::error::Error::NotImplemented { .. } => "not_implemented",
     }
 }
 
@@ -850,6 +866,7 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
+        Commands::Login(a) => a.output == login::LoginOutput::Json,
         _ => false,
     }
 }
@@ -906,10 +923,6 @@ fn run_cli(cli: Cli) -> Result<()> {
             rt.block_on(add::execute(&ctx, args))?;
         }
         Commands::Connect(mut args) => {
-            // `--cloud-region` on `connect` says which Spice Cloud to enroll
-            // into. Hand it to the command rather than dropping it here, so it
-            // participates in the documented enroll-endpoint precedence
-            // instead of being silently accepted and ignored.
             args.cloud_region.clone_from(&cli.cloud_region);
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
@@ -1336,13 +1349,7 @@ mod tests {
     /// command's own refusal is covered in `cli_integration`.
     #[test]
     fn cloud_region_is_left_to_connect_to_diagnose() {
-        let cli = parse_normalized(&[
-            "spice",
-            "connect",
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F",
-            "--cloud-region",
-            "us-west-2",
-        ]);
+        let cli = parse_normalized(&["spice", "connect", "status", "--cloud-region", "us-west-2"]);
         assert!(!cli.cloud);
         assert_eq!(cli.cloud_region.as_deref(), Some("us-west-2"));
         validate_cloud_region_usage(&cli)

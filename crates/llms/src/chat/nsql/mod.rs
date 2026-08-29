@@ -11,51 +11,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{
-    error::OpenAIError,
-    types::chat::{CreateChatCompletionRequest, CreateChatCompletionResponse},
-};
-
 use std::fmt::Write;
+
+// The NSQL contract lives in `chat-api` beside the `Chat` trait that returns it.
+pub use chat_api::{FailedAttempt, QueryGenerationContext, SqlGeneration};
 
 pub mod default;
 pub(crate) mod json;
 pub(crate) mod structured_output;
-
-#[derive(Default)]
-pub struct QueryGenerationContext {
-    pub failed_attempts: Vec<FailedAttempt>,
-}
-
-pub struct FailedAttempt {
-    pub attempted_query: String,
-    pub error_message: String,
-}
-
-impl FailedAttempt {
-    #[must_use]
-    pub fn new(attempted_query: String, error_message: String) -> Self {
-        Self {
-            attempted_query,
-            error_message,
-        }
-    }
-}
-
-/// Additional methods (beyond [`super::Chat`]), whereby a model can provide improved results for SQL code generation.
-pub trait SqlGeneration: Sync + Send {
-    fn create_request_for_query(
-        &self,
-        model_id: &str,
-        query: &str,
-        context: &QueryGenerationContext,
-    ) -> Result<CreateChatCompletionRequest, OpenAIError>;
-
-    fn parse_response(
-        &self,
-        resp: CreateChatCompletionResponse,
-    ) -> Result<Option<String>, OpenAIError>;
-}
 
 /// Default system prompt for SQL code generation.
 #[must_use]

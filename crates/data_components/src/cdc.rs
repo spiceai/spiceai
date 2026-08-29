@@ -89,6 +89,44 @@ pub fn shutdown_epoch() -> u64 {
 /// that may never arrive — see <https://github.com/spiceai/spiceai/issues/5201>.
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
+/// What the accelerator already holds at the moment its changes stream is built.
+///
+/// A CDC source that cannot prove where an acceleration's contents left off has
+/// to assume the worst: rows may have been deleted at the source while the
+/// acceleration was away, and no change row will ever arrive for them, so only
+/// re-reading the table removes them. That assumption is what makes an
+/// unprovable position expensive — it forces a rebuild.
+///
+/// An acceleration that holds no rows escapes the assumption outright, and it is
+/// the one case that can be settled by observation rather than inference: no row
+/// is present, so no row can be stale and no deletion can be missing. Only
+/// [`Self::Empty`] carries that proof. [`Self::Unknown`] is deliberately not a
+/// third answer callers may reason about — it means the question was not
+/// answered, and must be treated exactly like [`Self::NonEmpty`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccelerationContents {
+    /// Observed to hold no rows, so there is nothing that could be stale.
+    Empty,
+    /// Observed to hold at least one row.
+    NonEmpty,
+    /// Not determined — the probe failed, or the caller never ran one.
+    #[default]
+    Unknown,
+}
+
+impl AccelerationContents {
+    /// Whether the acceleration is *proven* to hold no rows.
+    ///
+    /// The only safe direction to read this type in: everything that is not a
+    /// positive proof of emptiness — including [`Self::Unknown`] — answers
+    /// `false`, so a failed probe degrades to the conservative behavior instead
+    /// of silently skipping work that protects correctness.
+    #[must_use]
+    pub fn is_provably_empty(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum CommitError {
     #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
@@ -617,6 +655,16 @@ impl ChangeEnvelope {
     /// Carried as its own zero-row envelope (see
     /// [`build_history_unavailable_envelope`]) so it is ordered in the stream
     /// rather than racing it.
+    ///
+    /// A source may raise it mid-stream, not only at the head. The consumer
+    /// treats it as a **barrier**: it coalesces envelopes into runs and performs
+    /// one rebuild per run, so everything the run carried ahead of the signal is
+    /// discarded rather than applied on top of the replacement — applying it
+    /// would write values the re-read has already moved past. Two obligations
+    /// follow for a source that raises this: the committers it emitted before
+    /// the signal must be safely droppable (they are dropped unacked), and the
+    /// position it resumes from afterwards must be at or after them, so the
+    /// re-read genuinely subsumes what was discarded.
     #[must_use]
     pub fn history_unavailable(&self) -> bool {
         self.history_unavailable
@@ -847,6 +895,15 @@ pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope,
 /// *before* the changes it precedes, so the rebuild is ordered ahead of them
 /// rather than racing them, and `is_dataset_ready` is false because a dataset
 /// whose accelerator is about to be replaced is not ready to serve.
+///
+/// **The no-op committer is the catch**, and why neither shipped source uses
+/// this: a rebuild that acknowledges no position leaves nothing behind saying it
+/// happened, so the next start finds the same unusable position and re-reads the
+/// whole table again — on every restart of a dataset whose source is quiet. A
+/// source with a position to record should build the envelope itself around its
+/// own committer (`ChangeEnvelope::from_parts(committer, batch, false, true)`),
+/// which also keeps it out of the consumer's zero-row heartbeat stripping. Use
+/// this only when there is genuinely no position to persist.
 pub fn build_history_unavailable_envelope(
     schema: &SchemaRef,
 ) -> Result<ChangeEnvelope, ChangeBatchError> {
@@ -2173,5 +2230,25 @@ mod deferred_tests {
         };
         let data_bearing = deferred(rows, false);
         assert!(!data_bearing.is_no_op_heartbeat());
+    }
+
+    /// Only a positive observation of emptiness may relax a rebuild, and the
+    /// failure mode this guards is silent: a probe that could not answer reads as
+    /// `Unknown`, and treating that as proof would skip the re-read an
+    /// acceleration needs to shed rows deleted at the source while it was away.
+    #[test]
+    fn only_an_observed_empty_acceleration_is_provably_empty() {
+        assert!(AccelerationContents::Empty.is_provably_empty());
+        assert!(!AccelerationContents::NonEmpty.is_provably_empty());
+        assert!(
+            !AccelerationContents::Unknown.is_provably_empty(),
+            "an unanswered probe is not proof of emptiness; treating it as one would skip a \
+             rebuild that protects against a missing deletion"
+        );
+        assert!(
+            !AccelerationContents::default().is_provably_empty(),
+            "the default must be the conservative answer, so a caller that never probes cannot \
+             accidentally opt out of the rebuild"
+        );
     }
 }

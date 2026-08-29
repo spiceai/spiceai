@@ -20,6 +20,7 @@ limitations under the License.
 //! Spice via `POST /v1/datasets/{name}/cdc`. Events are decoded (JSON or Avro)
 //! and applied through the shared `refresh_mode: changes` path — no Kafka.
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, pin::Pin, sync::Arc, time::Duration};
 
 use arrow::datatypes::SchemaRef;
@@ -27,8 +28,8 @@ use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
-    build_ready_signal_envelope,
+    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
+    CommitError, build_ready_signal_envelope,
 };
 use data_components::debezium::avro::AvroDecodeOptions;
 use data_components::debezium::decode::{self, CdcFormat};
@@ -45,7 +46,7 @@ use snafu::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::component::dataset::{
-    Dataset,
+    DatasetSpec,
     acceleration::{Engine, RefreshMode},
 };
 use data_connector_api::federated::FederatedTableProvider;
@@ -335,10 +336,11 @@ impl DataConnectorFactory for CdcIngestFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn std::future::Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(CdcIngest::new(&params.parameters)) as Arc<dyn DataConnector>)
         })
@@ -353,7 +355,7 @@ impl DataConnectorFactory for CdcIngestFactory {
     }
 }
 
-crate::register_data_connector!("cdc", CdcIngestFactory);
+data_connector_api::register_data_connector!("cdc", CdcIngestFactory);
 
 #[async_trait]
 impl DataConnector for CdcIngest {
@@ -367,7 +369,8 @@ impl DataConnector for CdcIngest {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -431,10 +434,12 @@ impl DataConnector for CdcIngest {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let dataset_name = dataset.name.to_string();
         Some(Box::pin(stream! {

@@ -23,9 +23,11 @@ pub struct SearchTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
-    /// Target test dataset to run the search test against.
+    /// Built-in MTEB benchmark dataset to run the search test against. When omitted, the run is
+    /// treated as a custom run: no MTEB data is downloaded, and the search harness tests the
+    /// `corpus`, `test_queries`, and `relevance_data` tables defined in `--spicepod-path` as-is.
     #[arg(long)]
-    pub(crate) benchmark_dataset: SearchDatasetArg,
+    pub(crate) benchmark_dataset: Option<SearchDatasetArg>,
 }
 
 /// Search benchmark dataset selector. Used both as the `--benchmark-dataset` CLI value and as the
@@ -72,6 +74,14 @@ pub enum SearchDatasetArg {
     #[value(name = "touche2020_retrieval")]
     #[serde(rename = "touche2020_retrieval")]
     Touche2020Retrieval,
+    /// MTEB `MSMARCO` (`https://huggingface.co/datasets/mteb/msmarco`).
+    #[value(name = "msmarco_retrieval")]
+    #[serde(rename = "msmarco_retrieval")]
+    MsmarcoRetrieval,
+    /// MTEB `StackOverflowQA` (`https://huggingface.co/datasets/mteb/stackoverflow-qa`).
+    #[value(name = "stackoverflow_qa_retrieval")]
+    #[serde(rename = "stackoverflow_qa_retrieval")]
+    StackoverflowQaRetrieval,
 }
 
 impl std::fmt::Display for SearchDatasetArg {
@@ -86,6 +96,8 @@ impl std::fmt::Display for SearchDatasetArg {
             SearchDatasetArg::ScifactRetrieval => write!(f, "scifact_retrieval"),
             SearchDatasetArg::NfcorpusRetrieval => write!(f, "nfcorpus_retrieval"),
             SearchDatasetArg::Touche2020Retrieval => write!(f, "touche2020_retrieval"),
+            SearchDatasetArg::MsmarcoRetrieval => write!(f, "msmarco_retrieval"),
+            SearchDatasetArg::StackoverflowQaRetrieval => write!(f, "stackoverflow_qa_retrieval"),
         }
     }
 }

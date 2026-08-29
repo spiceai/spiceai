@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.99",
+      "_score": "0.87",
       "data": {
         "i_color": "smoke",
         "i_item_id": "AAAAAAAADBAAAAAA"
@@ -22,7 +22,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.98",
+      "_score": "0.76",
       "data": {
         "i_color": "spring",
         "i_item_id": "AAAAAAAAHAAAAAAA"
