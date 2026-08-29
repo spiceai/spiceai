@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -354,11 +354,13 @@ impl ChunkedSearchIndex {
     /// the batch the inner index receives, so the inner index never sees that key on this write
     /// and nothing tells it to drop what the row's previous text produced.
     ///
-    /// The subtraction is what keeps the eviction from ever removing a chunk this write just
-    /// produced. It only bites when one batch carries the same key twice — once with text and
-    /// once without — which is already resolved last-write-wins downstream and is not resolved
-    /// here (#13713). Without it, evicting after the writes would delete the chunks the other
-    /// row wrote.
+    /// A key is judged on its **last** row in the batch, which is the one that survives
+    /// downstream: one batch can carry the same key more than once, and the eviction has to
+    /// agree with the row the table will end up holding. So a key whose last row still chunks
+    /// keeps what this write wrote for it, and a key whose last row chunked into nothing loses
+    /// everything under it — including chunks an earlier row of the same batch just produced.
+    /// (A batch carrying one key twice with text *both* times is a different, unresolved
+    /// problem: #13713.)
     ///
     /// `repeats` is parallel to `record`'s rows and holds each row's chunk count.
     fn rows_to_evict(
@@ -368,8 +370,7 @@ impl ChunkedSearchIndex {
     ) -> DataFusionResult<Option<RecordBatch>> {
         // Short-circuit before anything is allocated: on an ordinary write every row chunks into
         // something, and this is the only work that write should pay for.
-        let emptied = repeats.iter().filter(|n| **n == 0).count();
-        if emptied == 0 {
+        if !repeats.contains(&0) {
             return Ok(None);
         }
 
@@ -410,26 +411,27 @@ impl ChunkedSearchIndex {
         )?;
         let rows = converter.convert_columns(keys.columns())?;
 
-        // Keyed on the emptied rows rather than the written ones: the emptied set is the small
-        // one, and it is the side being subtracted from.
-        let mut candidates = HashSet::with_capacity(emptied);
-        for (i, _) in repeats.iter().enumerate().filter(|(_, n)| **n == 0) {
-            candidates.insert(rows.row(i));
-        }
-        for (i, _) in repeats.iter().enumerate().filter(|(_, n)| **n > 0) {
-            candidates.remove(&rows.row(i));
-        }
-        if candidates.is_empty() {
-            return Ok(None);
+        // A key's *last* row in the batch is the one that survives downstream, so that is the
+        // row that decides. Later inserts overwrite earlier ones, leaving each key mapped to its
+        // final occurrence.
+        let mut last_occurrence = HashMap::with_capacity(record.num_rows());
+        for i in 0..record.num_rows() {
+            last_occurrence.insert(rows.row(i), i);
         }
 
-        // Non-nullable by construction, so `filter_record_batch` takes its fast path.
+        // Evict a key exactly once, on its deciding row, and only when that row chunked into
+        // nothing. A key whose last row still has text keeps what this write wrote for it; a key
+        // whose last row is empty loses everything under it, including chunks an earlier row of
+        // the same batch just produced — which is the state the surviving row calls for.
         let evict = BooleanArray::new(
             BooleanBuffer::collect_bool(keys.num_rows(), |i| {
-                repeats[i] == 0 && candidates.contains(&rows.row(i))
+                repeats[i] == 0 && last_occurrence.get(&rows.row(i)) == Some(&i)
             }),
             None,
         );
+        if evict.true_count() == 0 {
+            return Ok(None);
+        }
 
         filter_record_batch(&keys, &evict)
             .map(Some)
@@ -441,7 +443,9 @@ impl ChunkedSearchIndex {
     ///
     /// Runs **after** this write's chunks have landed, not before: the deletion is externally
     /// visible and nothing restores it, so ordering it first would let a failed embedding or
-    /// bulk write leave the row present and its old chunks already gone.
+    /// bulk write leave the row present and its old chunks already gone. That narrows the window
+    /// rather than closing it — the row write itself commits later still, and there is no
+    /// post-commit index hook on the CDC path to hang this on (#13715).
     ///
     /// Skipped inside a [`WriteWindow::ReplaceAll`] window, where it would be destructive: an
     /// index that stages a replacing write keeps serving its *previous* rows until it commits,
@@ -2562,15 +2566,22 @@ mod tests {
         }
     }
 
-    /// The eviction must never remove a chunk this same write produced. One batch can carry the
-    /// same key twice — once with text, once without — and that shape is resolved last-write-wins
-    /// downstream but not here (#13713), so evicting on the emptied row would delete the chunks
-    /// the other row just wrote and leave the row with nothing searchable at all.
+    /// One batch can carry the same key more than once, and the eviction has to agree with the
+    /// row the table will end up holding — the last one. Order therefore decides the outcome:
+    /// text-then-empty leaves nothing searchable under the key, empty-then-text leaves the text.
+    ///
+    /// Getting this wrong in either direction is a wrong search result. Judging the key on *any*
+    /// occurrence rather than the deciding one keeps the superseded text searchable under a row
+    /// the table has emptied; not judging it at all lets the eviction delete chunks the same
+    /// write just produced.
+    ///
+    /// A batch carrying the key twice with text both times is a different, unresolved problem
+    /// (#13713) and is not asserted here.
     #[tokio::test]
-    async fn a_key_this_write_also_chunked_is_not_evicted() {
-        for rows in [
-            vec![(Some("a b"), 1i64), (None, 1)],
-            vec![(None, 1i64), (Some("a b"), 1)],
+    async fn a_duplicated_key_is_judged_on_the_row_that_survives_the_batch() {
+        for (rows, expected) in [
+            (vec![(Some("a b"), 1i64), (None, 1)], vec![]),
+            (vec![(None, 1i64), (Some("a b"), 1)], vec![(1, 0), (1, 1)]),
         ] {
             let inner = Arc::new(StatefulChunkInner::new(&[], false));
             let idx =
@@ -2580,11 +2591,31 @@ mod tests {
 
             assert_eq!(
                 inner.remaining(),
-                vec![(1, 0), (1, 1)],
-                "the chunks this write produced survive it, whichever order the batch carries \
-                 ({rows:?})"
+                expected,
+                "the last row for a key decides what stays searchable under it ({rows:?})"
             );
         }
+    }
+
+    /// The same rule with no duplicate in sight: an emptied key loses its chunks, and a key this
+    /// write chunked keeps them.
+    #[tokio::test]
+    async fn a_write_evicts_only_the_keys_it_emptied() {
+        let inner = Arc::new(StatefulChunkInner::new(&[], false));
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.write(build_input(&[("a b", 1), ("c", 2)]))
+            .await
+            .expect("first write ok");
+        idx.write(build_input_opt(&[(None, 1), (Some("d e"), 2)]))
+            .await
+            .expect("rewrite ok");
+
+        assert_eq!(
+            inner.remaining(),
+            vec![(2, 0), (2, 1)],
+            "id 1 emptied and went; id 2 was rewritten and kept its new chunks"
+        );
     }
 
     /// The eviction is an externally visible delete that nothing restores, so it must not run
