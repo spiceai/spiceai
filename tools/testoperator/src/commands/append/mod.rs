@@ -352,8 +352,11 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 ///
 /// Row counts prove only that the right *amount* of data arrived. Comparing the
 /// query results against the expected answers proves the right *data* arrived:
-/// a bad upsert resolution or a retention policy deleting the wrong row can
-/// still land on the expected row count.
+/// a duplicated append, a retention policy deleting the wrong row, or a
+/// corrupted column can all land on the expected row count.
+///
+/// No expected-answer query selects the appended `*_created_at` column, so this
+/// pass does not observe which of two conflicting versions an upsert kept.
 async fn verify_appended_data(
     spiced: &SpicedInstance,
     query_set: &QuerySet,
