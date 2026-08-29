@@ -18168,9 +18168,28 @@ impl CayenneTableProvider {
         // new current snapshot now holds all live rows, and protected snapshots /
         // inline entries were just cleared, so a bloom of this snapshot's keys is a
         // complete checkpoint tagged with `new_snapshot_id`.
+        //
+        // The checkpoint build scans `new_snapshot_id`'s Vortex files, so pin it
+        // against the retired-dir sweep first. A key-delete table compacts
+        // concurrently with its writers, so a writer can supersede this snapshot
+        // and the sweep unlink its files while the scan reads them. A NotFound here
+        // is only swallowed (the checkpoint is lost, not the data), but the pin
+        // avoids the wasted scan and keeps this read consistent with the rebuild
+        // reads. Pin-then-verify rather than the read fence, because this runs under
+        // `compaction_lock` and an `.await` under the fence would extend that hold
+        // (as in `pin_current_snapshot_for_compaction`). If the verify fails the
+        // snapshot is already superseded, so the checkpoint would be tagged a stale
+        // id and rejected on load — skip persisting it.
         if self.upsert_bloom_eligible() {
-            self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
-                .await;
+            let pin = SnapshotScanRef::new(
+                Arc::clone(&self.snapshot_scan_refs),
+                vec![new_snapshot_id.clone()],
+            );
+            if self.get_current_snapshot_id() == new_snapshot_id {
+                self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
+                    .await;
+            }
+            drop(pin);
         }
 
         // The fence guarantees no NEW plan-build sees the old listing table, and
