@@ -534,12 +534,14 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(body_string_contains("repositories"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"owner": {
-                "repositories": {
-                    "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
-                    "nodes": [{"id": "REPO_1", "name": "spiceai"}],
-                }
-            }}})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"owner": {
+                    "repositories": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                        "nodes": [{"id": "REPO_1", "name": "spiceai"}],
+                    }
+                }}})),
+            )
             .mount(&server)
             .await;
 
