@@ -263,18 +263,22 @@ impl PostWriteMaintenance {
     /// refuse. Being a count also makes it order-independent: two drains that
     /// finish out of order retire the same total either way.
     pub(crate) fn retire_applied_live_rows_deltas(&self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        // `saturating_sub` for the arithmetic alone: every retirement pairs
-        // with recorded deltas, but wrapping here would read as a permanently
-        // outstanding queue and strand the table on `Inexact`.
-        let _ = self.outstanding_live_rows_deltas.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |outstanding| Some(outstanding.saturating_sub(count)),
-        );
+        release_outstanding_live_rows_deltas(&self.outstanding_live_rows_deltas, count);
     }
+}
+
+/// Take `count` deltas off the outstanding tally.
+///
+/// `saturating_sub` for the arithmetic alone: every release pairs with a
+/// reservation, but wrapping here would read as a permanently outstanding queue
+/// and strand the table on `Inexact` for the life of the process.
+fn release_outstanding_live_rows_deltas(outstanding: &AtomicU64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        Some(remaining.saturating_sub(count))
+    });
 }
 
 /// A live-row delta counted as outstanding before the rows it describes become
@@ -307,12 +311,7 @@ impl OutstandingLiveRowsDelta {
 impl Drop for OutstandingLiveRowsDelta {
     fn drop(&mut self) {
         if let Some(outstanding) = self.outstanding.take() {
-            // `saturating_sub` for the arithmetic alone, as in
-            // `retire_applied_live_rows_deltas`: wrapping here would read as a
-            // permanently outstanding queue and strand the table on `Inexact`.
-            let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |outstanding| {
-                Some(outstanding.saturating_sub(1))
-            });
+            release_outstanding_live_rows_deltas(&outstanding, 1);
         }
     }
 }

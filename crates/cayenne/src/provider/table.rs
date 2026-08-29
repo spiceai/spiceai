@@ -47645,6 +47645,57 @@ mod tests {
         );
     }
 
+    /// Drive a write that is parked behind a lock the caller holds, until the
+    /// maintained row count stops being served as a provably exact one.
+    ///
+    /// Returns the first inexact reading. Completing is a panic rather than a
+    /// result: the write is supposed to be blocked, so if it finishes here the
+    /// park failed and the window under test never existed — a test that then
+    /// reported the count inexact would be reading the state *after* the
+    /// publish, which proves nothing about the ordering.
+    ///
+    /// `owed` names what the parked commit owes the count, for the timeout
+    /// message; a claim that never arrives is exactly the defect under test.
+    async fn drive_parked_write_until_count_is_inexact<F: std::future::Future>(
+        provider: &CayenneTableProvider,
+        mut write: std::pin::Pin<&mut F>,
+        owed: &str,
+    ) -> DFPrecision<usize> {
+        /// Generous: the write only has to be polled far enough to reach its
+        /// claim and block.
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            // `biased` so the write is polled first every pass: it has to be
+            // driven to reach its claim and park.
+            tokio::select! {
+                biased;
+                _ = &mut write => panic!(
+                    "the parked write completed while its lock was held, so the window this \
+                     test exists to close never existed"
+                ),
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+
+            let stats = provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present while the write is parked");
+            if matches!(stats.num_rows, DFPrecision::Inexact(_)) {
+                return stats.num_rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parked write never claimed its live-row delta: the maintained count is \
+                 still served as provably exact ({:?}) while a commit that has not published \
+                 yet owes it {owed}, so a reader landing after the publish folds COUNT(*) on a \
+                 short count",
+                stats.num_rows,
+            );
+        }
+    }
+
     /// A commit must claim its live-row delta *before* it publishes the rows
     /// that delta describes, not after.
     ///
@@ -47670,9 +47721,6 @@ mod tests {
     async fn a_staged_publish_claims_its_delta_before_the_rows_become_visible() {
         const SEED: i64 = 5;
         const STAGED: i64 = 3;
-        /// Generous: the finish future only has to reach its first await.
-        const PARKED_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) =
@@ -47718,38 +47766,12 @@ mod tests {
         let finish = staged.finish();
         tokio::pin!(finish);
 
-        let deadline = tokio::time::Instant::now() + PARKED_CLAIM_TIMEOUT;
-        let claimed = loop {
-            // `biased` so the finish future is polled first every pass: it has to
-            // be driven to reach its claim and park, and a completion here would
-            // mean the publish escaped the write lock and the test is measuring
-            // nothing.
-            tokio::select! {
-                biased;
-                finished = &mut finish => {
-                    panic!(
-                        "the staged publish completed while the write lock was held, so the \
-                         parked window never existed: {finished:?}"
-                    );
-                }
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
-            }
-
-            let stats = provider
-                .optimizer_table_statistics()
-                .expect("maintained stats present while the publish is parked");
-            if matches!(stats.num_rows, DFPrecision::Inexact(_)) {
-                break stats.num_rows;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the parked publish never claimed its live-row delta: the maintained count is \
-                 still served as provably exact ({:?}) while a commit that has not published \
-                 yet owes it {STAGED} rows, so a reader landing after the publish folds \
-                 COUNT(*) on a short count",
-                stats.num_rows,
-            );
-        };
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            finish.as_mut(),
+            &format!("{STAGED} staged rows"),
+        )
+        .await;
 
         // The claim landed before the rows did: still nothing but the seed is
         // visible, so this is the pre-publish window and not a late claim caught
@@ -47815,8 +47837,6 @@ mod tests {
     async fn an_insert_claims_its_delta_before_the_rows_become_visible() {
         const SEED: i64 = 4;
         const INSERTED: i64 = 6;
-        const PARKED_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) =
@@ -47849,39 +47869,20 @@ mod tests {
         );
         tokio::pin!(insert);
 
-        let deadline = tokio::time::Instant::now() + PARKED_CLAIM_TIMEOUT;
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut insert => panic!(
-                    "the insert completed while the visibility lock was held, so the parked \
-                     window never existed"
-                ),
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
-            }
-
-            let stats = provider
-                .optimizer_table_statistics()
-                .expect("maintained stats present while the insert is parked");
-            if matches!(stats.num_rows, DFPrecision::Inexact(_)) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the parked insert never claimed its live-row delta: the maintained count is \
-                 still served as provably exact ({:?}) while a commit that has not published \
-                 yet owes it {INSERTED} rows",
-                stats.num_rows,
-            );
-        }
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            insert.as_mut(),
+            &format!("{INSERTED} inserted rows"),
+        )
+        .await;
 
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "insert_delta_claim")
                 .await
                 .len(),
             usize::try_from(SEED).expect("row count fits usize"),
-            "the parked insert must not have made its rows visible yet, or the inexact reading \
-             above says nothing about the window this test exists to close",
+            "the parked insert must not have made its rows visible yet, or {claimed:?} says \
+             nothing about the window this test exists to close",
         );
 
         drop(park);
