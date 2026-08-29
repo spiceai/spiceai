@@ -28,6 +28,7 @@ subject="$script_dir/signoff"
 
 tests_run=0
 failures=0
+skipped=0
 
 fail_test() {
   failures=$((failures + 1))
@@ -354,6 +355,538 @@ fi
 # targeted work on, so the conditional entry is covered here too.
 assert_preflight_targets "every sign-off make target resolves in the repo's own Makefile" \
   "$(cd "$script_dir/.." && pwd)" 0 ""
+
+echo
+echo "preflight_lockfile"
+# The third preflight, and the third way to reach "the checks reached no
+# verdict": Cargo.lock no longer describes the manifests, so cargo has to rewrite
+# it before anything can build. A stub `cargo` stands in for the real resolution —
+# the question here is what the guard does with each answer cargo can give, and
+# resolving a 700-crate workspace for real would turn these tests into a build.
+lock_dir="$(mktemp -d)"
+trap 'rm -rf "$stub_dir" "$fixture_dir" "$lock_dir"' EXIT
+
+cargo_stub_dir="$lock_dir/bin"
+mkdir -p "$cargo_stub_dir"
+# STUB_CARGO_ERR is what cargo prints on stderr; STUB_CARGO_RC is its status.
+# Both default to a clean pass, so a case only states what it changes.
+cat >"$cargo_stub_dir/cargo" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ -n "${STUB_CARGO_ERR:-}" ]]; then
+  printf '%s\n' "${STUB_CARGO_ERR}" >&2
+fi
+exit "${STUB_CARGO_RC:-0}"
+STUB
+chmod +x "$cargo_stub_dir/cargo"
+
+
+# One assertion for all three lockfile entry points, since they differ only in
+# which snippet runs and which cargo is on PATH. $1 is the snippet, then the same
+# (name, dir, want_rc, want_output) contract as the other assert_ helpers, then
+# environment assignments for `env`.
+_assert_lock() {
+  local snippet="$1" name="$2" dir="$3" want_rc="$4" want_output="${5:-}"
+  shift 5
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result rc output
+  result="$(call_subject_in "$dir" "$snippet" GITHUB_STEP_SUMMARY="$summary" "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ -n "$want_output" ]]; then
+    if [[ "$output" != *"$want_output"* ]] && ! grep -qF "$want_output" "$summary"; then
+      fail_test "$name: expected '${want_output}' in the output or step summary, got '${output}' / '$(cat "$summary")'"
+      return
+    fi
+  fi
+  echo "  ok: $name"
+}
+
+# $3 is the exit status preflight_lockfile should return: 0 to proceed, 72 to stop.
+# The stub cargo answers, so each case states exactly what cargo said.
+assert_preflight_lock() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  _assert_lock 'preflight_lockfile' "$name" "$dir" "$want_rc" "$want_output" \
+    "PATH=$cargo_stub_dir:$PATH" "$@"
+}
+
+# Same, with PATH untouched so the *installed* cargo answers. Used by the drift
+# cases, which exist precisely to check what real cargo says rather than what the
+# stub was told to say.
+assert_preflight_lock_real() {
+  local name="$1" dir="$2" want_rc="$3" want_output="${4:-}"
+  shift 4
+  _assert_lock 'preflight_lockfile' "$name" "$dir" "$want_rc" "$want_output" "$@"
+}
+
+# Refuses to accept an explanation that should be absent. For the "cargo broke for
+# another reason" cases the failure worth guarding against is not a wrong status
+# but a wrong story: a guard that blames the lockfile for every cargo failure sends
+# the reader to regenerate a file that was never the problem.
+assert_preflight_lock_silent_on() {
+  local name="$1" dir="$2" unwanted="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local summary="$lock_dir/summary"
+  : >"$summary"
+
+  local result output
+  result="$(call_subject_in "$dir" 'preflight_lockfile' \
+    "PATH=$cargo_stub_dir:$PATH" GITHUB_STEP_SUMMARY="$summary" "$@")"
+  output="${result#*|}"
+
+  if [[ "$output" == *"$unwanted"* ]] || grep -qF "$unwanted" "$summary"; then
+    fail_test "$name: did not expect '${unwanted}', got '${output}' / '$(cat "$summary")'"
+    return
+  fi
+  echo "  ok: $name"
+}
+
+# A workspace as the guard sees one: a manifest, and a lockfile beside it. Both
+# files matter — the guard keys "is this a Cargo workspace" on Cargo.toml, because
+# the absence of Cargo.lock is the condition it reports rather than an exemption.
+with_lock_dir="$lock_dir/with-lock"
+mkdir -p "$with_lock_dir"
+printf '[workspace]\n' >"$with_lock_dir/Cargo.toml"
+printf 'version = 4\n' >"$with_lock_dir/Cargo.lock"
+# Neither file: not a Cargo workspace, so the guard has no question to ask here.
+no_lock_dir="$lock_dir/no-lock"
+mkdir -p "$no_lock_dir"
+
+# The wording cargo 1.96 uses, and the wording earlier releases used. The guard
+# matches on `--locked was passed` rather than either whole sentence: pinned to
+# one phrasing it would silently stop guarding on a toolchain bump, and both
+# spellings name the flag.
+readonly LOCKED_REFUSAL='error: cannot update the lock file /w/Cargo.lock because --locked was passed to prevent this'
+readonly LOCKED_REFUSAL_OLD='error: the lock file /w/Cargo.lock needs to be updated but --locked was passed to prevent this'
+
+assert_preflight_lock "proceeds when the lockfile still matches" "$with_lock_dir" 0 ""
+# A directory with no manifest is not one this guard has an opinion about — and it
+# must not become one just because cargo would have refused had it been asked.
+assert_preflight_lock "proceeds where there is no Cargo.toml at all" "$no_lock_dir" 0 "" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+
+# The shape this exists for: one PR bumps the version in [workspace.package]
+# while another adds a member, git merges both cleanly because they touch
+# different regions of the lockfile, and the combination is stale. Neither author
+# can see it, because on a pull request `Attestation` is the only job that runs.
+assert_preflight_lock "stops a branch whose lockfile is stale" "$with_lock_dir" 72 \
+  "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+assert_preflight_lock "recognises the older cargo wording too" "$with_lock_dir" 72 \
+  "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_OLD"
+assert_preflight_lock "says where the cost lands if this is not fixed" "$with_lock_dir" 72 \
+  "only after the whole suite has run" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+assert_preflight_lock "names a command that actually regenerates the lockfile" "$with_lock_dir" 72 \
+  "cargo update --workspace" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+# Fatal locally as well as remotely: unlike the disk floor this is not a
+# threshold someone may reasonably run under, it is a step certain to fail after
+# the whole gate has run.
+assert_preflight_lock "stops a local run as well as a remote one" "$with_lock_dir" 72 \
+  "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+# The annotation is deliberately not worded as a sign-off verdict: this guard now
+# also runs from pr.yml Build and Test, where "the branch was not evaluated" would
+# be false. It fires in any Actions job, not only a remote sign-off, for the same
+# reason.
+assert_preflight_lock "annotates the stop for the run page in a sign-off run" "$with_lock_dir" 72 \
+  "::error title=Cargo.lock does not match the manifests::" \
+  SIGNOFF_REMOTE_RUN=1 STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+
+# The other direction, and the one that matters more. An unreachable registry, a
+# manifest cargo cannot parse, a missing rustc — the gate itself reports all of
+# those minutes later with context this step does not have.
+assert_preflight_lock "proceeds when cargo failed for another reason" "$with_lock_dir" 0 \
+  "could not check whether Cargo.lock is current" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
+assert_preflight_lock_silent_on "does not call an unrelated cargo failure a stale lockfile" \
+  "$with_lock_dir" "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: failed to get 'serde' as a dependency: network unreachable"
+# `--locked` appearing in unrelated output is not cargo refusing to rewrite the
+# lock; the refusal names the flag as *passed*.
+assert_preflight_lock "does not read a mention of --locked as a refusal" "$with_lock_dir" 0 \
+  "could not check whether Cargo.lock is current" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="error: unexpected argument '--locked-x' found"
+
+# No cargo at all is the same class of answer as no lockfile: the guard has
+# nothing to read, and refusing a sign-off over its own missing tool would be a
+# check deciding a verdict it never computed.
+#
+# The PATH below keeps bash reachable and drops cargo. It cannot simply be
+# emptied: call_subject_in runs the subject through `env PATH=... bash -c`, so a
+# PATH without bash fails to start the shell at all and the case would pass for
+# the wrong reason. Naming the directory bash itself came from keeps that
+# independent of where this runs, and cargo lives under ~/.cargo/bin rather than
+# beside bash.
+bash_dir="$(dirname "$(command -v bash)")"
+assert_preflight_lock "proceeds when cargo is unavailable" "$with_lock_dir" 0 "" \
+  "PATH=$bash_dir"
+
+
+# A missing lockfile is a `--locked` violation in cargo's own terms, not an absence
+# of one, and it needs to be: `git diff` cannot see it, so the pr.yml backstop
+# would pass a branch that deleted Cargo.lock and let the first cargo command
+# recreate it untracked. Cargo words it "cannot create" rather than "cannot
+# update", which is why the guard matches the flag and not a phrase.
+readonly LOCKED_REFUSAL_MISSING='error: cannot create the lock file /w/Cargo.lock because --locked was passed to prevent this'
+assert_preflight_lock "stops a workspace whose lockfile is missing" "$with_lock_dir" 72 \
+  "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_MISSING"
+
+# Cargo's own words are quoted rather than paraphrased: which of the two cases this
+# is — stale or absent — is in that text and nowhere else in the output.
+assert_preflight_lock "quotes what cargo actually said" "$with_lock_dir" 72 \
+  "cannot create the lock file" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL_MISSING"
+
+
+# Drift detector. Everything above feeds the guard hand-written strings, so none of
+# it would notice cargo rewording its `--locked` diagnostic — the guard would stop
+# guarding, silently, on a toolchain bump. These cases drive a real cargo against
+# fixtures that really are stale and really are missing a lockfile.
+#
+# The toolchain matters and is easy to get wrong: rustup picks a toolchain from the
+# *current directory's* rust-toolchain.toml, so a fixture under $TMPDIR gets the
+# runner's default cargo rather than the one this repository pins — measured on one
+# machine as 1.97.1 in the temp directory against the pinned 1.96.1 at the repo
+# root. Testing the wrong cargo's wording is indistinguishable from testing none,
+# so RUSTUP_TOOLCHAIN is set from rust-toolchain.toml explicitly.
+#
+# And a skip is not a pass. In CI, being unable to exercise this is fatal: the whole
+# point is that the guard cannot quietly stop working, and "the fixture did not run"
+# is exactly how it would.
+lock_repo_root="$(cd "$script_dir/.." && pwd)"
+lock_pinned_toolchain=""
+if [[ -f "$lock_repo_root/rust-toolchain.toml" ]]; then
+  lock_pinned_toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' \
+    "$lock_repo_root/rust-toolchain.toml")"
+fi
+
+# Report a fixture that could not run. Fatal under GITHUB_ACTIONS, where a silent
+# skip would retire the check; a local developer without the pinned toolchain
+# installed gets a loud notice and keeps working.
+lock_fixture_unavailable() {
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    fail_test "cargo drift fixture could not run in CI: $1"
+  else
+    skipped=$((skipped + 1))
+    echo "  SKIP: $1"
+  fi
+}
+
+if [[ -z "$lock_pinned_toolchain" ]]; then
+  lock_fixture_unavailable "no channel found in rust-toolchain.toml, so the pinned cargo cannot be selected"
+elif ! RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" cargo --version >/dev/null 2>&1; then
+  lock_fixture_unavailable "the pinned toolchain ${lock_pinned_toolchain} is not installed here"
+else
+  echo "  (cargo drift fixture pinned to ${lock_pinned_toolchain}: $(RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" cargo --version))"
+  real_dir="$lock_dir/real-cargo"
+  mkdir -p "$real_dir/src"
+  printf 'fn main() {}\n' >"$real_dir/src/main.rs"
+  # `[workspace]` in the fixture's own manifest so it is its own workspace root
+  # wherever it sits, rather than a stray member of whatever encloses it.
+  write_fixture_manifest() {
+    printf '[workspace]\n\n[package]\nname = "lockdrift"\nversion = "%s"\nedition = "2021"\n\n[dependencies]\n' \
+      "$1" >"$real_dir/Cargo.toml"
+  }
+
+  # No lockfile yet — the missing case, before one is generated. Cargo words this
+  # "cannot create" rather than "cannot update", which is why the guard matches the
+  # flag and not a phrase.
+  write_fixture_manifest 0.2.0
+  assert_preflight_lock_real "the pinned cargo refuses a missing lockfile" \
+    "$real_dir" 72 "does not describe the workspace manifests" \
+    RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+
+  if (cd "$real_dir" && RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" \
+      cargo generate-lockfile --offline >/dev/null 2>&1); then
+    assert_preflight_lock_real "the pinned cargo accepts a matching lockfile" \
+      "$real_dir" 0 "" RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+    # Bump the version the lockfile just recorded, so the lock is stale in exactly
+    # the way #13598's merge was.
+    write_fixture_manifest 0.3.0
+    assert_preflight_lock_real "the pinned cargo's stale-lock refusal is recognised" \
+      "$real_dir" 72 "does not describe the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+  else
+    lock_fixture_unavailable "cargo generate-lockfile --offline failed, so the stale-lock fixture could not be built"
+  fi
+
+  # Invoked from a member directory rather than the workspace root. Cargo walks up
+  # and reads the root lockfile, so the guard must not read "no lockfile beside me"
+  # as "this branch has no lockfile" — that would refuse every sign-off run from a
+  # subdirectory with a diagnosis that is simply false.
+  #
+  # Its own two-level fixture, not a member of *this* repository. Running the guard
+  # from `crates/<x>` would walk up to the real root and resolve the whole
+  # workspace — ~2,000 locked packages across dozens of Git sources — in a job that
+  # restores no Cargo cache and allows 20 minutes. Worse, the assertion below pins
+  # the success message, and an unreachable registry makes `preflight_lockfile`
+  # fail *open* with a different one: the case would go red on a network hiccup,
+  # reporting a guard regression that had not happened. A fixture with no
+  # dependencies answers the same question offline in milliseconds.
+  #
+  # The fixture has to satisfy three conditions the case is worthless without:
+  #
+  #   - the member needs a manifest. Without one the guard returns at its `[[ -f
+  #     Cargo.toml ]]` line before cargo is invoked at all, and the case asserts
+  #     the exit status of a code path that never ran — which is what it did.
+  #   - the member must not declare `[workspace]`. Such a crate is its own
+  #     workspace root, so cargo stops there rather than walking up.
+  #   - the member must have no `Cargo.lock` beside it, or there is no walk-up.
+  #
+  # And the assertion pins the *message*, not just the status: both the walk-up and
+  # the no-manifest short-circuit return 0, so the status alone cannot tell a
+  # working case from a vacuous one.
+  walkup_root="$lock_dir/walkup"
+  walkup_member="$walkup_root/member"
+  mkdir -p "$walkup_member/src"
+  printf 'fn main() {}\n' >"$walkup_member/src/main.rs"
+  printf '[workspace]\nmembers = ["member"]\n' >"$walkup_root/Cargo.toml"
+  printf '[package]\nname = "lockwalk"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' \
+    >"$walkup_member/Cargo.toml"
+  if (cd "$walkup_root" && RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" \
+      cargo generate-lockfile --offline >/dev/null 2>&1); then
+    assert_preflight_lock_real "reads the root lockfile from a member directory" \
+      "$walkup_member" 0 "still describes the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain" SIGNOFF_DEBUG=1
+    # And it is the *root* lockfile it read. Without this, a guard that ignored the
+    # lockfile entirely from a member directory would pass the case above: remove
+    # the root lock and the same invocation has to refuse.
+    mv "$walkup_root/Cargo.lock" "$walkup_root/Cargo.lock.bak"
+    assert_preflight_lock_real "refuses from a member when the root lockfile is missing" \
+      "$walkup_member" 72 "does not describe the workspace manifests" \
+      RUSTUP_TOOLCHAIN="$lock_pinned_toolchain"
+    mv "$walkup_root/Cargo.lock.bak" "$walkup_root/Cargo.lock"
+  else
+    lock_fixture_unavailable "cargo generate-lockfile --offline failed for the walk-up fixture, so the member-directory case could not run"
+  fi
+fi
+
+
+# pr.yml runs this guard rather than carrying its own copy, which is the only
+# reason there is one wording to keep correct instead of two. If that call is ever
+# replaced by an inline cargo invocation the two will drift, and the one that
+# drifts is the one nobody notices has stopped guarding.
+tests_run=$((tests_run + 1))
+if grep -q 'signoff preflight-lockfile' "$lock_repo_root/.github/workflows/pr.yml"; then
+  echo "  ok: pr.yml runs scripts/signoff preflight-lockfile"
+else
+  fail_test ".github/workflows/pr.yml no longer runs 'signoff preflight-lockfile'"
+fi
+
+# ...and the subcommand it names has to exist and reach the guard. Run as a
+# command rather than sourced, so the dispatch table is covered too — the same
+# shape as the preflight-disk subcommand cases below.
+assert_preflight_lockfile_cmd() {
+  local name="$1" dir="$2" want_rc="$3" want_out="$4"
+  shift 4
+  tests_run=$((tests_run + 1))
+
+  local output rc
+  output="$(cd "$dir" && env "PATH=$cargo_stub_dir:$PATH" "$@" \
+    bash "$subject" preflight-lockfile 2>&1)"
+  rc=$?
+
+  if [[ "$rc" -ne "$want_rc" ]]; then
+    fail_test "$name: expected exit ${want_rc}, got ${rc} (output: '${output}')"
+  elif [[ -n "$want_out" && "$output" != *"$want_out"* ]]; then
+    fail_test "$name: expected '${want_out}' in the output, got '${output}'"
+  else
+    echo "  ok: $name"
+  fi
+}
+
+assert_preflight_lockfile_cmd "the subcommand passes a matching lockfile" \
+  "$with_lock_dir" 0 ""
+assert_preflight_lockfile_cmd "the subcommand stops a stale lockfile" \
+  "$with_lock_dir" 72 "does not describe the workspace manifests" \
+  STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+# The annotation has to reach a plain Actions job, not only a remote sign-off:
+# pr.yml's Build and Test is not a sign-off run, and its failure summary is what
+# the author reads.
+assert_preflight_lockfile_cmd "the subcommand annotates a plain Actions job" \
+  "$with_lock_dir" 72 "::error title=Cargo.lock does not match the manifests::" \
+  GITHUB_ACTIONS=true STUB_CARGO_RC=101 STUB_CARGO_ERR="$LOCKED_REFUSAL"
+
+# And the preflight has to actually be wired into the gate: a function nothing
+# calls is a test suite passing over dead code.
+tests_run=$((tests_run + 1))
+if awk '/^run_checks\(\) \{/{f=1} f && /preflight_lockfile \|\| return/{found=1} f && /^\}/{exit} END{exit !found}' \
+  "$subject"; then
+  echo "  ok: run_checks invokes preflight_lockfile"
+else
+  fail_test "run_checks no longer invokes preflight_lockfile"
+fi
+tests_run=$((tests_run + 1))
+if awk '/^run_checks\(\) \{/{f=1} f && /postcheck_lockfile "\$lock_before" \|\| return/{found=1} f && /^\}/{exit} END{exit !found}' \
+  "$subject"; then
+  echo "  ok: run_checks invokes postcheck_lockfile"
+else
+  fail_test "run_checks no longer invokes postcheck_lockfile"
+fi
+
+echo
+echo "postcheck_lockfile"
+# The other half of the preflight, and the reason the preflight is allowed to fail
+# open: `lint-rust` and `nextest` invoke cargo *without* `--locked`, so on a cargo
+# error the preflight could not read, cargo quietly brings the lockfile up to date
+# while the gate runs — and the run would then post `signoff=success` for a HEAD
+# whose committed lockfile does not describe it.
+#
+# Driven against a real git repository rather than a stub `git`: the distinction
+# that matters is between git's own notions of modified, deleted and untracked,
+# which is precisely what a stub would have to reimplement to be worth anything.
+postcheck_repo=""
+if command -v git >/dev/null 2>&1; then
+  postcheck_repo="$lock_dir/postcheck-repo"
+  mkdir -p "$postcheck_repo"
+  (
+    cd "$postcheck_repo" || exit 1
+    git init -q .
+    git config user.email t@example.com
+    git config user.name Test
+    printf 'version = 4\n' >Cargo.lock
+    printf '[workspace]\n' >Cargo.toml
+    git add Cargo.lock Cargo.toml
+    git commit -qm init
+  ) >/dev/null 2>&1 || postcheck_repo=""
+fi
+
+# $3 is the exit status postcheck_lockfile should return, $4 the snapshot to
+# compare against.
+assert_postcheck() {
+  local name="$1" dir="$2" want_rc="$3" before="$4" want_output="${5:-}"
+  shift 5
+  _assert_lock "postcheck_lockfile '${before}'" "$name" "$dir" "$want_rc" "$want_output" "$@"
+}
+
+# The snapshot the way run_checks takes it: through the subject's own function, so
+# these cases cannot drift from what production compares.
+postcheck_snapshot() {
+  (cd "$1" && bash -c 'source "$1"; lockfile_fingerprint' _ "$subject" 2>/dev/null)
+}
+
+if [[ -z "$postcheck_repo" ]]; then
+  lock_fixture_unavailable "could not create a git fixture, so postcheck_lockfile was not exercised"
+else
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  assert_postcheck "passes when the checks left the lockfile alone" "$postcheck_repo" 0 "$lock_snap" ""
+  printf '\n# rewritten by cargo\n' >>"$postcheck_repo/Cargo.lock"
+  assert_postcheck "refuses a lockfile the checks rewrote" "$postcheck_repo" 73 "$lock_snap" \
+    "rewrote Cargo.lock"
+  assert_postcheck "says the committed lockfile no longer describes the tree" \
+    "$postcheck_repo" 73 "$lock_snap" "does not"
+
+  # `signoff -f` on a tree that was already carrying lockfile edits. Both halves
+  # matter, and only a content snapshot can tell them apart — the tree reads
+  # ` M Cargo.lock` in both:
+  #
+  #   - the run is judged on what *it* changed, not on what it inherited, so an
+  #     edit already in the tree is not a refusal…
+  #   - …but a *further* rewrite by the checks is, and that is the case a porcelain
+  #     comparison silently passed.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  assert_postcheck "ignores lockfile edits the tree already carried" "$postcheck_repo" 0 \
+    "$lock_snap" ""
+  printf '\n# and again, by the gate\n' >>"$postcheck_repo/Cargo.lock"
+  assert_postcheck "refuses a further rewrite of an already-modified lockfile" \
+    "$postcheck_repo" 73 "$lock_snap" "rewrote Cargo.lock"
+
+  # A lockfile deleted in the commit and recreated by cargo is untracked, not
+  # modified — the state `git diff` cannot see, which is why lockfile_status asks
+  # for --untracked-files=all.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  (cd "$postcheck_repo" && git rm -q --cached Cargo.lock && printf 'version = 4\n' >Cargo.lock) >/dev/null 2>&1
+  assert_postcheck "notices a lockfile deleted and recreated untracked" "$postcheck_repo" 73 \
+    "$lock_snap" "rewrote Cargo.lock"
+
+  # And a lockfile the checks deleted outright: `absent` is a fingerprint like any
+  # other, so this needs no special case in the guard — but it does need a case
+  # here, because it is the one state a digest comparison could get wrong.
+  lock_snap="$(postcheck_snapshot "$postcheck_repo")"
+  rm -f "$postcheck_repo/Cargo.lock"
+  assert_postcheck "notices a lockfile the checks deleted" "$postcheck_repo" 73 \
+    "$lock_snap" "rewrote Cargo.lock"
+  printf 'version = 4\n' >"$postcheck_repo/Cargo.lock"
+fi
+
+# The same guard where Git cannot answer at all: a directory that is not a
+# repository stands in for the supported non-colocated JJ workspace, which has no
+# `.git`. lockfile_status is empty here both before and after, so a porcelain
+# comparison sees two equal strings and passes — the hole this fixture exists to
+# keep closed. It runs whether or not git is installed, and needs no fixture repo.
+postcheck_nogit="$lock_dir/postcheck-nogit"
+mkdir -p "$postcheck_nogit"
+printf 'version = 4\n' >"$postcheck_nogit/Cargo.lock"
+lock_snap="$(postcheck_snapshot "$postcheck_nogit")"
+assert_postcheck "passes outside a git repository when the lockfile is untouched" \
+  "$postcheck_nogit" 0 "$lock_snap" ""
+printf '\n# rewritten by cargo\n' >>"$postcheck_nogit/Cargo.lock"
+assert_postcheck "refuses a rewrite outside a git repository" \
+  "$postcheck_nogit" 73 "$lock_snap" "rewrote Cargo.lock"
+
+echo
+echo "lockfile_fingerprint"
+# The snapshot the post-check compares. Its one forbidden answer is the empty
+# string: two of those are equal, so an empty answer does not weaken the guard, it
+# removes it.
+assert_fingerprint() {
+  local name="$1" dir="$2" want="$3"
+  tests_run=$((tests_run + 1))
+  local got
+  got="$(postcheck_snapshot "$dir")"
+  if [[ -z "$got" ]]; then
+    fail_test "$name: fingerprint was empty, which compares equal to any other empty answer"
+    return
+  fi
+  case "$want" in
+    absent) [[ "$got" == "absent" ]] || { fail_test "$name: expected 'absent', got '${got}'"; return; } ;;
+    present) [[ "$got" != "absent" ]] || { fail_test "$name: expected a digest, got 'absent'"; return; } ;;
+  esac
+  echo "  ok: $name"
+}
+
+fingerprint_dir="$lock_dir/fingerprint"
+mkdir -p "$fingerprint_dir"
+assert_fingerprint "answers 'absent' with no lockfile" "$fingerprint_dir" absent
+printf 'version = 4\n' >"$fingerprint_dir/Cargo.lock"
+assert_fingerprint "answers a digest for a lockfile that exists" "$fingerprint_dir" present
+
+tests_run=$((tests_run + 1))
+fingerprint_a="$(postcheck_snapshot "$fingerprint_dir")"
+printf '\n# one more line\n' >>"$fingerprint_dir/Cargo.lock"
+fingerprint_b="$(postcheck_snapshot "$fingerprint_dir")"
+if [[ "$fingerprint_a" != "$fingerprint_b" ]]; then
+  echo "  ok: the digest moves when the content does"
+else
+  fail_test "the digest did not move when Cargo.lock changed (both: ${fingerprint_a})"
+fi
+
+# Content, not mtime: a rewrite that restores the original bytes is not a rewrite
+# the merge queue would reject, and a digest that moved on touch alone would refuse
+# every run whose checks rewrote the lockfile identically.
+tests_run=$((tests_run + 1))
+printf 'version = 4\n' >"$fingerprint_dir/Cargo.lock"
+if [[ "$(postcheck_snapshot "$fingerprint_dir")" == "$fingerprint_a" ]]; then
+  echo "  ok: the digest is of content, not of mtime"
+else
+  fail_test "the digest changed for identical content, so it reads mtime rather than bytes"
+fi
 
 echo
 echo "run_make_step + build_hit_disk_full"
@@ -723,6 +1256,39 @@ assert_failure_kind "keeps a missing make target distinct with a cache hit recor
 # ...and it must not swallow a genuinely signalled run, which is decided first.
 assert_failure_kind "a signalled run stays signalled, not a missing target" 143 "signalled" \
   STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The fourth way, and the newest: the lockfile preflight refused to start because
+# Cargo.lock no longer describes the manifests. Same requirement as
+# missing-target — it must stay distinct from "checks", or the status reads as a
+# lint denial for a run that compiled nothing at all.
+assert_failure_kind "calls a stale lockfile its own kind, not a check failure" 72 "stale-lockfile" \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+# The preflight refused before anything ran, so no later reading may overrule it.
+assert_failure_kind "keeps a stale lockfile distinct on a near-empty volume" 72 "stale-lockfile" \
+  STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a stale lockfile distinct with a cache hit recorded" 72 "stale-lockfile" \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and it must not swallow a genuinely signalled run, which is decided first.
+assert_failure_kind "a signalled run stays signalled, not a stale lockfile" 72 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The fifth way, and the only one that follows a suite that *passed*: the
+# post-check found the checks had rewritten Cargo.lock. It must not share
+# stale-lockfile's status, because that kind publishes "the checks did not run"
+# — false here, and the reason this distinction exists at all.
+assert_failure_kind "calls a rewritten lockfile its own kind, not a stale one" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "keeps a rewritten lockfile distinct from a check failure" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 200)"
+# The post-check read the file itself, so no later reading may overrule it —
+# including a watched build's, which by definition ran and passed here.
+assert_failure_kind "keeps a rewritten lockfile distinct on a near-empty volume" 73 \
+  "rewritten-lockfile" STUB_FREE_KB="$(gib_to_kb 1)"
+assert_failure_kind "keeps a rewritten lockfile distinct with a cache hit recorded" 73 \
+  "rewritten-lockfile" SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and, as for every other named cause, "no verdict" still outranks it.
+assert_failure_kind "a signalled run stays signalled, not a rewritten lockfile" 73 "signalled" \
+  SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -915,6 +1481,35 @@ assert_describe() {
   echo "  ok: $name"
 }
 
+# What a verdict must *not* say. The two lockfile kinds are distinguished by
+# exactly this: sharing a status made the post-check publish the preflight's
+# "the checks did not run", so a positive assertion on the new wording would not
+# have caught the bug — only an assertion that the old wording is absent does.
+assert_describe_lacks() {
+  local name="$1" check_status="$2" forbidden="$3"
+  shift 3
+  tests_run=$((tests_run + 1))
+
+  local result rc output
+  result="$(call_subject \
+    "describe_check_failure ${check_status} 21195 someone
+     printf 'DESC[%s]\nMSG[%s]\nSUM[%s]\n' \
+       \"\$SIGNOFF_FAILURE_STATUS_DESC\" \"\$SIGNOFF_FAILURE_MESSAGE\" \"\$SIGNOFF_FAILURE_SUMMARY\"" \
+    "$@")"
+  rc="${result%%|*}"
+  output="${result#*|}"
+
+  if [[ "$rc" -ne 0 ]]; then
+    fail_test "$name: expected exit 0, got ${rc} (output: ${output})"
+    return
+  fi
+  if [[ "$output" == *"${forbidden}"* ]]; then
+    fail_test "$name: verdict must not contain '${forbidden}', got: ${output}"
+    return
+  fi
+  echo "  ok: $name"
+}
+
 # The regression, stated as the contract: run 30942941645 on PR #12448 timed out
 # with the suite still passing, and published "Sign-off checks failed after
 # 21195s" — a code failure that had not happened, on top of a `signoff=success`
@@ -971,6 +1566,39 @@ assert_describe "tells the author to merge trunk in" 71 \
 # reached one.
 assert_describe "declines the missing-target verdict for a signalled run" 71 "" \
   "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# A branch whose lockfile is stale has the same problem as one that predates a
+# gate target: the commit-status description is all most readers see, and worded
+# as a check failure it sends them looking for a lint denial in a log containing
+# no compilation. The remedy has to be in the description itself.
+assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
+  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "names the command that regenerates the lockfile" 72 \
+  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
+# And, as for missing-target, "no verdict" outranks naming a cause.
+assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
+  "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The post-check's refusal is the one that follows a *passing* suite, and its
+# whole reason for having a status of its own is that the two must read
+# differently. Both halves are asserted: what it does say, and what it must not.
+assert_describe "says a rewritten lockfile passed its checks, not that they failed" 73 \
+  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "the checks passed" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe "names committing the regenerated lockfile as the remedy" 73 \
+  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "commit the regenerated Cargo.lock and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
+# The regression this distinction exists to prevent, stated as a contract: the
+# post-check must never publish the preflight's "did not run" wording.
+assert_describe_lacks "does not claim the checks did not run for a rewritten lockfile" 73 \
+  "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not claim the branch was not evaluated for a rewritten lockfile" 73 \
+  "the branch was not evaluated" STUB_FREE_KB="$(gib_to_kb 200)"
+# ...and "no verdict" outranks this cause too.
+assert_describe "declines the rewritten-lockfile verdict for a signalled run" 73 "" \
+  "the checks reached no verdict" SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
 echo
 
 # `08` passes the digit regex, but bash arithmetic reads a leading zero as
@@ -1024,4 +1652,8 @@ if [[ "$failures" -gt 0 ]]; then
   echo "${failures} of ${tests_run} tests failed"
   exit 1
 fi
-echo "all ${tests_run} tests passed"
+if [[ "$skipped" -gt 0 ]]; then
+  echo "all ${tests_run} tests passed (${skipped} group(s) skipped — see SKIP lines above)"
+else
+  echo "all ${tests_run} tests passed"
+fi

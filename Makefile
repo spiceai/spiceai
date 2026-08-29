@@ -280,6 +280,10 @@ lint-rust:
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	python3 scripts/test_check_module_reachability.py
 	python3 scripts/check_module_reachability.py
+	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
+	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
+	python3 scripts/test_check_fork_patches.py
+	python3 scripts/check_fork_patches.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
