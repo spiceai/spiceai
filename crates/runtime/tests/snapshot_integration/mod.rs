@@ -1902,7 +1902,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1910,7 +1910,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1918,7 +1918,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -1926,7 +1926,7 @@ async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> 
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -2024,7 +2024,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -2032,7 +2032,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             runtime
                 .datafusion()
@@ -2040,7 +2040,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .await
                 .expect("Table refresh")
                 .expect("Notify")
-                .notified()
+                .wait()
                 .await;
             tokio::time::sleep(Duration::from_secs(10)).await;
 

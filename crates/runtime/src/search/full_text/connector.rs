@@ -17,9 +17,6 @@ use crate::dataconnector::ConnectorContext;
 use async_trait::async_trait;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
-use search::generation::text_search::index::FullTextDatabaseIndex;
-use search::index::chunking::ChunkedSearchIndex;
-use search::index::compound::CompoundSearchIndex;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -28,7 +25,7 @@ use crate::component::dataset::DatasetSpec;
 use crate::component::{ComponentInitialization, dataset::acceleration::RefreshMode};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
-use crate::search::full_text::table::add_full_text_search_to_table;
+use crate::search::full_text::table::{add_full_text_search_to_table, dataset_attaches_stream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use futures::StreamExt;
@@ -64,19 +61,6 @@ impl FullTextConnector {
         // This is required so that the index layer can be peeled in both cases —
         // whether or not there is an `EmbeddingConnector` underneath.
         let all_indexes = indexed_table.indexes().to_vec();
-
-        // A full-text index written by this change stream must not defer its commits
-        // to the sink write lifecycle: the two share one tantivy writer, so a window
-        // commit would publish a partial refresh and a window rollback would discard
-        // these change-stream documents. A layer's indexes come back
-        // whatever was registered, unpeeled, so the tantivy tier can be reached only
-        // indirectly — nested as the primary of a `CompoundSearchIndex` (the warm/external
-        // full-text compound, registered in place of its tiers) or wrapped in a
-        // `ChunkedSearchIndex` — so peel through those to reach it.
-        for index in &all_indexes {
-            mark_full_text_cdc_attached(index.as_any());
-        }
-
         let below = Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
         Some((Indexes::new(all_indexes), below))
     }
@@ -86,24 +70,6 @@ impl FullTextConnector {
         stream
             .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
             .boxed()
-    }
-}
-
-/// Marks the [`FullTextDatabaseIndex`] reachable from `index` as CDC-attached, so it never
-/// opens a deferred-commit window that a change stream's writes could be rolled back out of.
-///
-/// `index` may not be a `FullTextDatabaseIndex` itself — the warm/external full-text compound
-/// registers a `CompoundSearchIndex` in its place, with the tantivy tier nested as its primary
-/// (or, in principle, wrapped in a `ChunkedSearchIndex`) — so this peels through the composing
-/// index types that can hold one before giving up.
-fn mark_full_text_cdc_attached(index: &dyn Any) {
-    if let Some(full_text) = index.downcast_ref::<FullTextDatabaseIndex>() {
-        full_text.mark_cdc_attached();
-    } else if let Some(compound) = index.downcast_ref::<CompoundSearchIndex>() {
-        mark_full_text_cdc_attached(compound.primary().as_any());
-        mark_full_text_cdc_attached(compound.secondary().as_any());
-    } else if let Some(chunked) = index.downcast_ref::<ChunkedSearchIndex>() {
-        mark_full_text_cdc_attached(chunked.inner().as_any());
     }
 }
 
@@ -120,14 +86,19 @@ impl DataConnector for FullTextConnector {
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(context, dataset).await?;
-        add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
-            .map(|idx| idx as Arc<dyn TableProvider>)
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: dataset.source().to_string(),
-                message: e.to_string(),
-                connector_component: dataset.into(),
-                source: e,
-            })
+        add_full_text_search_to_table(
+            &inner,
+            &dataset.columns,
+            &dataset.name,
+            dataset_attaches_stream(&self.inner_connector, dataset),
+        )
+        .map(|idx| idx as Arc<dyn TableProvider>)
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: e,
+        })
     }
 
     async fn read_write_provider(
@@ -141,14 +112,19 @@ impl DataConnector for FullTextConnector {
             .await
         {
             Some(Ok(inner)) => Some(
-                add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
-                    .map(|idx| idx as Arc<dyn TableProvider>)
-                    .map_err(|e| DataConnectorError::InvalidConfiguration {
-                        dataconnector: dataset.source().to_string(),
-                        message: e.to_string(),
-                        connector_component: dataset.into(),
-                        source: e,
-                    }),
+                add_full_text_search_to_table(
+                    &inner,
+                    &dataset.columns,
+                    &dataset.name,
+                    dataset_attaches_stream(&self.inner_connector, dataset),
+                )
+                .map(|idx| idx as Arc<dyn TableProvider>)
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: dataset.source().to_string(),
+                    message: e.to_string(),
+                    connector_component: dataset.into(),
+                    source: e,
+                }),
             ),
             Some(Err(e)) => Some(Err(e)),
             None => None,
@@ -212,6 +188,18 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
+        self.inner_connector
+            .write_back_deliverer(context, dataset)
+            .await
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,
@@ -255,8 +243,9 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::datasource::MemTable;
     use futures::TryStreamExt;
+    use search::generation::text_search::index::FullTextDatabaseIndex;
     use search::index::SearchIndex;
-    use search::index::compound::CompoundReadMode;
+    use search::index::compound::{CompoundReadMode, CompoundSearchIndex};
     use spice_table::{Index, WriteWindow};
 
     fn test_table() -> Arc<dyn TableProvider> {
@@ -268,33 +257,32 @@ mod tests {
         )
     }
 
-    fn full_text_tier() -> FullTextDatabaseIndex {
+    fn full_text_tier(stream_attached: bool) -> FullTextDatabaseIndex {
         FullTextDatabaseIndex::try_new(
             test_table(),
             vec!["content".to_string()],
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            stream_attached,
         )
         .expect("failed to create FullTextDatabaseIndex")
     }
 
     /// Regression test for #12061: the warm/external full-text tier registers a
-    /// `CompoundSearchIndex` in place of its tiers, so `IndexLayer::get_all_indexes`
-    /// never surfaces the nested `FullTextDatabaseIndex` directly. `mark_full_text_cdc_attached`
-    /// has to peel through the compound to reach it, or the tantivy tier keeps deferring
-    /// commits and a failed refresh discards change-stream documents for good.
+    /// `CompoundSearchIndex` in place of its tiers, so a caller reaching the tantivy tier
+    /// through the compound must have told it at construction whether a CDC/append stream
+    /// will attach — a tier built with `stream_attached = false` keeps deferring commits and a
+    /// failed refresh discards change-stream documents for good.
     #[tokio::test]
-    async fn mark_full_text_cdc_attached_reaches_compound_primary() {
-        let warm = full_text_tier();
+    async fn stream_attached_warm_tier_never_defers_commits_through_compound() {
+        let warm = full_text_tier(true);
         let compound = CompoundSearchIndex::try_new(
             Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
-            Arc::new(full_text_tier()) as Arc<dyn SearchIndex>,
+            Arc::new(full_text_tier(false)) as Arc<dyn SearchIndex>,
             CompoundReadMode::PrimaryOnly,
         )
         .expect("two full-text tiers over the same table are compatible");
-
-        mark_full_text_cdc_attached(&compound);
 
         // A sink-driven refresh opens a write window on both tiers.
         compound

@@ -22,9 +22,10 @@ use app::AppBuilder;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use runtime::Runtime;
 use runtime::{
-    component::dataset::Dataset as RuntimeDataset,
-    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
+    component::dataset::Dataset as RuntimeDataset, dataaccelerator::spice_sys::dataset_checkpointer,
 };
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::{
     acceleration::{Acceleration, Mode},
     component::dataset::Dataset,
@@ -266,10 +267,11 @@ async fn wait_for_checkpoint(
     dataset: &RuntimeDataset,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
-    let checkpoint = DatasetCheckpoint::try_new(
+    let checkpoint = dataset_checkpointer(
         dataset,
         dataset.runtime.accelerator_engine_registry(),
         OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create checkpoint: {e}"))?;

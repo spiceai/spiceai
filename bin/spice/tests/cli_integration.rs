@@ -245,6 +245,8 @@ mod dataset {
 mod login {
     use super::*;
 
+    const LOGIN_PATHS: [&[&str]; 2] = [&["login"], &["cloud", "login"]];
+
     #[test]
     fn test_login_help() {
         let mut cmd = spice_cmd();
@@ -265,6 +267,50 @@ mod login {
             .success()
             // Check for subcommand-based providers
             .stdout(predicate::str::contains("Commands:"));
+    }
+
+    #[test]
+    fn test_cloud_login_methods_match_on_both_command_paths() {
+        for prefix in LOGIN_PATHS {
+            let mut cmd = spice_cmd();
+            cmd.args(prefix)
+                .arg("--help")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("subscription"))
+                .stdout(predicate::str::contains("token"))
+                .stdout(predicate::str::contains("api"))
+                .stdout(predicate::str::contains("--output"));
+        }
+    }
+
+    #[test]
+    fn test_access_token_and_device_spellings_are_explicit() {
+        for prefix in LOGIN_PATHS {
+            let mut token = spice_cmd();
+            token
+                .args(prefix)
+                .args(["token", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Access token"));
+
+            let mut pat_alias = spice_cmd();
+            pat_alias
+                .args(prefix)
+                .args(["pat", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Access token"));
+
+            let mut subscription = spice_cmd();
+            subscription
+                .args(prefix)
+                .args(["subscription", "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("--device"));
+        }
     }
 
     #[test]
@@ -781,31 +827,38 @@ mod connect {
     use super::*;
 
     #[test]
-    fn test_connect_help_describes_the_interactive_surface() {
+    fn test_connect_help_describes_only_the_deprecated_pod_add_surface() {
         spice_cmd()
             .arg("connect")
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains(
-                "This is an interactive setup flow",
-            ))
-            .stdout(predicate::str::contains("spiced --token"))
-            .stdout(predicate::str::contains("--dir"))
-            .stdout(predicate::str::contains("--region"))
-            .stdout(predicate::str::contains("SPICE-ADOPT").not())
-            .stdout(predicate::str::contains("--install").not())
-            .stdout(predicate::str::contains("status").not())
-            .stdout(predicate::str::contains("remove --force --yes"));
+            .stdout(predicate::str::contains("deprecated"))
+            .stdout(predicate::str::contains("spice add"))
+            .stdout(predicate::str::contains("spice cloud link"))
+            .stdout(predicate::str::contains("\n      --dir").not())
+            .stdout(predicate::str::contains("\n      --region").not())
+            .stdout(predicate::str::contains("\n      --endpoint").not())
+            .stdout(predicate::str::contains("\n      --force").not())
+            .stdout(predicate::str::contains("\n      --yes").not());
     }
 
     #[test]
     fn test_connect_rejects_removed_automation_flags() {
-        for flag in ["--token", "--org", "--project", "--install"] {
+        for flag in [
+            "--token",
+            "--org",
+            "--project",
+            "--install",
+            "--dir",
+            "--region",
+            "--endpoint",
+            "--force",
+            "--yes",
+        ] {
             spice_cmd()
                 .arg("connect")
                 .arg(flag)
-                .arg("value")
                 .assert()
                 .failure()
                 .stderr(predicate::str::contains("unexpected argument"));
@@ -813,49 +866,15 @@ mod connect {
     }
 
     #[test]
-    fn test_connect_rejects_removal_only_flags_during_setup() {
-        for flag in ["--force", "--yes"] {
+    fn test_connect_rejects_removed_lifecycle_subcommands() {
+        for command in ["status", "remove", "service"] {
             spice_cmd()
                 .arg("connect")
-                .arg(flag)
+                .arg(command)
                 .assert()
                 .failure()
-                .stderr(predicate::str::contains(
-                    "apply only to `spice connect remove`",
-                ));
+                .stdout(predicate::str::contains("only accepts the deprecated"));
         }
-    }
-
-    #[test]
-    fn test_local_remove_rejects_a_control_plane_endpoint() {
-        spice_cmd()
-            .arg("connect")
-            .arg("remove")
-            .arg("--force")
-            .arg("--yes")
-            .arg("--endpoint")
-            .arg("https://control.example")
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(
-                "--endpoint does not apply to `connect remove`",
-            ));
-    }
-
-    #[test]
-    fn test_local_remove_rejects_an_enrollment_region() {
-        spice_cmd()
-            .arg("connect")
-            .arg("remove")
-            .arg("--force")
-            .arg("--yes")
-            .arg("--region")
-            .arg("us-west-2")
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(
-                "--region applies to enrollment, not to `connect remove`",
-            ));
     }
 }
 

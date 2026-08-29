@@ -23,6 +23,10 @@ on:
       - 'scripts/signoff'
       - 'scripts/test_signoff_disk_guard.sh'
       - '.github/workflows/signoff_disk_guard_test.yml'
+      # The lockfile cases run the toolchain this file pins, so a channel bump is
+      # itself a reason to re-check that cargo still words its refusal the way the
+      # guard matches on.
+      - 'rust-toolchain.toml'
   push:
     branches:
       - trunk
@@ -30,6 +34,7 @@ on:
       - 'scripts/signoff'
       - 'scripts/test_signoff_disk_guard.sh'
       - '.github/workflows/signoff_disk_guard_test.yml'
+      - 'rust-toolchain.toml'
   workflow_dispatch:
 
 concurrency:
@@ -39,12 +44,15 @@ concurrency:
 jobs:
   test-signoff-disk-guard:
     name: Unit tests for the sign-off disk guard
-    # GitHub-hosted on purpose: this is a sub-second check and must not queue
-    # behind the saturated self-hosted pool — the same pool whose full disks
-    # this guard exists to report.
+    # GitHub-hosted on purpose: the assertions themselves are sub-second and must
+    # not queue behind the saturated self-hosted pool — the same pool whose full
+    # disks this guard exists to report. The Rust setup below is the only slow
+    # part, and it buys the one thing a stub cannot: the real cargo diagnostic.
     runs-on: ubuntu-24.04
-    # A checkout plus a local bash script against a stub `df` — the job reads
-    # the repository and nothing else, so it needs no write scope.
+    # Sized for the toolchain install; the assertions themselves are seconds.
+    timeout-minutes: 20
+    # A checkout, a toolchain, and a local bash script against stub binaries —
+    # the job reads the repository and nothing else, so it needs no write scope.
     permissions:
       contents: read
     steps:
@@ -53,7 +61,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # The lockfile cases drive the *pinned* cargo against a fixture whose lock
+      # really is stale, so that a reworded '--locked' diagnostic fails here
+      # rather than quietly retiring the guard. The test treats an unavailable
+      # pinned toolchain as a failure under GITHUB_ACTIONS rather than as a skip,
+      # so without this step the job would go red — the right direction, but not
+      # a useful signal.
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
       - name: Run tests
-        # Invoked through `bash` rather than as `./…` so the job does not depend
+        # Invoked through 'bash' rather than as a path so the job does not depend
         # on the script's executable bit surviving a checkout on every platform.
         run: bash scripts/test_signoff_disk_guard.sh

@@ -36,7 +36,7 @@ use crate::telemetry::streaming::QueryMetricEvent;
 use crate::{
     metrics::QueryStatus,
     queries::{Query, validation, validation::QueryValidationResult},
-    snapshot::record_explain_plan,
+    snapshot::{ResultsSnapshotPredicate, SnapshotMode, record_explain_plan, round_float_columns},
 };
 
 use super::EndCondition;
@@ -46,7 +46,7 @@ pub(crate) struct SpiceTestQueryWorker {
     query_set: Vec<Query>,
     end_condition: EndCondition,
     explain_plan_snapshot: bool,
-    results_snapshot_predicate: Option<fn(&str) -> bool>,
+    results_snapshot_predicate: Option<ResultsSnapshotPredicate>,
     name: String,
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
@@ -174,7 +174,7 @@ impl SpiceTestQueryWorker {
 
     pub fn with_results_snapshot(
         mut self,
-        results_snapshot_predicate: Option<fn(&str) -> bool>,
+        results_snapshot_predicate: Option<ResultsSnapshotPredicate>,
     ) -> Self {
         self.results_snapshot_predicate = results_snapshot_predicate;
         self
@@ -332,10 +332,15 @@ impl SpiceTestQueryWorker {
                         let query_start = SystemTime::now();
                         let mut query_status = QueryStatus::Passed;
 
-                        let snapshot_results = self
-                            .results_snapshot_predicate
-                            .is_some_and(|predicate| predicate(&query.name))
-                            && self.id == 0; // only one worker should snapshot results
+                        // Only one worker should snapshot results.
+                        let snapshot_mode = if self.id == 0 {
+                            self.results_snapshot_predicate
+                                .map_or(SnapshotMode::Skip, |predicate| {
+                                    predicate(&self.name, &query.name)
+                                })
+                        } else {
+                            SnapshotMode::Skip
+                        };
 
                         // Record the explain plan before the warmup run so the plan is visible
                         // in logs even if the warmup query itself hangs.
@@ -379,14 +384,14 @@ impl SpiceTestQueryWorker {
                                 query,
                                 Arc::new(DashMap::new()),
                                 &mut BTreeMap::new(),
-                                snapshot_results,
+                                snapshot_mode,
                                 false,
                             )
                             .await?;
 
                         // The warmup's timing is thrown away; its verdict is not. This is the
                         // only run of the query that compares results against their snapshot —
-                        // the timed iterations below pass `false` for `results_snapshot` so they
+                        // the timed iterations below pass `Skip` for `snapshot_mode` so they
                         // do not re-assert it — so dropping this failure is what would let a
                         // wrong answer, or a missing baseline, finish the benchmark green.
                         query_status = status_after_run(query_status, query_failure);
@@ -431,7 +436,7 @@ impl SpiceTestQueryWorker {
                                     query,
                                     Arc::clone(&query_durations),
                                     &mut row_counts,
-                                    false, // don't attempt to snapshot results more than once
+                                    SnapshotMode::Skip, // don't attempt to snapshot results more than once
                                     self.validate,
                                 )
                                 .await?;
@@ -540,7 +545,7 @@ impl SpiceTestQueryWorker {
                     query,
                     Arc::clone(&query_durations),
                     row_counts,
-                    false,
+                    SnapshotMode::Skip,
                     false,
                 )
                 .await?;
@@ -573,7 +578,7 @@ impl SpiceTestQueryWorker {
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
+        snapshot_mode: SnapshotMode,
         validate: bool,
     ) -> Result<QueryRunResult> {
         let query_start = std::time::Instant::now();
@@ -582,7 +587,7 @@ impl SpiceTestQueryWorker {
                 query,
                 Arc::clone(&query_durations),
                 row_counts,
-                results_snapshot,
+                snapshot_mode,
                 validate,
             )
             .await
@@ -640,14 +645,15 @@ impl SpiceTestQueryWorker {
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
         row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
+        snapshot_mode: SnapshotMode,
         validate: bool,
     ) -> Result<()> {
         // Only retain result batches when something actually consumes them:
         // validation (executor must support it) or a results snapshot. The
         // throughput path needs neither, so the executor streams-and-discards
         // instead of materializing the full result set in memory.
-        let collect_batches = results_snapshot || (validate && self.executor.supports_validation());
+        let collect_batches = snapshot_mode != SnapshotMode::Skip
+            || (validate && self.executor.supports_validation());
 
         // Execute query using the configured executor
         let result = self.executor.execute(query, collect_batches).await?;
@@ -771,7 +777,9 @@ impl SpiceTestQueryWorker {
         }
 
         // Handle result snapshots if requested
-        if results_snapshot && let Some(batches) = &result.batches {
+        if snapshot_mode != SnapshotMode::Skip
+            && let Some(batches) = &result.batches
+        {
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
             let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
@@ -797,6 +805,16 @@ impl SpiceTestQueryWorker {
                 }
             }
 
+            // In `RoundedFloats` mode, round float columns to a fixed precision
+            // before formatting: these scenarios' sources surface numbers as
+            // Float64, so their aggregates carry machine-dependent low bits
+            // (partial sums combine in partition order and float addition is not
+            // associative) and would re-record on every machine change.
+            let limited_records = if snapshot_mode == SnapshotMode::RoundedFloats {
+                round_float_columns(&limited_records)?
+            } else {
+                limited_records
+            };
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
@@ -865,7 +883,7 @@ impl SpiceTestQueryWorker {
 /// The warmup is the reason this is a named function rather than an `if` at each
 /// site. Its *timing* is discarded by design, which makes it tempting to discard
 /// its verdict too, but it is the only run that asserts the result snapshot — the
-/// timed iterations pass `false` for `results_snapshot` so they never re-assert it.
+/// timed iterations pass `Skip` for `snapshot_mode` so they never re-assert it.
 /// A status that skipped the warmup would let a wrong answer, or a missing
 /// baseline, finish the benchmark green.
 fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> QueryStatus {

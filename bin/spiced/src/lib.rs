@@ -20,7 +20,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,18 +97,31 @@ use connector_smb as _;
 use connector_snowflake as _;
 #[cfg(feature = "spark")]
 use connector_spark as _;
+
+// Same force-linkage for accelerator engines, which self-register via
+// `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
-use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -121,7 +134,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use util::in_tracing_context;
+use util::{in_tracing_context, in_tracing_context_async};
 use yaml::Value;
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -428,15 +441,15 @@ pub struct Args {
     /// Write the console log to bounded, rotating files in this directory
     /// instead of relying on the supervisor to store it.
     ///
-    /// Set by `spice connect service install` on a supervisor that owns no log
+    /// Set by `spice cloud service install` on a supervisor that owns no log
     /// store of its own — launchd writes whatever a job prints to the files its
     /// definition names and never bounds them, so the runtime bounds its own
     /// output instead. The policy is fixed
-    /// (`runtime_cloud_connect::service_log`) because `spice connect service
+    /// (`runtime_cloud_connect::service_log`) because `spice cloud service
     /// logs` reads these files back against the same constants.
     ///
     /// Hidden: this is the service installer's interface to the runtime, not an
-    /// operator's. `spice connect service logs` is how the files are read.
+    /// operator's. `spice cloud logs` is how the files are read.
     #[arg(long, value_name = "PATH", hide = true)]
     pub service_log_dir: Option<PathBuf>,
 
@@ -478,7 +491,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 }
 
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
-/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// process-wide [`runtime_tls::TlsControl`] to reload every TLS
 /// material the runtime is watching. Mirrors the `nginx -s reload` /
 /// `kill -HUP <pid>` convention.
 ///
@@ -491,7 +504,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 ///
 /// On Windows or other targets without SIGHUP semantics this is a
 /// no-op: rotation still works via the polling filesystem watcher.
-fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime_tls::TlsControl>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -727,7 +740,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // callbacks here so we have one watcher, one dispatcher thread, one
     // SIGHUP target. Created lazily on success of `TlsControl::new`; if
     // the watcher fails to spawn we surface the error eagerly.
-    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+    let tls_control = std::sync::Arc::new(runtime_tls::TlsControl::new().map_err(|e| {
         Error::UnableToInitializeTls {
             source: Box::new(e),
         }
@@ -761,7 +774,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
-        Some(runtime::metrics_reader::MetricsReader::new())
+        Some(telemetry::metrics_reader::MetricsReader::new())
     } else {
         None
     };
@@ -777,7 +790,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // already loaded and validated while building the app, and that same
     // decision gates log capture.
     let cloud_connect_metrics = if cloud_connect_configured {
-        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+        Some(telemetry::metrics_reader::MetricsReader::new_cumulative())
     } else {
         None
     };
@@ -833,7 +846,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         }
     }
 
-    let rt = builder.build().await;
+    // The global subscriber cannot be installed before this call: its
+    // task-history layer is built from the `DataFusion` the runtime returns.
+    // Without a window subscriber the build's own warnings — the coordinated
+    // accelerator memory budget, invalid `runtime.query.*` values — are dropped.
+    let rt = in_tracing_context_async(builder.build()).await;
 
     spiced_tracing::init_tracing(
         app.as_ref(),
@@ -1074,7 +1091,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
+        // Gated like the dependency itself: `accelerator-cayenne` is a
+        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
+        #[cfg(not(windows))]
+        accelerator_cayenne::register_cayenne_telemetry();
     }
 
     // The global meter provider is now final: either `init_metrics` replaced the
@@ -1285,6 +1305,52 @@ fn tolerates_missing_spicepod(args: &Args, error: &app::Error, cloud_managed_sta
     tolerates_missing_spicepod_when_cloud_managed(args, error, cloud_managed_state)
 }
 
+/// The local manifest [`AppBuilder::build_from_path`] resolves `spicepod_path`
+/// to: the file itself, or `spicepod.yaml` inside the instance directory.
+///
+/// A remote URL resolves to neither — a manifest that is not on this machine
+/// cannot be pointed at, so the notes that name it fall back to the path
+/// itself.
+fn local_spicepod_manifest(spicepod_path: &Path) -> Option<PathBuf> {
+    if spicepod_path.is_file() {
+        return Some(spicepod_path.to_path_buf());
+    }
+    let manifest = spicepod_path.join("spicepod.yaml");
+    manifest.is_file().then_some(manifest)
+}
+
+/// Render a user-supplied path for a one-line log: `--spicepod` may contain
+/// control characters that would otherwise split the warning.
+fn display_path(path: &Path) -> String {
+    path.display().to_string().replace(['\r', '\n'], " ")
+}
+
+/// Which note a cloud-managed instance attaches when a deployment loaded.
+fn cloud_managed_deployed_note(local: Option<PathBuf>, deployed: PathBuf) -> DeploymentNote {
+    match local {
+        Some(local) => DeploymentNote::LocalSpicepodIgnored { local, deployed },
+        None => DeploymentNote::Loaded { path: deployed },
+    }
+}
+
+/// Which note a cloud-managed instance attaches when no deployment is served
+/// and a local filesystem manifest loaded.
+///
+/// A remote `--spicepod` URL is not a local file: there is nothing on this
+/// machine to copy into Spice Cloud, so this note stays off.
+fn local_awaiting_note(
+    cloud_managed: bool,
+    already_noted: bool,
+    local_manifest: Option<&Path>,
+) -> Option<DeploymentNote> {
+    if !cloud_managed || already_noted {
+        return None;
+    }
+    Some(DeploymentNote::LocalAwaitingDeployment {
+        path: local_manifest?.to_path_buf(),
+    })
+}
+
 /// Pure policy behind [`tolerates_missing_spicepod`]. Configuration provenance
 /// is deliberately separate from credential activation: an unusable identity
 /// still means the instance has no local Spicepod, while it enables no Cloud
@@ -1328,16 +1394,31 @@ enum DeploymentNote {
         error: String,
         local_error: String,
     },
-    /// `--pods-watcher-enabled` was passed on an instance serving a deployment.
-    /// The watcher is not installed: reconciling the local spicepod into a
-    /// deployed app would swap the deployed configuration out from under it.
+    /// `--pods-watcher-enabled` was passed on a Cloud Connect managed instance.
+    /// The watcher is not installed: reconciling the local spicepod into an app
+    /// that arrives by deployment would swap that configuration out from under
+    /// the control plane.
     PodsWatcherDeclined,
     /// A cloud-managed instance found no spicepod — neither deployed nor local —
     /// and started on an empty one.
     NoSpicepod,
+    /// A cloud-managed instance whose first deployment has not landed yet
+    /// started on the local spicepod.yaml, which serves until a deployment
+    /// replaces it.
+    LocalAwaitingDeployment { path: PathBuf },
+    /// A cloud-managed instance serves the deployed spicepod while a local
+    /// spicepod.yaml also exists: the local file is on disk but not read.
+    LocalSpicepodIgnored { local: PathBuf, deployed: PathBuf },
 }
 
 impl DeploymentNote {
+    /// Why a Cloud Connect managed instance does not watch the local spicepod.
+    ///
+    /// Names no deployment: this note also reaches an instance whose first
+    /// deployment has not landed, one whose deployment did not build, and one
+    /// with no spicepod at all.
+    const PODS_WATCHER_DECLINED_MESSAGE: &str = "Spice Cloud Connect: `--pods-watcher-enabled` was ignored because this instance is Cloud Connect managed, so it will not reload when the local `spicepod.yaml` changes. Edit the app in Spice Cloud and deploy it there instead. See: https://spiceai.org/docs";
+
     fn log(&self) {
         match self {
             Self::Loaded { path } => tracing::info!(
@@ -1356,13 +1437,40 @@ impl DeploymentNote {
                 "Spice Cloud Connect: this instance started with no configuration — the deployed spicepod at {} could not be loaded ({error}), and neither could the local one ({local_error}). It serves nothing until a deployment replaces the file; the runtime stays reachable so that deployment can land.",
                 path.display()
             ),
-            Self::PodsWatcherDeclined => tracing::warn!(
-                "Spice Cloud Connect: --pods-watcher-enabled was ignored because this instance serves a deployed spicepod. Watching the local spicepod.yaml would replace the deployed configuration while the instance kept reporting the deployment as applied. Edit the app in Spice Cloud and deploy it instead."
-            ),
+            // `spice run` passes `--pods-watcher-enabled` on every runtime it
+            // launches, so reaching this arm does not mean the operator asked
+            // for the watcher.
+            Self::PodsWatcherDeclined => {
+                tracing::debug!("{}", Self::PODS_WATCHER_DECLINED_MESSAGE);
+            }
             Self::NoSpicepod => {
                 tracing::warn!("No existing spicepod was found. Starting Runtime without one.");
             }
+            Self::LocalAwaitingDeployment { path } => {
+                tracing::warn!("{}", Self::local_awaiting_deployment(path));
+            }
+            Self::LocalSpicepodIgnored { local, deployed } => {
+                tracing::warn!("{}", Self::local_spicepod_ignored(local, deployed));
+            }
         }
+    }
+
+    /// The local manifest a cloud-managed instance serves before its first
+    /// deployment, and why a deployment to the portal is what makes it stick.
+    fn local_awaiting_deployment(path: &Path) -> String {
+        format!(
+            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. See: https://spiceai.org/docs",
+            display_path(path)
+        )
+    }
+
+    /// A local manifest that coexists with the deployed one is not read.
+    fn local_spicepod_ignored(local: &Path, deployed: &Path) -> String {
+        format!(
+            "The local '{}' is ignored: this instance serves the deployed spicepod at '{}'. Edit the project's Spicepod in Spice Cloud and deploy there instead. See: https://spiceai.org/docs",
+            display_path(local),
+            display_path(deployed)
+        )
     }
 }
 
@@ -1435,16 +1543,24 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                     Error::UnableToReadCloudManagedSpicepod { path, source }
                 },
             )?;
+    let spicepod_path = args
+        .spicepod
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+    let local_manifest = local_spicepod_manifest(&spicepod_path);
+
     if let Some(deployed) = cloud_managed_spicepod {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                deployment_note = Some(cloud_managed_deployed_note(
+                    local_manifest,
+                    deployed.path.clone(),
+                ));
                 return Ok(AppBundle {
                     app: Some(Arc::new(app)),
                     spicepod_load_error: None,
-                    deployment_note: Some(DeploymentNote::Loaded {
-                        path: deployed.path.clone(),
-                    }),
+                    deployment_note,
                     running_deployment: Some(deployed),
                     cloud_connect_identity,
                 });
@@ -1463,16 +1579,24 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         }
     }
 
-    let spicepod_path = args
-        .spicepod
-        .clone()
-        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
-
     let mut spicepod_load_error: Option<app::Error> = None;
 
     let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            // A cloud-managed instance with no deployment yet serves this
+            // manifest only until the first deployment replaces it; the local
+            // file is not part of the app, so it has to be copied into Spice
+            // Cloud to survive the first deployment. A deployment that landed
+            // but did not build (`Rejected`) already says the local manifest
+            // is a fallback, so no second note.
+            if let Some(note) = local_awaiting_note(
+                cloud_managed_state,
+                deployment_note.is_some(),
+                local_manifest.as_deref(),
+            ) {
+                deployment_note = Some(note);
+            }
             Some(Arc::new(app))
         }
         Err(e) => {
@@ -1499,9 +1623,8 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                 None
             } else if tolerates_missing_spicepod(args, &e, cloud_managed_state) {
                 // A cloud-managed instance that has connected but not yet
-                // received a deployment has no spicepod anywhere: none was
-                // deployed, and `spice connect` writes nothing to the instance
-                // directory. Come up on an empty spicepod so the control plane
+                // received a deployment and has no local spicepod has no
+                // spicepod anywhere. Come up on an empty spicepod so the control plane
                 // can reach it and deploy one, rather than exiting with the
                 // "run spice init" guidance that does not apply here.
                 deployment_note = Some(DeploymentNote::NoSpicepod);
@@ -1556,9 +1679,9 @@ struct MetricsInit<'a> {
     otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     /// On-demand reader for cluster metrics collection.
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     /// On-demand reader for the metrics pushed over Cloud Connect.
-    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    cloud_connect_metrics: Option<telemetry::metrics_reader::MetricsReader>,
     /// `runtime.telemetry.properties`, as dimensions on every exported metric.
     resource_attributes: Vec<KeyValue>,
     /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.
@@ -2119,5 +2242,123 @@ mod tests {
                 .contains("without the anonymous_telemetry feature")
         );
         assert!(TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE.contains("Spice.ai Enterprise"));
+    }
+
+    #[test]
+    fn the_local_awaiting_deployment_warning_names_the_file_and_how_to_fix_it() {
+        let message = DeploymentNote::local_awaiting_deployment(Path::new("/tmp/spicepod.yaml"));
+        assert!(message.contains("/tmp/spicepod.yaml"));
+        assert!(message.contains("will be replaced by Spice Cloud"));
+        assert!(!message.contains("Copy it to the project's Spicepod in Spice Cloud"));
+        assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn the_declined_pods_watcher_note_claims_no_deployment() {
+        let message = DeploymentNote::PODS_WATCHER_DECLINED_MESSAGE;
+        assert!(message.contains("`--pods-watcher-enabled`"));
+        assert!(message.contains("Cloud Connect managed"));
+        assert!(message.contains("`spicepod.yaml`"));
+        let lowercase = message.to_lowercase();
+        assert!(!lowercase.contains("deployed"));
+        assert!(!lowercase.contains("deployment"));
+        assert!(message.contains("Edit the app in Spice Cloud and deploy it there instead"));
+        assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn the_local_spicepod_ignored_warning_names_both_files() {
+        let message = DeploymentNote::local_spicepod_ignored(
+            Path::new("/tmp/spicepod.yaml"),
+            Path::new("/tmp/config/spicepod-cloud-managed.yml"),
+        );
+        assert!(message.contains("/tmp/spicepod.yaml"));
+        assert!(message.contains("/tmp/config/spicepod-cloud-managed.yml"));
+        assert!(message.contains("is ignored"));
+        assert!(
+            message.contains("Edit the project's Spicepod in Spice Cloud and deploy there instead")
+        );
+        assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn a_loaded_deployment_with_a_local_manifest_is_ignored() {
+        let note = cloud_managed_deployed_note(
+            Some(PathBuf::from("/tmp/spicepod.yaml")),
+            PathBuf::from("/tmp/config/spicepod-cloud-managed.yml"),
+        );
+        assert!(matches!(note, DeploymentNote::LocalSpicepodIgnored { .. }));
+    }
+
+    #[test]
+    fn a_loaded_deployment_without_a_local_manifest_is_loaded() {
+        let note = cloud_managed_deployed_note(
+            None,
+            PathBuf::from("/tmp/config/spicepod-cloud-managed.yml"),
+        );
+        assert!(matches!(note, DeploymentNote::Loaded { .. }));
+    }
+
+    #[test]
+    fn no_deployment_with_a_local_manifest_awaits() {
+        let note = local_awaiting_note(true, false, Some(Path::new("/tmp/spicepod.yaml")));
+        assert!(matches!(
+            note,
+            Some(DeploymentNote::LocalAwaitingDeployment { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rejected_deployment_does_not_add_awaiting() {
+        let note = local_awaiting_note(true, true, Some(Path::new("/tmp/spicepod.yaml")));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_remote_spicepod_url_does_not_get_the_local_awaiting_warning() {
+        assert_eq!(
+            local_spicepod_manifest(Path::new("s3://bucket/spicepod.yaml")),
+            None
+        );
+        assert!(local_awaiting_note(true, false, None).is_none());
+    }
+
+    #[test]
+    fn a_non_cloud_managed_start_does_not_await() {
+        assert!(local_awaiting_note(false, false, Some(Path::new("/tmp/spicepod.yaml"))).is_none());
+    }
+
+    #[test]
+    fn a_path_with_a_newline_stays_on_one_log_line() {
+        let path = Path::new("/tmp/spice\npod.yaml");
+        let awaiting = DeploymentNote::local_awaiting_deployment(path);
+        let ignored = DeploymentNote::local_spicepod_ignored(path, Path::new("/tmp/deployed.yml"));
+        assert!(awaiting.contains("/tmp/spice pod.yaml"));
+        assert!(ignored.contains("/tmp/spice pod.yaml"));
+        assert!(!awaiting.contains('\n'));
+        assert!(!ignored.contains('\n'));
+        assert!(awaiting.contains("'/tmp/spice pod.yaml'"));
+        assert!(ignored.contains("'/tmp/spice pod.yaml'"));
+    }
+
+    #[test]
+    fn local_spicepod_manifest_resolves_a_directory_to_its_spicepod_yaml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir.path().join("spicepod.yaml");
+        std::fs::write(&manifest, "\n").expect("write spicepod.yaml");
+
+        assert_eq!(local_spicepod_manifest(dir.path()), Some(manifest.clone()));
+
+        // A path that is neither a file nor a directory holds no manifest.
+        assert_eq!(
+            local_spicepod_manifest(dir.path().join("absent").as_ref()),
+            None
+        );
+
+        // A manifest file path resolves to itself when it exists.
+        assert_eq!(local_spicepod_manifest(&manifest), Some(manifest));
     }
 }

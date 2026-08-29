@@ -300,12 +300,11 @@ impl Runtime {
                 }
             };
 
-            match accelerator
-                .init(view.as_ref(), Arc::clone(&self.accelerator_engine_registry))
-                .await
-                .context(AcceleratorInitializationFailedSnafu {
+            match accelerator.init(view.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
                     name: acceleration_settings.engine.to_string(),
-                }) {
+                },
+            ) {
                 Ok(_) => {
                     // Initialization successful, continue to next view
                 }
@@ -342,8 +341,16 @@ impl Runtime {
             let view_name = view.name.clone();
             let notifier = register_task.await;
             match notifier {
-                Ok(Some(notifier)) => {
-                    notifier.notified().await;
+                Ok(Some(completion)) => {
+                    if completion.wait().await.is_abandoned() {
+                        // The accelerated table was dropped before its initial
+                        // refresh landed. Creating the schedule now would
+                        // resurrect one for a view that is no longer there.
+                        tracing::debug!(
+                            "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                        );
+                        return;
+                    }
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
                         tracing::error!(
                             "Failed to create refresh schedule for accelerated view '{view_name}': {e}."

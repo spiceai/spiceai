@@ -142,8 +142,24 @@ pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_facto
     (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
 }
 
+/// True for a `Date32`/`Date64` against a timezone-free `Timestamp`, in either
+/// order. Oracle's `DATE` is a datetime, so a date column arrives as a
+/// `Timestamp`.
+fn is_date_and_timestamp_pair(left: &DataType, right: &DataType) -> bool {
+    matches!(
+        (left, right),
+        (
+            DataType::Date32 | DataType::Date64,
+            DataType::Timestamp(_, None)
+        ) | (
+            DataType::Timestamp(_, None),
+            DataType::Date32 | DataType::Date64
+        )
+    )
+}
+
 fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
-    if expected_type == actual_type {
+    if expected_type == actual_type || is_date_and_timestamp_pair(expected_type, actual_type) {
         return true;
     }
 
@@ -447,6 +463,9 @@ pub fn validate_batches_as_strings(
         let data_type = field.data_type();
         let expected_array = expected.column(i).as_ref();
         let actual_array = actual.column(i).as_ref();
+        // Stringified values lose their type, so the midnight normalization below
+        // is limited to the columns it is meant for.
+        let date_vs_timestamp = is_date_and_timestamp_pair(data_type, actual_array.data_type());
 
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
@@ -504,6 +523,12 @@ pub fn validate_batches_as_strings(
                         // padding (ns vs us engines). Treat equal after stripping
                         // trailing fractional zeros.
                         if timestamp_strings_equivalent(&expected_val, &actual_val) {
+                            continue;
+                        }
+
+                        if date_vs_timestamp
+                            && date_and_midnight_timestamp_equivalent(&expected_val, &actual_val)
+                        {
                             continue;
                         }
 
@@ -713,6 +738,52 @@ pub fn validate_row_count(
     }
 }
 
+/// True when `s` matches `shape`, where `#` marks a digit and every other byte
+/// is a literal at that offset.
+fn matches_shape(s: &str, shape: &[u8]) -> bool {
+    s.len() == shape.len()
+        && s.bytes().zip(shape).all(|(c, &want)| {
+            if want == b'#' {
+                c.is_ascii_digit()
+            } else {
+                c == want
+            }
+        })
+}
+
+/// True when one string is a plain date and the other is that date at midnight:
+/// the answer set's `1995-03-05` against the `1995-03-05 00:00:00` an engine
+/// whose `DATE` carries a time component (Oracle) returns.
+///
+/// Only midnight matches. A non-midnight time is a real difference in the data.
+fn date_and_midnight_timestamp_equivalent(a: &str, b: &str) -> bool {
+    /// Exactly `YYYY-MM-DD`, the form [`array_value_to_string`] emits for a date.
+    fn is_date(s: &str) -> bool {
+        matches_shape(s, b"####-##-##")
+    }
+
+    /// The date part of a `YYYY-MM-DD 00:00:00` timestamp, fractional second
+    /// permitted only if zero. `None` for anything else.
+    fn midnight_date(s: &str) -> Option<&str> {
+        let (date, time) = s.split_once(' ')?;
+        if !is_date(date) {
+            return None;
+        }
+        let fraction = time.strip_prefix("00:00:00")?;
+        let fraction_is_zero = match fraction.strip_prefix('.') {
+            Some(digits) => !digits.is_empty() && digits.bytes().all(|c| c == b'0'),
+            None => fraction.is_empty(),
+        };
+        fraction_is_zero.then_some(date)
+    }
+
+    match (is_date(a), is_date(b)) {
+        (true, false) => midnight_date(b) == Some(a),
+        (false, true) => midnight_date(a) == Some(b),
+        _ => false,
+    }
+}
+
 /// True when both strings are timestamps in the format [`array_value_to_string`]
 /// emits and differ only by fractional-second zero padding — a nanosecond engine's
 /// `2024-01-01 00:00:00.000000000` against a microsecond engine's
@@ -727,17 +798,7 @@ fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
     /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
     /// for every `Timestamp` unit.
     fn is_timestamp_prefix(s: &str) -> bool {
-        /// Literal separators at their exact offsets; `#` marks a digit slot.
-        const SHAPE: &[u8; 19] = b"####-##-## ##:##:##";
-
-        s.len() == SHAPE.len()
-            && s.bytes().zip(SHAPE).all(|(c, &want)| {
-                if want == b'#' {
-                    c.is_ascii_digit()
-                } else {
-                    c == want
-                }
-            })
+        matches_shape(s, b"####-##-## ##:##:##")
     }
 
     /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
@@ -928,8 +989,8 @@ mod test {
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array, UInt8Array,
-            UInt16Array, UInt32Array, UInt64Array,
+            ArrayRef, Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
         datatypes::{Field, Schema, SchemaRef, i256},
     };
@@ -1576,5 +1637,120 @@ mod test {
         assert!(!timestamp_strings_equivalent("12:30.100", "12:30.1"));
         // Decimals must fall through to the numeric comparison path.
         assert!(!timestamp_strings_equivalent("1.10", "1.1"));
+    }
+
+    #[test]
+    fn test_date_and_midnight_timestamp_equivalent() {
+        // Either argument may be the date.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05"
+        ));
+        // A zero fraction is still midnight.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.000"
+        ));
+
+        // Non-midnight times are real differences.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 06:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:01"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.001"
+        ));
+        // A different day differs even at midnight.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-06 00:00:00"
+        ));
+        // Two dates, or two timestamps, are left to the caller's other rules.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05 00:00:00"
+        ));
+        // Anything outside the emitted format falls through.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-3-5",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05T00:00:00"
+        ));
+    }
+
+    #[test]
+    fn test_midnight_normalization_is_limited_to_date_columns() {
+        fn compare(data_type: DataType, expected: ArrayRef, actual: ArrayRef) -> String {
+            let schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("value", data_type, false)]));
+            let expected = RecordBatch::try_new(Arc::clone(&schema), vec![expected])
+                .expect("expected batch should build");
+            // The actual batch carries the engine's own type for the column.
+            let actual_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                actual.data_type().clone(),
+                false,
+            )]));
+            let actual = RecordBatch::try_new(actual_schema, vec![actual])
+                .expect("actual batch should build");
+            format!(
+                "{:?}",
+                validate_batches_as_strings(&expected, &actual).expect("comparison should run")
+            )
+        }
+
+        // A date against the same date at midnight passes.
+        let result = compare(
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![9194])),
+            Arc::new(TimestampSecondArray::from(vec![794_361_600])),
+        );
+        assert!(
+            result.contains("Pass"),
+            "date vs midnight timestamp: {result}"
+        );
+
+        // The same two strings in a text column are still a mismatch.
+        let result = compare(
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec!["1995-03-05"])),
+            Arc::new(StringArray::from(vec!["1995-03-05 00:00:00"])),
+        );
+        assert!(result.contains("DataMismatch"), "text column: {result}");
+    }
+
+    #[test]
+    fn test_datatype_equivalent_date_and_timestamp() {
+        // The answer set infers `Date32`; an Oracle `DATE` arrives as a
+        // second-resolution `Timestamp`.
+        assert!(datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, None)
+        ));
+        assert!(datatype_equivalent(
+            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Date32
+        ));
+        // A zoned timestamp against a date stays a mismatch.
+        assert!(!datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))
+        ));
     }
 }

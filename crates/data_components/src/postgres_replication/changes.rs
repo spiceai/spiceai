@@ -19,6 +19,7 @@ limitations under the License.
 //! apply.
 
 use std::borrow::Cow;
+use std::num::NonZeroU32;
 use std::sync::{Arc, atomic::AtomicU64};
 
 use arrow::{
@@ -38,7 +39,7 @@ use async_trait::async_trait;
 use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
-use super::{PgOutputDecodeSnafu, Result};
+use super::{PgOutputDecodeSnafu, Result, XidRegistry};
 use crate::cdc::{
     ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
     changes_schema,
@@ -343,11 +344,49 @@ pub struct PgChangeRows {
     /// merging pushes a `Vec` instead of moving every `Bytes` while holding the
     /// member mailbox lock.
     raw_chunks: Vec<Vec<bytes::Bytes>>,
+    /// The source transaction ids behind `raw_chunks`, tracked only for a member
+    /// that can act on them. See [`ChunkXids`].
+    chunk_xids: ChunkXids,
     source_commit_ts_ms: Option<i64>,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
     row_hint: usize,
     byte_len: usize,
+}
+
+/// The source transaction ids behind [`PgChangeRows`]'s buffered chunks.
+///
+/// Tracking them serves exactly one purpose: letting a durable write-back
+/// dataset recognize the echo of its own delivery. The shared pump therefore
+/// tracks them per *member*, and only for a member that holds an echo-suppression
+/// registry — every other dataset (which is every dataset in a deployment that
+/// does not write through Spice) allocates nothing and does no per-commit
+/// bookkeeping for a feature it cannot use, even while sharing a slot with a
+/// write-back table.
+enum ChunkXids {
+    /// This member suppresses no echoes, so no xid was recorded. Holds no
+    /// allocation.
+    Untracked,
+    /// One entry per `raw_chunks` entry, same length and index-aligned. `None`
+    /// for a chunk built with no known xid (e.g. a test fixture); `xid` 0 is
+    /// Postgres's "no transaction assigned" sentinel and is likewise stored as
+    /// `None`, which is why the slot is a `NonZeroU32` — it also keeps the tag a
+    /// compact 32 bits with no separate discriminant.
+    Tracked(Vec<Option<NonZeroU32>>),
+}
+
+/// What one [`PgChangeRows::drop_echoed`] pass observed about the source
+/// transactions buffered in an envelope.
+#[derive(Default)]
+pub(super) struct EchoScan {
+    /// The xids dropped as this dataset's own write-back echo, for the caller to
+    /// persist via [`XidRegistry::mark_commit_observed`].
+    pub(super) dropped: Vec<u32>,
+    /// Whether a chunk survived the filter carrying a transaction id this dataset
+    /// did not issue — a write to this table from outside Spice. Drives the
+    /// one-time external-writer report in
+    /// [`super::shared::MemberMailboxReceiver::pop`].
+    pub(super) saw_foreign_txn: bool,
 }
 
 impl PgChangeRows {
@@ -358,13 +397,57 @@ impl PgChangeRows {
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
     ) -> Self {
-        // Computed once here (per commit-per-relation) so the metadata accessors
-        // are O(1): the consumer calls them on the coalescing/metric hot path,
-        // possibly several times per envelope. Upper bound = one row per message,
-        // plus one more per UPDATE ('U') since a primary-key-changing UPDATE
-        // expands to a delete + upsert.
-        let updates = raw.iter().filter(|m| m.first() == Some(&b'U')).count();
-        let row_hint = raw.len() + updates;
+        let (row_hint, byte_len) = Self::compute_hints(&schema, raw.iter());
+        Self {
+            schema,
+            relation,
+            raw_chunks: vec![raw],
+            // Only a member that can act on the xids pays for them; see
+            // `with_source_xid`, which the pump calls for exactly those members.
+            chunk_xids: ChunkXids::Untracked,
+            source_commit_ts_ms,
+            row_hint,
+            byte_len,
+        }
+    }
+
+    /// Track the source `xid` (pgoutput's 32-bit stream xid) that produced this
+    /// instance's one transaction chunk, so a later [`Self::drop_echoed`] can
+    /// recognize whether it is the echo of this dataset's own write-back
+    /// delivery. Called once, immediately after [`Self::new`] and before any
+    /// [`Self::try_append`], and **only** for a member holding an
+    /// echo-suppression registry — a member without one leaves the envelope
+    /// [`ChunkXids::Untracked`] and allocates nothing.
+    #[must_use]
+    pub(super) fn with_source_xid(mut self, xid: Option<u32>) -> Self {
+        // `xid` 0 is Postgres's "no transaction assigned" sentinel, so it
+        // collapses to `None` alongside a genuinely absent xid.
+        self.chunk_xids =
+            ChunkXids::Tracked(vec![xid.and_then(NonZeroU32::new); self.raw_chunks.len()]);
+        self
+    }
+
+    /// Compute `(row_hint, byte_len)` for a set of raw pgoutput messages
+    /// against `schema` — see [`Self::new`]'s doc for what each term
+    /// estimates. Shared with [`Self::drop_echoed`], which must recompute both
+    /// after removing echoed chunks.
+    fn compute_hints<'a>(
+        schema: &SchemaRef,
+        raw: impl Iterator<Item = &'a bytes::Bytes>,
+    ) -> (usize, usize) {
+        // Upper bound = one row per message, plus one more per UPDATE ('U')
+        // since a primary-key-changing UPDATE expands to a delete + upsert.
+        let mut count = 0usize;
+        let mut updates = 0usize;
+        let mut wire_bytes = 0usize;
+        for message in raw {
+            count += 1;
+            if message.first() == Some(&b'U') {
+                updates += 1;
+            }
+            wire_bytes += message.len();
+        }
+        let row_hint = count + updates;
 
         // Coalescing byte-budget estimate. Raw wire bytes alone under-count the
         // eventual Arrow memory for NULL / unchanged-TOAST / DELETE-key-only rows
@@ -373,22 +456,13 @@ impl PgChangeRows {
         // footprint derived from the schema. `max` tracks Arrow in both regimes
         // without a per-value scan: value-heavy rows → wire dominates;
         // NULL/delete-heavy → the fixed-width floor dominates.
-        let wire_bytes: usize = raw.iter().map(bytes::Bytes::len).sum();
         let per_row_fixed: usize = schema
             .fields()
             .iter()
             .map(|f| arrow_fixed_width(f.data_type()))
             .sum();
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
-
-        Self {
-            schema,
-            relation,
-            raw_chunks: vec![raw],
-            source_commit_ts_ms,
-            row_hint,
-            byte_len,
-        }
+        (row_hint, byte_len)
     }
 
     /// Append a compatible committed transaction without decoding or moving
@@ -415,6 +489,14 @@ impl PgChangeRows {
             return Some(other);
         }
 
+        // Both sides come from the same member, so both were built with the same
+        // tracking decision. Declining a mixed merge costs a coalescing
+        // opportunity at worst, and never mis-attributes an xid to a chunk.
+        match (&mut self.chunk_xids, &mut other.chunk_xids) {
+            (ChunkXids::Untracked, ChunkXids::Untracked) => {}
+            (ChunkXids::Tracked(ours), ChunkXids::Tracked(theirs)) => ours.append(theirs),
+            _ => return Some(other),
+        }
         self.raw_chunks.append(&mut other.raw_chunks);
         self.row_hint = self.row_hint.saturating_add(other.row_hint);
         self.byte_len = self.byte_len.saturating_add(other.byte_len);
@@ -424,6 +506,66 @@ impl PgChangeRows {
             (None, right) => right,
         };
         None
+    }
+
+    /// Drop every buffered transaction chunk whose xid the registry recognizes
+    /// as one of this dataset's own write-back deliveries — the echo of a
+    /// commit Spice itself issued. Called by the per-dataset consumer
+    /// ([`super::shared::MemberMailboxReceiver::pop`]), not the shared pump:
+    /// [`XidRegistry::contains`] is a lock-free read of a small mirror, so
+    /// filtering here costs nothing on the shared demux, and only the one
+    /// dataset that actually produced the echo pays for decoding (and
+    /// immediately discarding) it, rather than every table sharing the pump.
+    ///
+    /// Returns what the pass observed ([`EchoScan`]) — this method only reads the
+    /// registry's lock-free membership mirror, never its own (async) state.
+    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> EchoScan {
+        // Compact both index-aligned vectors in place: keep a write cursor at the
+        // next surviving slot, shift each kept chunk down over the gaps an echo
+        // leaves, then truncate. When nothing echoes — the common case, since most
+        // transactions carry an xid this dataset never wrote — the cursor stays in
+        // lockstep with the scan, no swap runs, and the buffers (and their hints)
+        // are left untouched, so a clean pop pays nothing beyond the membership
+        // reads.
+        // Unreachable in production: the pump tracks xids for exactly the members
+        // that hold a registry, and only such a member calls this. Keeping every
+        // chunk is the safe direction for a state that should not arise — it
+        // delivers a change rather than discarding one.
+        let ChunkXids::Tracked(xids) = &mut self.chunk_xids else {
+            return EchoScan::default();
+        };
+        let mut scan = EchoScan::default();
+        let mut kept = 0;
+        for read in 0..xids.len() {
+            if let Some(xid) = xids[read] {
+                if registry.contains(xid.get()) {
+                    // Leave the echoed chunk behind the write cursor; the final
+                    // `truncate` discards it. Record its xid for the caller.
+                    scan.dropped.push(xid.get());
+                    continue;
+                }
+                // Surviving with a transaction id this dataset did not issue:
+                // someone else wrote this table. A chunk with no xid is not
+                // counted either way — only a positively identified foreign
+                // transaction is.
+                scan.saw_foreign_txn = true;
+            }
+            if read != kept {
+                self.raw_chunks.swap(read, kept);
+                xids.swap(read, kept);
+            }
+            kept += 1;
+        }
+        if scan.dropped.is_empty() {
+            return scan;
+        }
+        self.raw_chunks.truncate(kept);
+        xids.truncate(kept);
+        let (row_hint, byte_len) =
+            Self::compute_hints(&self.schema, self.raw_chunks.iter().flatten());
+        self.row_hint = row_hint;
+        self.byte_len = byte_len;
+        scan
     }
 }
 
@@ -1324,8 +1466,8 @@ fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
 /// Public wrapper: parse a Postgres NUMERIC text value to `i128` with the
 /// dataset's scale. Bootstrap reuses this so we only have one numeric parsing
 /// implementation.
-pub(super) fn parse_pg_numeric_public(s: &str, scale: i8) -> Result<i128> {
-    parse_pg_numeric_to_i128(s, 38, scale)
+pub(super) fn parse_pg_numeric_public(s: &str, precision: u8, scale: i8) -> Result<i128> {
+    parse_pg_numeric_to_i128(s, precision, scale)
 }
 
 /// Decode a Postgres binary `numeric` (`send` wire form) into an `i128` scaled
@@ -2738,24 +2880,27 @@ mod tests {
     fn numeric_parser_handles_standard_cases() {
         // Scale 2, value 123.45 → 12345
         assert_eq!(
-            parse_pg_numeric_public("123.45", 2).expect("parse 123.45"),
+            parse_pg_numeric_public("123.45", 38, 2).expect("parse 123.45"),
             12_345i128
         );
         // Negative
         assert_eq!(
-            parse_pg_numeric_public("-7.25", 2).expect("parse -7.25"),
+            parse_pg_numeric_public("-7.25", 38, 2).expect("parse -7.25"),
             -725i128
         );
         // Integer (no decimal point) with scale 2 → padded
-        assert_eq!(parse_pg_numeric_public("7", 2).expect("parse 7"), 700i128);
+        assert_eq!(
+            parse_pg_numeric_public("7", 38, 2).expect("parse 7"),
+            700i128
+        );
         // Explicit "+" sign
         assert_eq!(
-            parse_pg_numeric_public("+1.5", 2).expect("parse +1.5"),
+            parse_pg_numeric_public("+1.5", 38, 2).expect("parse +1.5"),
             150i128
         );
         // Zero
         assert_eq!(
-            parse_pg_numeric_public("0.00", 2).expect("parse 0.00"),
+            parse_pg_numeric_public("0.00", 38, 2).expect("parse 0.00"),
             0i128
         );
     }
@@ -2763,7 +2908,7 @@ mod tests {
     #[test]
     fn numeric_parser_rejects_nan_and_inf() {
         for bad in ["NaN", "Infinity", "-Infinity"] {
-            let err = parse_pg_numeric_public(bad, 2).expect_err(bad);
+            let err = parse_pg_numeric_public(bad, 38, 2).expect_err(bad);
             assert!(err.to_string().contains("not representable"));
         }
     }
@@ -2771,8 +2916,33 @@ mod tests {
     #[test]
     fn numeric_parser_rejects_overscale() {
         // 0.1234 with scale 2 has 4 fractional digits → error, not silent truncation.
-        let err = parse_pg_numeric_public("0.1234", 2).expect_err("should reject");
+        let err = parse_pg_numeric_public("0.1234", 38, 2).expect_err("should reject");
         assert!(err.to_string().contains("scale"));
+    }
+
+    /// The initial snapshot and the WAL stream read the same column, so a value
+    /// one path stores is a value the other must store. The snapshot loader used
+    /// to reach this parser without a precision, which pinned it to 38 and let
+    /// bootstrap admit rows replication rejects — the same source value landing
+    /// differently depending on which path carried it.
+    #[test]
+    fn the_public_numeric_parser_honours_the_declared_precision() {
+        assert_eq!(
+            parse_pg_numeric_public("9.99", 3, 2).expect("9.99 fits Decimal128(3, 2)"),
+            999
+        );
+        parse_pg_numeric_public("10.00", 3, 2).expect_err("10.00 is too wide for Decimal128(3, 2)");
+
+        // Same input, same answer as the routine the WAL path calls directly.
+        assert_eq!(
+            parse_pg_numeric_public("9.99", 3, 2).expect("snapshot path"),
+            parse_pg_numeric_to_i128("9.99", 3, 2).expect("replication path")
+        );
+        assert!(
+            parse_pg_numeric_public("10.00", 3, 2).is_err()
+                == parse_pg_numeric_to_i128("10.00", 3, 2).is_err(),
+            "both paths must agree on rejection"
+        );
     }
 
     #[test]
