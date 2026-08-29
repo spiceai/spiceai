@@ -208,11 +208,8 @@ fn build_table_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogconnector::stub_udf;
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{
-        ColumnarValue, Expr, Volatility, create_udf, expr::ScalarFunction,
-    };
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
     use std::error::Error as StdError;
 
@@ -248,17 +245,6 @@ mod tests {
         }
     }
 
-    fn stub_udf(name: &str) -> Expr {
-        let udf = Arc::new(create_udf(
-            name,
-            vec![DataType::Utf8],
-            DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
-        ));
-        Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![]))
-    }
-
     /// The catalog connector must install the same deny-list its dataset
     /// counterpart installs. It did not, so a Snowflake source registered as a
     /// `catalogs:` entry pushed every Spice-only UDF into the remote SQL and the
@@ -273,15 +259,15 @@ mod tests {
             .clone();
 
         assert!(
-            !function_support.supports(&stub_udf("json_get_str")),
+            !function_support.supports(&stub_udf("json_get_str", 2)),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            !function_support.supports(&stub_udf("cosine_distance")),
+            !function_support.supports(&stub_udf("cosine_distance", 2)),
             "cosine_distance must be denied (Snowflake has no exact equivalent)"
         );
         assert!(
-            function_support.supports(&stub_udf("upper")),
+            function_support.supports(&stub_udf("upper", 1)),
             "a non-Spice function like upper() must still federate to Snowflake"
         );
     }

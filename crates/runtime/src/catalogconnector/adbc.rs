@@ -219,6 +219,10 @@ impl CatalogConnector for AdbcCatalog {
 ///
 /// This mirrors the ADBC *dataset* connector's `build_table_factory`; see
 /// issues #10703 and #13664.
+///
+/// Public so `connector-adbc`'s regression tests can drive it: the in-process
+/// stub ADBC driver they need already lives there, and duplicating it here would
+/// cost more than the visibility does.
 #[must_use]
 pub fn build_table_factory<D>(
     pool: Arc<ADBCPool<D>>,

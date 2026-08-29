@@ -393,28 +393,11 @@ mod tests {
 #[cfg(test)]
 mod federation_tests {
     use super::*;
-    use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{
-        ColumnarValue, Expr, Volatility, create_udf, expr::ScalarFunction,
-    };
+    use crate::catalogconnector::stub_udf;
     use datafusion::prelude::col;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::Dialect as _;
     use runtime_datafusion::dialect::duckdb_native_function_names;
-
-    fn stub_udf(name: &str, arity: usize) -> Expr {
-        let udf = Arc::new(create_udf(
-            name,
-            vec![DataType::Utf8; arity],
-            DataType::Utf8,
-            Volatility::Immutable,
-            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
-        ));
-        Expr::ScalarFunction(ScalarFunction::new_udf(
-            udf,
-            (0..arity).map(|i| col(format!("c{i}"))).collect(),
-        ))
-    }
 
     /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
     /// `DataFusion` evaluates them locally instead of unparsing them into the
