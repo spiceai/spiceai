@@ -29,6 +29,7 @@ use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams,
 };
+use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
@@ -2145,7 +2146,19 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
+    async fn create_table(&self, mut options: CreateTableOptions) -> CatalogResult<String> {
+        // A requested schema is brought in line with the Arrow map layout before Cayenne
+        // does anything with it, so the declaration this table is persisted under, compared
+        // against and evolved from is the same conforming one. A producer is free to declare
+        // a `MAP`'s `entries` field nullable, which the layout forbids: the column decodes
+        // and then fails in whichever kernel first rebuilds it, reporting `MapArray entries
+        // cannot contain nulls` whether or not a null is involved. Correcting it is a repair
+        // of an illegal declaration rather than a schema evolution — nullability lives in the
+        // type and not in any buffer, so no file is rewritten — and it has to happen here
+        // because the stored declaration is what every read is planned against and what the
+        // write sink casts each incoming batch to.
+        options.schema = conforming_schema(options.schema);
+
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
 
@@ -2350,7 +2363,13 @@ impl MetadataCatalog for CayenneCatalog {
                         })?
                     };
 
-                    let schema = Arc::new(schema);
+                    // A schema persisted before the correction above — or by a Spice that
+                    // predates it — still declares its `MAP` entries the way its producer did,
+                    // and nothing else will ever repair it: the retention rule that keeps a
+                    // stored schema canonical across a nullability difference is what holds it
+                    // in place. Repairing it on the way out heals such a table on its next load
+                    // without rewriting a single file.
+                    let schema = conforming_schema(Arc::new(schema));
 
                     // Parse primary key
                     let primary_key = if let Some(pk_json) = primary_key_json {
@@ -9188,5 +9207,313 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// An Arrow `MAP` whose `entries` field is declared the way the layout forbids, alongside
+    /// one declared correctly and a nested one reached through a `Struct`.
+    fn map_entries_schema(entries_nullable: bool) -> Arc<arrow_schema::Schema> {
+        let entries = |nullable: bool| {
+            arrow_schema::Field::new(
+                "entries",
+                arrow_schema::DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new("keys", arrow_schema::DataType::Utf8, false),
+                        arrow_schema::Field::new("values", arrow_schema::DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                nullable,
+            )
+        };
+        let map_of =
+            |nullable: bool| arrow_schema::DataType::Map(Arc::new(entries(nullable)), false);
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("headers", map_of(entries_nullable), true),
+            arrow_schema::Field::new(
+                "wrapped",
+                arrow_schema::DataType::Struct(
+                    vec![arrow_schema::Field::new(
+                        "inner",
+                        map_of(entries_nullable),
+                        true,
+                    )]
+                    .into(),
+                ),
+                true,
+            ),
+        ]))
+    }
+
+    /// Every `MAP` in `schema`, nested ones included, declares its `entries` non-nullable.
+    fn every_map_conforms(schema: &arrow_schema::Schema) -> bool {
+        fn conforms(data_type: &arrow_schema::DataType) -> bool {
+            match data_type {
+                arrow_schema::DataType::Map(entries, _) => {
+                    !entries.is_nullable() && conforms(entries.data_type())
+                }
+                arrow_schema::DataType::Struct(fields) => {
+                    fields.iter().all(|f| conforms(f.data_type()))
+                }
+                arrow_schema::DataType::List(field)
+                | arrow_schema::DataType::LargeList(field)
+                | arrow_schema::DataType::FixedSizeList(field, _) => conforms(field.data_type()),
+                _ => true,
+            }
+        }
+        schema.fields().iter().all(|f| conforms(f.data_type()))
+    }
+
+    fn map_test_catalog(name: &str) -> (Arc<CayenneCatalog>, String) {
+        let test_db = format!("sqlite://./.test_{name}_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
+        (catalog, test_db)
+    }
+
+    fn remove_test_db(test_db: &str) {
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Read `cayenne_table.schema_json` back exactly as it is stored, without the repair
+    /// `get_table` applies — so a test can ask what was actually persisted rather than what
+    /// the read path hands back.
+    async fn stored_schema_bytes(
+        catalog: &CayenneCatalog,
+        table_name: &str,
+    ) -> arrow_schema::Schema {
+        use base64::Engine;
+        use bytes::Bytes;
+
+        let schema_json = catalog
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT schema_json FROM cayenne_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("read the stored schema_json");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&schema_json)
+            .expect("decode base64");
+        arrow_schema::Schema::try_from(arrow_flight::IpcMessage(Bytes::from(bytes)))
+            .expect("deserialize IPC schema")
+    }
+
+    fn map_table_options(
+        table_name: &str,
+        schema: Arc<arrow_schema::Schema>,
+        base_path: String,
+    ) -> CreateTableOptions {
+        CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path,
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        }
+    }
+
+    /// The Arrow map layout forbids a nullable `entries` field, and a table persisted under
+    /// one can never be read: every kernel that rebuilds the column reports `MapArray entries
+    /// cannot contain nulls`. `create_table` therefore has to persist the conforming
+    /// declaration, not the one the producer asked for.
+    ///
+    /// Asserted against the stored bytes rather than `get_table`, whose own repair would
+    /// otherwise hide a create path that still writes the illegal declaration.
+    #[tokio::test]
+    async fn create_table_persists_a_conforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_create");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_create",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        let persisted = stored_schema_bytes(&catalog, "map_create").await;
+        assert!(
+            every_map_conforms(&persisted),
+            "the persisted declaration must conform to the Arrow map layout, got: {persisted:?}"
+        );
+        assert_eq!(
+            persisted,
+            *map_entries_schema(false),
+            "only the entries nullability may change; every other field, type and metadata is carried across"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// A table whose stored declaration was persisted before that correction — by an earlier
+    /// Spice, or by any path that wrote the producer's own declaration through — does not
+    /// self-heal on its own: the rule that keeps a stored schema canonical across a
+    /// nullability difference is exactly what holds the illegal declaration in place. Reading
+    /// it back repairs it, which costs no file rewrite because nullability lives in the type
+    /// rather than in any buffer.
+    #[tokio::test]
+    async fn get_table_repairs_a_stored_nonconforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_legacy");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_legacy",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        // Put the pre-correction declaration back, the way a metastore written by an earlier
+        // Spice already holds it.
+        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
+            .expect("serialize the legacy declaration");
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
+                params: vec![
+                    MetastoreValue::Text(legacy),
+                    MetastoreValue::Text("map_legacy".to_string()),
+                ],
+            })
+            .await
+            .expect("store the legacy declaration");
+        assert!(
+            !every_map_conforms(&stored_schema_bytes(&catalog, "map_legacy").await),
+            "the test must start from a genuinely non-conforming stored declaration"
+        );
+
+        let metadata = catalog.get_table("map_legacy").await.expect("get table");
+        assert!(
+            every_map_conforms(&metadata.schema),
+            "a stored declaration that violates the Arrow map layout must be repaired on read, got: {:?}",
+            metadata.schema
+        );
+        assert_eq!(*metadata.schema, *map_entries_schema(false));
+
+        remove_test_db(&test_db);
+    }
+
+    /// The user-visible consequence of the two mechanisms together. A source that reports the
+    /// conforming declaration — which is what every Arrow decode point now hands over — against
+    /// a table stored under the illegal one is not a configuration change and must not be
+    /// treated as one: the schema difference is a nullability tighten, which keeps the stored
+    /// schema canonical, so the correction would never reach the table and the column would
+    /// stay unreadable for the life of the accelerator.
+    #[tokio::test]
+    async fn a_conforming_source_schema_is_not_a_configuration_change_against_a_stored_one() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_revalidate");
+        catalog.init().await.expect("init catalog");
+
+        let table_id = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(true),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
+            .expect("serialize the legacy declaration");
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
+                params: vec![
+                    MetastoreValue::Text(legacy),
+                    MetastoreValue::Text("map_revalidate".to_string()),
+                ],
+            })
+            .await
+            .expect("store the legacy declaration");
+
+        let reopened = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(false),
+                base_path,
+            ))
+            .await
+            .expect("reopening the table with the conforming declaration must not be refused");
+        assert_eq!(
+            reopened, table_id,
+            "the table must be reopened rather than treated as reconfigured"
+        );
+        assert!(
+            every_map_conforms(
+                &catalog
+                    .get_table("map_revalidate")
+                    .await
+                    .expect("get table")
+                    .schema
+            ),
+            "the reopened table must be planned against a readable declaration"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// The repair touches map entries and nothing else: a schema carrying no `MAP` — including
+    /// its field and schema metadata, which Cayenne stores and compares — round-trips
+    /// unchanged, so nothing else in the stored declaration moves under it.
+    #[tokio::test]
+    async fn a_schema_without_a_map_round_trips_unchanged() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_untouched");
+        catalog.init().await.expect("init catalog");
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("unit".to_string(), "bytes".to_string());
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("origin".to_string(), "test".to_string());
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("size", arrow_schema::DataType::Int64, true)
+                    .with_metadata(field_metadata),
+            ],
+            schema_metadata,
+        ));
+
+        catalog
+            .create_table(map_table_options(
+                "map_untouched",
+                Arc::clone(&schema),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        assert_eq!(
+            stored_schema_bytes(&catalog, "map_untouched").await,
+            *schema
+        );
+        assert_eq!(
+            *catalog
+                .get_table("map_untouched")
+                .await
+                .expect("get table")
+                .schema,
+            *schema
+        );
+
+        remove_test_db(&test_db);
     }
 }
