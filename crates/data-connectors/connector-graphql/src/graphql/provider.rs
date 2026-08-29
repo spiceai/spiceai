@@ -110,17 +110,15 @@ impl GraphQLTableProviderBuilder {
             return Err(super::Error::NoJsonPointerFound {});
         }
 
-        // Health check on GraphQL resource existence
+        // Health check on GraphQL resource existence. The probe answers a
+        // different question than the table's rows do and is shaped nothing
+        // like them, so it is run for its error signal alone rather than
+        // parsed with the table's schema.
         if let Some(health_check_query) = self.health_check_query {
-            let _ = self
-                .client
-                .execute(
+            self.client
+                .execute_health_check(
                     &health_check_query,
-                    None,
-                    None,
-                    None,
                     self.context.clone().and_then(|o| o.error_checker()),
-                    None,
                 )
                 .await?;
         }
@@ -452,7 +450,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
 mod tests {
     use super::*;
     use crate::graphql::builder::GraphQLClientBuilder;
-    use crate::graphql::client::UnnestBehavior;
+    use crate::graphql::client::{UnnestBehavior, UnnestHandler};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use url::Url;
@@ -510,6 +508,85 @@ mod tests {
 
         assert_eq!(derived.field(0).name(), "renamed_id");
         assert_eq!(derived.field(0).data_type(), &DataType::Int64);
+    }
+
+    /// The probe a health check sends back is not a row: it names the resource
+    /// and stops there. `repos` on the GitHub connector reads its `repo` column
+    /// out of the response and declares it non-null, so a probe run through the
+    /// table's schema reads back as an unmasked null and fails a dataset whose
+    /// rows are perfectly good — which is what happened to `spiceai/repos`.
+    #[tokio::test]
+    async fn a_health_check_probe_that_is_not_a_row_still_builds_the_table() {
+        use serde_json::{Map, Value, json};
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // The health check names the resource and nothing else.
+        Mock::given(method("POST"))
+            .and(body_string_contains("healthCheckProbe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"healthCheckProbe": {"id": "ORG_1", "login": "spiceai"}}}),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("repositories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"owner": {
+                "repositories": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    "nodes": [{"id": "REPO_1", "name": "spiceai"}],
+                }
+            }}})))
+            .mount(&server)
+            .await;
+
+        // `repo` is read from the response, so only a row can supply it.
+        let stamp_repo: UnnestHandler = Box::new(|object: &Value| {
+            let mut row = match object {
+                Value::Object(row) => row.clone(),
+                _ => Map::new(),
+            };
+            let repo = row.remove("name").unwrap_or(Value::Null);
+            row.insert("repo".to_string(), repo);
+            Ok(vec![Value::Object(row)])
+        });
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("repo", DataType::Utf8, false),
+        ]));
+
+        let client = GraphQLClientBuilder::new(
+            Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+            UnnestBehavior::Custom(stamp_repo),
+        )
+        .with_schema(Some(schema))
+        .build(reqwest::Client::new())
+        .expect("client to build");
+
+        let health_check = GraphQLQuery::try_from(Arc::<str>::from(
+            r#"{ healthCheckProbe: repositoryOwner(login: "spiceai") { id login } }"#,
+        ))
+        .expect("query to parse")
+        .with_json_pointer(Arc::from("/data/healthCheckProbe"));
+
+        let provider = GraphQLTableProviderBuilder::new(client)
+            .with_health_check_query(health_check)
+            .build(
+                r#"{ owner: repositoryOwner(login: "spiceai") {
+                    repositories(first: 50) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id name }
+                    }
+                } }"#,
+            )
+            .await
+            .expect("a probe that is not a row is not a reason to fail the dataset");
+
+        assert_eq!(provider.schema().field(1).name(), "repo");
     }
 
     #[test]
