@@ -2497,15 +2497,18 @@ impl RefreshTask {
         // classifying it would stall replication for a burst that applies
         // cleanly and whose ack covers a burst applied in full.
         //
-        // The input is `change_batch.data_batch().schema()`, a burst-wide value
-        // that does not vary with the sub-batch, and the target it is compared
-        // against is only changed by an upsert — so classifying once per burst
-        // reaches the same verdict as classifying per upsert sub-batch.
+        // The input is `change_batch.data_schema()`, a burst-wide value that does
+        // not vary with the sub-batch, and the target it is compared against is
+        // only changed by an upsert — so classifying once per burst reaches the
+        // same verdict as classifying per upsert sub-batch. It reads the schema
+        // off the data column rather than through `data_batch()`, so classifying
+        // a burst no longer builds a `RecordBatch` that `process_upsert_batch`
+        // immediately builds again.
         if sub_batches
             .iter()
             .any(|(op_type, _)| matches!(op_type, ChangeOperationType::Upsert))
         {
-            self.maybe_evolve_schema_for_cdc(&change_batch.data_batch().schema())
+            self.maybe_evolve_schema_for_cdc(&change_batch.data_schema())
                 .await?;
         }
 
