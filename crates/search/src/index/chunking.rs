@@ -79,6 +79,12 @@ pub struct ChunkedSearchIndex {
     /// same inner index, so a window opened against either of them is open for both. (Callers do
     /// clone — `runtime-search` clones a borrowed index to hand the search path an owned
     /// `Arc<dyn SearchIndex>`.)
+    ///
+    /// It describes the sink's replacing write, but it is stored on the index, so it is read by
+    /// every caller — including a change-data-capture stream, which drives `compute_index`
+    /// outside the sink write lifecycle. A CDC write that empties a row while a replacing window
+    /// is open therefore evicts nothing and leaves that row's previous chunks searchable; #13727
+    /// owns scoping the suppression to the replacing write's own batches.
     replace_window: Arc<AtomicBool>,
 }
 
@@ -114,7 +120,18 @@ impl Index for ChunkedSearchIndex {
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         self.replace_window
             .store(window == WriteWindow::ReplaceAll, Ordering::Release);
-        self.inner.on_write_start(window).await
+
+        // Stays set for the duration of the inner call, so a `compute_index` running
+        // alongside it sees the window that is opening. On failure it has to be cleared
+        // here: `prepare_indexes` rolls back only the indexes that *started*, leaving the
+        // index whose start failed to own its own cleanup, so nothing else will ever call
+        // `on_write_failed` on this one. A flag left set outlives the abandoned write and
+        // suppresses eviction on every later append and CDC write, which is the stale-chunk
+        // bug this eviction exists to fix, reintroduced for the life of the index.
+        self.inner
+            .on_write_start(window)
+            .await
+            .inspect_err(|_| self.replace_window.store(false, Ordering::Release))
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -453,7 +470,8 @@ impl ChunkedSearchIndex {
     /// rather than closing it — the row write itself commits later still, and there is no
     /// post-commit index hook on the CDC path to hang this on (#13715).
     ///
-    /// Skipped inside a [`WriteWindow::ReplaceAll`] window, where it would be destructive: an
+    /// Skipped inside a [`WriteWindow::ReplaceAll`] window (see [`Self::replace_window`] for the
+    /// CDC writes that window also suppresses, #13727), where it would be destructive: an
     /// index that stages a replacing write keeps serving its *previous* rows until it commits,
     /// so an eviction resolved against that listing resolves the previous contents' keys and
     /// applies the delete to the staged rows — removing rows this same write just wrote. The
@@ -478,7 +496,16 @@ impl ChunkedSearchIndex {
         // reporting it as "this index cannot be addressed" would tell the user a story the
         // error never told.
         if !self.deletes_by_partial_key() && Arc::clone(&self.inner).as_vector_index().is_none() {
-            if repeats.contains(&0) {
+            // Warn for an eviction that is actually owed, not merely for a batch that
+            // contains an empty row. A key is judged on its last row, so an `empty -> text`
+            // pair for one key resolves to no eviction at all — and the warning tells the
+            // user their previous text stays searchable and the index must be re-created,
+            // which for that batch is false and asks them to rebuild for nothing.
+            //
+            // `rows_to_evict`'s error is deliberately dropped rather than propagated: an
+            // index that cannot be addressed could not act on the answer either way, so
+            // raising it here would fail writes that this branch has always let through.
+            if matches!(self.rows_to_evict(record, repeats), Ok(Some(_))) {
                 tracing::warn!(
                     "{}",
                     unreachable_chunk_eviction_warning(self.inner.name(), &self.search_column())
@@ -1353,6 +1380,9 @@ mod tests {
         /// Makes [`SearchIndex::write`] fail, for the paths that must not act on a write that
         /// did not land.
         write_fails: bool,
+        /// Makes [`Index::on_write_start`] fail, for the paths that must not be left holding
+        /// state an abandoned write set.
+        start_fails: bool,
         /// Whether [`SearchIndex::as_vector_index`] hands one back. `false` is the shape of a
         /// full-text index: not enumerable, so a chunked index over it can only reach its chunks
         /// if it deletes by partial key.
@@ -1382,6 +1412,7 @@ mod tests {
                 write_complete_fatal: false,
                 deletes_partial_key: false,
                 write_fails: false,
+                start_fails: false,
                 is_vector_index: true,
                 primary_fields: vec![Field::new("id", DataType::Int64, false)],
                 listed: None,
@@ -1464,6 +1495,14 @@ mod tests {
         }
         fn deletes_by_partial_key(&self) -> bool {
             self.deletes_partial_key
+        }
+        async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+            if self.start_fails {
+                return Err(DataFusionError::External(
+                    "RecordingInner was told to fail its start".into(),
+                ));
+            }
+            Ok(())
         }
         fn write_start_failure_is_fatal(&self) -> bool {
             self.write_start_fatal
@@ -2667,6 +2706,155 @@ mod tests {
             "links the docs: {msg}"
         );
         assert!(!msg.contains('\n'), "stays on one line: {msg}");
+    }
+
+    /// A `MakeWriter` that accumulates this thread's log output, so a test can assert on what
+    /// an operator would actually see in `spice.log`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn occurrences_of(&self, needle: &str) -> usize {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .matches(needle)
+            .count()
+        }
+    }
+
+    thread_local! {
+        static CAPTURE_SINK: std::cell::RefCell<Option<CapturedLogs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Routes each event to the buffer registered for the emitting thread, and discards events
+    /// from threads that registered none.
+    #[derive(Clone, Default)]
+    struct ThreadCapture;
+
+    impl std::io::Write for ThreadCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURE_SINK.with(|sink| {
+                if let Some(logs) = sink.borrow().as_ref() {
+                    logs.0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for ThreadCapture {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            Self
+        }
+    }
+
+    /// Registers a buffer for this thread's log lines and hands it back to be asserted on.
+    ///
+    /// The subscriber is installed **globally**, once per test binary, rather than scoped to the
+    /// calling thread: `tracing` caches each callsite's interest process-wide, so a sibling test
+    /// reaching this callsite without a subscriber would cache it as "never" and the event would
+    /// be dropped before any subscriber saw it. The thread-local sink is what keeps concurrent
+    /// tests from reading each other's lines.
+    fn capture_logs() -> CapturedLogs {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(ThreadCapture)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+            .expect("no other global subscriber is installed in this test binary");
+        });
+
+        let logs = CapturedLogs::default();
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(logs.clone()));
+        logs
+    }
+
+    /// The warning tells the user that a row's previous text stays searchable and that the index
+    /// has to be re-created to clear it. That is a claim about *this* batch, so it must be made
+    /// only when this batch actually leaves entries behind.
+    ///
+    /// A key is judged on its last row, so an `empty -> text` pair for one key resolves to no
+    /// eviction: the surviving row still chunks and keeps what this write wrote for it. Warning
+    /// on "some row in the batch chunked to nothing" instead reports stale results for a batch
+    /// the code handled correctly, and sends the user to rebuild an index that is fine.
+    #[tokio::test]
+    async fn the_unreachable_warning_fires_only_when_an_eviction_is_owed() {
+        for (rows, expected_warnings) in [
+            // The key's surviving row still chunks: nothing is left behind, nothing to say.
+            (vec![(None, 1i64), (Some("a b"), 1)], 0),
+            // The key's surviving row chunked to nothing, and this index cannot reach what it
+            // left behind — the one case the warning describes.
+            (vec![(Some("a b"), 1i64), (None, 1)], 1),
+        ] {
+            let logs = capture_logs();
+            let inner = Arc::new(RecordingInner {
+                is_vector_index: false,
+                ..RecordingInner::new("content")
+            });
+            let idx =
+                ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+            idx.write(build_input_opt(&rows))
+                .await
+                .expect("the write lands even when the eviction cannot");
+
+            assert_eq!(
+                logs.occurrences_of("stays searchable"),
+                expected_warnings,
+                "rows {rows:?} should produce {expected_warnings} warning(s)"
+            );
+            assert!(
+                inner.deletes().is_empty(),
+                "an unreachable index is never asked to delete"
+            );
+        }
+    }
+
+    /// `prepare_indexes` rolls back only the indexes whose start *succeeded*, leaving the one
+    /// whose start failed to clean up after itself. So an `on_write_start` that records the
+    /// window and then fails must put the flag back before it propagates: nothing else will,
+    /// and a flag left set suppresses eviction on every later append and CDC write for the life
+    /// of the index — the stale-chunk bug this eviction exists to fix, made permanent.
+    #[tokio::test]
+    async fn a_failed_write_start_does_not_leave_the_replace_window_open() {
+        let inner = Arc::new(RecordingInner {
+            start_fails: true,
+            ..RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])])
+        });
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect_err("the inner index was told to fail its start");
+
+        // The abandoned write is over. A later write that empties a row must still evict.
+        idx.compute_index(vec![build_input_opt(&[(None, 1)])])
+            .await
+            .expect("write ok");
+
+        assert_eq!(
+            resolved_ids(&inner.deletes()),
+            vec![1],
+            "eviction is still live after a start that failed"
+        );
     }
 
     /// An inner index that neither deletes by partial key nor can be enumerated as a vector
