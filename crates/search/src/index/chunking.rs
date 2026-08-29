@@ -18,7 +18,7 @@ use arrow::{
         Array, ArrayRef, BooleanArray, FixedSizeListArray, FixedSizeListBuilder, Int32Builder,
         LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
     },
-    buffer::OffsetBuffer,
+    buffer::{BooleanBuffer, OffsetBuffer},
     compute::{concat, filter_record_batch},
     row::{RowConverter, SortField},
 };
@@ -61,7 +61,6 @@ pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 /// Two new [`FieldRef`]s augment the table:
 ///   1. An index of the chunks position in the underlying search column. This is an additional element in [`SearchIndex::primary_fields`].
 ///   2. The start and end index of the chunk into the underlying search column. This is an additional [`MetadataColumn::NonFilterable`] in  [`SearchIndex::metadata_columns`].
-#[derive(Clone)]
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
@@ -69,13 +68,12 @@ pub struct ChunkedSearchIndex {
     embedding_col_name: String,
     /// Cached `{search_column}_offset` — avoids reallocating the name on every write.
     offset_col_name: String,
-    /// Set for the duration of a [`WriteWindow::ReplaceAll`] window, so
-    /// [`Self::evict_rows_chunked_to_nothing`] can tell a replacing write from every other one.
-    ///
-    /// Shared with the [`ChunkedVectorIndex`] this wrapper hands out and with the temporary
-    /// [`ChunkedSearchIndex`] that index delegates through, so the window one of them opens is
-    /// the window the other one sees.
-    replace_window: Arc<AtomicBool>,
+    /// Cached names of the base row's primary-key columns — avoids re-deriving them from
+    /// [`SearchIndex::primary_fields`], which clones every `Field`, on every write.
+    base_key_names: Vec<String>,
+    /// Set for the duration of a [`WriteWindow::ReplaceAll`] window. See
+    /// [`Self::evict_rows_chunked_to_nothing`], which is where it is read and why it exists.
+    replace_window: AtomicBool,
 }
 
 #[async_trait]
@@ -109,17 +107,17 @@ impl Index for ChunkedSearchIndex {
     /// index is staging rather than serving what it is about to hold.
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         self.replace_window
-            .store(window == WriteWindow::ReplaceAll, Ordering::SeqCst);
+            .store(window == WriteWindow::ReplaceAll, Ordering::Release);
         self.inner.on_write_start(window).await
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
-        self.replace_window.store(false, Ordering::SeqCst);
+        self.replace_window.store(false, Ordering::Release);
         self.inner.on_write_failed().await
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        self.replace_window.store(false, Ordering::SeqCst);
+        self.replace_window.store(false, Ordering::Release);
         self.inner.on_write_complete().await
     }
 
@@ -334,9 +332,10 @@ impl ChunkedSearchIndex {
         Self {
             embedding_col_name: embedding_col(search_column.as_str()),
             offset_col_name: Self::chunking_offset_col(search_column.as_str()),
+            base_key_names: Self::base_key_columns(&inner.primary_fields()),
             inner,
             chunker,
-            replace_window: Arc::new(AtomicBool::new(false)),
+            replace_window: AtomicBool::new(false),
         }
     }
 
@@ -367,54 +366,72 @@ impl ChunkedSearchIndex {
         record: &RecordBatch,
         repeats: &[usize],
     ) -> DataFusionResult<Option<RecordBatch>> {
-        if !repeats.iter().any(|n| *n == 0) {
+        // Short-circuit before anything is allocated: on an ordinary write every row chunks into
+        // something, and this is the only work that write should pay for.
+        let emptied = repeats.iter().filter(|n| **n == 0).count();
+        if emptied == 0 {
             return Ok(None);
         }
 
         // A key of no columns addresses nothing, so there is no group to evict.
-        let key_columns = Self::base_key_columns(&self.inner.primary_fields());
-        if key_columns.is_empty() {
+        if self.base_key_names.is_empty() {
             return Ok(None);
         }
 
-        let key_arrays: Vec<ArrayRef> = key_columns
+        let key_indices: Vec<usize> = self
+            .base_key_names
             .iter()
-            .map(|name| record.column_by_name(name).map(Arc::clone))
+            .map(|name| record.schema().index_of(name).ok())
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Failed to update the search index on '{}': the rows being written do not \
-                     carry the key column(s) {key_columns:?} the index is addressed by, so a row \
-                     whose value is now empty cannot have its previous entries removed and a \
-                     search would keep returning them.",
-                    self.search_column()
+                     carry the key column(s) {:?} the index is addressed by, so a row whose \
+                     value is now empty cannot have its previous entries removed and a search \
+                     would keep returning them.",
+                    self.search_column(),
+                    self.base_key_names
                 ))
             })?;
 
-        // Compare whole key tuples, whatever their column types, by converting them to Arrow's
-        // comparable row encoding once for the batch.
+        // `delete_by_keys` reads the key columns out of whatever batch it is handed and ignores
+        // the rest, so narrow to them first: `project` re-slices the column vec without copying,
+        // where filtering the whole batch would run a kernel over the search text and the
+        // embedding vectors only to discard them.
+        let keys = record.project(&key_indices)?;
+
+        // Compare whole key tuples, whatever their column types, through Arrow's comparable row
+        // encoding.
         let converter = RowConverter::new(
-            key_arrays
+            keys.columns()
                 .iter()
                 .map(|a| SortField::new(a.data_type().clone()))
                 .collect(),
         )?;
-        let rows = converter.convert_columns(&key_arrays)?;
-        let written: HashSet<_> = (0..record.num_rows())
-            .filter(|i| repeats[*i] > 0)
-            .map(|i| rows.row(i))
-            .collect();
+        let rows = converter.convert_columns(keys.columns())?;
 
-        let evict: BooleanArray = (0..record.num_rows())
-            .map(|i| Some(repeats[i] == 0 && !written.contains(&rows.row(i))))
-            .collect();
-        if evict.true_count() == 0 {
+        // Keyed on the emptied rows rather than the written ones: the emptied set is the small
+        // one, and it is the side being subtracted from.
+        let mut candidates = HashSet::with_capacity(emptied);
+        for (i, _) in repeats.iter().enumerate().filter(|(_, n)| **n == 0) {
+            candidates.insert(rows.row(i));
+        }
+        for (i, _) in repeats.iter().enumerate().filter(|(_, n)| **n > 0) {
+            candidates.remove(&rows.row(i));
+        }
+        if candidates.is_empty() {
             return Ok(None);
         }
 
-        // `delete_by_keys` reads the key columns out of whatever batch it is handed and ignores
-        // the rest, so the filtered source rows can go straight through.
-        filter_record_batch(record, &evict)
+        // Non-nullable by construction, so `filter_record_batch` takes its fast path.
+        let evict = BooleanArray::new(
+            BooleanBuffer::collect_bool(keys.num_rows(), |i| {
+                repeats[i] == 0 && candidates.contains(&rows.row(i))
+            }),
+            None,
+        );
+
+        filter_record_batch(&keys, &evict)
             .map(Some)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
@@ -433,15 +450,30 @@ impl ChunkedSearchIndex {
     /// backends that *don't* stage discard nothing at all for that window, including entries for
     /// rows the refresh dropped outright, which is #12413 rather than this path.
     ///
-    /// An inner index that can neither delete by partial key nor enumerate its own entries has
-    /// no way to reach those chunks; that is reported and the write stands, because failing it
-    /// after the chunks have landed would not remove the stale entries either.
+    /// An inner index that can neither delete by partial key nor be enumerated as a vector index
+    /// has no way to reach those chunks at all. That is asked up front, so the write reports it
+    /// and stands — failing it after the chunks have landed would not remove the stale entries
+    /// either — and every error from the delete itself stays an error.
     async fn evict_rows_chunked_to_nothing(
         &self,
         record: &RecordBatch,
         repeats: &[usize],
     ) -> DataFusionResult<()> {
-        if self.replace_window.load(Ordering::SeqCst) {
+        if self.replace_window.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Ask the capability rather than inferring it from the shape of a failure: a
+        // `NotImplemented` raised deeper down is a real failure of a supported path, and
+        // reporting it as "this index cannot be addressed" would tell the user a story the
+        // error never told.
+        if !self.deletes_by_partial_key() && Arc::clone(&self.inner).as_vector_index().is_none() {
+            if repeats.contains(&0) {
+                tracing::warn!(
+                    "{}",
+                    unreachable_chunk_eviction_warning(self.inner.name(), &self.search_column())
+                );
+            }
             return Ok(());
         }
 
@@ -449,16 +481,7 @@ impl ChunkedSearchIndex {
             return Ok(());
         };
 
-        match self.delete_by_keys(keys).await {
-            Err(DataFusionError::NotImplemented(_)) => {
-                tracing::warn!(
-                    "{}",
-                    unreachable_chunk_eviction_warning(self.inner.name(), &self.search_column())
-                );
-                Ok(())
-            }
-            other => other,
-        }
+        self.delete_by_keys(keys).await
     }
 
     /// Build the intermediate "chunked" [`RecordBatch`] for a contiguous group of input rows
@@ -631,14 +654,13 @@ impl SearchIndex for ChunkedSearchIndex {
             .collect::<Vec<_>>()
     }
 
+    /// The vector view delegates its chunking back to *this* object rather than to a copy, so
+    /// the write window one of them opens is the window the other one reads.
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
-        let chunker = Arc::clone(&self.chunker);
-        let replace_window = Arc::clone(&self.replace_window);
-        let vector_index = Arc::clone(&self.inner).as_vector_index()?;
+        let inner = Arc::clone(&self.inner).as_vector_index()?;
         Some(Arc::new(ChunkedVectorIndex {
-            inner: vector_index,
-            chunker,
-            replace_window,
+            inner,
+            delegate: self,
         }))
     }
 
@@ -878,33 +900,25 @@ fn to_offset_array(x: &[Vec<(usize, usize)>], nullable: bool) -> FixedSizeListAr
 #[derive(Clone)]
 pub struct ChunkedVectorIndex {
     inner: Arc<dyn VectorIndex>,
-    chunker: Arc<dyn Chunker>,
-    /// See [`ChunkedSearchIndex::replace_window`] — shared with every [`ChunkedSearchIndex`]
-    /// [`Self::as_search_index`] hands out, so a window opened here is visible there.
-    replace_window: Arc<AtomicBool>,
+    /// The chunking itself, which this index is a vector-typed view of. Holding the delegate
+    /// rather than the pieces to rebuild it is what lets the two share one write window: a
+    /// delegate rebuilt per call would carry its own, always reading "no window open".
+    ///
+    /// `delegate.inner` is the same index as [`Self::inner`], reached as a [`SearchIndex`].
+    delegate: Arc<ChunkedSearchIndex>,
 }
 
 impl ChunkedVectorIndex {
-    #[must_use]
-    pub fn new(inner: Arc<dyn VectorIndex>, chunker: Arc<dyn Chunker>) -> Self {
-        Self {
-            inner,
+    /// Builds the vector wrapper and its delegate together. Production reaches this type through
+    /// [`ChunkedSearchIndex::as_vector_index`], which hands over an existing delegate so the two
+    /// share one write window; this constructor is what the tests build a standalone one with.
+    #[cfg(test)]
+    fn new(inner: Arc<dyn VectorIndex>, chunker: Arc<dyn Chunker>) -> Self {
+        let delegate = Arc::new(ChunkedSearchIndex::new(
+            Arc::clone(&inner) as Arc<dyn SearchIndex>,
             chunker,
-            replace_window: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// The [`ChunkedSearchIndex`] view of this index, which is where the chunking logic lives.
-    /// Shares the write-window flag rather than starting a fresh one: the delegate is what
-    /// decides whether a write may evict, and a private flag would always read "no window open".
-    fn as_search_index(&self) -> ChunkedSearchIndex {
-        ChunkedSearchIndex {
-            replace_window: Arc::clone(&self.replace_window),
-            ..ChunkedSearchIndex::new(
-                Arc::clone(&self.inner) as Arc<dyn SearchIndex>,
-                Arc::clone(&self.chunker),
-            )
-        }
+        ));
+        Self { inner, delegate }
     }
 }
 
@@ -1025,7 +1039,7 @@ impl Index for ChunkedVectorIndex {
 
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String> {
-        self.as_search_index().required_columns()
+        self.delegate.required_columns()
     }
 
     /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
@@ -1034,25 +1048,21 @@ impl Index for ChunkedVectorIndex {
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        self.as_search_index().compute_index(batches).await
+        self.delegate.compute_index(batches).await
     }
 
-    /// Records the window exactly as [`ChunkedSearchIndex::on_write_start`] does — this index
-    /// delegates its writes to that one, and the delegate reads the flag this sets.
+    /// Through the delegate, which records the window and forwards to the same inner index —
+    /// so the object that decides whether a write may evict is the object that was told.
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        self.replace_window
-            .store(window == WriteWindow::ReplaceAll, Ordering::SeqCst);
-        self.inner.on_write_start(window).await
+        self.delegate.on_write_start(window).await
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
-        self.replace_window.store(false, Ordering::SeqCst);
-        self.inner.on_write_failed().await
+        self.delegate.on_write_failed().await
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        self.replace_window.store(false, Ordering::SeqCst);
-        self.inner.on_write_complete().await
+        self.delegate.on_write_complete().await
     }
 
     /// See [`ChunkedSearchIndex::delete_by_keys`] — same outer-key-to-chunk resolution, with the
@@ -1090,7 +1100,7 @@ impl SearchIndex for ChunkedVectorIndex {
 
     /// All [`Field`]s that define a primary key between the underlying table and the [`SearchIndex`].
     fn primary_fields(&self) -> Vec<Field> {
-        self.as_search_index().primary_fields()
+        self.delegate.primary_fields()
     }
 
     /// Update the index based on a [`RecordBatch`] from the underlying table.
@@ -1098,14 +1108,14 @@ impl SearchIndex for ChunkedVectorIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        self.as_search_index().write(record).await
+        self.delegate.write(record).await
     }
 
     /// A [`TableProvider`] containing the [`SearchIndex::primary_fields`], additional metadata
     /// columns, the associated vectors/indexed content of the [`SearchIndex::search_column`] and the
     ///  search score between `query` and the [`SearchIndex::search_column`].
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        self.as_search_index().query_table_provider(query)
+        self.delegate.query_table_provider(query)
     }
 
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
@@ -1315,6 +1325,11 @@ mod tests {
     /// Float32) and an `<col>_offset` column copied from the input. The chunking layer reads
     /// these back and folds them into per-document list columns on the final output.
     #[derive(Debug)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "a test double's independently-settable knobs; grouping them would obscure the \
+                  `..RecordingInner::new(..)` struct updates every test here is written with"
+    )]
     struct RecordingInner {
         search_column: String,
         calls: AtomicUsize,
@@ -1328,6 +1343,10 @@ mod tests {
         /// Makes [`SearchIndex::write`] fail, for the paths that must not act on a write that
         /// did not land.
         write_fails: bool,
+        /// Whether [`SearchIndex::as_vector_index`] hands one back. `false` is the shape of a
+        /// full-text index: not enumerable, so a chunked index over it can only reach its chunks
+        /// if it deletes by partial key.
+        is_vector_index: bool,
         /// What this mock reports from [`SearchIndex::primary_fields`]. A chunked index's inner
         /// index carries [`CHUNKED_INDEX_CHUNK_KEY`] here.
         primary_fields: Vec<Field>,
@@ -1353,6 +1372,7 @@ mod tests {
                 write_complete_fatal: false,
                 deletes_partial_key: false,
                 write_fails: false,
+                is_vector_index: true,
                 primary_fields: vec![Field::new("id", DataType::Int64, false)],
                 listed: None,
                 deleted: std::sync::Mutex::new(Vec::new()),
@@ -1486,7 +1506,7 @@ mod tests {
         }
 
         fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
-            Some(self)
+            self.is_vector_index.then_some(self as Arc<dyn VectorIndex>)
         }
 
         async fn write(
@@ -2483,84 +2503,63 @@ mod tests {
         assert_eq!(resolved_ids(&inner.deletes()), vec![1, 1, 1]);
     }
 
-    /// A replacing write reproduces the table's whole contents, so the inner index stages it and
-    /// keeps serving its previous rows until it commits. Evicting inside that window would
-    /// resolve the *previous* contents' keys and apply the delete to the *staged* rows, taking
-    /// out rows this same write just wrote — and there is nothing to evict anyway, since the
-    /// commit replaces everything.
+    /// The write window decides whether a write may evict, and both chunked wrappers have to
+    /// reach the same answer.
+    ///
+    /// A replacing write reproduces the table's whole contents, so an index that stages it keeps
+    /// serving its previous rows until it commits. Evicting inside that window would resolve the
+    /// previous contents' keys and apply the delete to the staged rows, taking out rows the same
+    /// write just wrote — and there is nothing to evict anyway, since the commit replaces
+    /// everything. An appending window is the opposite: its rows are added to what the index
+    /// already holds, so an emptied row's previous chunks are still there and still have to go.
+    ///
+    /// `ChunkedVectorIndex` is covered by the same table because it delegates its writes to a
+    /// `ChunkedSearchIndex`; were the two not sharing one window, the delegate would read "no
+    /// window open" and evict the rows a replacing write is staging.
     #[tokio::test]
-    async fn a_replacing_write_does_not_evict_the_rows_it_is_staging() {
-        let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
-        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+    async fn the_write_window_decides_whether_a_write_evicts() {
+        for (window, evicts) in [
+            (WriteWindow::ReplaceAll, false),
+            (WriteWindow::Append, true),
+        ] {
+            for vector_wrapper in [false, true] {
+                let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
+                let idx: Arc<dyn Index> = if vector_wrapper {
+                    Arc::new(ChunkedVectorIndex::new(
+                        Arc::clone(&inner) as Arc<dyn VectorIndex>,
+                        chunker(),
+                    ))
+                } else {
+                    Arc::new(ChunkedSearchIndex::new(
+                        Arc::clone(&inner) as Arc<dyn SearchIndex>,
+                        chunker(),
+                    ))
+                };
 
-        idx.on_write_start(WriteWindow::ReplaceAll)
-            .await
-            .expect("window opens");
-        idx.write(build_input_opt(&[(None, 1), (Some("a b"), 2)]))
-            .await
-            .expect("write ok");
+                idx.on_write_start(window).await.expect("window opens");
+                idx.compute_index(vec![build_input_opt(&[(None, 1)])])
+                    .await
+                    .expect("write ok");
 
-        assert!(
-            inner.deletes().is_empty(),
-            "a staged replacing write must not delete: {:?}",
-            inner.deletes()
-        );
+                let expected = if evicts { vec![1] } else { vec![] };
+                assert_eq!(
+                    resolved_ids(&inner.deletes()),
+                    expected,
+                    "{window:?} on {} wrapper",
+                    if vector_wrapper { "vector" } else { "search" }
+                );
 
-        // The window closing puts the index back on the evicting path.
-        idx.on_write_complete().await.expect("window closes");
-        idx.write(build_input_opt(&[(None, 1)]))
-            .await
-            .expect("write ok");
-        assert_eq!(
-            resolved_ids(&inner.deletes()),
-            vec![1],
-            "outside the window the emptied row's chunks are resolved and removed"
-        );
-    }
-
-    /// An appending window is not a replacing one — its rows are added to what the index already
-    /// holds, so an emptied row's previous chunks are still there and still have to go.
-    #[tokio::test]
-    async fn an_appending_write_still_evicts() {
-        let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
-        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
-
-        idx.on_write_start(WriteWindow::Append)
-            .await
-            .expect("window opens");
-        idx.write(build_input_opt(&[(None, 1)]))
-            .await
-            .expect("write ok");
-
-        assert_eq!(resolved_ids(&inner.deletes()), vec![1]);
-    }
-
-    /// `ChunkedVectorIndex` delegates its writes to a `ChunkedSearchIndex` it builds on the spot.
-    /// That delegate is what decides whether a write may evict, so the two have to share the
-    /// window flag — a delegate with a private flag would read "no window open" and evict inside
-    /// a replacing write, deleting the rows that write is staging.
-    #[tokio::test]
-    async fn chunked_vector_index_shares_its_write_window_with_the_delegate_that_evicts() {
-        let inner = Arc::new(RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])]));
-        let idx = ChunkedVectorIndex::new(Arc::clone(&inner) as Arc<dyn VectorIndex>, chunker());
-
-        idx.on_write_start(WriteWindow::ReplaceAll)
-            .await
-            .expect("window opens");
-        idx.write(build_input_opt(&[(None, 1)]))
-            .await
-            .expect("write ok");
-        assert!(
-            inner.deletes().is_empty(),
-            "the delegate must see the window this wrapper opened: {:?}",
-            inner.deletes()
-        );
-
-        idx.on_write_complete().await.expect("window closes");
-        idx.write(build_input_opt(&[(None, 1)]))
-            .await
-            .expect("write ok");
-        assert_eq!(resolved_ids(&inner.deletes()), vec![1]);
+                // Closing the window always puts the index back on the evicting path.
+                idx.on_write_complete().await.expect("window closes");
+                idx.compute_index(vec![build_input_opt(&[(None, 1)])])
+                    .await
+                    .expect("write ok");
+                assert!(
+                    resolved_ids(&inner.deletes()).contains(&1),
+                    "an emptied row evicts once the window is closed"
+                );
+            }
+        }
     }
 
     /// The eviction must never remove a chunk this same write produced. One batch can carry the
@@ -2633,12 +2632,15 @@ mod tests {
         assert!(!msg.contains('\n'), "stays on one line: {msg}");
     }
 
-    /// An inner index that neither deletes by partial key nor lists its own entries cannot be
-    /// reached at all. The write still has to land: failing it would take the rest of the batch's
-    /// new content with it and leave the stale chunks exactly where they are.
+    /// An inner index that neither deletes by partial key nor can be enumerated as a vector
+    /// index cannot be reached at all. The write still has to land: failing it would take the
+    /// rest of the batch's new content with it and leave the stale chunks exactly where they are.
     #[tokio::test]
     async fn a_write_over_an_unreachable_inner_index_still_lands() {
-        let inner = Arc::new(RecordingInner::new("content"));
+        let inner = Arc::new(RecordingInner {
+            is_vector_index: false,
+            ..RecordingInner::new("content")
+        });
         let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
 
         let out = idx
