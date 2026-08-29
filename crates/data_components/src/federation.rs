@@ -139,8 +139,9 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use datafusion::datasource::TableProvider;
+    use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
@@ -148,6 +149,7 @@ mod tests {
         expr::ScalarFunction,
     };
     use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
@@ -1306,5 +1308,235 @@ mod tests {
             !sql.contains("DOUBLE"),
             "bigquery: BigQuery has no `DOUBLE` type, so this statement is rejected: {sql}"
         );
+    }
+
+    /// A scan of `t` carrying one nanosecond timestamp column, which the `BigQuery`
+    /// guards below filter or project over. `tz` is the column's Arrow timezone.
+    fn timestamp_scan(tz: Option<&str>) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(
+            "t",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, tz.map(Into::into)),
+                true,
+            )]),
+            None,
+        )
+        .expect("scan t")
+    }
+
+    /// Regression test for the `BigQuery` timestamp literal format carried by fork PR
+    /// #144: the offset is attached directly to the time, with no space between them.
+    ///
+    /// `BigQuery` rejects the spaced form outright — `invalid timestamp: '2016-08-06
+    /// 20:05:00 +00:00'` — so a federated predicate comparing a timestamp column to a
+    /// literal takes the whole query down rather than returning a wrong row. Both
+    /// assertions pin the same boundary, so a rendering that keeps the offset but
+    /// re-introduces the space fails, and so does one that drops the offset entirely
+    /// and leaves `BigQuery` to read the literal in its own time zone.
+    ///
+    /// The pin satisfies this through the `Dialect` trait default, not a
+    /// `BigQueryDialect` override — the override PR #144 added is no longer on the
+    /// branch. That is why this guard asserts the rendering `BigQuery` receives rather
+    /// than the presence of an override: either layer may supply it, and a re-cut that
+    /// changes either one still has to keep the format.
+    #[test]
+    fn bigquery_attaches_a_timestamp_offset_to_the_time() {
+        let plan = timestamp_scan(Some("UTC"))
+            .filter(col("t.ts").gt(lit(ScalarValue::TimestampNanosecond(
+                Some(1_470_513_900_000_000_000),
+                Some("UTC".into()),
+            ))))
+            .expect("filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
+        assert!(
+            sql.contains("20:05:00+00:00"),
+            "bigquery: the offset has to reach BigQuery attached to the time, or the \
+             literal is read in BigQuery's own time zone and the predicate selects a \
+             different range of rows: {sql}"
+        );
+        assert!(
+            !sql.contains("20:05:00 +00:00"),
+            "bigquery: a space before the offset is rejected as an invalid timestamp, so \
+             the whole federated query fails: {sql}"
+        );
+    }
+
+    /// Regression test for the two `BigQueryDialect` overrides carried by fork PR #146.
+    ///
+    /// `date_field_extract_style` defaults to `DatePart`, which renders
+    /// `date_part('YEAR', …)`, and `BigQuery` answers `Function not found: date_part`.
+    /// `interval_style` defaults to `PostgresVerbose`, which renders `INTERVAL '3 MONS'`,
+    /// and `BigQuery` answers `Syntax error: Unexpected ")"`. Between them they took out
+    /// TPC-H Q4, Q7, Q8, Q9 and Q20.
+    ///
+    /// Each half also renders its plan through `DefaultDialect`, which still carries both
+    /// defaults. Those arms are what keep the `BigQuery` assertions honest: if a re-cut
+    /// changes the defaults, these plan shapes stop reaching the overrides, and without
+    /// the contrast the guard would keep passing while checking nothing.
+    #[test]
+    fn bigquery_extracts_date_fields_and_spells_intervals_the_standard_way() {
+        let extract = timestamp_scan(None)
+            .project(vec![date_part(lit("YEAR"), col("t.ts"))])
+            .expect("date_part projection")
+            .build()
+            .expect("build");
+
+        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &extract);
+        assert!(
+            sql.contains("EXTRACT(YEAR FROM"),
+            "bigquery: BigQuery has no `date_part` function, so this statement is \
+             rejected: {sql}"
+        );
+        assert!(
+            !sql.contains("date_part"),
+            "bigquery: BigQuery has no `date_part` function, so this statement is \
+             rejected: {sql}"
+        );
+        let default_extract = unparse_with("default", &DefaultDialect {}, &extract);
+        assert!(
+            default_extract.contains("date_part"),
+            "the default dialect no longer renders `date_part`, so this plan no longer \
+             reaches the extract-style override and the BigQuery arm above proves \
+             nothing: {default_extract}"
+        );
+
+        let interval = timestamp_scan(None)
+            .project(vec![
+                col("t.ts")
+                    + lit(ScalarValue::IntervalMonthDayNano(Some(
+                        IntervalMonthDayNano::new(3, 0, 0),
+                    ))),
+            ])
+            .expect("interval projection")
+            .build()
+            .expect("build");
+
+        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &interval);
+        assert!(
+            sql.contains("INTERVAL '3' MONTH"),
+            "bigquery: BigQuery parses only SQL-standard intervals, so this statement is \
+             rejected: {sql}"
+        );
+        assert!(
+            !sql.contains("MONS"),
+            "bigquery: `MONS` is PostgreSQL's verbose interval spelling, which BigQuery \
+             does not parse: {sql}"
+        );
+        let default_interval = unparse_with("default", &DefaultDialect {}, &interval);
+        assert!(
+            default_interval.contains("MONS"),
+            "the default dialect no longer renders a verbose interval, so this plan no \
+             longer reaches the interval-style override and the BigQuery arm above proves \
+             nothing: {default_interval}"
+        );
+    }
+
+    /// Regression test for `supports_column_alias_in_table_alias` carried by fork PR
+    /// #148: a derived table's column aliases are inlined into its own projection rather
+    /// than listed on the table alias.
+    ///
+    /// `BigQuery` does not parse a column alias list on a table alias — `Expected ")" but
+    /// got "("` — so the whole federated query fails. Inlining has to put the name
+    /// somewhere, so the guard also holds the alias to the derived table's projection: an
+    /// inlining that dropped the name would leave the outer query with no `key` to bind.
+    ///
+    /// The `PostgreSQL` arm renders the same plan *with* the alias list. That is the
+    /// dialect being right, and it is also the proof that this plan shape still produces
+    /// a column alias list at all — without it the `BigQuery` assertions would pass on a
+    /// plan that never had one to inline.
+    #[test]
+    fn bigquery_inlines_a_derived_tables_column_aliases() {
+        let plan = LogicalPlanBuilder::scan(
+            "orders",
+            table_source(vec![Field::new("o_orderkey", DataType::Int64, false)]),
+            None,
+        )
+        .expect("scan orders")
+        .project(vec![col("orders.o_orderkey")])
+        .expect("inner projection")
+        .project(vec![col("orders.o_orderkey").alias("key")])
+        .expect("renaming projection")
+        .alias("c")
+        .expect("subquery alias")
+        .project(vec![col("c.key")])
+        .expect("outer projection")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
+        assert!(
+            sql.trim_end().ends_with("AS `c`"),
+            "bigquery: BigQuery does not parse a column alias list on a table alias, so \
+             this statement is rejected: {sql}"
+        );
+        assert!(
+            sql.contains("AS `key`"),
+            "bigquery: the column alias has to move into the derived table's projection, \
+             or the outer query has no `key` column to bind: {sql}"
+        );
+
+        let postgres = unparse_with("postgres", &PostgreSqlDialect {}, &plan);
+        assert!(
+            postgres.contains("(key)"),
+            "this plan no longer unparses to a column alias list on any dialect, so there \
+             is nothing for the BigQuery arms above to have inlined: {postgres}"
+        );
+    }
+
+    /// Regression test for the `date_trunc` rewrite carried by fork PR #169: `BigQuery`
+    /// spells it `TIMESTAMP_TRUNC(value, PART)` — the value first, and the part a bare
+    /// keyword rather than a quoted string.
+    ///
+    /// The `DefaultDialect` arm holds the same plan to `date_trunc`, so a re-cut that
+    /// changes the default cannot leave this guard passing without checking anything.
+    #[test]
+    fn bigquery_truncates_a_timestamp_the_way_bigquery_does() {
+        for (granularity, part, consequence) in [
+            (
+                "month",
+                "MONTH",
+                "BigQuery has no `date_trunc` function, so the statement is rejected",
+            ),
+            (
+                "week",
+                "ISOWEEK",
+                "DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is \
+                 Sunday-based, so any other part shifts every truncated week by a day and \
+                 returns wrong rows with no error",
+            ),
+        ] {
+            let plan = timestamp_scan(Some("UTC"))
+                .project(vec![date_trunc(lit(granularity), col("t.ts"))])
+                .expect("date_trunc projection")
+                .build()
+                .expect("build");
+
+            let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
+            assert!(
+                sql.contains(&format!("TIMESTAMP_TRUNC(`t`.`ts`, {part})")),
+                "bigquery: `date_trunc('{granularity}', …)` has to reach BigQuery as \
+                 `TIMESTAMP_TRUNC` with the value first and `{part}` as a bare keyword — \
+                 {consequence}: {sql}"
+            );
+            assert!(
+                !sql.contains("date_trunc"),
+                "bigquery: BigQuery has no `date_trunc` function, so this statement is \
+                 rejected: {sql}"
+            );
+
+            let default_sql = unparse_with("default", &DefaultDialect {}, &plan);
+            assert!(
+                default_sql.contains("date_trunc"),
+                "the default dialect no longer renders `date_trunc`, so this plan no \
+                 longer reaches the BigQuery rewrite and the arm above proves nothing: \
+                 {default_sql}"
+            );
+        }
     }
 }
