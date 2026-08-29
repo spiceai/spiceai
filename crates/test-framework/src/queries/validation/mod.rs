@@ -133,7 +133,7 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
 });
 
 #[must_use]
-pub fn has_static_tpch_answer(query: &Query) -> bool {
+pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
     TPCH_ANSWERS.contains_key(&query.name)
 }
 

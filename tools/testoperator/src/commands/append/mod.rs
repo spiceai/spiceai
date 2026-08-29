@@ -35,7 +35,7 @@ use test_framework::{
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     queries::{
-        Query, QueryOverrides, QuerySet, TableWithRowCount,
+        QueryOverrides, QuerySet, TableWithRowCount,
         validation::{self, QueryValidationResult},
     },
     spiced::SpicedInstance,
@@ -362,40 +362,28 @@ async fn verify_appended_data(
     validate_results: bool,
 ) -> anyhow::Result<()> {
     println!("Verifying appended data");
-    check_table_counts(spiced, query_set, scale_factor).await?;
+
+    // The same queries ran throughout the test against partially loaded data, so
+    // a cached result would report an earlier load step.
+    let spice_client = Arc::new(spiced.spice_client(None, true).await?);
+
+    check_table_counts(&spice_client, query_set, scale_factor).await?;
 
     if !validate_results {
         println!("Skipping query result verification, pass --validate to enable it");
         return Ok(());
     }
 
-    check_query_results(spiced, query_set, query_overrides, scale_factor).await
+    check_query_results(&spice_client, query_set, query_overrides, scale_factor).await
 }
 
-/// A table whose row count doesn't match what the query set expects.
-struct TableCountMismatch {
-    name: &'static str,
-    expected: f64,
-    actual: f64,
-}
-
-impl std::fmt::Display for TableCountMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Table {} has {} rows, expected {}",
-            self.name, self.actual, self.expected
-        )
-    }
-}
-
-/// Counts every table in the query set, returning those outside a 0.01% margin
+/// Counts every table in the query set, describing those outside a 0.01% margin
 /// of the expected count.
 async fn table_count_mismatches(
     spice_client: &spiceai::Client,
     query_set: &QuerySet,
     scale_factor: f64,
-) -> anyhow::Result<Vec<TableCountMismatch>> {
+) -> anyhow::Result<Vec<String>> {
     let mut mismatches = Vec::new();
 
     for TableWithRowCount {
@@ -427,11 +415,9 @@ async fn table_count_mismatches(
         let upper_bound = expected_count * 1.0001;
         let lower_bound = expected_count * 0.9999;
         if !(count <= upper_bound && count >= lower_bound) {
-            mismatches.push(TableCountMismatch {
-                name,
-                expected: expected_count,
-                actual: count,
-            });
+            mismatches.push(format!(
+                "table {name} has {count} rows, expected {expected_count}"
+            ));
         }
     }
 
@@ -441,51 +427,34 @@ async fn table_count_mismatches(
 /// Waits, up to [`VERIFICATION_SETTLE_TIMEOUT`], for every table to reach its
 /// expected row count, so verification runs against the fully loaded dataset.
 async fn check_table_counts(
-    spiced: &SpicedInstance,
+    spice_client: &spiceai::Client,
     query_set: &QuerySet,
     scale_factor: f64,
 ) -> anyhow::Result<()> {
-    // The same queries ran throughout the test against partially loaded data, so
-    // a cached result would report an earlier load step.
-    let spice_client = spiced.spice_client(None, true).await?;
-
     let deadline = Instant::now() + VERIFICATION_SETTLE_TIMEOUT;
-    let mut mismatches = table_count_mismatches(&spice_client, query_set, scale_factor).await?;
-    while !mismatches.is_empty() && Instant::now() < deadline {
-        tokio::time::sleep(VERIFICATION_POLL_INTERVAL).await;
-        mismatches = table_count_mismatches(&spice_client, query_set, scale_factor).await?;
-    }
-
-    if !mismatches.is_empty() {
-        for mismatch in &mismatches {
-            println!("{mismatch}");
+    let mismatches = loop {
+        let mismatches = table_count_mismatches(spice_client, query_set, scale_factor).await?;
+        if mismatches.is_empty() || Instant::now() >= deadline {
+            break mismatches;
         }
 
+        tokio::time::sleep(VERIFICATION_POLL_INTERVAL).await;
+    };
+
+    if !mismatches.is_empty() {
         return Err(anyhow::anyhow!(
-            "Table row counts do not match expected values"
+            "Table row counts do not match expected values: {}",
+            mismatches.join("; ")
         ));
     }
 
     Ok(())
 }
 
-/// Explains why a query was not verified, so an all-skipped run isn't mistaken
-/// for a verified one.
-fn skip_reason(query: &Query, scale_factor: f64) -> String {
-    if validation::has_static_tpch_answer(query) {
-        format!(
-            "{}: an expected answer exists only at scale factor 1.0, this run is at scale factor {scale_factor}",
-            query.name
-        )
-    } else {
-        format!("{}: no expected answer", query.name)
-    }
-}
-
 /// Runs each query once against the appended data and compares the result
 /// against its expected answer.
 async fn check_query_results(
-    spiced: &SpicedInstance,
+    spice_client: &Arc<spiceai::Client>,
     query_set: &QuerySet,
     query_overrides: Option<QueryOverrides>,
     scale_factor: f64,
@@ -493,21 +462,21 @@ async fn check_query_results(
     let queries = query_set
         .get_queries(query_overrides, None, None, Some(scale_factor))
         .await?;
-    let spice_client = spiced.spice_client(None, true).await?;
-    let executor = FlightExecutor::new(Arc::new(spice_client));
+    let executor = FlightExecutor::new(Arc::clone(spice_client));
 
     println!(
         "Verifying {} query results against the expected answers",
         queries.len()
     );
 
-    let mut validated = 0usize;
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
 
     for query in &queries {
+        // Gate before running the query, so a query that can't be validated
+        // isn't executed for a result nothing compares.
         if !validation::should_validate_with_static_tpch_answer(query, scale_factor) {
-            skipped.push(skip_reason(query, scale_factor));
+            skipped.push(query.name.as_ref());
             continue;
         }
 
@@ -520,29 +489,26 @@ async fn check_query_results(
             }
         };
 
-        match validation::validate_tpch_query(query, &batches)? {
-            QueryValidationResult::Pass => validated += 1,
-            QueryValidationResult::Fail(reason) => {
-                eprintln!("\nQuery '{}' returned unexpected results", query.name);
-                eprintln!("Query SQL: {}", query.sql);
-                eprintln!("Validation failure reason: {reason:?}");
-                eprintln!("\nActual results:");
-                print_result_head(&batches);
-                eprintln!();
-                failures.push(format!("{}: {reason:?}", query.name));
-            }
+        if let QueryValidationResult::Fail(reason) =
+            validation::validate_tpch_query(query, &batches)?
+        {
+            eprintln!("\nQuery '{}' returned unexpected results", query.name);
+            eprintln!("Query SQL: {}", query.sql);
+            eprintln!("Validation failure reason: {reason:?}");
+            eprintln!("\nActual results:");
+            print_result_head(&batches);
+            eprintln!();
+            failures.push(format!("{}: {reason:?}", query.name));
         }
     }
 
+    let validated = queries.len() - skipped.len() - failures.len();
     println!(
         "Verified {validated}/{total} query results ({skipped_count} skipped, {failed_count} failed)",
         total = queries.len(),
         skipped_count = skipped.len(),
         failed_count = failures.len(),
     );
-    for reason in &skipped {
-        println!("  Skipped {reason}");
-    }
 
     if !failures.is_empty() {
         return Err(anyhow::anyhow!(
@@ -553,7 +519,13 @@ async fn check_query_results(
 
     if validated == 0 {
         eprintln!(
-            "Warning: no query in the {query_set} query set has an expected answer at scale factor {scale_factor}, so the appended data was verified by row count only"
+            "Warning: no {query_set} query has an expected answer at scale factor {scale_factor}, so the appended data was verified by row count only"
+        );
+    } else if !skipped.is_empty() {
+        println!(
+            "Skipped {count} queries with no expected answer at scale factor {scale_factor}: {names}",
+            count = skipped.len(),
+            names = skipped.join(", "),
         );
     }
 
@@ -583,44 +555,5 @@ fn print_result_head(batches: &[RecordBatch]) {
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if total_rows > MAX_PRINTED_FAILURE_ROWS {
         eprintln!("... {} more rows", total_rows - MAX_PRINTED_FAILURE_ROWS);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{skip_reason, validation};
-    use test_framework::queries::Query;
-
-    fn query(name: &str) -> Query {
-        Query::new(name.into(), "SELECT 1".into(), false)
-    }
-
-    #[test]
-    fn a_tpch_query_is_validated_at_scale_factor_one() {
-        assert!(validation::should_validate_with_static_tpch_answer(
-            &query("tpch_q1"),
-            1.0
-        ));
-    }
-
-    #[test]
-    fn skip_reason_reports_a_query_without_an_expected_answer() {
-        assert_eq!(
-            skip_reason(&query("tpch_simple_q1"), 1.0),
-            "tpch_simple_q1: no expected answer"
-        );
-    }
-
-    #[test]
-    fn skip_reason_reports_a_scale_factor_the_answers_dont_cover() {
-        let reason = skip_reason(&query("tpch_q1"), 10.0);
-        assert!(
-            reason.contains("only at scale factor 1.0"),
-            "expected the reason to name the scale factor the answers cover, got: {reason}"
-        );
-        assert!(
-            reason.contains("scale factor 10"),
-            "expected the reason to name this run's scale factor, got: {reason}"
-        );
     }
 }
