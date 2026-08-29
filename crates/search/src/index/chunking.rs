@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,6 +20,7 @@ use arrow::{
     },
     buffer::OffsetBuffer,
     compute::{concat, filter_record_batch},
+    row::{RowConverter, SortField},
 };
 
 use crate::index::primary_key_projection;
@@ -344,29 +346,96 @@ impl ChunkedSearchIndex {
         &self.inner
     }
 
-    /// Remove what the inner index still holds for the rows of `record` that this write chunked
-    /// into nothing — a NULL search value, an empty one, or text the chunker yields no chunk for.
+    /// The rows of `record` whose chunks the inner index has to be told to drop, or `None` when
+    /// there are none.
     ///
-    /// Such a row contributes no rows *at all* to the batch the inner index receives: not a row
-    /// the inner index can reject, but no row. The inner index therefore never sees that primary
-    /// key on this write, and nothing tells it to drop the chunks the row's previous text
-    /// produced — they stay searchable at their old vectors, and a search returns content the
-    /// row no longer has. That is a gap only this wrapper can close, because it is the layer
-    /// that decided not to send the row.
+    /// Those are the rows this write chunked into nothing — a NULL search value, an empty one,
+    /// or text the chunker yields no chunk for — **minus** any row whose key this same write
+    /// also produced chunks for. A row that chunked into nothing contributes no rows *at all* to
+    /// the batch the inner index receives, so the inner index never sees that key on this write
+    /// and nothing tells it to drop what the row's previous text produced.
+    ///
+    /// The subtraction is what keeps the eviction from ever removing a chunk this write just
+    /// produced. It only bites when one batch carries the same key twice — once with text and
+    /// once without — which is already resolved last-write-wins downstream and is not resolved
+    /// here (#13713). Without it, evicting after the writes would delete the chunks the other
+    /// row wrote.
     ///
     /// `repeats` is parallel to `record`'s rows and holds each row's chunk count.
+    fn rows_to_evict(
+        &self,
+        record: &RecordBatch,
+        repeats: &[usize],
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        if !repeats.iter().any(|n| *n == 0) {
+            return Ok(None);
+        }
+
+        // A key of no columns addresses nothing, so there is no group to evict.
+        let key_columns = Self::base_key_columns(&self.inner.primary_fields());
+        if key_columns.is_empty() {
+            return Ok(None);
+        }
+
+        let key_arrays: Vec<ArrayRef> = key_columns
+            .iter()
+            .map(|name| record.column_by_name(name).map(Arc::clone))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Failed to update the search index on '{}': the rows being written do not \
+                     carry the key column(s) {key_columns:?} the index is addressed by, so a row \
+                     whose value is now empty cannot have its previous entries removed and a \
+                     search would keep returning them.",
+                    self.search_column()
+                ))
+            })?;
+
+        // Compare whole key tuples, whatever their column types, by converting them to Arrow's
+        // comparable row encoding once for the batch.
+        let converter = RowConverter::new(
+            key_arrays
+                .iter()
+                .map(|a| SortField::new(a.data_type().clone()))
+                .collect(),
+        )?;
+        let rows = converter.convert_columns(&key_arrays)?;
+        let written: HashSet<_> = (0..record.num_rows())
+            .filter(|i| repeats[*i] > 0)
+            .map(|i| rows.row(i))
+            .collect();
+
+        let evict: BooleanArray = (0..record.num_rows())
+            .map(|i| Some(repeats[i] == 0 && !written.contains(&rows.row(i))))
+            .collect();
+        if evict.true_count() == 0 {
+            return Ok(None);
+        }
+
+        // `delete_by_keys` reads the key columns out of whatever batch it is handed and ignores
+        // the rest, so the filtered source rows can go straight through.
+        filter_record_batch(record, &evict)
+            .map(Some)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    /// Tell the inner index to drop what it still holds for [`Self::rows_to_evict`], so a row
+    /// whose text went away stops answering searches with content it no longer has.
     ///
-    /// Skipped inside a [`WriteWindow::ReplaceAll`] window, where it would be both pointless and
-    /// destructive: a replacing write reproduces the table's whole contents, so the inner index
-    /// stages this write and keeps serving its *previous* rows until it commits. An eviction
-    /// resolved against that listing resolves the keys the previous contents hold, and the
-    /// delete it derives from them applies to the staged rows — removing rows this same write
-    /// just wrote.
+    /// Runs **after** this write's chunks have landed, not before: the deletion is externally
+    /// visible and nothing restores it, so ordering it first would let a failed embedding or
+    /// bulk write leave the row present and its old chunks already gone.
+    ///
+    /// Skipped inside a [`WriteWindow::ReplaceAll`] window, where it would be destructive: an
+    /// index that stages a replacing write keeps serving its *previous* rows until it commits,
+    /// so an eviction resolved against that listing resolves the previous contents' keys and
+    /// applies the delete to the staged rows — removing rows this same write just wrote. The
+    /// backends that *don't* stage discard nothing at all for that window, including entries for
+    /// rows the refresh dropped outright, which is #12413 rather than this path.
     ///
     /// An inner index that can neither delete by partial key nor enumerate its own entries has
-    /// no way to reach those chunks; that is reported and the write continues, because failing
-    /// the write would take the row's *new* content with it and leave the stale chunks behind
-    /// anyway.
+    /// no way to reach those chunks; that is reported and the write stands, because failing it
+    /// after the chunks have landed would not remove the stale entries either.
     async fn evict_rows_chunked_to_nothing(
         &self,
         record: &RecordBatch,
@@ -376,15 +445,9 @@ impl ChunkedSearchIndex {
             return Ok(());
         }
 
-        let emptied: BooleanArray = repeats.iter().map(|n| Some(*n == 0)).collect();
-        if emptied.true_count() == 0 {
+        let Some(keys) = self.rows_to_evict(record, repeats)? else {
             return Ok(());
-        }
-
-        // `delete_by_keys` reads the base key columns out of whatever batch it is handed and
-        // ignores the rest, so the filtered source rows can go straight through.
-        let keys = filter_record_batch(record, &emptied)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        };
 
         match self.delete_by_keys(keys).await {
             Err(DataFusionError::NotImplemented(_)) => {
@@ -655,11 +718,6 @@ impl SearchIndex for ChunkedSearchIndex {
 
         let repeats = offsets.iter().map(Vec::len).collect::<Vec<_>>();
 
-        // A row that chunked into nothing is about to be invisible to the inner index, so drop
-        // what it still holds for that row before writing this batch's replacements.
-        self.evict_rows_chunked_to_nothing(&record, &repeats)
-            .await?;
-
         // Group input rows so that each call to `self.inner.write` sees at most
         // `INNER_WRITE_TARGET_CHUNKS` chunk rows in its intermediate batch. Each group is a
         // contiguous, row-atomic slice of the input. If a single row has more chunks than the
@@ -701,6 +759,12 @@ impl SearchIndex for ChunkedSearchIndex {
                 group_embedding_arrays.push(Arc::clone(arr));
             }
         }
+
+        // Every chunk this write produces has landed, so the rows it chunked into nothing can
+        // now have their previous chunks dropped — see `evict_rows_chunked_to_nothing` for why
+        // this is ordered after the writes rather than before them.
+        self.evict_rows_chunked_to_nothing(&record, &repeats)
+            .await?;
 
         // From the concatenated inner outputs we need {}_embedding and {}_offset, then convert
         // them from `<inner_type>` -> `List(<inner_type>)` (one list per original row, length
@@ -1261,6 +1325,9 @@ mod tests {
         write_complete_fatal: bool,
         /// What this mock reports from [`Index::deletes_by_partial_key`].
         deletes_partial_key: bool,
+        /// Makes [`SearchIndex::write`] fail, for the paths that must not act on a write that
+        /// did not land.
+        write_fails: bool,
         /// What this mock reports from [`SearchIndex::primary_fields`]. A chunked index's inner
         /// index carries [`CHUNKED_INDEX_CHUNK_KEY`] here.
         primary_fields: Vec<Field>,
@@ -1285,6 +1352,7 @@ mod tests {
                 write_start_fatal: false,
                 write_complete_fatal: false,
                 deletes_partial_key: false,
+                write_fails: false,
                 primary_fields: vec![Field::new("id", DataType::Int64, false)],
                 listed: None,
                 deleted: std::sync::Mutex::new(Vec::new()),
@@ -1425,6 +1493,11 @@ mod tests {
             &self,
             record: RecordBatch,
         ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+            if self.write_fails {
+                return Err(Box::new(DataFusionError::Execution(
+                    "inner write failed".to_string(),
+                )));
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.row_counts
                 .lock()
@@ -2488,6 +2561,54 @@ mod tests {
             .await
             .expect("write ok");
         assert_eq!(resolved_ids(&inner.deletes()), vec![1]);
+    }
+
+    /// The eviction must never remove a chunk this same write produced. One batch can carry the
+    /// same key twice — once with text, once without — and that shape is resolved last-write-wins
+    /// downstream but not here (#13713), so evicting on the emptied row would delete the chunks
+    /// the other row just wrote and leave the row with nothing searchable at all.
+    #[tokio::test]
+    async fn a_key_this_write_also_chunked_is_not_evicted() {
+        for rows in [
+            vec![(Some("a b"), 1i64), (None, 1)],
+            vec![(None, 1i64), (Some("a b"), 1)],
+        ] {
+            let inner = Arc::new(StatefulChunkInner::new(&[], false));
+            let idx =
+                ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+            idx.write(build_input_opt(&rows)).await.expect("write ok");
+
+            assert_eq!(
+                inner.remaining(),
+                vec![(1, 0), (1, 1)],
+                "the chunks this write produced survive it, whichever order the batch carries \
+                 ({rows:?})"
+            );
+        }
+    }
+
+    /// The eviction is an externally visible delete that nothing restores, so it must not run
+    /// ahead of the write it belongs to. A failed inner write leaves the row's previous chunks
+    /// stale — which is the bug this PR narrows — but stale beats gone: evicting first would
+    /// leave the row present in the table with nothing searchable under it at all.
+    #[tokio::test]
+    async fn a_write_that_fails_evicts_nothing() {
+        let inner = Arc::new(RecordingInner {
+            write_fails: true,
+            ..RecordingInner::chunked(vec![chunk_keyed_rows(&[(1, 0)])])
+        });
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.write(build_input_opt(&[(None, 1), (Some("a b"), 2)]))
+            .await
+            .expect_err("the inner write fails");
+
+        assert!(
+            inner.deletes().is_empty(),
+            "nothing landed, so nothing may be removed: {:?}",
+            inner.deletes()
+        );
     }
 
     /// The warning is the only account a user gets of why a search still returns text a row no
