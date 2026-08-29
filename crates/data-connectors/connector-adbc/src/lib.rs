@@ -2303,4 +2303,59 @@ mod function_support_tests {
             "`query_federation: disabled` must produce a provider that never federates"
         );
     }
+
+    /// The same two guarantees for the ADBC **catalog** connector, which builds
+    /// its own factory in `runtime` and for a long time built it bare — so a
+    /// source registered as a `catalogs:` entry rather than per-dataset pushed
+    /// every Spice-only UDF into the remote SQL, and had no `query_federation`
+    /// to turn that off. See issue #13664.
+    ///
+    /// The tests live here rather than in `runtime` because this is where the
+    /// in-process stub ADBC driver above already lives; the code under test is
+    /// `runtime::catalogconnector::adbc::build_table_factory`.
+    async fn stub_catalog_table_provider(federation_enabled: bool) -> Arc<dyn TableProvider> {
+        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        runtime::catalogconnector::adbc::build_table_factory(pool, federation_enabled)
+            .table_provider(TableReference::bare("t"), None)
+            .await
+            .expect("build the ADBC catalog table provider")
+    }
+
+    #[tokio::test]
+    async fn catalog_table_factory_denies_spice_functions_from_federation() {
+        let provider = stub_catalog_table_provider(true).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        let federation = adaptor.source.federation_provider();
+
+        let denied = scan_project(udf_expr("json_get_str"));
+        assert!(
+            matches!(
+                federation.analyzer(&denied),
+                Some(FederationAnalyzerForLogicalPlan::Unable)
+            ),
+            "a plan using a Spice-only UDF must not federate to a catalog-registered ADBC database"
+        );
+
+        let allowed = scan_project(col("id"));
+        assert!(
+            matches!(
+                federation.analyzer(&allowed),
+                Some(FederationAnalyzerForLogicalPlan::With(_))
+            ),
+            "a plan without Spice-only UDFs must still federate"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_table_factory_disables_federation_when_configured() {
+        let provider = stub_catalog_table_provider(false).await;
+        assert!(
+            (provider.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+                .is_none(),
+            "`query_federation: disabled` on a catalog must produce a provider that never federates"
+        );
+    }
 }

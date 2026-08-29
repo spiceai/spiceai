@@ -151,8 +151,13 @@ pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
+// Only the ADBC catalog connector reads the `query_federation` parameter today;
+// the other SQL catalogs install their deny-list without an opt-out, matching
+// their dataset connectors.
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
+#[cfg(feature = "adbc")]
+mod federation;
 pub mod glue;
 pub mod iceberg;
 #[cfg(feature = "mssql")]

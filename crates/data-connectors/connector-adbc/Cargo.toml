@@ -43,7 +43,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-runtime = { path = "../../runtime" }
+runtime = { path = "../../runtime", features = ["adbc"] }
 app = { path = "../../app" }
 datafusion-federation = { workspace = true }
 

@@ -35,6 +35,7 @@ use data_components::ducklake::{
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -321,6 +322,9 @@ impl CatalogConnector for DuckLakeCatalog {
             writable,
             ddl_enabled,
             table_selector(catalog),
+            // The DuckDB-flavored deny-list: every Spice-only UDF except the
+            // ones the DuckDB dialect rewrites into native SQL. See #13664.
+            deny_spice_functions_for_duckdb_table_providers(),
         ));
 
         // Initial refresh to populate schemas and tables

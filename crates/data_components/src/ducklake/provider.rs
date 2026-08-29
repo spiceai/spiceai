@@ -30,6 +30,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
@@ -108,6 +109,13 @@ impl DuckLakeCatalogProvider {
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
     /// * `selector` - Which discovered tables the catalog registers
+    /// * `function_support` - Which functions federation may push into the SQL
+    ///   sent to `DuckDB`. Taken by value rather than defaulted because a
+    ///   factory built without one pushes every Spice-only UDF (`json_get_str`
+    ///   and the rest of the JSON set, the embedding/distance UDFs, every
+    ///   user-registered function) verbatim into the remote statement, where it
+    ///   does not exist — so the caller has to decide rather than inherit a
+    ///   permissive default it never saw. See issues #10703 and #13664.
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
@@ -115,9 +123,12 @@ impl DuckLakeCatalogProvider {
         writable: bool,
         ddl_enabled: bool,
         selector: TableSelector,
+        function_support: FunctionSupport,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
-        let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
+        let duckdb_factory = Arc::new(
+            DuckDBTableFactory::new(Arc::clone(&pool)).with_function_support(function_support),
+        );
         Self {
             pool,
             duckdb_factory,
