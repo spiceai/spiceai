@@ -81,6 +81,14 @@ pub enum Error {
         #[snafu(source(from(data_components::s3_vectors::Error, Box::new)))]
         source: Box<data_components::s3_vectors::Error>,
     },
+
+    #[snafu(display(
+        "Failed to update search index '{index}' (s3_vectors): the vectors stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Check the index's AWS credentials grant s3vectors:DeleteVectors, then write the affected rows again. See: https://spiceai.org/docs/features/search. Cause: {source}"
+    ))]
+    CannotEvictRejectedRecords {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
@@ -185,8 +193,20 @@ async fn process_single_batch(
     .map_err(|e| Error::from(*e))?;
 
     // Filter out zero vectors to prevent cosine similarity calculation errors
-    let (filtered_embeddings, filtered_primary_key, filtered_metadata) =
+    let (filtered_embeddings, filtered_primary_key, filtered_metadata, evicted) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
+
+    // Before the put, not after it: a key this batch both rejects and stores is
+    // excluded from `evicted`, so deleting first is what lets the two orders agree.
+    // No rejected row means no extra call at all.
+    if !evicted.is_empty() {
+        index.delete_key_strings(evicted).await.map_err(|source| {
+            Error::CannotEvictRejectedRecords {
+                index: index.name().to_string(),
+                source,
+            }
+        })?;
+    }
 
     let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
         index: index.name().to_string(),
@@ -274,6 +294,11 @@ pub fn extract_and_format_metadata(
 /// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
 /// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
 /// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+///
+/// The fourth element is the keys this batch will not store a vector for and so must
+/// delete, per [`write_util::keys_to_evict`]. It covers the rows filtered here and the
+/// rows carrying no embedding at all — `write_data` drops a `None` embedding, which
+/// leaves an earlier vector in place just as a filtered row does.
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -284,20 +309,24 @@ fn filter_zero_vectors(
     Vec<Option<Vec<f32>>>,
     Vec<Option<String>>,
     HashMap<String, Vec<Option<Value>>>,
+    Vec<String>,
 ) {
+    let mut rejected: Vec<String> = Vec::new();
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
         if let Some(embedding) = &embeddings[i]
             // Single pass: check if all values are zero or NaN (both are invalid embeddings)
             && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
         {
-            let key_str = primary_keys
-                .get(i)
-                .and_then(|k| k.as_ref().map(String::as_str))
-                .unwrap_or("unknown");
+            let key = primary_keys.get(i).and_then(Option::as_ref);
+            let key_str = key.map_or("unknown", String::as_str);
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
             );
+            // A NULL key addresses no stored vector, so there is nothing to remove.
+            if let Some(key) = key {
+                rejected.push(key.clone());
+            }
 
             embeddings.remove(i);
             primary_keys.remove(i);
@@ -307,7 +336,26 @@ fn filter_zero_vectors(
         }
     }
 
-    (embeddings, primary_keys, metadata)
+    // `write_data` skips a row whose embedding is `None` (a NULL or empty search
+    // text), so those keys keep whatever vector an earlier text stored.
+    let indexed: Vec<&str> = embeddings
+        .iter()
+        .zip(primary_keys.iter())
+        .filter_map(|(embedding, key)| match (embedding, key) {
+            (Some(_), Some(key)) => Some(key.as_str()),
+            _ => None,
+        })
+        .collect();
+    rejected.extend(
+        embeddings
+            .iter()
+            .zip(primary_keys.iter())
+            .filter(|(embedding, _)| embedding.is_none())
+            .filter_map(|(_, key)| key.clone()),
+    );
+
+    let evicted = write_util::keys_to_evict(rejected, indexed);
+    (embeddings, primary_keys, metadata, evicted)
 }
 
 #[cfg(test)]
@@ -344,7 +392,7 @@ mod tests {
             ],
         );
 
-        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+        let (filtered_embeddings, filtered_keys, filtered_metadata, _evicted) =
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
         assert_eq!(filtered_embeddings.len(), 3);
@@ -389,7 +437,7 @@ mod tests {
             ],
         );
 
-        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+        let (filtered_embeddings, filtered_keys, filtered_metadata, _evicted) =
             filter_zero_vectors(embeddings, keys, metadata, "test_index");
 
         // Should keep only the 2 valid vectors
@@ -402,6 +450,87 @@ mod tests {
         assert_eq!(filtered_embeddings[1], Some(vec![3.0, 4.0]));
         assert_eq!(filtered_keys[0], Some("key1".to_string()));
         assert_eq!(filtered_keys[1], Some("key4".to_string()));
+    }
+
+    fn keys_of(keys: &[Option<&str>]) -> Vec<Option<String>> {
+        keys.iter().map(|k| k.map(ToString::to_string)).collect()
+    }
+
+    /// Regression test for #13504. A row rewritten from an indexable embedding to a rejected
+    /// one is dropped from the `PutVectors` call, so without a delete beside it the vector
+    /// its previous text produced stays in the index and goes on being returned.
+    #[test]
+    fn a_rejected_row_is_named_for_deletion() {
+        let embeddings = vec![
+            Some(vec![1.0, 2.0]),           // indexed
+            Some(vec![0.0, 0.0]),           // rejected — all zeros
+            Some(vec![f32::NAN, f32::NAN]), // rejected — all NaN
+        ];
+        let keys = keys_of(&[Some("kept"), Some("zeroed"), Some("nan")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        let mut evicted = evicted;
+        evicted.sort();
+        assert_eq!(
+            evicted,
+            vec!["nan".to_string(), "zeroed".to_string()],
+            "every rejected row must be deleted; the row that was indexed must not be"
+        );
+    }
+
+    /// `write_data` drops a `None` embedding as silently as a filtered one, so the same
+    /// stale vector survives a row whose search text became NULL or empty.
+    #[test]
+    fn a_row_with_no_embedding_at_all_is_named_for_deletion() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), None];
+        let keys = keys_of(&[Some("kept"), Some("no_text")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert_eq!(evicted, vec!["no_text".to_string()]);
+    }
+
+    /// A NULL primary key addresses no stored vector, so there is nothing to delete for it —
+    /// and inventing a key would delete something else.
+    #[test]
+    fn a_rejected_row_with_a_null_key_names_nothing_for_deletion() {
+        let embeddings = vec![Some(vec![0.0, 0.0]), None];
+        let keys = keys_of(&[None, None]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty(), "a NULL key names no stored vector");
+    }
+
+    /// The same key indexed and rejected within one batch: the put re-establishes it, so a
+    /// delete would only cost a round trip.
+    #[test]
+    fn a_key_this_batch_also_stores_is_not_named_for_deletion() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![0.0, 0.0])];
+        let keys = keys_of(&[Some("same"), Some("same")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_rejects_nothing_names_nothing_for_deletion() {
+        let embeddings = vec![Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])];
+        let keys = keys_of(&[Some("a"), Some("b")]);
+
+        let (_, _, _, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(
+            evicted.is_empty(),
+            "the happy path must issue no delete call at all"
+        );
     }
 
     #[test]

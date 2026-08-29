@@ -36,8 +36,9 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::elasticsearch::ElasticsearchIndex;
+use crate::index::elasticsearch::{ElasticsearchIndex, delete};
 use crate::index::embedding_col;
+use crate::index::write_util;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -109,6 +110,14 @@ pub enum Error {
         "Failed to write to Elasticsearch index '{index}': source column '{column}' collides with the configured vector_field name. Rename one of the columns so the embedding vector does not silently overwrite a source value."
     ))]
     VectorFieldCollidesWithSourceColumn { index: String, column: String },
+
+    #[snafu(display(
+        "Failed to update the search index '{index}' (elasticsearch): the documents stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Cause: {source}"
+    ))]
+    CannotEvictRejectedRecords {
+        index: String,
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -160,8 +169,20 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
 
     // Build all documents in a sync block so the arrow-json encoders (which are
     // `!Send`) are dropped before any subsequent `.await`.
-    let docs: Vec<(Option<String>, Value)> =
+    let (docs, evicted): (Vec<(Option<String>, Value)>, Vec<String>) =
         build_documents(index, &record, &embedding_vectors, &primary_keys)?;
+
+    // Before the bulk index, not after it: a key this batch both rejects and indexes is
+    // excluded from `evicted`, so deleting first is what lets the two orders agree.
+    // No rejected row means no extra request at all.
+    if !evicted.is_empty() {
+        delete::delete_by_ids(index.client.as_ref(), es_index, &evicted)
+            .await
+            .map_err(|source| Error::CannotEvictRejectedRecords {
+                index: es_index.to_string(),
+                source,
+            })?;
+    }
 
     if docs.is_empty() {
         tracing::debug!(
@@ -200,14 +221,18 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
 
 /// Build ES `_bulk` documents from a record batch + pre-computed embeddings.
 ///
+/// Returns the documents to index and, beside them, the `_id`s of the rows this batch
+/// could not index and must therefore delete (see [`write_util::keys_to_evict`]).
+///
 /// Kept sync so the arrow-json encoders it uses (which are `!Send`) stay off
 /// the async state machine.
+#[expect(clippy::type_complexity)]
 fn build_documents(
     index: &ElasticsearchIndex,
     record: &RecordBatch,
     embedding_vectors: &[Option<Vec<f32>>],
     primary_keys: &[Option<String>],
-) -> Result<Vec<(Option<String>, Value)>> {
+) -> Result<(Vec<(Option<String>, Value)>, Vec<String>)> {
     // Aggregate per-row skip reasons into batch-level counts (plus a small
     // sample of row indices) to avoid high-volume per-row logs on large
     // batches with many NULLs or invalid embeddings.
@@ -261,16 +286,25 @@ fn build_documents(
 
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
 
+    // The `_id`s of rows this batch could not index. A document already stored under
+    // one of them holds a vector from an earlier value of the row's text, which a
+    // search would go on returning — see [`write_util::keys_to_evict`].
+    let mut rejected: Vec<String> = Vec::new();
+
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
+            if let Some(id) = primary_keys[row].as_ref() {
+                rejected.push(id.clone());
+            }
             continue;
         };
 
         // Skip rows with NULL primary keys when a primary key is configured.
         // Without an `_id`, Elasticsearch would auto-generate one, making
         // re-indexing the same row non-idempotent (producing duplicates on
-        // refresh/CDC writes).
+        // refresh/CDC writes). No `_id` also means no document this write can
+        // address, so there is nothing for it to evict.
         if !index.primary_key.is_empty() && primary_keys[row].is_none() {
             null_pk_skips += 1;
             if null_pk_samples.len() < SAMPLE_LIMIT {
@@ -293,6 +327,9 @@ fn build_documents(
             if zero_or_nan_samples.len() < SAMPLE_LIMIT {
                 zero_or_nan_samples.push(row);
             }
+            if let Some(id) = primary_keys[row].as_ref() {
+                rejected.push(id.clone());
+            }
             continue;
         }
 
@@ -300,6 +337,9 @@ fn build_documents(
             non_finite_skips += 1;
             if non_finite_samples.len() < SAMPLE_LIMIT {
                 non_finite_samples.push(row);
+            }
+            if let Some(id) = primary_keys[row].as_ref() {
+                rejected.push(id.clone());
             }
             continue;
         }
@@ -342,12 +382,12 @@ fn build_documents(
     }
     if zero_or_nan_skips > 0 {
         tracing::warn!(
-            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Any document already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {zero_or_nan_samples:?}"
         );
     }
     if non_finite_skips > 0 {
         tracing::warn!(
-            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
+            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Any document already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {non_finite_samples:?}"
         );
     }
     if missing_embedding_skips > 0 {
@@ -356,7 +396,9 @@ fn build_documents(
         );
     }
 
-    Ok(docs)
+    let indexed = docs.iter().filter_map(|(id, _)| id.as_deref());
+    let evicted = write_util::keys_to_evict(rejected, indexed);
+    Ok((docs, evicted))
 }
 
 async fn embed_column(
@@ -940,6 +982,145 @@ mod tests {
             panic!("expected a BulkIndexItemErrors rejection");
         };
         failures
+    }
+
+    mod eviction {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::super::build_documents;
+        use crate::index::elasticsearch::{
+            ElasticsearchIndex, ElasticsearchIndexWriteMaintenance, unused_client,
+        };
+        use crate::metadata::MetadataColumns;
+
+        const DIMS: i32 = 2;
+
+        /// `build_documents` neither embeds nor talks to Elasticsearch — it is handed the
+        /// embeddings and the `_id`s — so the index's client and embedder only have to exist.
+        #[derive(Debug)]
+        struct Unused;
+
+        #[async_trait::async_trait]
+        impl llms::embeddings::Embed for Unused {
+            async fn embed(
+                &self,
+                _input: llms::embeddings::EmbeddingInput,
+            ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+                panic!("build_documents must not embed");
+            }
+
+            fn size(&self) -> i32 {
+                DIMS
+            }
+        }
+
+        fn index() -> ElasticsearchIndex {
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("content", DataType::Utf8, true),
+            ]));
+            ElasticsearchIndex {
+                client: Arc::new(unused_client::UnusedClient),
+                es_index: "idx".to_string(),
+                embedded_column: "content".to_string(),
+                vector_field: "content_vector".to_string(),
+                text_fields: vec![],
+                primary_key: vec![Field::new("id", DataType::Int64, false)],
+                compute_query: Arc::new(Unused),
+                dims: DIMS,
+                similarity: "cosine".to_string(),
+                source_schema,
+                metadata_columns: MetadataColumns::none(),
+                batch_write_rows: 100,
+                write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            }
+        }
+
+        fn record(ids: &[i64]) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("content", DataType::Utf8, true),
+            ]));
+            let contents: Vec<String> = ids.iter().map(|id| format!("row {id}")).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(contents)),
+                ],
+            )
+            .expect("valid test batch")
+        }
+
+        fn keys(ids: &[i64]) -> Vec<Option<String>> {
+            ids.iter().map(|id| Some(id.to_string())).collect()
+        }
+
+        fn evicted(ids: &[i64], embeddings: &[Option<Vec<f32>>]) -> Vec<String> {
+            let index = index();
+            let (_docs, evicted) = build_documents(&index, &record(ids), embeddings, &keys(ids))
+                .expect("documents build");
+            let mut evicted = evicted;
+            evicted.sort();
+            evicted
+        }
+
+        /// Regression test for #13503. A row rewritten from an indexable embedding to a
+        /// rejected one is left out of the `_bulk` body, which only ever carries `index`
+        /// actions — so the document stored under its `_id` survives untouched and search
+        /// keeps returning it at the vector its previous text produced.
+        #[test]
+        fn an_all_zero_or_nan_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(
+                    &[1, 2, 3],
+                    &[
+                        Some(vec![1.0, 2.0]),
+                        Some(vec![0.0, 0.0]),
+                        Some(vec![f32::NAN, f32::NAN]),
+                    ],
+                ),
+                vec!["2".to_string(), "3".to_string()],
+            );
+        }
+
+        /// Elasticsearch is the one backend that already rejected a *partially* non-finite
+        /// vector, so this class is live on it today.
+        #[test]
+        fn a_partially_non_finite_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(
+                    &[1, 2, 3],
+                    &[
+                        Some(vec![1.0, 2.0]),
+                        Some(vec![1.0, f32::NAN]),
+                        Some(vec![1.0, f32::INFINITY]),
+                    ],
+                ),
+                vec!["2".to_string(), "3".to_string()],
+            );
+        }
+
+        /// No embedding at all — a NULL or empty search text — leaves the same stale
+        /// document behind as a rejected one.
+        #[test]
+        fn a_row_with_no_embedding_evicts_its_document() {
+            assert_eq!(
+                evicted(&[1, 2], &[Some(vec![1.0, 2.0]), None]),
+                vec!["2".to_string()],
+            );
+        }
+
+        #[test]
+        fn a_batch_that_indexes_every_row_evicts_nothing() {
+            assert!(
+                evicted(&[1, 2], &[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])]).is_empty(),
+                "the happy path must issue no delete request at all"
+            );
+        }
     }
 
     #[test]

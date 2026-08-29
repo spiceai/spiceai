@@ -398,6 +398,24 @@ impl Index for S3Vector {
                 .flatten()
                 .collect();
 
+        self.delete_key_strings(key_strings).await
+    }
+}
+
+impl S3Vector {
+    /// Remove every vector stored under `key_strings`, from every physical index a delete
+    /// must reach (see [`Self::delete_target_tables`]).
+    ///
+    /// Shared by [`VectorIndex::delete_by_keys`], which resolves the keys from a batch, and
+    /// by the write path, which already holds them as strings for the rows it rejected.
+    pub(super) async fn delete_key_strings(
+        &self,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+
         let tables = self.delete_target_tables().await?;
         let num_tables = tables.len();
 
@@ -422,9 +440,7 @@ impl Index for S3Vector {
             )))
         }
     }
-}
 
-impl S3Vector {
     /// Every physical S3 Vectors index a delete of `self` must reach.
     ///
     /// Broadcasts to every index that could hold a matching key rather than routing to the exact
