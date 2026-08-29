@@ -412,11 +412,65 @@ impl S3Vector {
         &self,
         key_strings: Vec<String>,
     ) -> Result<(), DataFusionError> {
+        // Resolving the targets lists indexes in AWS, so nothing to delete must cost nothing.
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+        let tables = self.delete_target_tables().await?;
+        self.delete_key_strings_from(tables, key_strings).await
+    }
+
+    /// Remove the vectors a write could not replace, from the index that write is targeting.
+    ///
+    /// The broadcast [`Self::delete_target_tables`] performs exists because a resolved
+    /// delete-key batch cannot say which physical index a key's vector landed in. A write
+    /// does not have that problem for partitioning: it is *inside* the partition it
+    /// evaluated, and `table` is the very index it is about to `PutVectors` into, so the
+    /// stale vector for a rejected row in that partition is in `table` or nowhere. Routing
+    /// there instead of broadcasting keeps a partitioned write linear — the broadcast is
+    /// issued per chunk *and* per partition, and each one re-lists every partition index, so
+    /// it costs O(partitions²) `DeleteVectors` calls for what one call reaches.
+    ///
+    /// Spill writes are the case a write genuinely cannot resolve: which spill index absorbed
+    /// a key depends on write-time AWS quota state, so those still broadcast.
+    ///
+    /// A row whose *partition value* changed leaves its old vector in the old partition index.
+    /// That is untouched here on purpose: the `PutVectors` beside this delete has the same
+    /// blind spot, so a cross-partition move is a pre-existing gap in the write path rather
+    /// than something eviction can close on its own.
+    pub(super) async fn evict_written_keys(
+        &self,
+        table: &S3VectorsTable,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
+        if key_strings.is_empty() {
+            return Ok(());
+        }
+        let tables = self.evict_target_tables(table).await?;
+        self.delete_key_strings_from(tables, key_strings).await
+    }
+
+    /// The physical indexes [`Self::evict_written_keys`] must reach for a write targeting
+    /// `table`.
+    async fn evict_target_tables(
+        &self,
+        table: &S3VectorsTable,
+    ) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+        if self.spill_writes {
+            return self.delete_target_tables().await;
+        }
+        Ok(vec![table.clone()])
+    }
+
+    async fn delete_key_strings_from(
+        &self,
+        tables: Vec<S3VectorsTable>,
+        key_strings: Vec<String>,
+    ) -> Result<(), DataFusionError> {
         if key_strings.is_empty() {
             return Ok(());
         }
 
-        let tables = self.delete_target_tables().await?;
         let num_tables = tables.len();
 
         let results = join_all(tables.into_iter().map(|table| {
@@ -683,6 +737,67 @@ mod tests {
                 "virtual-index-01".to_string(),
                 "virtual-index-02".to_string(),
             ]
+        );
+    }
+
+    /// A write already knows which partition index it is writing to, so evicting the rows it
+    /// rejected must go there rather than re-listing and broadcasting to every partition. The
+    /// broadcast is issued per chunk *and* per partition, so leaving it in place costs
+    /// O(partitions²) `DeleteVectors` calls for what one call reaches.
+    #[tokio::test]
+    async fn a_partitioned_write_evicts_only_from_the_index_it_writes_to() {
+        let client = Arc::new(MockClient::new()) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index.partition_by = vec![col("region")];
+
+        for value in ["us", "eu"] {
+            let partitioned_name = PartitionedIndexName::new(
+                "virtual-index",
+                &index.embedded_column,
+                &index.partition_by,
+                &ScalarValue::from(value),
+            )
+            .expect("valid partition name")
+            .to_index_name();
+            create_index(&client, &partitioned_name).await;
+        }
+
+        let broadcast = index
+            .delete_target_tables()
+            .await
+            .expect("should resolve targets");
+        assert_eq!(broadcast.len(), 2, "the key-only delete still broadcasts");
+
+        let targeted = index
+            .evict_target_tables(&index.table)
+            .await
+            .expect("should resolve targets");
+        assert_eq!(
+            index_names(&targeted),
+            vec!["virtual-index".to_string()],
+            "the write's own target, not every partition index"
+        );
+    }
+
+    /// Spill writes are the case a write genuinely cannot resolve: which spill index absorbed
+    /// a key depends on write-time AWS quota state, so eviction must still broadcast.
+    #[tokio::test]
+    async fn a_spilling_write_still_evicts_from_every_spill_index() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let mut index = test_s3_vector(Arc::clone(&client)).await;
+        index = index.enable_spill_writes();
+
+        create_index(&client, "virtual-index-01").await;
+
+        let targeted = index
+            .evict_target_tables(&index.table)
+            .await
+            .expect("should resolve targets");
+
+        assert_eq!(
+            index_names(&targeted),
+            vec!["virtual-index".to_string(), "virtual-index-01".to_string()],
         );
     }
 

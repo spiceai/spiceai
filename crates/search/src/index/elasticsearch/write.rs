@@ -172,8 +172,13 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
     let (docs, evicted): (Vec<(Option<String>, Value)>, Vec<String>) =
         build_documents(index, &record, &embedding_vectors, &primary_keys)?;
 
-    // Before the bulk index, not after it: a key this batch both rejects and indexes is
-    // excluded from `evicted`, so deleting first is what lets the two orders agree.
+    // Before the bulk index, for two reasons. A key this batch both rejects and indexes is
+    // excluded from `evicted`, so deleting first is what lets the two orders agree. And the
+    // delete and the `_bulk` are separate requests that cannot be made atomic, so one of them
+    // has to be able to land without the other: deleting first fails toward the stale document
+    // being gone, whereas indexing first fails toward it still being searchable — which is the
+    // bug. A retry of the whole batch converges either way, because the delete is idempotent
+    // and the rows it addresses are exactly the ones no `index` action will restore.
     // No rejected row means no extra request at all.
     if !evicted.is_empty() {
         delete::delete_by_ids(index.client.as_ref(), es_index, &evicted)

@@ -196,16 +196,21 @@ async fn process_single_batch(
     let (filtered_embeddings, filtered_primary_key, filtered_metadata, evicted) =
         filter_zero_vectors(embedding_vectors, primary_key, metadata, index.name());
 
-    // Before the put, not after it: a key this batch both rejects and stores is
-    // excluded from `evicted`, so deleting first is what lets the two orders agree.
+    // Before the put, for two reasons. A key this batch both rejects and stores is excluded
+    // from `evicted`, so deleting first is what lets the two orders agree. And the delete and
+    // the put cannot be made one atomic operation against S3 Vectors, so one of them has to
+    // be able to land without the other: deleting first fails toward the stale vector being
+    // gone, whereas putting first fails toward it still being served — which is the bug.
+    // A retry of the whole batch converges either way.
     // No rejected row means no extra call at all.
     if !evicted.is_empty() {
-        index.delete_key_strings(evicted).await.map_err(|source| {
-            Error::CannotEvictRejectedRecords {
+        index
+            .evict_written_keys(table, evicted)
+            .await
+            .map_err(|source| Error::CannotEvictRejectedRecords {
                 index: index.name().to_string(),
                 source,
-            }
-        })?;
+            })?;
     }
 
     let spill_index = index.spill_index().await.context(CannotWriteIndexSnafu {
@@ -338,21 +343,15 @@ fn filter_zero_vectors(
 
     // `write_data` skips a row whose embedding is `None` (a NULL or empty search
     // text), so those keys keep whatever vector an earlier text stored.
-    let indexed: Vec<&str> = embeddings
-        .iter()
-        .zip(primary_keys.iter())
-        .filter_map(|(embedding, key)| match (embedding, key) {
-            (Some(_), Some(key)) => Some(key.as_str()),
-            _ => None,
-        })
-        .collect();
-    rejected.extend(
-        embeddings
-            .iter()
-            .zip(primary_keys.iter())
-            .filter(|(embedding, _)| embedding.is_none())
-            .filter_map(|(_, key)| key.clone()),
-    );
+    let mut indexed: Vec<&str> = Vec::with_capacity(embeddings.len());
+    for (embedding, key) in embeddings.iter().zip(primary_keys.iter()) {
+        match (embedding, key) {
+            (Some(_), Some(key)) => indexed.push(key.as_str()),
+            // A NULL key addresses no stored vector, so `None` here evicts nothing.
+            (None, Some(key)) => rejected.push(key.clone()),
+            _ => {}
+        }
+    }
 
     let evicted = write_util::keys_to_evict(rejected, indexed);
     (embeddings, primary_keys, metadata, evicted)

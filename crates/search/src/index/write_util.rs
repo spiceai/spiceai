@@ -371,11 +371,10 @@ pub fn keys_to_evict<'a>(
     indexed: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
     let indexed: std::collections::HashSet<&str> = indexed.into_iter().collect();
-    let mut seen = std::collections::HashSet::new();
     rejected
         .into_iter()
         .filter(|key| !indexed.contains(key.as_str()))
-        .filter(|key| seen.insert(key.clone()))
+        .unique()
         .collect()
 }
 
