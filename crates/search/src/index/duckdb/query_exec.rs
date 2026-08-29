@@ -383,7 +383,7 @@ mod tests {
             "a timezone-aware column must not be rendered through whole milliseconds: {sql}"
         );
         assert!(
-            sql.contains(".000999"),
+            sql.contains("1767225600000999"),
             "the comparison must keep its sub-millisecond digits: {sql}"
         );
     }
