@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -98,6 +99,26 @@ impl std::fmt::Debug for DuckLakeCatalogProvider {
     }
 }
 
+/// The dialect a `DuckLake` catalog unparses with, and the functions federation
+/// may push down to it.
+///
+/// One value because they are one decision. The `DuckDB` deny-list does not deny
+/// every Spice function: it *carves out* the ones the `DuckDB` dialect rewrites
+/// into native SQL (`cosine_distance` -> `array_cosine_distance`, `rand` ->
+/// `random()`, ...), and both sides of that are derived from the same override
+/// list. Supply the deny-list with the stock dialect and every carved-out name
+/// federates and is then emitted verbatim — the unknown-function failure the
+/// deny-list exists to prevent, now reachable only through the functions it
+/// deliberately allowed. Building them together is what stops half the pair
+/// being installed.
+pub struct DuckLakeFederation {
+    /// The unparser dialect. Must be the one whose rewrites `function_support`
+    /// was derived from.
+    pub dialect: Arc<dyn Dialect + Send + Sync>,
+    /// Which functions may be pushed into the SQL sent to `DuckDB`.
+    pub function_support: FunctionSupport,
+}
+
 impl DuckLakeCatalogProvider {
     /// Creates a new `DuckLakeCatalogProvider` with the given `DuckDB` pool.
     ///
@@ -109,13 +130,12 @@ impl DuckLakeCatalogProvider {
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
     /// * `selector` - Which discovered tables the catalog registers
-    /// * `function_support` - Which functions federation may push into the SQL
-    ///   sent to `DuckDB`. Taken by value rather than defaulted because a
-    ///   factory built without one pushes every Spice-only UDF (`json_get_str`
+    /// * `federation` - How this catalog unparses and what it may push down.
+    ///   Required rather than defaulted: the factory's own defaults federate
+    ///   everything with no deny-list, so every Spice-only UDF (`json_get_str`
     ///   and the rest of the JSON set, the embedding/distance UDFs, every
-    ///   user-registered function) verbatim into the remote statement, where it
-    ///   does not exist — so the caller has to decide rather than inherit a
-    ///   permissive default it never saw. See issues #10703 and #13664.
+    ///   user-registered function) is unparsed verbatim into the statement sent
+    ///   to `DuckDB`, where it does not exist. See issues #10703 and #13664.
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
@@ -123,11 +143,13 @@ impl DuckLakeCatalogProvider {
         writable: bool,
         ddl_enabled: bool,
         selector: TableSelector,
-        function_support: FunctionSupport,
+        federation: DuckLakeFederation,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
         let duckdb_factory = Arc::new(
-            DuckDBTableFactory::new(Arc::clone(&pool)).with_function_support(function_support),
+            DuckDBTableFactory::new(Arc::clone(&pool))
+                .with_dialect(federation.dialect)
+                .with_function_support(federation.function_support),
         );
         Self {
             pool,
