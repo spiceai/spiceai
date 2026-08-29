@@ -23,11 +23,11 @@ limitations under the License.
 //!
 //! Deletion vectors are stored as Arrow IPC files with one of two schemas:
 //!
-//! - **Position-based** (for tables without primary key):
+//! - **Position-based** (the vector schema for a file-scoped delete):
 //!   - `row_id: UInt64` - File-local row position (0-indexed)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 //!
-//! - **Key-based** (for tables with primary key):
+//! - **Key-based** (the vector schema for a table-wide delete by key):
 //!   - `row_key: Binary` - Primary key bytes (via Arrow's `RowConverter`)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 
@@ -124,8 +124,8 @@ impl Drop for TestWriterHookGuard {
 ///   Used when a primary key is defined.
 #[derive(Debug)]
 pub enum DeletionIdentifier {
-    /// Position-based row IDs for a specific data file (tables without primary key).
-    /// The file path identifies which data file these row positions belong to.
+    /// Position-based row IDs for a specific data file. The file path identifies
+    /// which data file these row positions belong to.
     PositionBased {
         file_path: String,
         row_ids: Vec<u64>,
@@ -133,7 +133,7 @@ pub enum DeletionIdentifier {
         /// can skip its sort/dedup pass.
         pre_sorted: bool,
     },
-    /// Primary key-based row keys (for tables with primary key).
+    /// Row keys, which apply table-wide rather than to one data file.
     KeyBased(Vec<Box<[u8]>>),
 }
 
@@ -943,7 +943,11 @@ fn build_delete_file(
     })
 }
 
-/// Schema for position-based deletion vectors (tables without primary key).
+/// Schema for position-based deletion vectors. Selected by the shape of the
+/// delete being recorded — a known `(file path, file-local position)` — not by
+/// whether the table has a primary key: a primary-key table in
+/// `deletion_mode: position` writes these, and falls back to the key schema
+/// below for any row whose position it does not know.
 static POSITION_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::UInt64, false),
@@ -951,7 +955,8 @@ static POSITION_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Schema for key-based deletion vectors (tables with primary key).
+/// Schema for key-based deletion vectors. Requires a primary key, but primary-key
+/// presence does not select it — see the position-based schema above.
 static KEY_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("row_key", DataType::Binary, false),
