@@ -96,6 +96,40 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      # The FinanceBench spicepods read a pre-built corpus and its qrels from the bench MinIO
+      # bucket (s3://benchmarks/financebench/). That data is not committed, so a fresh bucket
+      # leaves the datasets forever unavailable and the run times out waiting for readiness.
+      # Stage it here once per bucket for any FinanceBench spicepod, so every workflow that
+      # runs one finds the data. Both steps no-op for non-FinanceBench runs.
+      - name: Set up Python for FinanceBench staging
+        if: contains(github.event.inputs.spicepod_path, 'financebench')
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Stage FinanceBench corpus to MinIO
+        if: contains(github.event.inputs.spicepod_path, 'financebench')
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # relevance_data.parquet is the last object financebench_stage.py writes, so its
+          # presence means a prior run staged the corpus in full. Skip the work when it is
+          # already there, so the corpus is built once and reused across every run.
+          if mc stat spice-minio/benchmarks/financebench/relevance_data.parquet >/dev/null 2>&1; then
+            echo "FinanceBench data already staged in MinIO; skipping."
+            exit 0
+          fi
+          echo "FinanceBench data not found in MinIO; staging now."
+          cargo build --release -p pdf-split
+          python3 -m pip install --upgrade boto3 pyarrow
+          # Pin --source to a commit so the corpus cannot change under a staged run.
+          ./scripts/financebench_stage.py \
+            --source https://raw.githubusercontent.com/patronus-ai/financebench/cc39aeb4afdf33909ee1412188bf89035950c2eb \
+            --dest s3://benchmarks/financebench/
+
       - name: Extract spicepod filename path
         id: extract_spicepod_filename
         run: |
