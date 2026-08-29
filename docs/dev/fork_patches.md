@@ -99,7 +99,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `b5cb7bb321acbbff749bb9147130f6b47bb36034` | `spiceai-54` |
+| [datafusion](#datafusion) | `859621d612511efb93a7f3e020f8baae8e33e3b4` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `beeecde18a72d2b6cad9d75aa44279398f084bce` | `spiceai-54` |
@@ -119,7 +119,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `633c1dc4ad0d4a5b38f291a391da08519068519a` | `spiceai-54` |
+| [vortex](#vortex) | `ba043de0ab6e214e825932210cc336b7ce5e8309` | `spiceai-54` |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
@@ -139,16 +139,9 @@ so patches to it are not fork state and are not listed. Only patches to
 `vortex-array`, `vortex-arrow`, `vortex-io`, `vortex-file`, `vortex-layout` and
 `vortex-utils` can be lost by a re-cut.
 
-The Arrow `Map` alias is **not on this pin**. `633c1dc4` predates both halves of the
-restore (`feat(arrow): restore the Arrow Map alias` and `fix(arrow): recurse into map
-entries when importing through the session`), so a `Map` column still fails to write
-here with `Array encoding not implemented for Arrow data type Map(...)`
-([#13524](https://github.com/spiceai/spiceai/issues/13524)). There is no row for it
-below because the fork at this revision does not carry it, and no guard, because a
-guard would fail. Closing it means moving the pin, not adding a test.
-
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
+| Arrow `Map` alias (`vortex-arrow`), both halves: the `DType` alias and the map-entry recursion in the session importer | Every write of a `Map` column fails with `Array encoding not implemented for Arrow data type Map(...)`. The table is created happily first, so it surfaces only on flush | silent | `crates/vortex/src/persistent/mod.rs::map_column_roundtrips_through_a_vortex_file`, and `crates/cayenne/src/schema.rs::vortex_encodes_exactly_the_types_not_listed_as_unsupported` for the whole type list |
 | Tokio one-shot for the spawned-task result channel (`vortex-io/src/runtime/handle.rs`) | Reentrant waker drop on the cancellation path → `SIGSEGV` under ordinary query cancellation | silent (crash) | `crates/cayenne/tests/vortex_task_cancellation.rs` |
 | Tokio one-shot in `vortex-io/src/runtime/single.rs` | The same hazard on the single-runtime path | silent (crash) | as above |
 | Tokio one-shot for the segment-read result channel (`vortex-file/src/segments/source.rs`) | The same hazard on `ReadFuture`, polled and then dropped on cancellation | silent (crash) | as above |
@@ -191,6 +184,8 @@ catch.
 | Unparser: `ORDER BY` kept out of a derived table when the sort key is computed (fork PR #191) | The ordering is emitted inside a derived table, which SQL does not require the outer query to preserve — rows come back in any order | silent (wrong order) | **GAP** |
 | Unparser: a stacked aggregate is unparsed as a derived table (fork PR #192) | An aggregate over an aggregate is flattened into one query, changing the grouping | silent (wrong data) | **GAP** |
 | Unparser: a bounded `EXISTS` build side is scoped, so its limit selects rows (fork PR #201) | The limit binds to the correlated subquery rather than the build side, so the `EXISTS` matches rows it should not | silent (wrong data) | **GAP** |
+| Unparser: refuse an `EXISTS` bound that cannot be scoped, rather than emit wrong rows (fork PR #205) | The unparser silently emits SQL that returns wrong rows for the shapes it cannot scope ([#13277](https://github.com/spiceai/spiceai/issues/13277)) | silent (wrong data) | **GAP** |
+| Unparser: name a derived table's unnamed outputs (fork PR #206) | A derived table with an unnamed output column produces SQL the remote engine rejects, or binds the wrong column ([#12751](https://github.com/spiceai/spiceai/issues/12751)) | silent (wrong data / query failure) | **GAP** |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
 | BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169) | Federated BigQuery queries are rejected by BigQuery, or silently coerce types | silent (query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does` covers the type spelling; the remaining four are a **GAP** |
@@ -199,6 +194,7 @@ catch.
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
+| `Inner`/`Full` join metadata kept stable across a `JoinSelection` input swap (fork PR #208) | `JoinType::swap` leaves `Inner` and `Full` alone, so the join's output schema follows whichever input the swap put on the left. Any join between two datasets whose schema metadata disagrees — two datasets that each carry a `description` is enough — fails to plan with `PhysicalOptimizer rule 'join_selection' failed. Schema mismatch` | silent (query failure) | **GAP** |
 | Pluggable `CollectLeftAccumulator` seam on `HashJoinExec` | Cayenne's custom left-side accumulator cannot be installed | build | compile-guarded by `crates/cayenne` |
 
 ## arrow-rs
@@ -441,7 +437,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**42 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -454,57 +450,62 @@ They are not equal in consequence; this is the order to close them in.
 2. `datafusion` unparser: a stacked aggregate unparsed as a derived table (fork PR #192).
 3. `datafusion` unparser: a bounded `EXISTS` build side scoped outside the correlation
    (fork PR #201).
-4. `datafusion` BigQuery dialect: timestamp literal format, `date_field_extract_style`
+4. `datafusion` unparser: an `EXISTS` bound that cannot be scoped is refused rather
+   than unparsed to wrong rows (fork PR #205).
+5. `datafusion` unparser: a derived table's unnamed outputs are named (fork PR #206).
+6. `datafusion` BigQuery dialect: timestamp literal format, `date_field_extract_style`
    / `interval_style`, `date_trunc`, table-alias column aliases (fork PRs #144, #146,
    #148, #169).
-5. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
-6. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-7. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-8. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-9. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
-   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-10. `snowflake-rs` chunked JSON responses and record-batch ordering.
-11. `clickhouse-rs` `Date32` range.
-12. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+7. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
+8. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
+9. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+10. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+11. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
+12. `snowflake-rs` chunked JSON responses and record-batch ordering.
+13. `clickhouse-rs` `Date32` range.
+14. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
     change the text that gets embedded.
-13. `mistral.rs` `tool_calls` chat-template handling.
-14. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
+15. `mistral.rs` `tool_calls` chat-template handling.
+16. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
     from the reference implementation.
 
-The first three are the cheapest to close by a long way. Each patch is present on the
+The first five are the cheapest to close by a long way. Each patch is present on the
 `datafusion` revision this branch pins, and each already has a written guard — the
 tests live in `crates/data_components/src/federation.rs` on `trunk`. Porting them is
 a copy, not an audit.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-15. `vortex` session lock re-entry in writer init (fork PR #29).
-16. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+17. `datafusion` `Inner`/`Full` join metadata across a `JoinSelection` input swap (fork
+    PR #208) — a join between two datasets that each carry a `description` fails to plan.
+18. `vortex` session lock re-entry in writer init (fork PR #29).
+19. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-17. `async-openai` null-suppression in requests.
-18. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-19. `model2vec-rs` optional `config.json`.
-20. `snowflake-rs` async query response support — long-running queries time out.
+20. `async-openai` null-suppression in requests.
+21. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+22. `model2vec-rs` optional `config.json`.
+23. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-21. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+24. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-22. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+25. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-23. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+26. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-24. `model2vec-rs` HF cache directory read from the environment — models are
+27. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-25. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+28. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-26. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-27. `graph-rs-sdk` tower middleware application.
+29. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+30. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -512,7 +513,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-28. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+31. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
@@ -521,7 +522,7 @@ without becoming a flaky timing test:
 ## A patch that is present but incomplete
 
 Found while writing the guard for it, so it is a defect rather than a coverage gap,
-and it is not one of the 39 above.
+and it is not one of the 42 above.
 
 `vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
 `ExtensionArray`. A scan also evaluates a pushed-down predicate against *constant*
