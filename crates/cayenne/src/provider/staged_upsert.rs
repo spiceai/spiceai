@@ -264,6 +264,12 @@ impl CayenneStagedUpsert {
             });
         }
 
+        // Taken before the publish below, which makes this transaction's staged
+        // rows visible while the `num_rows` delta describing them only reaches
+        // the maintenance queue afterwards. Released on drop if the commit
+        // returns early — nothing was published.
+        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
+
         // visibility lock then listing fence — the same order as
         // `apply_under_barrier` and the sync on-conflict publish.
         let _visibility = self.table.visibility_lock_arc().lock_owned().await;
@@ -301,6 +307,7 @@ impl CayenneStagedUpsert {
             false,
             retention_requested,
             live_rows_delta,
+            reserved_live_rows_delta,
         );
         if retention_requested {
             self.table.clear_cached_pk_keyset();
@@ -427,6 +434,10 @@ impl PreparedTxnCommit {
     /// Returns an error only if swapping the in-memory deletion caches fails.
     pub fn finish(self) -> Result<u64> {
         let sequence = self.publish.snapshot_sequence;
+        // Taken before the publish below, which makes this transaction's staged
+        // rows visible while the `num_rows` delta describing them only reaches
+        // the maintenance queue afterwards.
+        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
         // The fused transaction publish just made this transaction's staged rows
@@ -448,6 +459,7 @@ impl PreparedTxnCommit {
             false,
             retention_requested,
             live_rows_delta,
+            reserved_live_rows_delta,
         );
         if retention_requested {
             self.table.clear_cached_pk_keyset();
