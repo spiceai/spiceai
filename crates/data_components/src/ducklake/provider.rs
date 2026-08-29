@@ -102,18 +102,15 @@ impl std::fmt::Debug for DuckLakeCatalogProvider {
 /// The dialect a `DuckLake` catalog unparses with, and the functions federation
 /// may push down to it.
 ///
-/// One value because they are one decision. The `DuckDB` deny-list does not deny
-/// every Spice function: it *carves out* the ones the `DuckDB` dialect rewrites
-/// into native SQL (`cosine_distance` -> `array_cosine_distance`, `rand` ->
-/// `random()`, ...), and both sides of that are derived from the same override
-/// list. Supply the deny-list with the stock dialect and every carved-out name
-/// federates and is then emitted verbatim — the unknown-function failure the
-/// deny-list exists to prevent, now reachable only through the functions it
-/// deliberately allowed. Building them together is what stops half the pair
-/// being installed.
+/// One value because they are one decision. What a deny-list may safely allow
+/// depends on what the dialect beside it can translate: a name the deny-list lets
+/// through is emitted by that dialect, verbatim if it has no handler for it. So a
+/// caller supplying one without the other has not made half the decision -- it has
+/// made a different one, and the result shows up as remote SQL rather than as a
+/// type error. Taking them together is what stops that.
 pub struct DuckLakeFederation {
-    /// The unparser dialect. Must be the one whose rewrites `function_support`
-    /// was derived from.
+    /// The unparser dialect. Every name `function_support` allows through is
+    /// emitted by this dialect, so it has to be one that can spell them.
     pub dialect: Arc<dyn Dialect + Send + Sync>,
     /// Which functions may be pushed into the SQL sent to `DuckDB`.
     pub function_support: FunctionSupport,
