@@ -10374,7 +10374,7 @@ impl CayenneTableProvider {
         // together under the WRITE fence, so resolving cold after this block would
         // let the rebuild fold the promoted rows from BOTH the pre-promotion warm
         // snapshot and the post-promotion cold manifest.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files) = {
+        let (mem_snapshots, protected_snapshots, current_snapshot_id, cold_files, _scan_guard) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -10408,11 +10408,29 @@ impl CayenneTableProvider {
             } else {
                 None
             };
+            // Pin every snapshot dir this rebuild reads (the current snapshot plus
+            // every protected snapshot) against the retired-dir sweep for the whole
+            // read. Unlike a query scan, this write-path read opens Vortex files with
+            // no `SnapshotScanRef` behind it, so without this pin a concurrent commit
+            // could supersede one of these dirs and the sweep unlink its files
+            // mid-scan — a NotFound that fails the CDC apply and stops the dataset
+            // replicating (#13683). Created under the same read fence that captured
+            // the ids, so a publish's `listing_fence.write()` flip cannot retire a
+            // dir before its pin is registered — the same listing-flip invariant the
+            // query path relies on. Held (as `_scan_guard`) until this function
+            // returns, after every `execute_stream` below has drained.
+            let scan_guard = {
+                let mut ids = Vec::with_capacity(protected_snapshots.len() + 1);
+                ids.push(current_snapshot_id.clone());
+                ids.extend(protected_snapshots.keys().cloned());
+                SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
+            };
             (
                 mem_snapshots,
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
+                scan_guard,
             )
         };
 
@@ -10905,7 +10923,7 @@ impl CayenneTableProvider {
         // The mem-tier snapshot is taken inside the same fence so a concurrent
         // off-`write_lock` checkpoint cannot hide a live key: it is in this snapshot
         // or already durable in the protected/current scan.
-        let (mem_snapshots, protected_snapshots, current_snapshot_id) = {
+        let (mem_snapshots, protected_snapshots, current_snapshot_id, _scan_guard) = {
             let _fence = self.listing_fence.read().await;
             let mem_snapshots: Vec<Arc<crate::provider::mem_tier::MemTier>> = self
                 .mem_tier
@@ -10915,7 +10933,25 @@ impl CayenneTableProvider {
                 .collect();
             let protected_snapshots = self.protected_snapshots.load_full();
             let current_snapshot_id = self.get_current_snapshot_id();
-            (mem_snapshots, protected_snapshots, current_snapshot_id)
+            // Pin the snapshot dirs this path reads (the protected snapshots folded
+            // by `extend_bloom_with_protected_and_inline` below) against the
+            // retired-dir sweep for the whole read. The current snapshot is served
+            // from the persisted sidecar, not a file scan, but is pinned too to
+            // mirror the full rebuild and cover any future read here. Taken under the
+            // same read fence that captured the ids so the listing-flip invariant
+            // holds (#13683); held as `_scan_guard` across the extend call.
+            let scan_guard = {
+                let mut ids = Vec::with_capacity(protected_snapshots.len() + 1);
+                ids.push(current_snapshot_id.clone());
+                ids.extend(protected_snapshots.keys().cloned());
+                SnapshotScanRef::new(Arc::clone(&self.snapshot_scan_refs), ids)
+            };
+            (
+                mem_snapshots,
+                protected_snapshots,
+                current_snapshot_id,
+                scan_guard,
+            )
         };
 
         // Gate on the snapshot tag: the bloom covers the full current snapshot
