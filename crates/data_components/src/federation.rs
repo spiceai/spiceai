@@ -1330,10 +1330,14 @@ mod tests {
     ///
     /// `BigQuery` rejects the spaced form outright — `invalid timestamp: '2016-08-06
     /// 20:05:00 +00:00'` — so a federated predicate comparing a timestamp column to a
-    /// literal takes the whole query down rather than returning a wrong row. Both
-    /// assertions pin the same boundary, so a rendering that keeps the offset but
-    /// re-introduces the space fails, and so does one that drops the offset entirely
-    /// and leaves `BigQuery` to read the literal in its own time zone.
+    /// literal takes the whole query down. That half holds for any zone.
+    ///
+    /// The offset itself is load-bearing only away from UTC. `BigQuery` reads a
+    /// zone-less literal as UTC, so losing `+00:00` changes no instant, while losing
+    /// `-04:00` moves the literal by four hours and the predicate silently selects a
+    /// different range of rows. Both arms are here: UTC is the case fork PR #144
+    /// reported, and the named zone is the one where dropping the offset is a wrong
+    /// answer rather than a formatting change.
     ///
     /// The assertion is deliberately independent of which dialect layer produces the
     /// format: a `BigQueryDialect` override and the `Dialect` trait default are both
@@ -1341,29 +1345,45 @@ mod tests {
     /// re-cut that changes either layer still has to keep it.
     #[test]
     fn bigquery_attaches_a_timestamp_offset_to_the_time() {
-        let plan = timestamp_scan(Some("UTC"))
-            .filter(col("t.ts").gt(lit(ScalarValue::TimestampNanosecond(
-                Some(1_470_513_900_000_000_000),
-                Some("UTC".into()),
-            ))))
-            .expect("filter")
-            .project(vec![col("t.ts")])
-            .expect("project")
-            .build()
-            .expect("build");
+        for (tz, instant, offset, losing_the_offset) in [
+            (
+                "UTC",
+                "20:05:00",
+                "+00:00",
+                "BigQuery reads a zone-less literal as UTC, so this arm pins the \
+                 rendering rather than the instant",
+            ),
+            (
+                "America/New_York",
+                "16:05:00",
+                "-04:00",
+                "BigQuery reads a zone-less literal as UTC, so the literal moves by four \
+                 hours and the predicate selects a different range of rows",
+            ),
+        ] {
+            let plan = timestamp_scan(Some(tz))
+                .filter(col("t.ts").gt(lit(ScalarValue::TimestampNanosecond(
+                    Some(1_470_513_900_000_000_000),
+                    Some(tz.into()),
+                ))))
+                .expect("filter")
+                .project(vec![col("t.ts")])
+                .expect("project")
+                .build()
+                .expect("build");
 
-        let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
-        assert!(
-            sql.contains("20:05:00+00:00"),
-            "bigquery: the offset has to reach BigQuery attached to the time, or the \
-             literal is read in BigQuery's own time zone and the predicate selects a \
-             different range of rows: {sql}"
-        );
-        assert!(
-            !sql.contains("20:05:00 +00:00"),
-            "bigquery: a space before the offset is rejected as an invalid timestamp, so \
-             the whole federated query fails: {sql}"
-        );
+            let sql = unparse_with("bigquery", &BigQueryDialect::new(), &plan);
+            assert!(
+                sql.contains(&format!("{instant}{offset}")),
+                "bigquery ({tz}): the offset has to reach BigQuery attached to the time \
+                 — {losing_the_offset}: {sql}"
+            );
+            assert!(
+                !sql.contains(&format!("{instant} {offset}")),
+                "bigquery ({tz}): a space before the offset is rejected as an invalid \
+                 timestamp, so the whole federated query fails: {sql}"
+            );
+        }
     }
 
     /// Regression test for the two `BigQueryDialect` overrides carried by fork PR #146.
