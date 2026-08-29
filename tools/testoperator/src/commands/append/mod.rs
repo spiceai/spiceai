@@ -17,6 +17,7 @@ limitations under the License.
 use super::get_app_and_start_request;
 use crate::{args::AppendTestArgs, health::HealthMonitor};
 use std::{
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -79,6 +80,10 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         );
 
     check_app_is_appendable(&app)?;
+
+    // Captured before `start_request` is consumed: the append source writes its
+    // source parquet here, which conflict verification reads back.
+    let tempdir_path = start_request.get_tempdir_path();
 
     println!("Running append test");
 
@@ -165,10 +170,15 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let verification_result = verify_appended_data(
         &spiced_instance,
-        &query_set,
-        query_overrides,
-        args.test_args.scale_factor.unwrap_or(1.0),
-        args.test_args.validate,
+        &VerificationContext {
+            app: &app,
+            query_set: &query_set,
+            query_overrides,
+            scale_factor: args.test_args.scale_factor.unwrap_or(1.0),
+            validate_results: args.test_args.validate,
+            conflict_data: args.with_conflict_data && !args.with_retention_data,
+            tempdir_path: &tempdir_path,
+        },
     )
     .await;
 
@@ -357,12 +367,23 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 ///
 /// No expected-answer query selects the appended `*_created_at` column, so this
 /// pass does not observe which of two conflicting versions an upsert kept.
-async fn verify_appended_data(
-    spiced: &SpicedInstance,
-    query_set: &QuerySet,
+/// What the end-of-test verification needs to know about the run it is checking.
+struct VerificationContext<'a> {
+    app: &'a App,
+    query_set: &'a QuerySet,
     query_overrides: Option<QueryOverrides>,
     scale_factor: f64,
     validate_results: bool,
+    /// Whether the run appended conflicting rows, so their resolution is worth
+    /// checking. Retention deletes rows the source parquet still holds, so the
+    /// two modes aren't verified together.
+    conflict_data: bool,
+    tempdir_path: &'a Path,
+}
+
+async fn verify_appended_data(
+    spiced: &SpicedInstance,
+    context: &VerificationContext<'_>,
 ) -> anyhow::Result<()> {
     println!("Verifying appended data");
 
@@ -370,14 +391,26 @@ async fn verify_appended_data(
     // a cached result would report an earlier load step.
     let spice_client = Arc::new(spiced.spice_client(None, true).await?);
 
-    check_table_counts(&spice_client, query_set, scale_factor).await?;
+    check_table_counts(&spice_client, context.query_set, context.scale_factor).await?;
 
-    if !validate_results {
+    if !context.validate_results {
         println!("Skipping query result verification, pass --validate to enable it");
         return Ok(());
     }
 
-    check_query_results(&spice_client, query_set, query_overrides, scale_factor).await
+    check_query_results(
+        &spice_client,
+        context.query_set,
+        context.query_overrides,
+        context.scale_factor,
+    )
+    .await?;
+
+    if context.conflict_data {
+        check_conflict_resolution(&spice_client, context.app, context.tempdir_path).await?;
+    }
+
+    Ok(())
 }
 
 /// Counts every table in the query set, describing those outside a 0.01% margin
@@ -558,5 +591,153 @@ fn print_result_head(batches: &[RecordBatch]) {
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if total_rows > MAX_PRINTED_FAILURE_ROWS {
         eprintln!("... {} more rows", total_rows - MAX_PRINTED_FAILURE_ROWS);
+    }
+}
+
+/// The primary-key columns an `acceleration.primary_key` names, with the
+/// parentheses a compound key is written with stripped.
+fn primary_key_columns(primary_key: &str) -> &str {
+    primary_key
+        .trim()
+        .strip_prefix('(')
+        .and_then(|key| key.strip_suffix(')'))
+        .unwrap_or(primary_key)
+        .trim()
+}
+
+/// Counts the rows the accelerated table holds at each distinct append
+/// timestamp, oldest first.
+async fn accelerated_timestamp_counts(
+    spice_client: &spiceai::Client,
+    table: &str,
+    time_column: &str,
+) -> anyhow::Result<Vec<u64>> {
+    let sql =
+        format!("SELECT COUNT(*) FROM {table} GROUP BY {time_column} ORDER BY {time_column} ASC");
+    let batches = spice_client
+        .sql(&sql)
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut counts = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            .context("Failed to read the row count as an Int64Type")?;
+        for index in 0..column.len() {
+            counts.push(u64::try_from(column.value(index))?);
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Counts the rows the source parquet holds at each distinct append timestamp,
+/// oldest first, keeping only the newest copy of each key. That is what an
+/// upsert that resolves a conflict in favour of the later row should leave.
+fn expected_timestamp_counts(
+    parquet_path: &Path,
+    primary_key: &str,
+    time_column: &str,
+) -> anyhow::Result<Vec<u64>> {
+    let keys = primary_key_columns(primary_key);
+    let sql = format!(
+        "SELECT COUNT(*) FROM (
+             SELECT {keys}, MAX({time_column}) AS {time_column}
+             FROM read_parquet('{path}') GROUP BY {keys}
+         ) GROUP BY {time_column} ORDER BY {time_column} ASC",
+        path = parquet_path.to_string_lossy()
+    );
+
+    let connection = duckdb::Connection::open_in_memory()?;
+    let mut statement = connection.prepare(&sql)?;
+    let counts = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    counts
+        .into_iter()
+        .map(|count| Ok(u64::try_from(count)?))
+        .collect()
+}
+
+/// Checks that each conflicting row was resolved in favour of the copy appended
+/// last.
+///
+/// A step's own rows and the conflicting copy it seeds for the next step share
+/// one transaction timestamp, so a row appended over a conflict carries the
+/// later of the two. Comparing per-timestamp row counts against the source
+/// parquet therefore distinguishes an upsert that kept the newer row from one
+/// that kept the stale one, which no expected-answer query can see.
+async fn check_conflict_resolution(
+    spice_client: &spiceai::Client,
+    app: &App,
+    tempdir_path: &Path,
+) -> anyhow::Result<()> {
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+
+    for dataset in &app.datasets {
+        let (Some(time_column), Some(primary_key)) = (
+            dataset.time_column.as_deref(),
+            dataset
+                .acceleration
+                .as_ref()
+                .and_then(|acceleration| acceleration.primary_key.as_deref()),
+        ) else {
+            continue;
+        };
+
+        let parquet_path = tempdir_path.join(format!("{}.parquet", dataset.name));
+        let path = parquet_path.clone();
+        let primary_key = primary_key.to_string();
+        let column = time_column.to_string();
+        let expected = tokio::task::spawn_blocking(move || {
+            expected_timestamp_counts(&path, &primary_key, &column)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", parquet_path.display()))??;
+
+        let actual = accelerated_timestamp_counts(spice_client, &dataset.name, time_column).await?;
+
+        if actual == expected {
+            checked += 1;
+        } else {
+            failures.push(format!(
+                "{}: appended {actual:?} rows per timestamp, expected {expected:?}",
+                dataset.name
+            ));
+        }
+    }
+
+    println!("Verified conflict resolution for {checked} tables");
+
+    if !failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Conflicting rows did not resolve to the row appended last: {}",
+            failures.join("; ")
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::primary_key_columns;
+
+    #[test]
+    fn a_single_column_primary_key_is_used_as_written() {
+        assert_eq!(primary_key_columns("c_custkey"), "c_custkey");
+    }
+
+    #[test]
+    fn a_compound_primary_key_loses_its_parentheses() {
+        assert_eq!(
+            primary_key_columns("(l_orderkey, l_linenumber)"),
+            "l_orderkey, l_linenumber"
+        );
     }
 }
