@@ -7379,7 +7379,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
