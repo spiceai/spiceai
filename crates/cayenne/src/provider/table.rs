@@ -49667,17 +49667,18 @@ mod tests {
         );
     }
 
-    /// A `DoNothingAll` table whose keys are all new takes the pipelined staged
-    /// append's `!stage_on_conflict` arm. That arm recorded its validated primary
-    /// keys nowhere until Stage B published, so a second batch beginning its
-    /// Stage A inside that window — the pipeline's normal steady state, since it
-    /// deliberately lets the next Stage A start before the previous Stage B
-    /// publishes — found neither the staged rows (not yet discoverable) nor a
-    /// recorded key, read the key as new, and kept it: two live rows for one
-    /// primary key the user declared unique (#13642).
+    /// Two pipelined appends of the same new primary key resolve to ONE live row
+    /// under `on_conflict: do_nothing`, even when the second begins its Stage A
+    /// before the first has published.
     ///
-    /// Regression test for #13642. Fails on the old code with
-    /// `[(77, 1), (77, 2)]`.
+    /// That overlap is the pipeline's steady state rather than a race to provoke:
+    /// the next Stage A is deliberately allowed to start before the previous
+    /// Stage B publishes. A `DoNothingAll` table whose keys are all new takes the
+    /// `!stage_on_conflict` arm, so this pins that arm's Stage-A key record — the
+    /// only thing that carries the first batch's key into the second batch's
+    /// validation while the staged rows are still undiscoverable.
+    ///
+    /// Regression test for #13642.
     #[tokio::test]
     async fn overlapping_pipelined_appends_of_one_new_do_nothing_key_leave_one_row() {
         let ctx = SessionContext::new();
@@ -49714,7 +49715,7 @@ mod tests {
         // new key. Whether it stages is an OUTCOME, not a precondition: once the
         // first append's key is visible to validation the row is dropped as a
         // conflict and there is nothing left to stage, so asserting
-        // `has_pending_finalize` here would assert the bug.
+        // `has_pending_finalize` here would demand the duplicate this test refuses.
         let second = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),

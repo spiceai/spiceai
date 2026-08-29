@@ -670,22 +670,20 @@ impl<'a> AppendMutationWriter<'a> {
                 // registration, where a rebuild folds them in and the publish
                 // retires them.
                 //
-                // The `!stage_on_conflict` arm needs this every bit as much as the
-                // on-conflict one. It is taken by a batch of purely-new keys into a
-                // table holding no tombstones, and the pipeline deliberately lets the
-                // next Stage A begin before this write's Stage B publishes. A second
-                // batch carrying the same new key then finds neither the staged rows
-                // (not discoverable) nor a recorded key, reads it as new, and keeps
-                // it — two live rows for one key the user declared unique (#13642).
+                // Both arms need it. The pipeline lets the next Stage A begin before
+                // this write's Stage B publishes, so this record is what carries a
+                // batch's keys into the validation of a batch that overlaps it. That
+                // includes the `!stage_on_conflict` arm, which takes purely-new keys
+                // into a table holding no tombstones — the ordinary `do_nothing`
+                // steady state, where the overlap decides whether one key ends up
+                // with one live row or two (#13642).
                 //
-                // `sequence_high_water()` is the stamp for the same reason
-                // `CayenneCdcWrite::finish` uses it, and on this arm it is never
-                // worse than recording nothing: the arm reserves no sequence, so the
-                // stamp can equal a concurrent transaction's begin token and fail
-                // open for per-key OCC — but an ABSENT key fails open identically
-                // (`sequence_by_digest` returns `None`), which is exactly what this
-                // window holds today. The publish re-stamps with the commit's own
-                // high water.
+                // `sequence_high_water()` is the stamp, matching
+                // `CayenneCdcWrite::finish`. On this arm it buys existence, not
+                // ordering: no sequence is reserved here, so the stamp can equal a
+                // concurrent transaction's begin token and per-key OCC does not see
+                // this append at all (#13685). The publish re-stamps with the
+                // commit's own high water.
                 let record_seq = self.table.sequence_high_water().await;
                 self.table.record_file_pk_keys(&validated_keys, record_seq);
                 self.table.attach_inflight_staged_pk_keys(
