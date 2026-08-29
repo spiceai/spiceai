@@ -1453,6 +1453,12 @@ impl ScanViewCache {
 #[cfg(test)]
 type TestPrePublishHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Test-only mid-sweep hook: an async callback fired after the orphaned-DV
+/// sweep's fenced eligibility capture and before it unlinks anything. See
+/// `CayenneTableProvider::test_post_capture_hook`.
+#[cfg(test)]
+type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -1660,6 +1666,12 @@ pub struct CayenneTableProvider {
     /// window the mid-pass overwrite guard defends. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired after the orphaned-DV sweep captures its eligibility
+    /// view (and released the listing fence) but before it unlinks anything, so a
+    /// test can advance the floor and re-signal inside the exact window a running
+    /// sweep holds a now-stale floor. Consumed on first fire.
+    #[cfg(test)]
+    test_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -2164,12 +2176,14 @@ pub struct CayenneTableProvider {
     /// does not spawn one background compaction task per append while a prior
     /// notification is still pending.
     post_write_compaction_scheduled: Arc<AtomicBool>,
-    /// Coalesces orphaned-deletion-vector cleanup sweeps. Set when file-based
-    /// retention empties a protected snapshot (raising the surviving-sequence
-    /// floor, which can orphan key DVs); a single lock-free sweep on the dedicated
-    /// compaction runtime drains it. Mirrors `post_write_compaction_scheduled` so a
-    /// burst of retention passes spawns at most one in-flight sweep.
-    orphan_dv_sweep_scheduled: Arc<AtomicBool>,
+    /// Coalescing state of the orphaned-deletion-vector cleanup sweep — one of
+    /// [`ORPHAN_DV_SWEEP_IDLE`], [`ORPHAN_DV_SWEEP_RUNNING`],
+    /// [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`]. Signalled by every publication that can
+    /// raise the surviving-sequence floor and so orphan key DVs, and once at open
+    /// to drain a backlog an earlier process left behind. At most one sweep runs
+    /// on the dedicated compaction runtime; a signal raised while it runs marks
+    /// the state dirty so the worker takes another pass against the newer floor.
+    orphan_dv_sweep_state: Arc<AtomicU8>,
     /// Coalesces write-driven listing refreshes and table-statistics updates
     /// so CDC catch-up bursts do not synchronously pay metastore/listing work
     /// on every append.
@@ -2770,6 +2784,52 @@ pub(crate) enum CheckpointAttempt {
 /// sweep frequency against lingering disk — never ingest latency, which is why it
 /// is a fixed constant rather than a tunable knob.
 pub(crate) const ORPHANED_DV_CLEANUP_MIN_FILES: usize = 20;
+
+/// Hard per-pass cap on the orphaned-DV working set. It bounds the fetch
+/// allocation, the unlink loop, AND — critically — the single
+/// `remove_delete_files` DELETE, which binds one parameter per id and would
+/// exceed the metastore's bound-parameter limit (e.g. `SQLite`'s ~32766) on a
+/// huge batch. A pass that fills the cap is repeated within the same sweep, so a
+/// backlog larger than one batch still drains without a further signal.
+const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
+
+/// `orphan_dv_sweep_state`: no sweep scheduled or running.
+const ORPHAN_DV_SWEEP_IDLE: u8 = 0;
+/// `orphan_dv_sweep_state`: exactly one worker is running and no later signal is
+/// outstanding.
+const ORPHAN_DV_SWEEP_RUNNING: u8 = 1;
+/// `orphan_dv_sweep_state`: a worker is running AND a signal arrived after it
+/// began, so the floor it captured may already be stale. The worker takes another
+/// pass before it may return to [`ORPHAN_DV_SWEEP_IDLE`].
+const ORPHAN_DV_SWEEP_RUNNING_DIRTY: u8 = 2;
+
+/// State an orphaned-DV sweep signal moves `orphan_dv_sweep_state` to, or `None`
+/// when the signal needs no change because a dirty worker will already re-run.
+///
+/// A plain "is scheduled" flag loses the edge: a signal raised while a sweep runs
+/// is dropped and the running sweep never re-reads the floor, so a table that goes
+/// idle right after that signal keeps its orphan backlog forever. Recording the
+/// signal as [`ORPHAN_DV_SWEEP_RUNNING_DIRTY`] keeps the at-most-one-worker
+/// property while guaranteeing that some pass observes the newest floor.
+/// [`ORPHAN_DV_SWEEP_IDLE`] is the only state whose signaller owns the worker.
+const fn orphan_dv_sweep_state_after_signal(state: u8) -> Option<u8> {
+    match state {
+        ORPHAN_DV_SWEEP_IDLE => Some(ORPHAN_DV_SWEEP_RUNNING),
+        ORPHAN_DV_SWEEP_RUNNING => Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+        _ => None,
+    }
+}
+
+/// Outcome of one [`CayenneTableProvider::sweep_orphaned_deletion_vectors`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanDvSweepPass {
+    /// The pass finished the eligible set it could see: it declined, found fewer
+    /// orphans than the threshold, failed, or reclaimed less than a full batch.
+    Complete,
+    /// The pass reclaimed a full [`ORPHAN_DV_SWEEP_MAX_BATCH`] of rows, so more may
+    /// still be eligible.
+    BatchSaturated,
+}
 
 /// Fraction of the (process-wide) query memory pool a single table's key-deletion
 /// index may occupy before the seq-prefix bake becomes a MANDATORY OOM backstop —
@@ -6904,6 +6964,7 @@ impl CayenneTableProvider {
             &table_metadata.current_snapshot_id,
             catalog_for_load,
             pk_deletion_strategy_kind,
+            table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
 
@@ -7024,6 +7085,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -7149,7 +7212,7 @@ impl CayenneTableProvider {
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
-            orphan_dv_sweep_scheduled: Arc::new(AtomicBool::new(false)),
+            orphan_dv_sweep_state: Arc::new(AtomicU8::new(ORPHAN_DV_SWEEP_IDLE)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             maintained_aggregates,
             filter_column_observations: Arc::new(
@@ -7213,6 +7276,21 @@ impl CayenneTableProvider {
         // compaction. Best-effort: it leaves the manifest empty on failure and
         // the scan falls back to directory listing.
         provider.backfill_snapshot_manifest_if_empty().await;
+
+        // Startup replay for the orphaned-DV sweep. A publication that raises the
+        // surviving-sequence floor and the in-memory signal that follows it cannot
+        // be made atomic, so a crash in that gap loses the edge for good: the
+        // orphans stay eligible but nothing ever asks for them again, and a table
+        // that then goes idle keeps them forever. One thresholded pass here repairs
+        // that gap and drains the backlog of a table that predates the signal.
+        // Recovery and the manifest backfill above have already run, so the state
+        // this reads is the final committed one. The pass runs on a background
+        // task and is throttled, so a table with no backlog costs its eligibility
+        // capture and nothing more: three catalog reads (current manifest,
+        // protected sequences, candidates), a fourth when the datalake tier is
+        // enabled, one directory listing only when the manifest reads back empty,
+        // and one `listing_fence` read acquisition across them.
+        provider.schedule_orphan_dv_sweep();
 
         if let Err(error) = provider
             .rebuild_maintained_aggregates_from_visible_state()
@@ -8400,6 +8478,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -8470,7 +8550,7 @@ impl CayenneTableProvider {
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
-            orphan_dv_sweep_scheduled: Arc::clone(&self.orphan_dv_sweep_scheduled),
+            orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             maintained_aggregates: Arc::clone(&self.maintained_aggregates),
             filter_column_observations: Arc::clone(&self.filter_column_observations),
@@ -15438,47 +15518,126 @@ impl CayenneTableProvider {
         });
     }
 
-    /// Signal that orphaned key-based deletion vectors may now exist (file-based
-    /// retention emptied a protected snapshot, raising the surviving-sequence
-    /// floor). Spawns at most one lock-free [`Self::sweep_orphaned_deletion_vectors`]
-    /// pass on the dedicated compaction runtime, coalescing a burst of retention
-    /// passes into a single in-flight sweep — mirroring
-    /// [`Self::schedule_post_write_compaction`].
+    /// Signal that orphaned key-based deletion vectors may now exist: a
+    /// publication raised the surviving-sequence floor, or this provider just
+    /// opened over a backlog an earlier process left behind.
+    ///
+    /// Runs at most one lock-free [`Self::sweep_orphaned_deletion_vectors`] worker
+    /// per table on the dedicated compaction runtime — mirroring
+    /// [`Self::schedule_post_write_compaction`]. A signal raised while that worker
+    /// runs is RECORDED rather than dropped
+    /// ([`orphan_dv_sweep_state_after_signal`]): the worker consumes it and takes
+    /// another pass, so the newest floor is always swept even if the table then
+    /// goes idle.
+    ///
+    /// Callers MUST signal only once the publication is complete in BOTH the
+    /// catalog and the in-memory state. The sweep proves eligibility from both, so
+    /// a signal raised mid-publication buys nothing (the sweep would block on the
+    /// publisher's `listing_fence` write guard anyway) and misreports when cleanup
+    /// became due.
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
-        // Coalesce: at most one in-flight sweep per table.
-        if self.orphan_dv_sweep_scheduled.swap(true, Ordering::AcqRel) {
+        let previous = self.orphan_dv_sweep_state.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            orphan_dv_sweep_state_after_signal,
+        );
+        // Only the idle -> running winner owns the worker; every other signal has
+        // been recorded on the worker that is already running.
+        if previous != Ok(ORPHAN_DV_SWEEP_IDLE) {
             return;
         }
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
-            // Clear the coalescing flag on ANY exit — normal completion, early
-            // return, a panic during unwind, or the task being dropped on abort —
-            // so a stuck flag can never permanently suppress future sweeps on a
-            // long-lived provider.
-            struct ClearOnDrop(Arc<AtomicBool>);
-            impl Drop for ClearOnDrop {
+            // A worker that ends abnormally — a panic during unwind, or the task
+            // being dropped on abort — never reaches the exchange below, so
+            // republish idle here or a stuck state would permanently suppress
+            // future sweeps on a long-lived provider AND hang
+            // `drain_in_flight_maintenance`. Disarmed on the clean exit path so
+            // this cannot stomp a state a LATER worker already owns.
+            //
+            // This deliberately drops a signal that arrived before the abnormal
+            // exit rather than re-arming a worker from `Drop`: the abort case IS
+            // runtime shutdown, where spawning panics inside an unwind. Losing one
+            // edge is bounded — the startup pass replays it on the next open, which
+            // is the same repair a crash between a publication and its signal
+            // needs — whereas leaving the state dirty with no worker wedges the
+            // sweep permanently.
+            struct ResetOnAbnormalExit {
+                state: Arc<AtomicU8>,
+                armed: bool,
+            }
+            impl Drop for ResetOnAbnormalExit {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
+                    if self.armed {
+                        self.state.store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
+                    }
                 }
             }
-            let _clear = ClearOnDrop(Arc::clone(&table.orphan_dv_sweep_scheduled));
+            let mut reset = ResetOnAbnormalExit {
+                state: Arc::clone(&table.orphan_dv_sweep_state),
+                armed: true,
+            };
 
             tokio::task::yield_now().await;
-            table
-                .sweep_orphaned_deletion_vectors(ORPHANED_DV_CLEANUP_MIN_FILES)
-                .await;
+            loop {
+                table
+                    .drain_orphan_dv_backlog(
+                        ORPHANED_DV_CLEANUP_MIN_FILES,
+                        ORPHAN_DV_SWEEP_MAX_BATCH,
+                    )
+                    .await;
+                // End the episode only by atomically claiming a CLEAN running
+                // state. A signal raised anywhere up to this point has already
+                // flipped the state to dirty, so the exchange fails and the worker
+                // sweeps again — the edge cannot be lost in the gap between the
+                // last pass and the worker exiting.
+                if table
+                    .orphan_dv_sweep_state
+                    .compare_exchange(
+                        ORPHAN_DV_SWEEP_RUNNING,
+                        ORPHAN_DV_SWEEP_IDLE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    reset.armed = false;
+                    break;
+                }
+                // Dirty: consume the signal and sweep again. A signal that lands
+                // between the failed exchange and this store finds the state
+                // already dirty and adds nothing — the pass it wants starts after
+                // it, which is exactly what it asked for.
+                table
+                    .orphan_dv_sweep_state
+                    .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
+            }
         });
     }
 
-    /// Synchronously run one orphaned-DV sweep at the given threshold. Test-only
-    /// deterministic drain for the otherwise background
+    /// Sweep the orphan backlog at `min_files`, repeating while a pass fills
+    /// `max_batch`. Each repeat is unconditional progress — a saturated pass
+    /// removed exactly `max_batch` rows — so the loop terminates, and a backlog
+    /// larger than one batch drains within a single sweep instead of stranding
+    /// until the next signal.
+    async fn drain_orphan_dv_backlog(&self, min_files: usize, max_batch: usize) {
+        while self
+            .sweep_orphaned_deletion_vectors(min_files, max_batch)
+            .await
+            == OrphanDvSweepPass::BatchSaturated
+        {}
+    }
+
+    /// Synchronously drain the orphaned-DV backlog at the given threshold.
+    /// Test-only deterministic stand-in for the otherwise background
     /// [`Self::schedule_orphan_dv_sweep`] path (which always uses the production
     /// constant [`ORPHANED_DV_CLEANUP_MIN_FILES`]); the explicit `min_files` lets
     /// tests drive the sweep with a small, deterministic orphan count.
     #[doc(hidden)]
     pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
-        self.sweep_orphaned_deletion_vectors(min_files).await;
+        self.drain_orphan_dv_backlog(min_files, ORPHAN_DV_SWEEP_MAX_BATCH)
+            .await;
     }
 
     /// Quiesce this provider instance before it is dropped or replaced in-process
@@ -15503,10 +15662,11 @@ impl CayenneTableProvider {
             // Retention / stats / listing-refresh loop (has its own barrier).
             self.flush_pending_maintenance().await?;
             // Fire-and-forget compaction / orphan-DV sweep / inline checkpoint
-            // each set their flag BEFORE spawning and clear it when done, so spin
-            // until all are clear — no scheduled-or-running detached pass remains.
+            // each mark themselves scheduled BEFORE spawning and clear that mark
+            // when done, so spin until all are clear — no scheduled-or-running
+            // detached pass remains.
             while self.post_write_compaction_scheduled.load(Ordering::Acquire)
-                || self.orphan_dv_sweep_scheduled.load(Ordering::Acquire)
+                || self.orphan_dv_sweep_state.load(Ordering::Acquire) != ORPHAN_DV_SWEEP_IDLE
                 || self.inline_checkpoint_scheduled.load(Ordering::Acquire)
             {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -15530,18 +15690,20 @@ impl CayenneTableProvider {
     }
 
     /// Surviving-sequence floor for orphaned-DV cleanup: the minimum data sequence
-    /// any live snapshot could hold, folding BOTH the protected snapshots' persisted
-    /// thresholds AND the current snapshot's manifest `min_sequence`. A key DV with
-    /// delete sequence `D` shadows only data with sequence `< D`, so it is orphaned
-    /// (shadows nothing live) exactly when `D <= floor`. Empty on both sides →
-    /// `i64::MAX` (genesis; nothing to protect). The current snapshot is folded in
-    /// because the scan applies ALL key DVs to it (the full deletion view), so a
-    /// plain-append or position-then-PK current snapshot could still hold a row a
-    /// sub-floor DV shadows — see the seq-prefix bake's `bake_clean_prefix_holds`.
+    /// ANY live row could hold, folding the protected snapshots' persisted
+    /// thresholds, the current snapshot's manifest `min_sequence`, and the cold
+    /// tier's manifest `min_sequence`. A key DV with delete sequence `D` shadows
+    /// only data with sequence `< D`, so it is orphaned (shadows nothing live)
+    /// exactly when `D <= floor`. No live rows anywhere → `i64::MAX` (genesis;
+    /// nothing to protect). The current snapshot is folded in because the scan
+    /// applies ALL key DVs to it (the full deletion view), so a plain-append or
+    /// position-then-PK current snapshot could still hold a row a sub-floor DV
+    /// shadows — see the seq-prefix bake's `bake_clean_prefix_holds`.
     async fn compute_orphan_dv_floor(
         catalog: &dyn MetadataCatalog,
         table_id: &str,
         current_snapshot_id: &str,
+        cold_tier_enabled: bool,
     ) -> CatalogResult<i64> {
         let protected_floor = catalog
             .get_all_snapshot_sequences(table_id)
@@ -15557,7 +15719,44 @@ impl CayenneTableProvider {
             .map(|f| f.min_sequence)
             .min()
             .unwrap_or(i64::MAX);
-        Ok(protected_floor.min(current_floor))
+        let cold_floor = Self::cold_snapshot_floor(catalog, table_id, cold_tier_enabled).await?;
+        Ok(protected_floor.min(current_floor).min(cold_floor))
+    }
+
+    /// Lowest commit sequence any live COLD-tier row holds; `i64::MAX` when the
+    /// tier is disabled or its manifest is empty.
+    ///
+    /// The cold tier is a live branch of the scan that key DVs apply to, and it is
+    /// the branch a warm-only view is most dangerous to omit: promotion moves the
+    /// OLDEST rows there, so their sequences sit below every warm one. Leaving the
+    /// tier out overstates the floor and marks DVs that still hide superseded
+    /// cold-resident rows orphan-eligible — deleting them durably resurrects those
+    /// rows on the next load. A cold file's manifest `min_sequence` is a LOWER
+    /// BOUND on the commit sequences it holds, not an exact range, so its minimum
+    /// bounds the floor the same way a warm snapshot's manifest does.
+    ///
+    /// Promotion records that bound as `0` — it re-materializes the whole table, so
+    /// a per-file lower bound is not meaningful — which pins the floor to `0` for
+    /// any table holding cold files, and no key DV is reclaimed there. That is the
+    /// correct outcome as well as the safe one: a promotion clears every
+    /// delete-file row it applied, so each DV recorded afterwards carries a
+    /// sequence above every cold row and genuinely hides one, until the next
+    /// promotion applies and clears it in turn.
+    async fn cold_snapshot_floor(
+        catalog: &dyn MetadataCatalog,
+        table_id: &str,
+        cold_tier_enabled: bool,
+    ) -> CatalogResult<i64> {
+        if !cold_tier_enabled {
+            return Ok(i64::MAX);
+        }
+        Ok(catalog
+            .list_cold_tier_files(table_id)
+            .await?
+            .iter()
+            .map(|f| f.min_sequence)
+            .min()
+            .unwrap_or(i64::MAX))
     }
 
     /// Current-snapshot sequence floor for the orphaned-DV sweep, or `None` when
@@ -15603,9 +15802,16 @@ impl CayenneTableProvider {
         catalog: &dyn MetadataCatalog,
         table_id: &str,
         current_snapshot_id: &str,
+        cold_tier_enabled: bool,
         missing: Vec<crate::provider::delete::MissingKeyDeletionVector>,
     ) -> CatalogResult<()> {
-        let floor = Self::compute_orphan_dv_floor(catalog, table_id, current_snapshot_id).await?;
+        let floor = Self::compute_orphan_dv_floor(
+            catalog,
+            table_id,
+            current_snapshot_id,
+            cold_tier_enabled,
+        )
+        .await?;
 
         let mut orphaned_ids: Vec<String> = Vec::with_capacity(missing.len());
         for m in missing {
@@ -15637,19 +15843,22 @@ impl CayenneTableProvider {
     }
 
     /// Lock-free, throttled cleanup of orphaned key-based deletion vectors (issue
-    /// #9388). Reclaims the `.arrow` files (and their catalog rows) that file-based
-    /// retention leaves behind: an orphaned key DV lives in the CURRENT snapshot's
-    /// `deletions/` dir, which never rotates under sustained CDC, so nothing else
-    /// reaps it (compaction's bake reclaims the in-memory tombstone and the catalog
-    /// row, but not the physical file — the measured dir/byte leak).
+    /// #9388). Reclaims the `.arrow` files (and their catalog rows) that a raised
+    /// surviving-sequence floor leaves behind: an orphaned key DV lives in the
+    /// CURRENT snapshot's `deletions/` dir, which never rotates under sustained
+    /// CDC, so nothing else reaps it (compaction's bake reclaims the in-memory
+    /// tombstone and the catalog row, but not the physical file — the measured
+    /// dir/byte leak).
     ///
-    /// Runs entirely OFF the file-based DELETE critical section: it holds NO
-    /// `write_lock` and NO `listing_fence`. This is sound because (a) orphaned DVs
-    /// are query-time no-ops, (b) scans never read DV `.arrow` files lazily (they
-    /// are materialized into the in-memory index only at load/refresh), so a
-    /// runtime unlink is invisible to scans, and (c) the floor is monotonic on the
-    /// live timeline — concurrent writes only ever take HIGHER sequences, so they
-    /// can never make a `D <= floor` DV needed again.
+    /// Runs entirely OFF every write critical section: it holds NO `write_lock`
+    /// and NO `compaction_lock`, and the `listing_fence` only in read mode across
+    /// the metadata capture ([`Self::capture_orphan_dv_candidates`]) — never
+    /// across an unlink. This is sound because (a) orphaned DVs are query-time
+    /// no-ops, (b) scans never read DV `.arrow` files lazily (they are
+    /// materialized into the in-memory index only at load/refresh), so a runtime
+    /// unlink is invisible to scans, and (c) the floor is monotonic on the live
+    /// timeline — concurrent writes only ever take HIGHER sequences, so they can
+    /// never make a `D <= floor` DV needed again.
     ///
     /// The in-memory deletion index is deliberately NOT pruned here — compaction's
     /// seq-prefix bake (`prune_deletion_caches_after_full_rewrite`) owns that, and
@@ -15662,104 +15871,25 @@ impl CayenneTableProvider {
     /// `current_snapshot_id` on a LIVE table reusing live files, it must account for
     /// orphaned-DV deletion (keep DVs alive longer or reject restoring below the GC
     /// point) — see the matching note on the snapshot set/restore code.
-    async fn sweep_orphaned_deletion_vectors(&self, min_files: usize) {
-        // Hard per-sweep cap on the orphan working set. This is a fixed upper bound
-        // (NOT `max(min_files)`, which would let a large threshold defeat the cap):
-        // it bounds the fetch allocation, the unlink loop, AND — critically — the
-        // single `remove_delete_files` DELETE, which binds one parameter per id and
-        // would exceed the metastore's bound-parameter limit (e.g. SQLite's
-        // ~32766) on a huge batch. The effective threshold is clamped to the cap so
-        // the gate below can still fire; a backlog beyond the cap drains on later
-        // retention passes.
-        const ORPHAN_DV_SWEEP_MAX_BATCH: usize = 4096;
+    async fn sweep_orphaned_deletion_vectors(
+        &self,
+        min_files: usize,
+        max_batch: usize,
+    ) -> OrphanDvSweepPass {
+        let Some((floor, orphaned)) = self.capture_orphan_dv_candidates(max_batch).await else {
+            return OrphanDvSweepPass::Complete;
+        };
 
-        let table_id = &self.table_metadata.table_id;
-        let current_snapshot_id = self.get_current_snapshot_id();
-
-        // Surviving-sequence floor, computed with a P1 correctness guard the loader
-        // self-heal path (`compute_orphan_dv_floor`, which has no directory listing
-        // on hand) cannot do. The per-snapshot manifest is best-effort and can be
-        // transiently empty while data files still exist on disk; trusting an empty
-        // manifest as genesis (floor = `i64::MAX`) would mark every key DV
-        // orphan-eligible and DURABLY remove DVs that still shadow live
-        // current-snapshot rows, resurrecting them on the next restart. So corroborate
-        // an empty manifest against the authoritative directory listing and skip the
-        // sweep this pass when the current snapshot cannot be proven empty. Only the
-        // (rare) empty-manifest case pays for the extra listing.
-        let manifest_min_sequences: Vec<i64> = match self
-            .catalog
-            .get_snapshot_files(table_id, &current_snapshot_id)
-            .await
-        {
-            Ok(files) => files.iter().map(|f| f.min_sequence).collect(),
-            Err(e) => {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to read current snapshot manifest: {e}"
-                );
-                return;
-            }
-        };
-        let directory_is_empty = if manifest_min_sequences.is_empty() {
-            match self
-                .list_snapshot_files_with_sizes(&current_snapshot_id)
-                .await
-            {
-                Ok(listed) => listed.is_empty(),
-                Err(e) => {
-                    tracing::warn!(
-                        table = self.table_metadata.table_name.as_str(),
-                        "Orphaned-DV sweep: failed to list current snapshot files: {e}"
-                    );
-                    return;
-                }
-            }
-        } else {
-            false
-        };
-        let Some(current_floor) =
-            Self::current_snapshot_floor(&manifest_min_sequences, directory_is_empty)
-        else {
-            tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                snapshot_id = %current_snapshot_id,
-                "Orphaned-DV sweep: current snapshot manifest empty but directory non-empty; \
-                 skipping this pass (cannot prove no live row is shadowed)"
-            );
-            return;
-        };
-        let protected_floor = match self.catalog.get_all_snapshot_sequences(table_id).await {
-            Ok(seqs) => seqs.values().copied().min().unwrap_or(i64::MAX),
-            Err(e) => {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to compute surviving-sequence floor: {e}"
-                );
-                return;
-            }
-        };
-        let floor = protected_floor.min(current_floor);
-
-        let effective_min = min_files.min(ORPHAN_DV_SWEEP_MAX_BATCH);
-        let orphaned = match self
-            .catalog
-            .get_orphan_eligible_delete_files(table_id, floor, ORPHAN_DV_SWEEP_MAX_BATCH)
-            .await
-        {
-            Ok(files) => files,
-            Err(e) => {
-                tracing::warn!(
-                    table = self.table_metadata.table_name.as_str(),
-                    "Orphaned-DV sweep: failed to list orphan-eligible delete files: {e}"
-                );
-                return;
-            }
-        };
+        // Fires OUTSIDE the capture's fence hold, so a hook may itself publish.
+        #[cfg(test)]
+        self.run_test_post_capture_hook().await;
 
         // Throttle: only sweep once enough orphans have accumulated to amortize the
-        // pass. Below the threshold, leave them — a later retention pass rechecks.
-        if orphaned.len() < effective_min {
-            return;
+        // pass. Below the threshold, leave them — a later signal rechecks. The
+        // threshold is clamped to the cap so a caller cannot raise it past the
+        // largest batch the capture can return and thereby defeat the gate.
+        if orphaned.len() < min_files.min(max_batch) {
+            return OrphanDvSweepPass::Complete;
         }
 
         // Unlink the `.arrow` file FIRST, then remove its catalog row. A crash in
@@ -15786,35 +15916,196 @@ impl CayenneTableProvider {
                     tracing::warn!(
                         table = self.table_metadata.table_name.as_str(),
                         path = %df.path,
-                        "Orphaned-DV sweep: failed to unlink DV file: {e}"
+                        "Failed to delete the reclaimable deletion vector '{}' of table '{}', so \
+                         it keeps using disk; its catalog row is kept and a later sweep retries \
+                         the delete. Cause: {e}",
+                        df.path,
+                        self.table_metadata.table_name
                     );
                 }
             }
         }
 
         if removed_ids.is_empty() {
-            return;
+            return OrphanDvSweepPass::Complete;
         }
 
         if let Err(e) = self
             .catalog
-            .remove_delete_files(table_id, &removed_ids)
+            .remove_delete_files(&self.table_metadata.table_id, &removed_ids)
             .await
         {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
-                "Orphaned-DV sweep: failed to remove {} delete-file row(s): {e}",
-                removed_ids.len()
+                "Failed to drop {} reclaimed deletion-vector row(s) of table '{}' after deleting \
+                 their files, so the rows dangle until the next provider restart self-heals \
+                 them; no data is lost. Cause: {e}",
+                removed_ids.len(),
+                self.table_metadata.table_name
             );
-            return;
+            return OrphanDvSweepPass::Complete;
         }
 
         tracing::debug!(
             table = self.table_metadata.table_name.as_str(),
             floor,
-            "Orphaned-DV sweep: reclaimed {} orphaned key-based deletion vector(s)",
-            removed_ids.len()
+            "Reclaimed {} orphaned deletion vector(s) of table '{}'",
+            removed_ids.len(),
+            self.table_metadata.table_name
         );
+
+        // Saturated ONLY when this pass reclaimed a full batch: that is strict,
+        // measurable progress, so the repeat in `drain_orphan_dv_backlog`
+        // terminates. A pass that fetched a full batch but could not remove all of
+        // it (a failed unlink) would re-fetch the same rows forever.
+        if removed_ids.len() == max_batch {
+            OrphanDvSweepPass::BatchSaturated
+        } else {
+            OrphanDvSweepPass::Complete
+        }
+    }
+
+    /// Capture ONE coherent orphan-eligibility view: the surviving-sequence floor
+    /// and the key-DV rows at or below it. `None` means this pass must delete
+    /// nothing — a read failed, or the current snapshot could not be proven empty.
+    ///
+    /// Taken under `listing_fence.read()`, the barrier every current-snapshot
+    /// publication holds in WRITE mode across BOTH its catalog commit and its
+    /// in-memory pointer flip. Without it a sweep can pair the pre-commit in-memory
+    /// current snapshot with the post-commit catalog: a full key-mode rewrite that
+    /// folds every protected snapshot then presents an empty protected set beside a
+    /// genesis current snapshot, the floor comes out at `i64::MAX`, and a DV the
+    /// rewrite deliberately carried past its cutoff is deleted while the newly
+    /// published current snapshot still holds the row that DV hides — resurrecting
+    /// that row on the next restart.
+    ///
+    /// Only metadata reads run under the fence; the unlinks do not. Once
+    /// eligibility is proven it cannot be invalidated, because sequence allocation
+    /// is monotone: every later write takes a HIGHER sequence and so can never make
+    /// a `D <= floor` DV needed again.
+    async fn capture_orphan_dv_candidates(
+        &self,
+        max_batch: usize,
+    ) -> Option<(i64, Vec<crate::metadata::DeleteFile>)> {
+        let table_id = &self.table_metadata.table_id;
+        let _fence = self.listing_fence.read().await;
+        let current_snapshot_id = self.get_current_snapshot_id();
+
+        // Surviving-sequence floor, computed with a P1 correctness guard the loader
+        // self-heal path (`compute_orphan_dv_floor`, which has no directory listing
+        // on hand) cannot do. The per-snapshot manifest is best-effort and can be
+        // transiently empty while data files still exist on disk; trusting an empty
+        // manifest as genesis (floor = `i64::MAX`) would mark every key DV
+        // orphan-eligible and DURABLY remove DVs that still shadow live
+        // current-snapshot rows, resurrecting them on the next restart. So corroborate
+        // an empty manifest against the authoritative directory listing and skip the
+        // sweep this pass when the current snapshot cannot be proven empty. Only the
+        // (rare) empty-manifest case pays for the extra listing.
+        let manifest_min_sequences: Vec<i64> = match self
+            .catalog
+            .get_snapshot_files(table_id, &current_snapshot_id)
+            .await
+        {
+            Ok(files) => files.iter().map(|f| f.min_sequence).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Failed to read the current snapshot manifest of table '{}', so no orphaned \
+                     deletion vector is reclaimed this pass and their '.arrow' files keep using \
+                     disk; the next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
+                );
+                return None;
+            }
+        };
+        let directory_is_empty = if manifest_min_sequences.is_empty() {
+            match self
+                .list_snapshot_files_with_sizes(&current_snapshot_id)
+                .await
+            {
+                Ok(listed) => listed.is_empty(),
+                Err(e) => {
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        "Failed to list the current snapshot files of table '{}', so no orphaned \
+                         deletion vector is reclaimed this pass and their '.arrow' files keep \
+                         using disk; the next compaction or provider restart retries. Cause: {e}",
+                        self.table_metadata.table_name
+                    );
+                    return None;
+                }
+            }
+        } else {
+            false
+        };
+        let current_floor = Self::current_snapshot_floor(
+            &manifest_min_sequences,
+            directory_is_empty,
+        )
+        .or_else(|| {
+            tracing::debug!(
+                table = self.table_metadata.table_name.as_str(),
+                snapshot_id = %current_snapshot_id,
+                "Declined to reclaim orphaned deletion vectors on table '{}': its current \
+                 snapshot manifest is empty while the directory holds files, so no live row can \
+                 be proven unshadowed; the next compaction or provider restart retries",
+                self.table_metadata.table_name
+            );
+            None
+        })?;
+        let protected_floor = match self.catalog.get_all_snapshot_sequences(table_id).await {
+            Ok(seqs) => seqs.values().copied().min().unwrap_or(i64::MAX),
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Failed to read the protected-snapshot sequences of table '{}', so no \
+                     orphaned deletion vector is reclaimed this pass and their '.arrow' files \
+                     keep using disk; the next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
+                );
+                return None;
+            }
+        };
+        let cold_floor = match Self::cold_snapshot_floor(
+            self.catalog.as_ref(),
+            table_id,
+            self.table_metadata.vortex_config.cold_tier_enabled(),
+        )
+        .await
+        {
+            Ok(floor) => floor,
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Failed to read the datalake manifest of table '{}', so no orphaned deletion \
+                     vector is reclaimed this pass and their '.arrow' files keep using disk; the \
+                     next compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
+                );
+                return None;
+            }
+        };
+        let floor = protected_floor.min(current_floor).min(cold_floor);
+
+        let orphaned = match self
+            .catalog
+            .get_orphan_eligible_delete_files(table_id, floor, max_batch)
+            .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Failed to list the reclaimable deletion vectors of table '{}', so none is \
+                     reclaimed this pass and their '.arrow' files keep using disk; the next \
+                     compaction or provider restart retries. Cause: {e}",
+                    self.table_metadata.table_name
+                );
+                return None;
+            }
+        };
+
+        Some((floor, orphaned))
     }
 
     pub(crate) fn schedule_inline_checkpoint_if_memtable_pressure_exceeded(&self) {
@@ -17901,6 +18192,12 @@ impl CayenneTableProvider {
             "Snapshot compaction completed"
         );
 
+        // No orphaned-DV signal here, unlike the protected-snapshot merges: this
+        // rewrite's fenced commit itself deletes every delete-file row at or below
+        // its cutoff, and sequence allocation is globally monotone, so a deletion
+        // that lands after the fence — the only kind the commit preserves — carries
+        // a sequence above every data sequence the rewrite just folded into the new
+        // current snapshot, and therefore above the floor it publishes.
         Ok(true)
     }
 
@@ -19695,6 +19992,12 @@ impl CayenneTableProvider {
             ],
         );
 
+        // The publication is complete in BOTH the catalog and this provider's
+        // in-memory state, and it raised the surviving-sequence floor — which is
+        // exactly what orphans a key DV. Signal the throttled background sweep from
+        // this point, never earlier: it proves eligibility from both halves.
+        self.schedule_orphan_dv_sweep();
+
         Ok(true)
     }
 
@@ -20304,6 +20607,12 @@ impl CayenneTableProvider {
         if !is_s3 {
             self.evict_compaction_input_pages(&old_ids).await;
         }
+
+        // The publication is complete in BOTH the catalog and this provider's
+        // in-memory state, and it raised the surviving-sequence floor — which is
+        // exactly what orphans a key DV. Signal the throttled background sweep from
+        // this point, never earlier: it proves eligibility from both halves.
+        self.schedule_orphan_dv_sweep();
 
         Ok(true)
     }
@@ -21159,6 +21468,7 @@ impl CayenneTableProvider {
             &current_snapshot_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
+            self.table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
 
@@ -21623,6 +21933,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only mid-sweep hook, if one is installed.
+    /// See [`Self::test_post_capture_hook`].
+    #[cfg(test)]
+    async fn run_test_post_capture_hook(&self) {
+        let hook = self.test_post_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Update the current snapshot ID after a compaction operation.
     ///
     /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
@@ -21696,6 +22016,7 @@ impl CayenneTableProvider {
             &current_snapshot_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
+            self.table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await
         .map_err(|e| Error::Internal {
@@ -22047,6 +22368,7 @@ impl CayenneTableProvider {
             snapshot_id,
             Arc::clone(&self.catalog),
             self.pk_deletion_strategy.strategy(),
+            self.table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await
         .map_err(|source| Error::Catalog { source })?;
@@ -27622,6 +27944,7 @@ impl CayenneTableProvider {
         current_snapshot_id: &str,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
+        cold_tier_enabled: bool,
     ) -> CatalogResult<PkDeletionStrategyWithCache> {
         use super::delete::detect_deletion_type_and_read;
 
@@ -27741,6 +28064,7 @@ impl CayenneTableProvider {
                 catalog.as_ref(),
                 table_id,
                 current_snapshot_id,
+                cold_tier_enabled,
                 missing_key_dvs,
             )
             .await?;
@@ -32082,6 +32406,272 @@ mod tests {
             2,
             "the live file remains queryable after retention"
         );
+    }
+
+    // ========================================================================
+    // Issue #13637 — orphaned-DV sweep scheduling and eligibility capture
+    // ========================================================================
+    //
+    // These reach the private sweep state, the `listing_fence` and the mid-sweep
+    // hook, so they live here rather than in an integration test crate. The
+    // end-to-end "which publication schedules the sweep" coverage is in
+    // `tests/orphan_dv_compaction_test.rs`.
+
+    /// Record `count` orphan-eligible key-DV rows at `sequence`, each with its
+    /// `.arrow` file on disk. The sweep reads only the row's path and sequence, so
+    /// the file's bytes are irrelevant here (the loader is not involved).
+    async fn seed_orphan_delete_files(
+        provider: &CayenneTableProvider,
+        count: usize,
+        sequence: i64,
+    ) -> Vec<std::path::PathBuf> {
+        let dir = std::path::Path::new(&provider.table_metadata.path)
+            .join(provider.get_current_snapshot_id())
+            .join("deletions");
+        std::fs::create_dir_all(&dir).expect("create deletions dir");
+
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = uuid::Uuid::now_v7().to_string();
+            let path = dir.join(format!("delete_{id}.arrow"));
+            std::fs::write(&path, b"orphan").expect("write DV file");
+            provider
+                .catalog
+                .add_delete_file(crate::metadata::DeleteFile {
+                    delete_file_id: id,
+                    table_id: provider.table_metadata.table_id.clone(),
+                    source_data_file_path: None,
+                    path: path.to_string_lossy().to_string(),
+                    path_is_relative: false,
+                    format: "arrow_ipc".to_string(),
+                    delete_count: 0,
+                    file_size_bytes: 0,
+                    deletion_type: crate::metadata::DeletionType::KeyBased,
+                    sequence_number: sequence,
+                    reinsert_sequence: None,
+                })
+                .await
+                .expect("record orphan delete file");
+            paths.push(path);
+        }
+        paths
+    }
+
+    async fn key_dv_count(provider: &CayenneTableProvider) -> usize {
+        provider
+            .catalog
+            .get_table_delete_files(&provider.table_metadata.table_id)
+            .await
+            .expect("read delete files")
+            .iter()
+            .filter(|df| df.source_data_file_path.is_none())
+            .count()
+    }
+
+    /// The transition table is the whole lost-wake fix: a signal raised while a
+    /// sweep runs must be RECORDED, not dropped. Under the plain "is scheduled"
+    /// flag this replaced, the running state absorbed the signal and returned
+    /// nothing to run again.
+    #[test]
+    fn orphan_dv_sweep_signal_records_an_edge_raised_during_a_pass() {
+        assert_eq!(
+            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_IDLE),
+            Some(ORPHAN_DV_SWEEP_RUNNING),
+            "an idle table starts a worker"
+        );
+        assert_eq!(
+            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING),
+            Some(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            "a signal during a pass must be recorded, not coalesced away"
+        );
+        assert_eq!(
+            orphan_dv_sweep_state_after_signal(ORPHAN_DV_SWEEP_RUNNING_DIRTY),
+            None,
+            "a second signal during a pass adds nothing: the worker already re-runs"
+        );
+    }
+
+    /// Signalling a table whose worker is already running must record the signal
+    /// on that worker rather than start a second one. The state IS the spawn
+    /// decision — `schedule_orphan_dv_sweep` spawns only on an idle-to-running
+    /// transition — so asserting it is a complete and deterministic check of the
+    /// one-worker invariant. Its behavioural consequence (a replayed pass, not a
+    /// concurrent one) is covered by
+    /// `orphan_dv_sweep_replays_a_signal_raised_mid_pass`.
+    #[tokio::test]
+    async fn orphan_dv_sweep_signal_starts_no_second_worker() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "orphan_dv_no_second_worker",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+
+        // Stand in for a worker mid-pass.
+        provider
+            .orphan_dv_sweep_state
+            .store(ORPHAN_DV_SWEEP_RUNNING, Ordering::Release);
+
+        provider.schedule_orphan_dv_sweep();
+        assert_eq!(
+            provider.orphan_dv_sweep_state.load(Ordering::Acquire),
+            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            "the signal must be recorded on the running worker"
+        );
+        provider.schedule_orphan_dv_sweep();
+        assert_eq!(
+            provider.orphan_dv_sweep_state.load(Ordering::Acquire),
+            ORPHAN_DV_SWEEP_RUNNING_DIRTY,
+            "a further signal leaves the state dirty"
+        );
+
+        provider
+            .orphan_dv_sweep_state
+            .store(ORPHAN_DV_SWEEP_IDLE, Ordering::Release);
+    }
+
+    /// A signal raised while a sweep is mid-pass — after it captured its
+    /// eligibility view — must be replayed against a FRESH view. The mid-sweep
+    /// hook commits a real seq-prefix bake (which signals) and records a further
+    /// orphan the first pass provably cannot have captured; only a replayed pass
+    /// can reclaim it.
+    ///
+    /// Under a coalescing flag the bake's signal is discarded, the worker exits
+    /// after its one pass, and the later orphan is stranded until something else
+    /// happens to the table.
+    #[tokio::test]
+    async fn orphan_dv_sweep_replays_a_signal_raised_mid_pass() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "orphan_dv_dirty_replay",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        // Both the capturing pass and the replayed pass must clear the production
+        // threshold on their own, or the sweep would decline for that reason
+        // instead of the one under test.
+        seed_orphan_delete_files(&provider, ORPHANED_DV_CLEANUP_MIN_FILES, 0).await;
+
+        let baked = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let baked_in_hook = Arc::clone(&baked);
+            *provider.test_post_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    baked_in_hook.store(
+                        provider_in_hook
+                            .bake_seq_prefix_protected_snapshots()
+                            .await
+                            .expect("mid-sweep bake"),
+                        Ordering::SeqCst,
+                    );
+                    // Lands after the running pass captured its candidates, so only
+                    // a replayed pass can see these.
+                    seed_orphan_delete_files(&provider_in_hook, ORPHANED_DV_CLEANUP_MIN_FILES, 0)
+                        .await;
+                })
+            }));
+        }
+
+        provider.schedule_orphan_dv_sweep();
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain the sweep");
+
+        assert!(
+            baked.load(Ordering::SeqCst),
+            "the mid-sweep hook must have committed a bake (the production signal under test)"
+        );
+        assert_eq!(
+            key_dv_count(&provider).await,
+            0,
+            "the orphans recorded during the pass must be reclaimed by a replayed pass"
+        );
+        assert_eq!(
+            provider.orphan_dv_sweep_state.load(Ordering::Acquire),
+            ORPHAN_DV_SWEEP_IDLE,
+            "the episode ends idle once no signal is outstanding"
+        );
+    }
+
+    /// A backlog larger than one capped batch drains within a single sweep, so a
+    /// table that goes idle after one signal does not strand the remainder.
+    #[tokio::test]
+    async fn orphan_dv_sweep_drains_successive_capped_batches() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "orphan_dv_batches",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        let paths = seed_orphan_delete_files(&provider, 5, 0).await;
+
+        provider.drain_orphan_dv_backlog(1, 2).await;
+
+        assert_eq!(
+            key_dv_count(&provider).await,
+            0,
+            "a 5-row backlog must drain through successive 2-row batches"
+        );
+        for path in &paths {
+            assert!(!path.exists(), "{} must be unlinked", path.display());
+        }
+    }
+
+    /// RESURRECTION GUARD. The sweep proves eligibility from the in-memory current
+    /// snapshot AND the catalog, and a current-snapshot publication commits both
+    /// under `listing_fence.write()`. So the sweep's capture must take the read
+    /// side: without it the capture can straddle a publication, pair a pre-commit
+    /// current snapshot with a post-commit catalog, derive a floor above a DV the
+    /// newly published snapshot still needs, and durably delete it.
+    ///
+    /// Mirrors `read_fence_blocks_write_fence_acquisition`: a held write guard
+    /// models the publication, and the sweep must make no progress until it is
+    /// released.
+    #[tokio::test]
+    async fn orphan_dv_sweep_capture_waits_for_a_publication_barrier() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "orphan_dv_capture_fence",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        seed_orphan_delete_files(&provider, 3, 0).await;
+
+        // Models a publication holding the barrier across its catalog commit and
+        // its in-memory pointer flip.
+        let publish_barrier = Arc::clone(&provider.listing_fence).write_owned().await;
+
+        let sweeper = provider.clone_for_write();
+        let mut sweep = tokio::spawn(async move { sweeper.drain_orphan_dv_sweep(1).await });
+
+        match tokio::time::timeout(std::time::Duration::from_millis(50), &mut sweep).await {
+            Err(_) => {
+                assert_eq!(
+                    key_dv_count(&provider).await,
+                    3,
+                    "nothing may be reclaimed while the barrier is held"
+                );
+                drop(publish_barrier);
+                tokio::time::timeout(std::time::Duration::from_secs(5), sweep)
+                    .await
+                    .expect("the sweep completes once the barrier is released")
+                    .expect("the sweep task did not panic");
+                assert_eq!(
+                    key_dv_count(&provider).await,
+                    0,
+                    "the sweep proceeds against the published state"
+                );
+            }
+            Ok(_) => panic!(
+                "the sweep proved orphan eligibility while a publication held the listing fence"
+            ),
+        }
     }
 
     /// The orphaned-DV sweep floor must never trust an empty manifest as genesis
