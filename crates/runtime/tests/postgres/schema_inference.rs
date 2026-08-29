@@ -171,7 +171,7 @@ async fn refresh_dataset(rt: &runtime::Runtime, name: &str) -> Result<(), anyhow
         .refresh_table(&datafusion::common::TableReference::from(name), None)
         .await?;
     let notify = notifier.ok_or_else(|| anyhow::anyhow!("no completion notifier for {name}"))?;
-    tokio::time::timeout(Duration::from_mins(1), notify.notified())
+    tokio::time::timeout(Duration::from_mins(1), notify.wait())
         .await
         .map_err(|_| {
             anyhow::anyhow!("timed out after 1 minute waiting for {name} refresh to complete")

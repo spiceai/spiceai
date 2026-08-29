@@ -441,6 +441,13 @@ fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
         return error;
     };
 
+    // A `not_found_error` arrives already explained by `explain_model_not_found`, and must not be
+    // re-typed here: the substring tests below read the model id in its message, so a snapshot id
+    // such as `claude-3-5-sonnet-20240403` would be reported as an authentication failure.
+    if api_error.r#type.as_deref() == Some("not_found_error") {
+        return OpenAIError::ApiError(api_error);
+    }
+
     let lowered = api_error.message.to_lowercase();
 
     if lowered.contains("too many requests") || lowered.contains("429") {
@@ -565,6 +572,69 @@ mod tests {
                 .as_ref()
                 .and_then(|details| details.audio_tokens),
             Some(u32::MAX - 1)
+        );
+    }
+    /// The streaming path explains a model-not-found upstream of `transform_stream`, so the
+    /// explanation has to survive this function. It did not: the fallback arm re-types every
+    /// `ApiError` as `AnthropicStreamError`, which both buried the actionable message behind a
+    /// `Anthropic streaming error:` prefix and made a downstream check for `not_found_error`
+    /// unreachable.
+    #[test]
+    fn an_explained_model_not_found_passes_through_unchanged() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-sonnet-4-6",
+            true,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-sonnet-4-6".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+        let OpenAIError::ApiError(before) = &explained else {
+            panic!("the explanation must stay an ApiError");
+        };
+        let expected = before.message.clone();
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert_eq!(after.message, expected);
+        assert_eq!(after.r#type.as_deref(), Some("not_found_error"));
+    }
+
+    /// A model id whose snapshot date contains `403` is what makes the guard above load-bearing
+    /// rather than cosmetic: the substring tests in this function read the whole message, so
+    /// without the typed check this would be reported as an authentication failure.
+    #[test]
+    fn a_model_id_containing_403_is_not_reported_as_an_auth_failure() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-3-5-sonnet-20240403",
+            false,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-3-5-sonnet-20240403".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert!(
+            after.message.contains("does not serve that model id"),
+            "the model-not-found explanation must survive: {}",
+            after.message
+        );
+        assert!(
+            !after.message.contains("authentication failed"),
+            "a model id is not a credential problem: {}",
+            after.message
         );
     }
 }
