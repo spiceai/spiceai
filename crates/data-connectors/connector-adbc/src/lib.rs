@@ -32,6 +32,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arr
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
 use runtime_component::dataset::DatasetSpec;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
@@ -396,7 +397,7 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
-        is_query_federation_enabled(&params.parameters).map_err(|e| {
+        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
                 connector_component: params.component.clone(),
@@ -532,7 +533,7 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool));
+        let adbc_factory = build_table_factory(Arc::clone(&pool), federation_enabled);
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),
@@ -540,6 +541,26 @@ impl AdbcFactory {
             driver_name: driver_name_owned,
         }) as Arc<dyn DataConnector>)
     }
+}
+
+/// Builds the [`AdbcTableFactory`] for a dataset, with the Spice function
+/// deny-list installed and the `query_federation` setting applied.
+///
+/// Without the deny-list, federation pushes Spice-only UDFs (`json_get_str`
+/// and the other JSON functions, the embedding/distance UDFs, etc.) into the
+/// SQL sent to the remote database, where those functions don't exist — the
+/// query then fails with an "unknown function" error from the remote (e.g.
+/// `BigQuery`). Installing the deny-list makes the table's `can_execute_plan`
+/// refuse such plans so `DataFusion` evaluates the affected expressions
+/// locally instead. See issue #10703.
+fn build_table_factory<D>(pool: Arc<ADBCPool<D>>, federation_enabled: bool) -> AdbcTableFactory<D>
+where
+    D: adbc_core::Database + Send + 'static,
+    D::ConnectionType: adbc_core::Connection + Send + Sync,
+{
+    AdbcTableFactory::new(pool)
+        .with_federation_enabled(federation_enabled)
+        .with_function_support(deny_spice_functions_for_table_providers())
 }
 
 async fn enrich_with_bigquery_metadata_from_weak_pool(
@@ -1969,3 +1990,317 @@ data_connector_api::register_data_connector!(
     CONNECTOR_NAME,
     AdbcFactory
 );
+
+#[cfg(test)]
+mod function_support_tests {
+    //! Regression tests for the federation deny-list on the ADBC table
+    //! factory: [`build_table_factory`] must install the Spice function
+    //! deny-list and honor the `query_federation` setting. Without the
+    //! deny-list, Spice-only UDFs like `json_get_str` are unparsed into the
+    //! SQL sent to the remote database (e.g. `BigQuery`), which cannot
+    //! evaluate them.
+
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
+    use adbc_core::options::{
+        InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+    };
+    use adbc_core::{Connection, Database, Optionable, PartitionedResult, Statement};
+    use arrow::array::{RecordBatch, RecordBatchReader};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
+        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+    };
+    use datafusion::prelude::col;
+    use datafusion::sql::TableReference;
+    use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan};
+    use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
+
+    use super::build_table_factory;
+
+    fn not_implemented(what: &str) -> AdbcError {
+        AdbcError::with_message_and_status(
+            format!("{what} is not implemented by the stub ADBC driver"),
+            Status::NotImplemented,
+        )
+    }
+
+    fn table_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ])
+    }
+
+    /// Minimal in-process ADBC driver: enough for the connection pool to hand
+    /// out connections and for `AdbcTableFactory::table_provider` to resolve
+    /// the table schema. Everything else reports `NotImplemented`.
+    struct StubDatabase;
+    struct StubConnection;
+    struct StubStatement;
+
+    impl Optionable for StubDatabase {
+        type Option = OptionDatabase;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Database for StubDatabase {
+        type ConnectionType = StubConnection;
+
+        fn new_connection(&self) -> AdbcResult<StubConnection> {
+            Ok(StubConnection)
+        }
+
+        fn new_connection_with_opts(
+            &self,
+            _opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
+        ) -> AdbcResult<StubConnection> {
+            Ok(StubConnection)
+        }
+    }
+
+    impl Optionable for StubConnection {
+        type Option = OptionConnection;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Connection for StubConnection {
+        type StatementType = StubStatement;
+
+        fn new_statement(&mut self) -> AdbcResult<StubStatement> {
+            Ok(StubStatement)
+        }
+
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+
+        fn get_info(
+            &self,
+            _codes: Option<HashSet<InfoCode>>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_info"))
+        }
+
+        fn get_objects(
+            &self,
+            _depth: ObjectDepth,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: Option<&str>,
+            _table_type: Option<Vec<&str>>,
+            _column_name: Option<&str>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_objects"))
+        }
+
+        fn get_table_schema(
+            &self,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: &str,
+        ) -> AdbcResult<Schema> {
+            Ok(table_schema())
+        }
+
+        fn get_table_types(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_table_types"))
+        }
+
+        fn get_statistic_names(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_statistic_names"))
+        }
+
+        fn get_statistics(
+            &self,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: Option<&str>,
+            _approximate: bool,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_statistics"))
+        }
+
+        fn commit(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("commit"))
+        }
+
+        fn rollback(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("rollback"))
+        }
+
+        fn read_partition(
+            &self,
+            _partition: impl AsRef<[u8]>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("read_partition"))
+        }
+    }
+
+    impl Optionable for StubStatement {
+        type Option = OptionStatement;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Statement for StubStatement {
+        fn bind(&mut self, _batch: RecordBatch) -> AdbcResult<()> {
+            Err(not_implemented("bind"))
+        }
+
+        fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> AdbcResult<()> {
+            Err(not_implemented("bind_stream"))
+        }
+
+        fn execute(&mut self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("execute"))
+        }
+
+        fn execute_update(&mut self) -> AdbcResult<Option<i64>> {
+            Err(not_implemented("execute_update"))
+        }
+
+        fn execute_schema(&mut self) -> AdbcResult<Schema> {
+            Err(not_implemented("execute_schema"))
+        }
+
+        fn execute_partitions(&mut self) -> AdbcResult<PartitionedResult> {
+            Err(not_implemented("execute_partitions"))
+        }
+
+        fn get_parameter_schema(&self) -> AdbcResult<Schema> {
+            Err(not_implemented("get_parameter_schema"))
+        }
+
+        fn prepare(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("prepare"))
+        }
+
+        fn set_sql_query(&mut self, _query: impl AsRef<str>) -> AdbcResult<()> {
+            Err(not_implemented("set_sql_query"))
+        }
+
+        fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> AdbcResult<()> {
+            Err(not_implemented("set_substrait_plan"))
+        }
+
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+    }
+
+    /// A projection over a scan of the stub table, so a plan can carry an
+    /// arbitrary expression through the federation `can_execute_plan` check.
+    fn scan_project(expr: Expr) -> LogicalPlan {
+        let source =
+            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+        LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan the stub table")
+            .project(vec![expr])
+            .expect("project the expression")
+            .build()
+            .expect("build the plan")
+    }
+
+    fn udf_expr(name: &str) -> Expr {
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![col("val")]))
+    }
+
+    async fn stub_table_provider(federation_enabled: bool) -> Arc<dyn TableProvider> {
+        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        build_table_factory(pool, federation_enabled)
+            .table_provider(TableReference::bare("t"), None)
+            .await
+            .expect("build the ADBC table provider")
+    }
+
+    #[tokio::test]
+    async fn table_factory_denies_spice_functions_from_federation() {
+        let provider = stub_table_provider(true).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        let federation = adaptor.source.federation_provider();
+
+        let denied = scan_project(udf_expr("json_get_str"));
+        assert!(
+            matches!(
+                federation.analyzer(&denied),
+                Some(FederationAnalyzerForLogicalPlan::Unable)
+            ),
+            "a plan using a Spice-only UDF must not federate to the remote ADBC database"
+        );
+
+        let allowed = scan_project(col("id"));
+        assert!(
+            matches!(
+                federation.analyzer(&allowed),
+                Some(FederationAnalyzerForLogicalPlan::With(_))
+            ),
+            "a plan without Spice-only UDFs must still federate"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_factory_disables_federation_when_configured() {
+        let provider = stub_table_provider(false).await;
+        assert!(
+            (provider.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+                .is_none(),
+            "`query_federation: disabled` must produce a provider that never federates"
+        );
+    }
+}
