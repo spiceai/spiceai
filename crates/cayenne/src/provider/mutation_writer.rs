@@ -1165,6 +1165,11 @@ impl<'a> AppendMutationWriter<'a> {
             (rows, stats_acc, validated_keys, superseded)
         };
 
+        // Both branches above have made this commit's rows visible, so from here
+        // the claim survives a cancellation or a failure: a commit that dies
+        // after publishing has left rows it will never queue a delta for.
+        let published_live_rows_delta = reserved_live_rows_delta.published();
+
         let retention_requested = self.table.has_retention_delete_filters();
 
         let live_rows_delta = i64::try_from(total_rows)
@@ -1175,7 +1180,7 @@ impl<'a> AppendMutationWriter<'a> {
             needs_new_snapshot,
             retention_requested,
             live_rows_delta,
-            reserved_live_rows_delta,
+            published_live_rows_delta,
         );
 
         if retention_requested {
@@ -1352,6 +1357,12 @@ impl<'a> AppendMutationWriter<'a> {
                 )
                 .await?
             {
+                // The inline rows are visible now, so the claim survives from
+                // here. `try_inline_batches_with_inlined_deletions` awaits the
+                // maintained-aggregate apply after its own visibility flip, so
+                // a cancellation inside it still loses the claim — see #13721.
+                let published_live_rows_delta = reserved_live_rows_delta.published();
+
                 // Inline tier0 (metastore BLOB) write — the synchronous CDC hot
                 // loop. Always skip NDV here (lazy): these rows contribute their
                 // distinct-count for free when the inline memtable later spills to
@@ -1373,7 +1384,7 @@ impl<'a> AppendMutationWriter<'a> {
                     false,
                     false,
                     live_rows_delta,
-                    reserved_live_rows_delta,
+                    published_live_rows_delta,
                 );
 
                 self.table

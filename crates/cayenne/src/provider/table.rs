@@ -41,8 +41,8 @@ use super::delete::{
 use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
     OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
-    PostWriteMaintenanceState, RetentionFailureAction, SnapshotMaintenanceTrigger,
-    duration_millis_saturating, protected_snapshot_maintenance_trigger,
+    PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction,
+    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
 };
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
@@ -573,6 +573,12 @@ impl CayenneCdcWrite {
                 prepared_append.apply_under_barrier().await?;
                 0
             };
+            // Both branches above have made this commit's rows visible. From
+            // here the claim survives a cancellation or a failure — `finish()`
+            // and `sequence_high_water()` below are both suspension points, and
+            // a commit that dies at one has published rows it will never queue a
+            // delta for.
+            let published_live_rows_delta = reserved_live_rows_delta.published();
             let rows = prepared_append.finish().await?;
             if staging_wal_removal_failed {
                 // `finish()` -> `mark_inflight_complete()` just cleared
@@ -616,7 +622,7 @@ impl CayenneCdcWrite {
                 false,
                 retention_requested,
                 live_rows_delta,
-                reserved_live_rows_delta,
+                published_live_rows_delta,
             );
             Ok(rows)
         } else {
@@ -16351,11 +16357,12 @@ impl CayenneTableProvider {
 
     /// Queue post-write maintenance for a commit.
     ///
-    /// `reserved` is the [`OutstandingLiveRowsDelta`] the caller took with
-    /// [`Self::reserve_live_rows_delta`] **before publishing its rows**, and is
-    /// mandatory so that a commit cannot stake its claim on the maintained count
-    /// after the rows the claim is about have already been published. It is
-    /// consumed here: kept outstanding when this commit moves the row count, and
+    /// `published` is the claim the caller staked with
+    /// [`Self::reserve_live_rows_delta`] **before** publishing its rows and
+    /// marked [`OutstandingLiveRowsDelta::published`] as soon as they became
+    /// visible. It is mandatory, so a commit cannot stake its claim on the
+    /// maintained count after the rows the claim is about are already readable.
+    /// It is consumed here — queued when this commit moves the row count,
     /// released when it does not.
     pub(crate) fn schedule_post_write_maintenance(
         &self,
@@ -16363,11 +16370,10 @@ impl CayenneTableProvider {
         refresh_listing: bool,
         retention_requested: bool,
         live_rows_delta: i64,
-        reserved: OutstandingLiveRowsDelta,
+        published: PublishedLiveRowsDelta,
     ) {
         if stats.is_none() && !refresh_listing && !retention_requested && live_rows_delta == 0 {
-            // `reserved` is released as it drops: this commit changed no row
-            // count, so nothing is owed.
+            published.release();
             return;
         }
 
@@ -16385,18 +16391,19 @@ impl CayenneTableProvider {
             maintenance_state.live_rows_delta = maintenance_state
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
-            if live_rows_delta != 0 {
+            if live_rows_delta == 0 {
+                // This commit's rows left the net live count where it was, so
+                // there is no delta to persist and nothing would ever retire
+                // the claim.
+                published.release();
+            } else {
                 // Count this delta under the same lock that folds it in, so
                 // `has_unapplied_live_rows_delta` reports this write until the
                 // persist that folds it into `num_rows` lands.
                 maintenance_state.live_rows_delta_count =
                     maintenance_state.live_rows_delta_count.saturating_add(1);
-                // Already counted, from before the rows were published; this
-                // hands that claim to the drain that will retire it.
-                reserved.queue();
+                published.queue();
             }
-            // A `reserved` still held here belongs to a commit whose net row
-            // count did not move, and is released as it drops.
         }
 
         self.spawn_post_write_maintenance_loop();
@@ -47630,7 +47637,7 @@ mod tests {
             false,
             false,
             QUEUED_DELTA,
-            provider.reserve_live_rows_delta(),
+            provider.reserve_live_rows_delta().published(),
         );
 
         let stats = provider
@@ -47898,6 +47905,64 @@ mod tests {
                 .num_rows,
             DFPrecision::Exact(usize::try_from(SEED + INSERTED).expect("row count fits usize")),
             "the claim must be retired by the persist that folds its delta into num_rows",
+        );
+    }
+
+    /// A commit whose rows leave the net live count where it was owes the
+    /// maintained count nothing, and nothing would ever retire a claim it left
+    /// behind — an upsert that replaces exactly as many rows as it inserts is
+    /// that shape. Both of `schedule_post_write_maintenance`'s zero-delta exits
+    /// must therefore release the claim, or one no-op commit strands the table
+    /// on `Inexact` for the life of the process and every distributed
+    /// `COUNT(*)` on it real-scans forever.
+    #[tokio::test]
+    async fn a_commit_that_moves_no_rows_releases_its_claim() {
+        const ROWS: i64 = 6;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("unmoved_count_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, ROWS),
+        )
+        .await;
+
+        let exact = DFPrecision::Exact(usize::try_from(ROWS).expect("row count fits usize"));
+
+        // The early exit: nothing to schedule at all.
+        provider.schedule_post_write_maintenance(
+            None,
+            false,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+        // ...and the in-lock exit: there is maintenance to do, just no row-count
+        // delta behind it.
+        provider.schedule_post_write_maintenance(
+            None,
+            true,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the drain")
+                .num_rows,
+            exact,
+            "a commit that moved no rows queued no delta, so a claim it held would never be \
+             retired and the table would serve Inexact forever",
         );
     }
 
