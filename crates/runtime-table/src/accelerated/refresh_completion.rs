@@ -139,6 +139,11 @@ impl RefreshCompletion {
     ///
     /// Such a completion answers every waiter taken before it and none taken
     /// after, which is all an uncorrelated signal can honestly claim.
+    ///
+    /// One transition rather than `record(self.issue())`: the intermediate state
+    /// of that pair is a request that has been issued and not completed, and a
+    /// waiter taken there would skip this completion and wait for the following
+    /// apply.
     pub fn record_untriggered(&self) {
         self.state.send_modify(|state| {
             state.issued = state.issued.saturating_add(1);
