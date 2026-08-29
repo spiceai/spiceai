@@ -123,11 +123,18 @@ def violations(path, text):
 
 
 def manifests():
+    """Every workflow and action manifest, in both spellings GitHub accepts.
+
+    `.yaml` is not a stylistic variant to normalise away -- GitHub runs those manifests
+    exactly as it runs `.yml`, and this repository already has three `action.yaml` files. A
+    scan that saw only `.yml` would leave them as a silent hole in a guard whose whole design
+    is to have no exemptions.
+    """
     for root in ROOTS:
         if not root.is_dir():
             continue
-        yield from sorted(root.glob("*.yml"))
-        yield from sorted(root.glob("*/action.yml"))
+        for pattern in ("*.yml", "*.yaml", "*/action.yml", "*/action.yaml"):
+            yield from sorted(root.glob(pattern))
 
 
 def main():

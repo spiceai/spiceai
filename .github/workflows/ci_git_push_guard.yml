@@ -24,7 +24,9 @@ on:
       # in the guard. Composite actions count -- one shared action carried the push for
       # eight call sites across six workflows.
       - '.github/workflows/*.yml'
+      - '.github/workflows/*.yaml'
       - '.github/actions/*/action.yml'
+      - '.github/actions/*/action.yaml'
   push:
     branches:
       - trunk
@@ -32,7 +34,9 @@ on:
       - 'scripts/check_ci_git_push_noninteractive.py'
       - 'scripts/test_check_ci_git_push_noninteractive.py'
       - '.github/workflows/*.yml'
+      - '.github/workflows/*.yaml'
       - '.github/actions/*/action.yml'
+      - '.github/actions/*/action.yaml'
   workflow_dispatch:
 
 concurrency:
