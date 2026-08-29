@@ -1335,11 +1335,10 @@ mod tests {
     /// re-introduces the space fails, and so does one that drops the offset entirely
     /// and leaves `BigQuery` to read the literal in its own time zone.
     ///
-    /// The pin satisfies this through the `Dialect` trait default, not a
-    /// `BigQueryDialect` override — the override PR #144 added is no longer on the
-    /// branch. That is why this guard asserts the rendering `BigQuery` receives rather
-    /// than the presence of an override: either layer may supply it, and a re-cut that
-    /// changes either one still has to keep the format.
+    /// The assertion is deliberately independent of which dialect layer produces the
+    /// format: a `BigQueryDialect` override and the `Dialect` trait default are both
+    /// able to supply it, so the guard pins the rendering `BigQuery` receives and a
+    /// re-cut that changes either layer still has to keep it.
     #[test]
     fn bigquery_attaches_a_timestamp_offset_to_the_time() {
         let plan = timestamp_scan(Some("UTC"))
