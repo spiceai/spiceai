@@ -729,16 +729,9 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Drop all non-authoritative cached metadata rows for one snapshot that has
     /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
-    /// `cayenne_snapshot_file_statistics` stats-cache rows.
-    ///
-    /// Scans read a snapshot's file set from the directory listing, not from
-    /// these rows, so both are safe to drop the moment the snapshot leaves the
-    /// roster (for example when time-based retention empties a protected
-    /// snapshot). Coupling the two deletions in one method keeps the sibling
-    /// caches from drifting: a caller can never delete the manifest rows and
-    /// forget the stats rows, or the reverse. Physical `.vortex` files are
-    /// reclaimed separately (reader-scoped). Implementations should run both
-    /// deletes in a single backend transaction.
+    /// `cayenne_snapshot_file_statistics` stats-cache rows. Coupling the two
+    /// deletions in one method keeps the sibling caches from drifting: a caller
+    /// can never delete the manifest rows and forget the stats rows, or the reverse.
     async fn clear_snapshot_cached_metadata(
         &self,
         table_id: &str,
