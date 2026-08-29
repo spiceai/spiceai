@@ -17,6 +17,7 @@ use super::DatasetMetricLabels;
 use super::RefreshTask;
 use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated::refresh::Refresh;
+use crate::accelerated::refresh_completion::RefreshCompletion;
 use crate::accelerated::refresh_task::deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
 };
@@ -70,7 +71,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated::Result<()>>;
 
@@ -397,7 +398,7 @@ struct ApplyContext<'a> {
     /// (see [`DatasetMetricLabels`]).
     metric_labels: &'a DatasetMetricLabels,
     caching: Option<&'a Weak<Caching>>,
-    ready_sender: Option<&'a Arc<Notify>>,
+    refresh_completion: Option<&'a RefreshCompletion>,
     initial_load_completed: &'a Arc<AtomicBool>,
     write_ctx: &'a SessionContext,
     write_session_state: &'a SessionState,
@@ -1041,7 +1042,7 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         // Effective CDC config = global (already env+default folded) with any
@@ -1055,7 +1056,7 @@ impl RefreshTask {
             refresh,
             changes_stream,
             caching,
-            ready_sender,
+            refresh_completion,
             initial_load_completed,
         )
         .await
@@ -1069,7 +1070,7 @@ impl RefreshTask {
         refresh: Arc<RwLock<Refresh>>,
         changes_stream: ChangesStream,
         caching: Option<Weak<Caching>>,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         let dataset_name = self.dataset_name.clone();
@@ -1298,7 +1299,7 @@ impl RefreshTask {
                                 refresh: &refresh,
                                 metric_labels: &metric_labels,
                                 caching: caching.as_ref(),
-                                ready_sender: ready_sender.as_ref(),
+                                refresh_completion: refresh_completion.as_ref(),
                                 initial_load_completed: &initial_load_completed,
                                 write_ctx: &write_ctx,
                                 write_session_state: &write_session_state,
@@ -1551,7 +1552,7 @@ impl RefreshTask {
                 refresh: &refresh,
                 metric_labels: &metric_labels,
                 caching: caching.as_ref(),
-                ready_sender: ready_sender.as_ref(),
+                refresh_completion: refresh_completion.as_ref(),
                 initial_load_completed: &initial_load_completed,
                 write_ctx: &write_ctx,
                 write_session_state: &write_session_state,
@@ -1610,7 +1611,7 @@ impl RefreshTask {
                     refresh: &refresh,
                     metric_labels: &metric_labels,
                     caching: caching.as_ref(),
-                    ready_sender: ready_sender.as_ref(),
+                    refresh_completion: refresh_completion.as_ref(),
                     initial_load_completed: &initial_load_completed,
                     write_ctx: &write_ctx,
                     write_session_state: &write_session_state,
@@ -1817,15 +1818,15 @@ impl RefreshTask {
     /// a fatal commit error was surfaced and the stream should stop.
     /// Signal the dataset Ready: flip `initial_load_completed`, wake readiness
     /// waiters, then publish the `Ready` component status — in that order, so a
-    /// waiter woken by the notify observes the completed flag. The single
+    /// waiter woken by the completion observes the completed flag. The single
     /// definition of the readiness side effect for every apply path (write,
     /// post-finalize, and readiness-only heartbeat runs).
     async fn signal_dataset_ready(&self, context: &ApplyContext<'_>) {
         context
             .initial_load_completed
             .store(true, Ordering::Relaxed);
-        if let Some(sender) = context.ready_sender {
-            sender.notify_waiters();
+        if let Some(refresh_completion) = context.refresh_completion {
+            refresh_completion.record();
         }
         self.update_component_status(status::ComponentStatus::Ready)
             .await;
@@ -6110,12 +6111,18 @@ mod tests {
     async fn run_changes_stream(
         task: &RefreshTask,
         stream: ChangesStream,
-        ready_sender: Option<Arc<Notify>>,
+        refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
         let refresh = Arc::new(RwLock::new(crate::accelerated::refresh::Refresh::default()));
-        task.start_changes_stream(refresh, stream, None, ready_sender, initial_load_completed)
-            .await
+        task.start_changes_stream(
+            refresh,
+            stream,
+            None,
+            refresh_completion,
+            initial_load_completed,
+        )
+        .await
     }
 
     // -- Correctness: ordering ------------------------------------------------
@@ -6518,7 +6525,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6771,7 +6778,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6835,7 +6842,7 @@ mod tests {
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
-            ready_sender: None,
+            refresh_completion: None,
             initial_load_completed: &initial_load_completed,
             write_ctx: &write_ctx,
             write_session_state: &write_session_state,
@@ -6933,21 +6940,12 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
-        // Subscribe BEFORE running so we don't miss the notify_waiters signal.
-        let notified = {
-            let n = Arc::clone(&notify);
-            tokio::spawn(async move {
-                let waiter = n.notified();
-                tokio::pin!(waiter);
-                tokio::time::timeout(Duration::from_secs(5), &mut waiter)
-                    .await
-                    .is_ok()
-            })
-        };
-        // Yield so the subscriber registers before we proceed.
-        tokio::task::yield_now().await;
+        // Take the waiter before the stream runs, and await it only after the
+        // stream has finished — the ordering that loses an edge-triggered
+        // wakeup entirely (#13086).
+        let waiter = refresh_completion.next();
 
         let stream = make_changes_stream(vec![
             Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
@@ -6957,7 +6955,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await
@@ -6967,10 +6965,9 @@ mod tests {
             initial_load.load(Ordering::Relaxed),
             "initial_load_completed must flip to true once a ready envelope is processed"
         );
-        assert!(
-            notified.await.expect("ready notifier task must finish"),
-            "ready_sender.notify_waiters() must fire when a ready envelope is processed"
-        );
+        tokio::time::timeout(Duration::from_secs(5), waiter.wait())
+            .await
+            .expect("a ready envelope must release a waiter taken before the stream ran");
     }
 
     // -- Correctness: readiness heartbeats bypass the write/durability path ---
@@ -7058,7 +7055,7 @@ mod tests {
         });
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let stream = make_changes_stream(vec![
             Ok(make_heartbeat_envelope(false)),
@@ -7068,7 +7065,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await
@@ -7098,7 +7095,7 @@ mod tests {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
         let log = CommitLog::new();
         let initial_load = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let stream = make_changes_stream(vec![
             Ok(make_tracked_envelope(1, Arc::clone(&log), false)),
@@ -7110,7 +7107,7 @@ mod tests {
         run_changes_stream(
             &task,
             stream,
-            Some(Arc::clone(&notify)),
+            Some(refresh_completion.clone()),
             Arc::clone(&initial_load),
         )
         .await
