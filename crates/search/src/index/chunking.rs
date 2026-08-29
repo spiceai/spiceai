@@ -61,6 +61,7 @@ pub static CHUNKED_INDEX_FULL_SEARCH_FIELD: &str = "_spice.search_field";
 /// Two new [`FieldRef`]s augment the table:
 ///   1. An index of the chunks position in the underlying search column. This is an additional element in [`SearchIndex::primary_fields`].
 ///   2. The start and end index of the chunk into the underlying search column. This is an additional [`MetadataColumn::NonFilterable`] in  [`SearchIndex::metadata_columns`].
+#[derive(Clone)]
 pub struct ChunkedSearchIndex {
     inner: Arc<dyn SearchIndex>,
     chunker: Arc<dyn Chunker>,
@@ -73,7 +74,12 @@ pub struct ChunkedSearchIndex {
     base_key_names: Vec<String>,
     /// Set for the duration of a [`WriteWindow::ReplaceAll`] window. See
     /// [`Self::evict_rows_chunked_to_nothing`], which is where it is read and why it exists.
-    replace_window: AtomicBool,
+    ///
+    /// Behind an [`Arc`] so a clone of this index observes the same window: a clone wraps the
+    /// same inner index, so a window opened against either of them is open for both. (Callers do
+    /// clone — `runtime-search` clones a borrowed index to hand the search path an owned
+    /// `Arc<dyn SearchIndex>`.)
+    replace_window: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -335,7 +341,7 @@ impl ChunkedSearchIndex {
             base_key_names: Self::base_key_columns(&inner.primary_fields()),
             inner,
             chunker,
-            replace_window: AtomicBool::new(false),
+            replace_window: Arc::new(AtomicBool::new(false)),
         }
     }
 
