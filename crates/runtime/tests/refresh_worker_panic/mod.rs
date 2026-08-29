@@ -38,6 +38,13 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
 
+/// Distinct, non-sequential request ids: a completion is reported under the id
+/// of the request that produced it (#13544), so a runner that echoed a
+/// constant, or the wrong one of the two in flight, would still pass with 1
+/// and 2.
+const PANICKING_REQUEST: u64 = 7;
+const SUCCEEDING_REQUEST: u64 = 11;
+
 #[derive(Debug)]
 struct PanickingOnceTableProvider {
     inner: Arc<MemTable>,
@@ -165,12 +172,6 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
 
     let (start_refresh, mut on_refresh_complete) =
         runner.start().expect("Should start refresh task");
-
-    // Distinct, non-sequential request ids: a completion is reported under the id
-    // of the request that produced it (#13544), so a runner that echoed a
-    // constant, or the wrong one of the two, would still pass with 1 and 2.
-    const PANICKING_REQUEST: u64 = 7;
-    const SUCCEEDING_REQUEST: u64 = 11;
 
     start_refresh
         .send((PANICKING_REQUEST, None))

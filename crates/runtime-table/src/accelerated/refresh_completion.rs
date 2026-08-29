@@ -115,6 +115,7 @@ impl RefreshCompletion {
     /// one table in one process — and reaching it would strand waiters rather
     /// than release them early, so the failure direction is a readiness ack that
     /// is never sent rather than one sent for data that was never loaded.
+    #[must_use]
     pub fn issue(&self) -> RefreshRequestId {
         let mut id = 0;
         self.state.send_modify(|state| {
