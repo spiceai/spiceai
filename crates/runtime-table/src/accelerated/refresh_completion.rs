@@ -175,19 +175,10 @@ impl RefreshCompletion {
         self.waiter(true)
     }
 
-    /// The number of requests issued so far.
-    ///
-    /// Test-only: a test that needs a refresh to be *in flight* has to wait for
-    /// the request rather than sleep for it, and nothing in production asks.
-    #[cfg(test)]
-    pub(crate) fn issued_requests(&self) -> RefreshRequestId {
-        self.state.borrow().issued
-    }
-
     /// The highest request id recorded complete so far.
     ///
-    /// Test-only, and for the same reason: it lets a test assert the refresh it
-    /// is racing against has not finished yet, so a run that loses that race
+    /// Test-only: it lets a test assert that the refresh it is holding open has
+    /// not finished, so a run that fails to reach the interleaving under test
     /// says so instead of passing vacuously.
     #[cfg(test)]
     pub(crate) fn completed_requests(&self) -> RefreshRequestId {

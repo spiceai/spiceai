@@ -1315,11 +1315,17 @@ mod tests {
         datatypes::{DataType, Field, Fields, Schema},
     };
     use data_components::arrow::write::MemTable;
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use datafusion::{
+        catalog::Session, datasource::TableType, physical_plan::ExecutionPlan,
+        physical_plan::collect, prelude::SessionContext,
+    };
     use opentelemetry::global;
     use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
     use prometheus::proto::MetricType;
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::{
+        sync::{mpsc, watch},
+        time::timeout,
+    };
 
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
@@ -1534,19 +1540,51 @@ mod tests {
         )
     }
 
-    /// Poll the request counter rather than sleeping, so a waiter taken after
-    /// this is taken while the triggered refresh is in flight.
-    async fn await_request_issued(refresh_completion: &RefreshCompletion) {
-        timeout(Duration::from_secs(5), async {
-            while refresh_completion.issued_requests() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the refresher requests the refresh it was triggered for");
+    /// A source that holds its scan open until the test lets it through, and
+    /// reports when a scan has entered.
+    ///
+    /// A refresh over a `MemTable` finishes inside one scheduler pass, so a
+    /// waiter taken "while it runs" is really taken after it: the interleaving
+    /// #13544 needs cannot be produced by timing alone. Gating the scan makes
+    /// the refresh provably in flight instead.
+    #[derive(Debug)]
+    struct GatedSource {
+        inner: Arc<dyn TableProvider>,
+        /// Set once, to release every waiting scan.
+        open: watch::Sender<bool>,
+        /// Scans entered so far, so the test can await one rather than spin.
+        entered: watch::Sender<u32>,
     }
 
-    /// Regression test for #13544. A refresh that was already requested when a
+    #[async_trait]
+    impl TableProvider for GatedSource {
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            self.inner.table_type()
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.entered.send_modify(|n| *n = n.saturating_add(1));
+            let mut open = self.open.subscribe();
+            while !*open.borrow_and_update() {
+                if open.changed().await.is_err() {
+                    break;
+                }
+            }
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    /// Regression test for #13544. A refresh that was already running when a
     /// waiter was taken must not answer it: on the partition-assignment path
     /// that completion acked `PartitionsLoaded` for partitions the refresh
     /// carrying their filters had not yet loaded, so the scheduler routed
@@ -1555,29 +1593,42 @@ mod tests {
     /// Both halves are asserted from one refresher, because the property is a
     /// pair: the in-flight refresh must not answer, and the next one must.
     #[tokio::test]
-    async fn test_a_refresh_already_requested_does_not_answer_a_later_waiter() {
-        let (refresher, refresh_completion, trigger, refresh_handle) =
-            started_full_refresher(status::RuntimeStatus::new()).await;
+    async fn test_a_refresh_already_running_does_not_answer_a_later_waiter() {
+        // Held, not used: dropping the refresher aborts the task running the
+        // refreshes this test drives.
+        let (_refresher, refresh_completion, trigger, open, entered, refresh_handle) =
+            started_gated_refresher().await;
 
+        // Trigger the first refresh and wait until it is inside the source scan,
+        // where the gate holds it. It cannot complete from here.
+        let mut entered_rx = entered.subscribe();
         trigger.send(None).await.expect("trigger is accepted");
-        await_request_issued(&refresh_completion).await;
+        timeout(Duration::from_secs(5), entered_rx.changed())
+            .await
+            .expect("the first refresh reaches the source")
+            .expect("the source outlives the scan");
 
-        // Independent waiters, both taken with the first refresh in flight: one
-        // to prove that refresh does not answer them, one left to be answered by
-        // the refresh triggered afterwards.
+        // Independent waiters, both taken with that refresh in flight: one to
+        // prove it does not answer them, one left for the refresh triggered
+        // afterwards. `first_done` is how the test knows the first refresh
+        // finished without polling for it.
         let in_flight_waiter = refresh_completion.next();
         let next_request_waiter = refresh_completion.next();
+        let first_done = refresh_completion.any();
         assert_eq!(
             refresh_completion.completed_requests(),
             0,
-            "the first refresh completed before the waiters were taken, so this run raced past the interleaving it exists to cover"
+            "the gate must hold the first refresh open until its waiters are taken"
         );
 
-        await_initial_load(&refresher).await;
+        open.send_replace(true);
+        timeout(Duration::from_secs(5), first_done.wait())
+            .await
+            .expect("the released refresh completes");
 
         let _ = timeout(Duration::from_millis(500), in_flight_waiter.wait())
             .await
-            .expect_err("a refresh requested before the waiter was taken must not answer it");
+            .expect_err("a refresh already running when the waiter was taken must not answer it");
 
         trigger.send(None).await.expect("trigger is accepted");
         timeout(Duration::from_secs(5), next_request_waiter.wait())
@@ -1585,6 +1636,72 @@ mod tests {
             .expect("the refresh requested after the waiter must answer it");
 
         drop(refresh_handle);
+    }
+
+    /// `started_full_refresher` over a source whose scan the test controls.
+    /// Returns the gate and the scan counter alongside the usual handles.
+    async fn started_gated_refresher() -> (
+        Arc<Refresher>,
+        RefreshCompletion,
+        mpsc::Sender<Option<RefreshOverrides>>,
+        watch::Sender<bool>,
+        watch::Sender<u32>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("source batch builds");
+        let open = watch::Sender::new(false);
+        let entered = watch::Sender::new(0);
+        let source = Arc::new(GatedSource {
+            inner: Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("source table builds"),
+            ),
+            open: open.clone(),
+            entered: entered.clone(),
+        });
+        let federated = Arc::new(FederatedTable::new_unchecked(source));
+        let accelerator =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
+                as Arc<dyn TableProvider>;
+
+        let refresh_completion = RefreshCompletion::new();
+        let mut refresher = Refresher::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("gated"),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.with_refresh_completion(refresh_completion.clone());
+
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let refresh_handle = refresher
+            .start(AccelerationRefreshMode::Full(receiver))
+            .await
+            .expect("refresh task starts");
+
+        (
+            Arc::new(refresher),
+            refresh_completion,
+            trigger,
+            open,
+            entered,
+            refresh_handle,
+        )
     }
 
     /// Poll `initial_load_completed` rather than sleeping, so the refresh is
@@ -1779,8 +1896,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
+        /// `dataset_load_state` is labelled by dataset and the meter provider is
+        /// global, so the family holds one series per dataset any concurrently
+        /// running test has registered. Select the series by its `dataset`
+        /// label — reading the first one makes this assertion depend on which
+        /// other tests happen to be in flight.
         async fn wait_until_ready_status(
             registry: &prometheus::Registry,
+            dataset: &str,
             desired: status::ComponentStatus,
             max_attempts: usize,
             delay: Duration,
@@ -1791,9 +1914,13 @@ mod tests {
                 };
 
                 let metrics = registry.gather();
-                if let Some(metric) = metrics.iter().find(|m| {
+                if let Some(family) = metrics.iter().find(|m| {
                     m.name() == "dataset_load_state" && m.get_field_type() == MetricType::GAUGE
-                }) && let Some(gauge) = metric.get_metric()[0].get_gauge().as_ref()
+                }) && let Some(series) = family.get_metric().iter().find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "dataset" && l.value() == dataset)
+                }) && let Some(gauge) = series.get_gauge().as_ref()
                     && gauge.value().is_eq(f64::from(desired_discriminant))
                 {
                     return true;
@@ -1840,6 +1967,7 @@ mod tests {
         assert!(
             wait_until_ready_status(
                 &registry,
+                "test",
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)
@@ -1858,6 +1986,7 @@ mod tests {
         assert!(
             wait_until_ready_status(
                 &registry,
+                "test",
                 status::ComponentStatus::Ready,
                 60,
                 Duration::from_millis(50)
