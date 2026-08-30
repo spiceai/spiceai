@@ -1901,7 +1901,10 @@ impl RefreshTask {
             .initial_load_completed
             .store(true, Ordering::Relaxed);
         if let Some(refresh_completion) = context.refresh_completion {
-            refresh_completion.record();
+            // A CDC apply answers no trigger, so it is recorded without a
+            // request id: it releases every waiter taken before it and none
+            // taken after.
+            refresh_completion.record_untriggered();
         }
         self.update_component_status(status::ComponentStatus::Ready)
             .await;
