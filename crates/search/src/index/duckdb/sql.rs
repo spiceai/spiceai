@@ -262,6 +262,25 @@ mod tests {
         ))
     }
 
+    /// A `docs` schema carrying one timezone-aware microsecond `ts` column — the resolved type
+    /// that declines the UTC normalization, so a guard on the literal sees the literal alone.
+    fn aware_ts_schema() -> SchemaRef {
+        docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )])
+    }
+
+    /// A whole-second timestamp literal, whose count DuckDB has to scale to microseconds before it
+    /// can hold it.
+    fn seconds_literal(seconds: i64) -> Expr {
+        lit(ScalarValue::TimestampSecond(
+            Some(seconds),
+            Some("UTC".into()),
+        ))
+    }
+
     /// The flat (filtered) statement for one filter, rendered against `schema`.
     fn flat_sql(schema: &SchemaRef, filter: &Expr) -> DataFusionResult<String> {
         duckdb_vector_sql(
@@ -457,11 +476,7 @@ mod tests {
     /// projects `id` alone, so this also covers a filter on a column the projection drops.
     #[test]
     fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
+        let schema = aware_ts_schema();
         let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
         let sql = flat_sql(&schema, &filter).expect("SQL should build");
@@ -471,37 +486,89 @@ mod tests {
             "a timezone-aware column needs no normalization, so it must not be rendered through whole milliseconds: {sql}"
         );
         assert!(
-            sql.contains(r#""ts" > "#),
-            "the column must be compared directly: {sql}"
-        );
-        assert!(
-            sql.contains("1767225600000999"),
-            "the literal must keep its sub-millisecond digits: {sql}"
+            sql.contains(r#""ts" > make_timestamptz(1767225600000999)"#),
+            "the column must be compared directly against the microsecond the literal names: {sql}"
         );
     }
 
-    /// The microsecond count is rendered as an integer, so it must survive past
-    /// 2^53 — the point beyond which a `f64` can no longer hold consecutive
-    /// integers, and a literal routed through one names a neighbouring
-    /// microsecond instead. A comparison against that literal then keeps or
-    /// drops the wrong boundary row, with well-formed SQL either way.
+    /// Regression test for #13432: past about 2255-06-05 an epoch-microsecond count exceeds the
+    /// `2^53` up to which an `f64` holds consecutive integers exactly. `TO_TIMESTAMP` takes a
+    /// `DOUBLE`, so rendering through it rounds the count and the literal names a neighbouring
+    /// microsecond — a filter that then selects a row set the query never asked for, silently,
+    /// since a wrong instant is still a valid one. `make_timestamptz` takes a `BIGINT`, so nothing
+    /// is widened.
+    ///
+    /// `2^53 + 1` is the first count an `f64` cannot hold: it rounds to `2^53`, one microsecond
+    /// below. That is the whole error, which is why this pins the literal rather than a tolerance.
     #[test]
     fn a_microsecond_count_past_the_double_bound_is_rendered_exactly() {
-        // One above 2^53, which is the first count a f64 cannot represent.
-        let micros = 9_007_199_254_740_993_i64;
-        let schema = docs_schema(vec![Field::new(
+        let schema = aware_ts_schema();
+        let past_2255 = 9_007_199_254_740_993_i64;
+        let filter = col("ts").gt(micros_literal(past_2255));
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+        assert!(
+            sql.contains(&format!(r#""ts" > make_timestamptz({past_2255})"#)),
+            "the literal must name the microsecond it holds, not the one an f64 rounds it to: {sql}"
+        );
+    }
+
+    /// DuckDB reserves `i64::MAX` and `-i64::MAX` microseconds as its infinity sentinels and
+    /// refuses both, and a second count large enough to overflow when scaled to microseconds names
+    /// an instant it cannot hold either. None of the three has a literal to render.
+    ///
+    /// The probe promises `Exact` for every filter it accepts, so rendering one of these anyway
+    /// would report the filter pushed down and then fail the statement built from it — which a
+    /// `DELETE` or `UPDATE` reaches only after its SQL is generated. Declining leaves DataFusion
+    /// applying the filter itself, which is correct and merely slower.
+    #[test]
+    fn a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement() {
+        let schema = aware_ts_schema();
+        let seconds_schema = docs_schema(vec![Field::new(
             "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
             false,
         )]);
 
-        let sql =
-            flat_sql(&schema, &col("ts").gt(micros_literal(micros))).expect("SQL should build");
+        let declined_filters = [
+            (&schema, col("ts").gt(micros_literal(i64::MAX))),
+            (&schema, col("ts").gt(micros_literal(-i64::MAX))),
+            (&seconds_schema, col("ts").gt(seconds_literal(i64::MAX))),
+        ];
 
+        for (schema, filter) in &declined_filters {
+            assert_eq!(
+                duckdb_filter_pushdown(schema, filter),
+                TableProviderFilterPushDown::Unsupported,
+                "the probe must not promise a filter it cannot render: {filter}"
+            );
+            assert!(
+                flat_sql(schema, filter).is_err(),
+                "an instant DuckDB refuses must not be rendered: {filter}"
+            );
+        }
+    }
+
+    /// The positive control for the refusal above: `i64::MIN` is not one of the sentinels — the
+    /// fork measures DuckDB round-tripping it as the finite instant it is — so it must still
+    /// render. A guard that only pinned the refusals would be satisfied by a renderer that
+    /// declined every timestamp, and the over-refusal that would cost is silent: the filter simply
+    /// stops being pushed down.
+    #[test]
+    fn the_smallest_microsecond_count_is_finite_and_still_renders() {
+        let schema = aware_ts_schema();
+        let filter = col("ts").gt(micros_literal(i64::MIN));
+
+        assert_eq!(
+            duckdb_filter_pushdown(&schema, &filter),
+            TableProviderFilterPushDown::Exact,
+            "i64::MIN is a finite instant, not a sentinel"
+        );
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
         assert!(
-            sql.contains(&micros.to_string()),
-            "the literal must name the microsecond it was given, not the nearest one a \
-             double can hold ({micros}): {sql}"
+            sql.contains(&format!(r#""ts" > make_timestamptz({})"#, i64::MIN)),
+            "a finite instant must render as the count it is: {sql}"
         );
     }
 
