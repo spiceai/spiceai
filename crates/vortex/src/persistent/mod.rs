@@ -785,6 +785,31 @@ mod tests {
         Ok(())
     }
 
+    /// Every `i64` is a nanosecond instant a timestamp scalar can carry, its floor included.
+    ///
+    /// The two guards above cover the fork's date-to-timestamp conversion; this one covers the
+    /// range the converted value has to land inside. The fork validates a timestamp scalar
+    /// against the timestamp's own range. Validating it by building a Jiff span instead — the
+    /// span's nanosecond floor is one above `i64::MIN` — refuses 1677-09-21, an instant a
+    /// `timestamp[ns]` column holds, so a file whose `min` statistic is that value fails to
+    /// bind and the scan errors on data it can read. Losing only that half of the fork patch
+    /// would leave both guards above passing.
+    #[test]
+    fn a_nanosecond_timestamp_scalar_spans_the_whole_i64_range() {
+        use vortex::dtype::{DType, Nullability};
+        use vortex::extension::datetime::{TimeUnit, Timestamp};
+        use vortex::scalar::Scalar;
+
+        let dtype =
+            DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::Nullable).erased());
+
+        for value in [i64::MIN, i64::MIN + 1, 0, i64::MAX] {
+            Scalar::try_new(dtype.clone(), Some(value.into())).unwrap_or_else(|err| {
+                panic!("{value} nanoseconds is an instant a timestamp can represent: {err}")
+            });
+        }
+    }
+
     /// A large `IN` list has to stay evaluable.
     ///
     /// An `IN (…)` filter is pushed into the Vortex scan as one `list_contains`
