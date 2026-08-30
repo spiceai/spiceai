@@ -29,7 +29,7 @@ limitations under the License.
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use async_openai::error::OpenAIError;
+use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
     CreateChatCompletionRequestArgs,
@@ -119,18 +119,19 @@ async fn stream_error(status: &'static str, body: &'static str) -> OpenAIError {
     }
 }
 
-fn api_error_message(error: &OpenAIError) -> String {
+fn api_error(error: &OpenAIError) -> &ApiError {
     match error {
-        OpenAIError::ApiError(api) => api.message.clone(),
+        OpenAIError::ApiError(api) => api,
         other => panic!("expected an ApiError, got {other:?}"),
     }
 }
 
-fn api_error_type(error: &OpenAIError) -> Option<String> {
-    match error {
-        OpenAIError::ApiError(api) => api.r#type.clone(),
-        other => panic!("expected an ApiError, got {other:?}"),
-    }
+fn api_error_message(error: &OpenAIError) -> &str {
+    &api_error(error).message
+}
+
+fn api_error_type(error: &OpenAIError) -> Option<&str> {
+    api_error(error).r#type.as_deref()
 }
 
 /// Anthropic echoes request detail back in an `invalid_request_error`, so its message carries
@@ -153,10 +154,7 @@ async fn an_invalid_request_naming_429_is_not_reported_as_a_rate_limit() {
         message.contains("lookup_429"),
         "the cause must survive so the caller can see which request was refused: {message}"
     );
-    assert_eq!(
-        api_error_type(&error).as_deref(),
-        Some("AnthropicStreamError")
-    );
+    assert_eq!(api_error_type(&error), Some("AnthropicStreamError"));
 }
 
 /// The same shape on the authentication arm: `403` in the echoed request detail must not send the
@@ -203,10 +201,7 @@ async fn a_rate_limit_error_is_reported_as_a_rate_limit_whatever_its_message_say
         message.contains("https://console.anthropic.com/settings/limits"),
         "the remediation link must survive: {message}"
     );
-    assert_eq!(
-        api_error_type(&error).as_deref(),
-        Some("AnthropicRateLimitError")
-    );
+    assert_eq!(api_error_type(&error), Some("AnthropicRateLimitError"));
 }
 
 /// A real credential failure, likewise: reported as one, with Anthropic's own words kept as the
@@ -228,10 +223,7 @@ async fn an_authentication_error_is_reported_as_one_and_keeps_its_cause() {
         message.contains("invalid x-api-key"),
         "the cause must survive: {message}"
     );
-    assert_eq!(
-        api_error_type(&error).as_deref(),
-        Some("AnthropicAuthenticationError")
-    );
+    assert_eq!(api_error_type(&error), Some("AnthropicAuthenticationError"));
 }
 
 /// Anthropic's 403 is `permission_error`, and it is answered the same way as a bad key.
@@ -286,7 +278,7 @@ async fn a_model_not_found_keeps_its_explanation() {
         message.contains("claude-sonnet-4-6"),
         "the model must be named: {message}"
     );
-    assert_eq!(api_error_type(&error).as_deref(), Some("not_found_error"));
+    assert_eq!(api_error_type(&error), Some("not_found_error"));
 }
 
 /// Anthropic's overload answer is a 529, and the SSE client hands a server-error body over
@@ -377,8 +369,5 @@ async fn a_mid_stream_rate_limit_is_classified_and_keeps_its_cause() {
         message.contains("per-minute limit"),
         "the cause must survive: {message}"
     );
-    assert_eq!(
-        api_error_type(&error).as_deref(),
-        Some("AnthropicRateLimitError")
-    );
+    assert_eq!(api_error_type(&error), Some("AnthropicRateLimitError"));
 }
