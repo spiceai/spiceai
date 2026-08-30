@@ -3020,9 +3020,14 @@ fn ignored_indexes_warning(table_name: &str) -> String {
 /// [`retention_period_never_reclaimed_warning`].
 ///
 /// `retention_period` is only ever a scan-time KEEP filter in Cayenne: expired rows are
-/// excluded from every read, but nothing on the engine's own write, checkpoint, or
-/// compaction paths deletes them, so their storage is never reclaimed. The DELETE that
-/// would reclaim it comes from the runtime's periodic retention check, and
+/// excluded from every read, and nothing on the engine's write or checkpoint paths
+/// deletes them. Compaction does drop them, but incidentally and only from the files it
+/// happens to rewrite — a full rewrite builds its input from `TableProvider::scan`
+/// (`visible_file_stream_for_rewrite`), and that scan appends the same keep filter, so an
+/// expired row never reaches the new file. Nothing schedules a rewrite on retention's
+/// account, so the reclamation is unpredictable rather than absent, which is what the
+/// warning has to say. The DELETE that reclaims on a schedule comes from the runtime's
+/// periodic retention check, and
 /// `Retention::build` returns `None` unless BOTH `retention_check_enabled` is true and
 /// `retention_check_interval` is set — the interval has no default, so enabling the flag
 /// alone is not enough. Keyed on both for that reason.
@@ -3040,7 +3045,7 @@ const fn retention_period_never_reclaimed_warning_applies(
 
 fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but nothing deletes them, so the accelerated table keeps growing. Reclaiming that storage needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but no scheduled pass deletes them, so their storage comes back only if a compaction happens to rewrite the files holding them — not on any predictable schedule. Reclaiming it reliably needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -4929,8 +4934,15 @@ mod tests {
             "the fix needs both settings named, or it does not work: {warning}"
         );
         assert!(
-            warning.contains("keeps growing"),
-            "the impact is unreclaimed storage, not exposed rows — the rows ARE hidden: {warning}"
+            !warning.contains("keeps growing") && !warning.contains("nothing deletes them"),
+            "a compaction rebuilds through `TableProvider::scan`, which appends the same keep \
+             filter, so it DOES drop expired rows — an unqualified \"nothing deletes them\" \
+             overstates the impact: {warning}"
+        );
+        assert!(
+            warning.contains("compaction") && warning.contains("not on any predictable schedule"),
+            "the impact is UNSCHEDULED reclamation, not absent reclamation, and the rows are \
+             hidden either way — say which it is and why: {warning}"
         );
         assert!(
             warning.contains("retention_sql"),
