@@ -58,10 +58,10 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
-    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
-    PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
-    serialize_pk_bloom_sidecar, shard_of_pk,
+    CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
+    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
+    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -658,6 +658,7 @@ pub(crate) enum InlineMemtablePressure {
     Rows,
     Segments,
     IpcBytes,
+    Tombstones,
 }
 
 impl InlineMemtablePressure {
@@ -667,6 +668,7 @@ impl InlineMemtablePressure {
             Self::Rows => "rows",
             Self::Segments => "segments",
             Self::IpcBytes => "ipc_bytes",
+            Self::Tombstones => "inline_tombstones",
         }
     }
 }
@@ -697,6 +699,21 @@ fn inline_memtable_pressure_with_thresholds(
     }
     if stats.ipc_bytes >= max_bytes {
         return Some(InlineMemtablePressure::IpcBytes);
+    }
+    // The checkpoint is also the only reclaimer of `cayenne_inlined_delete`, and
+    // that table grows on workloads that leave the corpus below every threshold
+    // above (#13621), so a corpus under them is not on its own a reason to skip.
+    //
+    // Deliberately NOT gated on an empty corpus. A table that retains even one
+    // small inline entry — including one whose rows are already tombstoned —
+    // sits under the row, segment and byte thresholds forever while file-backed
+    // upserts keep appending tombstones, so an empty-corpus gate would leave
+    // exactly the unbounded growth this reclamation exists to stop. The cost of
+    // not gating is that a small corpus is occasionally flushed early, writing a
+    // small file for compaction to merge; that happens at most once per budget
+    // and is the cheaper side of the trade by a wide margin.
+    if stats.tombstone_metastore_bytes() >= max_bytes {
+        return Some(InlineMemtablePressure::Tombstones);
     }
     None
 }
@@ -1853,6 +1870,37 @@ pub struct CayenneTableProvider {
     /// high and the next inline insert reschedules the checkpoint, by which time
     /// the fast backgrounded finalize has published and decremented this.
     pending_inline_tombstones: Arc<AtomicU64>,
+    /// Serialized bytes held in `cayenne_inlined_delete` for this table.
+    ///
+    /// Tombstones are written for EVERY superseded PK — including one whose prior
+    /// copy lives only in a Vortex file, so the copy is masked wherever it lives
+    /// (`push_key_supersede`). Their only reader
+    /// (`filter_inlined_batch_for_deletions`, via `load_inlined_deletion_maps`)
+    /// applies them to inline entries alone, so on an upsert workload whose rows
+    /// never land inline they mask nothing and are pure metastore garbage. Nothing
+    /// in the corpus-sized counters above can see them: `inlined_row_count` and
+    /// `durable_inlined_row_count` both describe `cayenne_inlined_data`, which
+    /// stays at zero for exactly that workload — which is why this counter is what
+    /// makes the reclamation reachable.
+    ///
+    /// Bytes rather than rows so the reclamation tracks metastore growth instead
+    /// of write rate: one row can hold a single key or tens of thousands, and a
+    /// row-count trigger would fire every N writes on a table whose tombstones are
+    /// tiny while letting a few enormous ones sit. Each row is charged
+    /// [`crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES`] on top of its
+    /// payload, so the same budget also bounds how MANY rows accumulate — a
+    /// single-key tombstone's payload is 9 bytes and would otherwise be nearly
+    /// free.
+    ///
+    /// Seeded from the authoritative catalog read at open (so tombstones inherited
+    /// from a prior process are reclaimed on this table's first write rather than
+    /// after a further budget's worth), accumulated by
+    /// `record_inline_tombstone_written`, re-synced from the catalog by every
+    /// checkpoint that reads the stats, and zeroed by the clears that empty the
+    /// table. Advisory only — a tombstone whose transaction later rolls back leaves
+    /// it high until the next re-sync, which costs one extra reclamation attempt
+    /// and never a wrong answer.
+    inlined_tombstone_bytes: Arc<AtomicI64>,
     /// Published inline-visibility watermark: the highest inlined-entry
     /// `sequence_number` whose in-memory visibility has been published.
     ///
@@ -3908,8 +3956,7 @@ impl CayenneTableProvider {
         pending_durable_flips: &mut Vec<String>,
     ) {
         if *pending_inline_tombstone_owned {
-            self.pending_inline_tombstones
-                .fetch_sub(1, Ordering::AcqRel);
+            self.release_pending_inline_tombstone();
             *pending_inline_tombstone_owned = false;
         }
         if !pending_durable_flips.is_empty() {
@@ -7013,7 +7060,12 @@ impl CayenneTableProvider {
         let protected_snapshots =
             Self::load_protected_snapshots(Arc::clone(&catalog), &table_id, &pk_deletion_strategy)
                 .await?;
-        let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
+        // One read for both inline tables: the corpus row count seeds the
+        // memtable counters, the tombstone bytes seed the reclamation budget so
+        // garbage inherited from a prior process is reclaimed on this table's
+        // first write rather than after a further budget accumulates.
+        let inlined_stats = catalog.get_inlined_data_stats(&table_id).await?;
+        let inlined_row_count = inlined_stats.record_count;
 
         // Every inlined entry persisted at open time is already published, and
         // all have `sequence_number <= current_sequence_number`. Seed the
@@ -7151,6 +7203,9 @@ impl CayenneTableProvider {
                 crate::provider::structural_version::StructuralVersion::new(),
             ),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
+            inlined_tombstone_bytes: Arc::new(AtomicI64::new(
+                inlined_stats.tombstone_metastore_bytes(),
+            )),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
@@ -8506,6 +8561,7 @@ impl CayenneTableProvider {
             scan_input_version: Arc::clone(&self.scan_input_version),
             structural_version: Arc::clone(&self.structural_version),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
+            inlined_tombstone_bytes: Arc::clone(&self.inlined_tombstone_bytes),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
             // monotone source (lever B2) — memory and the DB row never diverge.
@@ -8927,23 +8983,17 @@ impl CayenneTableProvider {
     /// [`PendingPkKeys`] window over that gap: keys committed meanwhile are held
     /// there and merged back by [`Self::store_cached_pk_index`].
     ///
-    /// Returns `None` when no index is cached — the caller then rebuilds one from
+    /// The window is returned as a [`PkCheckoutGuard`] the caller must carry until
+    /// the store, so a validation that fails or is cancelled closes it on the way
+    /// out instead of latching the log (see [`PkCheckoutGuard`]).
+    ///
+    /// The index is `None` when none is cached — the caller then rebuilds one from
     /// the table, which is equally a checkout: the rebuild reads a snapshot of the
     /// table and every key committed after it must still reach the restored index.
-    fn take_cached_pk_index(&self) -> Option<CachedPkIndex> {
+    fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        self.pk_keyset_pending.lock().begin_checkout();
-        guard.take()
-    }
-
-    /// Close a checkout opened by [`Self::take_cached_pk_index`] without restoring
-    /// an index (the validation never got one — it failed while rebuilding). The
-    /// cache stays empty, so the next validation rebuilds and sees every committed
-    /// key; holding the log open past that point would only accumulate keys nothing
-    /// will replay.
-    fn abandon_cached_pk_index_checkout(&self) {
-        let _guard = self.pk_keyset_cache.lock();
-        let _ = self.pk_keyset_pending.lock().end_checkout();
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        (guard.take(), checkout)
     }
 
     /// Existence view over the keys committed while the table-wide index has been
@@ -9061,13 +9111,13 @@ impl CayenneTableProvider {
     /// keys are gone, and the index is dropped instead of cached — an index missing
     /// a live key answers "absent" for it, which reads as a new primary key and
     /// duplicates the row.
-    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
+    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
         let max_bytes = self.effective_single_keyset_budget();
         // Held from closing the checkout window through the store, so no writer can
         // slip a key in between: it would find the cell empty, see no checkout, and
         // drop the key.
         let mut guard = self.pk_keyset_cache.lock();
-        let restored = self.pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -9601,12 +9651,13 @@ impl CayenneTableProvider {
     /// keys committed while the index was out (the sharded twin of
     /// `store_cached_pk_index` — see there for why an index that is missing a live
     /// key must be dropped rather than cached).
-    fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
+    fn store_sharded_pk_index(&self, checked_out: CheckedOutShardedPkIndex) {
+        let (index, checkout) = checked_out.into_parts();
         let max_bytes = self.effective_sharded_keyset_budget();
         // Held from closing the checkout window through the store — see
         // `store_cached_pk_index`.
         let mut guard = self.sharded_pk_keyset_cache.lock();
-        let restored = self.sharded_pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -11030,32 +11081,36 @@ impl CayenneTableProvider {
 
         let converter = self.build_pk_converter(&pk_indices)?;
         // Off-lock staging must NOT take/store the shared cache (it runs without
-        // `write_lock`); it builds a private keyset every time. The ordinary path
-        // reuses the shared cache and stores it back on finish.
-        let existing_keys = if offlock {
-            self.load_pk_index_for_validation(&pk_indices, &converter)
-                .await?
-        } else if let Some(existing_keys) = self.take_cached_pk_index() {
-            tracing::trace!(
-                "prepare_stream_for_insert: reused {} cached existing keys for table {}",
-                existing_keys.len(),
-                self.table_metadata.table_name
-            );
-            existing_keys
+        // `write_lock`); it builds a private keyset every time, and so opens no
+        // checkout window. The ordinary path reuses the shared cache and carries the
+        // window it opened into the validation stream, which stores the keyset back
+        // and closes the window however the stream ends.
+        let (existing_keys, pk_checkout) = if offlock {
+            (
+                self.load_pk_index_for_validation(&pk_indices, &converter)
+                    .await?,
+                None,
+            )
         } else {
-            // `take_cached_pk_index` already opened the checkout window, so close it
-            // if the rebuild fails: nothing will restore an index, and the keys it
-            // would hold are read from the table by the next validation's rebuild.
-            match self
-                .load_pk_index_for_validation(&pk_indices, &converter)
-                .await
-            {
-                Ok(existing_keys) => existing_keys,
-                Err(error) => {
-                    self.abandon_cached_pk_index_checkout();
-                    return Err(error);
+            let (cached, checkout) = self.take_cached_pk_index();
+            let existing_keys = match cached {
+                Some(existing_keys) => {
+                    tracing::trace!(
+                        "prepare_stream_for_insert: reused {} cached existing keys for table {}",
+                        existing_keys.len(),
+                        self.table_metadata.table_name
+                    );
+                    existing_keys
                 }
-            }
+                // Dropping `checkout` on the way out closes the window the take
+                // opened: nothing will restore an index, and the keys it would hold
+                // are read from the table by the next validation's rebuild.
+                None => {
+                    self.load_pk_index_for_validation(&pk_indices, &converter)
+                        .await?
+                }
+            };
+            (existing_keys, Some(checkout))
         };
 
         let on_conflict = self
@@ -11074,9 +11129,7 @@ impl CayenneTableProvider {
             existing_keys,
             on_conflict,
             Arc::clone(&post_validation),
-            // Ordinary path returns the keyset to the shared cache; off-lock
-            // staging drops its private keyset (never publishes it).
-            !offlock,
+            pk_checkout,
         );
 
         Ok(PreparedInsertStream::deferred(
@@ -11268,7 +11321,7 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         n: usize,
-    ) -> Result<ShardedPkIndex> {
+    ) -> Result<CheckedOutShardedPkIndex> {
         let n = n.max(1);
 
         // Reuse the per-shard cache if present (the sharded analog of
@@ -11276,21 +11329,22 @@ impl CayenneTableProvider {
         // the single source of truth restored after validation by
         // `store_sharded_pk_index` (before the appends), then grown per shard UNDER
         // `locks[s]` by the kept-key insert inside `append_to_shard` (§5 Phase 6).
-        let cached = {
+        // Open the checkout window over the gap this leaves in the cache, so a key
+        // committed before the index is restored is held rather than dropped (see
+        // `take_cached_pk_index`). Opened for the rebuild below too: it reads a
+        // snapshot of the table, and a key committed after that snapshot must still
+        // reach the restored index. Held in a guard so the `?`s below — and every
+        // exit between here and `store_sharded_pk_index` — close it.
+        let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            // Open the checkout window over the gap this leaves in the cache, so a
-            // key committed before the index is restored is held rather than dropped
-            // (see `take_cached_pk_index`). Opened for the rebuild below too: it
-            // reads a snapshot of the table, and a key committed after that snapshot
-            // must still reach the restored index.
-            self.sharded_pk_keyset_pending.lock().begin_checkout();
-            guard.take()
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            (guard.take(), checkout)
         };
         if let Some(cached) = cached {
             // The stored shard count is fixed at the table's `cdc_mem_tier_shards`
             // and never changes for the table's lifetime, so it always matches `n`.
             if cached.shard_count() == n {
-                return Ok(cached);
+                return Ok(CheckedOutShardedPkIndex::new(cached, checkout));
             }
             // Defensive: a mismatch (shouldn't happen) → rebuild below.
             tracing::debug!(
@@ -11364,7 +11418,7 @@ impl CayenneTableProvider {
                 "keyset_rebuild",
                 keyset_rebuild_start,
             );
-            return Ok(index);
+            return Ok(CheckedOutShardedPkIndex::new(index, checkout));
         }
 
         let index = self
@@ -11375,7 +11429,7 @@ impl CayenneTableProvider {
             "keyset_rebuild",
             keyset_rebuild_start,
         );
-        Ok(index)
+        Ok(CheckedOutShardedPkIndex::new(index, checkout))
     }
 
     pub(crate) fn apply_on_conflict_to_batch(
@@ -12055,7 +12109,7 @@ impl CayenneTableProvider {
     pub(crate) async fn validate_and_append_sharded(
         &self,
         batches: Vec<RecordBatch>,
-        mut sharded_index: Option<ShardedPkIndex>,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
@@ -12129,7 +12183,7 @@ impl CayenneTableProvider {
             // while still eliding the spawn for the small, frequent transactions
             // that dominate the apply rate — and thus replication lag.
             const SMALL_APPLY_INLINE_ROWS: usize = 32;
-            let index_ref = sharded_index.as_ref();
+            let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
             // sub-batches are dropped), so the incoming batches sum to the same
@@ -13458,9 +13512,9 @@ impl CayenneTableProvider {
         } else {
             None
         };
-        let tombstone_delete_count = inline_tombstone
+        let tombstone_write = inline_tombstone
             .as_ref()
-            .map(|tombstone| tombstone.delete_count);
+            .map(|tombstone| (tombstone.delete_count, tombstone.delete_ipc.len()));
 
         // b1★ (cycle-4): drain the durable `published = 1` flips owed for
         // PREVIOUSLY-finalized tombstones (whose Stage-B activated them in memory
@@ -13568,11 +13622,12 @@ impl CayenneTableProvider {
         // staged window, plus the trace/telemetry for the write. Gated on the
         // returned id (which is `Some` exactly when a tombstone row was written),
         // identical to the pre-fold `if id.is_some()` guard.
-        if let (Some(_), Some(delete_count)) = (&inlined_delete_id, tombstone_delete_count) {
+        if let (Some(_), Some((delete_count, ipc_bytes))) = (&inlined_delete_id, tombstone_write) {
             self.pending_inline_tombstones
                 .fetch_add(1, Ordering::AcqRel);
             self.record_inline_tombstone_written(
                 delete_count,
+                ipc_bytes,
                 delete_sequence.unwrap_or(snapshot_sequence),
                 false,
             );
@@ -13827,8 +13882,7 @@ impl CayenneTableProvider {
             // `inlined_locally_published` insert to any scan that loads the new
             // generation with `Acquire`.
             self.bump_inlined_generation();
-            self.pending_inline_tombstones
-                .fetch_sub(1, Ordering::AcqRel);
+            self.release_pending_inline_tombstone();
         }
 
         // Threshold = the snapshot's OWN allocated `sequence_number` (reserved in
@@ -14272,10 +14326,11 @@ impl CayenneTableProvider {
             return Ok(None);
         };
         let delete_count = tombstone.delete_count;
+        let ipc_bytes = tombstone.delete_ipc.len();
 
         let inlined_id = self.catalog.add_inlined_delete(tombstone).await?;
 
-        self.record_inline_tombstone_written(delete_count, delete_sequence, published);
+        self.record_inline_tombstone_written(delete_count, ipc_bytes, delete_sequence, published);
 
         Ok(Some(inlined_id))
     }
@@ -14334,11 +14389,14 @@ impl CayenneTableProvider {
         }))
     }
 
-    /// Trace + telemetry for a written inline tombstone, shared by the
-    /// `add_inlined_delete` path and the folded staged-upsert transaction path.
+    /// Trace, telemetry, and reclamation accounting for a written inline
+    /// tombstone — the single funnel for both the `add_inlined_delete` path and
+    /// the folded staged-upsert transaction path, which is why the reclamation is
+    /// armed here.
     fn record_inline_tombstone_written(
         &self,
         delete_count: i64,
+        ipc_bytes: usize,
         delete_sequence: i64,
         published: bool,
     ) {
@@ -14362,6 +14420,79 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+
+        // A table whose rows never land inline reaches no other inline-checkpoint
+        // trigger: every one of them is gated on a non-empty corpus.
+        self.inlined_tombstone_bytes.fetch_add(
+            i64::try_from(ipc_bytes)
+                .unwrap_or(i64::MAX)
+                .saturating_add(crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES),
+            Ordering::Relaxed,
+        );
+        // Only for a tombstone that is already active. The staged path writes an
+        // unpublished one and has just raised `pending_inline_tombstones`, which
+        // the checkpoint defers on — arming here would spawn a task that can only
+        // defer, so that path arms from `release_pending_inline_tombstone` once
+        // its window closes.
+        if published {
+            self.arm_inline_tombstone_reclaim();
+        }
+    }
+
+    /// Schedule the inline checkpoint when the tombstone table has grown past its
+    /// budget, so `cayenne_inlined_delete` is reclaimed on a table whose rows
+    /// never land inline (#13621) and so reach no other checkpoint trigger.
+    ///
+    /// Cheap enough to call from a write path: one relaxed atomic load, and the
+    /// schedule itself coalesces to at most one in-flight pass per table.
+    fn arm_inline_tombstone_reclaim(&self) {
+        if !self.inline_tombstone_reclaim_due() {
+            return;
+        }
+        // Reachable from `PreparedOnConflictDeletionPublish`'s destructor, which
+        // is supported outside a Tokio runtime — it falls back to a plain thread
+        // for its own file cleanup. `tokio::spawn` panics with no runtime
+        // entered, and a panic in a destructor that is already unwinding aborts
+        // the process. The arm is best-effort by construction (the next release
+        // or tombstone write re-arms), so skip it rather than reach for a runtime
+        // that may not be there.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        self.schedule_inline_checkpoint_if_memtable_pressure_exceeded();
+    }
+
+    /// Whether the inline tombstone table has grown past the budget that makes a
+    /// reclamation pass worth its `write_lock` acquisition and metastore write.
+    ///
+    /// Thresholded on `inline_flush_max_bytes` — the same byte budget that governs
+    /// the inline corpus — so both inline metastore tables are bounded by one
+    /// knob, and the trigger tracks how much metastore the tombstones actually
+    /// occupy rather than how many writes produced them.
+    fn inline_tombstone_reclaim_due(&self) -> bool {
+        self.inlined_tombstone_bytes.load(Ordering::Relaxed)
+            >= self.context.inline_flush_max_bytes()
+    }
+
+    /// Close one staged inline-conflict tombstone's unpublished window, and arm
+    /// the reclamation now that a checkpoint would no longer defer on it.
+    ///
+    /// Every site that lowers `pending_inline_tombstones` must go through here:
+    /// the write-side arm is skipped for a staged tombstone precisely because the
+    /// checkpoint defers inside this window, so the release is the seam that has
+    /// to re-arm it.
+    fn release_pending_inline_tombstone(&self) {
+        // `fetch_sub` returns the PREVIOUS value, so this arms only on the
+        // release that empties the window. An earlier release still leaves a
+        // staged tombstone in flight, and a pass spawned then could only defer on
+        // it — burning the coalescing slot to do nothing.
+        if self
+            .pending_inline_tombstones
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.arm_inline_tombstone_reclaim();
+        }
     }
 
     /// Synchronously store a deferred on-conflict deletion-cache update into the
@@ -16127,7 +16258,7 @@ impl CayenneTableProvider {
                     self.0.store(false, Ordering::Release);
                 }
             }
-            let _clear = ClearOnDrop(Arc::clone(&table.inline_checkpoint_scheduled));
+            let clear_on_exit = ClearOnDrop(Arc::clone(&table.inline_checkpoint_scheduled));
 
             tokio::task::yield_now().await;
             let result = async {
@@ -16138,11 +16269,39 @@ impl CayenneTableProvider {
             }
             .await;
 
-            if let Err(e) = result {
+            let failed = if let Err(e) = result {
                 tracing::warn!(
                     table = table.table_metadata.table_name.as_str(),
                     "Auto-checkpoint of inline memtable failed: {e}"
                 );
+                true
+            } else {
+                false
+            };
+
+            // Release the coalescing slot HERE, before the re-check, rather than
+            // letting the guard do it on the way out. Without this an arm that
+            // raced this pass is lost: a `release_pending_inline_tombstone`
+            // firing while the pass is still running loses its `swap(true)` and
+            // schedules nothing, and the clear that follows leaves no task behind
+            // — so a table that goes idle right there stays over budget until its
+            // next write.
+            //
+            // Dropping the guard is what releases the slot, and it MUST be a drop
+            // rather than a bare store: a still-armed guard would fire again when
+            // this task exits and write `false` over a replacement task's `true`,
+            // letting a second pass spawn alongside it and defeating the
+            // coalescing this flag exists to provide. Everything above this point
+            // is still covered against panics; nothing below can panic.
+            drop(clear_on_exit);
+
+            // Re-arm only where a fresh pass would make progress, so this cannot
+            // spin: a pass that deferred on an unpublished staged tombstone would
+            // just defer again (its release arms once the window closes), and one
+            // that failed would fail again. Otherwise the next pass reclaims and
+            // re-syncs the budget, after which the arm is a no-op.
+            if !failed && table.pending_inline_tombstones.load(Ordering::Acquire) == 0 {
+                table.arm_inline_tombstone_reclaim();
             }
         });
     }
@@ -16454,12 +16613,13 @@ impl CayenneTableProvider {
         // promptly even though the inline backstop is off.
         // Reclaim a bounded slice of the metastore freelist, BEFORE the
         // checkpoint below. A high-update upsert table frees pages as it
-        // supersedes rows; under the default auto-vacuum mode those stay on the
-        // freelist and are reused, so the file plateaus and this is a no-op. A
-        // deployment that opted into INCREMENTAL wants the space back instead,
-        // and this tick is the only safe place to take it: the pragma holds the
-        // write lock while it relocates pages, so it must never run on the hot
-        // path. Ordering is load-bearing — the relocation is written as WAL
+        // supersedes rows, and under the default INCREMENTAL auto-vacuum mode
+        // this tick is what returns them to the filesystem — the only safe place
+        // to take them, because the pragma holds the write lock while it
+        // relocates pages and so must never run on the hot path. On a database
+        // in NONE mode (opted out, or created before INCREMENTAL became the
+        // default) the freed pages are reused instead and this is a no-op.
+        // Ordering is load-bearing — the relocation is written as WAL
         // frames and the file only shrinks when a checkpoint copies them back,
         // so vacuuming after the checkpoint would defer the truncation a whole
         // tick. Best-effort, like the checkpoint: logged, never propagated to
@@ -21878,6 +22038,9 @@ impl CayenneTableProvider {
         // The durable corpus was wiped atomically with the catalog operation
         // that triggered this invalidation.
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
+        // That same operation clears `cayenne_inlined_delete` (`commit_overwrite`
+        // deletes both inline tables in its transaction).
+        self.inlined_tombstone_bytes.store(0, Ordering::Relaxed);
         // cycle-5 TASK 1: the corpus was wiped/replaced, so pending tombstone
         // removals reference rows that no longer exist — drop them. The structural
         // bump below fences off any concurrent delta cache built against the old
@@ -22411,6 +22574,7 @@ impl CayenneTableProvider {
             self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
             self.pending_inline_tombstones.store(0, Ordering::Release);
             self.bump_inlined_structural_epoch();
+            self.arm_inline_tombstone_reclaim();
         }
         self.publish_append_snapshot_under_held_fence(prepared);
         Ok(())
@@ -27360,13 +27524,25 @@ impl CayenneTableProvider {
             self.durable_inlined_row_count
                 .store(stats.record_count, Ordering::Relaxed);
 
-            if stats.entry_count > 0 {
+            // Authoritative read: re-sync the advisory reclamation budget, so a
+            // rolled-back tombstone write cannot leave it permanently over the
+            // threshold.
+            self.inlined_tombstone_bytes
+                .store(stats.tombstone_metastore_bytes(), Ordering::Relaxed);
+
+            // Ask BOTH inline tables whether there is anything to clear — the
+            // clear below empties both, and they do not empty together (see
+            // `inlined_tombstone_bytes`). Gating on the corpus alone stranded
+            // every tombstone of a table whose rows never land inline (#13621).
+            if stats.entry_count > 0 || stats.tombstone_entry_count > 0 {
                 tracing::debug!(
                     table = %self.table_metadata.table_name,
                     rows = stats.record_count,
                     segments = stats.entry_count,
                     ipc_bytes = stats.ipc_bytes,
-                    "Clearing fully-deleted inline memtable"
+                    tombstones = stats.tombstone_entry_count,
+                    tombstone_ipc_bytes = stats.tombstone_ipc_bytes,
+                    "Clearing inline memtable with no visible rows"
                 );
                 self.clear_inlined_metadata_after_checkpoint().await?;
             }
@@ -27503,6 +27679,8 @@ impl CayenneTableProvider {
 
     fn clear_inlined_state_after_checkpoint(&self) {
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        // `clear_inlined_data_and_deletes` emptied `cayenne_inlined_delete` too.
+        self.inlined_tombstone_bytes.store(0, Ordering::Relaxed);
         // The durable corpus is now empty: arm the zero-corpus rebuild fast
         // path (the structural bump below forces that rebuild).
         self.durable_inlined_row_count.store(0, Ordering::Relaxed);
@@ -27599,13 +27777,20 @@ impl CayenneTableProvider {
         // the safe-skip ends sooner — correctly — because they are closer to
         // the bytes threshold. After the fast path stops, we fall through
         // to the catalog for accurate stats including bytes.
+        //
+        // The skip is over the CORPUS only, so it must not suppress a tombstone
+        // reclamation: `cayenne_inlined_delete` grows on an upsert workload whose
+        // rows never land inline, and there `cached_rows` is 0 forever (#13621).
+        // `inline_tombstone_reclaim_due` reads one in-process atomic, so the
+        // round-trip-free property of this fast path is preserved.
+        let reclaim_tombstones = self.inline_tombstone_reclaim_due();
         let cached_rows = self.inlined_row_count.load(Ordering::Relaxed);
         let inline_max_bytes_i64 = i64::try_from(self.context.inline_max_bytes())
             .unwrap_or(i64::MAX)
             .max(1);
         let safe_skip_threshold: i64 =
             (self.context.inline_flush_max_bytes() / inline_max_bytes_i64).max(1);
-        if cached_rows < safe_skip_threshold {
+        if cached_rows < safe_skip_threshold && !reclaim_tombstones {
             return Ok(());
         }
 
@@ -27618,6 +27803,12 @@ impl CayenneTableProvider {
         // Authoritative catalog read: re-sync the durable-corpus counter.
         self.durable_inlined_row_count
             .store(stats.record_count, Ordering::Relaxed);
+
+        // Authoritative read: re-sync the advisory budget the fast path above
+        // consulted, so a rolled-back tombstone write cannot leave it permanently
+        // over the threshold and re-arm this pass forever.
+        self.inlined_tombstone_bytes
+            .store(stats.tombstone_metastore_bytes(), Ordering::Relaxed);
 
         let Some(pressure) = inline_memtable_pressure_with_thresholds(
             stats,
@@ -27633,9 +27824,13 @@ impl CayenneTableProvider {
             rows = stats.record_count,
             segments = stats.entry_count,
             ipc_bytes = stats.ipc_bytes,
+            tombstone_ipc_bytes = stats.tombstone_ipc_bytes,
             reason = pressure.as_str(),
             "Checkpointing inline memtable to Vortex"
         );
+        // Under `Tombstones` the corpus is empty, so this takes the no-batches
+        // path: it reclaims both inline tables and writes no file. Otherwise it
+        // flushes the corpus, which clears the tombstones in the same catalog call.
         self.checkpoint_inlined_data().await?;
         Ok(())
     }
@@ -35012,6 +35207,7 @@ mod tests {
             record_count: INLINE_FLUSH_MAX_ROWS - 1,
             entry_count: INLINE_FLUSH_MAX_SEGMENTS,
             ipc_bytes: INLINE_FLUSH_MAX_BYTES - 1,
+            ..InlinedDataStats::default()
         };
 
         assert_eq!(inline_memtable_pressure(stats), None);
@@ -35039,6 +35235,71 @@ mod tests {
                 ..InlinedDataStats::default()
             }),
             Some(InlineMemtablePressure::IpcBytes)
+        );
+        // Tombstones over budget: the reclaim-only checkpoint #13621 added,
+        // which no corpus threshold can reach.
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                tombstone_ipc_bytes: INLINE_FLUSH_MAX_BYTES,
+                ..InlinedDataStats::default()
+            }),
+            Some(InlineMemtablePressure::Tombstones)
+        );
+    }
+
+    /// A retained inline entry must NOT switch the tombstone reclamation off.
+    ///
+    /// One small segment — including one whose rows are all tombstoned — sits
+    /// under the row, segment and byte thresholds indefinitely, so gating the
+    /// tombstone term on an empty corpus would let `cayenne_inlined_delete` grow
+    /// without bound on any table that keeps a single inline entry while
+    /// file-backed upserts append tombstones.
+    #[test]
+    fn inline_memtable_pressure_reports_tombstones_while_the_corpus_is_occupied() {
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                record_count: 1,
+                entry_count: 1,
+                ipc_bytes: 64,
+                tombstone_ipc_bytes: INLINE_FLUSH_MAX_BYTES,
+                tombstone_entry_count: 1,
+            }),
+            Some(InlineMemtablePressure::Tombstones)
+        );
+    }
+
+    /// The budget bounds tombstone ROW count too, via the per-row overhead
+    /// charge. A single-key `Int64` tombstone's payload is 9 bytes, so a
+    /// payload-only budget would admit ~930K rows at the 8 MiB default — far more
+    /// metastore than the budget names.
+    #[test]
+    fn inline_memtable_pressure_charges_tombstone_rows_their_metastore_overhead() {
+        let rows_to_fill =
+            INLINE_FLUSH_MAX_BYTES / crate::metadata::INLINED_DELETE_ROW_OVERHEAD_BYTES;
+
+        // Payload bytes alone are negligible at this row count...
+        let stats = InlinedDataStats {
+            tombstone_entry_count: rows_to_fill,
+            tombstone_ipc_bytes: 9 * rows_to_fill,
+            ..InlinedDataStats::default()
+        };
+        assert!(
+            stats.tombstone_ipc_bytes < INLINE_FLUSH_MAX_BYTES,
+            "the point of this test is that the payloads alone stay under budget"
+        );
+        // ...but the rows themselves are what fills the metastore.
+        assert_eq!(
+            inline_memtable_pressure(stats),
+            Some(InlineMemtablePressure::Tombstones)
+        );
+
+        // One row short of the budget stays quiet.
+        assert_eq!(
+            inline_memtable_pressure(InlinedDataStats {
+                tombstone_entry_count: rows_to_fill - 1,
+                ..InlinedDataStats::default()
+            }),
+            None
         );
     }
 
@@ -49931,11 +50192,12 @@ mod tests {
         let pk_converter = provider
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
+        let (_, checkout) = provider.take_cached_pk_index();
         let index = provider
             .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
             .await
             .expect("cold keyset rebuild");
-        provider.store_cached_pk_index(index);
+        provider.store_cached_pk_index(index, checkout);
         assert!(
             provider.should_capture_positions(),
             "deletion_mode: position on a PK table must enable the position read-back"
@@ -51041,6 +51303,64 @@ mod tests {
     /// writer's `apply_under_barrier` (which is the future code path that
     /// will replace `refresh_listing_table` for cross-partition commits) is
     /// fenced out.
+    /// Arming the tombstone reclamation must never panic when there is no Tokio
+    /// runtime entered.
+    ///
+    /// `PreparedOnConflictDeletionPublish`'s destructor reaches this through
+    /// `restore_aborted_inline_tombstone_bookkeeping`, and that destructor is
+    /// supported with no runtime — it falls back to a plain thread for its own
+    /// file cleanup. A bare `tokio::spawn` there panics, and a panic in a
+    /// destructor that is already unwinding aborts the whole process.
+    #[tokio::test]
+    async fn arming_the_tombstone_reclaim_is_safe_with_no_runtime() {
+        let temp_dir = tempfile::TempDir::new().expect("create tempdir");
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("create data dir");
+
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("create catalog"));
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = CreateTableOptions {
+            table_name: "tombstone_arm_no_runtime".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+        let runtime_env = SessionContext::new().runtime_env();
+        let catalog_dyn: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let table = CayenneTableProvider::create_table(catalog_dyn, options, runtime_env)
+            .await
+            .expect("create table");
+
+        // Over budget, so the arm would reach the scheduler if it were not
+        // guarded — without this the test would pass for the wrong reason.
+        table
+            .inlined_tombstone_bytes
+            .store(i64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            table.inline_tombstone_reclaim_due(),
+            "the arm must actually be due, or this proves nothing"
+        );
+
+        // A plain thread has no runtime entered, exactly like a destructor run
+        // during shutdown. `join` reports a panic as `Err`.
+        let table_for_thread = table.clone_for_write();
+        std::thread::spawn(move || table_for_thread.arm_inline_tombstone_reclaim())
+            .join()
+            .expect("arming the tombstone reclaim must not panic without a runtime");
+    }
+
     #[tokio::test]
     async fn read_fence_blocks_write_fence_acquisition() {
         let temp_dir = tempfile::TempDir::new().expect("create tempdir");
@@ -54048,7 +54368,8 @@ mod tests {
         let mut keyset = CachedPkKeyset::with_capacity(1);
         keyset.insert(key.clone(), RowLocation::FileUnlocated);
         keyset.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset), checkout);
 
         let footprint: HashSet<u128> = HashSet::from([digest]);
         let empty_write_set = crate::provider::pk_index::PkDigestSet::with_capacity(0);
@@ -54095,7 +54416,8 @@ mod tests {
         let mut delta_updated = CachedPkKeyset::with_capacity(1);
         delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
         delta_updated.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated), checkout);
         assert!(
             !provider.transaction_has_conflict(
                 stage_seq,
@@ -54119,7 +54441,8 @@ mod tests {
         floor_stamped.insert(key, RowLocation::FileUnlocated);
         floor_stamped.record_sequence(digest, 5);
         floor_stamped.stamp_all_sequences_min(current_high_water);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped), checkout);
         assert!(
             provider.transaction_has_conflict(
                 stage_seq,
@@ -54181,9 +54504,8 @@ mod tests {
 
         // Seed one row so the table has a live keyset to check out.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // The concurrent writer commits id=7 while the keyset is out.
         let committed = pk_digest_set_for_ids(&converter, &[7]);
@@ -54205,7 +54527,7 @@ mod tests {
         );
 
         // The writer finishes and returns the keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
@@ -54249,9 +54571,8 @@ mod tests {
             .expect("primary key converter");
 
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, _checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
         provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
 
         let pending = provider.pending_pk_existence();
@@ -54319,15 +54640,14 @@ mod tests {
 
         // A mainline write starts validating: it holds the keyset for its whole
         // lazily-consumed stream.
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // Another writer commits id=7 in that window.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[70])).await;
 
         // The first write finishes and returns its keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         // A later upsert of the same key must replace the committed row.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[71])).await;
@@ -54391,5 +54711,157 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+    /// A checked-out index that is never restored must not blind the checkout
+    /// mechanism for the rest of the process — regression test for #13267.
+    ///
+    /// `build_sharded_pk_index` opens the window before the fallible work that
+    /// produces the index, and the index then travels through the raw-stream
+    /// drain, the per-table cap spill, and the global byte-budget wait before
+    /// `store_sharded_pk_index` closes it. Every one of those can exit first: an
+    /// error propagates, and sustained overload diverts the whole apply to the
+    /// durable path and abandons the index outright.
+    ///
+    /// A window left open latches the log: the next `begin_checkout` sees one
+    /// already outstanding and marks its index invalid, and `outstanding` never
+    /// returns to zero to clear it. From then on the log records nothing, so every
+    /// restore discards its index — a full keyset rebuild on every write — and an
+    /// in-flight validation stops seeing concurrent commits, reads a live key as
+    /// new, and writes a second row under a primary key that already exists.
+    ///
+    /// Abandoning the index is the cheapest faithful stand-in for those exits: it
+    /// is exactly what each of them does to the window.
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply that checks the index out and never restores it.
+        drop(
+            provider
+                .build_sharded_pk_index(&pk_indices, &converter, 4)
+                .await
+                .expect("the warm per-shard index is checked out"),
+        );
+
+        // The next apply must be unaffected: it checks the index out, a concurrent
+        // writer commits id=7 into that window, and the restore replays it.
+        provider.maybe_install_warm_pk_caches().await;
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard index is checked out again");
+
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_sharded_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the per-shard index: missing it reads id=7 as new and leaves two live \
+             rows for one declared primary key"
+        );
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert!(
+                    keysets
+                        .iter()
+                        .any(|keyset| keyset.location_by_digest(committed_digest).is_some()),
+                    "the restored per-shard index must know id=7"
+                );
+            }
+            other => panic!(
+                "an earlier abandoned checkout must not force this index to be \
+                 discarded (which rebuilds the whole keyset on every later write); \
+                 present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide keyset has the same window and the same latch — regression
+    /// test for #13267 on the serial path, where a validation stream dropped or
+    /// cancelled part-way (rather than an error before it starts) is what abandons
+    /// the checkout.
+    #[tokio::test]
+    async fn an_abandoned_serial_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        // A validation that takes the keyset and is then cancelled: nothing stores
+        // it back, so the cache is left empty and the window has to close here.
+        drop(provider.take_cached_pk_index());
+
+        // The next validation opens its own window over the gap and rebuilds.
+        let (rebuilt, checkout) = provider.take_cached_pk_index();
+        assert!(
+            rebuilt.is_none(),
+            "the abandoned checkout took the cached keyset with it"
+        );
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the keyset: missing it reads id=7 as new and leaves two live rows for \
+             one declared primary key"
+        );
+        drop(checkout);
+
+        // And an ordinary write restores its keyset to the cache rather than
+        // discarding it.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_some(),
+            "an earlier abandoned checkout must not force every later restore to \
+             discard its keyset, which rebuilds the whole keyset on every write"
+        );
     }
 }

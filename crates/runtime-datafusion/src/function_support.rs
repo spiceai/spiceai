@@ -47,6 +47,27 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
         .build()
 }
 
+/// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
+/// `AdbcTableFactory::with_function_support`.
+///
+/// Two layers, both derived from [`crate::dialect`] so they cannot drift from
+/// what the dialect can actually render:
+///
+/// 1. the name carve-out, so the JSON extraction functions the `BigQuery`
+///    dialect rewrites into `JSON_VALUE` federate instead of being denied;
+/// 2. a per-call check, because a carved-out *name* is not a carved-out *call*.
+///    `json_get_int(doc, key_col)` is legal and has no `BigQuery` translation —
+///    its JSON path argument must be a constant — and without this check that
+///    call would federate and be unparsed verbatim, which is the
+///    unknown-function failure the deny-list exists to prevent (issue #10703).
+#[must_use]
+pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .native(&crate::dialect::bigquery_native_function_names())
+        .build()
+        .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
+}
+
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
 /// evaluate are denied for `PostgreSQL` and PostgreSQL-wire backends (e.g.
 /// Redshift). The ones that match `PostgreSQL` exactly are listed here so they

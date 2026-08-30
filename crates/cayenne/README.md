@@ -642,7 +642,7 @@ These are runtime-global `runtime.params` (not per-dataset). They tune the SQLit
 | `cayenne_metastore_busy_timeout_ms`           | `busy_timeout` — how long a writer waits for the lock before erroring.                                                                          | `30000`          |
 | `cayenne_metastore_wal_autocheckpoint_pages`  | Inline WAL auto-checkpoint threshold in pages; `0` disables the inline checkpoint so it never fires inside a hot commit (the background maintenance tick drains the WAL instead). | `0`              |
 | `cayenne_metastore_wal_truncate_threshold_mb` | WAL size above which the background-tick checkpoint escalates PASSIVE→TRUNCATE to reclaim the `-wal` file (never on the hot write path).         | `160`            |
-| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `none`           |
+| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `incremental`    |
 
 The metastore always runs in WAL journal mode with `synchronous = NORMAL`.
 
