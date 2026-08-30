@@ -22099,6 +22099,7 @@ dependencies = [
  "async-trait",
  "rmcp",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
