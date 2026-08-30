@@ -881,6 +881,11 @@ impl<'a> AppendMutationWriter<'a> {
     /// with the N shard appends joined concurrently. The combined post-validation
     /// state is published for the durable fallback.
     ///
+    /// `prepared.sharded_index` carries the checkout window the index was taken
+    /// under, so the early exits here — a stream error, a spill failure, and the
+    /// sustained-overload diversion to the durable path, which abandons the index
+    /// entirely — close that window on the way out instead of leaving it latched.
+    ///
     /// Engaged only at N>1; the N=1 write path never reaches here, so today's
     /// behavior is byte-identical.
     async fn write_cdc_in_memory_sharded(
