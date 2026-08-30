@@ -30,9 +30,13 @@ limitations under the License.
 //! The deny-list itself is backend-specific — it carves out the functions each
 //! backend's unparser dialect rewrites into real remote SQL — so each connector
 //! names its own. What lives here is what they share: the `query_federation`
-//! parameter's spelling, its default, and the single place that turns its value
-//! into a `bool`, so a catalog cannot accept a spelling the dataset connector
-//! rejects.
+//! parameter's spelling, its default, and the one place the catalog connectors
+//! turn its value into a `bool`, so no two catalogs accept different spellings.
+//!
+//! This is not yet the single source of truth across the whole runtime: the ADBC
+//! *dataset* connector still declares and parses `query_federation` itself, so
+//! the two agree only by matching. #13743 tracks folding both onto one
+//! definition.
 
 use runtime_parameters::Parameters;
 use snafu::prelude::*;
@@ -49,7 +53,7 @@ pub(crate) const QUERY_FEDERATION_PARAMETER: super::ParameterSpec =
 #[derive(Debug, Snafu)]
 pub(crate) enum Error {
     #[snafu(display(
-        "Invalid 'query_federation' value '{value}'. Expected 'enabled' or 'disabled'."
+        "Invalid `query_federation` value '{value}'. Expected 'enabled' or 'disabled'."
     ))]
     InvalidQueryFederation { value: String },
 }

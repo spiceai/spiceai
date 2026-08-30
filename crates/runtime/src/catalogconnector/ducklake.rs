@@ -429,7 +429,9 @@ mod federation_tests {
     /// deny-list allows them on the grounds that the dialect rewrites them into
     /// `DuckDB` natives, but `cosine_distance` -> `array_cosine_distance` is not
     /// value-preserving -- local is `(1 - cos) / 2`, `DuckDB` is `1 - cos` -- so
-    /// a federated call answers twice the local one. See #13728.
+    /// a federated call answers twice the local one. `inner_product` is denied
+    /// on the same conservative footing without that parity having been
+    /// measured either way. See #13728.
     #[test]
     fn the_vector_udfs_are_denied_rather_than_carved_out() {
         let support = ducklake_federation().function_support;
@@ -440,8 +442,9 @@ mod federation_tests {
         for name in ["cosine_distance", "inner_product"] {
             assert!(
                 !support.supports(&stub_udf(name, 2)),
-                "{name} must be evaluated locally: DuckDB's equivalent is on a different scale, \
-                 so federating it would return a different number rather than fail"
+                "{name} must be evaluated locally: its DuckDB equivalent is not established to \
+                 be value-preserving, so it is denied pending that parity check rather than \
+                 carved out. Verified for cosine_distance; unverified for inner_product (#13728)"
             );
         }
     }
