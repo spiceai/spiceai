@@ -423,7 +423,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # The feature set the -data variants build with. It is NOT derived from bin/spiced's `default`,
 # and it is not `default` minus `models`: it is an independent list maintained by hand right here,
 # so a feature added to `default` does not reach `make install-data-only` until it is added below
-# too -- and nothing fails to tell you. The two currently differ in both directions, which is why
+# too, and no check reports the omission. The two currently differ in both directions, which is why
 # reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
 # with none of the secret stores, and it carries the PostgreSQL accelerator and acceleration
 # snapshots, which `default` does not. Recompute the difference before relying on it rather than
