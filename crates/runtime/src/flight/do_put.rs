@@ -313,10 +313,10 @@ fn allow_scheduler_trusted_executor_write(datafusion: &DataFusion) -> bool {
 
 /// Drains the messages remaining on the inbound flight stream after the write
 /// sink has already completed, returning the number of discarded messages that
-/// carried record-batch data — i.e. client rows that were streamed but never
-/// written. Keepalive heartbeats and empty trailer messages do not carry data
-/// and are not counted, so a sink that completes exactly as the stream ends
-/// reports zero discarded batches and the write is still acked as a success.
+/// carried IPC data — i.e. client rows that were streamed but never written.
+/// Keepalive heartbeats and schema-only or trailer messages carry no data and
+/// are not counted, so a sink that completes exactly as the stream ends reports
+/// zero discarded batches and the write is still acked as a success.
 async fn drain_discarded_data_batches<S>(stream: &mut S) -> usize
 where
     S: futures::Stream<Item = Result<FlightData, Status>> + Unpin,
@@ -325,13 +325,28 @@ where
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(data) => {
-                // A message carries record-batch (or dictionary) data when its
-                // body is non-empty; keepalive heartbeats are tagged and never
-                // count as lost client data.
-                if data.app_metadata.as_ref() != crate::flight::KEEPALIVE_APP_METADATA
-                    && !data.data_body.is_empty()
-                {
-                    discarded += 1;
+                // Keepalive heartbeats are tagged and never count as lost client
+                // data, whatever they carry.
+                if data.app_metadata.as_ref() == crate::flight::KEEPALIVE_APP_METADATA {
+                    continue;
+                }
+
+                match declares_ipc_data(&data.data_header) {
+                    Ok(carries_data) => {
+                        if carries_data {
+                            discarded += 1;
+                        }
+                    }
+                    Err(e) => {
+                        // A header with bytes that will not parse is a malformed
+                        // message, not the absence of a batch. This count sizes a
+                        // data-loss report, so it is counted: saying less was lost
+                        // than was is the error that matters here.
+                        tracing::error!(
+                            "Could not read the IPC header of a message discarded after early write completion ({e}); counting it as discarded client data"
+                        );
+                        discarded += 1;
+                    }
                 }
             }
             Err(e) => {
@@ -416,26 +431,44 @@ impl MapEntriesGuard {
     }
 }
 
-/// Whether an IPC message's header declares a record batch, read from the message header.
+/// What an IPC message's header declares, or `None` when the message carries no header bytes.
 ///
 /// The header is the discriminator, not the body length: a batch of zero rows — and a batch
-/// whose columns need no buffers — is sent as a `RecordBatch` header with an empty body, so
-/// treating an empty body as "no batch" drops rows the writer sent.
+/// whose columns need no buffers — is sent with an empty body, so treating an empty body as
+/// "no data" both drops rows the writer sent and under-counts the ones a failed write discarded.
 ///
-/// A message with no header bytes at all declares no batch — Flight allows a metadata-only
+/// A message with no header bytes at all declares nothing — Flight allows a metadata-only
 /// message, and there is nothing there to misread. A header that has bytes but will not parse is
-/// neither a batch nor the absence of one: it is a malformed stream, and the `Err` is what lets
-/// the caller report that parse failure instead of the "carries no record batch" diagnosis a
-/// `false` would produce, which names the wrong problem and hides the reason the IPC was
-/// rejected.
-fn declares_record_batch(data_header: &[u8]) -> Result<bool, String> {
+/// neither a declaration nor the absence of one: it is a malformed stream, and the `Err` is what
+/// lets a caller report that parse failure instead of the "carries no batch" diagnosis a `false`
+/// would produce, which names the wrong problem and hides the reason the IPC was rejected.
+fn declared_message_header(data_header: &[u8]) -> Result<Option<arrow_ipc::MessageHeader>, String> {
     if data_header.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
     arrow_ipc::root_as_message(data_header)
-        .map(|message| message.header_type() == arrow_ipc::MessageHeader::RecordBatch)
+        .map(|message| Some(message.header_type()))
         .map_err(|e| e.to_string())
+}
+
+/// Whether an IPC message's header declares a record batch — the messages the write decodes.
+fn declares_record_batch(data_header: &[u8]) -> Result<bool, String> {
+    Ok(declared_message_header(data_header)? == Some(arrow_ipc::MessageHeader::RecordBatch))
+}
+
+/// Whether an IPC message's header declares data the write needed: a record batch, or a
+/// dictionary the batches referencing it cannot be decoded without.
+///
+/// Wider than [`declares_record_batch`] because it answers a different question. That one asks
+/// what to decode; this one asks what was lost. A dictionary message carries the values its
+/// batch refers to, so a batch that references one carries nothing without it — a discarded
+/// dictionary is discarded client data even though it is not itself a batch.
+fn declares_ipc_data(data_header: &[u8]) -> Result<bool, String> {
+    Ok(matches!(
+        declared_message_header(data_header)?,
+        Some(arrow_ipc::MessageHeader::RecordBatch | arrow_ipc::MessageHeader::DictionaryBatch)
+    ))
 }
 
 fn create_response_stream(
@@ -722,11 +755,29 @@ async fn handle_record_batch(
 mod tests {
     use super::*;
 
-    fn data_message(body: &'static [u8]) -> FlightData {
-        FlightData {
-            data_body: body.into(),
-            ..Default::default()
-        }
+    /// Encodes `batch` the way a Flight client does and returns the messages after the leading
+    /// schema message: the batch itself, with a real IPC header. Building the messages by hand
+    /// would let the test agree with the code about a header layout neither shares with a client.
+    fn encoded_messages(batch: &RecordBatch) -> Vec<FlightData> {
+        let mut messages =
+            arrow_flight::utils::batches_to_flight_data(&batch.schema(), vec![batch.clone()])
+                .expect("encoding a batch as flight data");
+        // The leading message declares the schema and carries no rows.
+        messages.remove(0);
+        messages
+    }
+
+    /// A batch of one `Int32` row — the ordinary case, whose body is non-empty.
+    fn one_row_batch() -> RecordBatch {
+        use arrow::array::{ArrayRef, Int32Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("building a one-row batch")
     }
 
     fn keepalive_message() -> FlightData {
@@ -743,35 +794,127 @@ mod tests {
     /// trailers, and transient read errors are ignored.
     #[tokio::test]
     async fn drain_counts_only_data_bearing_messages() {
-        let messages = vec![
-            Ok(data_message(b"batch-1")),
-            Ok(keepalive_message()),
-            Ok(data_message(b"batch-2")),
-            Ok(FlightData::default()), // empty trailer message
-            Err(Status::internal("transient read error")),
-            Ok(data_message(b"batch-3")),
-        ];
+        let batch = one_row_batch();
+        let mut messages: Vec<Result<FlightData, Status>> = vec![];
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+        messages.push(Ok(keepalive_message()));
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+        messages.push(Ok(FlightData::default())); // empty trailer message
+        messages.push(Err(Status::internal("transient read error")));
+        messages.extend(encoded_messages(&batch).into_iter().map(Ok));
+
         let mut stream = futures::stream::iter(messages);
         assert_eq!(drain_discarded_data_batches(&mut stream).await, 3);
     }
 
-    /// A sink that completes exactly as the stream ends discards nothing, so
-    /// the write is still acked as a success.
+    /// The count sizes a data-loss report, so a batch of zero rows has to appear in it: the
+    /// client streamed it and it was not written. Arrow encodes such a batch as a `RecordBatch`
+    /// header with an empty body, so counting by body length reported it as nothing at all.
     #[tokio::test]
-    async fn drain_empty_stream_reports_zero() {
-        let mut stream = futures::stream::iter(Vec::<Result<FlightData, Status>>::new());
+    async fn drain_counts_a_zero_row_batch() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let messages = encoded_messages(&RecordBatch::new_empty(schema));
+
+        assert_eq!(messages.len(), 1, "expected a single batch message");
+        assert!(
+            messages[0].data_body.is_empty(),
+            "a zero-row batch is expected to encode with an empty body; without that this case does not exercise the miscount"
+        );
+        // What the discriminator this replaces would have counted. Asserted so the case cannot
+        // quietly stop distinguishing the two: it is the whole reason the case exists.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|data| !data.data_body.is_empty())
+                .count(),
+            0
+        );
+
+        let mut stream = futures::stream::iter(messages.into_iter().map(Ok::<_, Status>));
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, 1);
+    }
+
+    /// A dictionary message carries the values its batch refers to, so discarding one discards
+    /// client data even though the message is not itself a batch. `Resend` because the default
+    /// hydrates dictionaries into plain arrays and no dictionary message is sent at all.
+    #[tokio::test]
+    async fn drain_counts_a_dictionary_message() {
+        use arrow::array::{ArrayRef, DictionaryArray};
+        use arrow::datatypes::Int32Type;
+        use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
+        use arrow_schema::{DataType, Field, Schema};
+        use futures::TryStreamExt;
+
+        let values: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "label",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef])
+            .expect("building a dictionary-encoded batch");
+
+        let mut messages: Vec<FlightData> = FlightDataEncoderBuilder::new()
+            .with_dictionary_handling(DictionaryHandling::Resend)
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect()
+            .await
+            .expect("encoding a dictionary batch as flight data");
+        // The leading message declares the schema and carries no rows.
+        messages.remove(0);
+
+        let dictionaries = messages
+            .iter()
+            .filter(|message| {
+                arrow_ipc::root_as_message(&message.data_header)
+                    .expect("parsing an encoded header")
+                    .header_type()
+                    == arrow_ipc::MessageHeader::DictionaryBatch
+            })
+            .count();
+        assert_eq!(
+            dictionaries, 1,
+            "expected the encoder to emit one dictionary message"
+        );
+
+        let expected = messages.len();
+        let mut stream = futures::stream::iter(messages.into_iter().map(Ok::<_, Status>));
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, expected);
+    }
+
+    /// A schema message declares no rows, so re-sending one after the sink completed loses
+    /// nothing and must not be reported as a discarded batch.
+    #[tokio::test]
+    async fn drain_does_not_count_a_schema_message() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let schema_message = arrow_flight::utils::batches_to_flight_data(&schema, vec![])
+            .expect("encoding a schema as flight data")
+            .remove(0);
+
+        assert!(
+            !schema_message.data_header.is_empty(),
+            "a schema message is expected to carry a header"
+        );
+
+        let mut stream = futures::stream::iter(vec![Ok::<_, Status>(schema_message)]);
         assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
     }
 
+    /// A header with bytes that will not parse is a malformed message, not an absent batch.
+    /// Under-reporting is the failure that matters for a data-loss count, so it counts.
     #[tokio::test]
-    async fn drain_keepalive_and_trailers_only_reports_zero() {
-        let messages = vec![
-            Ok(keepalive_message()),
-            Ok(FlightData::default()),
-            Ok(keepalive_message()),
-        ];
-        let mut stream = futures::stream::iter(messages);
-        assert_eq!(drain_discarded_data_batches(&mut stream).await, 0);
+    async fn drain_counts_a_message_whose_header_will_not_parse() {
+        let malformed = FlightData {
+            data_header: (&b"not an ipc message"[..]).into(),
+            ..Default::default()
+        };
+
+        let mut stream = futures::stream::iter(vec![Ok::<_, Status>(malformed)]);
+        assert_eq!(drain_discarded_data_batches(&mut stream).await, 1);
     }
 
     /// The failure a client sees when its `MAP` column cannot be brought in line with the Arrow
