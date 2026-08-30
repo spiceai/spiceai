@@ -606,7 +606,7 @@ fn validate_distributed_engine(
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
-fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => Some(AccelerationEngine::DuckDB),
@@ -2646,7 +2646,6 @@ impl DataFusion {
         } else {
             Arc::new(federated_read_table)
         };
-
         let source_schema = source_table_provider.schema();
 
         let acceleration_settings =
@@ -3052,7 +3051,6 @@ impl DataFusion {
             get_acceleration_layout(dataset, &self.accelerator_engine_registry)
                 .await
                 .ok();
-
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
@@ -3262,6 +3260,9 @@ impl DataFusion {
             });
         accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
 
+        // A snapshotable index (today: file-backed full-text search) is restored onto its live
+        // instance earlier, in `init::dataset::try_load_dataset_once` right after the connector's
+        // `read_provider` builds it — see `SnapshotManager::restore_indexes_from_snapshot`.
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)
             .await

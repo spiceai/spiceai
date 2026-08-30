@@ -1046,6 +1046,67 @@ impl Runtime {
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
+        // Restore any snapshotable index (today: file-backed full-text search) onto the live
+        // instance the connector above just built, before anything else can write to it. This is
+        // the same generic mechanism `refresh_mode: snapshot` already uses on every later
+        // hot-swap (`SnapshotManager::restore_indexes_from_snapshot`, matching by
+        // `Index::snapshot_identity()`) — applied once here, for the index's first
+        // (cold-bootstrap) generation. See #7557.
+        let mut index_restore_failure: Option<String> = None;
+        if let BootstrapStatus::Bootstrapped(info) = &bootstrap_status
+            && !info.index_snapshots.is_empty()
+            && let Some(table_provider) = federated_table.try_table_provider_sync()
+            && let Some(acceleration_settings) = ds.acceleration.as_ref()
+        {
+            // `LayerWalk::Index` also steps into a router's secondary stack, so a table with
+            // indexes attached at more than one layer (e.g. both vector and full-text search
+            // indexes) must have every layer's indexes collected here, not just the first.
+            let mut seen_indexes = std::collections::HashSet::new();
+            let indexes: Vec<Arc<dyn spice_table::Index + Send + Sync>> =
+                spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
+                    .flat_map(spice_table::SpiceTable::indexes)
+                    .filter(|index| seen_indexes.insert(Arc::as_ptr(index).cast::<()>()))
+                    .cloned()
+                    .collect();
+            if !indexes.is_empty()
+                && let Ok(layout) = data_accelerator_api::get_acceleration_layout(
+                    ds.as_ref(),
+                    &self.accelerator_engine_registry,
+                )
+                .await
+                && let Some(engine) =
+                    crate::datafusion::engine_to_acceleration_engine(acceleration_settings.engine)
+                && let Some(manager) = runtime_acceleration::snapshot::SnapshotManager::try_new(
+                    ds.name.to_string(),
+                    acceleration_settings.snapshot_behavior.clone(),
+                    layout,
+                    engine,
+                )
+                .await
+            {
+                manager.set_indexes(indexes).await;
+                if let Err(error) = manager
+                    .restore_indexes_from_snapshot(&info.index_snapshots)
+                    .await
+                {
+                    // A restored dataset with `refresh_mode: full` and no `refresh_check_interval`
+                    // takes `NextRefresh::Disabled` on startup, so nothing will rebuild this index
+                    // on its own. Surface the degraded status below rather than registering as
+                    // fully Ready with a silently empty or partial index.
+                    index_restore_failure = Some(format!(
+                        "Failed to restore the full-text search index for dataset '{}' from its snapshot: {error}. \
+                        Search results may be empty or incomplete until the index is rebuilt by a refresh.",
+                        ds.name
+                    ));
+                    tracing::warn!(
+                        dataset = %ds.name,
+                        error = %error,
+                        "Failed to restore a snapshotted index; search results may be empty or incomplete until the index is rebuilt by a refresh"
+                    );
+                }
+            }
+        }
+
         // Release the load permit before registration so other datasets can
         // begin their source-facing work while this one registers.
         drop(load_guard);
@@ -1115,7 +1176,7 @@ impl Runtime {
                 );
                 metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
-                if let Some(message) = schema_change_failure {
+                if let Some(message) = schema_change_failure.or(index_restore_failure) {
                     self.status.update_dataset(
                         &ds.name,
                         status::ComponentStatus::error_with_message(message),

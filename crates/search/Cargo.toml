@@ -39,6 +39,7 @@ snafu.workspace = true
 spice-table = { path = "../spice-table" }
 tantivy = { workspace = true, optional = true }
 tantivy_datafusion_filter = { path = "../tantivy_datafusion_filter", optional = true }
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -53,7 +54,6 @@ text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
-tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

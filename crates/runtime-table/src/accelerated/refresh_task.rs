@@ -1435,6 +1435,31 @@ impl RefreshTask {
             ));
         }
 
+        if let Err(error) = state
+            .manager
+            .restore_indexes_from_snapshot(&info.index_snapshots)
+            .await
+        {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                error = %error,
+                "refresh_mode: snapshot - failed to restore index artifacts; refusing to publish the database snapshot"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message(
+                    "snapshot index restore failure".to_string(),
+                ),
+            )
+            .await;
+            return Err(RetryError::transient(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::External(Box::new(error)),
+                },
+            ));
+        }
+
         // The accelerator write mutex was taken above, before the download,
         // so the entire reload + swap remains serialized with concurrent
         // accelerator writes.

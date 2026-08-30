@@ -24,7 +24,8 @@ use datafusion::{
     logical_expr::LogicalPlan,
 };
 use futures::future::try_join_all;
-use spice_table::{Index, WriteWindow};
+use spice_table::{Index, SnapshotIndexIdentity, WriteWindow};
+use std::path::{Path, PathBuf};
 
 use crate::index::{SearchIndex, VectorIndex};
 
@@ -92,6 +93,18 @@ impl Index for CompoundSearchIndex {
 
     fn required_columns(&self) -> Vec<String> {
         compound_required_columns(self.primary.as_ref(), self.secondary.as_ref())
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.primary.snapshot_identity()
+    }
+
+    async fn freeze_for_snapshot(&self) -> DataFusionResult<PathBuf> {
+        self.primary.freeze_for_snapshot().await
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> DataFusionResult<()> {
+        self.primary.restore_from(extracted_dir).await
     }
 
     async fn compute_index(

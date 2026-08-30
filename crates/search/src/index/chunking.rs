@@ -1,4 +1,8 @@
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
@@ -32,7 +36,7 @@ use datafusion_expr::ident;
 use futures::future::try_join_all;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
-use spice_table::{Index, WriteWindow, build_key_match_predicate};
+use spice_table::{Index, SnapshotIndexIdentity, WriteWindow, build_key_match_predicate};
 use util::{arrow::repeat, convert_string_arrow_to_iterator};
 
 /// Additional primary key column to uniquely identify chunks within a single database row.
@@ -77,6 +81,18 @@ impl Index for ChunkedSearchIndex {
                 && *s != Self::chunking_offset_col(self.search_column().as_str())
         });
         cols
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.inner.snapshot_identity()
+    }
+
+    async fn freeze_for_snapshot(&self) -> DataFusionResult<PathBuf> {
+        self.inner.freeze_for_snapshot().await
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> DataFusionResult<()> {
+        self.inner.restore_from(extracted_dir).await
     }
 
     async fn compute_index(
@@ -845,6 +861,18 @@ impl Index for ChunkedVectorIndex {
             Arc::clone(&self.chunker),
         )
         .required_columns()
+    }
+
+    fn snapshot_identity(&self) -> Option<SnapshotIndexIdentity> {
+        self.inner.snapshot_identity()
+    }
+
+    async fn freeze_for_snapshot(&self) -> DataFusionResult<PathBuf> {
+        self.inner.freeze_for_snapshot().await
+    }
+
+    async fn restore_from(&self, extracted_dir: &Path) -> DataFusionResult<()> {
+        self.inner.restore_from(extracted_dir).await
     }
 
     /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
