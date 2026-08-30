@@ -30,9 +30,17 @@ def _log_path() -> pathlib.Path:
 
 
 def record(fixture: str, **facts) -> None:
-    """Append one line describing a call into the fixture under test."""
+    """Append one line describing a call into the fixture under test.
+
+    Each line carries the run id the runner generated for this run. The scorer
+    rejects lines that do not carry the id it was given, which keeps entries
+    from an earlier run, a shared log, or a hand-written file out of the
+    scoring. See the threat model in the README: this raises the bar, it does
+    not make the log unforgeable by the process writing it.
+    """
     entry = {
         "fixture": fixture,
+        "run_id": os.environ.get("EVIDENCE_RUN_ID"),
         "ts": round(time.time(), 3),
         "argv": sys.argv,
         **facts,

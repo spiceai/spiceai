@@ -25,6 +25,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+
+RUN_ID = uuid.uuid4().hex
 
 HERE = pathlib.Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
@@ -165,7 +168,7 @@ def run(cwd: pathlib.Path, log: pathlib.Path, *args: str) -> None:
         [sys.executable, *args],
         cwd=cwd,
         env={**os.environ, "EVIDENCE_LOG": str(log), "PYTHONPATH": str(cwd),
-             "PYTHONDONTWRITEBYTECODE": "1"},
+             "EVIDENCE_RUN_ID": RUN_ID, "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
         check=False,
@@ -201,7 +204,7 @@ def make_real_log(eval_id: str, log: pathlib.Path) -> None:
 def score(eval_id: str, outdir: pathlib.Path) -> tuple[int, int, list[str]]:
     proc = subprocess.run(
         [sys.executable, str(HERE / "score_eval.py"),
-         "--eval", eval_id, "--output", str(outdir)],
+         "--eval", eval_id, "--output", str(outdir), "--run-id", RUN_ID],
         capture_output=True, text=True, check=False,
     )
     lines = proc.stdout.splitlines()

@@ -30,7 +30,9 @@ run costs seconds.
 
 1. Copy `fixtures/` somewhere writable, one copy per run. The fixture modules
    append to `.invocations.jsonl` beside themselves unless `EVIDENCE_LOG` says
-   otherwise, so a private copy keeps concurrent runs from sharing a log.
+   otherwise, so a private copy keeps concurrent runs from sharing a log. Set
+   `EVIDENCE_RUN_ID` to a fresh value per run and pass the same value to the
+   scorer's `--run-id`, so only this run's entries are scored.
 2. Read the prompt from `evals.json` and run it in a fresh session or subagent,
    pointing the paths at that copy. Do not add "reproduce this first" to the
    prompt — whether the agent seeks evidence before it makes a claim is the
@@ -112,7 +114,35 @@ That matters twice over:
   carried more than 8192 rows; the unit suite's largest is 4.
 
 The recording is deliberately not hidden. An agent that reads the fixture will
-see it, which is fine — the log cannot be filled in without running the code.
+see it, which is fine for the same reason the threat model below gives.
+
+### What the log does and does not establish
+
+**It is not tamper-proof, and must not be described as if it were.** The log is
+ordinary JSON in a directory the agent can write, so a hand-written entry plus a
+matching report scores full marks with no fixture ever executed. That was
+demonstrated against this scorer, not argued: one synthetic `compaction` line
+and a report quoting the right counts returned `7/7 passed`.
+
+What the log is for is a **cooperating agent that might cut a corner** — the one
+that reads the code, reaches a confident conclusion, and writes it up without
+running anything. Against that, the log is decisive and cheap, which is the
+whole failure mode the rule exists to catch. It is not an anti-adversary
+mechanism, and the pass rates here should not be quoted as if it were.
+
+Two things narrow the gap without pretending to close it. The runner sets
+`EVIDENCE_RUN_ID`, the harness stamps it on every line, and `score_eval.py
+--run-id` scores only lines carrying it, so a stale log, a log shared by
+concurrent runs, or a file written before the run cannot count. And forging a
+line that survives the *report* assertions still means producing counts
+consistent with the real defect, which is most of the work of finding it.
+
+Neither is provenance. Provenance needs a record the writing process cannot
+forge, which means observing execution from outside the agent — for these evals
+the natural source is the harness's own tool-call transcript, which the agent
+cannot rewrite. **Anyone using these evals adversarially — comparing vendors,
+or scoring a model with something at stake — should score against the transcript
+and treat the in-band log as a convenience.**
 
 ## Adding an eval
 

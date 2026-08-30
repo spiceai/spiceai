@@ -38,21 +38,33 @@ VERDICT_RE = re.compile(rf"verdict{_GAP}(confirmed|disproved|unverified)", re.I)
 
 
 def read_report(path: str) -> str:
-    return open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
 
 
-def read_log(path: str) -> list[dict]:
-    """Load the invocation log the fixtures wrote. Absent means nothing ran."""
+def read_log(path: str, run_id: str | None = None) -> list[dict]:
+    """Load the invocation log the fixtures wrote. Absent means nothing ran.
+
+    When the runner supplied a run id, only entries carrying it are scored.
+    That keeps a stale log, a log shared between concurrent runs, and a
+    hand-written file from being counted as this run's evidence. It does not
+    make the log unforgeable — the fixture process can read the id from its own
+    environment — so see the README's threat model before relying on it against
+    anything but a cooperating agent.
+    """
     if not path or not os.path.isfile(path):
         return []
     entries = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line:
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if run_id is None or entry.get("run_id") == run_id:
+                    entries.append(entry)
     return entries
 
 
@@ -347,13 +359,16 @@ def main() -> int:
     parser.add_argument("--eval", required=True, choices=sorted(SCORERS))
     parser.add_argument("--output", required=True, help="Output file or directory")
     parser.add_argument("--log", help="Invocation log (default: <output>/invocations.jsonl)")
+    parser.add_argument("--run-id", help="Only score entries carrying this run id "
+                                         "(the EVIDENCE_RUN_ID the runner set)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     report_path = resolve_report(args.output)
     log_path = resolve_log(args.output, args.log)
 
-    expectations = SCORERS[args.eval](read_report(report_path), read_log(log_path))
+    expectations = SCORERS[args.eval](read_report(report_path),
+                                      read_log(log_path, args.run_id))
     passed = sum(1 for e in expectations if e["passed"])
     result = {
         "eval": args.eval,
