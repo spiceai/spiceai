@@ -169,11 +169,16 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
     # The recipe invokes the guards through $(PYTHON) — the Makefile variable
     # that resolves a Python 3.11+ interpreter. Both make spellings and a literal
-    # `python3` are accepted so a recipe line written any of those ways still
-    # derives; anything else is deliberately NOT matched, because a guard that
-    # silently stopped deriving a path is the exact failure this script exists to
-    # catch.
-    paths.update(re.findall(r"(?:\$[({]PYTHON[)}]|python3) (scripts/[\w./-]+\.py)", recipe))
+    # `python3` are accepted, with any run of spaces between, so a recipe line
+    # written any of those ways still derives. The two directions are not
+    # symmetric: over-matching only adds a path to the "must be gated" set, which
+    # fails closed, while under-matching silently drops a guard from it and is the
+    # exact failure this script exists to catch. So the accepted spellings are
+    # deliberately broad, and only a spelling that would drop a guard — a
+    # different variable, or a bare `python` — is left unmatched.
+    paths.update(
+        re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
+    )
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 
