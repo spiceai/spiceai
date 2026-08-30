@@ -948,10 +948,13 @@ impl CpuBudget {
         };
         // Every pool comes from `ceil(millicores / 1000)`, so lowering to the ceiling
         // only shrinks one when the ceiling rounds down to a smaller whole-core
-        // count. Under a fractional ceiling both round to the same number, and
-        // telling an operator to lower it would promise a change that does not
-        // happen — there the entitlement is what exceeds the wall, and raising the
-        // wall is the only remedy that moves anything.
+        // count. Under a fractional ceiling both round to the same number, so
+        // promising that lowering resizes anything would over-claim — but lowering
+        // is still a real fix there, because `cpu_busy_fraction` divides by the
+        // exact `millicores` rather than the rounded count, and an entitlement above
+        // the wall makes a saturated process report itself as idle by the ratio
+        // between them. Both remedies stay on the table; only the pool claim is
+        // dropped.
         if millicores_to_cores(ceiling) < self.cores {
             return Some(format!(
                 "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so every pool is \
@@ -964,9 +967,9 @@ impl CpuBudget {
         }
         Some(format!(
             "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so {consequence}. \
-             Every pool is still sized for {pool_cores} cores either way — lowering it to \
-             {ceiling_value} rounds to the same {pool_cores} — so {raise_to} {entitlement} \
-             instead. See: {DOCS_URL}",
+             Lower it to {ceiling_value} or {raise_to} {entitlement}. Lowering leaves every pool \
+             at {pool_cores} cores — {entitlement} already rounds to that — but it corrects the \
+             busy fraction this process reports against its entitlement. See: {DOCS_URL}",
             origin = self.origin(),
             entitlement = format_millicores(self.millicores),
             ceiling_value = format_millicores(ceiling),
@@ -2049,20 +2052,44 @@ mod tests {
             "the premise: following the advice must change no pool size"
         );
 
+        // …but `cpu_busy_fraction` divides by the exact entitlement, not the rounded
+        // count, so lowering is still a real fix: a process saturating its 2.5-core
+        // quota reports 0.83 against a 3-core entitlement and 1.00 against a
+        // 2.5-core one, and the Cayenne tuner reads that as spare CPU.
+        let (busy, wall) = (2.5, 1.0);
+        assert!(
+            (over.cpu_busy_fraction(busy, wall) - 0.833_333_333_333_333_3).abs() < 1e-12,
+            "the premise: {}",
+            over.cpu_busy_fraction(busy, wall)
+        );
+        assert!(
+            (at_ceiling.cpu_busy_fraction(busy, wall) - 1.0).abs() < f64::EPSILON,
+            "the premise: {}",
+            at_ceiling.cpu_busy_fraction(busy, wall)
+        );
+
         let warning = over
             .configured_above_ceiling_warning()
             .expect("3 cores above a 2500m quota is still worth naming");
         assert!(
-            !warning.contains("Lower it to"),
-            "must not prescribe a lowering that changes nothing: {warning}"
+            warning.contains("Lower it to 2.5 cores"),
+            "lowering stays on the table — it fixes the busy fraction: {warning}"
         );
         assert!(
             warning.contains("raise the container's CPU limit to 3 cores"),
-            "names the only remedy that moves anything: {warning}"
+            "and so does raising the wall: {warning}"
         );
         assert!(
-            warning.contains("rounds to the same 3"),
-            "says why lowering would not help: {warning}"
+            warning.contains("Lowering leaves every pool at 3 cores"),
+            "scopes the unchanged claim to pool sizes: {warning}"
+        );
+        assert!(
+            warning.contains("busy fraction"),
+            "says what lowering does buy: {warning}"
+        );
+        assert!(
+            !warning.contains("every pool is sized for 3 cores and"),
+            "must not attribute the throttling to pool oversizing here: {warning}"
         );
         assert!(
             warning.contains("CFS-throttled"),
