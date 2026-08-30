@@ -32,8 +32,15 @@ const VERSION_CACHE_DURATION: Duration = Duration::from_hours(24); // 24 hours
 #[derive(Args, Debug)]
 #[command(
     about = "Print the Spice CLI and runtime versions and check for updates",
-    long_about = r#"Print the installed Spice CLI version, the installed Spice runtime
-version (if any), and check whether a newer release is available on GitHub.
+    long_about = r#"Print the installed Spice CLI version, the version of the Spice runtime
+'spice run' would start (if any) and where that runtime was found, and check
+whether a newer release is available on GitHub.
+
+The runtime reported is the one that will run, which need not be the one
+'spice install' wrote: a 'SPICED_PATH' pin and a 'spiced' beside the CLI both
+take precedence over the managed install. 'PATH' is never searched for a
+runtime, because the environment that supplies it is not always the account
+the runtime would run as.
 
 The latest-version check is cached for 24 hours. Use `--cli-only` to skip the
 runtime version lookup, and `-o json` for machine-readable output.
@@ -158,29 +165,67 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
 ///
 /// # Errors
 ///
-/// Returns an error if the runtime version cannot be determined.
+/// Returns an error if the runtime cannot be resolved, or if the JSON output
+/// cannot be serialized. A runtime that was located but could not be asked for
+/// its version is reported as unavailable, not returned as an error.
 pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     let cli = cli_version();
-    let runtime = if args.cli_only {
+    // Printed before the runtime is resolved so it survives a resolution that
+    // fails: a broken `SPICED_PATH` is propagated rather than reported as "not
+    // installed" — this is the command people run to find out which runtime is
+    // selected, and an absence would send them to `spice install`, which cannot
+    // fix a pin — and the CLI version is worth having either way.
+    if matches!(args.output, OutputFormat::Table) {
+        println!("CLI version:     {cli}");
+    }
+
+    // Resolved once and reused: asking twice could report the path of one
+    // binary beside the version of another.
+    let resolved = if args.cli_only {
         None
     } else {
-        ctx.runtime_version().ok()
+        ctx.resolve_spiced()?
     };
+    // Three states, and the table has to keep them apart: no runtime located at
+    // all, one located that answered, and one located that could not be asked.
+    // Folding the last into "not installed" contradicts the concrete `Runtime
+    // path` printed directly beneath it, and sends someone looking for a missing
+    // install when what they have is a broken one.
+    let runtime = resolved
+        .as_ref()
+        .map(|found| crate::context::runtime_version_at(found.path()));
 
     match args.output {
         OutputFormat::Table => {
-            println!("CLI version:     {cli}");
             if !args.cli_only {
                 println!(
                     "Runtime version: {}",
-                    runtime.as_deref().unwrap_or("not installed")
+                    describe_runtime_version(runtime.as_ref())
                 );
+                // Where the runtime came from belongs beside its version: this
+                // is where people look when the CLI and the runtime disagree,
+                // and the answer is usually that they are from different
+                // directories.
+                if let Some(resolved) = &resolved {
+                    println!(
+                        "Runtime path:    {} ({})",
+                        resolved.path().display(),
+                        resolved.source.describe()
+                    );
+                }
             }
         }
         OutputFormat::Json => {
             write_json(&serde_json::json!({
                 "cli": cli,
-                "runtime": runtime,
+                // Version-or-null, the shape this field has always had. A
+                // located runtime that could not be asked reports null here and
+                // is told apart by `runtime_path`, which is populated.
+                "runtime": runtime.as_ref().and_then(|version| version.as_deref().ok()),
+                "runtime_path": resolved.as_ref().map(|found| found.path().display().to_string()),
+                // The enum, not `describe()`: that phrasing is prose for a
+                // human, and rewording it must not change a machine schema.
+                "runtime_source": resolved.as_ref().map(|found| found.source),
             }))?;
         }
     }
@@ -191,9 +236,50 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     Ok(())
 }
 
+/// How the table renders the runtime version.
+///
+/// A function so the three states are asserted rather than eyeballed: the
+/// difference between "there is no runtime" and "there is one and it would not
+/// say" decides whether a user goes looking for an install or for a broken
+/// binary, and the path printed beneath contradicts the first answer.
+fn describe_runtime_version(runtime: Option<&crate::Result<String>>) -> String {
+    match runtime {
+        None => "not installed".to_string(),
+        Some(Ok(version)) => version.clone(),
+        Some(Err(_)) => {
+            "unavailable — the runtime at the path below did not report a version".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A located runtime that cannot be asked for its version is not an absent
+    /// install, and must not be described as one — the `Runtime path` line
+    /// printed directly beneath names the binary that was found.
+    #[test]
+    fn a_runtime_that_cannot_be_probed_is_not_reported_as_absent() {
+        let unprobeable = Some(Err(crate::error::Error::RuntimeVersion {
+            message: "exec format error".to_string(),
+        }));
+        let described = describe_runtime_version(unprobeable.as_ref());
+        assert_ne!(
+            described, "not installed",
+            "a located runtime must not be described as missing"
+        );
+        assert!(
+            described.contains("did not report a version"),
+            "the description must say what actually failed: {described}"
+        );
+
+        assert_eq!(describe_runtime_version(None), "not installed");
+        assert_eq!(
+            describe_runtime_version(Some(&Ok("v2.1.5".to_string()))),
+            "v2.1.5"
+        );
+    }
 
     #[test]
     fn test_cli_version_format() {
