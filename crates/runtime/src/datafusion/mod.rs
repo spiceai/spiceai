@@ -1201,9 +1201,14 @@ impl DataFusion {
 
     /// Captures the identity of a provider at the moment it is registered.
     ///
-    /// Tighter than re-resolving the name afterwards, which can only see
-    /// whatever is registered by then: no `.await` separates the registration
-    /// from this, so nothing can replace it in between.
+    /// The guarantee is that this never consults the registry: it takes the very
+    /// `Arc` handed to `register_table`, so whether another worker replaces that
+    /// registration in the meantime does not change which table the identity is
+    /// about. Re-resolving the name instead can only see whatever is registered
+    /// by the time it looks, which is how a replacement gets captured as the
+    /// thing the action was started for — and then compares equal to itself. A
+    /// replacement is still reported, but by the comparison after the wait,
+    /// which is where it belongs.
     #[must_use]
     pub fn table_instance_as_registered(
         table: TableReference,
