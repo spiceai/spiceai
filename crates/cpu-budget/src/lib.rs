@@ -636,9 +636,7 @@ impl CpuBudget {
 
         Ok(Self {
             millicores,
-            cores: usize::try_from(millicores.div_ceil(1000))
-                .unwrap_or(usize::MAX)
-                .max(1),
+            cores: millicores_to_cores(millicores).max(1),
             source,
             setting,
             detected_cores,
@@ -920,7 +918,10 @@ impl CpuBudget {
         if self.millicores <= ceiling {
             return None;
         }
-        let (ceiling_phrase, consequence, remedy) = match binding_quota {
+        // `raise_to` is the same remedy phrased to take the entitlement as its
+        // object, so the branch below can name what to raise the wall *to* without
+        // splicing a phrase that only reads correctly under a quota.
+        let (ceiling_phrase, consequence, remedy, raise_to) = match binding_quota {
             Some(limit) => (
                 format!(
                     "this container's cgroup CPU limit of {}",
@@ -928,23 +929,48 @@ impl CpuBudget {
                 ),
                 "the container is CFS-throttled under load",
                 "raise the container's CPU limit",
+                "raise the container's CPU limit to",
             ),
+            // Not "widen this process's CPU affinity": with no quota to compare
+            // against, `detected_cores` is whatever `available_parallelism`
+            // returned, which on a bare-metal or non-Linux host is the machine's
+            // whole logical CPU count rather than a restricted mask. There is no
+            // wider mask to apply there, so the remedy has to hold for both shapes.
             None => (
                 format!(
                     "the {} available to this process",
                     format_millicores(ceiling)
                 ),
                 "its threads contend for those CPUs",
-                "widen this process's CPU affinity",
+                "give this process more CPUs (a wider CPU affinity, or a host with more)",
+                "give this process",
             ),
         };
+        // Every pool comes from `ceil(millicores / 1000)`, so lowering to the ceiling
+        // only shrinks one when the ceiling rounds down to a smaller whole-core
+        // count. Under a fractional ceiling both round to the same number, and
+        // telling an operator to lower it would promise a change that does not
+        // happen — there the entitlement is what exceeds the wall, and raising the
+        // wall is the only remedy that moves anything.
+        if millicores_to_cores(ceiling) < self.cores {
+            return Some(format!(
+                "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so every pool is \
+                 sized for {entitlement} and {consequence} instead of being given the extra \
+                 CPU. Lower it to {ceiling_value} or {remedy}. See: {DOCS_URL}",
+                origin = self.origin(),
+                entitlement = format_millicores(self.millicores),
+                ceiling_value = format_millicores(ceiling),
+            ));
+        }
         Some(format!(
-            "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so every pool is sized \
-             for {entitlement} and {consequence} instead of being given the extra CPU. \
-             Lower it to {ceiling_value} or {remedy}. See: {DOCS_URL}",
+            "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so {consequence}. \
+             Every pool is still sized for {pool_cores} cores either way — lowering it to \
+             {ceiling_value} rounds to the same {pool_cores} — so {raise_to} {entitlement} \
+             instead. See: {DOCS_URL}",
             origin = self.origin(),
             entitlement = format_millicores(self.millicores),
             ceiling_value = format_millicores(ceiling),
+            pool_cores = self.cores,
         ))
     }
 
@@ -1317,6 +1343,13 @@ fn cores_to_millicores(cores: usize) -> u64 {
     u64::try_from(cores)
         .unwrap_or(u64::MAX)
         .saturating_mul(1000)
+}
+
+/// Whole cores a millicore quantity resolves to — the same rounding every derived
+/// pool size is taken through, so a comparison against [`CpuBudget::cores`] answers
+/// whether a different quantity would size anything differently.
+fn millicores_to_cores(millicores: u64) -> usize {
+    usize::try_from(millicores.div_ceil(1000)).unwrap_or(usize::MAX)
 }
 
 /// Render millicores the way an operator writes them: `4 cores`, `3.5 cores`,
@@ -1836,6 +1869,17 @@ mod tests {
             !oversubscribed.contains("cgroup"),
             "no quota to name here: {oversubscribed}"
         );
+        // The remedy has to hold on a host that is not restricted at all. Nothing
+        // here distinguishes a `taskset` mask from a 2-CPU machine, and on the
+        // machine there is no wider mask to apply.
+        assert!(
+            !oversubscribed.contains("widen this process's CPU affinity"),
+            "a bare-metal host has no mask to widen: {oversubscribed}"
+        );
+        assert!(
+            oversubscribed.contains("give this process more CPUs"),
+            "the remedy must hold whether or not a mask is what bounds it: {oversubscribed}"
+        );
 
         // A quota wider than affinity cannot be used, so affinity is the tightest
         // ceiling and the one worth naming — `docker run --cpus=100` on 16 CPUs.
@@ -1979,6 +2023,64 @@ mod tests {
         assert!(
             !over.contains("affinity"),
             "a fractional quota is not an affinity problem: {over}"
+        );
+    }
+
+    /// Lowering to a fractional ceiling changes no pool size, so the warning must
+    /// not prescribe it as though it did.
+    ///
+    /// Every derived quantity comes from `ceil(millicores / 1000)`, so a 3-core
+    /// override and the 2.5-core quota it exceeds both resolve to three workers and
+    /// three partitions. Telling the operator to lower it names a remedy that
+    /// provably moves nothing; the entitlement is what exceeds the wall, and only
+    /// raising the wall changes what the container gets.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_ceiling_that_rounds_to_the_configured_cores_is_not_prescribed_as_a_remedy() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+        let fractional = quota(2, 2500);
+
+        let over = CpuBudget::resolve(&spicepod("3"), &fractional).expect("valid");
+        let at_ceiling = CpuBudget::resolve(&spicepod("2.5"), &fractional).expect("valid");
+        assert_eq!(
+            over.derived_sizing(),
+            at_ceiling.derived_sizing(),
+            "the premise: following the advice must change no pool size"
+        );
+
+        let warning = over
+            .configured_above_ceiling_warning()
+            .expect("3 cores above a 2500m quota is still worth naming");
+        assert!(
+            !warning.contains("Lower it to"),
+            "must not prescribe a lowering that changes nothing: {warning}"
+        );
+        assert!(
+            warning.contains("raise the container's CPU limit to 3 cores"),
+            "names the only remedy that moves anything: {warning}"
+        );
+        assert!(
+            warning.contains("rounds to the same 3"),
+            "says why lowering would not help: {warning}"
+        );
+        assert!(
+            warning.contains("CFS-throttled"),
+            "still names what the operator observes: {warning}"
+        );
+        assert!(warning.contains(DOCS_URL), "{warning}");
+
+        // A configured value that does round up past the ceiling keeps the original
+        // wording, because there lowering genuinely shrinks every pool.
+        let shrinks = CpuBudget::resolve(&spicepod("3.5"), &fractional).expect("valid");
+        assert_eq!(shrinks.cores(), 4, "the premise: 3.5 rounds to 4");
+        assert_eq!(at_ceiling.cores(), 3, "and the ceiling to 3");
+        let shrinking_warning = shrinks
+            .configured_above_ceiling_warning()
+            .expect("3.5 cores above a 2500m quota must be remarked on");
+        assert!(
+            shrinking_warning.contains("Lower it to 2.5 cores"),
+            "lowering does shrink the pools here: {shrinking_warning}"
         );
     }
 
