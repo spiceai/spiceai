@@ -474,8 +474,11 @@ pub async fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
-    // Observed by the runtime just before this stream was built, and only ever
-    // read to decide whether a *missing* watermark is evidence of a gap.
+    // Observed by the runtime just before this stream was built
+    // (`probe_acceleration_contents`). Read in both directions of the gap
+    // decision: against a *missing* watermark, only Empty licenses skipping
+    // the rebuild; against a *present*, usable one, only NonEmpty licenses
+    // the resume. Unknown (probe failed) rebuilds under its own cause.
     params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
