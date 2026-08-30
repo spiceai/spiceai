@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![expect(
+    clippy::expect_used,
+    reason = "a failed set-up in a test should name itself and stop"
+)]
+
 //! What a caller of `chat_stream` is told when Anthropic refuses the request.
 //!
 //! These drive the whole path a real failure takes — HTTP status, error body, the SSE client's
@@ -26,7 +31,8 @@ use std::net::TcpListener;
 
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
+    CreateChatCompletionRequestArgs,
 };
 use chat_api::Chat;
 use futures::StreamExt;
@@ -36,6 +42,10 @@ use llms::config::GenericAuthMechanism;
 /// Serves one request with `status` and `body`, then closes. Returns the base URL to configure the
 /// adapter with.
 fn serve_one_error(status: &'static str, body: &'static str) -> String {
+    serve_one(status, "application/json", body)
+}
+
+fn serve_one(status: &'static str, content_type: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
     let port = listener
         .local_addr()
@@ -58,7 +68,7 @@ fn serve_one_error(status: &'static str, body: &'static str) -> String {
         }
 
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(response.as_bytes());
@@ -68,14 +78,12 @@ fn serve_one_error(status: &'static str, body: &'static str) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Runs one streaming chat against a server that answers `status`/`body`, and returns the error the
-/// caller is given.
-async fn stream_error(status: &'static str, body: &'static str) -> OpenAIError {
-    let base = serve_one_error(status, body);
+/// Opens one streaming chat against `base`.
+async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
     let model = Anthropic::new(
         GenericAuthMechanism::from_api_key("not-a-real-key"),
         Some("claude-sonnet-4-6"),
-        Some(&base),
+        Some(base),
         None,
     )
     .expect("the adapter is configured");
@@ -92,17 +100,22 @@ async fn stream_error(status: &'static str, body: &'static str) -> OpenAIError {
         .build()
         .expect("build the request");
 
-    let mut stream = model
+    model
         .chat_stream(request)
         .await
-        .expect("a refusal is delivered as a stream item, not as a failure to open the stream");
+        .expect("a refusal is delivered as a stream item, not as a failure to open the stream")
+}
 
-    loop {
-        match stream.next().await {
-            Some(Err(e)) => return e,
-            Some(Ok(item)) => panic!("expected an error, got a completion chunk: {item:?}"),
-            None => panic!("the stream ended without delivering the error"),
-        }
+/// Runs one streaming chat against a server that answers `status`/`body`, and returns the error the
+/// caller is given.
+async fn stream_error(status: &'static str, body: &'static str) -> OpenAIError {
+    let base = serve_one_error(status, body);
+    let mut stream = chat_stream_against(&base).await;
+
+    match stream.next().await {
+        Some(Err(e)) => e,
+        Some(Ok(item)) => panic!("expected an error, got a completion chunk: {item:?}"),
+        None => panic!("the stream ended without delivering the error"),
     }
 }
 
@@ -292,5 +305,80 @@ async fn an_overload_arrives_untyped_and_keeps_its_body_as_the_cause() {
     assert!(
         message.contains("overloaded_error"),
         "the body must survive as the cause: {message}"
+    );
+}
+
+/// Anthropic sheds load partway through a generation by sending an `error` event over an HTTP 200
+/// stream, which is the only shape a mid-stream failure has. The caller must be told what
+/// Anthropic reported — not that the adapter could not parse a packet.
+#[tokio::test]
+async fn a_mid_stream_error_event_is_reported_as_the_failure_anthropic_sent() {
+    let base = serve_one(
+        "200 OK",
+        "text/event-stream",
+        concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"content":[],"stop_reason":null}}"#,
+            "\n\nevent: error\n",
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "\n\n",
+        ),
+    );
+
+    let mut stream = chat_stream_against(&base).await;
+
+    let first = stream.next().await.expect("the message_start chunk");
+    assert!(first.is_ok(), "the stream starts normally: {first:?}");
+
+    let error = stream
+        .next()
+        .await
+        .expect("the error event reaches the caller")
+        .expect_err("an error event is an error");
+
+    let message = api_error_message(&error);
+    assert!(
+        message.contains("Overloaded"),
+        "the caller must be told what Anthropic reported: {message}"
+    );
+    assert!(
+        !message.contains("unknown variant"),
+        "a failure Anthropic reported is not a parse failure: {message}"
+    );
+}
+
+/// A mid-stream rate limit is classified from its type like any other, so the caller gets the
+/// remediation rather than a bare packet.
+#[tokio::test]
+async fn a_mid_stream_rate_limit_is_classified_and_keeps_its_cause() {
+    let base = serve_one(
+        "200 OK",
+        "text/event-stream",
+        concat!(
+            "event: error\n",
+            r#"data: {"type":"error","error":{"type":"rate_limit_error","message":"Number of output tokens has exceeded your per-minute limit"}}"#,
+            "\n\n",
+        ),
+    );
+
+    let error = chat_stream_against(&base)
+        .await
+        .next()
+        .await
+        .expect("the error event reaches the caller")
+        .expect_err("an error event is an error");
+
+    let message = api_error_message(&error);
+    assert!(
+        message.contains("rate limit exceeded"),
+        "a mid-stream rate_limit_error must be reported as one: {message}"
+    );
+    assert!(
+        message.contains("per-minute limit"),
+        "the cause must survive: {message}"
+    );
+    assert_eq!(
+        api_error_type(&error).as_deref(),
+        Some("AnthropicRateLimitError")
     );
 }

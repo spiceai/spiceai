@@ -53,6 +53,13 @@ pub enum MessageCreateStreamResponse {
     MessageDelta { delta: MessageDelta, usage: Usage },
     #[serde(rename = "message_stop")]
     MessageStop,
+    /// Anthropic answers a mid-stream failure with an `error` event over an HTTP 200 stream — an
+    /// `overloaded_error` when it sheds load partway through a generation, and the other error
+    /// types with it. Without a variant for it the packet is a serde failure, and the caller is
+    /// handed the deserializer's "unknown variant" complaint instead of the failure Anthropic
+    /// actually reported.
+    #[serde(rename = "error")]
+    Error { error: ApiError },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -351,6 +358,17 @@ pub fn transform_stream(
                         | MessageCreateStreamResponse::ContentBlockStop { .. }
                         | MessageCreateStreamResponse::MessageStop,
                     ) => None,
+                    Ok(MessageCreateStreamResponse::Error { error }) => {
+                        // An error Anthropic delivered as a stream packet is the same failure as
+                        // one it delivered as an HTTP status, and is reported the same way.
+                        let formatted_error =
+                            format_anthropic_stream_error(OpenAIError::ApiError(error));
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
+                    }
                     Err(e) => {
                         let formatted_error = format_anthropic_stream_error(e);
                         tracing::debug!(
