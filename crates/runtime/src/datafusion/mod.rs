@@ -4059,8 +4059,10 @@ impl DataFusion {
             table.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
-            // Taken before the trigger, so the refresh it starts cannot finish
-            // unobserved between here and the caller's wait (#13086).
+            // Taken before the trigger, for both halves of the correlation: the
+            // refresh it starts cannot finish unobserved between here and the
+            // caller's wait (#13086), and a refresh already running when the
+            // caller changed the table cannot answer for it (#13544).
             let notifier = accelerated_table
                 .refresher()
                 .refresh_completion()

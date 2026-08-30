@@ -1,6 +1,6 @@
 # Fork patches and their guards
 
-Spice builds against forks of 29 upstream crates. Some of those forks carry Spice
+Spice builds against forks of 30 upstream crates. Some of those forks carry Spice
 patches; the rest are pinned for a version or dependency reason and carry no
 behaviour of ours at all.
 
@@ -95,7 +95,8 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `859621d612511efb93a7f3e020f8baae8e33e3b4` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `896356c3f7af9db5b6da3f2379196b420eee1b2b` | `spiceai-54` |
+| [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0d24a546748b54fd3ff48853739d85a6d351058f` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `7229b20daf24765c84d294c52cf4b4165ca79073` | `spiceai-1.5.5` |
@@ -181,7 +182,7 @@ catch.
 | Unparser: name a derived table's unnamed outputs (fork PR #206) | A derived table with an unnamed output column produces SQL the remote engine rejects, or binds the wrong column ([#12751](https://github.com/spiceai/spiceai/issues/12751)) | silent (wrong data / query failure) | `…::a_derived_tables_unnamed_outputs_are_named` |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
-| BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169) | Federated BigQuery queries are rejected by BigQuery, or silently coerce types | silent (query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does` covers the type spelling; the remaining four are a **GAP** |
+| BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169). The #144 override is no longer on the branch — the upstream `Dialect` default now renders an accepted format, which the guard pins either way | Federated BigQuery queries are rejected by BigQuery, or silently coerce types. Losing the `date_trunc` week mapping is quieter still: DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is Sunday-based, so the week starts on the wrong day — one day out for a Monday-to-Saturday timestamp, six for a Sunday one — and the query returns wrong rows with no error | silent (wrong data / query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does`, `…::bigquery_attaches_a_timestamp_offset_to_the_time`, `…::bigquery_extracts_date_fields_and_spells_intervals_the_standard_way`, `…::bigquery_inlines_a_derived_tables_column_aliases`, `…::bigquery_truncates_a_timestamp_the_way_bigquery_does` |
 | `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
@@ -239,6 +240,36 @@ rather than patch by patch.
 
 Two things would change that and mean giving each a table here: either fork being
 rebased onto a moved upstream, or upstream resuming releases we track.
+
+Two patches here have rows, because losing either is a wrong answer rather than a
+build failure:
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`, and `sql.rs::a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for; the fourth names the two sentinel counts, so a revert that renders them instead of declining them fails there rather than inside a generated statement |
+| `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
+
+## datafusion-functions-json
+
+Upstream
+[datafusion-contrib/datafusion-functions-json](https://github.com/datafusion-contrib/datafusion-functions-json),
+branch `spiceai-54`.
+
+**No Spice patches.** The branch is upstream `main` unmodified. It is pinned rather
+than taken from crates.io because three correctness fixes landed upstream after
+`v0.54.2` and have not been published; the pin exists only to carry them, and should
+be dropped for a plain version requirement as soon as a release contains them.
+
+Every one of the three returns a wrong answer rather than an error, so the loss mode
+if the pin is dropped early is silent. All three guards live in one file, and the
+`json_get_int`/`json_get_float` rows cover the sign and type matrix rather than only
+the case named:
+
+| Patch | What breaks if it is lost | Loss | Guard |
+|---|---|---|---|
+| `json_get_int` / `json_get_float` read negative numbers (upstream PR #125) | Every negative JSON number reads as NULL — `json_get_int('{"a": -1}', 'a')` is NULL, not `-1`. No error, no warning | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_int_reads_negative_numbers`, `::json_get_float_reads_negative_numbers` |
+| Integers outside jiter's `i64` fast path (upstream PR #124) | `json_get` panics on an in-range integer jiter hands back as a big integer, taking the query down; `json_get_int` reads the same value as NULL | silent (panic, and wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::json_get_reads_an_integer_outside_the_fast_path_without_panicking`, `::json_get_int_spans_the_whole_i64_range` |
+| Nested `json_as_text` is not flattened (upstream PR #121) | `json_as_text(json_as_text(x, 'a'), 'b')` folds into one two-element path, which reads the wrong value whenever the inner result is itself a JSON document | silent (wrong data) | `crates/runtime-udfs-api/tests/json_semantics.rs::a_json_string_holding_json_is_read_one_level_at_a_time` |
 
 ## duckdb-rs
 
@@ -429,7 +460,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**35 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -437,52 +468,49 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion` BigQuery dialect: timestamp literal format, `date_field_extract_style`
-   / `interval_style`, `date_trunc`, table-alias column aliases (fork PRs #144, #146,
-   #148, #169).
-2. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
-3. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-4. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-5. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-6. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+1. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
+2. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
+3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-7. `snowflake-rs` chunked JSON responses and record-batch ordering.
-8. `clickhouse-rs` `Date32` range.
-9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+6. `snowflake-rs` chunked JSON responses and record-batch ordering.
+7. `clickhouse-rs` `Date32` range.
+8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-10. `mistral.rs` `tool_calls` chat-template handling.
-11. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
+9. `mistral.rs` `tool_calls` chat-template handling.
+10. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
     from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-12. `vortex` session lock re-entry in writer init (fork PR #29).
-13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+11. `vortex` session lock re-entry in writer init (fork PR #29).
+12. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-14. `async-openai` null-suppression in requests.
-15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-16. `model2vec-rs` optional `config.json`.
-17. `snowflake-rs` async query response support — long-running queries time out.
+13. `async-openai` null-suppression in requests.
+14. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+15. `model2vec-rs` optional `config.json`.
+16. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+17. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+18. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+19. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-21. `model2vec-rs` HF cache directory read from the environment — models are
+20. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+21. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-24. `graph-rs-sdk` tower middleware application.
+22. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+23. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -490,7 +518,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+24. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
@@ -499,7 +527,7 @@ without becoming a flaky timing test:
 ## A patch that is present but incomplete
 
 Found while writing the guard for it, so it is a defect rather than a coverage gap,
-and it is not one of the 36 above.
+and it is not one of the 35 above.
 
 `vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
 `ExtensionArray`. A scan also evaluates a pushed-down predicate against *constant*
