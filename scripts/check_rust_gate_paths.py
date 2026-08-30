@@ -21,7 +21,7 @@
 # `scripts/check_crate_layers.py` all sat until #12111.
 #
 # The paths that must be gated are DERIVED, not listed: from what the `lint-rust`
-# recipe reads (`CLIPPY_CONF_DIR`, each `python3 scripts/…` guard), from the
+# recipe reads (`CLIPPY_CONF_DIR`, each `$(PYTHON) scripts/…` guard), from the
 # tracked files whose name marks them as lint/test config, and from every tracked
 # `.rs` file. So this catches "a config file the gate reads is in none of the
 # lists" and "a Rust source tree is in none of the lists" — the actual bugs — and
@@ -153,7 +153,7 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
-    at, and every `python3 scripts/…` guard it runs) plus the tracked files whose
+    at, and every `$(PYTHON) scripts/…` guard it runs) plus the tracked files whose
     basename marks them as lint/test config.
     """
     paths: set[str] = set(RUST_SOURCE_PATHS)
@@ -167,7 +167,13 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
         )
     for conf_dir in re.findall(r'CLIPPY_CONF_DIR="([^"]+)"', recipe):
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
-    paths.update(re.findall(r"python3 (scripts/[\w./-]+\.py)", recipe))
+    # The recipe invokes the guards through $(PYTHON) — the Makefile variable
+    # that resolves a Python 3.11+ interpreter. Both make spellings and a literal
+    # `python3` are accepted so a recipe line written any of those ways still
+    # derives; anything else is deliberately NOT matched, because a guard that
+    # silently stopped deriving a path is the exact failure this script exists to
+    # catch.
+    paths.update(re.findall(r"(?:\$[({]PYTHON[)}]|python3) (scripts/[\w./-]+\.py)", recipe))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 
