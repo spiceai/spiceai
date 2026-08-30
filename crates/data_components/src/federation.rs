@@ -1931,7 +1931,8 @@ mod tests {
                 "week",
                 "ISOWEEK",
                 "DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is \
-                 Sunday-based, so any other part shifts every truncated week by a day and \
+                 Sunday-based, so any other part starts the week on the wrong day — one \
+                 day out for a Monday-to-Saturday timestamp, six for a Sunday one — and \
                  returns wrong rows with no error",
             ),
         ] {
