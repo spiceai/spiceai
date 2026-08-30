@@ -48,7 +48,8 @@ pub(crate) const QUERY_FEDERATION_PARAMETER: super::ParameterSpec =
         .description(
             "Enable or disable query federation for this catalog. Valid values: 'enabled' (default), 'disabled'.",
         )
-        .default("enabled");
+        .default("enabled")
+        .one_of(&["enabled", "disabled"]);
 
 #[derive(Debug, Snafu)]
 pub(crate) enum Error {
