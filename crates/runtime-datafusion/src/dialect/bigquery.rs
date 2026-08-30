@@ -1364,4 +1364,181 @@ mod tests {
             "a `Dialect` method is not forwarded to the inner BigQuery dialect"
         );
     }
+
+    /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
+    /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
+    fn timestamp_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
+    }
+
+    /// The SQL `dialect` renders for `plan`.
+    fn unparse_plan(
+        dialect: &dyn datafusion::sql::unparser::dialect::Dialect,
+        plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> String {
+        Unparser::new(dialect)
+            .plan_to_sql(plan)
+            .expect("unparse the plan")
+            .to_string()
+    }
+
+    /// Every `BigQuery`-specific rendering the fork's dialect fixes produce has to
+    /// survive the wrapper.
+    ///
+    /// [`the_wrapper_unparses_exactly_as_the_bigquery_dialect_does`] covers the casts,
+    /// quoting and aliasing an ordinary projection reaches. A [`Dialect`] method that
+    /// only some SQL shapes touch is invisible to it: drop the `interval_style` forward
+    /// and that plan still renders identically through both dialects, while a federated
+    /// predicate carrying an interval starts reaching `BigQuery` as `INTERVAL '3 MONS'`,
+    /// which it rejects.
+    ///
+    /// This is the path production takes — [`new_bigquery_dialect`] returns the wrapper,
+    /// so every federated `BigQuery` query unparses through it, while the fork's fixes
+    /// live on the inner dialect.
+    ///
+    /// Each arm asserts the rendering `BigQuery` receives, and that the wrapper and the
+    /// inner dialect agree on it — so the two being wrong together is not a pass.
+    ///
+    /// Removing a forward from [`SpiceBigQueryDialect`] fails the matching arm for
+    /// `interval_style`, `supports_column_alias_in_table_alias`, and the
+    /// `scalar_function_to_sql_overrides` delegation that the extract and `date_trunc`
+    /// arms reach. Two forwards cannot be caught this way, and those arms stand as
+    /// guards on the rendering rather than on the forward: nothing consults a
+    /// *wrapper's* `date_field_extract_style`, because the only caller is a dialect's
+    /// own `scalar_function_to_sql_overrides` reading its own, and
+    /// `timestamp_with_tz_to_string` is indistinguishable from the trait default for as
+    /// long as the inner dialect carries no override of it.
+    #[test]
+    fn the_wrapper_forwards_every_bigquery_specific_rendering() {
+        let timestamp_literal = timestamp_scan()
+            .filter(col("t.ts").gt(lit(ScalarValue::TimestampNanosecond(
+                Some(1_470_513_900_000_000_000),
+                Some("UTC".into()),
+            ))))
+            .expect("filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let extract = timestamp_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("YEAR"),
+                col("t.ts"),
+            )])
+            .expect("date_part projection")
+            .build()
+            .expect("build");
+
+        let interval = timestamp_scan()
+            .project(vec![
+                col("t.ts")
+                    + lit(ScalarValue::IntervalMonthDayNano(Some(
+                        datafusion::arrow::datatypes::IntervalMonthDayNano::new(3, 0, 0),
+                    ))),
+            ])
+            .expect("interval projection")
+            .build()
+            .expect("build");
+
+        let orders = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("o_orderkey", DataType::Int64, false),
+        ]));
+        let table_alias = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "orders",
+            Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                orders,
+            )) as Arc<dyn datafusion::logical_expr::TableSource>,
+            None,
+        )
+        .expect("scan orders")
+        .project(vec![col("orders.o_orderkey")])
+        .expect("inner projection")
+        .project(vec![col("orders.o_orderkey").alias("key")])
+        .expect("renaming projection")
+        .alias("c")
+        .expect("subquery alias")
+        .project(vec![col("c.key")])
+        .expect("outer projection")
+        .build()
+        .expect("build");
+
+        let truncated = timestamp_scan()
+            .project(vec![datafusion::functions::expr_fn::date_trunc(
+                lit("month"),
+                col("t.ts"),
+            )])
+            .expect("date_trunc projection")
+            .build()
+            .expect("build");
+
+        for (property, plan, must_contain, must_not_contain) in [
+            (
+                "timestamp literal offset (fork PR #144)",
+                &timestamp_literal,
+                "20:05:00+00:00",
+                "20:05:00 +00:00",
+            ),
+            (
+                "date field extract style (fork PR #146)",
+                &extract,
+                "EXTRACT(YEAR FROM",
+                "date_part",
+            ),
+            (
+                "interval style (fork PR #146)",
+                &interval,
+                "INTERVAL '3' MONTH",
+                "MONS",
+            ),
+            (
+                "column alias in table alias (fork PR #148)",
+                &table_alias,
+                "AS `key`",
+                "(key)",
+            ),
+            (
+                "date_trunc rewrite (fork PR #169)",
+                &truncated,
+                "TIMESTAMP_TRUNC(`t`.`ts`, MONTH)",
+                "date_trunc",
+            ),
+        ] {
+            let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
+            let inner = unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                plan,
+            );
+
+            assert_eq!(
+                wrapper, inner,
+                "{property}: the wrapper and the inner BigQuery dialect no longer \
+                 render this shape the same way, so federated BigQuery SQL diverges \
+                 from the dialect's own rendering"
+            );
+            assert!(
+                wrapper.contains(must_contain),
+                "{property}: BigQuery needs `{must_contain}` here, so this statement is \
+                 rejected: {wrapper}"
+            );
+            assert!(
+                !wrapper.contains(must_not_contain),
+                "{property}: `{must_not_contain}` is the rendering BigQuery rejects: \
+                 {wrapper}"
+            );
+        }
+    }
 }
