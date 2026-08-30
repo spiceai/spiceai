@@ -43,6 +43,7 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
+    component::{AcceleratedComponent, disabled_acceleration_warning},
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
@@ -82,6 +83,40 @@ use util::{error_spaced, warn_spaced};
 /// bound once per dataset.
 const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Warn an operator whose dataset or view sets `acceleration.enabled: false` and leaves
+/// settings in the block that the runtime will not apply (#13514).
+///
+/// Deliberately **not** in `DatasetBuilder`/`ViewBuilder`'s `TryFrom`, where this started.
+/// Those conversions are not the load path: `datasets_iter` runs them on every call to
+/// `get_valid_datasets`, and `GET /v1/datasets` is one of those callers — so a warning
+/// emitted there fires once per misconfigured dataset **per HTTP request**, in a caller
+/// that passes `LogErrors(false)` precisely to say "do not log from here". Emitting it
+/// here instead puts it behind the same `log_errors` gate as the load errors beside it,
+/// so it is tied to a load rather than to a read.
+pub(crate) fn warn_about_discarded_acceleration_settings(
+    component: AcceleratedComponent,
+    name: &str,
+    acceleration: Option<&spicepod::acceleration::Acceleration>,
+    log_errors: LogErrors,
+) {
+    if !log_errors.0 {
+        return;
+    }
+    let Some(acceleration) = acceleration else {
+        return;
+    };
+    let ignored = acceleration.fields_ignored_when_disabled();
+    if ignored.is_empty() {
+        return;
+    }
+    // The name is escaped inside the formatter: a *quoted* Spicepod identifier passes
+    // validation carrying a newline, and would otherwise forge a second log line.
+    tracing::warn!(
+        "{}",
+        disabled_acceleration_warning(component, name, &ignored)
+    );
+}
+
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
         let Some(app) = self.read_app().await else {
@@ -94,6 +129,13 @@ impl Runtime {
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
+        //
+        // `LogErrors(true)` here, and `LogErrors(false)` in `load_views` below, because
+        // the two validate the same views and only one of them may report: this pre-pass
+        // is the one that always runs. The snapshot validations between here and
+        // `load_views` return early on failure, so reporting from `load_views` instead
+        // loses every view's load error, its status update, and its
+        // discarded-acceleration warning on exactly the startups that already went wrong.
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
 
@@ -300,7 +342,15 @@ impl Runtime {
         self.datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
-                Ok(ds) => Some(Arc::new(ds)),
+                Ok(ds) => {
+                    warn_about_discarded_acceleration_settings(
+                        AcceleratedComponent::Dataset,
+                        &spicepod_ds.name,
+                        spicepod_ds.acceleration.as_ref(),
+                        log_errors,
+                    );
+                    Some(Arc::new(ds))
+                }
                 Err(e) => {
                     if log_errors.0 {
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
@@ -2603,7 +2653,7 @@ mod tests {
             let waiter = completion.any();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                completion.record();
+                completion.record_untriggered();
             });
 
             let started = tokio::time::Instant::now();
@@ -2630,7 +2680,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_completion_that_predates_the_wait_ends_it_immediately() {
             let completion = RefreshCompletion::new();
-            completion.record();
+            completion.record_untriggered();
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
@@ -2712,7 +2762,7 @@ mod tests {
             let completion = RefreshCompletion::new();
             let waiter = completion.any();
             let records_then_reports_unloaded = move || {
-                completion.record();
+                completion.record_untriggered();
                 false
             };
 

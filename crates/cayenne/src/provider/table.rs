@@ -40,9 +40,9 @@ use super::delete::{
 };
 use super::inlined_cache::{InlinedCache, InlinedDurableCommit, InlinedViewEntry};
 use super::maintenance::{
-    PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance, PostWriteMaintenanceState,
-    RetentionFailureAction, SnapshotMaintenanceTrigger, duration_millis_saturating,
-    protected_snapshot_maintenance_trigger,
+    OutstandingLiveRowsDelta, PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT, PostWriteMaintenance,
+    PostWriteMaintenanceState, PublishedLiveRowsDelta, RetentionFailureAction,
+    SnapshotMaintenanceTrigger, duration_millis_saturating, protected_snapshot_maintenance_trigger,
 };
 use super::manifest::{ManifestSequenceTag, SeqPrefixPlan};
 use super::mutation_writer::AppendMutationWriter;
@@ -58,10 +58,10 @@ use super::on_conflict::{
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
-    ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
-    PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
-    serialize_pk_bloom_sidecar, shard_of_pk,
+    CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
+    PendingPkKeys, PkBloom, PkCheckoutGuard, PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome,
+    RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
+    pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -433,6 +433,14 @@ impl CayenneCdcWrite {
     /// Returns an error if the staged append cannot be published.
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
+            // Taken before the publish below, because the rows it makes visible
+            // are described by a `num_rows` delta that only reaches the
+            // maintenance queue at the end of this function. A reader landing in
+            // between would otherwise be served the pre-write count as a
+            // provably exact one, and the distributed `COUNT(*)` fold answers
+            // from it rather than scanning. Released on every early return: those
+            // publish nothing.
+            let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
             let publish_start = Instant::now();
             // The best-effort staging-WAL removal on the protected-snapshot path
             // below can fail without failing the (already-durable) write. Track
@@ -565,6 +573,12 @@ impl CayenneCdcWrite {
                 prepared_append.apply_under_barrier().await?;
                 0
             };
+            // Both branches above have made this commit's rows visible. From
+            // here the claim survives a cancellation or a failure — `finish()`
+            // and `sequence_high_water()` below are both suspension points, and
+            // a commit that dies at one has published rows it will never queue a
+            // delta for.
+            let published_live_rows_delta = reserved_live_rows_delta.published();
             let rows = prepared_append.finish().await?;
             if staging_wal_removal_failed {
                 // `finish()` -> `mark_inflight_complete()` just cleared
@@ -608,6 +622,7 @@ impl CayenneCdcWrite {
                 false,
                 retention_requested,
                 live_rows_delta,
+                published_live_rows_delta,
             );
             Ok(rows)
         } else {
@@ -9205,23 +9220,17 @@ impl CayenneTableProvider {
     /// [`PendingPkKeys`] window over that gap: keys committed meanwhile are held
     /// there and merged back by [`Self::store_cached_pk_index`].
     ///
-    /// Returns `None` when no index is cached — the caller then rebuilds one from
+    /// The window is returned as a [`PkCheckoutGuard`] the caller must carry until
+    /// the store, so a validation that fails or is cancelled closes it on the way
+    /// out instead of latching the log (see [`PkCheckoutGuard`]).
+    ///
+    /// The index is `None` when none is cached — the caller then rebuilds one from
     /// the table, which is equally a checkout: the rebuild reads a snapshot of the
     /// table and every key committed after it must still reach the restored index.
-    fn take_cached_pk_index(&self) -> Option<CachedPkIndex> {
+    fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        self.pk_keyset_pending.lock().begin_checkout();
-        guard.take()
-    }
-
-    /// Close a checkout opened by [`Self::take_cached_pk_index`] without restoring
-    /// an index (the validation never got one — it failed while rebuilding). The
-    /// cache stays empty, so the next validation rebuilds and sees every committed
-    /// key; holding the log open past that point would only accumulate keys nothing
-    /// will replay.
-    fn abandon_cached_pk_index_checkout(&self) {
-        let _guard = self.pk_keyset_cache.lock();
-        let _ = self.pk_keyset_pending.lock().end_checkout();
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        (guard.take(), checkout)
     }
 
     /// Existence view over the keys committed while the table-wide index has been
@@ -9339,13 +9348,13 @@ impl CayenneTableProvider {
     /// keys are gone, and the index is dropped instead of cached — an index missing
     /// a live key answers "absent" for it, which reads as a new primary key and
     /// duplicates the row.
-    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex) {
+    pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
         let max_bytes = self.effective_single_keyset_budget();
         // Held from closing the checkout window through the store, so no writer can
         // slip a key in between: it would find the cell empty, see no checkout, and
         // drop the key.
         let mut guard = self.pk_keyset_cache.lock();
-        let restored = self.pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -9879,12 +9888,13 @@ impl CayenneTableProvider {
     /// keys committed while the index was out (the sharded twin of
     /// `store_cached_pk_index` — see there for why an index that is missing a live
     /// key must be dropped rather than cached).
-    fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
+    fn store_sharded_pk_index(&self, checked_out: CheckedOutShardedPkIndex) {
+        let (index, checkout) = checked_out.into_parts();
         let max_bytes = self.effective_sharded_keyset_budget();
         // Held from closing the checkout window through the store — see
         // `store_cached_pk_index`.
         let mut guard = self.sharded_pk_keyset_cache.lock();
-        let restored = self.sharded_pk_keyset_pending.lock().end_checkout();
+        let restored = checkout.close();
         if restored.index_must_be_discarded() {
             drop(guard);
             tracing::debug!(
@@ -11344,32 +11354,36 @@ impl CayenneTableProvider {
 
         let converter = self.build_pk_converter(&pk_indices)?;
         // Off-lock staging must NOT take/store the shared cache (it runs without
-        // `write_lock`); it builds a private keyset every time. The ordinary path
-        // reuses the shared cache and stores it back on finish.
-        let existing_keys = if offlock {
-            self.load_pk_index_for_validation(&pk_indices, &converter)
-                .await?
-        } else if let Some(existing_keys) = self.take_cached_pk_index() {
-            tracing::trace!(
-                "prepare_stream_for_insert: reused {} cached existing keys for table {}",
-                existing_keys.len(),
-                self.table_metadata.table_name
-            );
-            existing_keys
+        // `write_lock`); it builds a private keyset every time, and so opens no
+        // checkout window. The ordinary path reuses the shared cache and carries the
+        // window it opened into the validation stream, which stores the keyset back
+        // and closes the window however the stream ends.
+        let (existing_keys, pk_checkout) = if offlock {
+            (
+                self.load_pk_index_for_validation(&pk_indices, &converter)
+                    .await?,
+                None,
+            )
         } else {
-            // `take_cached_pk_index` already opened the checkout window, so close it
-            // if the rebuild fails: nothing will restore an index, and the keys it
-            // would hold are read from the table by the next validation's rebuild.
-            match self
-                .load_pk_index_for_validation(&pk_indices, &converter)
-                .await
-            {
-                Ok(existing_keys) => existing_keys,
-                Err(error) => {
-                    self.abandon_cached_pk_index_checkout();
-                    return Err(error);
+            let (cached, checkout) = self.take_cached_pk_index();
+            let existing_keys = match cached {
+                Some(existing_keys) => {
+                    tracing::trace!(
+                        "prepare_stream_for_insert: reused {} cached existing keys for table {}",
+                        existing_keys.len(),
+                        self.table_metadata.table_name
+                    );
+                    existing_keys
                 }
-            }
+                // Dropping `checkout` on the way out closes the window the take
+                // opened: nothing will restore an index, and the keys it would hold
+                // are read from the table by the next validation's rebuild.
+                None => {
+                    self.load_pk_index_for_validation(&pk_indices, &converter)
+                        .await?
+                }
+            };
+            (existing_keys, Some(checkout))
         };
 
         let on_conflict = self
@@ -11388,9 +11402,7 @@ impl CayenneTableProvider {
             existing_keys,
             on_conflict,
             Arc::clone(&post_validation),
-            // Ordinary path returns the keyset to the shared cache; off-lock
-            // staging drops its private keyset (never publishes it).
-            !offlock,
+            pk_checkout,
         );
 
         Ok(PreparedInsertStream::deferred(
@@ -11582,7 +11594,7 @@ impl CayenneTableProvider {
         pk_indices: &[usize],
         converter: &RowConverter,
         n: usize,
-    ) -> Result<ShardedPkIndex> {
+    ) -> Result<CheckedOutShardedPkIndex> {
         let n = n.max(1);
 
         // Reuse the per-shard cache if present (the sharded analog of
@@ -11590,21 +11602,22 @@ impl CayenneTableProvider {
         // the single source of truth restored after validation by
         // `store_sharded_pk_index` (before the appends), then grown per shard UNDER
         // `locks[s]` by the kept-key insert inside `append_to_shard` (§5 Phase 6).
-        let cached = {
+        // Open the checkout window over the gap this leaves in the cache, so a key
+        // committed before the index is restored is held rather than dropped (see
+        // `take_cached_pk_index`). Opened for the rebuild below too: it reads a
+        // snapshot of the table, and a key committed after that snapshot must still
+        // reach the restored index. Held in a guard so the `?`s below — and every
+        // exit between here and `store_sharded_pk_index` — close it.
+        let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            // Open the checkout window over the gap this leaves in the cache, so a
-            // key committed before the index is restored is held rather than dropped
-            // (see `take_cached_pk_index`). Opened for the rebuild below too: it
-            // reads a snapshot of the table, and a key committed after that snapshot
-            // must still reach the restored index.
-            self.sharded_pk_keyset_pending.lock().begin_checkout();
-            guard.take()
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            (guard.take(), checkout)
         };
         if let Some(cached) = cached {
             // The stored shard count is fixed at the table's `cdc_mem_tier_shards`
             // and never changes for the table's lifetime, so it always matches `n`.
             if cached.shard_count() == n {
-                return Ok(cached);
+                return Ok(CheckedOutShardedPkIndex::new(cached, checkout));
             }
             // Defensive: a mismatch (shouldn't happen) → rebuild below.
             tracing::debug!(
@@ -11678,7 +11691,7 @@ impl CayenneTableProvider {
                 "keyset_rebuild",
                 keyset_rebuild_start,
             );
-            return Ok(index);
+            return Ok(CheckedOutShardedPkIndex::new(index, checkout));
         }
 
         let index = self
@@ -11689,7 +11702,7 @@ impl CayenneTableProvider {
             "keyset_rebuild",
             keyset_rebuild_start,
         );
-        Ok(index)
+        Ok(CheckedOutShardedPkIndex::new(index, checkout))
     }
 
     pub(crate) fn apply_on_conflict_to_batch(
@@ -12369,7 +12382,7 @@ impl CayenneTableProvider {
     pub(crate) async fn validate_and_append_sharded(
         &self,
         batches: Vec<RecordBatch>,
-        mut sharded_index: Option<ShardedPkIndex>,
+        mut sharded_index: Option<CheckedOutShardedPkIndex>,
         pk_indices: &[usize],
         converter: &RowConverter,
         on_conflict: &OnConflict,
@@ -12443,7 +12456,7 @@ impl CayenneTableProvider {
             // while still eliding the spawn for the small, frequent transactions
             // that dominate the apply rate — and thus replication lag.
             const SMALL_APPLY_INLINE_ROWS: usize = 32;
-            let index_ref = sharded_index.as_ref();
+            let index_ref = sharded_index.as_ref().map(CheckedOutShardedPkIndex::index);
             let non_empty_shards = per_shard_batches.iter().filter(|b| !b.is_empty()).count();
             // Total rows in this apply. Split preserves every row (only empty
             // sub-batches are dropped), so the incoming batches sum to the same
@@ -15755,6 +15768,46 @@ impl CayenneTableProvider {
             )?
         };
 
+        // Author the new snapshot's manifest BEFORE the commit, so the
+        // publish-before-clear invariant holds when the post-commit prune drops
+        // the old current snapshot's rows (a crash between commit and prune then
+        // leaves the new file set already recorded). This subset rewrite carries
+        // exactly `source_snapshot_id`'s live files forward (unpicked hardlinks +
+        // the re-encoded candidate), so its true range is the merged commit-seq
+        // range over `source_snapshot_id`; fall back to the conservative
+        // `[0, current table sequence]` when the source manifest is unavailable,
+        // which keeps the output always bake-eligible (`min = 0`). Best-effort:
+        // a manifest failure must not fail the compaction, so log and continue —
+        // the scan still resolves files from the directory listing.
+        let source_ids = [source_snapshot_id.to_string()];
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&source_ids)
+            .await
+            .unwrap_or((0, self.table_metadata.current_sequence_number));
+        let manifest_authored = match self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            Ok(_files) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to author snapshot manifest before subset small-file compaction commit; \
+                     scan falls back to directory listing"
+                );
+                false
+            }
+        };
+
         {
             let listing_guard = self.listing_fence.write().await;
             let snapshot_id_now = self.get_current_snapshot_id();
@@ -15795,6 +15848,44 @@ impl CayenneTableProvider {
             self.new_files_since_last_compaction
                 .store(0, Ordering::Release);
             drop(listing_guard);
+        }
+
+        // Commit succeeded: `new_snapshot_id` is now the only live snapshot (the
+        // subset path runs only when there are no protected snapshots, per
+        // `can_subset_rewrite_current_small_files`), so every other snapshot's
+        // manifest rows — including `source_snapshot_id`'s — are dead. Without
+        // this prune those rows leak on every subset pass, unbounded. Run it AFTER
+        // the commit so a failed commit leaves the old snapshot's rows intact, and
+        // only when the new manifest was authored above (publish-before-clear).
+        // Best-effort: a prune failure must not fail the compaction.
+        if manifest_authored
+            && let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to prune stale snapshot manifest rows after subset small-file compaction commit"
+            );
+        }
+
+        // The per-file statistics cache (`cayenne_snapshot_file_statistics`) keys
+        // by snapshot, so the old current snapshot's stats rows are now dead too.
+        // `_except(new)` deletes exactly them: after the flip `new_snapshot_id` is
+        // the only live snapshot. Best-effort, mirroring the manifest prune.
+        if let Err(error) = self
+            .catalog
+            .clear_snapshot_file_statistics_except(&self.table_metadata.table_id, &new_snapshot_id)
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to clear stale per-file snapshot statistics after subset small-file compaction commit"
+            );
         }
 
         self.schedule_old_snapshot_cleanup();
@@ -16617,14 +16708,37 @@ impl CayenneTableProvider {
         self.spawn_post_write_maintenance_loop();
     }
 
+    /// Mark a live-row delta outstanding before the commit that publishes its
+    /// rows, so the maintained count is never served as a provably exact one
+    /// while it is short by that delta.
+    ///
+    /// Hand the reservation back to [`Self::schedule_post_write_maintenance`]
+    /// once the delta is known; dropping it releases it, which is what a commit
+    /// that fails needs. See
+    /// [`PostWriteMaintenance::reserve_live_rows_delta`].
+    pub(crate) fn reserve_live_rows_delta(&self) -> OutstandingLiveRowsDelta {
+        self.post_write_maintenance.reserve_live_rows_delta()
+    }
+
+    /// Queue post-write maintenance for a commit.
+    ///
+    /// `published` is the claim the caller staked with
+    /// [`Self::reserve_live_rows_delta`] **before** publishing its rows and
+    /// marked [`OutstandingLiveRowsDelta::published`] as soon as they became
+    /// visible. It is mandatory, so a commit cannot stake its claim on the
+    /// maintained count after the rows the claim is about are already readable.
+    /// It is consumed here — queued when this commit moves the row count,
+    /// released when it does not.
     pub(crate) fn schedule_post_write_maintenance(
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
         refresh_listing: bool,
         retention_requested: bool,
         live_rows_delta: i64,
+        published: PublishedLiveRowsDelta,
     ) {
         if stats.is_none() && !refresh_listing && !retention_requested && live_rows_delta == 0 {
+            published.release();
             return;
         }
 
@@ -16642,14 +16756,18 @@ impl CayenneTableProvider {
             maintenance_state.live_rows_delta = maintenance_state
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
-            if live_rows_delta != 0 {
+            if live_rows_delta == 0 {
+                // This commit's rows left the net live count where it was, so
+                // there is no delta to persist and nothing would ever retire
+                // the claim.
+                published.release();
+            } else {
                 // Count this delta under the same lock that folds it in, so
-                // `has_unapplied_live_rows_delta` reports this write from the
-                // moment its rows become visible until the persist that folds
-                // them into `num_rows` lands.
+                // `has_unapplied_live_rows_delta` reports this write until the
+                // persist that folds it into `num_rows` lands.
                 maintenance_state.live_rows_delta_count =
                     maintenance_state.live_rows_delta_count.saturating_add(1);
-                self.post_write_maintenance.record_queued_live_rows_delta();
+                published.queue();
             }
         }
 
@@ -33896,6 +34014,163 @@ mod tests {
         );
     }
 
+    /// A committed subset small-file rewrite must delete the old current
+    /// snapshot's catalog rows at the commit — both its manifest
+    /// (`cayenne_snapshot_file`) and its per-file stats cache
+    /// (`cayenne_snapshot_file_statistics`). Without the prune, every subset pass
+    /// on a repeatedly-compacted table leaks those rows unbounded, because the
+    /// subset path only flips the current pointer and never clears the snapshot
+    /// it leaves behind. Safe to prune to the single new snapshot because the
+    /// subset path runs only when there are no protected snapshots.
+    #[tokio::test]
+    async fn subset_rewrite_deletes_old_snapshot_manifest_and_stats_rows() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch_of = |start: i64, n: i64| {
+            let ids: Vec<i64> = (start..start + n).collect();
+            let values: Vec<String> = ids.iter().map(|i| format!("v_{i:0400}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .expect("batch built")
+        };
+
+        let vortex_config = VortexConfig {
+            target_vortex_file_size_mb: 1,
+            compaction_trigger_files: 1_000,
+            compaction_background_interval_ms: 0,
+            compaction_max_files_per_pick: 2,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            ..VortexConfig::default()
+        };
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "subset_manifest_gc",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        for i in 0..4 {
+            insert_batch(&provider, batch_of(i * 50, 50)).await;
+        }
+
+        let source_snapshot_id = provider.get_current_snapshot_id();
+        let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
+        let files = provider
+            .list_snapshot_files_with_sizes(&source_snapshot_id)
+            .await
+            .expect("listed current snapshot files");
+        assert!(
+            files.len() >= 3,
+            "need a proper subset to rewrite, listed {} file(s)",
+            files.len()
+        );
+
+        // Author the source snapshot's manifest and seed a stats-cache row so the
+        // precondition is a populated old snapshot; the fix must delete both.
+        provider.rebuild_live_snapshot_manifests().await;
+        let table_id = provider.table_metadata.table_id.clone();
+        provider
+            .catalog
+            .upsert_snapshot_file_statistics(&crate::metadata::SnapshotFileStatistics {
+                table_id: table_id.clone(),
+                snapshot_id: source_snapshot_id.clone(),
+                file_path: files[0].0.clone(),
+                file_size_bytes: i64::try_from(files[0].1).unwrap_or(i64::MAX),
+                num_rows: 50,
+                statistics_blob: Vec::new(),
+            })
+            .await
+            .expect("seed source stats-cache row");
+
+        assert!(
+            !provider
+                .catalog
+                .get_snapshot_files(&table_id, &source_snapshot_id)
+                .await
+                .expect("read source manifest")
+                .is_empty(),
+            "precondition: the source snapshot must have manifest rows before the rewrite"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_file_statistics(&table_id, &source_snapshot_id, &files[0].0)
+                .await
+                .expect("read source stats cache")
+                .is_some(),
+            "precondition: the source snapshot must have a stats-cache row before the rewrite"
+        );
+
+        let candidate = subset_candidate_of_first_two(&files);
+        assert!(
+            provider.can_subset_rewrite_current_small_files(&candidate, &files),
+            "fixture must land on the subset path"
+        );
+
+        let committed = provider
+            .rewrite_current_snapshot_small_file_subset(
+                &candidate,
+                &files,
+                &source_snapshot_id,
+                generation_before,
+            )
+            .await
+            .expect("subset rewrite succeeds");
+        assert!(committed, "the subset rewrite must commit");
+
+        let new_snapshot_id = provider.get_current_snapshot_id();
+        assert_ne!(
+            new_snapshot_id, source_snapshot_id,
+            "a committed subset rewrite must publish a new snapshot"
+        );
+
+        // The leak this fix closes: the old current snapshot's catalog rows must
+        // be gone after the commit.
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(&table_id, &source_snapshot_id)
+                .await
+                .expect("read source manifest after commit")
+                .is_empty(),
+            "the source snapshot's manifest rows must be deleted at the subset commit"
+        );
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_file_statistics(&table_id, &source_snapshot_id, &files[0].0)
+                .await
+                .expect("read source stats cache after commit")
+                .is_none(),
+            "the source snapshot's stats-cache rows must be deleted at the subset commit"
+        );
+
+        // The new snapshot keeps its freshly authored manifest rows.
+        assert!(
+            !provider
+                .catalog
+                .get_snapshot_files(&table_id, &new_snapshot_id)
+                .await
+                .expect("read new manifest after commit")
+                .is_empty(),
+            "the new snapshot must keep its authored manifest rows"
+        );
+    }
+
     #[test]
     fn subset_write_amp_x100_is_total_over_candidate_percent() {
         // Full rewrite of 10 MiB when candidate is 1 MiB → 1000% amp (10×).
@@ -47994,7 +48269,13 @@ mod tests {
 
         // A commit makes two more rows live and queues their delta for a
         // maintenance pass that does not apply it.
-        provider.schedule_post_write_maintenance(None, false, false, QUEUED_DELTA);
+        provider.schedule_post_write_maintenance(
+            None,
+            false,
+            false,
+            QUEUED_DELTA,
+            provider.reserve_live_rows_delta().published(),
+        );
 
         let stats = provider
             .optimizer_table_statistics()
@@ -48005,6 +48286,320 @@ mod tests {
              Inexact so the distributed COUNT(*) fold declines and a real scan answers, \
              got {:?}",
             stats.num_rows,
+        );
+    }
+
+    /// Drive a write that is parked behind a lock the caller holds, until the
+    /// maintained row count stops being served as a provably exact one.
+    ///
+    /// Returns the first inexact reading. Completing is a panic rather than a
+    /// result: the write is supposed to be blocked, so if it finishes here the
+    /// park failed and the window under test never existed — a test that then
+    /// reported the count inexact would be reading the state *after* the
+    /// publish, which proves nothing about the ordering.
+    ///
+    /// `owed` names what the parked commit owes the count, for the timeout
+    /// message; a claim that never arrives is exactly the defect under test.
+    async fn drive_parked_write_until_count_is_inexact<F: std::future::Future>(
+        provider: &CayenneTableProvider,
+        mut write: std::pin::Pin<&mut F>,
+        owed: &str,
+    ) -> DFPrecision<usize> {
+        /// Generous: the write only has to be polled far enough to reach its
+        /// claim and block.
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            // `biased` so the write is polled first every pass: it has to be
+            // driven to reach its claim and park.
+            tokio::select! {
+                biased;
+                _ = &mut write => panic!(
+                    "the parked write completed while its lock was held, so the window this \
+                     test exists to close never existed"
+                ),
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+
+            let stats = provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present while the write is parked");
+            if matches!(stats.num_rows, DFPrecision::Inexact(_)) {
+                return stats.num_rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parked write never claimed its live-row delta: the maintained count is \
+                 still served as provably exact ({:?}) while a commit that has not published \
+                 yet owes it {owed}, so a reader landing after the publish folds COUNT(*) on a \
+                 short count",
+                stats.num_rows,
+            );
+        }
+    }
+
+    /// A commit must claim its live-row delta *before* it publishes the rows
+    /// that delta describes, not after.
+    ///
+    /// `queued_live_rows_delta_is_never_served_exact` covers a delta that has
+    /// reached the queue. Reaching the queue is the end of the commit, though:
+    /// a staged CDC append publishes its rows in `CayenneCdcWrite::finish` and
+    /// hands the matching `num_rows` delta to `schedule_post_write_maintenance`
+    /// several await points later. On a pure-append table every other proxy for
+    /// "rows the persisted count does not describe yet" is false, so a reader
+    /// landing in that window scans the new rows while being served the
+    /// pre-write count as a provably exact one — and the distributed `COUNT(*)`
+    /// fold answers from it rather than scanning.
+    ///
+    /// The window is opened deterministically by holding the table's write lock,
+    /// which `apply_under_barrier` acquires before it moves a single file: the
+    /// finish future parks there with its rows still invisible. The count has to
+    /// read `Inexact` already at that point, because a claim staked only after
+    /// the publish is one the reader can beat. Both halves are asserted at the
+    /// same instant — the rows are still absent from a scan AND the count is
+    /// already inexact — since either alone would pass on code that claims the
+    /// delta too late.
+    #[tokio::test]
+    async fn a_staged_publish_claims_its_delta_before_the_rows_become_visible() {
+        const SEED: i64 = 5;
+        const STAGED: i64 = 3;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("staged_publish_delta_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, SEED),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let seeded = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after the seed append");
+        assert_eq!(
+            seeded.num_rows,
+            DFPrecision::Exact(usize::try_from(SEED).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact, or this test \
+             cannot tell a late claim from a table that never serves Exact at all",
+        );
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(Arc::clone(&schema), SEED, STAGED)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(
+            staged.has_pending_finalize(),
+            "the staged append must still owe a publish, or there is no window to test",
+        );
+
+        // Park the publish. `apply_under_barrier` takes the write lock before it
+        // moves any staged file, so the finish future stops there with its rows
+        // still invisible to a scan.
+        let park = provider.write_lock_arc().lock_owned().await;
+        let finish = staged.finish();
+        tokio::pin!(finish);
+
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            finish.as_mut(),
+            &format!("{STAGED} staged rows"),
+        )
+        .await;
+
+        // The claim landed before the rows did: still nothing but the seed is
+        // visible, so this is the pre-publish window and not a late claim caught
+        // after the fact.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_publish_delta_claim")
+                .await
+                .len(),
+            usize::try_from(SEED).expect("row count fits usize"),
+            "the parked publish must not have made its rows visible yet, or {claimed:?} says \
+             nothing about the window this test exists to close",
+        );
+
+        drop(park);
+        let rows = finish
+            .await
+            .expect("the parked publish completes once unblocked");
+        assert_eq!(rows, u64::try_from(STAGED).expect("row count fits u64"));
+
+        // The claim survives the hand-off to the maintenance queue: releasing it
+        // there would re-open the window on the far side of the publish, where
+        // the rows are visible and the persisted count is still short.
+        assert!(
+            matches!(
+                provider
+                    .optimizer_table_statistics()
+                    .expect("maintained stats present after the publish")
+                    .num_rows,
+                DFPrecision::Inexact(_)
+            ),
+            "the published rows are visible and their delta is not persisted yet, so the count \
+             must not be served as a provably exact one",
+        );
+
+        // ...and the claim is released once maintenance persists the delta, or
+        // the table would be stranded on Inexact for the rest of its life.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        let drained = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after the publish drains");
+        assert_eq!(
+            drained.num_rows,
+            DFPrecision::Exact(usize::try_from(SEED + STAGED).expect("row count fits usize")),
+            "the claim must be retired by the persist that folds its delta into num_rows",
+        );
+    }
+
+    /// The same claim-before-publish contract on the DML path.
+    ///
+    /// `INSERT INTO` reaches `AppendMutationWriter::write_prepared_stream`,
+    /// which is a separate commit from the staged CDC one in
+    /// `a_staged_publish_claims_its_delta_before_the_rows_become_visible` and
+    /// stakes its own claim. That path holds the table write lock for the whole
+    /// write, so the window is opened one lock further in: `apply_under_barrier`
+    /// takes the visibility lock before it moves any staged file, and holding
+    /// that parks the insert with its rows still invisible. (Not the listing
+    /// fence — the scan below needs it, and a pending fence writer blocks new
+    /// readers.)
+    #[tokio::test]
+    async fn an_insert_claims_its_delta_before_the_rows_become_visible() {
+        const SEED: i64 = 4;
+        const INSERTED: i64 = 6;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("insert_delta_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, SEED),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the seed insert")
+                .num_rows,
+            DFPrecision::Exact(usize::try_from(SEED).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact, or this test \
+             cannot tell a late claim from a table that never serves Exact at all",
+        );
+
+        let park = provider.visibility_lock_arc().lock_owned().await;
+        let insert = insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), SEED, INSERTED),
+        );
+        tokio::pin!(insert);
+
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            insert.as_mut(),
+            &format!("{INSERTED} inserted rows"),
+        )
+        .await;
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "insert_delta_claim")
+                .await
+                .len(),
+            usize::try_from(SEED).expect("row count fits usize"),
+            "the parked insert must not have made its rows visible yet, or {claimed:?} says \
+             nothing about the window this test exists to close",
+        );
+
+        drop(park);
+        insert.await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the insert drains")
+                .num_rows,
+            DFPrecision::Exact(usize::try_from(SEED + INSERTED).expect("row count fits usize")),
+            "the claim must be retired by the persist that folds its delta into num_rows",
+        );
+    }
+
+    /// A commit whose rows leave the net live count where it was owes the
+    /// maintained count nothing, and nothing would ever retire a claim it left
+    /// behind — an upsert that replaces exactly as many rows as it inserts is
+    /// that shape. Both of `schedule_post_write_maintenance`'s zero-delta exits
+    /// must therefore release the claim, or one no-op commit strands the table
+    /// on `Inexact` for the life of the process and every distributed
+    /// `COUNT(*)` on it real-scans forever.
+    #[tokio::test]
+    async fn a_commit_that_moves_no_rows_releases_its_claim() {
+        const ROWS: i64 = 6;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("unmoved_count_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, ROWS),
+        )
+        .await;
+
+        let exact = DFPrecision::Exact(usize::try_from(ROWS).expect("row count fits usize"));
+
+        // The early exit: nothing to schedule at all.
+        provider.schedule_post_write_maintenance(
+            None,
+            false,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+        // ...and the in-lock exit: there is maintenance to do, just no row-count
+        // delta behind it.
+        provider.schedule_post_write_maintenance(
+            None,
+            true,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the drain")
+                .num_rows,
+            exact,
+            "a commit that moved no rows queued no delta, so a claim it held would never be \
+             retired and the table would serve Inexact forever",
         );
     }
 
@@ -50598,11 +51193,12 @@ mod tests {
         let pk_converter = provider
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
+        let (_, checkout) = provider.take_cached_pk_index();
         let index = provider
             .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
             .await
             .expect("cold keyset rebuild");
-        provider.store_cached_pk_index(index);
+        provider.store_cached_pk_index(index, checkout);
         assert!(
             provider.should_capture_positions(),
             "deletion_mode: position on a PK table must enable the position read-back"
@@ -54776,7 +55372,8 @@ mod tests {
         let mut keyset = CachedPkKeyset::with_capacity(1);
         keyset.insert(key.clone(), RowLocation::FileUnlocated);
         keyset.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset), checkout);
 
         let footprint: HashSet<u128> = HashSet::from([digest]);
         let empty_write_set = crate::provider::pk_index::PkDigestSet::with_capacity(0);
@@ -54823,7 +55420,8 @@ mod tests {
         let mut delta_updated = CachedPkKeyset::with_capacity(1);
         delta_updated.insert(key.clone(), RowLocation::FileUnlocated);
         delta_updated.record_sequence(digest, 5);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(delta_updated), checkout);
         assert!(
             !provider.transaction_has_conflict(
                 stage_seq,
@@ -54847,7 +55445,8 @@ mod tests {
         floor_stamped.insert(key, RowLocation::FileUnlocated);
         floor_stamped.record_sequence(digest, 5);
         floor_stamped.stamp_all_sequences_min(current_high_water);
-        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped));
+        let (_, checkout) = provider.take_cached_pk_index();
+        provider.store_cached_pk_index(CachedPkIndex::Exact(floor_stamped), checkout);
         assert!(
             provider.transaction_has_conflict(
                 stage_seq,
@@ -54909,9 +55508,8 @@ mod tests {
 
         // Seed one row so the table has a live keyset to check out.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // The concurrent writer commits id=7 while the keyset is out.
         let committed = pk_digest_set_for_ids(&converter, &[7]);
@@ -54933,7 +55531,7 @@ mod tests {
         );
 
         // The writer finishes and returns the keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
@@ -54977,9 +55575,8 @@ mod tests {
             .expect("primary key converter");
 
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, _checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
         provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
 
         let pending = provider.pending_pk_existence();
@@ -55047,15 +55644,14 @@ mod tests {
 
         // A mainline write starts validating: it holds the keyset for its whole
         // lazily-consumed stream.
-        let checked_out = provider
-            .take_cached_pk_index()
-            .expect("the seed insert leaves a cached keyset");
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
 
         // Another writer commits id=7 in that window.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[70])).await;
 
         // The first write finishes and returns its keyset.
-        provider.store_cached_pk_index(checked_out);
+        provider.store_cached_pk_index(checked_out, checkout);
 
         // A later upsert of the same key must replace the committed row.
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[7], &[71])).await;
@@ -55119,5 +55715,157 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+    /// A checked-out index that is never restored must not blind the checkout
+    /// mechanism for the rest of the process — regression test for #13267.
+    ///
+    /// `build_sharded_pk_index` opens the window before the fallible work that
+    /// produces the index, and the index then travels through the raw-stream
+    /// drain, the per-table cap spill, and the global byte-budget wait before
+    /// `store_sharded_pk_index` closes it. Every one of those can exit first: an
+    /// error propagates, and sustained overload diverts the whole apply to the
+    /// durable path and abandons the index outright.
+    ///
+    /// A window left open latches the log: the next `begin_checkout` sees one
+    /// already outstanding and marks its index invalid, and `outstanding` never
+    /// returns to zero to clear it. From then on the log records nothing, so every
+    /// restore discards its index — a full keyset rebuild on every write — and an
+    /// in-flight validation stops seeing concurrent commits, reads a live key as
+    /// new, and writes a second row under a primary key that already exists.
+    ///
+    /// Abandoning the index is the cheapest faithful stand-in for those exits: it
+    /// is exactly what each of them does to the window.
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply that checks the index out and never restores it.
+        drop(
+            provider
+                .build_sharded_pk_index(&pk_indices, &converter, 4)
+                .await
+                .expect("the warm per-shard index is checked out"),
+        );
+
+        // The next apply must be unaffected: it checks the index out, a concurrent
+        // writer commits id=7 into that window, and the restore replays it.
+        provider.maybe_install_warm_pk_caches().await;
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the per-shard index is checked out again");
+
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_sharded_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the per-shard index: missing it reads id=7 as new and leaves two live \
+             rows for one declared primary key"
+        );
+
+        provider.store_sharded_pk_index(checked_out);
+
+        match provider.sharded_pk_keyset_cache.lock().as_ref() {
+            Some(ShardedPkIndex::Exact(keysets)) => {
+                assert!(
+                    keysets
+                        .iter()
+                        .any(|keyset| keyset.location_by_digest(committed_digest).is_some()),
+                    "the restored per-shard index must know id=7"
+                );
+            }
+            other => panic!(
+                "an earlier abandoned checkout must not force this index to be \
+                 discarded (which rebuilds the whole keyset on every later write); \
+                 present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide keyset has the same window and the same latch — regression
+    /// test for #13267 on the serial path, where a validation stream dropped or
+    /// cancelled part-way (rather than an error before it starts) is what abandons
+    /// the checkout.
+    #[tokio::test]
+    async fn an_abandoned_serial_checkout_does_not_latch_the_pending_log() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+
+        // A validation that takes the keyset and is then cancelled: nothing stores
+        // it back, so the cache is left empty and the window has to close here.
+        drop(provider.take_cached_pk_index());
+
+        // The next validation opens its own window over the gap and rebuilds.
+        let (rebuilt, checkout) = provider.take_cached_pk_index();
+        assert!(
+            rebuilt.is_none(),
+            "the abandoned checkout took the cached keyset with it"
+        );
+        let committed = pk_digest_set_for_ids(&converter, &[7]);
+        let committed_digest = committed
+            .iter_with_digest()
+            .next()
+            .expect("one committed key")
+            .0;
+        provider.record_file_pk_keys(&committed, 11);
+
+        assert!(
+            provider
+                .pending_pk_existence()
+                .is_some_and(|pending| pending.location_by_digest(committed_digest).is_some()),
+            "the in-flight validation must still see a key committed while it holds \
+             the keyset: missing it reads id=7 as new and leaves two live rows for \
+             one declared primary key"
+        );
+        drop(checkout);
+
+        // And an ordinary write restores its keyset to the cache rather than
+        // discarding it.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+        assert!(
+            provider.pk_keyset_cache.lock().is_some(),
+            "an earlier abandoned checkout must not force every later restore to \
+             discard its keyset, which rebuilds the whole keyset on every write"
+        );
     }
 }

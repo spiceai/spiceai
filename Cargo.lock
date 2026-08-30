@@ -4438,6 +4438,7 @@ dependencies = [
  "parking_lot",
  "runtime",
  "runtime-component",
+ "runtime-datafusion",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -6933,8 +6934,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-json"
 version = "0.54.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab80590f2e0c240fd14a8178b584941f5ced55ee90cd41a128e6c08176c0f7cc"
+source = "git+https://github.com/spiceai/datafusion-functions-json.git?rev=ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc#ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc"
 dependencies = [
  "datafusion",
  "jiter",
@@ -7308,7 +7308,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=896356c3f7af9db5b6da3f2379196b420eee1b2b#896356c3f7af9db5b6da3f2379196b420eee1b2b"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=0d24a546748b54fd3ff48853739d85a6d351058f#0d24a546748b54fd3ff48853739d85a6d351058f"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -17822,6 +17822,7 @@ dependencies = [
  "object_store 0.13.2",
  "opentelemetry",
  "parking_lot",
+ "regex",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
  "runtime-object-store",
@@ -19031,6 +19032,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "util",
 ]
 
@@ -22098,6 +22100,7 @@ dependencies = [
  "async-trait",
  "rmcp",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

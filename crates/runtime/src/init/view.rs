@@ -98,7 +98,11 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 
 impl Runtime {
     pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
-        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
+        // already validated the same views with `LogErrors(true)` before its snapshot
+        // checks, so reporting again here only prints each view's load error, and each
+        // view's discarded-acceleration warning, twice per startup.
+        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
 
         // Determine the dependency order for views based on their SQL dependencies
         let views_in_dependency_order = order_views_by_dependencies(&validated_views)
@@ -130,8 +134,15 @@ impl Runtime {
         let rt_ref = Arc::clone(&self);
         let status = Arc::clone(&self.status);
 
+        // `LogErrors(false)` regardless of this call's own flag: this is a name
+        // lookup, not a dataset load. Both paths that reach here with
+        // `LogErrors(true)` — `load_datasets`, and `apply_dataset_diff` ahead of
+        // `apply_view_diff` — already call `get_valid_datasets(app,
+        // LogErrors(true))` themselves, so nothing is silenced by this; passing
+        // the flag through only made each dataset's load error, and each
+        // dataset's discarded-acceleration warning, print twice per load.
         let datasets = Arc::clone(&self)
-            .get_valid_datasets(app, log_errors)
+            .get_valid_datasets(app, LogErrors(false))
             .iter()
             .map(|ds| ds.name.clone())
             .collect::<HashSet<_>>();
@@ -218,6 +229,23 @@ impl Runtime {
 
                     // Extract dependencies from the validated statement
                     let dependencies = view::get_dependent_table_names(&statement);
+
+                    // `enabled: false` turns the whole acceleration block off, so anything
+                    // else set in it is read, accepted and then never applied — the same for
+                    // a view as for a dataset (#13514). Reported from here — the load path,
+                    // behind `log_errors` — rather than from `ViewBuilder::try_from`, which
+                    // read-only callers run too.
+                    //
+                    // Last, after every rejection above has had its chance: a view that
+                    // collides with a dataset name or fails SQL validation never loads, so
+                    // nothing of its acceleration block is silently discarded and warning
+                    // about it would only add noise to the error that actually matters.
+                    crate::init::dataset::warn_about_discarded_acceleration_settings(
+                        crate::component::AcceleratedComponent::View,
+                        &spicepod_view.name,
+                        spicepod_view.acceleration.as_ref(),
+                        log_errors,
+                    );
 
                     Some(ValidatedView {
                         view: Arc::new(view),
