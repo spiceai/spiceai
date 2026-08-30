@@ -103,10 +103,10 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0d24a546748b54fd3ff48853739d85a6d351058f` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `642e121192fcc4c3430e28e01e660ee5d189d517` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `7229b20daf24765c84d294c52cf4b4165ca79073` | `spiceai-1.5.5` |
+| [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `af383410a9c86915263fbd1145b8becfc1e317b5` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `c86f2f7ae9b37a8a795cc4c25574df436aa1d392` | `spiceai-0.10.0-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
@@ -282,7 +282,7 @@ the case named:
 ## duckdb-rs
 
 Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
-`spiceai-1.5.5`.
+`spiceai-1.4.4`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
