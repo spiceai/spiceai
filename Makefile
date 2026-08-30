@@ -425,9 +425,12 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # so a feature added to `default` does not reach `make install-data-only` until it is added below
 # too, and no check reports the omission. The two currently differ in both directions, which is why
 # reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
-# with none of the secret stores, and it carries the PostgreSQL accelerator and acceleration
-# snapshots, which `default` does not. Recompute the difference before relying on it rather than
-# trusting a comment, from this list and the `default = [...]` array in bin/spiced/Cargo.toml.
+# without the feature-gated secret stores `default` turns on (aws-secrets-manager and
+# keyring-secret-store) — the env and Kubernetes stores are not feature-gated at all, so a -data
+# build still reads secrets from both of those — and it carries the PostgreSQL accelerator and
+# acceleration snapshots, which `default` does not. Recompute the difference before relying on it
+# rather than trusting a comment, from this list and the `default = [...]` array in
+# bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
 SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
