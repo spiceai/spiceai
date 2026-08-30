@@ -6,6 +6,27 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 As an AI-native database, query results can NEVER be wrong. Correctness supersedes performance, developer experience, and feature velocity. Verify transformations preserve integrity (row counts, key values); rigorously test NULLs, empty sets, boundaries, type coercions, and overflow; when uncertain, return a structured error instead of possibly-wrong data. Never corrupt data or drop errors silently.
 
+## Evidence — no claim without a reproduction
+
+Code inspection is a hypothesis generator, never proof. **Every issue, concern, bug, regression, or performance claim you raise — in a PR, a GitHub issue, a review comment, or a message to the user — must carry evidence produced by *running* something, external to the code you read.** Reading a diff and reasoning about it is where a finding starts, not where it ends: a plausible-looking race, overflow, or lost update that nobody has observed is a hypothesis and must be labeled one.
+
+What counts as evidence, strongest first:
+
+- **An actual run of Spice.ai** — `spiced` against a real Spicepod, with the query output, the log line, or the wrong row count pasted in.
+- **A benchmark or harness run** — `testoperator`, `cbench`, the CH-benCH lab — with before/after numbers from the same rig; mandatory for anything about performance, memory, or lag.
+- **An end-to-end or integration test** that fails on current code and passes on the fix, exercising the real wired path (`make test-integration`, `test/spicepods/…`, `verify-cli`).
+- **A targeted experiment**: a property/fuzz test, a SQL session, a `curl`, a `psql` CDC feed, a crash/`dmesg`/profile capture — anything that exhibits the wrong behavior directly.
+
+**A unit test alone is not evidence.** A unit test written from the same reading of the code that produced the claim encodes the same misunderstanding — it can pass on wrong code and fail on correct code — and it routinely misses exactly the failures that matter here: defaulted no-op wrapper methods (see *Trait evolution & wrapper delegation*), feature-gated paths, real I/O, concurrency, and anything the harness stubs out. Land the unit test as a regression guard, but prove the bug outside it first.
+
+Rules:
+
+- **Show the artifact** — the command and its actual output or numbers, not a summary of them. "Verified" without pasted output is not verified.
+- **Demonstrate the failure before the fix and its absence after**, with the same command. A check that only ever ran green proves nothing.
+- **If you cannot reproduce it, say exactly that** — "unverified, code inspection only" — with the repro you attempted and why it did not land. Never round a hypothesis up to a bug, and never present a change driven by one as a fix.
+- **Report negative results.** When the run contradicts your reading of the code, the reading was wrong: withdraw the claim rather than re-arguing it from the source.
+- The bar scales with the cost of being wrong, never down to zero: a correctness or data-loss claim needs a run of the engine, not a passing assertion.
+
 ## Build, test, lint (expensive — read first)
 
 Full workspace and release builds take 20–35 minutes. Minimize large builds:
@@ -143,6 +164,7 @@ A new trait method with a default impl silently no-ops in wrapper/decorator impl
 
 ## Testing
 
+- **A green unit test is not proof a bug existed or is gone** — see *Evidence — no claim without a reproduction*: reproduce outside the unit test first, then land the unit test as the regression guard.
 - **Spicepod naming**: `{connector[variant]}-{accelerator[variant]}-{test_variant}`; non-accelerated must use the `-federated` suffix. Examples: `s3[parquet]-federated`, `mysql-duckdb[file]-on_zero_results`.
 - **testoperator** is the benchmark/test harness: `cargo run -p testoperator -- run bench -p test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate` (also `run throughput … --concurrency 25`).
 - **No fixed sleeps as readiness waits**: poll the actual condition with a bounded timeout, short interval, and a failure message carrying the last observed state — `runtime_ready_check[_with_timeout]`, `wait_until_true`, `util::retry` with `FibonacciBackoffBuilder`, health/ping probes, `SELECT 1`, refresh notifiers, result polling. Fixed sleeps only when time itself is under test (TTL, backoff, cron, rate limits) — keep them short and explain them.
