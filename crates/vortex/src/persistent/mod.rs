@@ -817,6 +817,48 @@ mod tests {
         }
     }
 
+    /// A timestamp count that denotes no instant renders instead of taking the process down.
+    ///
+    /// The guard above covers nanoseconds, where the fix is that the whole `i64` is admitted.
+    /// The other three units keep a Jiff span, so what the fork patch changes for them is that
+    /// the span is built with the *checked* constructors and added with `checked_add`. Both of
+    /// the unchecked forms abort, and a `Display` impl has no way to report a failure, so a
+    /// re-cut that restored either one would panic on these — while the nanosecond guard above
+    /// stayed green. `TimestampValue` is public, so these are reachable without a scalar.
+    #[test]
+    fn a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting() {
+        use vortex::extension::datetime::TimestampValue;
+
+        // Past the span range: the unchecked `Span` constructors abort here.
+        assert_eq!(
+            TimestampValue::Seconds(i64::MAX, None).to_string(),
+            "9223372036854775807s"
+        );
+        assert_eq!(
+            TimestampValue::Seconds(i64::MIN, None).to_string(),
+            "-9223372036854775808s"
+        );
+        assert_eq!(
+            TimestampValue::Milliseconds(i64::MAX, None).to_string(),
+            "9223372036854775807ms"
+        );
+        assert_eq!(
+            TimestampValue::Microseconds(i64::MAX, None).to_string(),
+            "9223372036854775807\u{b5}s"
+        );
+        // Inside the span range but past the last instant: `Timestamp + Span` aborts here, so
+        // this pins the second of the two abort paths.
+        assert_eq!(
+            TimestampValue::Seconds(253_402_300_800, None).to_string(),
+            "253402300800s"
+        );
+        // An instant still renders as one rather than falling back.
+        assert_eq!(
+            TimestampValue::Seconds(1_709_251_200, None).to_string(),
+            "2024-03-01T00:00:00Z"
+        );
+    }
+
     /// A large `IN` list has to stay evaluable.
     ///
     /// An `IN (…)` filter is pushed into the Vortex scan as one `list_contains`
