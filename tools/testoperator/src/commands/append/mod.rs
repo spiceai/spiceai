@@ -355,8 +355,9 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
 /// a duplicated append, a retention policy deleting the wrong row, or a
 /// corrupted column can all land on the expected row count.
 ///
-/// No expected-answer query selects the appended `*_created_at` column, so this
-/// pass does not observe which of two conflicting versions an upsert kept.
+/// Under `--with-conflict-data` it also covers conflict resolution: the copy an
+/// upsert must discard carries a negated queried column, so keeping it shows up
+/// in the query results.
 async fn verify_appended_data(
     spiced: &SpicedInstance,
     query_set: &QuerySet,
