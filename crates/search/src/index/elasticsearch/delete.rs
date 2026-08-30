@@ -172,6 +172,11 @@ pub async fn delete_by_keys(
         }
     };
 
+    // Before the first request, not per chunk: a key the resolved field never indexed fails the
+    // whole delete, and finding that out three chunks in would leave the batch half applied.
+    ensure_keys_are_indexable(es_index, &key_paths, keys)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
     // Hold the first failure and keep going. Each chunk is an independent `_delete_by_query` over
     // its own slice of `keys`, so returning at the first one would leave every later chunk
     // unissued, turning a report of a partial delete into a cause of a larger one.
@@ -186,7 +191,7 @@ pub async fn delete_by_keys(
         let query = if addresses_whole_key {
             build_ids_query(primary_key, es_index, &chunk)?
         } else {
-            build_or_of_row_term_queries(es_index, &key_paths, &chunk)?
+            build_or_of_row_term_queries(&key_paths, &chunk)?
         };
         let Some(query) = query else {
             continue;
@@ -420,7 +425,6 @@ fn build_ids_query(
 /// not always the column's own name: a `text`-mapped column is matched on its `keyword`
 /// multi-field, since the column itself holds analyzed tokens.
 fn build_or_of_row_term_queries(
-    es_index: &str,
     key_paths: &[KeyFieldPath],
     keys: &RecordBatch,
 ) -> DataFusionResult<Option<Value>> {
@@ -450,23 +454,6 @@ fn build_or_of_row_term_queries(
                 terms.clear();
                 break;
             };
-            // A value Elasticsearch declined to index is unreachable by any filter, so the delete
-            // has to say so rather than issue a clause that matches nothing and reports success.
-            if let Some(json_string) = json_value.as_str()
-                && let Some(ignore_above) = key_path.ignore_above
-                && let Ok(length) = i64::try_from(json_string.chars().count())
-                && length > ignore_above
-            {
-                return Err(DataFusionError::External(Box::new(
-                    Error::KeyValueNotIndexed {
-                        index: es_index.to_string(),
-                        column: key_path.column.clone(),
-                        path: key_path.path.clone(),
-                        length: json_string.chars().count(),
-                        ignore_above,
-                    },
-                )));
-            }
             terms.push(json!({ "term": { key_path.path.as_str(): json_value } }));
         }
         if !terms.is_empty() {
@@ -554,7 +541,10 @@ fn is_term_exact(mapping: &FieldMapping) -> bool {
 ///
 /// Returns `Ok(None)` when a key column is absent from the mapping entirely: Elasticsearch maps a
 /// field the first time a document carries it, so no document holds that column and the delete
-/// has nothing to address. That is a delete of rows the index does not have, not a failure.
+/// has nothing to address. That is a delete of rows the index does not have, not a failure. The
+/// exception is an index the user pre-created with `dynamic: false` and then populated elsewhere,
+/// where a document can carry an unmapped field — but the runtime maps its own key columns when
+/// it prepares the index, so a column it writes is mapped by the time any delete runs.
 async fn resolve_term_exact_paths(
     client: &dyn Elasticsearch,
     es_index: &str,
@@ -640,6 +630,57 @@ async fn resolve_term_exact_paths(
     }
 
     Ok(Some(paths))
+}
+
+/// Refuses the delete if any key in `keys` is longer than the `ignore_above` of the field it
+/// would be matched on.
+///
+/// Elasticsearch stores such a value but does not index it, so no filter reaches it — the same
+/// silent no-op an analyzed key column produces, one layer down. It cannot be caught while
+/// resolving the field, which sees no values, so it is caught here: before the first request,
+/// rather than by the chunk that happens to carry the long key, which would leave the chunks
+/// before it applied and the ones after it unissued.
+///
+/// Only the columns whose resolved field declares a limit are scanned, and the runtime's own
+/// mapping declares none — so on an index it created this walks nothing.
+fn ensure_keys_are_indexable(
+    es_index: &str,
+    key_paths: &[KeyFieldPath],
+    keys: &RecordBatch,
+) -> Result<()> {
+    for key_path in key_paths {
+        let Some(ignore_above) = key_path.ignore_above else {
+            continue;
+        };
+        let Some(array) = keys.column_by_name(&key_path.column) else {
+            // A missing column is the query builder's error to report, with the whole key in hand.
+            continue;
+        };
+        for row in 0..array.len() {
+            let Ok(value) = ScalarValue::try_from_array(array.as_ref(), row) else {
+                continue;
+            };
+            let Some(json_value) = scalar_to_term_value(&value) else {
+                continue;
+            };
+            let Some(text) = json_value.as_str() else {
+                continue;
+            };
+            let length = text.chars().count();
+            if i64::try_from(length).is_ok_and(|length| length > ignore_above) {
+                return KeyValueNotIndexedSnafu {
+                    index: es_index.to_string(),
+                    column: key_path.column.clone(),
+                    path: key_path.path.clone(),
+                    length,
+                    ignore_above,
+                }
+                .fail();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn scalar_to_term_value(value: &ScalarValue) -> Option<Value> {
@@ -2106,7 +2147,6 @@ mod tests {
     fn a_chunked_index_deletes_every_chunk_of_a_base_key() {
         let chunked = ChunkedSearchIndex::augment_primary_key(vec![id_field()]);
         let query = build_or_of_row_term_queries(
-            "idx",
             &exact_paths(&document_key_columns(&chunked)),
             &base_keys(&[7]),
         )
@@ -2133,7 +2173,7 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
 
-        let err = build_or_of_row_term_queries("idx", &exact_paths(&full), &base_keys(&[7]))
+        let err = build_or_of_row_term_queries(&exact_paths(&full), &base_keys(&[7]))
             .expect_err("the chunk id is not in the batch");
         assert!(
             err.to_string().contains(CHUNKED_INDEX_CHUNK_KEY),
@@ -2154,13 +2194,10 @@ mod tests {
         )
         .expect("valid batch");
 
-        let query = build_or_of_row_term_queries(
-            "idx",
-            &exact_paths(&document_key_columns(&chunked)),
-            &keys,
-        )
-        .expect("query builds")
-        .expect("non-empty batch produces a query");
+        let query =
+            build_or_of_row_term_queries(&exact_paths(&document_key_columns(&chunked)), &keys)
+                .expect("query builds")
+                .expect("non-empty batch produces a query");
 
         assert_eq!(
             query["bool"]["should"][0]["bool"]["filter"],
