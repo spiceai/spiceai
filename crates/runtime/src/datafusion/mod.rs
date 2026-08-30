@@ -774,6 +774,41 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
     fn install(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()>;
 }
 
+/// The specific table instance registered under a name at the moment it was
+/// captured, for an action that is decided before an `.await` and applied after
+/// it.
+///
+/// Acking a partition set as loaded, or creating a refresh schedule, is about
+/// the table the action started for. A table removed — or removed and
+/// re-registered, as a rebuild or a schema-change recreate does — resolves to a
+/// different provider, and applying the action then reports a result for a table
+/// that never produced it.
+///
+/// Captured by [`DataFusion::capture_table_instance`] before the wait, and
+/// re-resolved by [`DataFusion::await_refresh_completion`] after it.
+pub struct TableInstance {
+    table: TableReference,
+    /// `None` when nothing resolved under the name at capture time, which leaves
+    /// the instance with no identity to compare against.
+    provider: Option<Arc<dyn TableProvider>>,
+}
+
+/// What a deferred action gated on a refresh completion should do once that
+/// refresh has landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredRefreshOutcome {
+    /// A refresh landed and the table is still the one the action was started
+    /// for.
+    Apply,
+    /// Every recorder was dropped before a completion was recorded: no refresh
+    /// ran, and none can.
+    Abandoned,
+    /// A refresh landed, but the table has since been removed, or rebuilt as a
+    /// new instance, so the action is no longer about the table registered under
+    /// this name.
+    TableChanged,
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -1137,6 +1172,70 @@ impl DataFusion {
             schema_provider.as_ref(),
             table_reference.table(),
         )
+    }
+
+    /// Captures the table instance registered under `table_reference` right now,
+    /// so an action decided before an `.await` can tell, once it resumes,
+    /// whether it is still about the same table.
+    ///
+    /// Pair with [`DataFusion::await_refresh_completion`], which re-resolves it
+    /// once the refresh the action waits on has landed.
+    #[must_use]
+    pub async fn capture_table_instance(&self, table_reference: &TableReference) -> TableInstance {
+        TableInstance {
+            table: table_reference.clone(),
+            provider: self.get_table(table_reference).await,
+        }
+    }
+
+    /// Waits for `waiter`, then reports whether the action it gates may still be
+    /// applied to `instance`'s table.
+    ///
+    /// A deferred action has two questions to ask and this answers both, so a
+    /// caller cannot answer the first and forget the second. `Abandoned` alone is
+    /// not enough: it reports only a drop that happens *before* any completion
+    /// was recorded, while a completion recorded and *then* invalidated by a
+    /// removal or a rebuild still reads as answered.
+    ///
+    /// A `None` waiter is a caller with nothing to wait for; the table is still
+    /// re-resolved, since it may have gone in the meantime.
+    #[must_use]
+    pub async fn await_refresh_completion(
+        &self,
+        instance: TableInstance,
+        waiter: Option<RefreshCompletionWaiter>,
+    ) -> DeferredRefreshOutcome {
+        if let Some(waiter) = waiter
+            && waiter.wait().await.is_abandoned()
+        {
+            return DeferredRefreshOutcome::Abandoned;
+        }
+
+        if self.table_instance_is_current(&instance).await {
+            DeferredRefreshOutcome::Apply
+        } else {
+            DeferredRefreshOutcome::TableChanged
+        }
+    }
+
+    /// Whether `instance` still names the table registered under its name.
+    ///
+    /// `false` once that table has been removed, and equally once it has been
+    /// removed and re-registered: a rebuild resolves to a new provider, so an
+    /// action captured against the old one is about a table that is no longer
+    /// there.
+    #[must_use]
+    async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
+        let Some(captured) = instance.provider.as_ref() else {
+            // Nothing resolved under the name when the instance was captured, so
+            // there is no identity to compare against; the most the registry can
+            // still answer is whether the name is registered at all.
+            return self.table_exists(&instance.table);
+        };
+
+        self.get_table(&instance.table)
+            .await
+            .is_some_and(|current| Arc::ptr_eq(captured, &current))
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -6684,6 +6783,196 @@ mod tests {
             assert_eq!(strip_outer_parens("foo".to_string()), "foo");
             assert_eq!(strip_outer_parens("(foo".to_string()), "(foo");
             assert_eq!(strip_outer_parens("foo)".to_string()), "foo)");
+        }
+    }
+
+    /// Revalidating a deferred action against the table it was started for.
+    ///
+    /// A refresh completion resolves `Answered` for a table that has since been
+    /// removed or rebuilt — `Abandoned` reports only a drop that happens before
+    /// any completion is recorded — so the callers that act on one re-resolve the
+    /// table too. Regression tests for #13603.
+    mod deferred_refresh {
+        use super::*;
+        use crate::accelerated::refresh_completion::RefreshCompletion;
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+
+        fn test_df() -> DataFusion {
+            DataFusionBuilder::new(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build()
+        }
+
+        /// A distinct provider instance each call, so identity is the only thing
+        /// telling two registrations of the same name apart.
+        fn a_table() -> Arc<dyn TableProvider> {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table"))
+        }
+
+        fn register(df: &DataFusion, name: &TableReference) {
+            df.ctx
+                .register_table(name.clone(), a_table())
+                .expect("register");
+        }
+
+        #[tokio::test]
+        async fn a_refresh_on_an_untouched_table_applies() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record();
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Apply,
+                "an untouched table must still apply, or every deferred action is dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refresh_no_recorder_ever_answered_is_abandoned() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            drop(completion);
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Abandoned,
+            );
+        }
+
+        /// The reported bug: the completion *is* recorded, so the wait answers,
+        /// and only then does the table go. `Abandoned` cannot see this.
+        #[tokio::test]
+        async fn a_table_removed_after_its_refresh_landed_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record();
+
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::TableChanged,
+                "a completion recorded before the table went still reads as answered, so the table itself has to be re-resolved"
+            );
+        }
+
+        /// The case an existence check cannot see: the name is registered the
+        /// whole time, but not to the table the action was started for. Applying
+        /// here reports the old table's result against the new one.
+        #[tokio::test]
+        async fn a_table_rebuilt_after_its_refresh_landed_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record();
+
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+            register(&df, &name);
+
+            assert!(
+                df.table_exists(&name),
+                "precondition: the rebuild leaves a table registered under the name, so existence alone cannot detect this"
+            );
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::TableChanged,
+                "a rebuilt table is a different table: the action was captured against the instance the rebuild replaced"
+            );
+        }
+
+        /// Abandonment is reported ahead of the table check, so a caller can tell
+        /// "no refresh ran" from "it ran, for a table that is gone".
+        #[tokio::test]
+        async fn abandonment_is_reported_even_when_the_table_is_also_gone() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            drop(completion);
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Abandoned,
+            );
+        }
+
+        /// A caller with nothing to wait for still has a table that may have gone.
+        #[tokio::test]
+        async fn a_missing_waiter_still_re_resolves_the_table() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            assert_eq!(
+                df.await_refresh_completion(instance, None).await,
+                DeferredRefreshOutcome::Apply,
+            );
+
+            let instance = df.capture_table_instance(&name).await;
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+            assert_eq!(
+                df.await_refresh_completion(instance, None).await,
+                DeferredRefreshOutcome::TableChanged,
+            );
+        }
+
+        /// Nothing resolved at capture time leaves no identity to compare, so the
+        /// check falls back to existence. Refusing outright instead would strand
+        /// a legitimately registered table's readiness ack for good.
+        #[tokio::test]
+        async fn an_instance_captured_over_no_table_falls_back_to_existence() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+
+            let instance = df.capture_table_instance(&name).await;
+            assert!(
+                !df.table_instance_is_current(&instance).await,
+                "no table captured and none registered: nothing for the action to be about"
+            );
+
+            register(&df, &name);
+            let instance = df
+                .capture_table_instance(&TableReference::bare("absent"))
+                .await;
+            register(&df, &TableReference::bare("absent"));
+            assert!(
+                df.table_instance_is_current(&instance).await,
+                "with no captured identity the check can only ask whether the name is registered"
+            );
         }
     }
 }
