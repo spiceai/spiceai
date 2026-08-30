@@ -115,6 +115,10 @@ impl View {
 /// the setting to, and the docs link — is asserted directly by a unit test rather than only
 /// through whatever a log capture happens to retain.
 fn deprecated_acceleration_ready_state_warning(view_name: &str) -> String {
+    // `escape_debug` rather than the raw name, matching `disabled_acceleration_warning`:
+    // `validate_identifier` accepts a *quoted* identifier, and a quoted one may legally contain a
+    // newline, so a validated name can still break this line in two and forge a second one.
+    let view_name = view_name.escape_debug();
     format!(
         "View '{view_name}' sets `acceleration.ready_state`, which is deprecated and will be removed. \
         Move the setting to the view's own `ready_state` to keep it working. \
@@ -500,6 +504,35 @@ sql: SELECT 1
         assert!(
             !message.contains('\n'),
             "a log message stays on one line: {message}"
+        );
+    }
+
+    /// The single-line assertion above uses a benign name, so it cannot see this: a *quoted*
+    /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
+    /// that passes validation could otherwise break the line in two and forge a second record.
+    /// `disabled_acceleration_warning` escapes for exactly this reason.
+    #[test]
+    fn a_view_name_carrying_a_newline_cannot_forge_a_second_log_line() {
+        let hostile = "\"api\nWARN forged\"";
+
+        // The escaping only matters if such a name reaches the warning at all, so assert that
+        // the builder accepts it rather than assuming it does.
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: {hostile:?}\nsql: SELECT 1\n")).expect("yaml parses");
+        assert!(
+            ViewBuilder::try_from(view).is_ok(),
+            "a quoted identifier containing a newline is accepted by the builder, which is what \
+             makes escaping load-bearing rather than decorative"
+        );
+
+        let message = deprecated_acceleration_ready_state_warning(hostile);
+        assert!(
+            !message.contains('\n'),
+            "an embedded newline must not survive into the log line: {message:?}"
+        );
+        assert!(
+            message.contains("WARN forged"),
+            "the name is still reported in full, only escaped: {message:?}"
         );
     }
 }
