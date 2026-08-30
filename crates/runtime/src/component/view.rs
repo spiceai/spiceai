@@ -24,11 +24,12 @@ use std::{collections::HashMap, fs, sync::Arc};
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
+    AcceleratedComponent,
     dataset::{
         Dataset, ReadyState,
         acceleration::{self, Acceleration},
     },
-    validate_identifier,
+    deprecated_ready_state_warning, validate_identifier,
 };
 use spicepod::semantic::Column;
 
@@ -108,24 +109,6 @@ impl View {
     }
 }
 
-/// Warns that a view set `acceleration.ready_state`, which the view honours but which is
-/// deprecated in favour of the view's own `ready_state`.
-///
-/// Built as a pure function so the wording a user depends on — the view's name, the key to move
-/// the setting to, and the docs link — is asserted directly by a unit test rather than only
-/// through whatever a log capture happens to retain.
-fn deprecated_acceleration_ready_state_warning(view_name: &str) -> String {
-    // `escape_debug` rather than the raw name, matching `disabled_acceleration_warning`:
-    // `validate_identifier` accepts a *quoted* identifier, and a quoted one may legally contain a
-    // newline, so a validated name can still break this line in two and forge a second one.
-    let view_name = view_name.escape_debug();
-    format!(
-        "View '{view_name}' sets `acceleration.ready_state`, which is deprecated and will be removed. \
-        Move the setting to the view's own `ready_state` to keep it working. \
-        See: https://spiceai.org/docs/reference/spicepod/views"
-    )
-}
-
 pub struct ViewBuilder {
     pub name: TableReference,
     pub sql: String,
@@ -167,7 +150,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             Some(Some(ready_state)) => {
                 tracing::warn!(
                     "{}",
-                    deprecated_acceleration_ready_state_warning(&view.name)
+                    deprecated_ready_state_warning(AcceleratedComponent::View, &view.name)
                 );
                 ReadyState::from(ready_state)
             }
@@ -362,7 +345,7 @@ impl ViewBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadyState, ViewBuilder, deprecated_acceleration_ready_state_warning};
+    use super::{AcceleratedComponent, ReadyState, ViewBuilder, deprecated_ready_state_warning};
     use spicepod::component::view as spicepod_view;
 
     /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a
@@ -479,35 +462,9 @@ sql: SELECT 1
         );
     }
 
-    /// The warning is the only thing that tells an operator to move the setting, so assert the
-    /// three parts they act on rather than that some warning was emitted.
-    #[test]
-    fn the_deprecation_warning_names_the_view_the_replacement_and_the_docs() {
-        let message = deprecated_acceleration_ready_state_warning("daily_totals");
-
-        assert!(
-            message.contains("'daily_totals'"),
-            "the warning must name the view: {message}"
-        );
-        assert!(
-            message.contains("`acceleration.ready_state`"),
-            "the warning must name the deprecated key: {message}"
-        );
-        assert!(
-            message.contains("`ready_state`") && message.contains("deprecated"),
-            "the warning must say the key is deprecated and name the replacement: {message}"
-        );
-        assert!(
-            message.contains("https://spiceai.org/docs/reference/spicepod/views"),
-            "the warning must link the docs: {message}"
-        );
-        assert!(
-            !message.contains('\n'),
-            "a log message stays on one line: {message}"
-        );
-    }
-
-    /// The single-line assertion above uses a benign name, so it cannot see this: a *quoted*
+    /// The wording itself is asserted beside the shared builder in `component::tests`. What is
+    /// specific to the view — and what makes that escaping load-bearing rather than decorative — is
+    /// that a name carrying a newline gets through `ViewBuilder::try_from` at all: a *quoted*
     /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
     /// that passes validation could otherwise break the line in two and forge a second record.
     /// `disabled_acceleration_warning` escapes for exactly this reason.
@@ -525,7 +482,7 @@ sql: SELECT 1
              makes escaping load-bearing rather than decorative"
         );
 
-        let message = deprecated_acceleration_ready_state_warning(hostile);
+        let message = deprecated_ready_state_warning(AcceleratedComponent::View, hostile);
         assert!(
             !message.contains('\n'),
             "an embedded newline must not survive into the log line: {message:?}"

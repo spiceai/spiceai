@@ -23,6 +23,7 @@ use super::{
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
+use crate::component::{AcceleratedComponent, deprecated_ready_state_warning};
 use app::App;
 use datafusion::sql::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
@@ -78,8 +79,8 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
             Some(Some(ready_state)) => {
                 tracing::warn!(
-                    "{}: `dataset.acceleration.ready_state` is deprecated, use `dataset.ready_state` instead.",
-                    dataset.name
+                    "{}",
+                    deprecated_ready_state_warning(AcceleratedComponent::Dataset, &dataset.name)
                 );
                 ReadyState::from(ready_state)
             }
