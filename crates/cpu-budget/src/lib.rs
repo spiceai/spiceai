@@ -968,8 +968,8 @@ impl CpuBudget {
         Some(format!(
             "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so {consequence}. \
              Lower it to {ceiling_value} or {raise_to} {entitlement}. Lowering leaves every pool \
-             at {pool_cores} cores — {entitlement} already rounds to that — but it corrects the \
-             busy fraction this process reports against its entitlement. See: {DOCS_URL}",
+             at {pool_cores} cores — {ceiling_value} already rounds up to that — but it corrects \
+             the busy fraction this process reports against its entitlement. See: {DOCS_URL}",
             origin = self.origin(),
             entitlement = format_millicores(self.millicores),
             ceiling_value = format_millicores(ceiling),
@@ -2029,18 +2029,21 @@ mod tests {
         );
     }
 
-    /// Lowering to a fractional ceiling changes no pool size, so the warning must
-    /// not prescribe it as though it did.
+    /// Lowering to a fractional ceiling resizes no pool but still fixes the reported
+    /// busy fraction, so the warning must keep it as a remedy while scoping the
+    /// "unchanged" claim to pool sizes.
     ///
-    /// Every derived quantity comes from `ceil(millicores / 1000)`, so a 3-core
-    /// override and the 2.5-core quota it exceeds both resolve to three workers and
-    /// three partitions. Telling the operator to lower it names a remedy that
-    /// provably moves nothing; the entitlement is what exceeds the wall, and only
-    /// raising the wall changes what the container gets.
+    /// Every *pool* comes from `ceil(millicores / 1000)`, so a 3-core override and
+    /// the 2.5-core quota it exceeds both resolve to three workers and three
+    /// partitions — promising that lowering resizes anything would over-claim.
+    /// `cpu_busy_fraction` divides by the exact `millicores` instead, so the same
+    /// lowering moves a saturated container from 0.83 to 1.0 and stops the Cayenne
+    /// tuner reading it as partly idle. Both remedies are therefore real, and the
+    /// message has to say which one buys what.
     ///
     /// Regression test for #13275.
     #[test]
-    fn a_ceiling_that_rounds_to_the_configured_cores_is_not_prescribed_as_a_remedy() {
+    fn a_ceiling_that_rounds_to_the_configured_cores_keeps_both_remedies() {
         let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
         let fractional = quota(2, 2500);
 
@@ -2080,8 +2083,9 @@ mod tests {
             "and so does raising the wall: {warning}"
         );
         assert!(
-            warning.contains("Lowering leaves every pool at 3 cores"),
-            "scopes the unchanged claim to pool sizes: {warning}"
+            warning.contains("Lowering leaves every pool at 3 cores — 2.5 cores already rounds up"),
+            "explains why lowering preserves the pools by naming the ceiling, not restating the \
+             entitlement: {warning}"
         );
         assert!(
             warning.contains("busy fraction"),
