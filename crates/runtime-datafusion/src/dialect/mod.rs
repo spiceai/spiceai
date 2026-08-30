@@ -143,6 +143,19 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
 /// node exactly as it does for a missing key, so the two cannot be told apart.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
+///
+/// The remaining JSON extraction functions each answer something that is a
+/// property of the **document's own text**, which is the half `BigQuery` is
+/// least likely to reproduce and the half its documentation says least about.
+/// `json_get_float` reads an out-of-range magnitude as an infinity and
+/// underflows to zero rather than declining the value, so a cast that declines
+/// it answers a different number on the same row rather than failing.
+/// `json_length` and `json_object_keys` walk the token stream, so they count
+/// and return **duplicate** object members in the order written — `BigQuery`
+/// counts and lists an object's members through a parsed JSON value instead.
+/// `json_get_str` and `json_get_bool` answer only for a JSON string and only
+/// for a JSON bool respectively, so both need `JSON_VALUE`'s rendering of every
+/// *other* node type to be pinned before a guard around it can be trusted.
 #[must_use]
 pub fn bigquery_native_function_names() -> Vec<&'static str> {
     bigquery::SCALAR_OVERRIDES

@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `BigQuery` translations for the JSON extraction functions, and the
-//! `BigQuery` dialect that installs them.
+//! The `BigQuery` translation of `json_get_int`, and the `BigQuery` dialect
+//! that installs it. [`SCALAR_OVERRIDES`] is the whole of what this dialect
+//! rewrites, and says what a further entry costs.
 //!
 //! `datafusion-functions-json` takes a **variadic path**, not a `JSONPath`
 //! string: `json_get_int(col, 'a', 'b', 0)` reads key `a`, then key `b`, then
@@ -36,10 +37,8 @@ use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
-    self, BinaryOperator, CaseWhen, Function, FunctionArg, FunctionArgExpr, ObjectName,
-    WindowFrameBound,
+    self, BinaryOperator, Function, FunctionArg, FunctionArgExpr, ObjectName, WindowFrameBound,
 };
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{
@@ -48,28 +47,6 @@ use datafusion::sql::unparser::dialect::{
 };
 
 pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
-pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
-pub(crate) const JSON_GET_BOOL_NAME: &str = "json_get_bool";
-pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
-pub(crate) const JSON_LENGTH_NAME: &str = "json_length";
-/// `json_length`'s alias. `ScalarUDF::name` returns the canonical name, so a
-/// plan never carries this one — but the federation deny-list is built from
-/// the registry, which does, and a name it denies that this dialect cannot
-/// render would be inconsistent. Both names carry the same handler.
-pub(crate) const JSON_LEN_NAME: &str = "json_len";
-pub(crate) const JSON_OBJECT_KEYS_NAME: &str = "json_object_keys";
-/// `json_object_keys`'s alias, carried for the reason [`JSON_LEN_NAME`] gives.
-pub(crate) const JSON_KEYS_NAME: &str = "json_keys";
-
-/// The first byte of a JSON string node's own token, as `JSON_QUERY` returns it.
-///
-/// `json_get_str` answers only for a JSON **string** — `jiter`'s `Peek::String`
-/// — and NULL for every other node. `JSON_VALUE` cannot express that on its
-/// own: it renders a number as its digits and a bool as `true`/`false`, where
-/// `json_get_str` returns NULL. `JSON_QUERY` returns the node's raw JSON token
-/// instead, and a leading double quote is what distinguishes a string node from
-/// every other type. See [`json_get_str_to_sql`].
-const JSON_STRING_TOKEN_PREFIX: &str = "\"";
 
 /// The grammar Rust's `i64::FromStr` accepts, which is what
 /// `json_get_int` applies to a JSON **string** node.
@@ -81,31 +58,12 @@ const JSON_STRING_TOKEN_PREFIX: &str = "\"";
 ///
 /// It also agrees at the boundaries: an integer too large for `i64` is NULL on
 /// both sides, because Rust's `i64::FromStr` fails rather than saturating.
-/// See [`FLOAT64_FROM_STR`] for the float grammar, which agrees for the
-/// opposite reason — both sides saturate.
 ///
 /// Any group must be non-capturing. `REGEXP_EXTRACT` accepts **at most one**
 /// capturing group and errors on more, which would fail every federated call
 /// remotely; with none it returns the whole match, which is what this wants.
-/// [`tests::no_pattern_has_a_capturing_group`] holds the patterns to that.
+/// [`tests::no_pattern_has_a_capturing_group`] holds the pattern to that.
 const INT64_FROM_STR: &str = r"^[+-]?[0-9]+$";
-
-/// The grammar Rust's `f64::FromStr` accepts, which is what `json_get_float`
-/// applies to a JSON **string** node.
-///
-/// Measured against `BigQuery`: `SAFE_CAST(… AS FLOAT64)` saturates an
-/// out-of-range magnitude to `±Infinity` and underflows to zero, exactly as
-/// Rust does, and reads `inf`, `infinity` and `nan` case-insensitively, exactly
-/// as Rust does. So the boundaries need no special rendering — they already
-/// agree.
-///
-/// What does not agree is the same pair the integer form has: `SAFE_CAST`
-/// reads `0x2A` as 42 and trims `  1.5  `, where `f64::FromStr` fails and
-/// `json_get_float` is NULL. Extracting through this pattern first is what
-/// closes that, and nothing else.
-///
-/// Every group is non-capturing, for the reason [`INT64_FROM_STR`] gives.
-const FLOAT64_FROM_STR: &str = r"^[+-]?(?:(?i:inf|infinity|nan)|(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?)$";
 
 /// What `BigQuery` should be asked for, given a `json_get_*` call's path
 /// arguments.
@@ -220,7 +178,7 @@ pub fn can_translate(call: &ScalarFunction) -> bool {
 /// verbatim into the remote SQL.
 pub(crate) struct ScalarOverride {
     pub(crate) name: &'static str,
-    /// Renders the call, or fails if it cannot — see [`json_get_number_to_sql`].
+    /// Renders the call, or fails if it cannot — see [`json_call_to_sql`].
     pub(crate) handler: fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>>,
     /// Whether `handler` can render a call with these arguments.
     pub(crate) can_translate: fn(&[Expr]) -> bool,
@@ -229,53 +187,28 @@ pub(crate) struct ScalarOverride {
 /// Every function the `BigQuery` dialect rewrites, with what each consumer
 /// needs. [`crate::dialect`] derives the dialect's handlers, the deny-list
 /// carve-out, and the per-call check from this one table.
-pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
-    ScalarOverride {
-        name: JSON_GET_INT_NAME,
-        handler: json_get_int_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_GET_STR_NAME,
-        handler: json_get_str_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_GET_BOOL_NAME,
-        handler: json_get_bool_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_GET_FLOAT_NAME,
-        handler: json_get_float_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_LENGTH_NAME,
-        handler: json_length_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_LEN_NAME,
-        handler: json_length_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_OBJECT_KEYS_NAME,
-        handler: json_object_keys_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-    ScalarOverride {
-        name: JSON_KEYS_NAME,
-        handler: json_object_keys_to_sql,
-        can_translate: json_path_is_renderable,
-    },
-];
+///
+/// An entry here is a claim that `BigQuery` answers what the local function
+/// answers, for **every** document and path the call shapes in `can_translate`
+/// admit — and it is enforced as a wrong row rather than an error, since the
+/// unparsed SQL is whatever this says it is. So the bar for an entry is a
+/// mapping measured against a real `BigQuery`, not one derived from what its
+/// documentation implies: the disagreements that matter live at the boundaries
+/// (an out-of-range magnitude, a duplicate object member, member order, a node
+/// of the wrong JSON type), which is exactly where documented behaviour is
+/// thinnest. `crate::function_support::tests::bigquery_pushes_down_exactly_one_json_function`
+/// asserts the list whole, so an entry cannot be added quietly.
+pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[ScalarOverride {
+    name: JSON_GET_INT_NAME,
+    handler: json_get_int_to_sql,
+    can_translate: json_path_is_renderable,
+}];
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
 /// and hands both to `render` as `BigQuery` SQL.
 ///
-/// Every handler goes through here so the failure below is written once. It is
+/// Every handler goes through here so the failure below is written once, and
+/// takes the function's name so the message can say which call failed. It is
 /// unreachable with the deny-list installed, which refuses exactly the calls
 /// [`json_path`] cannot render. Reachable only if this dialect is used without
 /// `deny_spice_functions_for_bigquery_table_providers`, and there the
@@ -328,306 +261,25 @@ fn json_call_to_sql(
 /// NULL from `SAFE_CAST` exactly as it is a NULL from the `i64` conversion. The
 /// pattern is what makes a JSON **string** node exact — see [`INT64_FROM_STR`].
 pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
-    json_get_number_to_sql(
+    json_call_to_sql(
         unparser,
         args,
         JSON_GET_INT_NAME,
-        INT64_FROM_STR,
         ast::DataType::Int64,
-    )
-}
-
-/// `json_get_str(doc, path…)` →
-/// `CASE WHEN STARTS_WITH(JSON_QUERY(doc, '<path>'), '"') THEN JSON_VALUE(doc, '<path>') END`.
-///
-/// `json_get_str` answers only for a JSON **string** node and NULL for every
-/// other kind. `JSON_VALUE` alone is wider than that: it renders a number as
-/// its digits and a bool as `true`/`false`, so it would answer a string where
-/// `json_get_str` answers NULL — on rows a `WHERE … IS NOT NULL` then keeps
-/// remotely and drops locally.
-///
-/// `JSON_QUERY` returns the node's own JSON token rather than its value, and
-/// only a string node's token opens with a double quote — a number, a bool, a
-/// JSON `null`, an object and an array all render bare. Testing that first byte
-/// is what narrows `JSON_VALUE` to exactly the nodes the local function
-/// answers for, so the guard is the whole reason this is translatable at all.
-///
-/// Where the two already agree, no guard is needed: `JSON_QUERY` returns SQL
-/// NULL for a missing path, and `STARTS_WITH` over NULL is NULL, so the `CASE`
-/// falls through to its implicit NULL — which is what `json_get_str` returns.
-/// The escape handling agrees too: `JSON_VALUE` unescapes, and so does
-/// `jiter`'s `known_str`, so the guard reads the raw token while the value
-/// comes back decoded.
-pub(crate) fn json_get_str_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
-    json_call_to_sql(
-        unparser,
-        args,
-        JSON_GET_STR_NAME,
-        ast::DataType::String(None),
-        |document, path| {
-            let is_string_node = call_function(
-                "STARTS_WITH",
-                vec![
-                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
-                    ast::Expr::Value(
-                        ast::Value::SingleQuotedString(JSON_STRING_TOKEN_PREFIX.to_string()).into(),
-                    ),
-                ],
-            );
-            ast::Expr::Case {
-                case_token: AttachedToken::empty(),
-                end_token: AttachedToken::empty(),
-                operand: None,
-                conditions: vec![CaseWhen {
-                    condition: is_string_node,
-                    result: call_function("JSON_VALUE", vec![document, path]),
-                }],
-                // No ELSE: a CASE with no matching WHEN is NULL, which is what
-                // `json_get_str` returns for every non-string node.
-                else_result: None,
-            }
-        },
-    )
-}
-
-/// `json_get_bool(doc, path…)` →
-/// `CASE JSON_VALUE(doc, '<path>') WHEN 'true' THEN TRUE WHEN 'false' THEN FALSE END`.
-///
-/// `json_get_bool` answers for a JSON `true`/`false`, and for a JSON **string**
-/// that Rust's `bool::from_str` accepts — which is `"true"` and `"false"`
-/// exactly, case-sensitively. Everything else is NULL.
-///
-/// Comparing `JSON_VALUE`'s rendering is what matches that, and the reason no
-/// cast appears here. Measured against `BigQuery`: `SAFE_CAST('TRUE' AS BOOL)`
-/// and `SAFE_CAST('True' AS BOOL)` both give `true`, where `bool::from_str`
-/// rejects both and the local function returns NULL. A string comparison is
-/// case-sensitive, so the two agree on exactly the same values.
-/// [`tests::no_bool_rendering_casts_to_bool`] is what keeps the cast out.
-///
-/// The single `JSON_VALUE` covers both accepted shapes at once: it renders a
-/// bool node as `true`/`false` and a string node as its decoded contents, so
-/// `"true"` and `true` both arrive as `'true'` — which is what `json_get_bool`
-/// does too. It decodes escapes on the way, so a string written `"tr\u0075e"`
-/// is `true` on both sides. A number renders as its digits and never matches,
-/// and an object, an array, a JSON `null` and a missing path are NULL from
-/// `JSON_VALUE` — NULL from `json_get_bool` as well.
-pub(crate) fn json_get_bool_to_sql(
-    unparser: &Unparser,
-    args: &[Expr],
-) -> Result<Option<ast::Expr>> {
-    json_call_to_sql(
-        unparser,
-        args,
-        JSON_GET_BOOL_NAME,
-        ast::DataType::Bool,
-        |document, path| {
-            let arm = |literal: &str, value: bool| CaseWhen {
-                condition: ast::Expr::Value(
-                    ast::Value::SingleQuotedString(literal.to_string()).into(),
-                ),
-                result: ast::Expr::Value(ast::Value::Boolean(value).into()),
-            };
-            ast::Expr::Case {
-                case_token: AttachedToken::empty(),
-                end_token: AttachedToken::empty(),
-                operand: Some(Box::new(call_function("JSON_VALUE", vec![document, path]))),
-                conditions: vec![arm("true", true), arm("false", false)],
-                // No ELSE: everything `bool::from_str` rejects is NULL on both sides.
-                else_result: None,
-            }
-        },
-    )
-}
-
-/// `json_get_float(doc, path…)` →
-/// `SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(doc, '<path>'), r'<float grammar>') AS FLOAT64)`.
-///
-/// The same shape as [`json_get_int_to_sql`], because the same two things are
-/// true: `JSON_VALUE` renders the node as its own token, and `SAFE_CAST` is
-/// wider than Rust's `FromStr` in ways a pattern can close.
-///
-/// The boundaries need nothing extra. `SAFE_CAST(… AS FLOAT64)` saturates an
-/// out-of-range magnitude to `±Infinity` and underflows to zero exactly as
-/// `f64::FromStr` does, and accepts `inf`/`infinity`/`nan` with the same
-/// case-insensitivity — all measured against `BigQuery`.
-/// `json_get_float_saturates_an_out_of_range_magnitude_to_infinity` in
-/// `runtime-udfs-api` holds the local half of that agreement.
-pub(crate) fn json_get_float_to_sql(
-    unparser: &Unparser,
-    args: &[Expr],
-) -> Result<Option<ast::Expr>> {
-    json_get_number_to_sql(
-        unparser,
-        args,
-        JSON_GET_FLOAT_NAME,
-        FLOAT64_FROM_STR,
-        ast::DataType::Float64,
-    )
-}
-
-/// `json_length(doc, path…)` → a `CASE` counting an array's elements or an
-/// object's keys, and NULL for every other node.
-///
-/// `json_length` answers only for an array and an object. `BigQuery` counts the
-/// two with different functions, so the node's own JSON token picks the branch:
-/// only an array's opens with `[` and only an object's with `{`.
-///
-/// * array — `ARRAY_LENGTH(JSON_QUERY_ARRAY(doc, path))`.
-/// * object — `ARRAY_LENGTH(JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(doc, path)), 1))`.
-///   The depth argument is load-bearing: without it `JSON_KEYS` descends,
-///   returning `["b", "c", "c.d"]` for `{"b":1,"c":{"d":2}}` where
-///   `json_length` counts two. `SAFE.PARSE_JSON` cannot fail the query — it is
-///   NULL for anything it will not parse, and `JSON_KEYS` and `ARRAY_LENGTH`
-///   carry that NULL out — so neither `CASE` branch can raise where the local
-///   function returns a number.
-///
-/// An empty array and an empty object are both 0 on both sides, and every
-/// scalar node, a JSON `null`, a missing path and a NULL document are NULL on
-/// both — all measured against `BigQuery`.
-///
-/// The local function returns `UInt64` and `BigQuery` has no unsigned type, so
-/// the count arrives as `INT64` and the scan's schema cast reconciles it. A
-/// count is never negative, so the conversion cannot lose one.
-pub(crate) fn json_length_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
-    json_call_to_sql(
-        unparser,
-        args,
-        JSON_LENGTH_NAME,
-        ast::DataType::Int64,
-        |document, path| {
-            let token = || call_function("JSON_QUERY", vec![document.clone(), path.clone()]);
-            let opens_with = |brace: &str| {
-                call_function(
-                    "STARTS_WITH",
-                    vec![
-                        token(),
-                        ast::Expr::Value(ast::Value::SingleQuotedString(brace.to_string()).into()),
-                    ],
-                )
-            };
-            ast::Expr::Case {
-                case_token: AttachedToken::empty(),
-                end_token: AttachedToken::empty(),
-                operand: None,
-                conditions: vec![
-                    CaseWhen {
-                        condition: opens_with("["),
-                        result: call_function(
-                            "ARRAY_LENGTH",
-                            vec![call_function(
-                                "JSON_QUERY_ARRAY",
-                                vec![document.clone(), path.clone()],
-                            )],
-                        ),
-                    },
-                    CaseWhen {
-                        condition: opens_with("{"),
-                        result: call_function(
-                            "ARRAY_LENGTH",
-                            vec![call_function(
-                                "JSON_KEYS",
-                                vec![parse_json(token()), depth(1)],
-                            )],
-                        ),
-                    },
-                ],
-                // No ELSE: json_length is NULL for every node that is neither.
-                else_result: None,
-            }
-        },
-    )
-}
-
-/// `json_object_keys(doc, path…)` →
-/// `CASE WHEN STARTS_WITH(JSON_QUERY(doc, '<path>'), '{')
-///  THEN JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(doc, '<path>')), 1) END`.
-///
-/// `json_object_keys` answers only for an object, and only with that object's
-/// own keys. The depth argument is what holds `JSON_KEYS` to the same level —
-/// without it `BigQuery` descends and returns `["b", "c", "c.d"]` where the local
-/// function returns `["b", "c"]`. The `{` test is what makes every other node
-/// NULL, matching the local function, since what `JSON_KEYS` does with an array
-/// or a scalar is not something this rests on.
-///
-/// This is the one function here whose element type has to survive the trip:
-/// it returns `List(Field { name: "item", … })`, and `BigQuery` sends back an
-/// `ARRAY<STRING>` whose element field the driver names. A disagreement there
-/// would fail the query rather than answer it differently, so unlike the rest
-/// of this module the risk is loud. Measured against a real `BigQuery` through
-/// the ADBC driver: the array arrives as a `List(Utf8)` the plan accepts.
-pub(crate) fn json_object_keys_to_sql(
-    unparser: &Unparser,
-    args: &[Expr],
-) -> Result<Option<ast::Expr>> {
-    json_call_to_sql(
-        unparser,
-        args,
-        JSON_OBJECT_KEYS_NAME,
-        ast::DataType::Array(ast::ArrayElemTypeDef::AngleBracket(Box::new(
-            ast::DataType::String(None),
-        ))),
-        |document, path| {
-            let token = call_function("JSON_QUERY", vec![document, path]);
-            ast::Expr::Case {
-                case_token: AttachedToken::empty(),
-                end_token: AttachedToken::empty(),
-                operand: None,
-                conditions: vec![CaseWhen {
-                    condition: call_function(
-                        "STARTS_WITH",
-                        vec![
-                            token.clone(),
-                            ast::Expr::Value(
-                                ast::Value::SingleQuotedString("{".to_string()).into(),
-                            ),
-                        ],
-                    ),
-                    result: call_function("JSON_KEYS", vec![parse_json(token), depth(1)]),
-                }],
-                else_result: None,
-            }
-        },
-    )
-}
-
-fn json_get_number_to_sql(
-    unparser: &Unparser,
-    args: &[Expr],
-    function: &str,
-    pattern: &str,
-    cast_to: ast::DataType,
-) -> Result<Option<ast::Expr>> {
-    json_call_to_sql(
-        unparser,
-        args,
-        function,
-        cast_to.clone(),
         |document, path| ast::Expr::Cast {
             kind: ast::CastKind::SafeCast,
             expr: Box::new(call_function(
                 "REGEXP_EXTRACT",
                 vec![
                     call_function("JSON_VALUE", vec![document, path]),
-                    ast::Expr::Value(raw_string(pattern).into()),
+                    ast::Expr::Value(raw_string(INT64_FROM_STR).into()),
                 ],
             )),
-            data_type: cast_to,
+            data_type: ast::DataType::Int64,
             array: false,
             format: None,
         },
     )
-}
-
-/// `SAFE.PARSE_JSON(value)` — SAFE so a document it will not parse is a NULL
-/// carried out through the call rather than a failed query.
-fn parse_json(value: ast::Expr) -> ast::Expr {
-    call_qualified_function("SAFE", "PARSE_JSON", vec![value])
-}
-
-/// A `JSON_KEYS` depth argument. Load-bearing: without it `BigQuery` descends and
-/// returns nested paths, where the local functions see only the top level.
-fn depth(levels: u32) -> ast::Expr {
-    ast::Expr::Value(ast::Value::Number(levels.to_string(), false).into())
 }
 
 fn cast_null_to(data_type: ast::DataType) -> ast::Expr {
@@ -638,18 +290,6 @@ fn cast_null_to(data_type: ast::DataType) -> ast::Expr {
         array: false,
         format: None,
     }
-}
-
-/// A call to a function reached through a prefix, such as `SAFE.PARSE_JSON`.
-fn call_qualified_function(prefix: &str, name: &str, args: Vec<ast::Expr>) -> ast::Expr {
-    let mut call = call_function(name, args);
-    if let ast::Expr::Function(function) = &mut call {
-        function.name = ObjectName(vec![
-            ast::ObjectNamePart::Identifier(ast::Ident::new(prefix)),
-            ast::ObjectNamePart::Identifier(ast::Ident::new(name)),
-        ]);
-    }
-    call
 }
 
 fn call_function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
@@ -870,11 +510,22 @@ mod tests {
     use datafusion::sql::unparser::Unparser;
 
     use super::{
-        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_GET_BOOL_NAME, JSON_GET_FLOAT_NAME,
-        JSON_GET_INT_NAME, JSON_GET_STR_NAME, JSON_KEYS_NAME, JSON_LEN_NAME, JSON_LENGTH_NAME,
-        JSON_OBJECT_KEYS_NAME, JsonPath, SpiceBigQueryDialect, can_translate, json_path,
+        INT64_FROM_STR, JSON_GET_INT_NAME, JsonPath, SpiceBigQueryDialect, can_translate, json_path,
     };
-    use crate::dialect::new_bigquery_dialect;
+    use crate::dialect::{bigquery_native_function_names, new_bigquery_dialect};
+
+    /// The JSON functions this dialect deliberately leaves to the local engine.
+    /// Every one of them is a name `datafusion-functions-json` registers, so a
+    /// carve-out for it would federate — which is what these hold shut.
+    const UNTRANSLATED: &[&str] = &[
+        "json_get_str",
+        "json_get_bool",
+        "json_get_float",
+        "json_length",
+        "json_len",
+        "json_object_keys",
+        "json_keys",
+    ];
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::expr::ScalarFunction;
@@ -950,7 +601,7 @@ mod tests {
         // more; with none it returns the whole match. A capturing group added
         // here would fail every federated call at BigQuery, which no local test
         // can see.
-        for pattern in [INT64_FROM_STR, FLOAT64_FROM_STR] {
+        for pattern in [INT64_FROM_STR] {
             let mut chars = pattern.chars().peekable();
             while let Some(c) = chars.next() {
                 match c {
@@ -965,6 +616,63 @@ mod tests {
                     _ => {}
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_integer_grammar_accepts_what_rust_accepts_and_nothing_more() {
+        // Every case is asserted against Rust's own parser as well as the
+        // pattern, so the two cannot drift apart while the test still passes.
+        // `regex` and BigQuery's engine are both RE2 lineage, so a pattern this
+        // one accepts is one BigQuery accepts.
+        let pattern = regex::Regex::new(INT64_FROM_STR).expect("the integer grammar compiles");
+        for accepted in [
+            "0",
+            "1",
+            "-1",
+            "+1",
+            "9223372036854775807",
+            "-9223372036854775808",
+        ] {
+            assert!(
+                pattern.is_match(accepted),
+                "`{accepted}` parses as i64 in Rust, so the pattern must accept it"
+            );
+            assert!(
+                accepted.parse::<i64>().is_ok(),
+                "`{accepted}` must actually parse in Rust, or this test is asserting the wrong thing"
+            );
+        }
+        // `0x2A` and `  1  ` are the pair SAFE_CAST reads and Rust does not,
+        // which is the whole reason the extraction happens before the cast.
+        for rejected in ["0x2A", "  1  ", "1.0", "1e3", "", "-", "1,5", "true"] {
+            assert!(
+                !pattern.is_match(rejected),
+                "`{rejected}` is not an i64 in Rust, so the pattern must reject it"
+            );
+            assert!(
+                rejected.parse::<i64>().is_err(),
+                "`{rejected}` must actually fail in Rust, or this test is asserting the wrong thing"
+            );
+        }
+    }
+
+    /// An integer outside `i64` is the boundary the two sides agree on for the
+    /// opposite reason to the float form: the pattern matches the digits, and
+    /// both Rust's `i64::FromStr` and `SAFE_CAST(… AS INT64)` decline the value
+    /// rather than saturating, so both are NULL.
+    #[test]
+    fn the_integer_grammar_leaves_an_out_of_range_magnitude_to_the_cast() {
+        let pattern = regex::Regex::new(INT64_FROM_STR).expect("the integer grammar compiles");
+        for out_of_range in ["9223372036854775808", "-9223372036854775809"] {
+            assert!(
+                pattern.is_match(out_of_range),
+                "`{out_of_range}` is a run of digits, so the pattern matches it"
+            );
+            assert!(
+                out_of_range.parse::<i64>().is_err(),
+                "`{out_of_range}` must not parse, or the NULL the cast gives has no counterpart"
+            );
         }
     }
 
@@ -1009,23 +717,7 @@ mod tests {
             JSON_GET_INT_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(can_translate(&call(
-            JSON_GET_STR_NAME,
-            vec![col("doc"), lit("a")]
-        )));
-        assert!(!can_translate(&call(
-            JSON_GET_STR_NAME,
-            vec![col("doc"), col("key")]
-        )));
-        assert!(can_translate(&call(
-            JSON_GET_BOOL_NAME,
-            vec![col("doc"), lit("a")]
-        )));
-        assert!(!can_translate(&call(
-            JSON_GET_BOOL_NAME,
-            vec![col("doc"), col("key")]
-        )));
-        for name in ["json_contains", "upper"] {
+        for name in UNTRANSLATED.iter().chain(&["json_contains", "upper"]) {
             assert!(
                 can_translate(&call(name, vec![col("doc"), col("key")])),
                 "{name} has no handler in this dialect, so it is not this check's business — \
@@ -1051,156 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn json_get_str_renders_as_a_guarded_json_value() {
-        // The STARTS_WITH/JSON_QUERY guard is the whole reason this is
-        // translatable: JSON_VALUE alone renders a JSON number as its digits,
-        // where `json_get_str` returns NULL.
-        assert_eq!(
-            render(JSON_GET_STR_NAME, vec![col("doc"), lit("a")]),
-            r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
-        );
-    }
-
-    #[test]
-    fn json_get_str_never_resolving_renders_as_a_typed_null() {
-        // Utf8, not Int64: a federated schema that disagrees with the local one
-        // is a cast error at best and a wrong column type at worst.
-        assert_eq!(
-            render(JSON_GET_STR_NAME, vec![col("doc"), lit(-1_i64)]),
-            "CAST(NULL AS STRING)"
-        );
-    }
-
-    #[test]
-    fn json_get_bool_renders_as_a_case_over_the_rendered_text() {
-        // A string comparison, not SAFE_CAST(… AS BOOL): the cast is
-        // case-insensitive where Rust's `bool::from_str` is not, so a cast
-        // would answer true for "TRUE" where the local function is NULL.
-        assert_eq!(
-            render(JSON_GET_BOOL_NAME, vec![col("doc"), lit("a")]),
-            r#"CASE JSON_VALUE(`doc`, R'$."a"') WHEN 'true' THEN true WHEN 'false' THEN false END"#
-        );
-    }
-
-    #[test]
-    fn no_bool_rendering_casts_to_bool() {
-        // The whole reason `json_get_bool` is translatable is that it never
-        // reaches BigQuery's BOOL cast. If one appears, the case-sensitivity
-        // agreement is gone and "TRUE" starts answering true remotely only.
-        let sql = render(JSON_GET_BOOL_NAME, vec![col("doc"), lit("a")]);
-        assert!(
-            !sql.contains("AS BOOL"),
-            "a BOOL cast is case-insensitive and must not appear: {sql}"
-        );
-    }
-
-    #[test]
-    fn json_get_float_renders_as_a_guarded_safe_cast() {
-        assert_eq!(
-            render(JSON_GET_FLOAT_NAME, vec![col("doc"), lit("a")]),
-            concat!(
-                r#"SAFE_CAST(REGEXP_EXTRACT(JSON_VALUE(`doc`, R'$."a"'), "#,
-                r#"R'^[+-]?(?:(?i:inf|infinity|nan)|(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+|[0-9]+)"#,
-                r#"(?:[eE][+-]?[0-9]+)?)$') AS FLOAT64)"#
-            )
-        );
-    }
-
-    #[test]
-    fn the_float_grammar_accepts_what_rust_accepts_and_nothing_more() {
-        // Every case is asserted against Rust's own parser as well as the
-        // pattern, so the two cannot drift apart while the test still passes.
-        // `regex` and BigQuery's engine are both RE2 lineage, so a pattern this
-        // one accepts is one BigQuery accepts.
-        let pattern = regex::Regex::new(FLOAT64_FROM_STR).expect("the float grammar compiles");
-        for accepted in [
-            "1", "-1", "1.5", "-1.5", "1.", ".5", "1e3", "-1E-3", "0", "inf", "-inf", "Infinity",
-            "INFINITY", "nan", "NaN", "+1.5",
-        ] {
-            assert!(
-                pattern.is_match(accepted),
-                "`{accepted}` parses as f64 in Rust, so the pattern must accept it"
-            );
-            assert!(
-                accepted.parse::<f64>().is_ok(),
-                "`{accepted}` must actually parse in Rust, or this test is asserting the wrong thing"
-            );
-        }
-        for rejected in [
-            "0x2A", "  1.5  ", "1.5f", "", "e3", "1e", "1,5", "true", "--1",
-        ] {
-            assert!(
-                !pattern.is_match(rejected),
-                "`{rejected}` is not an f64 in Rust, so the pattern must reject it"
-            );
-            assert!(
-                rejected.parse::<f64>().is_err(),
-                "`{rejected}` must actually fail in Rust, or this test is asserting the wrong thing"
-            );
-        }
-    }
-
-    #[test]
-    fn json_length_counts_an_array_and_an_object_differently() {
-        // The depth argument on JSON_KEYS is what keeps an object's count to
-        // its own keys: without it BigQuery descends and returns nested paths,
-        // where json_length counts only the top level.
-        assert_eq!(
-            render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]),
-            concat!(
-                r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '[') "#,
-                r#"THEN ARRAY_LENGTH(JSON_QUERY_ARRAY(`doc`, R'$."a"')) "#,
-                r#"WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '{') "#,
-                r#"THEN ARRAY_LENGTH(JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$."a"')), 1)) END"#
-            )
-        );
-    }
-
-    #[test]
-    fn json_length_object_keys_are_capped_to_the_top_level() {
-        let sql = render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]);
-        assert!(
-            sql.contains("JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$.\"a\"')), 1)"),
-            "JSON_KEYS must carry the depth argument, or it counts nested paths: {sql}"
-        );
-    }
-
-    #[test]
-    fn json_object_keys_renders_as_a_depth_capped_json_keys() {
-        assert_eq!(
-            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit("a")]),
-            concat!(
-                r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '{') "#,
-                r#"THEN JSON_KEYS(SAFE.PARSE_JSON(JSON_QUERY(`doc`, R'$."a"')), 1) END"#
-            )
-        );
-    }
-
-    #[test]
-    fn json_object_keys_never_resolving_keeps_its_element_type() {
-        // An untyped NULL would make the federated schema disagree with the
-        // plan's List(Utf8), which is a failed query rather than a wrong row.
-        assert_eq!(
-            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit(-1_i64)]),
-            "CAST(NULL AS ARRAY<STRING>)"
-        );
-    }
-
-    #[test]
-    fn the_alias_renders_exactly_as_the_canonical_name_does() {
-        assert_eq!(
-            render(JSON_LEN_NAME, vec![col("doc"), lit("a")]),
-            render(JSON_LENGTH_NAME, vec![col("doc"), lit("a")]),
-            "`json_len` is `json_length`; the two must not drift"
-        );
-        assert_eq!(
-            render(JSON_KEYS_NAME, vec![col("doc"), lit("a")]),
-            render(JSON_OBJECT_KEYS_NAME, vec![col("doc"), lit("a")]),
-            "`json_keys` is `json_object_keys`; the two must not drift"
-        );
-    }
-
-    #[test]
     fn a_path_that_can_never_resolve_renders_as_a_typed_null() {
         assert_eq!(
             render(JSON_GET_INT_NAME, vec![col("doc"), lit(-1_i64)]),
@@ -1210,14 +752,7 @@ mod tests {
 
     #[test]
     fn no_rendering_ever_contains_the_function_verbatim() {
-        for name in [
-            JSON_GET_INT_NAME,
-            JSON_GET_STR_NAME,
-            JSON_GET_BOOL_NAME,
-            JSON_GET_FLOAT_NAME,
-            JSON_LENGTH_NAME,
-            JSON_OBJECT_KEYS_NAME,
-        ] {
+        for name in [JSON_GET_INT_NAME] {
             for args in [
                 vec![col("doc"), lit("a")],
                 vec![col("doc"), lit("a"), lit(0_i64)],
@@ -1271,7 +806,7 @@ mod tests {
         // list is only safe while the dialect answers for all of it.
         let dialect = new_bigquery_dialect();
         let unparser = Unparser::new(dialect.as_ref());
-        for name in crate::dialect::bigquery_native_function_names() {
+        for name in bigquery_native_function_names() {
             let rendered = dialect
                 .scalar_function_to_sql_overrides(&unparser, name, &[col("doc"), lit("a")])
                 .unwrap_or_else(|error| panic!("the dialect must render `{name}`: {error}"));
@@ -1279,6 +814,38 @@ mod tests {
                 rendered.is_some(),
                 "`{name}` is carved out of the deny-list but the dialect has no handler for it, \
                  so it would be unparsed verbatim into BigQuery SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn the_carve_out_is_one_name_wide() {
+        assert_eq!(
+            bigquery_native_function_names(),
+            vec![JSON_GET_INT_NAME],
+            "`json_get_int` is the only JSON function whose BigQuery rendering has been \
+             measured to answer what the local function answers"
+        );
+    }
+
+    #[test]
+    fn the_untranslated_json_families_have_no_rendering_at_all() {
+        // No handler is what makes the deny-list the single gate for these: the
+        // dialect has nothing to offer the unparser, so the only thing standing
+        // between them and a `json_get_float(...)` verbatim in BigQuery SQL is
+        // that they never federate. `crate::function_support` is where that is
+        // asserted; this is the half that says the dialect cannot quietly grow
+        // a rendering the carve-out has not accounted for.
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for name in UNTRANSLATED {
+            let rendered = dialect
+                .scalar_function_to_sql_overrides(&unparser, name, &[col("doc"), lit("a")])
+                .unwrap_or_else(|error| panic!("the dialect must not fail on `{name}`: {error}"));
+            assert!(
+                rendered.is_none(),
+                "`{name}` has a BigQuery rendering but is not carved out of the deny-list; one \
+                 of the two is wrong"
             );
         }
     }

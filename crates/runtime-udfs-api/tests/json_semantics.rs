@@ -45,7 +45,8 @@ use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs, ScalarUD
 use datafusion::prelude::{SessionContext, col, lit};
 use datafusion_functions_json::functions::json_as_text;
 use datafusion_functions_json::udfs::{
-    json_get_float_udf, json_get_int_udf, json_get_str_udf, json_get_udf,
+    json_get_float_udf, json_get_int_udf, json_get_str_udf, json_get_udf, json_length_udf,
+    json_object_keys_udf,
 };
 use datafusion_functions_json::{JSON_UNION_DATA_TYPE, JsonUnionEncoder, JsonUnionValue};
 
@@ -106,6 +107,33 @@ fn get_float(json: &str, path: &[Path]) -> Option<f64> {
     match call(&json_get_float_udf(), json, path, DataType::Float64) {
         ScalarValue::Float64(value) => value,
         other => panic!("json_get_float returned {other:?}, not a Float64"),
+    }
+}
+
+fn get_length(json: &str, path: &[Path]) -> Option<u64> {
+    match call(&json_length_udf(), json, path, DataType::UInt64) {
+        ScalarValue::UInt64(value) => value,
+        other => panic!("json_length returned {other:?}, not a UInt64"),
+    }
+}
+
+fn get_object_keys(json: &str, path: &[Path]) -> Option<Vec<String>> {
+    let return_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    match call(&json_object_keys_udf(), json, path, return_type) {
+        ScalarValue::List(list) if list.is_valid(0) => {
+            let keys = list.value(0);
+            let strings = keys
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("json_object_keys returns a list of strings");
+            Some(
+                (0..strings.len())
+                    .map(|index| strings.value(index).to_string())
+                    .collect(),
+            )
+        }
+        ScalarValue::List(_) => None,
+        other => panic!("json_object_keys returned {other:?}, not a List"),
     }
 }
 
@@ -458,4 +486,54 @@ fn json_get_float_saturates_an_out_of_range_magnitude_to_infinity() {
             "{value} must underflow to zero"
         );
     }
+}
+
+/// `json_length` walks the document's own token stream, so it counts object
+/// members **as written**: a duplicate key is two members, not one.
+///
+/// This is why `json_length` is not carved out for `BigQuery` pushdown: the
+/// count is a property of the document's text, where `BigQuery` counts an
+/// object's members through a parsed JSON value, and nothing has established
+/// that the two agree on a document written this way.
+#[test]
+fn json_length_counts_duplicate_object_members_separately() {
+    assert_eq!(
+        get_length(r#"{"a": {"b": 1, "b": 2}}"#, A),
+        Some(2),
+        "both members are counted, however the document spells them"
+    );
+    assert_eq!(
+        get_length(r#"{"a": {"b": 1, "c": 2}}"#, A),
+        Some(2),
+        "the distinct-key case is the same count, which is what makes the duplicate \
+         case indistinguishable remotely"
+    );
+
+    // Nothing but an array or an object has a length; the rest are NULL.
+    assert_eq!(get_length(&doc("[1, 2, 3]"), A), Some(3));
+    assert_eq!(get_length(&doc("{}"), A), Some(0));
+    assert_eq!(get_length(&doc("1"), A), None);
+    assert_eq!(get_length(&doc("null"), A), None);
+    assert_eq!(get_length(&doc(r#""ab""#), A), None);
+}
+
+/// `json_object_keys` returns an object's keys in the order the document
+/// writes them, duplicates included.
+///
+/// This is why `json_object_keys` is not carved out for `BigQuery` pushdown:
+/// both properties are the document's own text, and nothing has established
+/// that an array `BigQuery` builds from a parsed JSON value carries either.
+#[test]
+fn json_object_keys_preserves_the_written_order_and_duplicates() {
+    assert_eq!(
+        get_object_keys(r#"{"a": {"b": 1, "a": 2, "b": 3}}"#, A),
+        Some(vec!["b".to_string(), "a".to_string(), "b".to_string()]),
+        "the keys come back as written — not sorted, and not deduplicated"
+    );
+
+    // Only an object has keys; the rest are NULL.
+    assert_eq!(get_object_keys(&doc("{}"), A), Some(vec![]));
+    assert_eq!(get_object_keys(&doc("[1, 2]"), A), None);
+    assert_eq!(get_object_keys(&doc("1"), A), None);
+    assert_eq!(get_object_keys(&doc("null"), A), None);
 }

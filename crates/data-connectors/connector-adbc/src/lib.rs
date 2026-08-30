@@ -2314,28 +2314,6 @@ mod function_support_tests {
             "the BigQuery dialect rewrites this into JSON_VALUE, so it must push down"
         );
         assert!(
-            federates("bigquery", json_call("json_get_str", vec![lit("a")])).await,
-            "the BigQuery dialect guards JSON_VALUE with JSON_QUERY for the string \
-             form, so it must push down too"
-        );
-        assert!(
-            federates("bigquery", json_call("json_get_bool", vec![lit("a")])).await,
-            "the BigQuery dialect compares JSON_VALUE's rendering for the bool form"
-        );
-        assert!(
-            federates("bigquery", json_call("json_get_float", vec![lit("a")])).await,
-            "BigQuery's SAFE_CAST saturates exactly as Rust's f64::FromStr does, so the \
-             float form is translatable too"
-        );
-        assert!(
-            federates("bigquery", json_call("json_length", vec![lit("a")])).await,
-            "an array's and an object's counts each have a BigQuery equivalent"
-        );
-        assert!(
-            federates("bigquery", json_call("json_object_keys", vec![lit("a")])).await,
-            "JSON_KEYS at depth 1 is the object's own keys, which is what this returns"
-        );
-        assert!(
             federates(
                 "bigquery",
                 json_call("json_get_int", vec![lit("a"), lit(0_i64)])
@@ -2368,17 +2346,6 @@ mod function_support_tests {
             "a key the SQL-literal and JSON-path layers quote differently is left local \
              rather than escaped across both and silently turned into another path"
         );
-        // The check is per call, not per function: every translated name owes
-        // the same refusals, or the newest handler is the one that federates a
-        // shape it cannot render.
-        assert!(
-            !federates("bigquery", json_call("json_get_str", vec![col("val")])).await,
-            "a per-row path has no BigQuery translation for the string form either"
-        );
-        assert!(
-            !federates("bigquery", json_call("json_get_str", vec![lit(r#"a"b"#)])).await,
-            "an unquotable key is left local for the string form too"
-        );
     }
 
     #[tokio::test]
@@ -2392,6 +2359,19 @@ mod function_support_tests {
             // A JSON `null` and a missing key are indistinguishable in
             // BigQuery, and json_contains tells them apart.
             "json_contains",
+            // Each answers something that is a property of the document's own
+            // text — an infinity rather than a declined value, a duplicate
+            // object member, the order members were written in, one JSON node
+            // type and not the rest. `runtime_datafusion::dialect` carries the
+            // reason per function. Aliases are listed too, because the
+            // deny-list answers by registered name.
+            "json_get_float",
+            "json_get_str",
+            "json_get_bool",
+            "json_length",
+            "json_len",
+            "json_object_keys",
+            "json_keys",
         ] {
             assert!(
                 !federates("bigquery", json_call(name, vec![lit("a")])).await,

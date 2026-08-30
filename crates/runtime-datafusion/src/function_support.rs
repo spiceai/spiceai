@@ -103,3 +103,70 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
         .deny_also(unsupported_arrays)
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, create_udf};
+    use datafusion::prelude::{col, lit};
+
+    use super::deny_spice_functions_for_bigquery_table_providers;
+
+    /// A `json_*(doc, 'a')` call over a column, the shape a plan carries when a
+    /// JSON function reads a constant path.
+    fn json_call(name: &str, path: Vec<Expr>) -> Expr {
+        let mut args = vec![col("doc")];
+        args.extend(path);
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; args.len()],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, args))
+    }
+
+    /// The `BigQuery` carve-out is one name wide, and this is what holds it
+    /// there. Every other JSON function is a translation nothing in this repo
+    /// has measured against a real `BigQuery`, and each carries a divergence
+    /// that would come back as a wrong row rather than an error — so the list
+    /// is asserted whole, not sampled.
+    #[test]
+    fn bigquery_pushes_down_exactly_one_json_function() {
+        let support = deny_spice_functions_for_bigquery_table_providers();
+        let pushed: Vec<&str> = runtime_udfs_api::json_function_names()
+            .iter()
+            .filter(|name| support.supports(&json_call(name, vec![lit("a")])))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            pushed,
+            ["json_get_int"],
+            "only `json_get_int` has a BigQuery translation verified to answer what the local \
+             function answers; every other JSON function must be evaluated locally"
+        );
+    }
+
+    /// Non-vacuity for the assertion above: the deny-list is not simply
+    /// refusing everything. `json_get_int` over a constant path federates, and
+    /// the same name over a per-row path does not, because `BigQuery`'s JSON
+    /// path argument must be a constant.
+    #[test]
+    fn the_bigquery_carve_out_still_answers_per_call() {
+        let support = deny_spice_functions_for_bigquery_table_providers();
+
+        assert!(
+            support.supports(&json_call("json_get_int", vec![lit("a")])),
+            "a constant path is the shape the BigQuery dialect renders"
+        );
+        assert!(
+            !support.supports(&json_call("json_get_int", vec![col("doc")])),
+            "a per-row path has no BigQuery translation, so it must not federate"
+        );
+    }
+}
