@@ -654,6 +654,31 @@ mod tests {
         Ok(())
     }
 
+    /// Assert that `sql`'s `CAST(event_date AS TIMESTAMP)` is evaluated inside the Vortex
+    /// scan.
+    ///
+    /// Both date-cast guards below assert a row count, and `DataFusion` returns the same
+    /// count when it evaluates the filter itself in a `FilterExec` above the scan. Without
+    /// this, a pushdown that stopped happening would leave them green and guarding nothing.
+    async fn assert_cast_pushes_into_the_scan(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let plan = ctx
+            .session
+            .state()
+            .create_physical_plan(ctx.session.sql(sql).await?.logical_plan())
+            .await?;
+        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_display.contains("predicate: CAST(event_date"),
+            "the cast has to push into the Vortex scan, got plan:\n{plan_display}"
+        );
+        Ok(())
+    }
+
     /// A pushed-down `CAST(date_col AS TIMESTAMP)` has to return the matching rows.
     ///
     /// The filter goes into the Vortex scan whole, and the scan uses it twice: it
@@ -694,20 +719,7 @@ mod tests {
         let sql = "SELECT count(*) FROM events \
                    WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
 
-        // The cast has to be inside the scan for this to be the pushdown path at all.
-        let plan = ctx
-            .session
-            .state()
-            .create_physical_plan(ctx.session.sql(sql).await?.logical_plan())
-            .await?;
-        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
-            .indent(true)
-            .to_string();
-        assert!(
-            plan_display.contains("predicate: CAST(event_date"),
-            "the cast has to push into the Vortex scan, got plan:\n{plan_display}"
-        );
-
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
         assert_eq!(
             scalar_count(&ctx, sql).await?,
             1,
@@ -760,13 +772,12 @@ mod tests {
             .await?;
         writer.shutdown().await?;
 
+        let sql = "SELECT count(*) FROM '/date64.vortex' \
+                   WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
+
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
         assert_eq!(
-            scalar_count(
-                &ctx,
-                "SELECT count(*) FROM '/date64.vortex' \
-                 WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'",
-            )
-            .await?,
+            scalar_count(&ctx, sql).await?,
             1,
             "2024-03-01 matches, so the file cannot be pruned"
         );
