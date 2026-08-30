@@ -501,7 +501,7 @@ mod tests {
     /// `2^53 + 1` is the first count an `f64` cannot hold: it rounds to `2^53`, one microsecond
     /// below. That is the whole error, which is why this pins the literal rather than a tolerance.
     #[test]
-    fn a_timestamp_past_the_f64_integer_bound_names_the_microsecond_it_holds() {
+    fn a_microsecond_count_past_the_double_bound_is_rendered_exactly() {
         let schema = aware_ts_schema();
         let past_2255 = 9_007_199_254_740_993_i64;
         let filter = col("ts").gt(micros_literal(past_2255));

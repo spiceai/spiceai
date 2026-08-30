@@ -103,6 +103,9 @@ pub type ExecutorAddressProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 #[derive(Clone)]
 pub struct BroadcastJoinFlightSqlExec {
     sql: String,
+    /// The tables this join reads, for the errors its stream can raise. A broadcast join
+    /// reads two, and either one's connector can be the source of a malformed batch.
+    source_tables: String,
     client: FlightSqlClient,
     cookie_store: Arc<CookieStore>,
     output_schema: SchemaRef,
@@ -114,6 +117,7 @@ pub struct BroadcastJoinFlightSqlExec {
 impl BroadcastJoinFlightSqlExec {
     fn new(
         sql: String,
+        source_tables: String,
         client: FlightSqlClient,
         cookie_store: Arc<CookieStore>,
         output_schema: SchemaRef,
@@ -128,6 +132,7 @@ impl BroadcastJoinFlightSqlExec {
         ));
         Self {
             sql,
+            source_tables,
             client,
             cookie_store,
             output_schema,
@@ -185,8 +190,13 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         // mirroring `FlightSqlExec`'s own schema alignment.
         let target = Arc::clone(&self.output_schema);
         let target_for_map = Arc::clone(&target);
-        let stream = query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
-            .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
+        let stream = query_to_stream(
+            client,
+            self.sql.clone(),
+            Arc::clone(&self.cookie_store),
+            self.source_tables.clone(),
+        )
+        .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
     }
 
@@ -326,9 +336,19 @@ fn try_rewrite(
     let output_schema = join.schema();
     let statistics = Statistics::new_unknown(&output_schema);
     let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(fact.flight_execs.len());
+    // Every scan on a side reads the same table, so either side's first exec names it.
+    let source_tables = match (fact.flight_execs.first(), dim.flight_execs.first()) {
+        (Some(fact_fe), Some(dim_fe)) => format!(
+            "{} (joined with {})",
+            fact_fe.table_reference().to_quoted_string(),
+            dim_fe.table_reference().to_quoted_string()
+        ),
+        _ => return Ok(Transformed::no(plan)),
+    };
     for fe in &fact.flight_execs {
         children.push(Arc::new(BroadcastJoinFlightSqlExec::new(
             sql.clone(),
+            source_tables.clone(),
             fe.client().clone(),
             Arc::clone(fe.cookie_store()),
             Arc::clone(&output_schema),

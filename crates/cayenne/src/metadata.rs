@@ -2098,7 +2098,12 @@ pub struct InlinedData {
     pub created_at: String,
 }
 
-/// Aggregate size information for inline data entries in the metastore.
+/// Aggregate size information for the metastore's two inline tables.
+///
+/// Both are reported together because the inline checkpoint clears both together
+/// and they do not fill together — see `CayenneTableProvider`'s
+/// `inlined_tombstone_bytes` for why `cayenne_inlined_delete` grows on a table
+/// whose `cayenne_inlined_data` stays empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinedDataStats {
     /// Total number of visible rows represented by inline entries.
@@ -2107,6 +2112,33 @@ pub struct InlinedDataStats {
     pub entry_count: i64,
     /// Total serialized Arrow IPC bytes stored inline.
     pub ipc_bytes: i64,
+    /// Number of inline tombstone rows (`cayenne_inlined_delete`).
+    pub tombstone_entry_count: i64,
+    /// Total serialized tombstone-key bytes stored inline.
+    pub tombstone_ipc_bytes: i64,
+}
+
+/// Metastore bytes a `cayenne_inlined_delete` row costs beyond its `delete_ipc`
+/// payload: the `inlined_id` and `table_id` UUID text, the sequence number, the
+/// timestamp, the activation flag, the row header, and the
+/// `(table_id, sequence_number)` index entry.
+///
+/// Charged so a budget spent against tombstone size bounds their ROW count too.
+/// A single-key `Int64` tombstone's payload is 9 bytes — one format tag plus one
+/// big-endian key — so a payload-only budget would admit on the order of ten
+/// times the metastore it accounts for.
+pub const INLINED_DELETE_ROW_OVERHEAD_BYTES: i64 = 128;
+
+impl InlinedDataStats {
+    /// Metastore bytes the inline tombstones occupy: payload plus per-row
+    /// overhead. What the reclamation budget is spent against.
+    #[must_use]
+    pub fn tombstone_metastore_bytes(&self) -> i64 {
+        self.tombstone_ipc_bytes.saturating_add(
+            self.tombstone_entry_count
+                .saturating_mul(INLINED_DELETE_ROW_OVERHEAD_BYTES),
+        )
+    }
 }
 
 impl InlinedData {
