@@ -270,8 +270,17 @@ impl PreparedOverwrite {
         // be owed. Arming is a synchronous flag plus a debounced task, and that task
         // takes `write_lock` itself, so it simply waits out the guard still held here.
         if self.table.has_retention_delete_filters() {
-            self.table
-                .schedule_post_write_maintenance(None, false, true, 0);
+            // Arming only: the flip re-baselines `num_rows` itself, so this call carries
+            // no live-row delta and the claim it must supply is released rather than
+            // queued. Reserving one anyway is how a caller with nothing to persist
+            // satisfies the gate that stops a real delta being claimed after its publish.
+            self.table.schedule_post_write_maintenance(
+                None,
+                false,
+                true,
+                0,
+                self.table.reserve_live_rows_delta().published(),
+            );
         }
 
         // Drain the metastore WAL on the debounced maintenance tick. An inlined

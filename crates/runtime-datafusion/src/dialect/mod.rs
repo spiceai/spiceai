@@ -16,12 +16,16 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
+mod bigquery;
 mod duckdb;
+
+pub use bigquery::SpiceBigQueryDialect;
 
 const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
 const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_match function calls
@@ -120,4 +124,70 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
     let dialect = DuckDBDialect::new().with_custom_scalar_overrides(duckdb_scalar_overrides());
 
     Arc::new(dialect) as Arc<dyn Dialect>
+}
+
+/// Names of the functions [`new_bigquery_dialect`] rewrites to native
+/// `BigQuery` SQL. The federation deny-list derives its `BigQuery` carve-out
+/// from this list; see [`crate::function_support::deny_spice_functions_for_bigquery_table_providers`].
+///
+/// This, the dialect's handlers and [`bigquery_can_translate`] are all derived
+/// from `bigquery::SCALAR_OVERRIDES`, so the three cannot drift: a function
+/// cannot be allowed to federate that the dialect has no handler for, and a
+/// handler cannot be added without saying which call shapes it can render.
+///
+/// The rest stay denied, each for something `BigQuery` cannot be talked out of.
+/// `json_get_json` and `json_as_text` return the matched node's own bytes,
+/// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
+/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
+/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
+/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
+/// union, which has no SQL type to unparse into.
+#[must_use]
+pub fn bigquery_native_function_names() -> Vec<&'static str> {
+    bigquery::SCALAR_OVERRIDES
+        .iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// Whether the `BigQuery` dialect can translate this particular call.
+///
+/// A name in [`bigquery_native_function_names`] is not enough on its own: the
+/// JSON functions take a variadic path, and a path element that is not a
+/// literal has no `BigQuery` equivalent, because its JSON path argument must be
+/// a constant. The deny-list installs this so such a call is left to evaluate
+/// locally instead of being unparsed.
+#[must_use]
+pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
+    bigquery::can_translate(call)
+}
+
+/// Creates a `BigQuery` dialect that also rewrites the Spice JSON functions
+/// [`bigquery_native_function_names`] lists.
+#[must_use]
+pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
+    let handlers: Vec<(&str, ScalarFnToSqlHandler)> = bigquery::SCALAR_OVERRIDES
+        .iter()
+        .map(|entry| (entry.name, Box::new(entry.handler) as ScalarFnToSqlHandler))
+        .collect();
+
+    Arc::new(SpiceBigQueryDialect::new().with_custom_scalar_overrides(handlers)) as Arc<dyn Dialect>
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bigquery_native_function_names;
+
+    #[test]
+    fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
+        let json = runtime_udfs_api::json_function_names();
+        for name in bigquery_native_function_names() {
+            assert!(
+                json.iter().any(|known| known == name),
+                "`{name}` is not a name `datafusion-functions-json` registers, so carving it out \
+                 of the deny-list does nothing"
+            );
+        }
+    }
 }
