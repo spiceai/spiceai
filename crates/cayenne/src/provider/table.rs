@@ -23821,6 +23821,47 @@ impl CayenneTableProvider {
     ///
     /// A corpus already at the live width (the overwhelmingly common case) short-
     /// circuits on a field comparison and is returned untouched.
+    /// Points batches at the table's own schema allocation where they already
+    /// carry an identical one.
+    ///
+    /// Every inline entry is decoded from its own Arrow IPC blob, and a blob
+    /// carries its own copy of the schema, so a cached view over N entries would
+    /// otherwise retain N identical `Schema`s — and it retains them for as long
+    /// as the entry is live, with no per-entry budget bounding the total. One
+    /// table has one schema, so pointing the batches at it costs a pointer and
+    /// leaves nothing to reclaim later.
+    ///
+    /// Requires full equality, not the fields-only test that selects the caller's
+    /// fast path: a decoded schema may carry metadata the live one does not, and
+    /// replacing it would silently drop that. Anything short of identical is
+    /// left exactly as it arrived.
+    fn share_live_schema(
+        mut batches: Vec<RecordBatch>,
+        live_schema: &SchemaRef,
+    ) -> Vec<RecordBatch> {
+        for batch in &mut batches {
+            if Arc::ptr_eq(batch.schema_ref(), live_schema)
+                || batch.schema_ref().as_ref() != live_schema.as_ref()
+            {
+                continue;
+            }
+
+            // Content-equal by the check above, so this cannot fail; on the
+            // impossible path keep the batch as it stands rather than losing an
+            // inline row over an optimisation.
+            match batch.clone().with_schema(Arc::clone(live_schema)) {
+                Ok(reschemad) => *batch = reschemad,
+                Err(e) => {
+                    tracing::debug!(
+                        "Retaining an inlined batch's own schema, which did not match the table's: {e}"
+                    );
+                }
+            }
+        }
+
+        batches
+    }
+
     fn adapt_inlined_batches_to_live_schema(
         &self,
         batches: Vec<RecordBatch>,
@@ -23830,7 +23871,7 @@ impl CayenneTableProvider {
             .iter()
             .all(|batch| batch.schema_ref().fields() == live_schema.fields())
         {
-            return Ok(batches);
+            return Ok(Self::share_live_schema(batches, &live_schema));
         }
 
         batches
@@ -39593,6 +39634,71 @@ mod tests {
         );
     }
 
+    /// Segments are retained for as long as the tier holds them, so a tier of
+    /// many small segments would be dominated by schema copies if each batch
+    /// carried its own. It does not: the write path normalises every incoming
+    /// batch onto `table_metadata.schema`, so the whole tier shares that one
+    /// allocation however many applies land in it.
+    ///
+    /// This pins that normalisation. If it ever stops, the tier starts holding
+    /// one schema per batch and this fails rather than quietly regressing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_segments_share_the_tables_one_schema() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("intern_mem_tier", Arc::clone(&runtime_env), 1).await;
+
+        let table_schema = Arc::clone(&provider.table_metadata.schema);
+        // A fresh, equal allocation per apply, as separately-decoded CDC batches
+        // produce — never the same `Arc` handed in twice.
+        let fresh_schema = || {
+            Arc::new(
+                arrow::datatypes::Schema::new(table_schema.fields().clone())
+                    .with_metadata(table_schema.metadata().clone()),
+            )
+        };
+
+        let first = fresh_schema();
+        let second = fresh_schema();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the two applies must start from distinct schema allocations"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &table_schema),
+            "and neither may be the table's own schema, or normalisation would have nothing to do"
+        );
+
+        apply_upsert_burst(&ctx, &provider, first, &[(1, 10)]).await;
+        apply_upsert_burst(&ctx, &provider, second, &[(2, 20)]).await;
+
+        let tier = provider.mem_tier.shard(0).load();
+        let schemas: Vec<SchemaRef> = tier
+            .segments
+            .iter()
+            .flat_map(|segment| {
+                segment
+                    .batches
+                    .iter()
+                    .map(|batch| Arc::clone(batch.schema_ref()))
+            })
+            .collect();
+
+        assert!(
+            schemas.len() >= 2,
+            "the tier must retain a batch from each apply, got {} across {} segment(s)",
+            schemas.len(),
+            tier.segments.len()
+        );
+        for (i, schema) in schemas.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(schema, &provider.table_metadata.schema),
+                "retained batch {i} must hold the table's one schema allocation, not a copy of it"
+            );
+        }
+    }
+
     /// DELETE-RECEIVING TABLE — the N>1 split-brain fix. A CDC DELETE absorbed
     /// into the sharded tier (`write_cdc_delete_keys_in_memory`) must land its
     /// tombstone in the SAME shard that owns the deleted key's rows, or the
@@ -48237,6 +48343,59 @@ mod tests {
             "every queued delta has been applied, so the maintained count must be served \
              Exact at the live row count",
         );
+    }
+
+    /// Every inline entry is its own Arrow IPC blob, and a blob carries a copy
+    /// of the schema, so decoding N entries produced N equal-but-distinct
+    /// `Schema` allocations — all retained for as long as the cached view lives,
+    /// with no per-entry budget bounding the total.
+    #[tokio::test]
+    async fn cached_inlined_view_entries_share_the_tables_schema() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "inline_shared_schema",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Separate inserts, so each row lands in its own inline entry and is
+        // decoded from its own IPC blob.
+        for id in 1..=4_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+
+        let view = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        let schemas: Vec<SchemaRef> = view
+            .iter()
+            .flat_map(|entry| entry.batches.iter().map(|b| Arc::clone(b.schema_ref())))
+            .collect();
+
+        assert!(
+            schemas.len() >= 2,
+            "the view must hold a batch from each entry, got {} across {} entries",
+            schemas.len(),
+            view.len()
+        );
+        for (i, decoded) in schemas.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(decoded, &provider.table_schema()),
+                "inline entry batch {i} must point at the table's schema, not its own copy"
+            );
+        }
     }
 
     /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
