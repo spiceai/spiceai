@@ -1776,9 +1776,15 @@ async fn an_empty_acceleration_with_a_surviving_position_is_loaded_not_resumed()
 ///
 /// Covering it end-to-end is what stops the unsafe mapping from coming back
 /// silently. The decision is a `match` on all three states, so restoring
-/// `Unknown => resume` is a visible edit — but this case is what proves the live
-/// attach path actually reaches that match with the probe's own answer, which no
+/// `Unknown => resume` is a visible edit — and this case proves the live attach
+/// path honours `Unknown` across a real slot, publication and rejoin, which no
 /// unit test on the decision function alone can show.
+///
+/// It does *not* cover the seam above it. The contents are handed to
+/// `ReplicationStreamInput` directly, so nothing here exercises
+/// `datafusion::handle_schema_difference` calling `probe_acceleration_contents`
+/// and forwarding that answer into the connector; a regression in the forwarding
+/// would leave this case green. Tracked in #13752.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unprovable_acceleration_with_a_surviving_position_is_loaded_not_resumed()
 -> Result<(), anyhow::Error> {
