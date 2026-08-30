@@ -551,12 +551,12 @@ fn create_response_stream(
                             if discarded > 0 {
                                 tracing::error!(
                                     dataset = %path,
-                                    discarded_batches = discarded,
+                                    discarded_messages = discarded,
                                     unreadable_headers = drained.unreadable_headers,
-                                    "Write sink completed before the client finished streaming; {discarded} data batch(es) were not written",
+                                    "Write sink completed before the client finished streaming; {discarded} client data message(s) were not written",
                                 );
                                 yield Err(Status::data_loss(format!(
-                                    "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
+                                    "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data message(s) streamed by the client were not written",
                                 )));
                                 break;
                             }
@@ -649,12 +649,12 @@ fn create_response_stream(
                                             let discarded = 1 + drained.total;
                                             tracing::error!(
                                                 dataset = %path,
-                                                discarded_batches = discarded,
+                                                discarded_messages = discarded,
                                                 unreadable_headers = drained.unreadable_headers,
-                                                "Write sink completed while a client batch was still pending; {discarded} data batch(es) were not written",
+                                                "Write sink completed while a client batch was still pending; {discarded} client data message(s) were not written",
                                             );
                                             yield Err(Status::data_loss(format!(
-                                                "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data batch(es) streamed by the client were not written",
+                                                "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data message(s) streamed by the client were not written",
                                             )));
                                             break;
                                         }
