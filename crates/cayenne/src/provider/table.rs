@@ -433,6 +433,14 @@ impl CayenneCdcWrite {
     /// Returns an error if the staged append cannot be published.
     pub async fn finish(self) -> Result<u64> {
         if let Some(prepared_append) = self.prepared_append {
+            // Taken before the publish below, because the rows it makes visible
+            // are described by a `num_rows` delta that only reaches the
+            // maintenance queue at the end of this function. A reader landing in
+            // between would otherwise be served the pre-write count as a
+            // provably exact one, and the distributed `COUNT(*)` fold answers
+            // from it rather than scanning. Released on every early return: those
+            // publish nothing.
+            let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
             let publish_start = Instant::now();
             // The best-effort staging-WAL removal on the protected-snapshot path
             // below can fail without failing the (already-durable) write. Track
@@ -565,6 +573,12 @@ impl CayenneCdcWrite {
                 prepared_append.apply_under_barrier().await?;
                 0
             };
+            // Both branches above have made this commit's rows visible. From
+            // here the claim survives a cancellation or a failure — `finish()`
+            // and `sequence_high_water()` below are both suspension points, and
+            // a commit that dies at one has published rows it will never queue a
+            // delta for.
+            let published_live_rows_delta = reserved_live_rows_delta.published();
             let rows = prepared_append.finish().await?;
             if staging_wal_removal_failed {
                 // `finish()` -> `mark_inflight_complete()` just cleared
@@ -608,6 +622,7 @@ impl CayenneCdcWrite {
                 false,
                 retention_requested,
                 live_rows_delta,
+                published_live_rows_delta,
             );
             Ok(rows)
         } else {
@@ -15931,14 +15946,37 @@ impl CayenneTableProvider {
         self.spawn_post_write_maintenance_loop();
     }
 
+    /// Mark a live-row delta outstanding before the commit that publishes its
+    /// rows, so the maintained count is never served as a provably exact one
+    /// while it is short by that delta.
+    ///
+    /// Hand the reservation back to [`Self::schedule_post_write_maintenance`]
+    /// once the delta is known; dropping it releases it, which is what a commit
+    /// that fails needs. See
+    /// [`PostWriteMaintenance::reserve_live_rows_delta`].
+    pub(crate) fn reserve_live_rows_delta(&self) -> OutstandingLiveRowsDelta {
+        self.post_write_maintenance.reserve_live_rows_delta()
+    }
+
+    /// Queue post-write maintenance for a commit.
+    ///
+    /// `published` is the claim the caller staked with
+    /// [`Self::reserve_live_rows_delta`] **before** publishing its rows and
+    /// marked [`OutstandingLiveRowsDelta::published`] as soon as they became
+    /// visible. It is mandatory, so a commit cannot stake its claim on the
+    /// maintained count after the rows the claim is about are already readable.
+    /// It is consumed here — queued when this commit moves the row count,
+    /// released when it does not.
     pub(crate) fn schedule_post_write_maintenance(
         &self,
         stats: Option<Arc<ColumnStatsAccumulator>>,
         refresh_listing: bool,
         retention_requested: bool,
         live_rows_delta: i64,
+        published: PublishedLiveRowsDelta,
     ) {
         if stats.is_none() && !refresh_listing && !retention_requested && live_rows_delta == 0 {
+            published.release();
             return;
         }
 
@@ -15956,14 +15994,18 @@ impl CayenneTableProvider {
             maintenance_state.live_rows_delta = maintenance_state
                 .live_rows_delta
                 .saturating_add(live_rows_delta);
-            if live_rows_delta != 0 {
+            if live_rows_delta == 0 {
+                // This commit's rows left the net live count where it was, so
+                // there is no delta to persist and nothing would ever retire
+                // the claim.
+                published.release();
+            } else {
                 // Count this delta under the same lock that folds it in, so
-                // `has_unapplied_live_rows_delta` reports this write from the
-                // moment its rows become visible until the persist that folds
-                // them into `num_rows` lands.
+                // `has_unapplied_live_rows_delta` reports this write until the
+                // persist that folds it into `num_rows` lands.
                 maintenance_state.live_rows_delta_count =
                     maintenance_state.live_rows_delta_count.saturating_add(1);
-                self.post_write_maintenance.record_queued_live_rows_delta();
+                published.queue();
             }
         }
 
@@ -45986,7 +46028,13 @@ mod tests {
 
         // A commit makes two more rows live and queues their delta for a
         // maintenance pass that does not apply it.
-        provider.schedule_post_write_maintenance(None, false, false, QUEUED_DELTA);
+        provider.schedule_post_write_maintenance(
+            None,
+            false,
+            false,
+            QUEUED_DELTA,
+            provider.reserve_live_rows_delta().published(),
+        );
 
         let stats = provider
             .optimizer_table_statistics()
@@ -45997,6 +46045,320 @@ mod tests {
              Inexact so the distributed COUNT(*) fold declines and a real scan answers, \
              got {:?}",
             stats.num_rows,
+        );
+    }
+
+    /// Drive a write that is parked behind a lock the caller holds, until the
+    /// maintained row count stops being served as a provably exact one.
+    ///
+    /// Returns the first inexact reading. Completing is a panic rather than a
+    /// result: the write is supposed to be blocked, so if it finishes here the
+    /// park failed and the window under test never existed — a test that then
+    /// reported the count inexact would be reading the state *after* the
+    /// publish, which proves nothing about the ordering.
+    ///
+    /// `owed` names what the parked commit owes the count, for the timeout
+    /// message; a claim that never arrives is exactly the defect under test.
+    async fn drive_parked_write_until_count_is_inexact<F: std::future::Future>(
+        provider: &CayenneTableProvider,
+        mut write: std::pin::Pin<&mut F>,
+        owed: &str,
+    ) -> DFPrecision<usize> {
+        /// Generous: the write only has to be polled far enough to reach its
+        /// claim and block.
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            // `biased` so the write is polled first every pass: it has to be
+            // driven to reach its claim and park.
+            tokio::select! {
+                biased;
+                _ = &mut write => panic!(
+                    "the parked write completed while its lock was held, so the window this \
+                     test exists to close never existed"
+                ),
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+
+            let stats = provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present while the write is parked");
+            if matches!(stats.num_rows, DFPrecision::Inexact(_)) {
+                return stats.num_rows;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parked write never claimed its live-row delta: the maintained count is \
+                 still served as provably exact ({:?}) while a commit that has not published \
+                 yet owes it {owed}, so a reader landing after the publish folds COUNT(*) on a \
+                 short count",
+                stats.num_rows,
+            );
+        }
+    }
+
+    /// A commit must claim its live-row delta *before* it publishes the rows
+    /// that delta describes, not after.
+    ///
+    /// `queued_live_rows_delta_is_never_served_exact` covers a delta that has
+    /// reached the queue. Reaching the queue is the end of the commit, though:
+    /// a staged CDC append publishes its rows in `CayenneCdcWrite::finish` and
+    /// hands the matching `num_rows` delta to `schedule_post_write_maintenance`
+    /// several await points later. On a pure-append table every other proxy for
+    /// "rows the persisted count does not describe yet" is false, so a reader
+    /// landing in that window scans the new rows while being served the
+    /// pre-write count as a provably exact one — and the distributed `COUNT(*)`
+    /// fold answers from it rather than scanning.
+    ///
+    /// The window is opened deterministically by holding the table's write lock,
+    /// which `apply_under_barrier` acquires before it moves a single file: the
+    /// finish future parks there with its rows still invisible. The count has to
+    /// read `Inexact` already at that point, because a claim staked only after
+    /// the publish is one the reader can beat. Both halves are asserted at the
+    /// same instant — the rows are still absent from a scan AND the count is
+    /// already inexact — since either alone would pass on code that claims the
+    /// delta too late.
+    #[tokio::test]
+    async fn a_staged_publish_claims_its_delta_before_the_rows_become_visible() {
+        const SEED: i64 = 5;
+        const STAGED: i64 = 3;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("staged_publish_delta_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, SEED),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let seeded = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after the seed append");
+        assert_eq!(
+            seeded.num_rows,
+            DFPrecision::Exact(usize::try_from(SEED).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact, or this test \
+             cannot tell a late claim from a table that never serves Exact at all",
+        );
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch_for_range(Arc::clone(&schema), SEED, STAGED)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged CDC append prepares");
+        assert!(
+            staged.has_pending_finalize(),
+            "the staged append must still owe a publish, or there is no window to test",
+        );
+
+        // Park the publish. `apply_under_barrier` takes the write lock before it
+        // moves any staged file, so the finish future stops there with its rows
+        // still invisible to a scan.
+        let park = provider.write_lock_arc().lock_owned().await;
+        let finish = staged.finish();
+        tokio::pin!(finish);
+
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            finish.as_mut(),
+            &format!("{STAGED} staged rows"),
+        )
+        .await;
+
+        // The claim landed before the rows did: still nothing but the seed is
+        // visible, so this is the pre-publish window and not a late claim caught
+        // after the fact.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "staged_publish_delta_claim")
+                .await
+                .len(),
+            usize::try_from(SEED).expect("row count fits usize"),
+            "the parked publish must not have made its rows visible yet, or {claimed:?} says \
+             nothing about the window this test exists to close",
+        );
+
+        drop(park);
+        let rows = finish
+            .await
+            .expect("the parked publish completes once unblocked");
+        assert_eq!(rows, u64::try_from(STAGED).expect("row count fits u64"));
+
+        // The claim survives the hand-off to the maintenance queue: releasing it
+        // there would re-open the window on the far side of the publish, where
+        // the rows are visible and the persisted count is still short.
+        assert!(
+            matches!(
+                provider
+                    .optimizer_table_statistics()
+                    .expect("maintained stats present after the publish")
+                    .num_rows,
+                DFPrecision::Inexact(_)
+            ),
+            "the published rows are visible and their delta is not persisted yet, so the count \
+             must not be served as a provably exact one",
+        );
+
+        // ...and the claim is released once maintenance persists the delta, or
+        // the table would be stranded on Inexact for the rest of its life.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        let drained = provider
+            .optimizer_table_statistics()
+            .expect("maintained stats present after the publish drains");
+        assert_eq!(
+            drained.num_rows,
+            DFPrecision::Exact(usize::try_from(SEED + STAGED).expect("row count fits usize")),
+            "the claim must be retired by the persist that folds its delta into num_rows",
+        );
+    }
+
+    /// The same claim-before-publish contract on the DML path.
+    ///
+    /// `INSERT INTO` reaches `AppendMutationWriter::write_prepared_stream`,
+    /// which is a separate commit from the staged CDC one in
+    /// `a_staged_publish_claims_its_delta_before_the_rows_become_visible` and
+    /// stakes its own claim. That path holds the table write lock for the whole
+    /// write, so the window is opened one lock further in: `apply_under_barrier`
+    /// takes the visibility lock before it moves any staged file, and holding
+    /// that parks the insert with its rows still invisible. (Not the listing
+    /// fence — the scan below needs it, and a pending fence writer blocks new
+    /// readers.)
+    #[tokio::test]
+    async fn an_insert_claims_its_delta_before_the_rows_become_visible() {
+        const SEED: i64 = 4;
+        const INSERTED: i64 = 6;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("insert_delta_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, SEED),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the seed insert")
+                .num_rows,
+            DFPrecision::Exact(usize::try_from(SEED).expect("row count fits usize")),
+            "a drained append-only table must serve its maintained count Exact, or this test \
+             cannot tell a late claim from a table that never serves Exact at all",
+        );
+
+        let park = provider.visibility_lock_arc().lock_owned().await;
+        let insert = insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), SEED, INSERTED),
+        );
+        tokio::pin!(insert);
+
+        let claimed = drive_parked_write_until_count_is_inexact(
+            &provider,
+            insert.as_mut(),
+            &format!("{INSERTED} inserted rows"),
+        )
+        .await;
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "insert_delta_claim")
+                .await
+                .len(),
+            usize::try_from(SEED).expect("row count fits usize"),
+            "the parked insert must not have made its rows visible yet, or {claimed:?} says \
+             nothing about the window this test exists to close",
+        );
+
+        drop(park);
+        insert.await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the insert drains")
+                .num_rows,
+            DFPrecision::Exact(usize::try_from(SEED + INSERTED).expect("row count fits usize")),
+            "the claim must be retired by the persist that folds its delta into num_rows",
+        );
+    }
+
+    /// A commit whose rows leave the net live count where it was owes the
+    /// maintained count nothing, and nothing would ever retire a claim it left
+    /// behind — an upsert that replaces exactly as many rows as it inserts is
+    /// that shape. Both of `schedule_post_write_maintenance`'s zero-delta exits
+    /// must therefore release the claim, or one no-op commit strands the table
+    /// on `Inexact` for the life of the process and every distributed
+    /// `COUNT(*)` on it real-scans forever.
+    #[tokio::test]
+    async fn a_commit_that_moves_no_rows_releases_its_claim() {
+        const ROWS: i64 = 6;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_append_only_table("unmoved_count_claim", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, ROWS),
+        )
+        .await;
+
+        let exact = DFPrecision::Exact(usize::try_from(ROWS).expect("row count fits usize"));
+
+        // The early exit: nothing to schedule at all.
+        provider.schedule_post_write_maintenance(
+            None,
+            false,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+        // ...and the in-lock exit: there is maintenance to do, just no row-count
+        // delta behind it.
+        provider.schedule_post_write_maintenance(
+            None,
+            true,
+            false,
+            0,
+            provider.reserve_live_rows_delta().published(),
+        );
+
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        assert_eq!(
+            provider
+                .optimizer_table_statistics()
+                .expect("maintained stats present after the drain")
+                .num_rows,
+            exact,
+            "a commit that moved no rows queued no delta, so a claim it held would never be \
+             retired and the table would serve Inexact forever",
         );
     }
 
