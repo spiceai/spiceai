@@ -167,6 +167,22 @@ they catch a future model, or a future edit to the instructions, that stops
 reproducing before it claims. Anyone wanting to show the rule changes behavior
 should first add a fixture where reproduction genuinely costs something.
 
+## The gap worth filling next
+
+Every fixture here answers its question with a row count, because a row count is
+cheap to produce and unambiguous to score. The rule also admits an artifact
+captured off a running system — an `EXPLAIN ANALYZE` plan, `runtime.metrics` or
+`runtime.query_history` rows, a profile, a stack dump — and none of these evals
+exercises that at all.
+
+That gap and the cost-pressure gap above are the same gap. Claims about
+pushdown, join order, latency, or memory are exactly the ones where the evidence
+is expensive to obtain, where the artifact has to be matched to the claim rather
+than merely produced, and where a passing assertion is least able to stand in
+for a measurement. A fixture built around a plan or a metrics scrape would put
+cost back into the reproduction and cover the artifact forms in one move, which
+makes it the most valuable eval to add next.
+
 ## A trap when measuring the rule's effect
 
 An A/B against a baseline is only meaningful if the baseline arm does not have

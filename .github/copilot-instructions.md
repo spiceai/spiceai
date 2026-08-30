@@ -10,12 +10,15 @@ As an AI-native database, query results can NEVER be wrong. Correctness supersed
 
 Code inspection is a hypothesis generator, never proof. **Every issue, concern, bug, regression, or performance claim you raise — in a PR, a GitHub issue, a review comment, or a message to the user — must carry evidence produced by *running* something, external to the code you read.** Reading a diff and reasoning about it is where a finding starts, not where it ends: a plausible-looking race, overflow, or lost update that nobody has observed is a hypothesis and must be labeled one.
 
-What counts as evidence, strongest first:
+What counts as evidence:
 
 - **An actual run of Spice.ai** — `spiced` against a real Spicepod, with the query output, the log line, or the wrong row count pasted in.
 - **A benchmark or harness run** — `testoperator`, `cbench`, the CH-benCH lab — with before/after numbers from the same rig; mandatory for anything about performance, memory, or lag.
+- **An artifact captured off a running system** — an `EXPLAIN` or `EXPLAIN ANALYZE` plan; `runtime.metrics`, `runtime.query_history` or `runtime.task_history` rows, or a scrape of the metrics endpoint; a CPU or heap profile, a flamegraph, an allocation or RSS trace; a stack dump, core dump, or backtrace. These are first-class evidence, not a consolation prize for when a test is hard to write — for a query engine the plan often *is* the observation.
 - **An end-to-end or integration test** that fails on current code and passes on the fix, exercising the real wired path (`make test-integration`, `test/spicepods/…`, `verify-cli`).
-- **A targeted experiment**: a property/fuzz test, a SQL session, a `curl`, a `psql` CDC feed, a crash/`dmesg`/profile capture — anything that exhibits the wrong behavior directly.
+- **A targeted experiment**: a property/fuzz test, a SQL session, a `curl`, a `psql` CDC feed — anything that exhibits the wrong behavior directly.
+
+**Match the artifact to the claim**; the wrong one proves nothing however real it is. Wrong results need the wrong rows. A pushdown, join-order, partitioning or statistics claim needs the plan — `EXPLAIN ANALYZE` reports the rows and time each operator actually saw, which is what separates a plan that looks wrong from one that is. Latency, throughput or lag needs metrics or a profile from the same rig, never a stopwatch. Memory needs RSS under `runtime.query.memory_limit` or a heap profile. A hang needs a stack dump; a crash needs the backtrace. Much of this is queryable in-process, so the cost of getting it is usually a `SELECT`.
 
 **A unit test alone is not evidence.** A unit test written from the same reading of the code that produced the claim encodes the same misunderstanding — it can pass on wrong code and fail on correct code — and it routinely misses exactly the failures that matter here: defaulted no-op wrapper methods (see *Trait evolution & wrapper delegation*), feature-gated paths, real I/O, concurrency, and anything the harness stubs out. Land the unit test as a regression guard, but prove the bug outside it first.
 
