@@ -15042,13 +15042,38 @@ impl CayenneTableProvider {
         // `CayenneContext::configured_deletion_index_trigger`.
         let trigger_len = self.context.configured_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
-        (deletion_index_len >= trigger_len || over_memory_ceiling).then_some(
-            SnapshotMaintenanceTrigger::DeletionIndexSize {
+        if deletion_index_len < trigger_len && !over_memory_ceiling {
+            return None;
+        }
+        // Apply-back-pressure gate, mirroring the seq-prefix bake's. The rewrite
+        // competes with the CDC apply for the same write path, and it competes
+        // harder than the bake: it re-encodes the whole current snapshot and holds
+        // `write_lock` for the duration, so firing it at a table that is already
+        // replication-lag-bound starves the apply that would let the lag close —
+        // measured at SF-1000, where `order_line` bootstrapped and then never caught
+        // up. Defer; the next tick re-evaluates.
+        //
+        // EXCEPT over the memory ceiling, where the rewrite is the OOM guard: the
+        // index is undroppable and over-commits the pool, so deferring it trades a
+        // survival constraint for a throughput one.
+        //
+        // This is the gate's only caller for a position table — the bake's call sits
+        // behind `key_mode`, and no table is both — so the sample counter it
+        // consumes is not shared.
+        if !over_memory_ceiling && self.context.bake_should_defer_for_apply() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
                 deletion_index_len,
-                trigger_len,
-                over_memory_ceiling,
-            },
-        )
+                "Deferring position-mode deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
+            );
+            return None;
+        }
+        Some(SnapshotMaintenanceTrigger::DeletionIndexSize {
+            deletion_index_len,
+            trigger_len,
+            over_memory_ceiling,
+        })
     }
 
     /// Compact current snapshot files into a new snapshot dir, with atomic,
@@ -44814,6 +44839,104 @@ mod tests {
             !worked_inf && after_inf == before_inf,
             "unbounded pool + unmet count trigger ⇒ the bake must NOT fire: \
              worked={worked_inf} before={before_inf} after={after_inf}"
+        );
+    }
+
+    /// The position-mode reclaim yields to the CDC apply, and the memory ceiling
+    /// overrides that yield.
+    ///
+    /// Its rewrite competes with the apply for the write path and competes harder
+    /// than the bake — it re-encodes the whole current snapshot and holds
+    /// `write_lock` throughout — so firing it at a table that is already
+    /// replication-lag-bound starves the apply that would let the lag close. That
+    /// is not hypothetical: it is what an SF-1000 CH-benCHmark run did, where
+    /// `order_line` bootstrapped and then never reached ready. But the ceiling is a
+    /// survival constraint rather than a throughput one, so it must still fire
+    /// through the defer, or an undroppable index grows until the host OOMs.
+    #[tokio::test]
+    async fn position_reclaim_defers_to_apply_but_not_past_the_memory_ceiling() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        use std::time::Duration;
+
+        // ~32 bytes/tombstone, so 1M tombstones (≈32 MiB) sit far over 25% of a
+        // 16 MiB pool, and 1k (≈32 KiB) far under it.
+        const POOL_BYTES: usize = 16 * 1024 * 1024;
+
+        let config = || VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Position,
+            bake_deletion_index_trigger: 100,
+            compaction_background_interval_ms: 3_600_000,
+            ..VortexConfig::default()
+        };
+        let finite_rt = || {
+            Arc::new(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+                    .build()
+                    .expect("finite-pool runtime env"),
+            )
+        };
+
+        // Drive apply_vs_arrival ≫ 1: 200 ms of apply per sample against the ~µs
+        // arrival gaps of a tight loop, past warmup. Same shape as the bake's own
+        // back-pressure test.
+        let apply_backpressure = |table: &CayenneTableProvider| {
+            for _ in 0..(crate::provider::tuning::WARMUP_BATCHES * 3) {
+                table
+                    .context
+                    .record_ingest(100, 1, 10_000, Duration::from_millis(200), None);
+            }
+        };
+
+        // ---- Over the count trigger, under the ceiling: the apply wins. ----
+        let (lagging, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "position_reclaim_defer",
+            finite_rt(),
+            config(),
+        )
+        .await;
+        let small: Vec<(i64, i64)> = (0..1_000).map(|key| (key, 15)).collect();
+        install_int64_deletes(&lagging, &small);
+        assert!(
+            !lagging.deletion_index_over_memory_ceiling(),
+            "precondition: 1k tombstones must sit under 25% of the {POOL_BYTES}-byte pool"
+        );
+        assert!(
+            lagging.deletion_index_reclaim_trigger().is_some(),
+            "precondition: a healthy apply over the count trigger must fire the rewrite"
+        );
+        apply_backpressure(&lagging);
+        assert_eq!(
+            lagging.deletion_index_reclaim_trigger(),
+            None,
+            "an apply at/over capacity must defer the rewrite that would starve it"
+        );
+
+        // ---- Over the ceiling: the survival constraint overrides the defer. ----
+        let (over_ceiling, _catalog2, _tmp2) = create_cdc_upsert_table_with_vortex_config(
+            "position_reclaim_ceiling",
+            finite_rt(),
+            config(),
+        )
+        .await;
+        let many: Vec<(i64, i64)> = (0..1_000_000).map(|key| (key, 15)).collect();
+        install_int64_deletes(&over_ceiling, &many);
+        assert!(
+            over_ceiling.deletion_index_over_memory_ceiling(),
+            "precondition: 1M tombstones must exceed 25% of the {POOL_BYTES}-byte pool"
+        );
+        apply_backpressure(&over_ceiling);
+        assert!(
+            matches!(
+                over_ceiling.deletion_index_reclaim_trigger(),
+                Some(SnapshotMaintenanceTrigger::DeletionIndexSize {
+                    over_memory_ceiling: true,
+                    ..
+                })
+            ),
+            "the memory ceiling must fire through the apply-back-pressure defer"
         );
     }
 
