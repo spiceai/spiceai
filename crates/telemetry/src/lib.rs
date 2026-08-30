@@ -987,6 +987,33 @@ pub mod cayenne {
         .add(1, dimensions);
     }
 
+    static DELETE_MAIN_VISIBILITY_DOWNGRADE: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts DELETEs whose main-snapshot re-insert handling was downgraded from
+    /// `Apply` to `Ignore` because a protected snapshot appeared between the plan being
+    /// built and the sink taking `write_lock`.
+    ///
+    /// The downgrade is what keeps the delete from tombstoning a key off a superseded
+    /// version and hiding the live replacement, and it is deliberately biased toward
+    /// under-deleting: rows in a snapshot published after the capture are not scanned by
+    /// that pass, and a later pass removes them. That trade is only sound while the
+    /// downgrade is rare, which is exactly what this counter is for — a rate that climbs
+    /// with ingest load means DELETEs are routinely leaving work behind, and the capture
+    /// should move under the execution-time lock instead. `dimensions` carries `table`.
+    pub fn track_delete_main_visibility_downgrade(dimensions: &[KeyValue]) {
+        DELETE_MAIN_VISIBILITY_DOWNGRADE
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_delete_main_visibility_downgrade_total")
+                    .with_description(
+                        "DELETEs whose main-snapshot re-insert handling was downgraded to Ignore because a protected snapshot was published after the scan sources were captured, labeled by table.",
+                    )
+                    .with_unit("deletes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
     static MEM_TIER_APPLY_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
     static MEM_TIER_DURABLE_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
 
