@@ -102,11 +102,16 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
 
     // Check if already installed (unless force)
     if !args.force
-        && ctx.is_runtime_installed()
-        && let Ok(installed_version) = ctx.runtime_version()
+        && let Ok(installed_version) = ctx.managed_runtime_version()
         && installed_version.contains(&release.tag_name)
     {
         tracing::info!("Spice.ai runtime {} already installed", release.tag_name);
+        // Warned here too, not only after a download. This is the path a user
+        // takes when they are trying to work out why the runtime they installed
+        // is not the one running, so it is the path where being shadowed most
+        // needs saying — and "already installed" on its own reads as agreement
+        // that the install is the one in use.
+        crate::context::warn_if_install_will_not_run(ctx);
         return Ok(());
     }
 
@@ -142,6 +147,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         "Spice.ai runtime {} installed successfully",
         release.tag_name
     );
+    crate::context::warn_if_install_will_not_run(ctx);
 
     // Write version file for caching
     let version_file = ctx.spice_runtime_dir().join("runtime_version.txt");

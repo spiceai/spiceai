@@ -29,7 +29,7 @@ on:
         description: 'Duration of the HTAP workload in seconds'
         required: false
         type: string
-        default: '600'
+        default: '1800'
       concurrency:
         description: 'Number of concurrent analytical query clients'
         required: false
@@ -94,7 +94,11 @@ jobs:
   run-htap:
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 120
+    # 30-minute HTAP window plus ready_wait (up to 30 min on cold SF1000), template
+    # restore, analytical gate, and teardown. SF1000 jobs typically land around 65-90 min
+    # at this duration, so 150 min keeps ~1h of headroom without silently eating a
+    # wedged-seed budget (that path has its own 90-min step timeout).
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -235,7 +239,7 @@ jobs:
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
         # Backstop so a wedged seed/restore (e.g. a DROP blocked on a stale lock)
         # fails THIS step fast and attributably, instead of silently consuming the
-        # whole 120-min job budget and reporting a confusing "cancelled". A cold
+        # whole 150-min job budget and reporting a confusing "cancelled". A cold
         # SF1000 CSV seed finishes comfortably under this; exceeding it means the
         # seed is stuck.
         timeout-minutes: 90

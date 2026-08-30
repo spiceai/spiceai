@@ -107,7 +107,12 @@ impl SQLExecutor for FlightSQLTable {
         }
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(client, query.to_string(), Arc::clone(&self.cookie_store)),
+            query_to_stream(
+                client,
+                query.to_string(),
+                Arc::clone(&self.cookie_store),
+                self.table_reference.to_quoted_string(),
+            ),
         )))
     }
 
