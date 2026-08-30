@@ -372,14 +372,12 @@ impl Runtime {
             let notifier = register_task.await;
             match notifier {
                 Ok(Some(completion)) => {
-                    // Captured once the view is registered and before the wait,
-                    // so the schedule created below can be checked against the
-                    // view instance it was started for.
+                    // Captured once the view is registered and before the wait:
+                    // `view` is a snapshot taken before it too, so the schedule
+                    // below has to be checked against the view still registered
+                    // under that name, not just against a refresh having landed.
                     let instance = df.capture_table_instance(&view_name).await;
 
-                    // `view` was captured before the wait, so the schedule below
-                    // has to be checked against the view still registered under
-                    // that name, not just against a refresh having landed.
                     match df
                         .await_refresh_completion(instance, Some(completion))
                         .await

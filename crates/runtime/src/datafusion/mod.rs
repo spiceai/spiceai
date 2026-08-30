@@ -788,6 +788,11 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
 /// re-resolved by [`DataFusion::await_refresh_completion`] after it.
 pub struct TableInstance {
     table: TableReference,
+    /// Held as a strong reference on purpose. Identity is the provider's address,
+    /// and only keeping the allocation alive stops a dropped table's address from
+    /// being reused by its replacement — which would read as the *same* instance
+    /// and wave through exactly the stale action this type exists to refuse.
+    ///
     /// `None` when nothing resolved under the name at capture time, which leaves
     /// the instance with no identity to compare against.
     provider: Option<Arc<dyn TableProvider>>,
@@ -6964,11 +6969,9 @@ mod tests {
                 "no table captured and none registered: nothing for the action to be about"
             );
 
-            register(&df, &name);
-            let instance = df
-                .capture_table_instance(&TableReference::bare("absent"))
-                .await;
-            register(&df, &TableReference::bare("absent"));
+            let absent = TableReference::bare("absent");
+            let instance = df.capture_table_instance(&absent).await;
+            register(&df, &absent);
             assert!(
                 df.table_instance_is_current(&instance).await,
                 "with no captured identity the check can only ask whether the name is registered"
