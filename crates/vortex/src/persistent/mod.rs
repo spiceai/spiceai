@@ -804,9 +804,16 @@ mod tests {
             DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::Nullable).erased());
 
         for value in [i64::MIN, i64::MIN + 1, 0, i64::MAX] {
-            Scalar::try_new(dtype.clone(), Some(value.into())).unwrap_or_else(|err| {
+            let scalar = Scalar::try_new(dtype.clone(), Some(value.into())).unwrap_or_else(|err| {
                 panic!("{value} nanoseconds is an instant a timestamp can represent: {err}")
             });
+            // Rendering reaches the same value through a second path, which the fork also
+            // keeps off Jiff spans. A `Display` impl cannot report a failure, so building one
+            // on them turns this value into an abort rather than an error.
+            assert!(
+                !scalar.to_string().is_empty(),
+                "{value} nanoseconds has to render"
+            );
         }
     }
 
