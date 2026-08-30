@@ -528,9 +528,21 @@ impl<'a> AppendMutationWriter<'a> {
                 rows,
                 post_validation,
             } => {
-                let record_seq = self.table.sequence_high_water().await;
-                self.table
-                    .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
+                // Mirror `write_prepared_stream`: this outcome arms retention (see the
+                // inline commit in `try_inline_or_restream`), which runs asynchronously
+                // after this returns and may delete the very rows these keys name. A
+                // later `DoNothing` insert validating against one of them would be
+                // dropped as a duplicate of a row that no longer exists, so clear the
+                // cache conservatively rather than record. The staged path never reaches
+                // here — `InlineMutationPolicy` bars inlining for a retention table — but
+                // the pipelined path does not consult it.
+                if self.table.has_retention_delete_filters() {
+                    self.table.clear_cached_pk_keyset();
+                } else {
+                    let record_seq = self.table.sequence_high_water().await;
+                    self.table
+                        .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
+                }
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -1384,10 +1396,16 @@ impl<'a> AppendMutationWriter<'a> {
                 let live_rows_delta = i64::try_from(buffer.total_rows())
                     .unwrap_or(i64::MAX)
                     .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+                // `write_cdc_pipelined` reaches this inline commit without consulting
+                // `InlineMutationPolicy`, so unlike the staged path it can land here on
+                // a table that has retention delete filters — and an inlined outcome
+                // returns `CayenneCdcWrite::completed`, whose `finish` schedules
+                // nothing. This is the only place on that route that can arm the
+                // retention the header comment above promises the scheduler picks up.
                 self.table.schedule_post_write_maintenance(
                     Some(Arc::new(stats_acc)),
                     false,
-                    false,
+                    self.table.has_retention_delete_filters(),
                     live_rows_delta,
                     published_live_rows_delta,
                 );
