@@ -1013,6 +1013,13 @@ impl Runtime {
             assignments,
         ));
 
+        // The ack below reports that *this* table instance loaded these
+        // partitions, so the identity has to be the one the assignments are
+        // about — captured ahead of the update that installs them, not after.
+        // Capturing later would tie the ack to whatever the name resolves to by
+        // then, which is a different table if a rebuild has landed in between.
+        let instance = self.datafusion().capture_table_instance(&table_ref).await;
+
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
         self.datafusion()
@@ -1024,12 +1031,6 @@ impl Runtime {
             })?;
 
         tracing::info!("Updated partition assignments for {table}");
-
-        // The ack below reports *this* table instance's partitions as loaded, so
-        // capture which instance that is before triggering the refresh. By the
-        // time the refresh lands, the name may have been re-registered against a
-        // rebuilt table with a different partition set.
-        let instance = self.datafusion().capture_table_instance(&table_ref).await;
 
         // Trigger a refresh to load the data for the new partitions, capturing
         // the completion notifier so we can ack the scheduler with a

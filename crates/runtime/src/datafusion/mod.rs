@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
@@ -784,19 +784,39 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
 /// different provider, and applying the action then reports a result for a table
 /// that never produced it.
 ///
-/// Captured by [`DataFusion::capture_table_instance`] before the wait, and
-/// re-resolved by [`DataFusion::await_refresh_completion`] after it.
+/// Captured either by [`DataFusion::table_instance_as_registered`], from the
+/// provider a caller has just registered, or by
+/// [`DataFusion::capture_table_instance`], by resolving a name. Prefer the first
+/// where the registration is in reach: resolving by name can only see whatever
+/// is registered by then, so a replacement landing in between is captured as the
+/// thing the action was about. Either way
+/// [`DataFusion::await_refresh_completion`] re-resolves it after the wait.
+///
+/// The verdict is point-in-time and does not survive into the side effect the
+/// caller then commits; closing that remaining window needs the side effect
+/// itself to carry a generation (#13746).
 pub struct TableInstance {
     table: TableReference,
-    /// Held as a strong reference on purpose. Identity is the provider's address,
-    /// and only keeping the allocation alive stops a dropped table's address from
-    /// being reused by its replacement — which would read as the *same* instance
-    /// and wave through exactly the stale action this type exists to refuse.
+    /// Held weakly on purpose. A `Weak` keeps the allocation open, so a dropped
+    /// table's address cannot be reused by its replacement and read as the
+    /// *same* instance — and it does that without keeping the table alive, which
+    /// is what makes the identity safe to hold across the wait. An accelerated
+    /// table owns the refresher that owns the recorder, and a waiter reports
+    /// `Abandoned` only once every recorder has dropped; an instance holding the
+    /// table strongly would hold open, for the length of the `.await`, the very
+    /// signal that `.await` is waiting to see close.
+    ///
+    /// A captured provider that no longer upgrades is decisive on its own: the
+    /// table the action was about is gone, whatever the name resolves to now.
     ///
     /// `None` when nothing resolved under the name at capture time, which leaves
     /// the instance with no identity to compare against.
-    provider: Option<Arc<dyn TableProvider>>,
+    provider: Option<Weak<dyn TableProvider>>,
 }
+
+/// What `register_view`'s task hands back: the waiter for an accelerated view's
+/// initial refresh, and the identity of the provider it registered.
+type ViewRegistration = (TableInstance, RefreshCompletionWaiter);
 
 /// What a deferred action gated on a refresh completion should do once that
 /// refresh has landed.
@@ -1179,6 +1199,22 @@ impl DataFusion {
         )
     }
 
+    /// Captures the identity of a provider at the moment it is registered.
+    ///
+    /// Tighter than re-resolving the name afterwards, which can only see
+    /// whatever is registered by then: no `.await` separates the registration
+    /// from this, so nothing can replace it in between.
+    #[must_use]
+    pub fn table_instance_as_registered(
+        table: TableReference,
+        provider: &Arc<dyn TableProvider>,
+    ) -> TableInstance {
+        TableInstance {
+            table,
+            provider: Some(Arc::downgrade(provider)),
+        }
+    }
+
     /// Captures the table instance registered under `table_reference` right now,
     /// so an action decided before an `.await` can tell, once it resumes,
     /// whether it is still about the same table.
@@ -1189,7 +1225,11 @@ impl DataFusion {
     pub async fn capture_table_instance(&self, table_reference: &TableReference) -> TableInstance {
         TableInstance {
             table: table_reference.clone(),
-            provider: self.get_table(table_reference).await,
+            provider: self
+                .get_table(table_reference)
+                .await
+                .as_ref()
+                .map(Arc::downgrade),
         }
     }
 
@@ -1238,9 +1278,15 @@ impl DataFusion {
             return self.table_exists(&instance.table);
         };
 
+        let Some(captured) = captured.upgrade() else {
+            // The captured table has been dropped outright, so nothing
+            // registered under the name now can be it.
+            return false;
+        };
+
         self.get_table(&instance.table)
             .await
-            .is_some_and(|current| Arc::ptr_eq(captured, &current))
+            .is_some_and(|current| Arc::ptr_eq(&captured, &current))
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -4464,7 +4510,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<JoinHandle<Option<RefreshCompletionWaiter>>> {
+    ) -> Result<JoinHandle<Option<ViewRegistration>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
             return TableAlreadyExistsSnafu.fail();
@@ -4491,7 +4537,7 @@ impl DataFusion {
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
-        let register_task: JoinHandle<Option<RefreshCompletionWaiter>> = spawn(async move {
+        let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -4595,12 +4641,15 @@ impl DataFusion {
         Ok(register_task)
     }
 
+    /// Returns the waiter for the view's initial refresh together with the
+    /// identity of the provider this registered it as, so a caller acting once
+    /// that refresh lands can tell the view from a replacement.
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
         view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<Option<RefreshCompletionWaiter>> {
+    ) -> Result<Option<ViewRegistration>> {
         let table = &view.name;
 
         let acceleration =
@@ -4732,10 +4781,20 @@ impl DataFusion {
         );
 
         self.ctx
-            .register_table(table.clone(), table_provider)
+            .register_table(table.clone(), Arc::clone(&table_provider))
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to register view: {e}"),
             })?;
+
+        // Taken from the provider just registered, rather than re-resolved by
+        // name once the caller resumes: by then the name may already answer with
+        // a replacement, and the schedule would be built for the wrong view.
+        let registration = is_ready.map(|waiter| {
+            (
+                Self::table_instance_as_registered(table.clone(), &table_provider),
+                waiter,
+            )
+        });
 
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
 
@@ -4755,7 +4814,7 @@ impl DataFusion {
                 .update_view(&view.name, status::ComponentStatus::Ready);
         }
 
-        Ok(is_ready)
+        Ok(registration)
     }
 
     /// Returns all table names in user defined schemas (i.e. not system or runtime schemas).
@@ -6975,6 +7034,90 @@ mod tests {
             assert!(
                 df.table_instance_is_current(&instance).await,
                 "with no captured identity the check can only ask whether the name is registered"
+            );
+        }
+
+        /// A provider that owns its `RefreshCompletion`, the way a real
+        /// `AcceleratedTable` owns the `Refresher` that holds one. The doubles
+        /// above let the test drop the recorder by hand, which is the one thing
+        /// production cannot do: there the recorder's lifetime *is* the
+        /// provider's.
+        #[derive(Debug)]
+        struct ProviderOwningItsCompletion {
+            inner: MemTable,
+            _completion: RefreshCompletion,
+        }
+
+        impl ProviderOwningItsCompletion {
+            fn new(completion: RefreshCompletion) -> Self {
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                    "a",
+                    DataType::Int32,
+                    false,
+                )]));
+                Self {
+                    inner: MemTable::try_new(schema, vec![vec![]]).expect("mem table"),
+                    _completion: completion,
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TableProvider for ProviderOwningItsCompletion {
+            fn schema(&self) -> arrow::datatypes::SchemaRef {
+                self.inner.schema()
+            }
+            fn table_type(&self) -> datafusion::datasource::TableType {
+                self.inner.table_type()
+            }
+            async fn scan(
+                &self,
+                state: &dyn datafusion::catalog::Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[Expr],
+                limit: Option<usize>,
+            ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>
+            {
+                self.inner.scan(state, projection, filters, limit).await
+            }
+        }
+
+        /// Removing a table has to let a waiter taken from *that table's own*
+        /// recorder end. The recorder lives inside the provider, so an instance
+        /// that pinned the provider across the wait pinned the recorder with it,
+        /// and the signal the wait is watching could never close.
+        #[tokio::test]
+        async fn a_removed_table_does_not_pin_its_own_recorder_across_the_wait() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            // Moved, not cloned: the provider now holds the only recorder, the
+            // way an accelerated table holds the one inside its refresher.
+            df.ctx
+                .register_table(
+                    name.clone(),
+                    Arc::new(ProviderOwningItsCompletion::new(completion)),
+                )
+                .expect("register");
+
+            let instance = df.capture_table_instance(&name).await;
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                df.await_refresh_completion(instance, Some(waiter)),
+            )
+            .await
+            .expect(
+                "the wait must end: dropping the table drops its recorder, which closes the signal",
+            );
+
+            assert_eq!(
+                outcome,
+                DeferredRefreshOutcome::Abandoned,
+                "no refresh was ever recorded, and none can be now the table is gone"
             );
         }
     }
