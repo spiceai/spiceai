@@ -992,9 +992,17 @@ fn cayenne_optimizer_config(config: &ConfigOptions) -> CayenneOptimizerConfig {
 /// build side the pool cannot hold as fitting comfortably within it. Clamping
 /// here rather than at the callers keeps every consumer, present and future, on
 /// a gate that means what it says.
+///
+/// `None` disables the gate, which is strictly weaker than gating at the pool:
+/// it drops the memory-gated path entirely and falls back to the same-source
+/// semi/anti row-count rule, so an oversized inner or outer build stays a
+/// non-spillable hash join. Only a fraction that cannot name a gate earns it —
+/// `NaN`, which is uncomparable, and zero or negative, which ask for no gate.
+/// Positive infinity does name one, the whole pool, so it clamps like any other
+/// over-1.0 value rather than removing the protection it asked to maximise.
 fn sort_merge_memory_gate_bytes(config: &CayenneOptimizerConfig) -> Option<usize> {
     let fraction = config.sort_merge_memory_pool_fraction;
-    if !fraction.is_finite() || fraction <= 0.0 {
+    if fraction.is_nan() || fraction <= 0.0 {
         return None;
     }
     let fraction = fraction.min(1.0);
@@ -3335,6 +3343,44 @@ mod tests {
             gate_for(0.0),
             None,
             "fraction 0 still disables the memory gate"
+        );
+        assert_eq!(
+            gate_for(f64::INFINITY),
+            Some(1_024),
+            "an infinite fraction clamps to the pool rather than removing the gate"
+        );
+        assert_eq!(
+            gate_for(f64::NAN),
+            None,
+            "a NaN fraction is uncomparable, so it disables the gate"
+        );
+        assert_eq!(
+            gate_for(f64::NEG_INFINITY),
+            None,
+            "a negative-infinite fraction stays on the non-positive disabling path"
+        );
+    }
+
+    /// An infinite `sort_merge_memory_pool_fraction` must clamp to the pool, not
+    /// remove the gate. Removing it drops the whole memory-gated path, and the
+    /// legacy fallback it lands on refuses inner joins outright — so the very
+    /// build side the gate exists to spill stays a non-spillable hash join.
+    #[test]
+    fn rewrites_oversized_inner_join_when_the_pool_fraction_is_infinite() {
+        let schema = order_line_schema();
+        let left = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let right = large_exact_cayenne_file_exec(&schema, "order_line.vortex");
+        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
+        // 10M rows x ~24 B/row x 2.5 hash-table overhead ~ 600 MiB estimated,
+        // against a 64 MiB pool the clamped fraction turns into a 64 MiB gate.
+        let config =
+            config_with_cayenne_optimizer(None, Some(f64::INFINITY), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "an infinite pool fraction must clamp to the pool, leaving the oversized inner build spillable"
         );
     }
 
