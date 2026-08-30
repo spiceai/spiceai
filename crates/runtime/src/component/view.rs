@@ -108,6 +108,20 @@ impl View {
     }
 }
 
+/// Warns that a view set `acceleration.ready_state`, which the view honours but which is
+/// deprecated in favour of the view's own `ready_state`.
+///
+/// Built as a pure function so the wording a user depends on — the view's name, the key to move
+/// the setting to, and the docs link — is asserted directly by a unit test rather than only
+/// through whatever a log capture happens to retain.
+fn deprecated_acceleration_ready_state_warning(view_name: &str) -> String {
+    format!(
+        "View '{view_name}' sets `acceleration.ready_state`, which is deprecated and will be removed. \
+        Move the setting to the view's own `ready_state` to keep it working. \
+        See: https://spiceai.org/docs/reference/spicepod/views"
+    )
+}
+
 pub struct ViewBuilder {
     pub name: TableReference,
     pub sql: String,
@@ -139,6 +153,23 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
 
         let metadata = view.metadata();
 
+        // `acceleration.ready_state` is a legitimate member of the acceleration block, so it
+        // parses cleanly on a view as well as on a dataset. A dataset reads it out of the block
+        // and applies it; resolve it the same way here so the key means one thing wherever it is
+        // written, rather than being accepted and dropped on one of the two components. See
+        // `DatasetBuilder::try_from` for the dataset side.
+        #[expect(deprecated)]
+        let ready_state = match view.acceleration.as_ref().map(|a| a.ready_state) {
+            Some(Some(ready_state)) => {
+                tracing::warn!(
+                    "{}",
+                    deprecated_acceleration_ready_state_warning(&view.name)
+                );
+                ReadyState::from(ready_state)
+            }
+            _ => ReadyState::from(view.ready_state),
+        };
+
         let acceleration = view
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -169,7 +200,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             metadata,
             columns: view.columns,
             acceleration,
-            ready_state: ReadyState::from(view.ready_state),
+            ready_state,
             vectors: view.vectors,
             params: view
                 .params
@@ -322,5 +353,153 @@ impl ViewBuilder {
             runtime,
             app,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadyState, ViewBuilder, deprecated_acceleration_ready_state_warning};
+    use spicepod::component::view as spicepod_view;
+
+    /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a
+    /// `spicepod.yaml` goes through rather than a hand-built struct that could disagree with it.
+    fn ready_state_of(view_yaml: &str) -> ReadyState {
+        let view: spicepod_view::View = yaml::from_str(view_yaml).expect("view yaml parses");
+        ViewBuilder::try_from(view)
+            .expect("view builds")
+            .ready_state
+    }
+
+    /// Regression test for #13615. The key parses on a view whether or not anything reads it, so
+    /// assert the value the built view carries rather than that the Spicepod was accepted.
+    #[test]
+    fn acceleration_ready_state_is_applied_to_a_view() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "a view's `acceleration.ready_state` must reach the built view"
+        );
+    }
+
+    /// The block being switched off does not discard the setting, matching the dataset. That is
+    /// what `spicepod`'s `CONSUMED_WHEN_DISABLED` relies on when it leaves `ready_state` out of
+    /// the "discarded because `enabled: false`" warning.
+    #[test]
+    fn acceleration_ready_state_is_applied_even_when_acceleration_is_disabled() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: false
+  ready_state: on_schema_resolved
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnSchemaResolved);
+    }
+
+    /// The deprecated key wins over the view's own field, the same precedence `DatasetBuilder`
+    /// applies, so the two components cannot resolve the same pair of settings differently.
+    ///
+    /// Both values are non-default and differ from each other. `on_load` would be useless on
+    /// either side: it is the `#[default]`, so a written-out `ready_state: on_load` is
+    /// indistinguishable from an omitted one, and the assertion would hold for an implementation
+    /// that ignored one of the two fields entirely.
+    #[test]
+    fn acceleration_ready_state_takes_precedence_over_the_views_own_field() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "the acceleration block's value must win over the view's own"
+        );
+    }
+
+    #[test]
+    fn the_views_own_ready_state_is_used_when_the_acceleration_block_omits_it() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_registration
+acceleration:
+  enabled: true
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn a_view_with_no_acceleration_block_uses_its_own_ready_state() {
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+"
+            ),
+            ReadyState::OnSchemaResolved
+        );
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+"
+            ),
+            ReadyState::OnLoad,
+            "an unset `ready_state` keeps the default"
+        );
+    }
+
+    /// The warning is the only thing that tells an operator to move the setting, so assert the
+    /// three parts they act on rather than that some warning was emitted.
+    #[test]
+    fn the_deprecation_warning_names_the_view_the_replacement_and_the_docs() {
+        let message = deprecated_acceleration_ready_state_warning("daily_totals");
+
+        assert!(
+            message.contains("'daily_totals'"),
+            "the warning must name the view: {message}"
+        );
+        assert!(
+            message.contains("`acceleration.ready_state`"),
+            "the warning must name the deprecated key: {message}"
+        );
+        assert!(
+            message.contains("`ready_state`") && message.contains("deprecated"),
+            "the warning must say the key is deprecated and name the replacement: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/reference/spicepod/views"),
+            "the warning must link the docs: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "a log message stays on one line: {message}"
+        );
     }
 }
