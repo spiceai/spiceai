@@ -274,7 +274,7 @@ the case named:
 ## duckdb-rs
 
 Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
-`sgrebnov/duckdb-1.4.4-arrow58`.
+`spiceai-1.4.4`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
