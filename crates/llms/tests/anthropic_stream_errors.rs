@@ -169,7 +169,7 @@ async fn an_invalid_request_naming_403_is_not_reported_as_an_auth_failure() {
 
     let message = api_error_message(&error);
     assert!(
-        !message.contains("authentication failed"),
+        !message.contains("rejected the API key") && !message.contains("not permitted"),
         "a malformed request is not a credential problem: {message}"
     );
     assert!(
@@ -216,8 +216,8 @@ async fn an_authentication_error_is_reported_as_one_and_keeps_its_cause() {
 
     let message = api_error_message(&error);
     assert!(
-        message.contains("authentication failed"),
-        "an authentication_error must be reported as one: {message}"
+        message.contains("rejected the API key"),
+        "an authentication_error must be reported as a rejected key: {message}"
     );
     assert!(
         message.contains("invalid x-api-key"),
@@ -226,9 +226,10 @@ async fn an_authentication_error_is_reported_as_one_and_keeps_its_cause() {
     assert_eq!(api_error_type(&error), Some("AnthropicAuthenticationError"));
 }
 
-/// Anthropic's 403 is `permission_error`, and it is answered the same way as a bad key.
+/// Anthropic's 403 is `permission_error` — a key that is valid and lacks access. Reporting it as a
+/// rejected key sends the caller to rotate a key that is working, so the two stay apart.
 #[tokio::test]
-async fn a_permission_error_is_reported_as_an_authentication_failure() {
+async fn a_permission_error_is_not_reported_as_a_rejected_key() {
     let error = stream_error(
         "403 Forbidden",
         r#"{"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission to use the specified resource"}}"#,
@@ -237,13 +238,18 @@ async fn a_permission_error_is_reported_as_an_authentication_failure() {
 
     let message = api_error_message(&error);
     assert!(
-        message.contains("authentication failed"),
-        "a permission_error is answered by checking the key and its workspace: {message}"
+        message.contains("not permitted"),
+        "a permission_error must be reported as one: {message}"
+    );
+    assert!(
+        !message.contains("rejected the API key"),
+        "a key that is valid but lacks access is not a key to rotate: {message}"
     );
     assert!(
         message.contains("does not have permission"),
         "the cause must survive: {message}"
     );
+    assert_eq!(api_error_type(&error), Some("AnthropicPermissionError"));
 }
 
 /// A proxy in front of Anthropic may answer without a `type`. That is the one case the message
@@ -281,10 +287,10 @@ async fn a_model_not_found_keeps_its_explanation() {
     assert_eq!(api_error_type(&error), Some("not_found_error"));
 }
 
-/// Anthropic's overload answer is a 529, and the SSE client hands a server-error body over
-/// unparsed — so it arrives with no `type` and its whole JSON body as the message. That is the
-/// production shape the message tests still have to serve, and the caller must at least be told
-/// what came back.
+/// Anthropic's pre-stream overload answer is a 529, and the SSE client hands a server-error body
+/// over unparsed — so it arrives with no `type` and its whole JSON body as the message, and lands
+/// in the unclassified arm even though the body names `overloaded_error`. That is the shape the
+/// message tests still have to serve, and the caller must at least be told what came back.
 #[tokio::test]
 async fn an_overload_arrives_untyped_and_keeps_its_body_as_the_cause() {
     let error = stream_error(
@@ -337,6 +343,11 @@ async fn a_mid_stream_error_event_is_reported_as_the_failure_anthropic_sent() {
         !message.contains("unknown variant"),
         "a failure Anthropic reported is not a parse failure: {message}"
     );
+    assert!(
+        message.contains("Retry with backoff"),
+        "an overload is the retryable failure, and the caller has to be told so: {message}"
+    );
+    assert_eq!(api_error_type(&error), Some("AnthropicOverloadedError"));
 }
 
 /// A mid-stream rate limit is classified from its type like any other, so the caller gets the

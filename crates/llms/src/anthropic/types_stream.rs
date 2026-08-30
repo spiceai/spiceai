@@ -457,7 +457,9 @@ fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
 #[derive(Debug, PartialEq, Eq)]
 enum StreamErrorKind {
     RateLimit,
+    Overloaded,
     Authentication,
+    Permission,
     Other,
 }
 
@@ -470,13 +472,18 @@ enum StreamErrorKind {
 ///
 /// The message tests survive only for an error carrying no `type` at all. A proxy in front of
 /// Anthropic may answer that way, and so does a 5xx from Anthropic itself: the SSE client does not
-/// parse a server-error body, and hands the whole thing over as an untyped message.
+/// parse a server-error body, and hands the whole thing over as an untyped message. A pre-stream
+/// `overloaded_error` therefore arrives untyped and lands in `Other`, while the same condition
+/// delivered as a mid-stream packet is typed and reaches the arm below — settling that difference
+/// means parsing the 5xx body, which is the client's job rather than this function's.
 fn classify_stream_error(api_error: &ApiError) -> StreamErrorKind {
     match api_error.r#type.as_deref() {
-        // Anthropic's documented error types. `permission_error` is its 403 and belongs with
-        // `authentication_error`: both are answered by checking the key and its workspace.
+        // Anthropic's documented error types. Its 401 and its 403 stay apart because they are
+        // answered differently: a rejected key is rotated, a key without access is granted it.
         Some("rate_limit_error") => StreamErrorKind::RateLimit,
-        Some("authentication_error" | "permission_error") => StreamErrorKind::Authentication,
+        Some("overloaded_error") => StreamErrorKind::Overloaded,
+        Some("authentication_error") => StreamErrorKind::Authentication,
+        Some("permission_error") => StreamErrorKind::Permission,
         Some(_) => StreamErrorKind::Other,
         None => classify_untyped_stream_error(&api_error.message),
     }
@@ -524,12 +531,26 @@ fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
             ),
             "AnthropicRateLimitError",
         ),
+        StreamErrorKind::Overloaded => (
+            format!(
+                "Anthropic is overloaded and shed the request ({}). Retry with backoff — the model is temporarily unavailable rather than misconfigured.",
+                api_error.message
+            ),
+            "AnthropicOverloadedError",
+        ),
         StreamErrorKind::Authentication => (
             format!(
-                "Anthropic authentication failed ({}). Verify your Anthropic API key and workspace permissions.",
+                "Anthropic rejected the API key ({}). Check the key the model is configured with at https://console.anthropic.com/settings/keys.",
                 api_error.message
             ),
             "AnthropicAuthenticationError",
+        ),
+        StreamErrorKind::Permission => (
+            format!(
+                "The Anthropic API key is not permitted to make this request ({}). Grant it access to the model and workspace the request names, or configure the model with a key that has it.",
+                api_error.message
+            ),
+            "AnthropicPermissionError",
         ),
         StreamErrorKind::Other => (
             format!("Anthropic streaming error: {}", api_error.message),
