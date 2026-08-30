@@ -61,7 +61,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
        - Workflow to execute: `bench`
        - All other values left empty.
    - [ ] Verify [Append Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_append.yml) is green on `trunk` and the release branch.
-    - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new append test run. Specify `trunk` as the branch source, with the following parameters:
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new append test run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `append`
        - All other values left empty.
    - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
