@@ -407,7 +407,6 @@ mod federation_tests {
     use crate::catalogconnector::stub_udf;
     use datafusion::prelude::col;
     use datafusion::sql::unparser::Unparser;
-    use datafusion::sql::unparser::dialect::Dialect as _;
 
     /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
     /// `DataFusion` evaluates them locally instead of unparsing them into the
