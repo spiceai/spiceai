@@ -4951,6 +4951,55 @@ mod tests {
         );
     }
 
+    /// Regression test for #13549, CDC leg. A source that declares a `MAP`'s `entries` field
+    /// nullable — which the Arrow map layout forbids — is not reporting a schema change, so
+    /// `on_schema_change: fail` must not reject the batch. The surrounding `Map` pair is
+    /// otherwise identical, so the entries flag is the only thing under test.
+    #[tokio::test]
+    async fn cdc_schema_evolution_accepts_a_nonconforming_map_entries_declaration() {
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+
+        let dataset = "cdc_map_entries_accepted";
+        install_cdc_schema_evolution(
+            &datafusion::sql::TableReference::bare(dataset.to_string()),
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::Fail,
+                constraint_columns: vec![],
+            },
+        );
+        let task = make_refresh_task_named(
+            dataset,
+            Arc::new(MemTable::try_new(schema_with(false), vec![vec![]]).expect("mem table")),
+        );
+
+        task.maybe_evolve_schema_for_cdc(&schema_with(true))
+            .await
+            .expect(
+                "an entries declaration the Arrow map layout forbids is not a schema change and must not fail the write",
+            );
+    }
+
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
