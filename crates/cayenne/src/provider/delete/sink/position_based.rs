@@ -942,6 +942,11 @@ fn build_vortex_filter(
     let execution_props = ExecutionProps::new();
     let expr_convertor = DefaultExpressionConvertor::default();
 
+    // Fold `now()` (and other volatile functions) per pass before physical
+    // planning. `create_physical_expr` does not call `ExprSimplifier`.
+    let schema = Arc::new(df_schema.as_arrow().as_ref().clone());
+    let filters = crate::provider::retention::simplify_filters_for_execution(filters, &schema)?;
+
     // Convert logical filters to physical expressions
     let physical_filters: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>> = filters
         .iter()

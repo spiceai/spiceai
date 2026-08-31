@@ -26,6 +26,28 @@ use datafusion_common::ScalarValue;
 use snafu::prelude::*;
 use util::timestamp_filter::{TimestampFilterConvert, data_type_to_timestamp_format};
 
+/// Fold volatile functions such as `now()` in retention/delete filters to
+/// literals for this execution pass.
+///
+/// `create_physical_expr` does not run [`ExprSimplifier`]. DataFusion's
+/// `NowFunc::invoke` always errors (`invoke should not be called on a simplified
+/// now() function`); the only legal path is `NowFunc::simplify`, which needs
+/// `query_execution_start_time`. Call this immediately before physical planning,
+/// once per pass — folding at table-open would freeze the cutoff for the
+/// process lifetime.
+///
+/// [`ExprSimplifier`]: datafusion::optimizer::simplify_expressions::ExprSimplifier
+pub(crate) fn simplify_filters_for_execution(
+    filters: &[Expr],
+    schema: &SchemaRef,
+) -> datafusion_common::Result<Vec<Expr>> {
+    filters
+        .iter()
+        .cloned()
+        .map(|filter| util::expr::simplify_expr(filter, schema))
+        .collect()
+}
+
 /// Errors from [`TimeRetentionFilterBuilder`] construction.
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -203,6 +225,8 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::logical_expr::col;
+    use datafusion::prelude::SessionContext;
+    use datafusion_common::DFSchema;
     use std::sync::Arc;
 
     #[test]
@@ -378,6 +402,36 @@ mod tests {
         assert!(
             matches!(threshold, ScalarValue::TimestampMicrosecond(Some(_), _)),
             "threshold should be a resolved TimestampMicrosecond, got: {threshold}"
+        );
+    }
+
+    /// `retention_sql` predicates such as `arrival_time < now() - INTERVAL '7 days'`
+    /// must fold `now()` to a `TimestampNanosecond` literal per pass. Folding at
+    /// table-open would freeze the cutoff for the process lifetime.
+    #[test]
+    fn test_simplify_filters_folds_now_minus_interval() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "arrival_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )]));
+        let df_schema = DFSchema::try_from(schema.as_ref().clone()).expect("schema conversion");
+        let ctx = SessionContext::new();
+        let expr = ctx
+            .parse_sql_expr("arrival_time < now() - INTERVAL '7 days'", &df_schema)
+            .expect("parse now() retention filter");
+
+        let simplified = simplify_filters_for_execution(&[expr], &schema)
+            .expect("simplification should succeed");
+        assert_eq!(simplified.len(), 1, "one filter in, one filter out");
+
+        let (col_name, op, threshold) = extract_retention_column_and_threshold(&simplified[0])
+            .expect("simplified now() filter should be col < literal");
+        assert_eq!(col_name, "arrival_time");
+        assert_eq!(op, Operator::Lt);
+        assert!(
+            matches!(threshold, ScalarValue::TimestampNanosecond(Some(_), _)),
+            "now() - INTERVAL should fold to TimestampNanosecond, got: {threshold}"
         );
     }
 }
