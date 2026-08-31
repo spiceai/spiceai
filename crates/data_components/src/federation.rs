@@ -583,7 +583,7 @@ mod tests {
     /// The build relation in this self-join answers to the outer reference's
     /// qualifier. Emitting it as a correlated `EXISTS` would therefore bind the
     /// reference to the inner relation and silently return wrong rows. The
-    /// capture guard from DataFusion fork PR #207 must refuse the shape even
+    /// capture guard from `DataFusion` fork PR #207 must refuse the shape even
     /// without a row bound.
     #[test]
     fn an_unbounded_exists_refuses_a_correlation_shadowed_by_its_build_relation() {
