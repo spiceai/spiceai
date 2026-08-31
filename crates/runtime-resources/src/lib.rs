@@ -143,8 +143,8 @@ fn parse_proc_status_resident(status: &str) -> Option<ResidentMemory> {
 /// cases that matter.
 ///
 /// On macOS it is one `task_info(TASK_VM_INFO)` syscall, which is also what
-/// `vmmap` reports from — cheaper than the `sysinfo::System` this used to build
-/// per sample, and more informative.
+/// `vmmap` reports from — cheaper than constructing a `sysinfo::System` per
+/// sample, and more informative.
 ///
 /// This blocks (a filesystem read on Linux), so async callers must run it on the
 /// blocking pool rather than a runtime worker.
@@ -419,15 +419,25 @@ Threads:\t32
 
         // The split only exists on the platforms that implement it; elsewhere it
         // is `None` rather than a fabricated attribution, so asserting it
-        // unconditionally would fail on every other target.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        assert!(
+        // unconditionally would fail on every other target. Linux additionally
+        // reports `None` when the kernel's `/proc/self/status` carries no
+        // `RssAnon`/`RssFile` pair, which is the same contract, so require the
+        // pair only where the syscall cannot omit it.
+        #[cfg(target_os = "macos")]
+        let split = Some(
             resident
                 .split
-                .expect("Linux and macOS both supply the split")
-                .anon
-                > 0,
-            "a running process has anonymous memory (heap and stacks)"
+                .expect("`task_info(TASK_VM_INFO)` always supplies the split"),
         );
+        #[cfg(target_os = "linux")]
+        let split = resident.split;
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(split) = split {
+            assert!(
+                split.anon > 0,
+                "a running process has anonymous memory (heap and stacks)"
+            );
+        }
     }
 }
