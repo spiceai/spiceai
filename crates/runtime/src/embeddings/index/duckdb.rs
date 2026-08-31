@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use data_accelerator_api::swappable::SwappableTableProvider;
 use data_components::poly::PolyTableProvider;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use datafusion_table_providers::{
@@ -267,6 +268,16 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
+    // A caching-mode accelerator wraps its provider in a `SwappableTableProvider` so it can be
+    // reopened after a fatal error (spiceai/spiceai#13513). That wrapper is opaque to the
+    // structural walks below, so peel it to its current inner provider first; otherwise this
+    // returns `None` and DuckDB vector-index setup fails with "requires a DuckDB accelerator
+    // provider". Snapshot mode wraps the same way, so this also covers it.
+    if let Some(swappable) = provider.downcast_ref::<SwappableTableProvider>() {
+        let current = swappable.current();
+        return duckdb_writer_context(&current);
+    }
+
     if let Some(layered) = provider.downcast_ref::<SpiceTable>() {
         return duckdb_writer_context(layered.below());
     }

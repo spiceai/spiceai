@@ -5214,6 +5214,14 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
+    // A caching/snapshot accelerator wraps its provider in a `SwappableTableProvider`
+    // (spiceai/spiceai#13513); it is opaque to these structural walks, so peel it to its
+    // current inner provider or partition detection silently returns `None`.
+    if let Some(swappable) = table_provider.downcast_ref::<SwappableTableProvider>() {
+        let current = swappable.current();
+        return partition_expr_from_table_provider(&current);
+    }
+
     if let Some(layered) = table_provider.downcast_ref::<spice_table::SpiceTable>() {
         return partition_expr_from_table_provider(layered.below());
     }
