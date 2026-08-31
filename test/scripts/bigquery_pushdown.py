@@ -207,6 +207,14 @@ def free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def distinct_free_ports() -> tuple[int, int]:
+    http_port = free_port()
+    flight_port = free_port()
+    while flight_port == http_port:
+        flight_port = free_port()
+    return http_port, flight_port
+
+
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -455,8 +463,7 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        http_port = free_port()
-        flight_port = free_port()
+        http_port, flight_port = distinct_free_ports()
         log_handle = (output / "spiced.log").open("wb")
         environment = os.environ.copy()
         environment["BIGQUERY_SERVICE_ACCOUNT_JSON"] = compact_credential

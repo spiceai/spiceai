@@ -578,13 +578,22 @@ mod tests {
             ),
             "expected the refusal to name the probe-qualified correlation, got: {err}"
         );
+    }
 
-        // The unbounded sibling is deliberately left unpinned. Unlike the
-        // multi-relation shape, its rendering is *itself* wrong — the inner
-        // `FROM` shadows the outer relation, so the `EXISTS` reduces to "this
-        // table has a row" with or without a bound — so asserting that it still
-        // unparses would pin a defect and stand in the way of #12840's rewrite,
-        // which should be free to refuse this shape at any bound.
+    /// The build relation in this self-join answers to the outer reference's
+    /// qualifier. Emitting it as a correlated `EXISTS` would therefore bind the
+    /// reference to the inner relation and silently return wrong rows. The
+    /// capture guard from DataFusion fork PR #207 must refuse the shape even
+    /// without a row bound.
+    #[test]
+    fn an_unbounded_exists_refuses_a_correlation_shadowed_by_its_build_relation() {
+        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
+            .expect_err("a build relation that shadows the correlation must be refused");
+        assert!(
+            err.to_string()
+                .contains("a FROM the emitted SQL introduces would capture the correlation"),
+            "expected the refusal to identify the captured correlation, got: {err}"
+        );
     }
 
     /// The unparser dialects this workspace hands to the unparser, plus a
