@@ -303,7 +303,7 @@ impl CachingRecovery {
         // surface it as a swap rejection rather than inventing a variant for the unreachable.
         let previous = self
             .swappable
-            .replace(Arc::clone(&placeholder))
+            .swap(Arc::clone(&placeholder))
             .map_err(|source| RecoverError::SwapRejected { source })?;
         drop(previous);
 
@@ -319,6 +319,7 @@ impl CachingRecovery {
 
         self.swappable
             .swap(new_provider)
+            .map(|_| ())
             .map_err(|source| RecoverError::SwapRejected { source })
     }
 }

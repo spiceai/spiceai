@@ -162,50 +162,26 @@ impl SwappableTableProvider {
         )
     }
 
-    /// Replace the inner provider. Validates that the new provider's schema
-    /// is compatible with the cached schema (see [`schemas_compatible`]) and
-    /// returns [`SwapError::SchemaMismatch`] otherwise without mutating
-    /// state. Production callers should pre-validate too so they can surface
-    /// dataset-aware error context, but this guard ensures incompatible
-    /// providers cannot be installed even in release builds.
+    /// Install `new_inner` and return the provider it replaced. Validates that the new
+    /// provider's schema is compatible with the cached schema (see [`schemas_compatible`]) and
+    /// returns [`SwapError::SchemaMismatch`] otherwise without mutating state. Production callers
+    /// should pre-validate too so they can surface dataset-aware error context, but this guard
+    /// ensures incompatible providers cannot be installed even in release builds.
+    ///
+    /// The replaced provider is returned rather than dropped inside the lock. Callers that don't
+    /// need it drop it (or ignore the `Ok`); fatal-error recovery does need it — to reopen a
+    /// file-based engine that has locked its own file (e.g. an invalidated DuckDB instance), it
+    /// installs a schema-matching placeholder here and drops the returned provider to release
+    /// the file lock before rebuilding a replacement over the same file.
     ///
     /// Lock poisoning is recovered transparently via
     /// [`std::sync::PoisonError::into_inner`].
     ///
     /// # Errors
     ///
-    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible
-    /// with the cached schema.
-    pub fn swap(&self, new_inner: Arc<dyn TableProvider>) -> Result<(), SwapError> {
-        if !schemas_compatible(new_inner.schema().as_ref(), self.cached_schema.as_ref()) {
-            return Err(SwapError::SchemaMismatch);
-        }
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = new_inner;
-        Ok(())
-    }
-
-    /// Install `new_inner` and return the provider it replaced.
-    ///
-    /// Identical to [`Self::swap`] except the previous inner provider is
-    /// handed back instead of dropped inside the lock. Fatal-error recovery
-    /// needs this: to reopen a file-based engine that has locked its own file
-    /// (e.g. an invalidated DuckDB instance), the recovering caller must first
-    /// drop the *only* long-lived strong reference to the broken provider —
-    /// the one this wrapper holds — before it can rebuild a replacement over
-    /// the same file. It installs a schema-matching placeholder here, drops
-    /// the returned provider to release the file lock, then installs the
-    /// rebuilt provider with a second call.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SwapError::SchemaMismatch`] if `new_inner`'s schema is
-    /// incompatible with the cached schema; the inner provider is left
-    /// unchanged.
-    pub fn replace(
+    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible with
+    /// the cached schema; the inner provider is left unchanged.
+    pub fn swap(
         &self,
         new_inner: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, SwapError> {
