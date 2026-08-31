@@ -1075,22 +1075,25 @@ impl DataAccelerator for DuckDBAccelerator {
         PARAMETERS
     }
 
-    fn supports_snapshot_reload(&self) -> bool {
+    fn supports_provider_rebuild(&self) -> bool {
         true
     }
 
-    /// Reloads the `DuckDB`-backed table provider from the snapshot file
-    /// that was just written to the primary path.
+    /// Rebuilds the `DuckDB`-backed table provider over the file currently at
+    /// the primary path.
     ///
     /// Drops the previous provider, evicts the cached connection pool from
     /// the upstream `DuckDBTableProviderFactory` registry, and then re-runs
     /// the registry factory to build a fresh provider over the on-disk file.
     /// The pool eviction is required because the registry caches pool
     /// instances by file path; without it, the freshly built provider would
-    /// reuse the prior pool's open connections — which keep observing the
-    /// previous file inode — and queries would continue to return stale data
-    /// even after the file has been atomically replaced on disk.
-    async fn reload_from_snapshot(
+    /// reuse the prior pool's open connections. That matters for both callers:
+    /// after a `refresh_mode: snapshot` file replacement those connections
+    /// keep observing the previous file inode (stale reads), and after a fatal
+    /// out-of-memory rollback they belong to a `DuckDB` instance that has
+    /// invalidated itself and rejects every query until reopened. Evicting the
+    /// pool and rebuilding reopens the file into a healthy instance.
+    async fn rebuild_provider(
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,

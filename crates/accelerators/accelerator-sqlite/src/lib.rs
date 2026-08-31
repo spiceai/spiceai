@@ -605,11 +605,11 @@ impl DataAccelerator for SqliteAccelerator {
         PARAMETERS
     }
 
-    fn supports_snapshot_reload(&self) -> bool {
+    fn supports_provider_rebuild(&self) -> bool {
         true
     }
 
-    async fn reload_from_snapshot(
+    async fn rebuild_provider(
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,

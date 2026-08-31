@@ -44,6 +44,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
+use data_accelerator_api::swappable::SwappableTableProvider;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
@@ -223,6 +224,20 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 /// them is a configuration the accelerator cannot write to.
 const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 
+/// Whether `err` is a fatal accelerator state that a provider rebuild can recover from.
+///
+/// A file-mode DuckDB instance that reaches its memory limit can fail a transaction and then
+/// fail the transaction's rollback, at which point DuckDB invalidates the whole database:
+/// every subsequent query — including reads the cached rows could satisfy — returns the same
+/// fatal error until the instance is reopened (spiceai/spiceai#13513). Matching DuckDB's two
+/// fatal markers keeps recovery targeted: an ordinary out-of-memory error that did *not*
+/// invalidate the database is left to the normal degrade-and-continue path, not treated as a
+/// reason to tear the instance down and rebuild it.
+fn is_fatal_accelerator_error(err: &DataFusionError) -> bool {
+    let message = err.to_string();
+    message.contains("has been invalidated") || message.contains("Cannot continue operation")
+}
+
 /// The `error!` and dataset status a caching accelerator gets when it can accept writes but
 /// cannot store any of them.
 ///
@@ -344,6 +359,7 @@ impl CacheWriteHealth {
 ///
 /// Removes cache keys from `in_flight_revalidations` after writes complete.
 /// Updates `last_updated_at` after successful writes to support `snapshots_creation_policy: on_change`.
+#[expect(clippy::too_many_arguments)]
 pub fn spawn_batched_cache_write_task(
     mut rx: CacheWriteReceiver,
     accelerator: Arc<dyn TableProvider>,
@@ -352,6 +368,7 @@ pub fn spawn_batched_cache_write_task(
     in_flight_revalidations: InFlightRevalidations,
     last_updated_at: Arc<AtomicI64>,
     runtime_status: Arc<RuntimeStatus>,
+    recovery: Option<Arc<SwappableTableProvider>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let dataset_name = dataset.to_string();
@@ -388,6 +405,7 @@ pub fn spawn_batched_cache_write_task(
                                 &in_flight_revalidations,
                                 &last_updated_at,
                                 &mut health,
+                                recovery.as_ref(),
                             ).await;
                         }
                         break;
@@ -405,6 +423,7 @@ pub fn spawn_batched_cache_write_task(
                             &in_flight_revalidations,
                             &last_updated_at,
                             &mut health,
+                            recovery.as_ref(),
                         ).await;
                     }
                 }
@@ -416,6 +435,7 @@ pub fn spawn_batched_cache_write_task(
 }
 
 /// Flushes accumulated cache write requests as a single batched operation.
+#[expect(clippy::too_many_arguments)]
 async fn flush_cache_writes(
     buffer: &mut Vec<CacheWriteRequest>,
     accelerator: &Arc<dyn TableProvider>,
@@ -424,6 +444,7 @@ async fn flush_cache_writes(
     in_flight_revalidations: &InFlightRevalidations,
     last_updated_at: &Arc<AtomicI64>,
     health: &mut CacheWriteHealth,
+    recovery: Option<&Arc<SwappableTableProvider>>,
 ) {
     if buffer.is_empty() {
         return;
@@ -535,6 +556,27 @@ async fn flush_cache_writes(
     if let Err(e) = result {
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
         health.record_failure(&e);
+
+        // A file-mode DuckDB accelerator that reaches its memory limit can invalidate its own
+        // database, after which every query — reads included — fails until the process
+        // restarts (spiceai/spiceai#13513). Reopen the accelerator over the file it already
+        // has so the dataset keeps serving what it holds instead of going permanently dark.
+        // The writes this flush was carrying are dropped; caching-mode entries are re-fetched
+        // from source on the next access, so this loses freshness, not correctness.
+        if let Some(swappable) = recovery
+            && is_fatal_accelerator_error(&e)
+        {
+            tracing::warn!(
+                "Dataset '{dataset_name}' accelerator entered a fatal state; reopening it. \
+                 {request_count} buffered cache writes were dropped and will be re-fetched on \
+                 next access."
+            );
+            // Hold the accelerator write mutex across the reopen so it is serialized with
+            // concurrent writes, matching the invariant `DataAccelerator::rebuild_provider`
+            // documents.
+            let _guard = accelerator_write_mutex.lock().await;
+            swappable.recover(dataset_name).await;
+        }
     } else if insert_rows > 0 || upsert_rows > 0 {
         health.record_success();
 
@@ -2567,6 +2609,7 @@ mod tests {
             Arc::clone(in_flight_revalidations),
             last_updated_at,
             RuntimeStatus::new(),
+            None,
         );
         (tx, handle)
     }

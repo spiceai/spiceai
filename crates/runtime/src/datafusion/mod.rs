@@ -58,7 +58,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
-use data_accelerator_api::swappable::SwappableTableProvider;
+use data_accelerator_api::swappable::{RebuildFn, SwappableTableProvider};
 use data_connector_api::federated::FederatedTableProvider;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -517,7 +517,7 @@ pub enum Error {
 
     #[snafu(display(
         "refresh_mode: snapshot requires the accelerator to support snapshot reload, but \
-         engine '{engine}' does not implement `reload_from_snapshot`."
+         engine '{engine}' does not implement `rebuild_provider`."
     ))]
     SnapshotRefreshModeReloadUnsupported { engine: String },
 
@@ -2779,7 +2779,12 @@ impl DataFusion {
         // so the underlying provider can be replaced atomically when a newer snapshot
         // is loaded. The snapshot refresh state captures everything `RefreshTask` needs
         // to query the snapshot store and rebuild the provider on reload.
-        let (accelerated_table_provider, snapshot_refresh_state) =
+        //
+        // RefreshMode::Caching uses the same SwappableTableProvider for a different reason: a
+        // file-based engine (DuckDB) can invalidate itself on an out-of-memory rollback, and
+        // wrapping the provider is what lets the cache-write task reopen it in place instead of
+        // the dataset failing every query until restart (spiceai/spiceai#13513).
+        let (accelerated_table_provider, snapshot_refresh_state, caching_recovery) =
             if matches!(refresh_mode, RefreshMode::Snapshot) {
                 let snapshot_state = build_snapshot_refresh_state(
                     self,
@@ -2794,9 +2799,30 @@ impl DataFusion {
                 .await?;
                 let swappable: Arc<dyn TableProvider> =
                     Arc::clone(&snapshot_state.swappable_provider) as Arc<dyn TableProvider>;
-                (swappable, Some(snapshot_state))
+                (swappable, Some(snapshot_state), None)
+            } else if matches!(refresh_mode, RefreshMode::Caching) {
+                match build_caching_recovery_swappable(
+                    self,
+                    dataset,
+                    Arc::clone(&storage_schema),
+                    constraints.clone(),
+                    &acceleration_settings,
+                    Arc::clone(&secrets),
+                    Arc::clone(&accelerated_table_provider),
+                )
+                .await
+                {
+                    Some(swappable) => {
+                        let provider: Arc<dyn TableProvider> =
+                            Arc::clone(&swappable) as Arc<dyn TableProvider>;
+                        (provider, None, Some(swappable))
+                    }
+                    // The engine cannot rebuild itself (e.g. an in-memory accelerator), so leave
+                    // the provider unwrapped: there is nothing to recover to.
+                    None => (accelerated_table_provider, None, None),
+                }
             } else {
-                (accelerated_table_provider, None)
+                (accelerated_table_provider, None, None)
             };
 
         // If we already have an existing dataset checkpoint table that has been checkpointed,
@@ -3093,6 +3119,7 @@ impl DataFusion {
         }
 
         accelerated_table_builder.snapshot_refresh_state(snapshot_refresh_state);
+        accelerated_table_builder.caching_recovery(caching_recovery);
 
         // Pass the acceleration layout for size metrics
         if let Some(layout) = acceleration_layout {
@@ -5433,6 +5460,88 @@ async fn build_snapshot_creation_config(
     }))
 }
 
+/// Wrap a caching-mode accelerator provider in a [`SwappableTableProvider`] wired for
+/// fatal-error recovery, or return `None` when the engine cannot rebuild itself.
+///
+/// A file-based engine (DuckDB) can invalidate its database when it reaches its memory limit,
+/// after which every query fails until the process restarts (spiceai/spiceai#13513). The
+/// [`RebuildFn`] captured here lets [`SwappableTableProvider::recover`] reopen the engine over
+/// the file it already has and swap the fresh provider in, so the dataset keeps serving what it
+/// holds. The factory it calls is the same `create_accelerator_table` flow used at startup,
+/// built over the on-disk `storage_schema` (the schema the provider was created with, including
+/// the caching namespace column) so the rebuilt provider's schema matches and the swap
+/// validates.
+async fn build_caching_recovery_swappable(
+    df: &DataFusion,
+    dataset: &Dataset,
+    storage_schema: SchemaRef,
+    constraints: Option<datafusion::common::Constraints>,
+    acceleration_settings: &Acceleration,
+    secrets: Arc<TokioRwLock<Secrets>>,
+    initial_provider: Arc<dyn TableProvider>,
+) -> Option<Arc<SwappableTableProvider>> {
+    let accelerator = df
+        .accelerator_engine_registry
+        .get_accelerator_engine(acceleration_settings.engine)
+        .await?;
+    if !accelerator.supports_provider_rebuild() {
+        return None;
+    }
+
+    // Clone everything the rebuild factory needs into 'static state, mirroring
+    // `build_snapshot_refresh_state`'s provider_factory.
+    let registry = Arc::clone(&df.accelerator_engine_registry);
+    let dataset_owned = Arc::new(dataset.clone());
+    let acceleration_settings_owned = acceleration_settings.clone();
+    let ctx_owned = Arc::clone(&df.ctx);
+    let secrets_for_factory = secrets;
+    let table_name = dataset.name.clone();
+    let schema_for_factory = storage_schema;
+    let constraints_for_factory = constraints;
+
+    let provider_factory: ReloadProviderFactory = Arc::new(move || {
+        let registry = Arc::clone(&registry);
+        let dataset_owned = Arc::clone(&dataset_owned);
+        let acceleration_settings_owned = acceleration_settings_owned.clone();
+        let ctx_owned = Arc::clone(&ctx_owned);
+        let secrets_for_factory = Arc::clone(&secrets_for_factory);
+        let table_name = table_name.clone();
+        let schema_for_factory = Arc::clone(&schema_for_factory);
+        let constraints_for_factory = constraints_for_factory.clone();
+        Box::pin(async move {
+            registry
+                .create_accelerator_table(
+                    table_name,
+                    schema_for_factory,
+                    constraints_for_factory.as_ref(),
+                    &acceleration_settings_owned,
+                    secrets_for_factory,
+                    Some(dataset_owned.as_ref()),
+                    ctx_owned,
+                )
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        })
+    });
+
+    let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
+    let rebuild: RebuildFn = Arc::new(move |previous| {
+        let accelerator = Arc::clone(&accelerator);
+        let source = Arc::clone(&source);
+        let provider_factory = Arc::clone(&provider_factory);
+        Box::pin(async move {
+            accelerator
+                .rebuild_provider(source.as_ref(), previous, provider_factory)
+                .await
+        })
+    });
+
+    Some(SwappableTableProvider::new_recoverable(
+        initial_provider,
+        rebuild,
+    ))
+}
+
 /// Build the per-dataset state required to drive `RefreshMode::Snapshot`.
 ///
 /// Validates that the configuration is sound (snapshots enabled, supported
@@ -5462,7 +5571,7 @@ async fn build_snapshot_refresh_state(
             engine: acceleration_settings.engine.to_string(),
         })?;
 
-    // 3. accelerator must support reload_from_snapshot.
+    // 3. accelerator must support rebuild_provider.
     let accelerator = df
         .accelerator_engine_registry
         .get_accelerator_engine(acceleration_settings.engine)
@@ -5470,7 +5579,7 @@ async fn build_snapshot_refresh_state(
         .ok_or_else(|| Error::SnapshotRefreshModeUnsupportedEngine {
             engine: acceleration_settings.engine.to_string(),
         })?;
-    if !accelerator.supports_snapshot_reload() {
+    if !accelerator.supports_provider_rebuild() {
         return SnapshotRefreshModeReloadUnsupportedSnafu {
             engine: acceleration_settings.engine.to_string(),
         }

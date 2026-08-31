@@ -27,6 +27,7 @@ use ::cache::Caching;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
+use data_accelerator_api::swappable::SwappableTableProvider;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
 use data_connector_api::accelerated::{
@@ -421,6 +422,11 @@ pub struct Builder {
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
     snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
+    /// The live `SwappableTableProvider` for a `RefreshMode::Caching` dataset whose engine can
+    /// reopen itself after a fatal error (see [`SwappableTableProvider::recover`]). `None` for
+    /// other refresh modes and for engines that cannot rebuild. Handed to the cache-write task
+    /// so it can reopen the accelerator on a fatal write failure.
+    caching_recovery: Option<Arc<SwappableTableProvider>>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     cdc_apply_runtime: Option<Handle>,
@@ -478,6 +484,7 @@ impl Builder {
             refresh_semaphore: None,
             snapshot_creation_config: None,
             snapshot_refresh_state: None,
+            caching_recovery: None,
             metrics: None,
             cpu_runtime: None,
             cdc_apply_runtime: None,
@@ -715,6 +722,17 @@ impl Builder {
         state: Option<snapshots::SnapshotRefreshState>,
     ) -> &mut Self {
         self.snapshot_refresh_state = state;
+        self
+    }
+
+    /// Configure the recoverable `SwappableTableProvider` for a `RefreshMode::Caching` dataset,
+    /// letting the cache-write task reopen the accelerator after a fatal error. Ignored for
+    /// other refresh modes.
+    pub fn caching_recovery(
+        &mut self,
+        swappable: Option<Arc<SwappableTableProvider>>,
+    ) -> &mut Self {
+        self.caching_recovery = swappable;
         self
     }
 
@@ -1045,6 +1063,7 @@ impl Builder {
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
                 Arc::clone(&self.runtime_status),
+                self.caching_recovery.clone(),
             );
             // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
             handlers.push(consumer_handle);

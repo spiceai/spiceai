@@ -843,42 +843,52 @@ pub trait DataAccelerator: Send + Sync {
         Ok(())
     }
 
-    /// Whether this accelerator supports reloading its data from a freshly
-    /// downloaded snapshot file after [`DataAccelerator::init`] has already
-    /// produced a [`TableProvider`].
+    /// Whether this accelerator can drop its cached engine state and rebuild
+    /// its [`TableProvider`] over the file currently on disk, after
+    /// [`DataAccelerator::init`] has already produced a provider.
     ///
-    /// Returning `true` indicates that [`DataAccelerator::reload_from_snapshot`]
+    /// Returning `true` indicates that [`DataAccelerator::rebuild_provider`]
     /// is implemented; in-memory accelerators (e.g. Arrow) and accelerators
-    /// without a stable on-disk snapshot format must return `false`.
-    fn supports_snapshot_reload(&self) -> bool {
+    /// without a stable on-disk format must return `false`.
+    fn supports_provider_rebuild(&self) -> bool {
         false
     }
 
-    /// Reload the accelerator from a snapshot file that has already been
-    /// downloaded and written to the accelerator's primary path on disk
-    /// (i.e. `acceleration_layout(source).primary_path()`).
+    /// Drop the accelerator's cached engine state and rebuild its
+    /// [`TableProvider`] over the file at the accelerator's primary path on
+    /// disk (`acceleration_layout(source).primary_path()`).
+    ///
+    /// This is deliberately agnostic to *why* the rebuild is needed. Two
+    /// callers use it:
+    ///   - `refresh_mode: snapshot`, after a newer snapshot file has replaced
+    ///     the primary path, to pick up the new contents; and
+    ///   - fatal-error recovery (e.g. a DuckDB instance that invalidated
+    ///     itself on an out-of-memory rollback), where the file is unchanged
+    ///     and the goal is simply to reopen it into a healthy engine instance.
     ///
     /// The runtime guarantees the per-dataset accelerator write mutex is held
     /// for the duration of this call. Implementations must:
     ///   1. Drop or clear any cached engine state (open connections, pool
     ///      entries, file handles, cached schema views, etc.) holding the
-    ///      previous file open.
+    ///      previous file open — this is what lets a rebuild recover an engine
+    ///      instance that has entered a fatal state.
     ///   2. Invoke `provider_factory` to construct a fresh [`TableProvider`]
-    ///      backed by the now-replaced file at the primary path.
+    ///      backed by the file now at the primary path.
     ///
     /// `provider_factory` re-runs the same `create_accelerator_table` flow
     /// used at startup, so the returned provider has the same logical schema,
     /// constraints, and indexes as `previous_provider`.
     ///
     /// The default implementation rejects the call. File-based accelerators
-    /// that participate in `refresh_mode: snapshot` must override this.
-    async fn reload_from_snapshot(
+    /// must override this to participate in `refresh_mode: snapshot` or in
+    /// caching-mode fatal-error recovery.
+    async fn rebuild_provider(
         &self,
         _source: &dyn AccelerationSource,
         _previous_provider: Arc<dyn TableProvider>,
         _provider_factory: ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        Err(Box::new(SnapshotReloadUnsupported {
+        Err(Box::new(ProviderRebuildUnsupported {
             engine: self.name(),
         }))
     }
@@ -901,7 +911,7 @@ pub trait DataAccelerator: Send + Sync {
 /// Factory that re-runs the `create_accelerator_table` registry flow to
 /// produce a fresh [`TableProvider`] for an already-initialized dataset.
 ///
-/// Used by [`DataAccelerator::reload_from_snapshot`] so engines don't need
+/// Used by [`DataAccelerator::rebuild_provider`] so engines don't need
 /// to re-derive table options, attach databases, write handlers, etc.
 pub type ReloadProviderFactory = Arc<
     dyn Fn() -> std::pin::Pin<
@@ -917,15 +927,16 @@ pub type ReloadProviderFactory = Arc<
         + Sync,
 >;
 
-/// Error returned by the default [`DataAccelerator::reload_from_snapshot`]
-/// implementation when an engine does not support snapshot-based reloads.
+/// Error returned by the default [`DataAccelerator::rebuild_provider`]
+/// implementation when an engine cannot rebuild its provider over the
+/// on-disk file (used both by `refresh_mode: snapshot` and by caching-mode
+/// fatal-error recovery).
 #[derive(Debug, Snafu)]
 #[snafu(display(
-    "Acceleration engine '{engine}' does not support reloading from a snapshot. \
-     `refresh_mode: snapshot` requires a snapshot-capable file-based engine \
-     (DuckDB, SQLite, Cayenne, or Turso)."
+    "Acceleration engine '{engine}' does not support rebuilding its provider from disk. \
+     This requires a file-based engine (DuckDB, SQLite, Cayenne, or Turso)."
 ))]
-pub struct SnapshotReloadUnsupported {
+pub struct ProviderRebuildUnsupported {
     pub engine: &'static str,
 }
 
