@@ -61,14 +61,16 @@ pub(crate) const JSON_OBJECT_KEYS_NAME: &str = "json_object_keys";
 /// `json_object_keys`'s alias, carried for the reason [`JSON_LEN_NAME`] gives.
 pub(crate) const JSON_KEYS_NAME: &str = "json_keys";
 
-/// The first byte of a JSON string node's own token, as `JSON_QUERY` returns it.
+/// The first byte of a JSON string node's normalized JSON token.
 ///
 /// `json_get_str` answers only for a JSON **string** — `jiter`'s `Peek::String`
 /// — and NULL for every other node. `JSON_VALUE` cannot express that on its
 /// own: it renders a number as its digits and a bool as `true`/`false`, where
-/// `json_get_str` returns NULL. `JSON_QUERY` returns the node's raw JSON token
-/// instead, and a leading double quote is what distinguishes a string node from
-/// every other type. See [`json_get_str_to_sql`].
+/// `json_get_str` returns NULL. `JSON_QUERY` returns either a native `JSON`
+/// value or a JSON-formatted `STRING`, matching the document's input type;
+/// `FORMAT('%t', …)` normalizes both forms to printable JSON text. A leading
+/// double quote then distinguishes a string node from every other type. See
+/// [`json_get_str_to_sql`].
 const JSON_STRING_TOKEN_PREFIX: &str = "\"";
 
 /// The grammar Rust's `i64::FromStr` accepts, which is what
@@ -338,7 +340,7 @@ pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
 }
 
 /// `json_get_str(doc, path…)` →
-/// `CASE WHEN STARTS_WITH(JSON_QUERY(doc, '<path>'), '"') THEN JSON_VALUE(doc, '<path>') END`.
+/// `CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(doc, '<path>')), '"') THEN JSON_VALUE(doc, '<path>') END`.
 ///
 /// `json_get_str` answers only for a JSON **string** node and NULL for every
 /// other kind. `JSON_VALUE` alone is wider than that: it renders a number as
@@ -346,11 +348,13 @@ pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
 /// `json_get_str` answers NULL — on rows a `WHERE … IS NOT NULL` then keeps
 /// remotely and drops locally.
 ///
-/// `JSON_QUERY` returns the node's own JSON token rather than its value, and
-/// only a string node's token opens with a double quote — a number, a bool, a
+/// `JSON_QUERY` preserves the document representation: it returns `JSON` for a
+/// native `JSON` document and `STRING` for a JSON-formatted string document.
+/// `FORMAT('%t', …)` turns both results into the node's printable JSON token,
+/// where only a string node opens with a double quote — a number, a bool, a
 /// JSON `null`, an object and an array all render bare. Testing that first byte
-/// is what narrows `JSON_VALUE` to exactly the nodes the local function
-/// answers for, so the guard is the whole reason this is translatable at all.
+/// is what narrows `JSON_VALUE` to exactly the nodes the local function answers
+/// for, so the guard is the whole reason this is translatable at all.
 ///
 /// Where the two already agree, no guard is needed: `JSON_QUERY` returns SQL
 /// NULL for a missing path, and `STARTS_WITH` over NULL is NULL, so the `CASE`
@@ -365,10 +369,17 @@ pub(crate) fn json_get_str_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
         JSON_GET_STR_NAME,
         ast::DataType::String(None),
         |document, path| {
+            let normalized_json_token = call_function(
+                "FORMAT",
+                vec![
+                    ast::Expr::Value(ast::Value::SingleQuotedString("%t".to_string()).into()),
+                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
+                ],
+            );
             let is_string_node = call_function(
                 "STARTS_WITH",
                 vec![
-                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
+                    normalized_json_token,
                     ast::Expr::Value(
                         ast::Value::SingleQuotedString(JSON_STRING_TOKEN_PREFIX.to_string()).into(),
                     ),
@@ -827,6 +838,10 @@ impl Dialect for SpiceBigQueryDialect {
             .window_func_support_window_frame(func_name, start_bound, end_bound)
     }
 
+    fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
+        self.inner.union_distinct_set_quantifier()
+    }
+
     fn full_qualified_col(&self) -> bool {
         self.inner.full_qualified_col()
     }
@@ -865,7 +880,10 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+    use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionParams};
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarUDF, Volatility, WindowFrame, WindowFunctionDefinition, create_udf,
+    };
     use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
 
@@ -1052,12 +1070,13 @@ mod tests {
 
     #[test]
     fn json_get_str_renders_as_a_guarded_json_value() {
-        // The STARTS_WITH/JSON_QUERY guard is the whole reason this is
+        // The STARTS_WITH/FORMAT/JSON_QUERY guard is the whole reason this is
         // translatable: JSON_VALUE alone renders a JSON number as its digits,
-        // where `json_get_str` returns NULL.
+        // where `json_get_str` returns NULL. FORMAT normalizes JSON_QUERY's
+        // native JSON and JSON-formatted string result types before the guard.
         assert_eq!(
             render(JSON_GET_STR_NAME, vec![col("doc"), lit("a")]),
-            r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
+            r#"CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(`doc`, R'$."a"')), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
         );
     }
 
@@ -1362,6 +1381,106 @@ mod tests {
             unparse(&SpiceBigQueryDialect::new()),
             unparse(&datafusion::sql::unparser::dialect::BigQueryDialect::new()),
             "a `Dialect` method is not forwarded to the inner BigQuery dialect"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_emits_valid_bigquery_set_and_window_syntax() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, false),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            Arc::clone(&schema),
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let scan = |name: &'static str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(name, Arc::clone(&source), None)
+                .expect("build table scan")
+                .project(vec![col(format!("{name}.id"))])
+                .expect("project id")
+                .build()
+                .expect("build scan plan")
+        };
+
+        let left = scan("left_table");
+        let right = scan("right_table");
+        let distinct = datafusion::logical_expr::LogicalPlanBuilder::from(left.clone())
+            .union_distinct(right.clone())
+            .expect("build distinct union")
+            .build()
+            .expect("build distinct union plan");
+        let all = datafusion::logical_expr::LogicalPlanBuilder::from(left)
+            .union(right)
+            .expect("build all union")
+            .build()
+            .expect("build all union plan");
+
+        let distinct_sql = unparse_plan(new_bigquery_dialect().as_ref(), &distinct);
+        let all_sql = unparse_plan(new_bigquery_dialect().as_ref(), &all);
+        assert!(
+            distinct_sql.contains(" UNION DISTINCT "),
+            "BigQuery requires an explicit DISTINCT quantifier: {distinct_sql}"
+        );
+        assert!(
+            all_sql.contains(" UNION ALL "),
+            "UNION ALL must retain duplicate rows: {all_sql}"
+        );
+
+        let input = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "window_values",
+            Arc::clone(&source),
+            None,
+        )
+        .expect("build window table scan")
+        .build()
+        .expect("build window input");
+        let order_by = vec![col("window_values.id").sort(true, true)];
+        let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![],
+                partition_by: vec![],
+                order_by: order_by.clone(),
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("row_num");
+        let running_sum = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(
+                datafusion::functions_aggregate::sum::sum_udaf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![col("window_values.id")],
+                partition_by: vec![],
+                order_by,
+                window_frame: WindowFrame::new(Some(true)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("running_sum");
+        let window = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+            .window(vec![row_number, running_sum])
+            .expect("build window expressions")
+            .build()
+            .expect("build window plan");
+        let window_sql = unparse_plan(new_bigquery_dialect().as_ref(), &window);
+        assert!(
+            window_sql.contains(
+                "row_number() OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST) AS `row_num`"
+            ),
+            "BigQuery rejects a window frame on ROW_NUMBER: {window_sql}"
+        );
+        assert!(
+            window_sql.contains(
+                "sum(`window_values`.`id`) OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `running_sum`"
+            ),
+            "aggregate window frames change which rows contribute and must be retained: {window_sql}"
         );
     }
 
