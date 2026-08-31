@@ -27,7 +27,6 @@ use ::cache::Caching;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
-use data_accelerator_api::swappable::SwappableTableProvider;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
 use data_connector_api::accelerated::{
@@ -422,11 +421,11 @@ pub struct Builder {
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
     snapshot_refresh_state: Option<snapshots::SnapshotRefreshState>,
-    /// The live `SwappableTableProvider` for a `RefreshMode::Caching` dataset whose engine can
-    /// reopen itself after a fatal error (see [`SwappableTableProvider::recover`]). `None` for
-    /// other refresh modes and for engines that cannot rebuild. Handed to the cache-write task
-    /// so it can reopen the accelerator on a fatal write failure.
-    caching_recovery: Option<Arc<SwappableTableProvider>>,
+    /// Recovery hooks for a `RefreshMode::Caching` dataset whose engine can reopen itself after
+    /// a fatal error (see [`caching::CachingRecovery`]). `None` for other refresh modes and for
+    /// engines that do not support caching recovery. Handed to the cache-write task so it can
+    /// reopen the accelerator on a fatal write failure.
+    caching_recovery: Option<caching::CachingRecovery>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     cdc_apply_runtime: Option<Handle>,
@@ -725,14 +724,11 @@ impl Builder {
         self
     }
 
-    /// Configure the recoverable `SwappableTableProvider` for a `RefreshMode::Caching` dataset,
+    /// Configure the [`caching::CachingRecovery`] hooks for a `RefreshMode::Caching` dataset,
     /// letting the cache-write task reopen the accelerator after a fatal error. Ignored for
     /// other refresh modes.
-    pub fn caching_recovery(
-        &mut self,
-        swappable: Option<Arc<SwappableTableProvider>>,
-    ) -> &mut Self {
-        self.caching_recovery = swappable;
+    pub fn caching_recovery(&mut self, recovery: Option<caching::CachingRecovery>) -> &mut Self {
+        self.caching_recovery = recovery;
         self
     }
 

@@ -1079,6 +1079,10 @@ impl DataAccelerator for DuckDBAccelerator {
         true
     }
 
+    fn supports_caching_recovery(&self) -> bool {
+        true
+    }
+
     /// Rebuilds the `DuckDB`-backed table provider over the file currently at
     /// the primary path.
     ///

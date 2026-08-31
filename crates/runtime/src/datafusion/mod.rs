@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::accelerated::caching::CachingRecovery;
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
@@ -58,7 +59,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
-use data_accelerator_api::swappable::{RebuildFn, SwappableTableProvider};
+use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::federated::FederatedTableProvider;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -2812,13 +2813,14 @@ impl DataFusion {
                 )
                 .await
                 {
-                    Some(swappable) => {
+                    Some(recovery) => {
                         let provider: Arc<dyn TableProvider> =
-                            Arc::clone(&swappable) as Arc<dyn TableProvider>;
-                        (provider, None, Some(swappable))
+                            Arc::clone(&recovery.swappable) as Arc<dyn TableProvider>;
+                        (provider, None, Some(recovery))
                     }
-                    // The engine cannot rebuild itself (e.g. an in-memory accelerator), so leave
-                    // the provider unwrapped: there is nothing to recover to.
+                    // The engine does not support caching recovery (e.g. an in-memory
+                    // accelerator), so leave the provider unwrapped: there is nothing to
+                    // recover to.
                     None => (accelerated_table_provider, None, None),
                 }
             } else {
@@ -5469,13 +5471,14 @@ async fn build_snapshot_creation_config(
 }
 
 /// Wrap a caching-mode accelerator provider in a [`SwappableTableProvider`] wired for
-/// fatal-error recovery, or return `None` when the engine cannot rebuild itself.
+/// fatal-error recovery, or return `None` when the engine does not support caching recovery.
 ///
 /// A file-based engine (DuckDB) can invalidate its database when it reaches its memory limit,
 /// after which every query fails until the process restarts (spiceai/spiceai#13513). The
-/// [`RebuildFn`] captured here lets [`SwappableTableProvider::recover`] reopen the engine over
-/// the file it already has and swap the fresh provider in, so the dataset keeps serving what it
-/// holds. The factory it calls is the same `create_accelerator_table` flow used at startup,
+/// [`CachingRecovery`] returned here lets the cache-write task reopen the engine
+/// over the file it already has and swap the fresh provider in, so the dataset keeps serving
+/// what it holds. The factory it calls is the same `create_accelerator_table` flow used at
+/// startup,
 /// built over the on-disk `storage_schema` (the schema the provider was created with, including
 /// the caching namespace column) so the rebuilt provider's schema matches and the swap
 /// validates.
@@ -5487,12 +5490,14 @@ async fn build_caching_recovery_swappable(
     acceleration_settings: &Acceleration,
     secrets: Arc<TokioRwLock<Secrets>>,
     initial_provider: Arc<dyn TableProvider>,
-) -> Option<Arc<SwappableTableProvider>> {
+) -> Option<CachingRecovery> {
     let accelerator = df
         .accelerator_engine_registry
         .get_accelerator_engine(acceleration_settings.engine)
         .await?;
-    if !accelerator.supports_provider_rebuild() {
+    // Only wrap engines that can actually recover a caching accelerator from a fatal error
+    // (today just DuckDB). Others are left unwrapped and unchanged.
+    if !accelerator.supports_caching_recovery() {
         return None;
     }
 
@@ -5533,21 +5538,12 @@ async fn build_caching_recovery_swappable(
     });
 
     let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
-    let rebuild: RebuildFn = Arc::new(move |previous| {
-        let accelerator = Arc::clone(&accelerator);
-        let source = Arc::clone(&source);
-        let provider_factory = Arc::clone(&provider_factory);
-        Box::pin(async move {
-            accelerator
-                .rebuild_provider(source.as_ref(), previous, provider_factory)
-                .await
-        })
-    });
-
-    Some(SwappableTableProvider::new_recoverable(
-        initial_provider,
-        rebuild,
-    ))
+    Some(CachingRecovery {
+        swappable: SwappableTableProvider::new(initial_provider),
+        accelerator,
+        source,
+        provider_factory,
+    })
 }
 
 /// Build the per-dataset state required to drive `RefreshMode::Snapshot`.

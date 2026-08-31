@@ -854,6 +854,19 @@ pub trait DataAccelerator: Send + Sync {
         false
     }
 
+    /// Whether a `refresh_mode: caching` dataset on this engine should be wrapped so it can
+    /// reopen itself after a fatal error (spiceai/spiceai#13513).
+    ///
+    /// Only engines with a recoverable fatal state should return `true` — today only DuckDB,
+    /// whose out-of-memory rollback can invalidate the database. Returning `false` leaves the
+    /// caching accelerator unwrapped and unchanged, which is correct for engines that have no
+    /// such failure mode: wrapping them would add an inert indirection and needlessly expose
+    /// them to provider-unwrapping walks. The matching per-error test lives with the cache-write
+    /// task and is keyed off [`DataAccelerator::name`].
+    fn supports_caching_recovery(&self) -> bool {
+        false
+    }
+
     /// Drop the accelerator's cached engine state and rebuild its
     /// [`TableProvider`] over the file at the accelerator's primary path on
     /// disk (`acceleration_layout(source).primary_path()`).
