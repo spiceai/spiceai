@@ -113,7 +113,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [text-splitter](#text-splitter) | `58f9c21006e01e5e968c5de80a0398b3f5ec439a` | `spiceai` |
 | [tiberius](#dependency-only-forks) | `9ae93c65222b51b0579945ffce5cba053cb23cca` | `spiceai` |
 | [tokio-rusqlite](#rusqlite-and-tokio-rusqlite) | `b10df82e3bbc4f4700562a14a3a00714cbc2f0c7` | `spiceai` |
-| [vortex](#vortex) | `ba043de0ab6e214e825932210cc336b7ce5e8309` | `spiceai-54` |
+| [vortex](#vortex) | `3c5246867e627158211e8eafab7be55b0dc559f8` | `spiceai-54` |
 
 `spiceai/spice-rs` and `spiceai/spicebench` are also pinned as git dependencies but
 are not forks — they are Spice repositories with no upstream, so nothing can drop a
@@ -144,7 +144,9 @@ so patches to it are not fork state and are not listed. Only patches to
 | `DECIMAL` → floating-point cast applies the scale (fork PR #51) | Decimal columns read back off by a factor of 10^scale | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::test_decimal_to_float_cast_applies_scale` |
 | `UncompressedSizeInBytes` statistic handling | `ColumnStatistics.byte_size` is wrong, so the optimizer mis-sizes joins built over Vortex scans | silent | `crates/vortex/src/persistent/format.rs::propagates_per_column_byte_size` |
 | Target file size respected in the sink (fork PR #33) | The writer ignores `target_file_size_mb` and emits one file per flush regardless of size | silent | `crates/vortex/src/persistent/format.rs::format_plumbs_target_file_size_mb` guards the plumbing only; the sink's own honouring of it is a **GAP** |
-| `vortex.date` → `vortex.timestamp` extension cast (fork PR #28) | Upstream refuses the cast, so a pushed-down `CAST(date_col AS TIMESTAMP)` fails the scan | silent | `crates/vortex/src/persistent/mod.rs::test_date_to_timestamp_extension_cast` guards the kernel. The patch covers `ExtensionArray` only, and the scan reaches a second cast path that it does not patch — see [Open gaps](#open-gaps) |
+| `vortex.date` → `vortex.timestamp` **array** cast (fork PR #28) | Upstream refuses the cast, so a pushed-down `CAST(date_col AS TIMESTAMP)` fails the scan on the rows it reads | silent | `crates/vortex/src/persistent/mod.rs::test_date_to_timestamp_extension_cast` |
+| `vortex.date` → `vortex.timestamp` **scalar** cast (fork PR #93) | The row above converts a chunk's rows. A scan also casts the file's `max` statistic — a scalar — to decide whether to read the file at all, and without this `Scalar::cast` re-labels it through the target's storage type instead of converting it. `date[days]` fails the scan; `date[ms]` shares `i64` with `timestamp[ns]`, so it succeeds with an instant 10^6 too small and the file is pruned as unable to match ([#13624](https://github.com/spiceai/spiceai/issues/13624)) | silent (wrong data) | `crates/vortex/src/persistent/mod.rs::a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows` for the failure, `…::a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file` for the wrongly pruned file |
+| Timestamp validation uses `storage_range`, and rendering never aborts (fork PR #93) | The row above converts a date into a count of the target unit; this is the range that count has to land inside, and the same fork PR carries both. A Jiff span's limits are not a timestamp's: they stop one short of `i64::MIN` nanoseconds — 1677-09-21, which a `timestamp[ns]` column holds as an ordinary value read from Arrow — so a scalar built from such a column's `min`/`max` statistic was refused although the array carried it, and the scan failed on data it could read. They also run past the last instant, and the unchecked constructors abort outside them, so rendering a count past the span range took the process down rather than reporting it. (No `vortex.date` reaches `i64::MIN` nanoseconds — neither of its units divides it — so this is the range being wrong, not the conversion.) | silent (wrong data), and abort | `crates/vortex/src/persistent/mod.rs::a_nanosecond_timestamp_scalar_spans_the_whole_i64_range`, which builds that scalar and renders it, and `…::a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting` for the other three units — they keep a span, so what the patch changes for them is that it is built and added through the checked forms, and only a count outside the range exercises that. The two cast guards above pass on either side of this row, so a re-cut that carried only the cast would not be caught without these |
 | Balanced `list_contains` OR tree for large `IN` lists (fork PR #37) | A large `IN (...)` filter builds a right-leaning OR tree; deep enough and the plan blows the stack during pushdown conversion | silent (crash) | `crates/vortex/src/persistent/mod.rs::test_large_in_list_filter_pushdown_stays_evaluable` |
 | Avoid session lock re-entry in writer init (fork PR #29) | Deadlock in `vortex-file` writer initialisation — the write never completes and the refresh hangs | silent (hang) | **GAP** |
 | Unsupported pushdown node bubbles `TRUE` rather than erroring; empty `IN` list handled (fork PR #8) | A predicate Vortex cannot convert fails the scan instead of degrading to "keep the row" | silent | vendored: the pushdown conversion now lives in `crates/vortex/src/convert/exprs.rs`, guarded by `test_empty_in_list_conversion_produces_boolean_literal` and the `can_be_pushed_down` unsupported-operand cases |
@@ -523,22 +525,3 @@ without becoming a flaky timing test:
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
     cheap one exists); `async-openai` retry-after handling.
-
-## A patch that is present but incomplete
-
-Found while writing the guard for it, so it is a defect rather than a coverage gap,
-and it is not one of the 35 above.
-
-`vortex.date` → `vortex.timestamp` (fork PR #28) registers its cast kernel on
-`ExtensionArray`. A scan also evaluates a pushed-down predicate against *constant*
-arrays built from chunk statistics, and that path resolves a different kernel, which
-the fork does not patch. A `SELECT … WHERE CAST(date_col AS TIMESTAMP) > TIMESTAMP '…'`
-over a Vortex file therefore fails the scan outright with:
-
-```
-No CastReduce to cast constant array from vortex.date[days](i32?) to vortex.timestamp[ns](i64?)
-```
-
-Reproduced on the pin above against a four-row table. The kernel guard passes, so
-this is not caught by the row it belongs to and needs a fix on the fork, not a test
-here.
