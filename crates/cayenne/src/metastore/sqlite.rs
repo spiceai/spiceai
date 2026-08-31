@@ -1751,11 +1751,8 @@ impl SqliteMetastore {
         // numbers a scrape reads once a second.
         let db_path = self.db_path().to_string();
         let wal_path = format!("{db_path}-wal");
-        let Ok((db_bytes, wal_bytes)) = tokio::task::spawn_blocking(move || {
-            let size = |path: &str| std::fs::metadata(path).map_or(0, |m| m.len());
-            (size(&db_path), size(&wal_path))
-        })
-        .await
+        let Ok((db_bytes, wal_bytes)) =
+            tokio::task::spawn_blocking(move || measure_file_footprint(&db_path, &wal_path)).await
         else {
             return;
         };
@@ -1764,9 +1761,35 @@ impl SqliteMetastore {
             "catalog",
             self.db_path().to_string(),
         )];
-        telemetry::cayenne::track_metastore_wal_bytes(wal_bytes, &dimensions);
-        telemetry::cayenne::track_metastore_db_bytes(db_bytes, &dimensions);
+        if let Some(wal_bytes) = wal_bytes {
+            telemetry::cayenne::track_metastore_wal_bytes(wal_bytes, &dimensions);
+        }
+        if let Some(db_bytes) = db_bytes {
+            telemetry::cayenne::track_metastore_db_bytes(db_bytes, &dimensions);
+        }
     }
+}
+
+/// `stat` the metastore file and its `-wal`, as `(database bytes, WAL bytes)`.
+///
+/// `None` means NOT MEASURED, and the caller leaves that gauge at its previous
+/// value. Publishing a failed `stat` as `0` would say the metastore shrank to
+/// nothing — a louder and more wrong statement than saying nothing at all, and
+/// the same rule the table footprint sample follows when its query fails.
+///
+/// A missing `-wal` is the one real zero: the WAL is created on the first write
+/// and removed on a clean close, so its absence means no WAL bytes rather than a
+/// measurement that failed. `NotFound` on the database itself is NOT the same
+/// statement — an open `SQLite` database stays live and allocated after its
+/// pathname is unlinked, so its size is unknown, not zero.
+fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option<u64>) {
+    let db = std::fs::metadata(db_path).map(|m| m.len()).ok();
+    let wal = match std::fs::metadata(wal_path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    };
+    (db, wal)
 }
 
 /// A transaction on a `SQLite` metastore connection.
@@ -2876,6 +2899,46 @@ mod tests {
             read_user_version(&metastore).await,
             newer,
             "a refused open must leave the newer stamp untouched"
+        );
+    }
+
+    /// A `stat` that fails must leave its gauge alone, because the alternative
+    /// reading — zero — says the metastore shrank to nothing. The exception is a
+    /// missing `-wal`, which is a real zero: the WAL is created on the first
+    /// write and removed on a clean close.
+    ///
+    /// The database's own absence is deliberately NOT that exception. An open
+    /// `SQLite` database stays live and allocated after its pathname is unlinked,
+    /// so a failed `stat` on it means "unknown", never "empty".
+    #[test]
+    fn a_failed_stat_is_not_a_zero_byte_metastore() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("cayenne.db");
+        let wal = dir.path().join("cayenne.db-wal");
+        std::fs::write(&db, vec![0_u8; 4096]).expect("write the database file");
+        std::fs::write(&wal, vec![0_u8; 512]).expect("write the WAL file");
+
+        let db_path = db.to_string_lossy().to_string();
+        let wal_path = wal.to_string_lossy().to_string();
+
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (Some(4096), Some(512)),
+            "both files present: both measured"
+        );
+
+        std::fs::remove_file(&wal).expect("remove the WAL file");
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (Some(4096), Some(0)),
+            "a checkpointed-away WAL holds zero bytes, which is a measurement"
+        );
+
+        std::fs::remove_file(&db).expect("unlink the database file");
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (None, Some(0)),
+            "an unlinked database is unknown, not empty: an open handle keeps its pages allocated"
         );
     }
 }

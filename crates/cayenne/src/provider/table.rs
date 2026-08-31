@@ -5745,6 +5745,74 @@ impl CayenneTableProvider {
     /// it, if any — see [`RetiredDirAttempt`] for why both. `dir_removed` is
     /// false when one or more referenced files (or non-data files) kept the
     /// directory alive. A `NotFound` directory counts as fully removed.
+    /// Delete a retired snapshot directory wholesale, for a table whose manifest
+    /// is empty.
+    ///
+    /// No manifest means no file can be referenced from another snapshot, so
+    /// there is nothing to ref-count and the whole tree is dead. That is the only
+    /// difference from [`Self::delete_retired_snapshot_dir_refcounted`]; both
+    /// report the same [`RetiredDirAttempt`], and both bill only what THIS pass
+    /// physically removed.
+    fn delete_retired_snapshot_dir_wholesale(
+        snapshot_dir: &std::path::Path,
+        invalidate: impl FnOnce(HashSet<ObjectStorePath>),
+    ) -> RetiredDirAttempt {
+        Self::delete_retired_snapshot_dir_wholesale_with(snapshot_dir, invalidate, |dir| {
+            std::fs::remove_dir_all(dir)
+        })
+    }
+
+    /// [`Self::delete_retired_snapshot_dir_wholesale`] with the removal itself
+    /// supplied, so the already-gone arm can be reached deterministically.
+    ///
+    /// That arm exists for a race — the directory is sized, then removed by
+    /// another actor before this pass unlinks it — and it is the arm where a
+    /// wrong reading double-bills. Reached through the filesystem it is timing,
+    /// not a test; reached through this parameter it is one call.
+    fn delete_retired_snapshot_dir_wholesale_with(
+        snapshot_dir: &std::path::Path,
+        invalidate: impl FnOnce(HashSet<ObjectStorePath>),
+        remove: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> RetiredDirAttempt {
+        let paths = match Self::segment_cache_paths_in_dir(snapshot_dir) {
+            Ok(paths) => paths,
+            Err(e) => return Err((RetiredDirReclaim::default(), e)),
+        };
+        // Sized before the tree is removed: `remove_dir_all` is one call and
+        // cannot report what it took, so without this the pre-manifest path would
+        // report a reclaim of zero bytes however much it freed.
+        let (files, bytes) = dir_file_totals(snapshot_dir).unwrap_or((0, 0));
+        match remove(snapshot_dir) {
+            Ok(()) => {
+                invalidate(paths);
+                Ok(RetiredDirReclaim {
+                    files,
+                    bytes,
+                    dir_removed: true,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                invalidate(paths);
+                // Gone before this pass reached it, so the sizing above describes
+                // what SOMEBODY ELSE freed. The ledger keeps a directory eligible
+                // until a task completes, so two sweeps can size one directory
+                // while only one of them unlinks it — billing both would count
+                // those bytes twice. Same reading as the ref-counted path's
+                // already-removed arm.
+                Ok(RetiredDirReclaim::removed_dir_only())
+            }
+            Err(e) => {
+                let remaining = Self::segment_cache_paths_in_dir(snapshot_dir)
+                    .unwrap_or_else(|_| paths.clone());
+                invalidate(paths.difference(&remaining).cloned().collect());
+                // `remove_dir_all` is all-or-nothing from here: it may have removed
+                // part of the tree, and what survives is unknown without
+                // re-walking, so claim nothing rather than guess.
+                Err((RetiredDirReclaim::default(), e))
+            }
+        }
+    }
+
     fn delete_retired_snapshot_dir_refcounted(
         snapshot_dir: &std::path::Path,
         retiring_snapshot_id: &str,
@@ -6051,46 +6119,9 @@ impl CayenneTableProvider {
                             },
                         )
                     } else {
-                        // Legacy path: no manifest, so no file is referenced
-                        // across snapshots — the whole dir is dead.
-                        let paths = match Self::segment_cache_paths_in_dir(&dir) {
-                            Ok(paths) => paths,
-                            Err(e) => {
-                                return Err((RetiredDirReclaim::default(), e));
-                            }
-                        };
-                        // Sized before the tree is removed: `remove_dir_all` is
-                        // one call and cannot report what it took, so without
-                        // this the pre-manifest path would report a reclaim of
-                        // zero bytes however much it freed.
-                        let (files, bytes) = dir_file_totals(&dir).unwrap_or((0, 0));
-                        let reclaimed = RetiredDirReclaim {
-                            files,
-                            bytes,
-                            dir_removed: true,
-                        };
-                        match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => {
-                                retired_cache_paths_for_task.lock().extend(paths);
-                                Ok(reclaimed)
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                retired_cache_paths_for_task.lock().extend(paths);
-                                Ok(reclaimed)
-                            }
-                            Err(e) => {
-                                let remaining = Self::segment_cache_paths_in_dir(&dir)
-                                    .unwrap_or_else(|_| paths.clone());
-                                retired_cache_paths_for_task
-                                    .lock()
-                                    .extend(paths.difference(&remaining).cloned());
-                                // `remove_dir_all` is all-or-nothing from here:
-                                // it may have removed part of the tree, and what
-                                // survives is unknown without re-walking, so
-                                // claim nothing rather than guess.
-                                Err((RetiredDirReclaim::default(), e))
-                            }
-                        }
+                        Self::delete_retired_snapshot_dir_wholesale(&dir, |paths| {
+                            retired_cache_paths_for_task.lock().extend(paths);
+                        })
                     }
                 })
                 .await;
@@ -48384,6 +48415,55 @@ mod tests {
             retired_dir_sweep_outcome(reclaim.files, u64::from(reclaim.dir_removed), 1),
             MaintenanceOutcome::Failed,
             "a failed unlink makes the whole pass failed"
+        );
+    }
+
+    /// The manifest-less delete bills only what THIS pass removed. A directory
+    /// already gone when the unlink runs was freed by somebody else, and the
+    /// sizing taken a moment earlier describes THEIR reclaim: the sweep keeps a
+    /// directory eligible until its task completes, so two passes can size one
+    /// directory while only one of them unlinks it, and billing both counts those
+    /// bytes twice.
+    ///
+    /// The positive control is the same directory with the same contents removed
+    /// by this pass, which must bill them in full — a fix that simply stopped
+    /// counting would satisfy the first assertion and fail this one.
+    #[test]
+    fn a_directory_another_actor_removed_bills_no_bytes() {
+        let tmp = TempDir::new().expect("temp dir");
+        let populate = |name: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create the snapshot dir");
+            std::fs::write(dir.join("a.vortex"), vec![0_u8; 300]).expect("write a data file");
+            dir
+        };
+
+        let mine = populate("removed-here");
+        let reclaim = CayenneTableProvider::delete_retired_snapshot_dir_wholesale_with(
+            &mine,
+            |_| (),
+            |dir| std::fs::remove_dir_all(dir),
+        )
+        .expect("removing a present directory succeeds");
+        assert_eq!(
+            (reclaim.files, reclaim.bytes, reclaim.dir_removed),
+            (1, 300, true),
+            "this pass unlinked the file, so it bills the file and its bytes"
+        );
+
+        // Identical contents, identical sizing — only the unlink differs, standing
+        // in for the concurrent sweep that got there first.
+        let theirs = populate("removed-elsewhere");
+        let reclaim = CayenneTableProvider::delete_retired_snapshot_dir_wholesale_with(
+            &theirs,
+            |_| (),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .expect("a directory already gone is not a failure");
+        assert_eq!(
+            (reclaim.files, reclaim.bytes, reclaim.dir_removed),
+            (0, 0, true),
+            "the directory is gone, but this pass freed none of its bytes"
         );
     }
 
