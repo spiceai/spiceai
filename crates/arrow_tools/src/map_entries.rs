@@ -65,6 +65,8 @@ pub enum Error {
 /// relabelled — and what it becomes — is fixed for every batch. Deciding it per batch would
 /// rebuild the same schema over and over and hand each batch a distinct `SchemaRef`.
 pub struct MapEntriesNormalizer {
+    /// The stream's own schema, as its producer declared it.
+    declared: SchemaRef,
     /// The schema every batch is relabelled to, shared by all of them. `None` when the
     /// stream's own declarations already conform.
     target: Option<SchemaRef>,
@@ -81,14 +83,26 @@ impl MapEntriesNormalizer {
             .iter()
             .any(|field| contains(field.data_type(), &is_map));
 
-        let target = (holds_map
-            && schema
-                .fields()
-                .iter()
-                .any(|field| contains(field.data_type(), &declares_nullable_entries)))
-        .then(|| Arc::new(apply_rules(schema, &[&MapEntriesNonNullable])) as SchemaRef);
+        let target = holds_map
+            .then(|| conforming_schema(Arc::clone(schema)))
+            .filter(|target| !Arc::ptr_eq(target, schema));
 
-        Self { target, holds_map }
+        Self {
+            declared: Arc::clone(schema),
+            target,
+            holds_map,
+        }
+    }
+
+    /// The schema every batch this normalizer returns carries: the relabelled one when the
+    /// stream's declarations needed correcting, otherwise the stream's own.
+    ///
+    /// A decode point that hands its batches on under a separately declared schema — an
+    /// `ExecutionPlan`'s output schema, a `RecordBatchStreamAdapter`'s — must declare this one,
+    /// or it describes its batches with a type they no longer carry.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaRef {
+        self.target.as_ref().unwrap_or(&self.declared)
     }
 
     /// Returns `batch` with every `Map` column — nested ones included — declaring its
@@ -154,6 +168,64 @@ impl MapEntriesNormalizer {
             }
         }
         Ok(())
+    }
+}
+
+/// The Arrow-conforming form of `schema`: every `Map` field, nested ones included, declares
+/// its `entries` non-nullable.
+///
+/// A schema that already conforms is handed back untouched, so a caller can test whether
+/// anything changed with [`Arc::ptr_eq`] and pay nothing when nothing did.
+#[must_use]
+pub fn conforming_schema(schema: SchemaRef) -> SchemaRef {
+    if schema
+        .fields()
+        .iter()
+        .any(|field| contains(field.data_type(), &declares_nullable_entries))
+    {
+        Arc::new(apply_rules(&schema, &[&MapEntriesNonNullable]))
+    } else {
+        schema
+    }
+}
+
+/// Normalizes the batches of a decode point that learns its schema only from the batches
+/// themselves.
+///
+/// An Arrow Flight `DoGet` stream hands out decoded `RecordBatch`es without surfacing the
+/// schema message that preceded them, so the schema is whatever the first batch carries. It is
+/// still one schema per stream, so the resolved [`MapEntriesNormalizer`] is kept and reused for
+/// as long as the batches keep arriving under the same `SchemaRef`; a stream that does send a
+/// second schema message resolves a second normalizer rather than relabelling to the first one's
+/// target.
+#[derive(Default)]
+pub struct StreamNormalizer {
+    resolved: Option<MapEntriesNormalizer>,
+}
+
+impl StreamNormalizer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { resolved: None }
+    }
+
+    /// Returns `batch` with every `Map` column declaring its `entries` field non-nullable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MapEntriesContainNulls`] when an entries array carries nulls — see
+    /// [`MapEntriesNormalizer::normalize`], which this delegates to.
+    pub fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let normalizer = self
+            .resolved
+            .take()
+            .filter(|resolved| Arc::ptr_eq(&resolved.declared, &schema))
+            .unwrap_or_else(|| MapEntriesNormalizer::for_schema(&schema));
+
+        let outcome = normalizer.normalize(batch);
+        self.resolved = Some(normalizer);
+        outcome
     }
 }
 
@@ -656,6 +728,175 @@ mod tests {
         let normalized = normalize(batch.clone()).expect("normalization");
         assert_eq!(normalized.schema(), batch.schema());
         assert_eq!(normalized.column(0).to_data(), batch.column(0).to_data());
+    }
+
+    /// A decode point that hands its batches on under a separately declared schema — an
+    /// `ExecutionPlan`'s output schema, a `RecordBatchStreamAdapter`'s — has to declare the one
+    /// the batches actually carry, or it describes them with a type they no longer have.
+    #[test]
+    fn the_reported_schema_is_the_one_the_normalized_batches_carry() {
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "col_map",
+            map_type(true),
+            true,
+        )]));
+        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+        assert_eq!(
+            normalizer.schema().field(0).data_type(),
+            &map_type(false),
+            "the reported schema still declares the entries the batches no longer do"
+        );
+
+        let batch = batch_of(Arc::new(map_from_parts(
+            true,
+            None,
+            &[0, 1],
+            vec!["k0"],
+            vec![Some("v0")],
+        )) as ArrayRef);
+        let relabelled = normalizer.normalize(batch).expect("normalization");
+        assert_eq!(&relabelled.schema(), normalizer.schema());
+    }
+
+    /// A stream whose declarations already conform is reported under its own schema, by
+    /// reference — nothing is rebuilt to say the same thing.
+    #[test]
+    fn a_conforming_stream_is_reported_under_its_own_schema() {
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "col_map",
+            map_type(false),
+            true,
+        )]));
+        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+        assert!(Arc::ptr_eq(normalizer.schema(), &declared));
+    }
+
+    /// `conforming_schema` hands back the same `Arc` when nothing needs correcting, so a caller
+    /// can tell "already conformed" from "relabelled" and pay nothing in the common case.
+    #[test]
+    fn conforming_schema_shares_a_schema_that_already_conforms() {
+        let conforming = Arc::new(Schema::new(vec![Field::new(
+            "col_map",
+            map_type(false),
+            true,
+        )]));
+        assert!(Arc::ptr_eq(
+            &conforming_schema(Arc::clone(&conforming)),
+            &conforming
+        ));
+
+        let nullable_entries = Arc::new(Schema::new(vec![Field::new(
+            "col_map",
+            map_type(true),
+            true,
+        )]));
+        let corrected = conforming_schema(Arc::clone(&nullable_entries));
+        assert!(!Arc::ptr_eq(&corrected, &nullable_entries));
+        assert_eq!(corrected.field(0).data_type(), &map_type(false));
+    }
+
+    /// A schema holding no `Map` at all is shared rather than rebuilt, whatever else it holds.
+    #[test]
+    fn conforming_schema_shares_a_schema_holding_no_map() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+        assert!(Arc::ptr_eq(
+            &conforming_schema(Arc::clone(&schema)),
+            &schema
+        ));
+    }
+
+    /// A stream that only learns its schema from its batches resolves one normalizer and reuses
+    /// it: every batch comes back under the *same* `SchemaRef`, which is what a downstream
+    /// operator comparing schemas by pointer relies on.
+    #[test]
+    fn a_stream_normalizer_reuses_one_resolved_schema_across_batches() {
+        let mut normalizer = StreamNormalizer::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_map",
+            map_type(true),
+            true,
+        )]));
+
+        let of_schema = |keys: Vec<&str>, values: Vec<Option<&str>>, offsets: &[i32]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(map_from_parts(true, None, offsets, keys, values)) as ArrayRef],
+            )
+            .expect("batch")
+        };
+
+        let first = normalizer
+            .normalize(of_schema(vec!["k0"], vec![Some("v0")], &[0, 1]))
+            .expect("first batch");
+        let second = normalizer
+            .normalize(of_schema(vec!["k1"], vec![Some("v1")], &[0, 1]))
+            .expect("second batch");
+
+        assert_eq!(first.schema().field(0).data_type(), &map_type(false));
+        assert!(
+            Arc::ptr_eq(&first.schema(), &second.schema()),
+            "every batch of one stream must come out under one schema"
+        );
+    }
+
+    /// A second schema message mid-stream resolves a second normalizer: relabelling the new
+    /// batches to the first schema's target would rename their columns and change their types.
+    #[test]
+    fn a_stream_normalizer_re_resolves_when_the_schema_changes() {
+        let mut normalizer = StreamNormalizer::new();
+
+        let with_map = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "col_map",
+                map_type(true),
+                true,
+            )])),
+            vec![Arc::new(map_from_parts(
+                true,
+                None,
+                &[0, 1],
+                vec!["k0"],
+                vec![Some("v0")],
+            )) as ArrayRef],
+        )
+        .expect("map batch");
+        let without_map = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("int batch");
+
+        let first = normalizer.normalize(with_map).expect("map batch");
+        assert_eq!(first.schema().field(0).data_type(), &map_type(false));
+
+        let second = normalizer
+            .normalize(without_map.clone())
+            .expect("a batch under a new schema");
+        assert_eq!(second.schema(), without_map.schema());
+        assert_eq!(second.column(0).to_data(), without_map.column(0).to_data());
+    }
+
+    /// The one shape relabelling cannot fix is refused through the streaming form too, naming
+    /// the column — a stream must not hand on a map whose entries carry nulls.
+    #[test]
+    fn a_stream_normalizer_refuses_entry_nulls() {
+        let mut normalizer = StreamNormalizer::new();
+        let entry_nulls = NullBuffer::from(vec![true, false]);
+        let batch = batch_of(Arc::new(map_from_parts(
+            true,
+            Some(entry_nulls),
+            &[0, 1, 2],
+            vec!["k0", "k1"],
+            vec![Some("v0"), Some("v1")],
+        )) as ArrayRef);
+
+        let err = normalizer
+            .normalize(batch)
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        assert!(
+            err.to_string().contains("col_map"),
+            "the refusal must name the column: {err}"
+        );
     }
 
     /// An empty map column — zero rows — normalizes without touching offsets.

@@ -727,6 +727,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
+    /// Drop all non-authoritative cached metadata rows for one snapshot that has
+    /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
+    /// `cayenne_snapshot_file_statistics` stats-cache rows. Coupling the two
+    /// deletions in one method keeps the sibling caches from drifting: a caller
+    /// can never delete the manifest rows and forget the stats rows, or the reverse.
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
     /// Drop manifest rows for snapshots other than the given one (snapshot GC).
     async fn clear_snapshot_files_except(
         &self,
@@ -825,7 +836,9 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get the total number of inlined rows for a table.
     async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
 
-    /// Get aggregate inline data size information for a table.
+    /// Get aggregate size information for a table's inline corpus AND its inline
+    /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
+    /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).

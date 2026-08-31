@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
+use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
@@ -125,7 +126,7 @@ use spicepod::acceleration::SnapshotsTrigger;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
@@ -1229,12 +1230,13 @@ impl DataFusion {
         Arc::new(ComposedCatalogProvider::new(external, internal_schemas))
     }
 
-    // Returns a Notify if the table supports notifying the runtime when the table is ready.
+    /// Returns a waiter for the dataset's initial load when the table has one to
+    /// report, so the caller can act on it however late it asks.
     pub async fn register_table(
         &self,
         dataset: Arc<Dataset>,
         table: Table,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_access_mode = dataset.access();
@@ -1253,7 +1255,10 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
-                    let notifier = accelerated_table.refresher().on_complete_notification();
+                    let notifier = accelerated_table
+                        .refresher()
+                        .refresh_completion()
+                        .map(|completion| completion.any());
                     let table_provider = table_provider_with_spicepod_metadata(
                         accelerated_table.table_provider(),
                         &dataset.metadata,
@@ -3972,7 +3977,7 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
         initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         let mut accelerated_table = self
             .create_accelerated_table(
                 &dataset,
@@ -3983,7 +3988,10 @@ impl DataFusion {
                 initial_partition_filters,
             )
             .await?;
-        let notifier = accelerated_table.refresher().on_complete_notification();
+        let notifier = accelerated_table
+            .refresher()
+            .refresh_completion()
+            .map(|completion| completion.any());
 
         source
             .on_accelerated_table_registration(&dataset, &mut accelerated_table)
@@ -4013,7 +4021,7 @@ impl DataFusion {
         self: &Arc<Self>,
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
@@ -4033,7 +4041,14 @@ impl DataFusion {
             table.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
-            let notifier = accelerated_table.refresher().on_complete_notification();
+            // Taken before the trigger, for both halves of the correlation: the
+            // refresh it starts cannot finish unobserved between here and the
+            // caller's wait (#13086), and a refresh already running when the
+            // caller changed the table cannot answer for it (#13544).
+            let notifier = accelerated_table
+                .refresher()
+                .refresh_completion()
+                .map(|completion| completion.next());
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -4059,7 +4074,7 @@ impl DataFusion {
         partition_service: &PartitionService,
         dataset_name: &TableReference,
         overrides: Option<&RefreshOverrides>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         // Run on-demand partition discovery before forwarding the refresh command.
         // This ensures that any new partition values in the source data are discovered,
         // assigned to executors, and executors are notified -- before they receive the
@@ -4329,7 +4344,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<JoinHandle<Option<Arc<Notify>>>> {
+    ) -> Result<JoinHandle<Option<RefreshCompletionWaiter>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
             return TableAlreadyExistsSnafu.fail();
@@ -4356,7 +4371,7 @@ impl DataFusion {
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
-        let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
+        let register_task: JoinHandle<Option<RefreshCompletionWaiter>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -4465,7 +4480,7 @@ impl DataFusion {
         view: &View,
         view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         let table = &view.name;
 
         let acceleration =
@@ -4585,7 +4600,10 @@ impl DataFusion {
                     dataset_name: table.to_string(),
                 })?;
 
-        let is_ready = accelerated_table.refresher().on_complete_notification();
+        let is_ready = accelerated_table
+            .refresher()
+            .refresh_completion()
+            .map(|completion| completion.any());
 
         let table_provider = table_provider_with_spicepod_metadata(
             Arc::new(accelerated_table).table_provider(),

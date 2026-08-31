@@ -18,8 +18,8 @@ use crate::federated::FederatedTable;
 use runtime_status as status;
 
 use super::{
-    metrics, refresh::RefreshOverrides, refresh_task::RefreshTask,
-    synchronized_table::SynchronizedTable,
+    metrics, refresh::RefreshOverrides, refresh_completion::RefreshRequestId,
+    refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
 use tokio::{
@@ -253,8 +253,20 @@ pub struct RefreshTaskRunner {
 type RefreshRunFuture =
     BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
 
-type RefreshTaskStartSender = Sender<Option<RefreshOverrides>>;
-type RefreshTaskCompletionReceiver = Receiver<super::Result<()>>;
+/// One refresh request: the id it was issued under, and the overrides it
+/// carries.
+///
+/// The id travels with the request so the completion it produces can be
+/// attributed to it. A refresh already running when a request arrives is
+/// cancelled and never completes, so a completion cannot be attributed by
+/// counting requests — see [`RefreshRequestId`].
+pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
+
+/// A finished refresh, reported under the id of the request that started it.
+pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<()>);
+
+type RefreshTaskStartSender = Sender<RefreshRequest>;
+type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
 
 impl RefreshTaskRunner {
     #[expect(clippy::too_many_arguments)]
@@ -291,9 +303,10 @@ impl RefreshTaskRunner {
             return Err(super::Error::RefreshTaskAlreadyStarted {});
         }
 
-        let (start_refresh, mut on_start_refresh) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let (start_refresh, mut on_start_refresh) = mpsc::channel::<RefreshRequest>(1);
 
-        let (notify_refresh_complete, on_refresh_complete) = mpsc::channel::<super::Result<()>>(1);
+        let (notify_refresh_complete, on_refresh_complete) =
+            mpsc::channel::<RefreshTaskCompletion>(1);
 
         let dataset_name = self.dataset_name.clone();
         let notify_refresh_complete = Arc::new(notify_refresh_complete);
@@ -304,6 +317,11 @@ impl RefreshTaskRunner {
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<RefreshRunFuture> = None;
+            // The request the in-flight refresh was started for, so its
+            // completion is reported under the id that asked for it. A request
+            // arriving mid-refresh replaces both together: the running future is
+            // dropped by the `select!` below, so it never reports at all.
+            let mut running_request: RefreshRequestId = 0;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -312,13 +330,13 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
-                                    if let Err(err) = notify_refresh_complete.send(Ok(())).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
                                 Ok(Err(err)) => {
                                     tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
-                                    if let Err(err) = notify_refresh_complete.send(Err(err)).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(err))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
@@ -337,20 +355,22 @@ impl RefreshTaskRunner {
                                         message: panic_message.clone(),
                                     };
 
-                                    if let Err(err) = notify_refresh_complete.send(Err(panic_error)).await {
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Err(panic_error))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 }
                             }
                         },
-                        Some(overrides_opt) = on_start_refresh.recv() => {
+                        Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
+                            running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
                 } else {
                     select! {
-                        Some(overrides_opt) = on_start_refresh.recv() => {
+                        Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
+                            running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }

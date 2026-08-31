@@ -30,7 +30,6 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampNanosecondArra
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -38,7 +37,8 @@ use spicepod::{
     param::Params,
 };
 
-use crate::utils::{run_query, runtime_ready_check, test_request_context, wait_until_true};
+use crate::acceleration::{count, has_vortex_file, row_count, trigger_refresh};
+use crate::utils::{runtime_ready_check, test_request_context, wait_until_true};
 
 /// The accelerated table under test.
 const TABLE: &str = "cayenne_append_tz_it";
@@ -104,53 +104,6 @@ async fn write_source(path: &std::path::Path, ids: &[i64]) -> Result<(), anyhow:
     Ok(())
 }
 
-/// Queue an append refresh. The caller polls for the result rather than waiting on
-/// the returned notifier: completion signals with `notify_waiters`, which stores no
-/// permit, so a refresh that finishes first would leave a later waiter hanging.
-async fn trigger_refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
-    rt.datafusion()
-        .refresh_table(&TableReference::from(table), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
-    Ok(())
-}
-
-/// Rows currently in the accelerated table.
-async fn row_count(rt: &Arc<Runtime>) -> Result<i64, anyhow::Error> {
-    count(rt, &format!("SELECT COUNT(*) AS cnt FROM {TABLE}")).await
-}
-
-/// Run a `COUNT(*)` query and read back its single value.
-async fn count(rt: &Arc<Runtime>, sql: &str) -> Result<i64, anyhow::Error> {
-    let batches = run_query(rt, sql).await?;
-    let batch = batches
-        .iter()
-        .find(|batch| batch.num_rows() > 0)
-        .ok_or_else(|| anyhow::anyhow!("count query returned no rows"))?;
-    Ok(batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("count column is not Int64"))?
-        .value(0))
-}
-
-/// Whether any `.vortex` file exists under `dir`.
-fn has_vortex_file(dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            has_vortex_file(&path)
-        } else {
-            path.extension().is_some_and(|ext| ext == "vortex")
-        }
-    })
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[cfg(not(target_os = "windows"))]
 async fn cayenne_append_refresh_advances_a_timezone_aware_time_column() -> Result<(), anyhow::Error>
@@ -213,7 +166,7 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column() -> Resul
             runtime_ready_check(&rt).await;
 
             assert_eq!(
-                row_count(&rt).await?,
+                row_count(&rt, TABLE).await?,
                 ROWS_PER_ROUND,
                 "row count after the initial load"
             );
@@ -234,12 +187,12 @@ async fn cayenne_append_refresh_advances_a_timezone_aware_time_column() -> Resul
                 trigger_refresh(&rt, TABLE).await?;
 
                 let reached = wait_until_true(std::time::Duration::from_mins(1), || async {
-                    row_count(&rt).await.is_ok_and(|c| c == rows)
+                    row_count(&rt, TABLE).await.is_ok_and(|c| c == rows)
                 })
                 .await;
 
                 if !reached {
-                    let last = row_count(&rt).await?;
+                    let last = row_count(&rt, TABLE).await?;
                     return Err(anyhow::anyhow!(
                         "append refresh round {round} stalled at {last} rows, expected {rows}"
                     ));

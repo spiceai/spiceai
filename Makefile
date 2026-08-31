@@ -280,6 +280,10 @@ lint-rust:
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
 	python3 scripts/test_check_module_reachability.py
 	python3 scripts/check_module_reachability.py
+	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
+	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
+	python3 scripts/test_check_fork_patches.py
+	python3 scripts/check_fork_patches.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
@@ -417,7 +421,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
 
 .PHONY: install
 install: build
@@ -475,6 +479,11 @@ install-odbc:
 .PHONY: install-nfs
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# ScyllaDB variants
+.PHONY: install-scylladb
+install-scylladb:
+	make install SPICED_NON_DEFAULT_FEATURES="scylladb"
 
 # Install from a CI build artifact (branch or commit SHA)
 # Usage:

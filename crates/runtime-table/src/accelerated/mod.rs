@@ -62,13 +62,14 @@ use snafu::prelude::*;
 use spicepod::metric::Metrics;
 use synchronized_table::SynchronizedTable;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
 pub mod caching_eviction;
 pub mod federation;
 pub mod refresh;
+pub mod refresh_completion;
 pub mod refresh_task;
 pub mod refresh_task_runner;
 pub mod retention;
@@ -81,6 +82,9 @@ pub mod write_back_worker;
 
 pub(crate) use write::WriteMode;
 
+pub use refresh_completion::{
+    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
+};
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
 
@@ -810,7 +814,7 @@ impl Builder {
             return ExpectedAppendModeForAppendStreamSnafu.fail();
         }
 
-        let on_complete_notification = Arc::new(Notify::new());
+        let refresh_completion = RefreshCompletion::new();
 
         let (acceleration_refresh_mode, refresh_trigger) = match self.refresh.mode {
             RefreshMode::Disabled => (refresh::AccelerationRefreshMode::Disabled, None),
@@ -965,7 +969,7 @@ impl Builder {
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         );
-        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
         refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
@@ -1010,10 +1014,12 @@ impl Builder {
                 // `refresh_trigger` is None because the receiver will be
                 // dropped (refresher.start() is not called).
                 //
-                // Notify completion waiters so the schedule-creation path
-                // doesn't block waiting on a refresh that won't run here —
-                // dataset readiness is a separate concern handled above.
-                on_complete_notification.notify_waiters();
+                // No refresh will ever be recorded for this table here, so
+                // close the completion signal: the schedule-creation path and
+                // every other caller resolves at once instead of waiting on a
+                // refresh that cannot arrive. Dataset readiness is a separate
+                // concern handled above.
+                refresh_completion.close();
                 (None, None)
             } else {
                 (
@@ -2482,6 +2488,67 @@ mod tests {
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::prelude::{col, lit};
     use datafusion_functions_json::udfs::json_get_str_udf;
+
+    /// Build an accelerated table over an empty in-memory source in the given
+    /// cluster role, returning its refresh-completion signal.
+    async fn built_table_completion(
+        cluster_role: Option<ClusterRole>,
+        refresh_mode: RefreshMode,
+    ) -> RefreshCompletion {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source table builds"),
+        );
+        let accelerator = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator table builds"),
+        ) as Arc<dyn TableProvider>;
+
+        let mut builder = Builder::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("test"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "mem_table".to_string(),
+            accelerator,
+            refresh::Refresh::new(refresh_mode),
+            Handle::current(),
+        );
+        builder.cluster_role(cluster_role);
+
+        let table = builder.build().await.expect("accelerated table builds");
+        table
+            .refresher()
+            .refresh_completion()
+            .expect("the table carries a refresh-completion signal")
+    }
+
+    /// Regression test for #13086. A cluster scheduler runs no refresh locally,
+    /// so a caller waiting on one must be released rather than left holding a
+    /// wait that nothing can ever satisfy.
+    #[tokio::test]
+    async fn test_a_scheduler_releases_refresh_completion_waiters() {
+        let completion =
+            built_table_completion(Some(ClusterRole::Scheduler), RefreshMode::Full).await;
+
+        // Taken after the build, which is the only order a caller can manage:
+        // the table has to exist before its refresher can be reached.
+        tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
+            .await
+            .expect("a scheduler must release a waiter for a refresh it will never run");
+    }
+
+    /// The contrast that keeps the test above honest: off the scheduler path a
+    /// table with no refresh scheduled leaves its waiters pending, so the
+    /// release is the scheduler branch's doing and not the default.
+    #[tokio::test]
+    async fn test_a_table_with_no_refresh_scheduled_leaves_waiters_pending() {
+        let completion = built_table_completion(None, RefreshMode::Disabled).await;
+
+        tokio::time::timeout(Duration::from_millis(200), completion.next().wait())
+            .await
+            .expect_err("a table that is not a scheduler must not release the waiter itself");
+    }
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![

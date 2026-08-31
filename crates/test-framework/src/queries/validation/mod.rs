@@ -138,7 +138,7 @@ pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
 }
 
 #[must_use]
-pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+pub fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
     (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
 }
 
