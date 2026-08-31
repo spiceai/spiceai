@@ -402,6 +402,12 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_maintenance_reclaimed_files_total",
     "cayenne_maintenance_reclaimed_bytes_total",
     "cayenne_maintenance_reclaimed_rows_total",
+    // Deliberately a family of its own: it counts rows a pass MARKED deleted,
+    // the opposite event to the tombstone removal `reclaimed_rows` counts, so
+    // one summable series cannot hold both. Registered at zero with the reclaim
+    // family, so its absence here means the call site or the registration went
+    // missing rather than that no retention pass has run.
+    "cayenne_maintenance_tombstoned_rows_total",
     "cayenne_deletion_index_len",
     "cayenne_deletion_index_reinserts",
     "cayenne_deletion_index_bytes",

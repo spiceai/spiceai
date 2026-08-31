@@ -2258,6 +2258,7 @@ pub mod cayenne {
             .get_or_init(build_maintenance_outcome)
             .add(0, &with_outcome);
         track_maintenance_reclaimed(0, 0, 0, dimensions);
+        track_maintenance_tombstoned_rows(0, dimensions);
     }
 
     static COMPACTION_TRIGGER: OnceLock<Counter<u64>> = OnceLock::new();
@@ -2287,15 +2288,21 @@ pub mod cayenne {
     static MAINTENANCE_RECLAIMED_FILES: OnceLock<Counter<u64>> = OnceLock::new();
     static MAINTENANCE_RECLAIMED_BYTES: OnceLock<Counter<u64>> = OnceLock::new();
     static MAINTENANCE_RECLAIMED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+    static MAINTENANCE_TOMBSTONED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Records what one maintenance pass physically reclaimed: files unlinked,
-    /// bytes those files occupied, and rows (tombstones, or deleted rows for
-    /// retention) dropped. `dimensions` carries `table` and `op`.
+    /// bytes those files occupied, and rows dropped. `dimensions` carries `table`
+    /// and `op`.
     ///
     /// This is the counterpart to the footprint gauges: the gauges say how big
     /// the dataset is, these say how much each operation is actually giving back.
     /// A growing gauge with a flat reclaim counter is the signature of a
     /// reclamation path that is scheduled but never doing work.
+    ///
+    /// Every series in this family is a physical release, which is what makes it
+    /// summable across `op`. Rows a pass only MARKED deleted are counted by
+    /// [`track_maintenance_tombstoned_rows`] instead, and the two families must
+    /// never be added together — see that function for why.
     pub fn track_maintenance_reclaimed(files: u64, bytes: u64, rows: u64, dimensions: &[KeyValue]) {
         MAINTENANCE_RECLAIMED_FILES
             .get_or_init(|| {
@@ -2319,7 +2326,33 @@ pub mod cayenne {
             .get_or_init(|| {
                 operational_meter()
                     .u64_counter("cayenne_maintenance_reclaimed_rows_total")
-                    .with_description("Rows dropped by Cayenne maintenance passes. For a deletion-vector sweep these are tombstones retired from the metastore; for a retention pass they are rows TOMBSTONED, whose bytes return only when a later compaction rewrites without them — see the `applied` outcome.")
+                    .with_description("Rows physically dropped by Cayenne maintenance passes: tombstones retired from the metastore by a deletion-vector sweep. Rows a retention pass only marked deleted are counted by cayenne_maintenance_tombstoned_rows_total, which is a different quantity and must not be added to this one.")
+                    .with_unit("rows")
+                    .build()
+            })
+            .add(rows, dimensions);
+    }
+
+    /// Records rows a maintenance pass MARKED deleted: tombstones written, not
+    /// space returned. `dimensions` carries `table` and `op`; retention is the
+    /// only operation that writes any today.
+    ///
+    /// Separate from [`track_maintenance_reclaimed`] because the two count
+    /// opposite events, and one summable family cannot hold both. Retention
+    /// CREATES a tombstone, counted here; the deletion-vector sweep REMOVES one,
+    /// counted under `cayenne_maintenance_reclaimed_rows_total`. Added together
+    /// the same row lands twice — once when it is marked and once when its
+    /// tombstone is reclaimed — overstating cleanup on exactly the stalled table
+    /// an operator is investigating. Read this against the reclaim family rather
+    /// than into it: this counter climbing while
+    /// `cayenne_maintenance_reclaimed_bytes_total` stays flat is the "deletes
+    /// recorded, nothing given back" shape.
+    pub fn track_maintenance_tombstoned_rows(rows: u64, dimensions: &[KeyValue]) {
+        MAINTENANCE_TOMBSTONED_ROWS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_maintenance_tombstoned_rows_total")
+                    .with_description("Rows a Cayenne maintenance pass marked deleted without reclaiming space: a retention pass writes tombstones, and the bytes return only once a later compaction rewrites without them. NOT summable with cayenne_maintenance_reclaimed_rows_total, which counts tombstones removed rather than written.")
                     .with_unit("rows")
                     .build()
             })

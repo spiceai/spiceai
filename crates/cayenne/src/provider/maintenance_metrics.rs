@@ -393,10 +393,28 @@ pub(crate) fn register_all(table: &str) {
 }
 
 /// Record what one maintenance pass physically gave back.
+///
+/// Physical release only, which is what lets the family be summed across `op`.
+/// Rows a pass merely marked deleted belong to [`track_tombstoned_rows`].
 pub(crate) fn track_reclaimed(table: &str, op: MaintenanceOp, files: u64, bytes: u64, rows: u64) {
     telemetry::cayenne::track_maintenance_reclaimed(
         files,
         bytes,
+        rows,
+        &[
+            KeyValue::new("table", table.to_string()),
+            KeyValue::new("op", op.as_str()),
+        ],
+    );
+}
+
+/// Record rows one maintenance pass marked deleted without freeing anything.
+///
+/// Kept out of [`track_reclaimed`] because a tombstone written and a tombstone
+/// reclaimed are opposite events: summed into one series the same row is counted
+/// twice, once at each end of its life.
+pub(crate) fn track_tombstoned_rows(table: &str, op: MaintenanceOp, rows: u64) {
+    telemetry::cayenne::track_maintenance_tombstoned_rows(
         rows,
         &[
             KeyValue::new("table", table.to_string()),

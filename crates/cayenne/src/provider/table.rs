@@ -5726,25 +5726,6 @@ impl CayenneTableProvider {
         metadata.len()
     }
 
-    /// Ref-count-aware deletion of a single retired snapshot directory (local
-    /// FS, blocking I/O). Deletes only the data files inside `snapshot_dir`
-    /// whose table-relative path
-    /// (`{retiring_snapshot_id}/{name}` — see
-    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`, then
-    /// removes the directory itself only once it holds no entries. A file kept
-    /// alive by a live/protected snapshot's manifest (an in-place compaction
-    /// reference) is left untouched.
-    ///
-    /// `live_referenced` MUST be the complete live-referenced set (built from
-    /// [`MetadataCatalog::get_all_snapshot_files`] filtered to the live
-    /// snapshots): an incomplete set could orphan a file a scan still needs.
-    /// When the table's manifest is unpopulated the caller takes the legacy
-    /// whole-directory path instead and never reaches here.
-    ///
-    /// Returns what it physically removed together with the error that stopped
-    /// it, if any — see [`RetiredDirAttempt`] for why both. `dir_removed` is
-    /// false when one or more referenced files (or non-data files) kept the
-    /// directory alive. A `NotFound` directory counts as fully removed.
     /// Delete a retired snapshot directory wholesale, for a table whose manifest
     /// is empty.
     ///
@@ -5813,6 +5794,26 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Ref-count-aware deletion of a single retired snapshot directory (local
+    /// FS, blocking I/O). Deletes only the data files inside `snapshot_dir`
+    /// whose table-relative path
+    /// (`{retiring_snapshot_id}/{name}` — see
+    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`, then
+    /// removes the directory itself only once it holds no entries. A file kept
+    /// alive by a live/protected snapshot's manifest (an in-place compaction
+    /// reference) is left untouched.
+    ///
+    /// `live_referenced` MUST be the complete live-referenced set (built from
+    /// [`MetadataCatalog::get_all_snapshot_files`] filtered to the live
+    /// snapshots): an incomplete set could orphan a file a scan still needs.
+    /// When the table's manifest is unpopulated the caller takes
+    /// [`Self::delete_retired_snapshot_dir_wholesale`] instead and never
+    /// reaches here.
+    ///
+    /// Returns what it physically removed together with the error that stopped
+    /// it, if any — see [`RetiredDirAttempt`] for why both. `dir_removed` is
+    /// false when one or more referenced files (or non-data files) kept the
+    /// directory alive. A `NotFound` directory counts as fully removed.
     fn delete_retired_snapshot_dir_refcounted(
         snapshot_dir: &std::path::Path,
         retiring_snapshot_id: &str,
@@ -24134,15 +24135,16 @@ impl CayenneTableProvider {
                 MaintenanceOutcome::NoOp
             },
         );
-        // Rows only, and they are rows TOMBSTONED rather than space freed — a
-        // later compaction and deletion-vector sweep turn them back into bytes.
-        // A rising count here beside flat sweep reclaim is exactly the "deletes
-        // recorded, nothing given back" shape.
-        maintenance_metrics::track_reclaimed(
+        // Rows TOMBSTONED, not space freed: a later compaction and
+        // deletion-vector sweep turn them back into bytes. Its own family rather
+        // than the reclaim one because the sweep counts a tombstone REMOVED under
+        // `reclaimed_rows` — the opposite event — so one summable series cannot
+        // hold both without counting each row twice over its life. A rising count
+        // here beside flat reclaimed bytes is the "deletes recorded, nothing
+        // given back" shape.
+        maintenance_metrics::track_tombstoned_rows(
             table_name,
             MaintenanceOp::Retention,
-            0,
-            0,
             deleted_count,
         );
 
