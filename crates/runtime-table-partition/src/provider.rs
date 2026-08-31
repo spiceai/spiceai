@@ -119,6 +119,22 @@ impl PartitionTableProvider {
         contains
     }
 
+    /// The index of the partition expression `candidate` equals, but only when `literal` really
+    /// is a literal — the `partition_expr = lit` half of an equality. Called once per operand
+    /// order so that either `expr = lit` or `lit = expr` resolves.
+    fn partition_expression_index_of(
+        candidate: &Expr,
+        literal: &Expr,
+        partition_exprs: &[PartitionedBy],
+    ) -> Option<usize> {
+        if !matches!(literal, Expr::Literal(..)) {
+            return None;
+        }
+        partition_exprs
+            .iter()
+            .position(|p| candidate == &p.expression)
+    }
+
     /// The index of the single partition expression this filter resolves against, if the filter is
     /// built entirely from `<that expression> = <literal>` leaves combined with `AND`/`OR`.
     ///
@@ -146,17 +162,8 @@ impl PartitionTableProvider {
     ) -> Option<usize> {
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
-                Operator::Eq => {
-                    let index_of = |candidate: &Expr, literal: &Expr| -> Option<usize> {
-                        if !matches!(literal, Expr::Literal(..)) {
-                            return None;
-                        }
-                        partition_exprs
-                            .iter()
-                            .position(|p| candidate == &p.expression)
-                    };
-                    index_of(left, right).or_else(|| index_of(right, left))
-                }
+                Operator::Eq => Self::partition_expression_index_of(left, right, partition_exprs)
+                    .or_else(|| Self::partition_expression_index_of(right, left, partition_exprs)),
                 Operator::Or | Operator::And => {
                     let left_index =
                         Self::resolved_partition_expression_index(left, partition_exprs)?;
