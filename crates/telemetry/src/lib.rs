@@ -3138,7 +3138,7 @@ pub mod cayenne {
 
     /// Records the encode fan-out one write resolved to, together with the
     /// branch that chose it. `dimensions` carries `table` and `decision`
-    /// (`serial_sort_columns` / `size_bounded` /
+    /// (`serial_sort_columns` / `serial_required` / `size_bounded` /
     /// `concurrency_bounded`).
     ///
     /// The shard count alone cannot be acted on: a fan-out of 1 caused by a

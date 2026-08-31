@@ -262,7 +262,7 @@ pub(crate) enum MaintenanceOutcome {
     /// Retention is the case: it writes tombstones, and the bytes come back
     /// later when a compaction rewrites without the dead rows and the
     /// deletion-vector sweep unlinks the vectors. Reporting it as `reclaimed`
-    /// made reclamation dashboards climb on a pass that freed nothing.
+    /// would make reclamation dashboards climb on a pass that freed nothing.
     Applied,
     /// The pass ran and found nothing to reclaim.
     NoOp,

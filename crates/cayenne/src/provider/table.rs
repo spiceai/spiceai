@@ -3160,9 +3160,9 @@ impl WriteShapeDecision {
 /// Carries the file and byte totals, not just "was the directory removed":
 /// the ref-counted deletion can unlink several Vortex files and still leave the
 /// directory alive because a live snapshot references others in place. Reporting
-/// only the directory outcome counted those unlinks as nothing, and counted a
-/// removed directory as one "file" whatever it held — so the reclamation rate
-/// was wrong in both directions on exactly the tables worth measuring.
+/// only the directory outcome would count those unlinks as nothing, and count a
+/// removed directory as one "file" whatever it held — wrong in both directions
+/// on exactly the tables worth measuring.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RetiredDirReclaim {
     /// Files this attempt unlinked.
@@ -9142,9 +9142,9 @@ impl CayenneTableProvider {
 
         // `keys` is `Some` only in exact mode. A bloom's tally counts INSERTIONS —
         // re-upserting one key increments it every time and superseded keys still
-        // count — so publishing it as a key count made a hot-key workload report
-        // ever-growing cardinality and a falsely falling density. It goes out as
-        // `cayenne_pk_bloom_insertions` instead, named for what it is.
+        // count — so publishing it as a key count would make a hot-key workload
+        // report ever-growing cardinality and a falsely falling density. It goes
+        // out as `cayenne_pk_bloom_insertions` instead, named for what it is.
         let (format, keys, density) = match observed {
             PkIndexObservation::LockBusy => return,
             PkIndexObservation::Absent => (
@@ -9429,10 +9429,9 @@ impl CayenneTableProvider {
                     // Snapshot directories are named by UUID; every reserved
                     // coordination directory under the table root is
                     // underscore-prefixed (`_staging`, `_partitioned_wal`).
-                    // Testing the prefix rather than listing the names is what
-                    // keeps a reserved directory added later from being counted
-                    // as a snapshot — which is how `_partitioned_wal` inflated
-                    // this gauge when the check named only `_staging`.
+                    // Testing the prefix rather than naming the directories
+                    // keeps a reserved directory added later from inflating this
+                    // gauge as a snapshot.
                     if is_root && !Self::is_reserved_table_dir(&entry.file_name()) {
                         usage.snapshot_dirs = usage.snapshot_dirs.saturating_add(1);
                     }
@@ -9497,7 +9496,7 @@ impl CayenneTableProvider {
     /// Record the encode fan-out this write resolved to and the branch that
     /// chose it, for the background tick to publish.
     ///
-    /// Two lock-free stores rather than a gauge record here: this runs on every
+    /// One lock-free store rather than a gauge record here: this runs on every
     /// snapshot write, and a `KeyValue` carrying an owned table name would put an
     /// allocation on the write path for a value that is a last-write-wins gauge
     /// anyway. Sampling it on the tick loses nothing — the tick reads whatever
@@ -33679,9 +33678,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
         let protected_len = self.protected_snapshots.load().len();
         if protected_len < min_inputs {
-            // The most common idle path for the protected-subset merge, and it
-            // recorded nothing — so "why isn't the subset merge running" had no
-            // series at all, which reads identically to the pass not being
+            // The most common idle path for the protected-subset merge, so it
+            // must still record an outcome: with no series here, "why isn't the
+            // subset merge running" reads identically to the pass not being
             // instrumented.
             maintenance_metrics::track_compaction(
                 self.table_metadata.table_name.as_str(),
