@@ -1170,11 +1170,6 @@ impl CayenneDeletionSink {
         &self,
         filters: &[Expr],
     ) -> super::super::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        // Fold `now()` (and other volatile functions) per pass. Setting
-        // `ExecutionProps` start time is not enough: `create_physical_expr`
-        // does not call `ExprSimplifier`.
-        let filters =
-            crate::provider::retention::simplify_filters_for_execution(filters, &self.schema)?;
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         let execution_props = ExecutionProps::new();
 
