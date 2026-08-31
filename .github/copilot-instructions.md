@@ -6,6 +6,34 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 As an AI-native database, query results can NEVER be wrong. Correctness supersedes performance, developer experience, and feature velocity. Verify transformations preserve integrity (row counts, key values); rigorously test NULLs, empty sets, boundaries, type coercions, and overflow; when uncertain, return a structured error instead of possibly-wrong data. Never corrupt data or drop errors silently.
 
+## Evidence — no claim without a reproduction
+
+**A claim needs a reading *and* a run — the evidence is required in addition to the code inspection, not instead of it.** Inspection is how you find the defect and explain *why* it happens; running something is how you establish *that* it happens. Neither substitutes for the other: a run with no reading behind it gives a symptom whose cause you are guessing at, and invites a fix aimed at the symptom; a reading with no run behind it explains behavior the system may never exhibit. Read the code closely, then go get the artifact.
+
+**Every issue, concern, bug, regression, or performance claim you raise — in a PR, a GitHub issue, a review comment, or a message to the user — must carry, alongside the reasoning, evidence produced by *running* something external to the code you read.** A plausible-looking race, overflow, or lost update that nobody has observed is a hypothesis and must be labeled one.
+
+**Strengthen the reading with a model that does not share it.** Your reading of the code and a test you write from that reading fail together, because both carry whatever you have already misunderstood. A different model reading the same code adversarially does not inherit that blind spot, and is cheap next to the bug it catches: `grok:adversarial-review` challenges the approach and the design choices, `codex:rescue` gives an independent second diagnosis, `/code-review` covers the diff. Reach for one when the reading is load-bearing — a correctness or data-loss claim, a subtle concurrency or lifetime argument, or a finding you have not been able to reproduce, where the reading is all you have.
+
+What counts as evidence:
+
+- **An actual run of Spice.ai** — `spiced` against a real Spicepod, with the query output, the log line, or the wrong row count pasted in.
+- **A benchmark or harness run** — `testoperator`, `cbench`, the CH-benCH lab — with before/after numbers from the same rig; mandatory for anything about performance, memory, or lag. Keep the diagnostics and the result data the run emits, not just the headline number: per-query timings, the `--validate` output, the run directory, and the returned rows themselves are what turn a suspicious delta into a located one, and what let someone else re-derive your conclusion instead of taking it on trust.
+- **An artifact captured off a running system** — an `EXPLAIN` or `EXPLAIN ANALYZE` plan; `runtime.metrics`, `runtime.query_history` or `runtime.task_history` rows, or a scrape of the metrics endpoint; a CPU or heap profile, a flamegraph, an allocation or RSS trace; a stack dump, core dump, or backtrace. These are first-class evidence, not a consolation prize for when a test is hard to write — for a query engine the plan often *is* the observation.
+- **An end-to-end or integration test** that fails on current code and passes on the fix, exercising the real wired path (`make test-integration`, `test/spicepods/…`, `verify-cli`).
+- **A targeted experiment**: a property/fuzz test, a SQL session, a `curl`, a `psql` CDC feed — anything that exhibits the wrong behavior directly.
+
+**Match the artifact to the claim**; the wrong one proves nothing however real it is. Wrong results need the wrong rows. A pushdown, join-order, partitioning or statistics claim needs the plan — `EXPLAIN ANALYZE` reports the rows and time each operator actually saw, which is what separates a plan that looks wrong from one that is. Latency, throughput or lag needs metrics or a profile from the same rig, never a stopwatch. Memory needs RSS under `runtime.query.memory_limit` or a heap profile. A hang needs a stack dump; a crash needs the backtrace. Much of this is queryable in-process, so the cost of getting it is usually a `SELECT`.
+
+**A unit test alone is not evidence.** A unit test written from the same reading of the code that produced the claim encodes the same misunderstanding — it can pass on wrong code and fail on correct code — and it routinely misses exactly the failures that matter here: defaulted no-op wrapper methods (see *Trait evolution & wrapper delegation*), feature-gated paths, real I/O, concurrency, and anything the harness stubs out. Land the unit test as a regression guard, but prove the bug outside it first.
+
+Rules:
+
+- **Show the artifact** — the command and its actual output or numbers, not a summary of them. "Verified" without pasted output is not verified.
+- **Demonstrate the failure before the fix and its absence after**, with the same command. A check that only ever ran green proves nothing.
+- **If you cannot reproduce it, say exactly that** — "unverified, code inspection only" — with the repro you attempted and why it did not land. Never round a hypothesis up to a bug, and never present a change driven by one as a fix.
+- **Report negative results.** When the run contradicts your reading of the code, the reading was wrong: withdraw the claim rather than re-arguing it from the source.
+- The bar scales with the cost of being wrong, never down to zero: a correctness or data-loss claim needs a run of the engine, not a passing assertion.
+
 ## Build, test, lint (expensive — read first)
 
 Full workspace and release builds take 20–35 minutes. Minimize large builds:
@@ -143,6 +171,7 @@ A new trait method with a default impl silently no-ops in wrapper/decorator impl
 
 ## Testing
 
+- **A green unit test is not proof a bug existed or is gone** — see *Evidence — no claim without a reproduction*: reproduce outside the unit test first, then land the unit test as the regression guard.
 - **Spicepod naming**: `{connector[variant]}-{accelerator[variant]}-{test_variant}`; non-accelerated must use the `-federated` suffix. Examples: `s3[parquet]-federated`, `mysql-duckdb[file]-on_zero_results`.
 - **testoperator** is the benchmark/test harness: `cargo run -p testoperator -- run bench -p test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate` (also `run throughput … --concurrency 25`).
 - **No fixed sleeps as readiness waits**: poll the actual condition with a bounded timeout, short interval, and a failure message carrying the last observed state — `runtime_ready_check[_with_timeout]`, `wait_until_true`, `util::retry` with `FibonacciBackoffBuilder`, health/ping probes, `SELECT 1`, refresh notifiers, result polling. Fixed sleeps only when time itself is under test (TTL, backoff, cron, rate limits) — keep them short and explain them.
@@ -158,6 +187,8 @@ Git deps in `Cargo.toml`: always a full 40-character SHA (reproducible, unambigu
 ```toml
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "<full 40-char sha>" } # branch: spice
 ```
+
+**Moving a fork pin re-audits that fork's patches.** A fork branch is re-cut per upstream major, and a Spice patch not deliberately carried across is lost *silently* — the crate reverts to upstream behaviour and the fork's own tests leave with the patch (it has happened: [#13524](https://github.com/spiceai/spiceai/issues/13524), and a `SIGSEGV` that shipped). `docs/dev/fork_patches.md` records, per fork, every patch and the test **in this repo** that fails if it goes missing; `scripts/check_fork_patches.py` (in `make lint-rust`) fails the build when a pin moves without that ledger being updated. Adding a patch to a fork adds its row and a guard in the same change.
 
 ## Adding a data connector
 

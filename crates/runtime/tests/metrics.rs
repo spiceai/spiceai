@@ -637,7 +637,7 @@ async fn an_accelerated_dataset_reports_the_query_and_refresh_families() {
         .await
         .expect("the refresh request to be accepted")
         .expect("an accelerated table to return a refresh notifier");
-    tokio::time::timeout(Duration::from_mins(1), notifier.notified())
+    tokio::time::timeout(Duration::from_mins(1), notifier.wait())
         .await
         .expect("the refresh to complete within a minute");
 
