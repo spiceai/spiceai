@@ -281,6 +281,23 @@ pub(crate) enum MaintenanceOutcome {
     /// No candidate had reached its grace window, or every one is still pinned by
     /// an in-flight scan. Nothing was examined.
     DeclinedNotDue,
+    /// A concurrent write held the pass off: a staged inline-conflict tombstone
+    /// is unpublished, or a staged append is mid-finalization. The next debounce
+    /// retries, so a steady low rate here is the pass yielding to a busy writer
+    /// rather than a fault.
+    DeclinedWriteInFlight,
+    /// A mem-tier seal shadow is live, so the rows retention would scan are still
+    /// held in RAM above the visibility watermark and materializing them would
+    /// serve them twice.
+    ///
+    /// Distinct from [`Self::DeclinedWriteInFlight`] for the reason
+    /// [`Self::DeclinedLiveReference`] is distinct from [`Self::DeclinedNotDue`]:
+    /// the prognoses differ. A write in flight clears on its own within
+    /// milliseconds; this waits on the mem-tier checkpoint that makes the shadow
+    /// durable, and the deferred request is consumed rather than re-armed — so a
+    /// table reporting this while its checkpoint never fires has retention that
+    /// is not coming back on its own.
+    DeclinedAwaitingCheckpoint,
     /// Candidates WERE examined and none could be removed: their files are still
     /// referenced in place by a live snapshot, or a non-data sidecar keeps the
     /// directory alive.
@@ -307,6 +324,8 @@ impl MaintenanceOutcome {
         Self::DeclinedBelowThreshold,
         Self::DeclinedManifestUnprovable,
         Self::DeclinedNotDue,
+        Self::DeclinedWriteInFlight,
+        Self::DeclinedAwaitingCheckpoint,
         Self::DeclinedLiveReference,
         Self::Failed,
     ];
@@ -321,6 +340,8 @@ impl MaintenanceOutcome {
             Self::DeclinedBelowThreshold => "declined_below_threshold",
             Self::DeclinedManifestUnprovable => "declined_manifest_unprovable",
             Self::DeclinedNotDue => "declined_not_due",
+            Self::DeclinedWriteInFlight => "declined_write_in_flight",
+            Self::DeclinedAwaitingCheckpoint => "declined_awaiting_checkpoint",
             Self::DeclinedLiveReference => "declined_live_reference",
             Self::Failed => "failed",
         }
@@ -431,8 +452,9 @@ mod tests {
     fn declines_are_exactly_the_declined_prefixed_labels() {
         // BOTH families, because the `outcome=~"declined_.*"` selector spans
         // them: one unprefixed decline in either drops silently out of the
-        // answer to "what is stopping maintenance". `not_configured` was exactly
-        // that — a pass that never ran, invisible to the selector.
+        // answer to "what is stopping maintenance", and `not_configured` is the
+        // easy one to get wrong — a pass that never ran, but whose name does not
+        // read like a refusal.
         for outcome in MaintenanceOutcome::ALL.iter().copied() {
             let is_decline = !matches!(
                 outcome,

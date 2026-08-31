@@ -23987,6 +23987,20 @@ impl CayenneTableProvider {
                 // with no debounce between iterations, so re-arming from inside the pass
                 // would spin it forever while the flag stayed set. Only the caller knows
                 // whether a retry is a background debounce away or has nowhere to go.
+                //
+                // The two deferrals count separately because a shadow's deferral is
+                // consumed without re-arming: a table stuck on one has retention that
+                // never runs again until its checkpoint fires, which reads nothing like
+                // the transient case that clears on the next debounce.
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::Retention,
+                    if shadow_present {
+                        MaintenanceOutcome::DeclinedAwaitingCheckpoint
+                    } else {
+                        MaintenanceOutcome::DeclinedWriteInFlight
+                    },
+                );
                 return Ok(if shadow_present {
                     RetentionPass::DeferredUntilCheckpoint
                 } else {
@@ -23996,12 +24010,19 @@ impl CayenneTableProvider {
             let materialized = self.checkpoint_inlined_data_if_present_for_delete().await;
             drop(checkpoint_guard);
             drop(guard);
-            materialized.map_err(|err| CatalogError::InvalidOperation {
-                message: format!(
-                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                    self.table_metadata.table_name
-                ),
-                source: Box::new(err),
+            materialized.map_err(|err| {
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::Retention,
+                    MaintenanceOutcome::Failed,
+                );
+                CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                        self.table_metadata.table_name
+                    ),
+                    source: Box::new(err),
+                }
             })?;
         }
 
@@ -24031,12 +24052,19 @@ impl CayenneTableProvider {
                 DeletionRequestSource::User,
             )
             .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: format!(
-                    "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
-                    self.table_metadata.table_name
-                ),
-                source: Box::new(err),
+            .map_err(|err| {
+                maintenance_metrics::track_maintenance(
+                    table_name,
+                    MaintenanceOp::Retention,
+                    MaintenanceOutcome::Failed,
+                );
+                CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                        self.table_metadata.table_name
+                    ),
+                    source: Box::new(err),
+                }
             })?;
         // Nothing on this path re-derives `num_rows` from the rows about to be removed,
         // and a caller may have just `Set` an authoritative count (an overwrite
