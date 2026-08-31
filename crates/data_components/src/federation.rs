@@ -573,10 +573,9 @@ mod tests {
         let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
             .expect_err("a correlation qualified by the probe side must be refused");
         assert!(
-            err.to_string().contains(
-                "not supported when the correlation's only qualifier is one the probe side also answers to"
-            ),
-            "expected the refusal to name the probe-qualified correlation, got: {err}"
+            err.to_string()
+                .contains("a FROM the emitted SQL introduces would capture the correlation"),
+            "expected the refusal to identify the captured correlation, got: {err}"
         );
     }
 
