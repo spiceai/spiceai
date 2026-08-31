@@ -1433,10 +1433,7 @@ mod tests {
                 "a plain non-capturing group",
                 vec![col("code"), lit("(?:ab)+")],
             ),
-            (
-                "a negated inline flag",
-                vec![col("code"), lit("(?-i)r")],
-            ),
+            ("a negated inline flag", vec![col("code"), lit("(?-i)r")]),
             (
                 "a capture group followed by a quantifier",
                 vec![col("code"), lit("(ab)?c")],
@@ -1498,10 +1495,7 @@ mod tests {
                 "the inline R CRLF mode, which has no RE2 counterpart",
                 vec![col("code"), lit("(?R)^a")],
             ),
-            (
-                "an inline Unicode toggle",
-                vec![col("code"), lit("(?u)a")],
-            ),
+            ("an inline Unicode toggle", vec![col("code"), lit("(?u)a")]),
             (
                 "a named capture group, which the two engines spell differently",
                 vec![col("code"), lit("(?P<n>a)")],
@@ -1510,10 +1504,7 @@ mod tests {
                 "a lookahead, which neither engine supports",
                 vec![col("code"), lit("(?=a)")],
             ),
-            (
-                "an empty flag directive",
-                vec![col("code"), lit("(?)a")],
-            ),
+            ("an empty flag directive", vec![col("code"), lit("(?)a")]),
         ] {
             assert!(
                 !can_translate(&call(REGEXP_LIKE_NAME, args)),
