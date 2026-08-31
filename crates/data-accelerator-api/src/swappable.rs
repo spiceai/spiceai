@@ -168,12 +168,6 @@ impl SwappableTableProvider {
     /// should pre-validate too so they can surface dataset-aware error context, but this guard
     /// ensures incompatible providers cannot be installed even in release builds.
     ///
-    /// The replaced provider is returned rather than dropped inside the lock. Callers that don't
-    /// need it drop it (or ignore the `Ok`); fatal-error recovery does need it — to reopen a
-    /// file-based engine that has locked its own file (e.g. an invalidated DuckDB instance), it
-    /// installs a schema-matching placeholder here and drops the returned provider to release
-    /// the file lock before rebuilding a replacement over the same file.
-    ///
     /// Lock poisoning is recovered transparently via
     /// [`std::sync::PoisonError::into_inner`].
     ///

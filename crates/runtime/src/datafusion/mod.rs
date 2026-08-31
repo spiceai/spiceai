@@ -5472,16 +5472,6 @@ async fn build_snapshot_creation_config(
 
 /// Wrap a caching-mode accelerator provider in a [`SwappableTableProvider`] wired for
 /// fatal-error recovery, or return `None` when the engine does not support caching recovery.
-///
-/// A file-based engine (DuckDB) can invalidate its database when it reaches its memory limit,
-/// after which every query fails until the process restarts (spiceai/spiceai#13513). The
-/// [`CachingRecovery`] returned here lets the cache-write task reopen the engine
-/// over the file it already has and swap the fresh provider in, so the dataset keeps serving
-/// what it holds. The factory it calls is the same `create_accelerator_table` flow used at
-/// startup,
-/// built over the on-disk `storage_schema` (the schema the provider was created with, including
-/// the caching namespace column) so the rebuilt provider's schema matches and the swap
-/// validates.
 async fn build_caching_recovery_swappable(
     df: &DataFusion,
     dataset: &Dataset,

@@ -55,7 +55,7 @@ use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use util::expr::combine_exprs_balanced;
 
 /// Type alias for tracking in-flight revalidation requests.
@@ -281,7 +281,10 @@ impl CachingRecovery {
     /// worth calling.
     #[must_use]
     pub fn is_fatal_error(&self, err: &DataFusionError) -> bool {
-        is_recoverable_fatal_error(self.accelerator.name(), err)
+        match Engine::try_from(self.accelerator.name()) {
+            Ok(engine) => is_recoverable_fatal_error(engine, err),
+            Err(_) => false,
+        }
     }
 
     /// Reopen the wrapped engine over the file it already has and swap the fresh provider in.
@@ -304,7 +307,7 @@ impl CachingRecovery {
         let previous = self
             .swappable
             .swap(Arc::clone(&placeholder))
-            .map_err(|source| RecoverError::SwapRejected { source })?;
+            .context(SwapRejectedSnafu)?;
         drop(previous);
 
         let new_provider = self
@@ -315,12 +318,12 @@ impl CachingRecovery {
                 self.provider_factory.clone(),
             )
             .await
-            .map_err(|source| RecoverError::RebuildFailed { source })?;
+            .context(RebuildFailedSnafu)?;
 
         self.swappable
             .swap(new_provider)
             .map(|_| ())
-            .map_err(|source| RecoverError::SwapRejected { source })
+            .context(SwapRejectedSnafu)
     }
 }
 
@@ -332,9 +335,9 @@ impl CachingRecovery {
 /// commit reports `Cannot continue operation` and every later query reports `database has been
 /// invalidated` until the instance is reopened. It is deliberately narrow: an ordinary
 /// out-of-memory error that rolled back cleanly leaves the database usable and must not match.
-fn is_recoverable_fatal_error(engine: &str, err: &DataFusionError) -> bool {
-    match Engine::try_from(engine) {
-        Ok(Engine::DuckDB) => {
+fn is_recoverable_fatal_error(engine: Engine, err: &DataFusionError) -> bool {
+    match engine {
+        Engine::DuckDB => {
             let message = err.to_string();
             message.contains("has been invalidated")
                 || message.contains("Cannot continue operation")
@@ -719,12 +722,7 @@ async fn flush_cache_writes(
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
         health.record_failure(&e);
 
-        // A file-mode DuckDB accelerator that reaches its memory limit can invalidate its own
-        // database, after which every query — reads included — fails until the process
-        // restarts (spiceai/spiceai#13513). Reopen the accelerator over the file it already
-        // has so the dataset keeps serving what it holds instead of going permanently dark.
-        // The writes this flush was carrying are dropped; caching-mode entries are re-fetched
-        // from source on the next access, so this loses freshness, not correctness.
+        // If possible, recover the accelerator state.
         if let Some(rec) = recovery
             && rec.is_fatal_error(&e)
         {
