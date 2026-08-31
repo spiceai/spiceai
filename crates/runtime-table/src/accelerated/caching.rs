@@ -346,6 +346,32 @@ fn is_recoverable_fatal_error(engine: Engine, err: &DataFusionError) -> bool {
     }
 }
 
+/// Attempt a reopen and log the outcome, returning `true` if the accelerator is serving queries
+/// again. The caller must hold the accelerator write mutex (recovery serializes with writes,
+/// per the invariant [`DataAccelerator::rebuild_provider`] documents).
+///
+/// A `false` return leaves the recovering placeholder installed — every query and write then
+/// fails, so a later flush can never re-trigger recovery. The caller must remember to retry
+/// (the cache-write task does, on its flush ticker) until this succeeds.
+async fn recover_and_log(recovery: &CachingRecovery, dataset_name: &str) -> bool {
+    match recovery.recover().await {
+        Ok(()) => {
+            tracing::info!(
+                "Dataset '{dataset_name}' accelerator reopened after a fatal error; it is \
+                 serving queries again."
+            );
+            true
+        }
+        Err(recover_err) => {
+            tracing::error!(
+                "Dataset '{dataset_name}' accelerator reopen did not complete; retrying until it \
+                 succeeds or the process restarts. Cause: {recover_err}."
+            );
+            false
+        }
+    }
+}
+
 /// A schema-preserving stand-in installed into the [`SwappableTableProvider`] for the brief
 /// window while a broken engine provider is being rebuilt (see [`CachingRecovery::recover`]).
 ///
@@ -539,6 +565,9 @@ pub fn spawn_batched_cache_write_task(
         let dataset_name = dataset.to_string();
         let mut health = CacheWriteHealth::new(runtime_status, dataset);
         let mut batch_buffer: Vec<CacheWriteRequest> = Vec::new();
+
+        // On an error we are attempting to recover from, state might be pending between loops.
+        let mut recovery_pending = false;
         let mut flush_ticker =
             tokio::time::interval(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS));
         // First tick completes immediately, skip it
@@ -571,6 +600,7 @@ pub fn spawn_batched_cache_write_task(
                                 &last_updated_at,
                                 &mut health,
                                 recovery.as_ref(),
+                                &mut recovery_pending,
                             ).await;
                         }
                         break;
@@ -589,7 +619,16 @@ pub fn spawn_batched_cache_write_task(
                             &last_updated_at,
                             &mut health,
                             recovery.as_ref(),
+                            &mut recovery_pending,
                         ).await;
+                    } else if recovery_pending
+                        && let Some(rec) = recovery.as_ref()
+                    {
+                        // A previous reopen left the accelerator on the recovering placeholder.
+                        // Retry it here, driven by the ticker rather than by new writes: the
+                        // placeholder rejects writes, so no flush would ever re-trigger this.
+                        let _guard = accelerator_write_mutex.lock().await;
+                        recovery_pending = !recover_and_log(rec, &dataset_name).await;
                     }
                 }
             }
@@ -610,6 +649,7 @@ async fn flush_cache_writes(
     last_updated_at: &Arc<AtomicI64>,
     health: &mut CacheWriteHealth,
     recovery: Option<&CachingRecovery>,
+    recovery_pending: &mut bool,
 ) {
     if buffer.is_empty() {
         return;
@@ -735,17 +775,10 @@ async fn flush_cache_writes(
             // concurrent writes, matching the invariant `DataAccelerator::rebuild_provider`
             // documents.
             let _guard = accelerator_write_mutex.lock().await;
-            match rec.recover().await {
-                Ok(()) => tracing::info!(
-                    "Dataset '{dataset_name}' accelerator reopened after a fatal error; it is \
-                     serving queries again."
-                ),
-                Err(recover_err) => tracing::error!(
-                    "Dataset '{dataset_name}' accelerator could not be reopened, so it stays \
-                     unavailable until it recovers on a later write or the process restarts. \
-                     Cause: {recover_err}."
-                ),
-            }
+            // If the reopen fails it leaves the recovering placeholder installed, which rejects
+            // every query and write — so no later flush could re-trigger recovery. Record that
+            // it is pending; the task's ticker retries it until it succeeds.
+            *recovery_pending = !recover_and_log(rec, dataset_name).await;
         }
     } else if insert_rows > 0 || upsert_rows > 0 {
         health.record_success();
