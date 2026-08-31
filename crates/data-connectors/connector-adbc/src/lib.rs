@@ -1988,6 +1988,7 @@ mod function_support_tests {
     use datafusion::common::tree_node::TreeNode;
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::{TableProvider, provider_as_source};
+    use datafusion::functions::expr_fn;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
         builder::LogicalTableSource, create_udf, expr::ScalarFunction,
@@ -1998,6 +1999,7 @@ mod function_support_tests {
     use datafusion_federation::sql::federation_analyzer_rule;
     use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan};
     use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
+    use runtime_datafusion::analyzer_rule::RegexpMatchNullCheckRewrite;
 
     use super::{AdbcTableFactoryWithPolicy, dialect_for_driver};
 
@@ -2476,6 +2478,125 @@ mod function_support_tests {
                 })
                 .expect("walk the plan"),
             "the predicate must be left for the local engine to evaluate: {analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_denies_regexp_match_in_every_shape() {
+        // BigQuery has no `regexp_match`; federating any shape of it fails
+        // remotely with `Function not found: regexp_match`, and its
+        // list-of-matches result has no faithful BigQuery rendering. The
+        // NULL-check idiom federates only through its `regexp_like` rewrite
+        // (`RegexpMatchNullCheckRewrite` runs before federation), so the raw
+        // call must always stay local.
+        let matches = expr_fn::regexp_match(col("val"), lit("^R[0-9]{2}"), None);
+        assert!(
+            !federates("bigquery", matches.clone()).await,
+            "a projected regexp_match must stay local"
+        );
+        assert!(
+            !federates("bigquery", Expr::IsNotNull(Box::new(matches))).await,
+            "an unrewritten NULL-check still carries regexp_match and must stay local"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_the_regexp_like_shapes_its_dialect_can_translate() {
+        assert!(
+            federates(
+                "bigquery",
+                expr_fn::regexp_like(col("val"), lit("^R[0-9]{2}"), None)
+            )
+            .await,
+            "the BigQuery dialect rewrites this into REGEXP_CONTAINS, so it must push down"
+        );
+        assert!(
+            federates(
+                "bigquery",
+                expr_fn::regexp_like(col("val"), lit("^r[0-9]{2}"), Some(lit("i")))
+            )
+            .await,
+            "literal ims flags fold into the pattern as an inline group"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_refuses_the_regexp_like_shapes_its_dialect_cannot_translate() {
+        for (why, expr) in [
+            (
+                "a non-literal pattern cannot be scanned for engine agreement",
+                expr_fn::regexp_like(col("val"), col("val"), None),
+            ),
+            (
+                r"\d is Unicode-aware locally and ASCII in BigQuery's RE2",
+                expr_fn::regexp_like(col("val"), lit(r"^\d+$"), None),
+            ),
+            (
+                "the U flag is unmeasured against BigQuery",
+                expr_fn::regexp_like(col("val"), lit("^r"), Some(lit("U"))),
+            ),
+            (
+                "non-literal flags cannot be folded into the pattern",
+                expr_fn::regexp_like(col("val"), lit("^r"), Some(col("val"))),
+            ),
+        ] {
+            assert!(
+                !federates("bigquery", expr).await,
+                "{why}, so the call must stay local"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrewritten_null_check_stays_above_the_federated_scan() {
+        let analyzed = federated_plan(Expr::IsNotNull(Box::new(expr_fn::regexp_match(
+            col("val"),
+            lit("^R[0-9]{2}"),
+            None,
+        ))))
+        .await;
+        assert!(
+            !is_federated_node(&analyzed),
+            "regexp_match is denied for BigQuery, so the raw NULL-check cannot federate whole: {analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_null_check_rewrite_lets_the_regexp_predicate_federate_whole() {
+        // The production sequence, in miniature: RegexpMatchNullCheckRewrite
+        // runs before the federation analyzer (see
+        // `runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder`), so by the
+        // time federation consults the deny-list the plan carries
+        // `regexp_like`, which the BigQuery dialect translates.
+        let provider = stub_table_provider(true, "bigquery").await;
+        let plan = LogicalPlanBuilder::scan("t", provider_as_source(provider), None)
+            .expect("scan the stub table")
+            .filter(Expr::IsNotNull(Box::new(expr_fn::regexp_match(
+                col("val"),
+                lit("^R[0-9]{2}"),
+                None,
+            ))))
+            .expect("filter on the match")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build the plan");
+
+        let rewritten = RegexpMatchNullCheckRewrite::new()
+            .analyze(plan, &ConfigOptions::default())
+            .expect("rewrite the NULL-check");
+        let analyzed = federation_analyzer_rule()
+            .analyze(rewritten, &ConfigOptions::default())
+            .expect("federate what can be federated");
+
+        assert!(
+            is_federated_node(&analyzed),
+            "the rewritten predicate translates, so the whole plan is one remote statement: {analyzed}"
+        );
+        assert_eq!(
+            federated_node_count(&analyzed),
+            1,
+            "one remote statement, not one per side: {analyzed}"
         );
     }
 
