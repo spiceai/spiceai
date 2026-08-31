@@ -3081,7 +3081,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_bloom_insertions")
                     .with_description(
-                        "Insertions into one Cayenne primary-key cache's bloom filters. NOT distinct keys: a bloom cannot enumerate its members, so re-upserting one key counts every time and superseded keys still count. An upper bound on the distinct live keys covered.",
+                        "Insertions into one Cayenne primary-key cache's bloom filters. NOT distinct keys: a bloom cannot enumerate its members, so re-upserting one key counts every time and superseded keys still count. An upper bound on the distinct live keys covered. Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
                     )
                     .with_unit("insertions")
                     .build()
@@ -3092,7 +3092,7 @@ pub mod cayenne {
                 operational_meter()
                     .f64_gauge("cayenne_pk_bloom_bits_per_insertion")
                     .with_description(
-                        "Bits one Cayenne primary-key cache's bloom filters allocate per INSERTION — a lower bound on the true bits per distinct key. Already above the configured target proves over-allocation; it cannot prove the absence of it.",
+                        "Bits one Cayenne primary-key cache's bloom filters allocate per INSERTION — a lower bound on the true bits per distinct key. Already above the configured target proves over-allocation; it cannot prove the absence of it. Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
                     )
                     .with_unit("bits")
                     .build()
@@ -3103,7 +3103,7 @@ pub mod cayenne {
                 operational_meter()
                     .u64_gauge("cayenne_pk_bloom_bits")
                     .with_description(
-                        "Bits one Cayenne primary-key cache's bloom filters allocate (summed across its per-shard filters).",
+                        "Bits one Cayenne primary-key cache's bloom filters allocate (summed across its per-shard filters). Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
                     )
                     .with_unit("bits")
                     .build()
