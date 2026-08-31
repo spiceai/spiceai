@@ -669,10 +669,11 @@ pub(crate) fn regexp_like_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<O
             "Failed to run this query against BigQuery: '{name}' was called in a form BigQuery \
              cannot express, so the query cannot be completed. BigQuery needs a constant pattern \
              both regular-expression engines read identically: the pattern and any flags must be \
-             literals, the only supported flags are 'i', 'm' and 's', and the pattern cannot \
-             contain a quote, a control or non-ASCII character, or the classes \\d, \\D, \\w, \
-             \\W, \\s, \\S, \\b, \\B, \\p or \\P. Use a plain constant pattern, or set \
-             'query_federation: disabled' on the dataset to evaluate it locally instead. \
+             literals, the only supported flags are 'i', 'm' and 's' (as the flags argument or \
+             an inline (?...) group), and the pattern cannot contain a quote, a control or \
+             non-ASCII character, or the classes \\d, \\D, \\w, \\W, \\s, \\S, \\b, \\B, \\p or \
+             \\P. Use a plain constant pattern, or set 'query_federation: disabled' on the \
+             dataset to evaluate it locally instead. \
              See: https://spiceai.org/docs/components/data-connectors/adbc",
             name = super::REGEXP_LIKE_NAME,
         )));
@@ -743,27 +744,37 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 ///
 /// The two are near relatives, but the differences are silent: a diverging
 /// pattern changes *which rows match*, not whether the query runs. The known
-/// divergence is Unicode — the Perl classes and word boundaries (`\d`, `\w`,
-/// `\s`, `\b` and their negations) are Unicode-aware in Rust's `regex` and
-/// ASCII-only in RE2, so `\d` matches an Arabic-Indic digit locally and not
-/// remotely, and `\p{…}`/`\P{…}` lean on each engine's Unicode tables. Rather
-/// than enumerate agreements, this accepts only patterns built from constructs
-/// with one reading: printable ASCII, with no escape of those class letters.
-/// [`tests::rusts_perl_classes_are_unicode_aware`] holds the local half of the
-/// divergence this guards against.
+/// divergences are Unicode and inline modes. The Perl classes and word
+/// boundaries (`\d`, `\w`, `\s`, `\b` and their negations) are Unicode-aware
+/// in Rust's `regex` and ASCII-only in RE2, so `\d` matches an Arabic-Indic
+/// digit locally and not remotely, and `\p{…}`/`\P{…}` lean on each engine's
+/// Unicode tables. Inline `(?…)` modifier groups carry the same hazard in
+/// mode form: Rust reads modes RE2 does not have — `(?x)a b` (extended mode)
+/// matches `ab` locally and is a syntax error remotely — so a group head is
+/// accepted only when [`group_options_are_engine_agnostic`] can read it as
+/// something both engines agree on. Rather than enumerate agreements, this
+/// accepts only patterns built from constructs with one reading: printable
+/// ASCII, with no escape of those class letters and no group options beyond
+/// `i`, `m` and `s`. [`tests::rusts_perl_classes_are_unicode_aware`] and
+/// [`tests::rust_only_inline_modes_exist`] hold the local halves of the
+/// divergences this guards against.
+///
+/// The scan does not model character classes, so a literal `(` followed by
+/// `?` inside `[…]` is over-rejected; over-rejection only costs pushdown,
+/// never a wrong row.
 ///
 /// A single quote and control characters are rejected for a different reason:
 /// the pattern is emitted as a `BigQuery` **raw** string literal (see
 /// [`raw_string`]), which a `'` would terminate and a control character has no
 /// spelling in.
 fn pattern_is_engine_agnostic(pattern: &str) -> bool {
-    let mut chars = pattern.chars();
+    let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if !c.is_ascii() || c.is_ascii_control() || c == '\'' {
             return false;
         }
-        if c == '\\' {
-            match chars.next() {
+        match c {
+            '\\' => match chars.next() {
                 // A trailing backslash is an invalid pattern; refuse rather
                 // than reason about which engine rejects it first.
                 None => return false,
@@ -778,10 +789,43 @@ fn pattern_is_engine_agnostic(pattern: &str) -> bool {
                         return false;
                     }
                 }
+            },
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if !group_options_are_engine_agnostic(&mut chars) {
+                    return false;
+                }
             }
+            _ => {}
         }
     }
     true
+}
+
+/// Reads the `…` of a `(?…` group head, accepting only what both engines
+/// agree on: `:` (a plain non-capturing group), or inline flags from
+/// `i`/`m`/`s` — optionally negated after one `-` — closed by `)` (a flag
+/// directive) or `:` (a scoped group). Everything else is refused: Rust-only
+/// modes (`x` extended, `R` CRLF, `u` Unicode toggles), `U` (deliberately
+/// refused as a flags argument, so its inline spelling must not slip
+/// through), named groups, and lookarounds. An empty directive like `(?)` is
+/// refused too — both engines reject it, and the local error is the readable
+/// one.
+fn group_options_are_engine_agnostic(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.peek() == Some(&':') {
+        chars.next();
+        return true;
+    }
+    let mut saw_flag = false;
+    let mut saw_dash = false;
+    loop {
+        match chars.next() {
+            Some('i' | 'm' | 's') => saw_flag = true,
+            Some('-') if !saw_dash => saw_dash = true,
+            Some(')' | ':') => return saw_flag,
+            _ => return false,
+        }
+    }
 }
 
 /// The flags to fold into the pattern as an inline `(?…)` group, deduplicated
@@ -1377,6 +1421,30 @@ mod tests {
                 "literal ims flags",
                 vec![col("code"), lit("^r"), lit("ims")],
             ),
+            (
+                "an inline flag directive both engines read",
+                vec![col("code"), lit("(?i)^r[0-9]{2}")],
+            ),
+            (
+                "a scoped inline flag group",
+                vec![col("code"), lit("(?im-s:foo)bar")],
+            ),
+            (
+                "a plain non-capturing group",
+                vec![col("code"), lit("(?:ab)+")],
+            ),
+            (
+                "a negated inline flag",
+                vec![col("code"), lit("(?-i)r")],
+            ),
+            (
+                "a capture group followed by a quantifier",
+                vec![col("code"), lit("(ab)?c")],
+            ),
+            (
+                "an escaped parenthesis before a question mark",
+                vec![col("code"), lit(r"\(?a")],
+            ),
         ] {
             assert!(
                 can_translate(&call(REGEXP_LIKE_NAME, args)),
@@ -1418,6 +1486,34 @@ mod tests {
                 "non-literal flags",
                 vec![col("code"), lit("^r"), col("flags")],
             ),
+            (
+                "the inline x mode, which RE2 does not have",
+                vec![col("code"), lit("(?x)a b")],
+            ),
+            (
+                "the inline U flag, refused for the same reason as the U flags argument",
+                vec![col("code"), lit("(?U)a+")],
+            ),
+            (
+                "the inline R CRLF mode, which has no RE2 counterpart",
+                vec![col("code"), lit("(?R)^a")],
+            ),
+            (
+                "an inline Unicode toggle",
+                vec![col("code"), lit("(?u)a")],
+            ),
+            (
+                "a named capture group, which the two engines spell differently",
+                vec![col("code"), lit("(?P<n>a)")],
+            ),
+            (
+                "a lookahead, which neither engine supports",
+                vec![col("code"), lit("(?=a)")],
+            ),
+            (
+                "an empty flag directive",
+                vec![col("code"), lit("(?)a")],
+            ),
         ] {
             assert!(
                 !can_translate(&call(REGEXP_LIKE_NAME, args)),
@@ -1437,6 +1533,24 @@ mod tests {
         assert!(
             digits.is_match("\u{663}\u{664}\u{665}"),
             "Rust's \\d must match Arabic-Indic digits, or the gate is pointless"
+        );
+    }
+
+    #[test]
+    fn rust_only_inline_modes_exist() {
+        // The local half of the inline-modifier divergence the gate guards
+        // against: Rust's regex reads `(?x)` (extended mode, whitespace
+        // ignored), which RE2 does not have — so `(?x)a b` matches `ab`
+        // locally and is a syntax error remotely. If Rust ever drops the
+        // mode, the group-options gate can be relaxed.
+        let extended = regex::Regex::new("(?x)a b").expect("Rust reads extended mode");
+        assert!(
+            extended.is_match("ab"),
+            "extended mode must ignore the space, or the gate guards nothing"
+        );
+        assert!(
+            !extended.is_match("a b"),
+            "in extended mode the literal space is not part of the pattern"
         );
     }
 
