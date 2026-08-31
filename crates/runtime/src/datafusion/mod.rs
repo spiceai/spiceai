@@ -4549,10 +4549,27 @@ impl DataFusion {
             initial_load_complete = true;
         }
 
-        let mut refresh = Refresh::new(RefreshMode::Full).with_retry(
+        let refresh_mode = acceleration.refresh_mode.unwrap_or(RefreshMode::Full);
+        // Views have no `DataConnector`/`append_stream` fallback (unlike datasets), so
+        // append mode always requires `time_column`. `ViewBuilder::try_from` already
+        // enforces this at config-parse time; this is a defensive re-check since that
+        // path isn't compiler-enforced for every `View` construction.
+        if refresh_mode == RefreshMode::Append && view.time_column.is_none() {
+            return Err(Error::UnableToCreateView {
+                reason: "'refresh_mode: append' requires 'time_column' to be set".to_string(),
+            });
+        }
+
+        let mut refresh = Refresh::new(refresh_mode).with_retry(
             view.refresh_retry_enabled(),
             view.refresh_retry_max_attempts(),
         );
+        if let Some(format) = view.time_format {
+            refresh = refresh.time_format(format);
+        }
+        if let Some(time_col) = &view.time_column {
+            refresh = refresh.time_column(time_col.clone());
+        }
         if let Some(refresh_check_interval) = acceleration.refresh_check_interval {
             refresh = refresh.check_interval(refresh_check_interval);
         }

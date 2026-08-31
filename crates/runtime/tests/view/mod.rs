@@ -22,7 +22,10 @@ use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
-use spicepod::component::{dataset::Dataset, view::View};
+use spicepod::component::{
+    dataset::{Dataset, TimeFormat},
+    view::View,
+};
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
@@ -853,6 +856,190 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
             );
 
             rt.shutdown().await;
+
+            Ok(())
+        })
+        .await
+}
+
+/// A pass-through (projection/filter only) view with `refresh_mode: append` should
+/// incrementally pick up newly-arrived source rows on refresh, using `time_column` to
+/// filter for rows newer than what's already in the accelerator.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn accelerated_view_append_refresh_pass_through() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let db_path = "./view_append_refresh.db";
+            if std::path::Path::new(db_path).exists() {
+                std::fs::remove_file(db_path).expect("to remove file");
+            }
+            let csv_path = "./view_append_refresh_source.csv";
+            std::fs::write(csv_path, "id,created_at\n1,1000\n2,2000\n").expect("to write CSV file");
+
+            let dataset = Dataset::new(format!("file:{csv_path}"), "append_source");
+
+            let mut view = View::new("append_view".to_string());
+            view.sql = Some("SELECT id, created_at FROM append_source WHERE id > 0".to_string());
+            view.time_column = Some("created_at".to_string());
+            view.time_format = Some(TimeFormat::UnixSeconds);
+            view.acceleration = Some(Acceleration {
+                params: get_params(&Mode::File, Some(db_path.to_string()), "duckdb"),
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Append),
+                ..Acceleration::default()
+            });
+
+            let app = app::AppBuilder::new("test_view_append_refresh_pass_through")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let row_count = |batches: &[RecordBatch]| -> usize {
+                batches.iter().map(RecordBatch::num_rows).sum()
+            };
+
+            let initial = rt
+                .datafusion()
+                .query_builder("SELECT * FROM append_view")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+            assert_eq!(
+                row_count(&initial),
+                2,
+                "expected 2 rows after the initial append-mode load"
+            );
+
+            // Append a new row to the source CSV.
+            std::fs::write(csv_path, "id,created_at\n1,1000\n2,2000\n3,3000\n")
+                .expect("to rewrite CSV file");
+
+            let notifier = rt
+                .datafusion()
+                .refresh_table(&TableReference::bare("append_view"), None)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .ok_or_else(|| anyhow::anyhow!("Failed to trigger view refresh"))?;
+            notifier.notified().await;
+
+            let after_append = rt
+                .datafusion()
+                .query_builder("SELECT * FROM append_view")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+            assert_eq!(
+                row_count(&after_append),
+                3,
+                "expected 3 rows after the append refresh picked up the new source row"
+            );
+
+            rt.shutdown().await;
+            std::fs::remove_file(csv_path).ok();
+            std::fs::remove_file(db_path).ok();
+
+            Ok(())
+        })
+        .await
+}
+
+/// `refresh_mode: append` must be rejected for a view whose query aggregates
+/// (`GROUP BY`), since a later-arriving row could change an already-appended group's
+/// value, which append mode cannot revise.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn accelerated_view_append_refresh_rejects_aggregation() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let db_path = "./view_append_refresh_aggregate.db";
+            if std::path::Path::new(db_path).exists() {
+                std::fs::remove_file(db_path).expect("to remove file");
+            }
+            let csv_path = "./view_append_refresh_aggregate_source.csv";
+            std::fs::write(csv_path, "id,created_at,category\n1,1000,a\n2,2000,b\n")
+                .expect("to write CSV file");
+
+            let dataset = Dataset::new(format!("file:{csv_path}"), "append_agg_source");
+
+            let mut view = View::new("append_agg_view".to_string());
+            view.sql = Some(
+                "SELECT category, COUNT(*) AS total, MAX(created_at) AS created_at \
+                 FROM append_agg_source GROUP BY category"
+                    .to_string(),
+            );
+            view.time_column = Some("created_at".to_string());
+            view.time_format = Some(TimeFormat::UnixSeconds);
+            view.acceleration = Some(Acceleration {
+                params: get_params(&Mode::File, Some(db_path.to_string()), "duckdb"),
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Append),
+                ..Acceleration::default()
+            });
+
+            let app = app::AppBuilder::new("test_view_append_refresh_rejects_aggregation")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let view_statuses = rt.status().get_view_statuses();
+            let view_status = view_statuses.get(&TableReference::bare("append_agg_view"));
+            if let Some(status) = view_status {
+                if !status.is_error() {
+                    return Err(anyhow::anyhow!(
+                        "Aggregating view with refresh_mode: append should be in error state, got {status:?}"
+                    ));
+                }
+            } else {
+                return Err(anyhow::anyhow!("Aggregating view status not found"));
+            }
+
+            rt.shutdown().await;
+            std::fs::remove_file(csv_path).ok();
+            std::fs::remove_file(db_path).ok();
 
             Ok(())
         })

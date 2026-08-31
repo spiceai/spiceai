@@ -3846,6 +3846,24 @@
             "null"
           ]
         },
+        "time_column": {
+          "description": "Name of the column that carries the row's time value. Lets the acceleration / warm-tier data-window logic derive time-based properties (e.g. retention) for the view, mirroring datasets. For append data this should be at least creation-based; for mutating/change data it should be at least last-updated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "description": "Encoding of `time_column`'s values (e.g. `timestamp`, `unix_seconds`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "acceleration": {
           "anyOf": [
             {
