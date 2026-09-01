@@ -89,10 +89,7 @@ zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
-# Built without `--enable-prof`, so the allocation fast path carries no sampling
-# event: jemalloc compiles `te_alloc_prof_sample` into its per-allocation event
-# registry only under `JEMALLOC_PROF`. `alloc-jemalloc-profiling` turns prof on
-# for heap investigations.
+# No `profiling` feature here: `--enable-prof` belongs to `alloc-jemalloc-profiling`.
 tikv-jemallocator = { version = "0.7.0", optional = true }
 tokio.workspace = true
 # `CancellationToken` for the latches the connection report waits on.
@@ -126,11 +123,8 @@ tempfile.workspace = true
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
-# Heap-profiling jemalloc: `--enable-prof` is what makes
-# `MALLOC_CONF=prof:true,prof_prefix=…` take effect — without it jemalloc ignores
-# those knobs silently. Reads as `jemalloc-profiling` in the startup banner and
-# the crash report, because a profiling build is not throughput-comparable with
-# a plain `alloc-jemalloc` one.
+# Builds jemalloc with `--enable-prof`, without which `MALLOC_CONF=prof:true,…`
+# is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
 alloc-jemalloc-profiling = ["alloc-jemalloc", "tikv-jemallocator/profiling"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []

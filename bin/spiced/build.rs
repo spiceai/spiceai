@@ -78,8 +78,7 @@ fn build_features() -> String {
     let enabled: Vec<&str> = distinguishing
         .into_iter()
         .filter(|feature| {
-            // Cargo uppercases the feature name and maps `-` to `_`, so a hyphenated
-            // feature is never found under its own spelling.
+            // Cargo uppercases the feature name and maps `-` to `_`.
             let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
             std::env::var_os(var).is_some()
         })
