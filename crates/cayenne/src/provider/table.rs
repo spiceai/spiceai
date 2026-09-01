@@ -22139,7 +22139,24 @@ impl CayenneTableProvider {
 
         self.mark_maintained_aggregates_stale();
 
-        let filters = self.retention_filters.clone();
+        // Fold `now()` before the predicate reaches physical planning: `create_physical_expr`
+        // never runs `ExprSimplifier`, and `NowFunc::invoke` is an unconditional error, so an
+        // unsimplified `retention_sql` predicate fails the whole pass. This has to happen per
+        // pass rather than at table open, where `retention_filters` is parsed — folding once
+        // at open would freeze the cutoff for the process lifetime. Simplifying the set
+        // through one context keeps a single `now()` across every filter, the way the
+        // runtime-level retention check does for the accelerators that use it.
+        let filters = util::expr::coerce_and_simplify_exprs(
+            self.retention_filters.iter().cloned(),
+            &self.table_schema(),
+        )
+        .map_err(|err| CatalogError::InvalidOperation {
+            message: format!(
+                "Failed to apply the retention policy to accelerated dataset '{}', so rows matching `retention_sql` are still queryable. See: https://spiceai.org/docs/components/data-accelerators",
+                self.table_metadata.table_name
+            ),
+            source: Box::new(err),
+        })?;
         // Composed through the shared builder rather than hand-rolled, so retention gets
         // the same sink a user `DELETE` does: protected-snapshot and cold-tier listings
         // for reach, and — decisively — the visibility-filtered scan those listings make
