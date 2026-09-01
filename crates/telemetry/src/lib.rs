@@ -2629,30 +2629,6 @@ pub mod cayenne {
             .record(bytes, dimensions);
     }
 
-    static METASTORE_FREELIST_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
-
-    /// Records the bytes held on the metastore's `SQLite` freelist — pages that
-    /// are free inside the database file but, under the default
-    /// `auto_vacuum: none`, are never returned to the OS. `dimensions` carries
-    /// `catalog`.
-    ///
-    /// This is the part of `cayenne_metastore_db_bytes` that churn has already
-    /// released; a large freelist against a flat live row count is what
-    /// `auto_vacuum: incremental` would give back.
-    pub fn track_metastore_freelist_bytes(bytes: u64, dimensions: &[KeyValue]) {
-        METASTORE_FREELIST_BYTES
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_metastore_freelist_bytes")
-                    .with_description(
-                        "Bytes on the Cayenne metastore SQLite freelist — free inside the database file, and under the default `auto_vacuum: none` never returned to the OS.",
-                    )
-                    .with_unit("By")
-                    .build()
-            })
-            .record(bytes, dimensions);
-    }
-
     // ───────────────── Cayenne primary-key index observability ─────────────────
     //
     // The PK existence index is the structure an upsert-heavy CDC apply leans on
@@ -2666,31 +2642,6 @@ pub mod cayenne {
     // distinguishes a genuine invalidation from a checkout-time guard firing on
     // indexes that needed no invalidating. If these are ever trimmed for
     // cardinality, keep `site`.
-
-    static METASTORE_TABLE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
-
-    /// Records the bytes one metastore table (plus its indexes) occupies inside
-    /// the database file. `dimensions` carries `catalog` and `metastore_table`.
-    ///
-    /// This is the attribution `cayenne_metastore_db_bytes` cannot give: the file
-    /// total says the metastore is growing, this says which table is growing it.
-    /// Divided by that table's total row count and multiplied by one dataset
-    /// table's `cayenne_metastore_table_rows`, it also estimates a single
-    /// dataset's share — an estimate, because pages are shared between the rows
-    /// of every table in the catalog and cannot be attributed exactly.
-    pub fn track_metastore_table_bytes(bytes: u64, dimensions: &[KeyValue]) {
-        METASTORE_TABLE_BYTES
-            .get_or_init(|| {
-                operational_meter()
-                    .u64_gauge("cayenne_metastore_table_bytes")
-                    .with_description(
-                        "Bytes one Cayenne metastore table and its indexes occupy inside the database file — the per-table attribution of `cayenne_metastore_db_bytes`.",
-                    )
-                    .with_unit("By")
-                    .build()
-            })
-            .record(bytes, dimensions);
-    }
 
     /// What one Cayenne table's data directory actually holds on disk, by file
     /// role.

@@ -431,10 +431,6 @@ const EXPECTED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_data_dir_snapshot_dirs",
     "cayenne_metastore_db_bytes",
     "cayenne_metastore_wal_bytes",
-    "cayenne_metastore_freelist_bytes",
-    // `dbstat` is an optional SQLite module. The vendored build has it, so its
-    // absence here is a real regression rather than a portability caveat.
-    "cayenne_metastore_table_bytes",
     "cayenne_autotune_bake_deletion_index_trigger",
     // Zeroed rather than skipped while the index is exact, which is what makes
     // them readable against `cayenne_pk_index_format` instead of retaining a
