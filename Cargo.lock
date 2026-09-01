@@ -17762,6 +17762,7 @@ dependencies = [
 name = "runtime-resources"
 version = "2.2.1"
 dependencies = [
+ "mach2",
  "parking_lot",
  "sysinfo 0.38.4",
  "telemetry",

@@ -442,6 +442,37 @@ pub fn register_cayenne_telemetry() {
         })
         .build();
 
+    // --- Process-global primary-key keyset byte budget ---
+    // The per-table ceiling (`cayenne_pk_index_budget_bytes`) is derived from
+    // host memory with no view of sibling tables, so several tables can each
+    // believe they may hold gigabytes. This is the aggregate that actually binds:
+    // a table whose index refuses to grow because the FLEET is exhausted looks,
+    // in every per-table gauge, exactly like a table that is simply small.
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_used_bytes")
+        .with_description(
+            "Currently-reserved bytes across all Cayenne primary-key keyset caches; at the total, a table's exact keyset degrades to a bloom instead of growing.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(used) = cayenne::global_pk_keyset_used() {
+                obs.observe(used, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_total_bytes")
+        .with_description(
+            "Total byte ceiling of the process-global Cayenne primary-key keyset budget.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(total) = cayenne::global_pk_keyset_total() {
+                obs.observe(total, &[]);
+            }
+        })
+        .build();
+
     // --- Fleet-wide compaction semaphore ---
     let _ = meter
         .u64_observable_gauge("cayenne_compaction_permits_available")

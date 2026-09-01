@@ -87,6 +87,7 @@ pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
 pub(crate) mod maintenance;
+pub(crate) mod maintenance_metrics;
 pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;

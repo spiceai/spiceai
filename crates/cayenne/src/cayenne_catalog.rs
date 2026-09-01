@@ -20,7 +20,7 @@ use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSeque
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
     InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics,
+    TableMetadata, TableStatistics, TableStorageStats,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -124,6 +124,112 @@ impl MetastoreImpl {
             MetastoreImpl::Sqlite(m) => m.query_row(params, f).await,
             #[cfg(feature = "turso")]
             MetastoreImpl::Turso(m) => m.query_row(params, f).await,
+        }
+    }
+
+    /// Whether a failed observability query means the backend cannot answer it
+    /// at all, as opposed to a transient failure.
+    ///
+    /// `dbstat` is an optional `SQLite` compile-time module and the pragma
+    /// functions are a build option, so a backend lacking either reports "no
+    /// such table/module/function" for every call, forever. That is worth
+    /// degrading quietly. Everything else — a busy database, a closed pool, an
+    /// I/O error — must surface as an error, or the sampling gate treats the
+    /// sample as taken and stops asking for the rest of its interval while the
+    /// gauge holds a fabricated value.
+    fn is_unsupported_by_backend(error: &CatalogError) -> bool {
+        let message = error.to_string();
+        ["no such table", "no such module", "no such function"]
+            .iter()
+            .any(|signature| message.contains(signature))
+    }
+
+    /// Bytes held on the metastore's free page list.
+    ///
+    /// `freelist_count * page_size`: pages that are free inside the database
+    /// file and, under the default `auto_vacuum: none`, reused rather than
+    /// returned to the OS. This is the share of the file's size that churn has
+    /// already released, so a large value against a flat live row count is what
+    /// `auto_vacuum: incremental` would give back.
+    ///
+    /// `Ok(None)` on a backend without the pragma functions — a permanent state,
+    /// so the caller records nothing and stops asking. A transient failure is an
+    /// `Err`, because reporting zero free pages from a failed query would claim
+    /// the churn already released was reclaimed.
+    pub(crate) async fn freelist_bytes(&self) -> CatalogResult<Option<u64>> {
+        // One round trip: two `PRAGMA` statements would each acquire a pooled
+        // connection and hop to its thread for a single integer, and `page_size`
+        // is immutable for the life of the database anyway.
+        let bytes = self
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT (SELECT freelist_count FROM pragma_freelist_count()) \
+                          * (SELECT page_size FROM pragma_page_size())",
+                    params: Vec::new(),
+                },
+                |row| row.get_i64(0),
+            )
+            .await;
+
+        match bytes {
+            Ok(bytes) => Ok(Some(u64::try_from(bytes).unwrap_or(0))),
+            Err(error) if Self::is_unsupported_by_backend(&error) => {
+                tracing::debug!(
+                    %error,
+                    "Cayenne metastore free-page accounting is unavailable on this backend (no `pragma_freelist_count`); reporting the database total only"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Bytes each metastore table occupies inside the database file, indexes
+    /// folded into the table they belong to.
+    ///
+    /// `dbstat` reports one row per B-tree, so an index appears under its own
+    /// name; the join to `sqlite_master` attributes it to its table, because an
+    /// index's pages are that table's footprint and splitting them out would
+    /// under-report every table that carries one.
+    ///
+    /// `Ok(None)` on a backend built without `dbstat` — a permanent state, so the
+    /// caller records nothing and stops asking. A transient failure is an `Err`
+    /// rather than an empty attribution, which would read as every metastore
+    /// table occupying no space.
+    pub(crate) async fn table_bytes(&self) -> CatalogResult<Option<Vec<(String, i64)>>> {
+        let rows = self
+            .query_helper(
+                QueryParams {
+                    // `dbstat('main', 1)` is AGGREGATE mode: one row per B-tree
+                    // rather than one per page. `dbstat` walks every page either
+                    // way, so the saving is the vtab round trips — measured at
+                    // 260ms -> 150ms on a 405 MB metastore, and this cost scales
+                    // with database size rather than table count. Available since
+                    // SQLite 3.31; the error path below declines on a backend
+                    // that lacks it.
+                    sql: r"
+                    SELECT COALESCE(m.tbl_name, d.name) AS owner, SUM(d.pgsize)
+                    FROM dbstat('main', 1) d
+                    LEFT JOIN sqlite_master m ON m.name = d.name
+                    WHERE owner LIKE 'cayenne_%'
+                    GROUP BY owner
+                    ",
+                    params: Vec::new(),
+                },
+                |row| Ok((row.get_string(0)?, row.get_i64(1)?)),
+            )
+            .await;
+
+        match rows {
+            Ok(rows) => Ok(Some(rows)),
+            Err(error) if Self::is_unsupported_by_backend(&error) => {
+                tracing::debug!(
+                    %error,
+                    "Cayenne metastore per-table byte accounting is unavailable (SQLite `dbstat` not present); reporting the database total only"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -4165,6 +4271,168 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
+        // ONE statement, deliberately. A row moves BETWEEN these tiers — an
+        // inline checkpoint drains level-0 into a Vortex file and a manifest row,
+        // a compaction retires manifest rows — and each of those commits is a
+        // single metastore transaction. Read as two queries, the sample could
+        // take its inline half before such a commit and its manifest half after,
+        // publishing the same rows twice (or, in the other order, neither), and
+        // that wrong value would stand until the next throttled sample. Two
+        // queries can also land on two pooled connections, so they need not even
+        // agree on a snapshot. A single statement runs in one implicit read
+        // transaction, so every tier below is read as of one instant.
+        //
+        // A snapshot is LIVE when it is the table's `current_snapshot_id` or it
+        // carries a registered sequence. Rows naming anything else are
+        // unreachable: no scan can reach them, and they persist until a
+        // compaction or overwrite prunes the manifest.
+        //
+        // PATHNAMES, not inodes. `file_path` is a bare filename resolved
+        // against its OWN row's snapshot directory (see
+        // `manifest_partitioned_files`), so the same filename under two
+        // snapshots is two distinct paths, and every live manifest row
+        // contributes. Merging by bare filename would fuse unrelated files and
+        // under-report the table; grouping by `(snapshot_id, file_path)` is the
+        // manifest's own primary key, so a plain per-row sum is already
+        // duplicate-free.
+        //
+        // What a pathname sum does NOT give is physical bytes: subset compaction
+        // carries an unpicked file into the new snapshot's directory with a hard
+        // link, so two live snapshots can name one inode and each is counted.
+        // That matches `cayenne_data_dir_bytes`, which walks the filesystem the
+        // same way, and it is the right figure for "what the manifest describes".
+        // `cayenne_maintenance_reclaimed_bytes_total` is the physical
+        // counterpart: it only counts a file whose last link it removed.
+        //
+        // The non-manifest tiers are cross-joined derived tables rather than one
+        // scalar subquery per COLUMN: three of those aggregates read
+        // `cayenne_delete_file` with the same predicate, three read
+        // `cayenne_cold_tier_file`, and as separate subqueries each would be its
+        // own index scan. Measured 55ms -> 35ms on a metastore with 50k delete
+        // files and 100k cold-tier files.
+        //
+        // `cayenne_insert_record` keys `table_id` as the raw UUID bytes, so it
+        // takes its own parameter rather than the text id every other table
+        // stores.
+        let stats = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: r"
+                    WITH live AS (
+                        SELECT
+                            CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN 1 ELSE 0 END AS in_current,
+                            sf.file_size_bytes,
+                            sf.row_count
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                          AND (sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL)
+                    ),
+                    rows_total AS (
+                        SELECT
+                            COUNT(*) AS all_rows,
+                            COALESCE(SUM(CASE
+                                WHEN sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL
+                                THEN 1 ELSE 0
+                            END), 0) AS reachable_rows
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                    )
+                    SELECT
+                        COALESCE((SELECT SUM(in_current) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN row_count ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN 1 ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN row_count ELSE 0 END) FROM live), 0),
+                        (SELECT all_rows FROM rows_total),
+                        (SELECT reachable_rows FROM rows_total),
+                        df.n, df.bytes, df.deletes,
+                        ctf.n, ctf.bytes, ctf.row_total,
+                        (SELECT COUNT(*) FROM cayenne_snapshot_sequence WHERE table_id = ?1),
+                        (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
+                        (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
+                        idt.n, idt.row_total, idt.bytes,
+                        idl.n, idl.deletes
+                    FROM
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_delete_file WHERE table_id = ?1) df,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(row_count), 0) AS row_total
+                         FROM cayenne_cold_tier_file WHERE table_id = ?1) ctf,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(record_count), 0) AS row_total,
+                                COALESCE(SUM(LENGTH(data_ipc)), 0) AS bytes
+                         FROM cayenne_inlined_data WHERE table_id = ?1) idt,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_inlined_delete WHERE table_id = ?1) idl
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        insert_record_table_id_value(table_id),
+                    ],
+                },
+                |row| {
+                    let manifest_rows = row.get_i64(6)?;
+                    let reachable_manifest_rows = row.get_i64(7)?;
+                    Ok(TableStorageStats {
+                        current_files: row.get_i64(0)?,
+                        current_bytes: row.get_i64(1)?,
+                        current_rows: row.get_i64(2)?,
+                        protected_files: row.get_i64(3)?,
+                        protected_bytes: row.get_i64(4)?,
+                        protected_rows: row.get_i64(5)?,
+                        // Both counts come from the same statement, hence the
+                        // same snapshot, so the difference cannot be negative.
+                        // The clamp is what keeps that true if the query is ever
+                        // split again.
+                        unreachable_manifest_rows: (manifest_rows - reachable_manifest_rows).max(0),
+                        reachable_manifest_rows,
+                        delete_files: row.get_i64(8)?,
+                        delete_file_bytes: row.get_i64(9)?,
+                        delete_file_tombstones: row.get_i64(10)?,
+                        cold_files: row.get_i64(11)?,
+                        cold_bytes: row.get_i64(12)?,
+                        cold_rows: row.get_i64(13)?,
+                        snapshot_sequences: row.get_i64(14)?,
+                        file_statistics_rows: row.get_i64(15)?,
+                        insert_records: row.get_i64(16)?,
+                        inlined_entries: row.get_i64(17)?,
+                        inlined_rows: row.get_i64(18)?,
+                        inlined_bytes: row.get_i64(19)?,
+                        inlined_delete_entries: row.get_i64(20)?,
+                        inlined_delete_rows: row.get_i64(21)?,
+                    })
+                },
+            )
+            .await?;
+
+        Ok(stats)
+    }
+
+    fn metastore_label(&self) -> String {
+        self.db_path().to_string()
+    }
+
+    async fn metastore_table_bytes(&self) -> CatalogResult<Option<Vec<(String, i64)>>> {
+        self.metastore.table_bytes().await
+    }
+
+    async fn metastore_freelist_bytes(&self) -> CatalogResult<Option<u64>> {
+        self.metastore.freelist_bytes().await
+    }
+
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
@@ -5402,6 +5670,40 @@ fn log_configuration_differences(
 
 #[cfg(test)]
 mod tests {
+    /// The freelist and `dbstat` samples degrade quietly only for a backend that
+    /// will never answer. Misclassifying a transient failure as unsupported is
+    /// what publishes a fabricated zero and then advances the sampling gate, so
+    /// the classifier's exact reach is worth pinning.
+    #[test]
+    fn only_a_missing_backend_feature_counts_as_unsupported() {
+        let db = |message: &str| CatalogError::Database {
+            message: message.to_string(),
+        };
+
+        for message in [
+            "no such table: pragma_freelist_count",
+            "no such module: dbstat",
+            "no such function: pragma_page_size",
+        ] {
+            assert!(
+                MetastoreImpl::is_unsupported_by_backend(&db(message)),
+                "a missing backend feature must degrade quietly: {message}"
+            );
+        }
+
+        for message in [
+            "database is locked",
+            "disk I/O error",
+            "attempt to write a readonly database",
+            "interrupted",
+        ] {
+            assert!(
+                !MetastoreImpl::is_unsupported_by_backend(&db(message)),
+                "a transient failure must surface as an error, not a zero: {message}"
+            );
+        }
+    }
+
     use super::*;
     use crate::metadata::DeletionType;
     use std::sync::Arc;
@@ -8118,6 +8420,191 @@ mod tests {
             .expect("read preserved manifest");
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].file_path, old.file_path);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// The footprint sample's whole value rests on the reachability split: a
+    /// manifest row naming a dead snapshot is metastore weight no query can use,
+    /// and a sample that counts it as live reports a table far larger than the
+    /// one that exists.
+    ///
+    /// The negative control here is the third snapshot: it has a manifest row but
+    /// no `cayenne_snapshot_sequence` entry and is not the current snapshot, so
+    /// if the query resolved reachability by anything other than those two
+    /// sources it would land in `protected_*` and this assertion would fail.
+    #[tokio::test]
+    async fn table_storage_stats_splits_live_snapshots_from_dead_manifest_rows() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_table_storage_stats_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "storage_stats".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let current_snapshot_id = catalog
+            .get_table("storage_stats")
+            .await
+            .expect("get table")
+            .current_snapshot_id;
+
+        let protected_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let dead_snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7)
+            .await
+            .expect("register the protected snapshot");
+
+        let row = |snapshot_id: &str, file: &str, rows: i64, bytes: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: file.to_string(),
+            row_count: rows,
+            file_size_bytes: bytes,
+            min_sequence: 1,
+            max_sequence: 1,
+            digest: None,
+        };
+        for file in [
+            row(&current_snapshot_id, "c0.vortex", 10, 100),
+            row(&current_snapshot_id, "c1.vortex", 20, 200),
+            row(&protected_snapshot_id, "p0.vortex", 30, 300),
+            // The same FILENAME under a second live snapshot. `file_path` is
+            // resolved against its own row's snapshot directory, so this is a
+            // second path — one that subset compaction typically hard-links to
+            // the first row's inode. Two live paths; the bytes behind them may
+            // be shared.
+            row(&protected_snapshot_id, "c0.vortex", 10, 100),
+            row(&dead_snapshot_id, "d0.vortex", 40, 400),
+            row(&dead_snapshot_id, "d1.vortex", 50, 500),
+        ] {
+            catalog
+                .upsert_snapshot_file(&file)
+                .await
+                .expect("seed manifest row");
+        }
+
+        catalog
+            .add_delete_file(DeleteFile {
+                delete_file_id: String::new(),
+                table_id: table_id.clone(),
+                source_data_file_path: None,
+                path: "/tmp/storage_stats_dv.arrow".to_string(),
+                path_is_relative: false,
+                format: "arrow".to_string(),
+                delete_count: 9,
+                file_size_bytes: 640,
+                deletion_type: DeletionType::default(),
+                sequence_number: 3,
+                reinsert_sequence: None,
+            })
+            .await
+            .expect("add delete file");
+
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("sample storage stats");
+
+        assert_eq!(stats.current_files, 2, "current-snapshot file count");
+        assert_eq!(stats.current_bytes, 300, "current-snapshot bytes");
+        assert_eq!(stats.current_rows, 30, "current-snapshot rows");
+        // The protected snapshot names `p0.vortex` AND its own `c0.vortex`. The
+        // second is a distinct path — `file_path` is resolved against its own
+        // snapshot's directory — so both count. Merging the two `c0.vortex` rows
+        // by filename would fuse two paths that the loader treats as separate
+        // files and under-report the table.
+        assert_eq!(
+            stats.protected_files, 2,
+            "a filename repeated under a second snapshot is a second path"
+        );
+        assert_eq!(stats.protected_bytes, 400, "300 (p0) + 100 (its own c0)");
+        assert_eq!(stats.protected_rows, 40);
+        assert_eq!(
+            stats.live_data_bytes(),
+            700,
+            "100 + 200 (current) + 300 + 100 (protected) = 700 — every live path, \
+             which is also how `cayenne_data_dir_bytes` walks the filesystem"
+        );
+        assert_eq!(
+            stats.unreachable_manifest_rows, 2,
+            "the dead snapshot's rows must not be counted as live"
+        );
+        // The tiers partition the live manifest rows, so their file counts sum
+        // to the reachable row count exactly.
+        assert_eq!(stats.reachable_manifest_rows, 4);
+        assert_eq!(
+            stats.current_files + stats.protected_files,
+            stats.reachable_manifest_rows,
+            "the tiers must partition the live rows, not overlap or drop any"
+        );
+        assert_eq!(stats.snapshot_sequences, 1);
+        assert_eq!(stats.delete_files, 1);
+        assert_eq!(stats.delete_file_bytes, 640);
+        assert_eq!(stats.delete_file_tombstones, 9);
+        assert_eq!(stats.cold_files, 0);
+        assert_eq!(stats.inlined_entries, 0);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A table whose metastore rows are all absent must report zeroes, not fail:
+    /// the aggregate query joins through `cayenne_table`, and a join that yields
+    /// no rows still has to produce one all-zero result row for the gauges.
+    #[tokio::test]
+    async fn table_storage_stats_of_an_untouched_table_is_all_zero() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_table_storage_stats_empty_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "storage_stats_empty".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("sample storage stats for an empty table");
+        assert_eq!(stats, crate::metadata::TableStorageStats::default());
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
