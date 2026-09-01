@@ -874,6 +874,17 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
+/// Applies the `adbc.` prefix a driver-option key takes when it is written without
+/// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
+/// option, so anything matching on a key has to agree on the spelling.
+fn normalize_driver_option_key(key: &str) -> String {
+    if key.starts_with("adbc.") {
+        key.to_string()
+    } else {
+        format!("adbc.{key}")
+    }
+}
+
 pub(crate) fn build_db_options(
     uri: &str,
     username: Option<&str>,
@@ -899,12 +910,10 @@ pub(crate) fn build_db_options(
                     tracing::warn!("Ignoring ADBC driver option with empty key");
                     continue;
                 }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
+                opts.push((
+                    OptionDatabase::Other(normalize_driver_option_key(key)),
+                    value.trim().into(),
+                ));
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
             }
@@ -1166,8 +1175,9 @@ struct JoinIdentity<'a> {
     schema: Option<&'a str>,
 }
 
-/// The `BigQuery` driver option naming the dataset a connection defaults to.
-const BIGQUERY_DATASET_OPTION: &str = "adbc.bigquery.sql.dataset_id=";
+/// The `BigQuery` driver option naming the dataset a connection defaults to, in the
+/// normalized spelling [`normalize_driver_option_key`] produces.
+const BIGQUERY_DATASET_OPTION: &str = "adbc.bigquery.sql.dataset_id";
 
 /// Strips the default dataset out of the driver options for identity purposes,
 /// but only when the emitted SQL will name the dataset itself.
@@ -1199,7 +1209,16 @@ fn driver_options_for_identity(
     Some(
         options
             .split(';')
-            .filter(|option| !option.trim_start().starts_with(BIGQUERY_DATASET_OPTION))
+            .filter(|option| {
+                // Match the key the way the driver will receive it, not the way it
+                // happens to be written: the prefix is optional and the separator
+                // may be padded.
+                option
+                    .split_once('=')
+                    .map(|(key, _)| normalize_driver_option_key(key.trim()))
+                    .as_deref()
+                    != Some(BIGQUERY_DATASET_OPTION)
+            })
             .collect::<Vec<_>>()
             .join(";"),
     )
@@ -1906,6 +1925,22 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
             "bare table references resolve against the connection's dataset, so two \
              connections defaulting to different datasets must not share a join context"
         );
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_matches_every_spelling_of_the_key() {
+        for written in [
+            "adbc.bigquery.sql.dataset_id=ds_a",
+            "bigquery.sql.dataset_id=ds_a",
+            " adbc.bigquery.sql.dataset_id = ds_a ",
+        ] {
+            let options = format!("{written};adbc.bigquery.sql.project_id=proj");
+            assert_eq!(
+                driver_options_for_identity("bigquery", true, Some(&options)).as_deref(),
+                Some("adbc.bigquery.sql.project_id=proj"),
+                "the dataset option was not recognised written as `{written}`"
+            );
+        }
     }
 
     #[test]
