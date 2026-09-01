@@ -4838,6 +4838,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
+ "wiremock",
 ]
 
 [[package]]
