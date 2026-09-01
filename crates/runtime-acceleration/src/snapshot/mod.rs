@@ -2423,6 +2423,45 @@ impl SnapshotManager {
             // Always update engine to match the current engine
             dataset_entry.engine = Some(engine_str);
 
+            // Metadata written before recorded schemas were conformed keeps the invalid
+            // declaration in the *published* JSON. `to_schema_ref` repairs what this process
+            // reads, but the repaired form then compares equal to the live accelerator schema,
+            // so the evolution arm below writes no new version and nothing ever rewrites what
+            // the next reader downloads. Repaired in place, under the same schema id: a
+            // declaration the Arrow layout forbids was never a different schema, so correcting
+            // it is not a schema change and must not mint a version.
+            for recorded in &mut dataset_entry.schemas {
+                let raw = match serde_json::from_value::<Schema>(recorded.schema.clone()) {
+                    Ok(raw) => Arc::new(raw),
+                    // A recorded version this build cannot parse is left as it is; the paths
+                    // that actually read one report the failure with the dataset named.
+                    Err(source) => {
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            schema_id = recorded.schema_id,
+                            "snapshot upload: left recorded schema {} of dataset '{dataset_name}' unchanged, it could not be read: {source}",
+                            recorded.schema_id
+                        );
+                        continue;
+                    }
+                };
+                let conformed = conforming_schema(Arc::clone(&raw));
+                if !Arc::ptr_eq(&raw, &conformed) {
+                    recorded.schema = serde_json::to_value(&conformed).map_err(|source| {
+                        SnapshotUploadError::UploadSchemaSerialize {
+                            dataset: dataset_name.clone(),
+                            source,
+                        }
+                    })?;
+                    tracing::info!(
+                        dataset = %dataset_name,
+                        schema_id = recorded.schema_id,
+                        "snapshot upload: recorded schema {} of dataset '{dataset_name}' declared a MAP's `entries` field nullable, which the Arrow layout forbids and no accelerator can hold; rewrote it in place so restoring this snapshot no longer reports a schema mismatch",
+                        recorded.schema_id
+                    );
+                }
+            }
+
             if dataset_entry.schemas.is_empty() {
                 let schema_metadata = SchemaMetadata::from_schema(0, schema).map_err(|source| {
                     SnapshotUploadError::UploadSchemaSerialize {
@@ -6815,6 +6854,90 @@ mod tests {
         assert!(
             !declares_nullable_entries(&restored),
             "a checkpoint written before schemas were conformed must not be handed back as-is"
+        );
+    }
+
+    /// A snapshot written before recorded schemas were conformed keeps the invalid declaration
+    /// in its *published* JSON. Reading repairs what this process sees, but the next upload
+    /// finds the conformed form equal to the live schema and writes no new schema version — so
+    /// nothing ever rewrites what the next reader downloads.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn uploading_over_legacy_metadata_repairs_the_published_schema() {
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+        write_sample_local_db(&local_path, &AccelerationEngine::DuckDB);
+
+        // The accelerator's own schema conforms — it is the only form it can hold.
+        let forbidden = nullable_map_entries_schema();
+        let live_schema = conforming_schema(Arc::clone(&forbidden));
+
+        // Metadata written by an older build, carrying the declaration verbatim.
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                engine: Some(AccelerationEngine::DuckDB.to_string()),
+                schemas: vec![legacy_recorded_schema(0, &forbidden)],
+                current_schema_id: 0,
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            &live_schema,
+            false,
+        );
+        let mutex = Arc::new(Mutex::new(()));
+        manager
+            .create_snapshot(
+                &live_schema,
+                mutex.lock_owned().await,
+                None,
+                None,
+                ForceCreate(true),
+            )
+            .await
+            .expect("create snapshot");
+
+        let published: SnapshotMetadata = serde_json::from_slice(
+            &store
+                .get(&metadata_path)
+                .await
+                .expect("metadata stored")
+                .bytes()
+                .await
+                .expect("read metadata"),
+        )
+        .expect("parse metadata");
+        let dataset = published
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset metadata present");
+
+        assert_eq!(
+            dataset.schemas.len(),
+            1,
+            "repairing the declaration is not a schema change and must not mint a new version"
+        );
+        let raw: Schema = serde_json::from_value(
+            dataset
+                .current_schema()
+                .expect("current schema")
+                .schema
+                .clone(),
+        )
+        .expect("published schema");
+        assert!(
+            !declares_nullable_entries(&raw),
+            "the published snapshot metadata must not keep a Map declaration MapArray::try_new refuses"
         );
     }
 }
