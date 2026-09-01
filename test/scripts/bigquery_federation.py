@@ -467,6 +467,10 @@ def main() -> int:
         (output / "setup.sql").write_text(setup, encoding="utf-8")
         setup_job = client.query(setup, location=location)
         setup_job.result()
+        # The setup job references both datasets, so it matches the same predicates
+        # the job census uses. A scenario's window opens five seconds before its
+        # query, which a fast startup could stretch back over this job.
+        harness_jobs = {setup_job.job_id}
         print(f"setup_job={setup_job.job_id} datasets={project}.{{{core},{ledger}}} location={location}")
 
         pod = spicepod(project, core, ledger, driver)
@@ -580,9 +584,9 @@ def main() -> int:
             control = [
                 {key: value for key, value in dict(row).items()} for row in control_job.result()
             ]
-            # This credential is spiced's too, so the control and the job-log reads
-            # would otherwise show up as jobs spiced ran.
-            harness_jobs = {control_job.job_id}
+            # This credential is spiced's too, so the harness's own queries would
+            # otherwise show up as jobs spiced ran.
+            harness_jobs.add(control_job.job_id)
 
             # JOBS_BY_USER lags job creation, so poll until it stops growing.
             observed: list[dict[str, Any]] = []
