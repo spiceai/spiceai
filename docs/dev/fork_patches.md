@@ -184,14 +184,14 @@ catch.
 |---|---|---|---|
 | Unparser: a `fetch` pushed into a join input keeps its own scope (fork PR #197) | The remote engine is asked for the whole table and the join is evaluated over it — more rows than the plan ([#12406](https://github.com/spiceai/spiceai/issues/12406)) | silent (wrong data) | `crates/data_components/src/federation.rs::a_fetch_pushed_into_a_join_input_survives_unparsing` |
 | Unparser: a `Filter` above a `Limit` keeps the limit scoped (fork PR #198) | SQL evaluates `WHERE` before `LIMIT`, so the limit selects from filtered rows instead of bounding them ([#12591](https://github.com/spiceai/spiceai/issues/12591)) | silent (wrong data) | `…::a_filter_above_a_limit_keeps_the_limit_scoped` |
-| Unparser: `ORDER BY` kept out of a derived table when the sort key is computed (fork PR #191) | The ordering is emitted inside a derived table, which SQL does not require the outer query to preserve — rows come back in any order | silent (wrong order) | **GAP** |
-| Unparser: a stacked aggregate is unparsed as a derived table (fork PR #192) | An aggregate over an aggregate is flattened into one query, changing the grouping | silent (wrong data) | **GAP** |
-| Unparser: a bounded `EXISTS` build side is scoped, so its limit selects rows (fork PR #201) | The limit binds to the correlated subquery rather than the build side, so the `EXISTS` matches rows it should not | silent (wrong data) | **GAP** |
-| Unparser: refuse an `EXISTS` bound that cannot be scoped, rather than emit wrong rows (fork PR #205) | The unparser silently emits SQL that returns wrong rows for the shapes it cannot scope ([#13277](https://github.com/spiceai/spiceai/issues/13277)) | silent (wrong data) | **GAP** |
-| Unparser: name a derived table's unnamed outputs (fork PR #206) | A derived table with an unnamed output column produces SQL the remote engine rejects, or binds the wrong column ([#12751](https://github.com/spiceai/spiceai/issues/12751)) | silent (wrong data / query failure) | **GAP** |
+| Unparser: `ORDER BY` kept out of a derived table when the sort key is computed (fork PR #191) | The ordering is emitted inside a derived table, which SQL does not require the outer query to preserve — rows come back in any order | silent (wrong order) | `…::a_computed_sort_key_keeps_order_by_at_the_top_level` |
+| Unparser: a stacked aggregate is unparsed as a derived table (fork PR #192) | An aggregate over an aggregate is flattened into one query, changing the grouping | silent (wrong data) | `…::a_stacked_aggregate_keeps_its_inner_group_by`, `…::a_grouped_stacked_aggregate_binds_its_outer_clauses_through_the_derived_scope` |
+| Unparser: a bounded `EXISTS` build side is scoped, so its limit selects rows (fork PR #201) | The limit binds to the correlated subquery rather than the build side, so the `EXISTS` matches rows it should not | silent (wrong data) | `…::a_bounded_exists_build_side_is_scoped_outside_the_correlation`, `…::an_offset_only_exists_build_side_is_scoped_outside_the_correlation`, `…::an_unbounded_exists_build_side_is_left_unscoped` |
+| Unparser: refuse an `EXISTS` bound that cannot be scoped, rather than emit wrong rows (fork PR #205) | The unparser silently emits SQL that returns wrong rows for the shapes it cannot scope ([#13277](https://github.com/spiceai/spiceai/issues/13277)) | silent (wrong data) | `…::a_bounded_exists_refuses_a_correlation_naming_two_build_inputs`, `…::a_bounded_exists_refuses_a_correlation_qualified_by_the_probe` |
+| Unparser: name a derived table's unnamed outputs (fork PR #206) | A derived table with an unnamed output column produces SQL the remote engine rejects, or binds the wrong column ([#12751](https://github.com/spiceai/spiceai/issues/12751)) | silent (wrong data / query failure) | `…::a_derived_tables_unnamed_outputs_are_named` |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
-| BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169) | Federated BigQuery queries are rejected by BigQuery, or silently coerce types | silent (query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does` covers the type spelling; the remaining four are a **GAP** |
+| BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169). The #144 override is no longer on the branch — the upstream `Dialect` default now renders an accepted format, which the guard pins either way | Federated BigQuery queries are rejected by BigQuery, or silently coerce types. Losing the `date_trunc` week mapping is quieter still: DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is Sunday-based, so the week starts on the wrong day — one day out for a Monday-to-Saturday timestamp, six for a Sunday one — and the query returns wrong rows with no error | silent (wrong data / query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does`, `…::bigquery_attaches_a_timestamp_offset_to_the_time`, `…::bigquery_extracts_date_fields_and_spells_intervals_the_standard_way`, `…::bigquery_inlines_a_derived_tables_column_aliases`, `…::bigquery_truncates_a_timestamp_the_way_bigquery_does` |
 | `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
@@ -470,7 +470,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**42 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -478,67 +478,51 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion` unparser: `ORDER BY` kept out of a derived table when the sort key is
-   computed (fork PR #191).
-2. `datafusion` unparser: a stacked aggregate unparsed as a derived table (fork PR #192).
-3. `datafusion` unparser: a bounded `EXISTS` build side scoped outside the correlation
-   (fork PR #201).
-4. `datafusion` unparser: an `EXISTS` bound that cannot be scoped is refused rather
-   than unparsed to wrong rows (fork PR #205).
-5. `datafusion` unparser: a derived table's unnamed outputs are named (fork PR #206).
-6. `datafusion` BigQuery dialect: timestamp literal format, `date_field_extract_style`
-   / `interval_style`, `date_trunc`, table-alias column aliases (fork PRs #144, #146,
-   #148, #169).
-7. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
-8. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-9. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-10. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-11. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
-    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-12. `snowflake-rs` chunked JSON responses and record-batch ordering.
-13. `clickhouse-rs` `Date32` range.
-14. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
-    change the text that gets embedded.
-15. `mistral.rs` `tool_calls` chat-template handling.
-16. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
+1. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
+2. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
+3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+   PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
+6. `snowflake-rs` chunked JSON responses and record-batch ordering.
+7. `clickhouse-rs` `Date32` range.
+8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+   change the text that gets embedded.
+9. `mistral.rs` `tool_calls` chat-template handling.
+10. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
     from the reference implementation.
-
-The first five are the cheapest to close by a long way. Each patch is present on the
-`datafusion` revision this branch pins, and each already has a written guard — the
-tests live in `crates/data_components/src/federation.rs` on `trunk`. Porting them is
-a copy, not an audit.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-17. `datafusion` `Inner`/`Full` join metadata across a `JoinSelection` input swap (fork
+11. `datafusion` `Inner`/`Full` join metadata across a `JoinSelection` input swap (fork
     PR #208) — a join between two datasets that each carry a `description` fails to plan.
-18. `vortex` session lock re-entry in writer init (fork PR #29).
-19. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+12. `vortex` session lock re-entry in writer init (fork PR #29).
+13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-20. `async-openai` null-suppression in requests.
-21. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-22. `model2vec-rs` optional `config.json`.
-23. `snowflake-rs` async query response support — long-running queries time out.
+14. `async-openai` null-suppression in requests.
+15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+16. `model2vec-rs` optional `config.json`.
+17. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-24. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-25. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-26. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-27. `model2vec-rs` HF cache directory read from the environment — models are
+21. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-28. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-29. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-30. `graph-rs-sdk` tower middleware application.
+23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+24. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -546,7 +530,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-31. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
