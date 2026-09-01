@@ -14,6 +14,7 @@ limitations under the License.
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
 use arrow_schema::{Schema, SchemaRef};
+use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use aws_sdk_credential_bridge::object_store_builder::{
     S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
@@ -292,13 +293,32 @@ enum MetadataLoadError {
 }
 
 impl SchemaMetadata {
+    /// The recorded schema, in the Arrow-conforming form.
+    ///
+    /// A recorded schema is a foreign declaration — JSON written by whichever build produced
+    /// the snapshot — and everything downstream takes it at face value: it bootstraps the
+    /// checkpoint, it is one side of the `classify` comparison, and `download_if_newer` hands
+    /// it to a validator that compares it field by field against the live accelerator schema.
+    /// A `Map` declaring its `entries` field nullable is not a difference the other side of
+    /// that comparison can ever hold — `MapArray::try_new` refuses the declaration — so left
+    /// in, it reads as a schema mismatch no snapshot can satisfy. Conformed on the way out for
+    /// the same reason every other decode point conforms one; see
+    /// [`arrow_tools::type_rewrite::MapEntriesNonNullable`].
     fn to_schema_ref(&self) -> Result<SchemaRef, serde_json::Error> {
         let schema: Schema = serde_json::from_value(self.schema.clone())?;
-        Ok(Arc::new(schema))
+        Ok(conforming_schema(Arc::new(schema)))
     }
 
+    /// Records `schema` in the Arrow-conforming form, so a snapshot written from here on
+    /// carries a declaration an accelerator can hold. Paired with [`Self::to_schema_ref`],
+    /// which repairs the ones already written.
+    ///
+    /// Only the layout-conformance rule is applied, not `normalize_for_comparison`: that
+    /// helper also unwraps `Dictionary` encoding, which is transparent when *comparing* two
+    /// schemas but is real information in one that is persisted and later compared against a
+    /// live accelerator schema that still carries it.
     fn from_schema(schema_id: u64, schema: &SchemaRef) -> Result<Self, serde_json::Error> {
-        let schema_json = serde_json::to_value(schema)?;
+        let schema_json = serde_json::to_value(conforming_schema(Arc::clone(schema)))?;
         Ok(Self {
             schema_id,
             schema: schema_json,
@@ -1886,10 +1906,14 @@ impl SnapshotManager {
                 source,
             })?;
 
+        // The checkpoint is a third store of a schema, written by whichever build last
+        // checkpointed this dataset, and `final_schema` below is returned from it. Conformed
+        // for the same reason the recorded schema is.
         let local_schema = checkpointer
             .get_schema()
             .await
-            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?;
+            .map_err(|source| SnapshotDownloadError::CheckpointerSchema { source })?
+            .map(conforming_schema);
         let final_schema = if let Some(schema) = local_schema {
             if schema.as_ref() != metadata_schema.as_ref() {
                 let ctx = EvolutionContext {
@@ -3112,7 +3136,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
     use object_store::{memory::InMemory, path::Path};
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
@@ -6546,6 +6570,251 @@ mod tests {
             snapshot_json["snapshot-row-count"],
             serde_json::json!(100),
             "snapshot-row-count should be serialized"
+        );
+    }
+
+    /// A schema whose `Map` column declares its `entries` field nullable — the declaration the
+    /// Arrow layout forbids and `MapArray::try_new` refuses, so no accelerator can hold a
+    /// column declared that way.
+    fn nullable_map_entries_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int32, true),
+                    ])),
+                    true,
+                )),
+                false,
+            ),
+            true,
+        )]))
+    }
+
+    /// Whether the schema's single `Map` column declares its `entries` field nullable.
+    fn declares_nullable_entries(schema: &Schema) -> bool {
+        match schema.field(0).data_type() {
+            DataType::Map(entries, _) => entries.is_nullable(),
+            other => panic!("expected a Map column, got {other}"),
+        }
+    }
+
+    /// A `SchemaMetadata` holding exactly the JSON an older build wrote, before recorded
+    /// schemas were conformed — built by hand rather than through `from_schema`, which now
+    /// conforms on the way in.
+    fn legacy_recorded_schema(schema_id: u64, schema: &SchemaRef) -> SchemaMetadata {
+        SchemaMetadata {
+            schema_id,
+            schema: serde_json::to_value(schema).expect("serialize schema"),
+        }
+    }
+
+    #[test]
+    fn recording_a_snapshot_schema_conforms_a_map_declaration_arrow_refuses() {
+        let recorded = SchemaMetadata::from_schema(0, &nullable_map_entries_schema())
+            .expect("serialize schema");
+        let round_tripped = recorded.to_schema_ref().expect("deserialize schema");
+
+        assert!(
+            !declares_nullable_entries(&round_tripped),
+            "a recorded snapshot schema must not carry a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// The half that reaches snapshots already written: the JSON on the wire still carries the
+    /// forbidden declaration, and reading it is what has to repair it.
+    #[test]
+    fn reading_a_legacy_recorded_schema_conforms_its_map_declaration() {
+        let forbidden = nullable_map_entries_schema();
+        let legacy = legacy_recorded_schema(0, &forbidden);
+
+        assert!(
+            declares_nullable_entries(
+                &serde_json::from_value::<Schema>(legacy.schema.clone()).expect("raw schema")
+            ),
+            "the fixture must hold the declaration an older build recorded"
+        );
+        assert!(
+            !declares_nullable_entries(&legacy.to_schema_ref().expect("deserialize schema")),
+            "reading a snapshot written before recorded schemas were conformed must repair it"
+        );
+    }
+
+    /// Only the layout-conformance rule is applied, not `normalize_for_comparison`: unwrapping
+    /// `Dictionary` encoding is transparent when *comparing* two schemas, but a recorded schema
+    /// is later compared against a live accelerator schema that still carries it.
+    #[test]
+    fn recording_a_snapshot_schema_preserves_dictionary_encoding() {
+        let dictionary_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+
+        let round_tripped = SchemaMetadata::from_schema(0, &dictionary_schema)
+            .expect("serialize schema")
+            .to_schema_ref()
+            .expect("deserialize schema");
+
+        assert_eq!(
+            round_tripped.field(0).data_type(),
+            dictionary_schema.field(0).data_type(),
+            "recording a snapshot schema must not unwrap dictionary encoding"
+        );
+    }
+
+    /// A checkpointer that records what `checkpoint` was handed, so a test can assert what the
+    /// checkpoint holds after a restore rather than what the restore acknowledged.
+    #[derive(Clone)]
+    struct RecordingCheckpointer {
+        /// `None` drives the restore path's bootstrap branch — the steady state for engines
+        /// whose archive ships no `_dataset_checkpoint` row, Cayenne most notably.
+        schema: Option<SchemaRef>,
+        checkpointed: Arc<Mutex<Option<SchemaRef>>>,
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for RecordingCheckpointer {
+        async fn exists(&self) -> bool {
+            true
+        }
+
+        async fn checkpoint(
+            &self,
+            schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> DatasetCheckpointResult<()> {
+            *self.checkpointed.lock().await = Some(Arc::clone(schema));
+            Ok(())
+        }
+
+        async fn get_schema(&self) -> DatasetCheckpointResult<Option<SchemaRef>> {
+            Ok(self.schema.clone())
+        }
+
+        async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
+            Ok(None)
+        }
+
+        async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn delete(&self) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Restores a snapshot whose recorded schema is `recorded` against a checkpoint holding
+    /// `checkpoint_schema`, and returns `(what checkpoint() was handed, the restore's schema)`.
+    #[cfg(feature = "duckdb")]
+    async fn restore_snapshot_recording_schema(
+        snapshot_schema: SchemaMetadata,
+        checkpoint_schema: Option<SchemaRef>,
+    ) -> (Option<SchemaRef>, SchemaRef) {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+        let contents = Bytes::from_static(b"snapshot-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let entry = SnapshotEntry {
+            snapshot_id: 3,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: compute_sha256_hex(contents.as_ref()),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            engine: None,
+            schemas: vec![snapshot_schema],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(3),
+            ..Default::default()
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let handed_to_checkpoint = Arc::new(Mutex::new(None));
+        let recorder = RecordingCheckpointer {
+            schema: checkpoint_schema,
+            checkpointed: Arc::clone(&handed_to_checkpoint),
+        };
+        let factory: DatasetCheckpointerFactory = Arc::new(move || {
+            let recorder = recorder.clone();
+            Box::pin(async move { Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(recorder)) })
+        });
+
+        let mut manager = build_manager(
+            Arc::clone(&store),
+            temp_dir.path().join("snapshot.db"),
+            BootstrapOnFailureBehavior::Warn,
+            &sample_schema(),
+            false,
+        );
+        manager.checkpointer_factory = Some(Arc::clone(&factory));
+
+        let info = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await
+            .expect("restore snapshot");
+
+        let handed = handed_to_checkpoint.lock().await.clone();
+        (handed, info.schema)
+    }
+
+    /// The acceptance case: a snapshot written before recorded schemas were conformed
+    /// bootstraps the checkpoint, and what the checkpoint ends up holding must be a
+    /// declaration an accelerator can hold.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restoring_a_legacy_snapshot_bootstraps_a_conforming_checkpoint() {
+        let forbidden = nullable_map_entries_schema();
+        let (checkpointed, restored) =
+            restore_snapshot_recording_schema(legacy_recorded_schema(0, &forbidden), None).await;
+
+        let checkpointed = checkpointed.expect("the bootstrap branch checkpoints the schema");
+        assert!(
+            !declares_nullable_entries(&checkpointed),
+            "the bootstrapped checkpoint must not be given a Map declaration MapArray::try_new refuses"
+        );
+        assert!(
+            !declares_nullable_entries(&restored),
+            "the restore must not hand back a Map declaration MapArray::try_new refuses"
+        );
+    }
+
+    /// The checkpoint is a third store of a schema. One written by an older build carries the
+    /// same declaration, and it is what the restore returns on this branch.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn restoring_over_a_legacy_checkpoint_conforms_the_schema_it_returns() {
+        let forbidden = nullable_map_entries_schema();
+        let (_, restored) = restore_snapshot_recording_schema(
+            legacy_recorded_schema(0, &forbidden),
+            Some(Arc::clone(&forbidden)),
+        )
+        .await;
+
+        assert!(
+            !declares_nullable_entries(&restored),
+            "a checkpoint written before schemas were conformed must not be handed back as-is"
         );
     }
 }
