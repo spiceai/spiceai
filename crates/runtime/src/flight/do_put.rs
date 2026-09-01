@@ -346,6 +346,11 @@ where
                     continue;
                 }
 
+                if data.data_header.is_empty() && !data.data_body.is_empty() {
+                    discarded.total += 1;
+                    continue;
+                }
+
                 match declares_ipc_data(&data.data_header) {
                     Ok(true) => discarded.total += 1,
                     // A schema-only message, a trailer, or anything else carrying no rows.
