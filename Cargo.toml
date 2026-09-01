@@ -256,7 +256,7 @@ datafusion-common-runtime = "54.1.0"
 datafusion-datasource = "54.1.0"
 datafusion-execution = "54.1.0"
 datafusion-expr = "54.1.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a", features = ["sql"] } # spiceai-54
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "095504d9c05882c300ef60b625280220f2d4298b", features = ["sql"] } # branch: spiceai-54
 datafusion-functions = "54.1.0"
 datafusion-functions-aggregate = "54.1.0"
 datafusion-functions-aggregate-common = "54.1.0"
@@ -271,7 +271,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "642e121192fcc4c3430e28e01e660ee5d189d517" } # branch: spiceai-54 (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "4a0c194f802e8559c498bd8d82212a1c8ef54d19" } # branch: spiceai-54 (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
