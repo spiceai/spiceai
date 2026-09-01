@@ -8,6 +8,13 @@ name: Verus Verification
 # establish by sampling. Nothing else in the normal build checks it — a normal
 # `cargo build` erases the specifications — so this gate is what keeps the
 # proofs from silently rotting into comments.
+#
+# That is also why this runs on `merge_group` and not only on the pull request.
+# A proof is a claim about the tree it was checked against; two individually
+# green changes can combine into one the verifier would reject, and no other
+# check in the queue would notice. `merge_group` takes no `paths` filter, so
+# the job runs on every queue entry — acceptable, because the verifier archive
+# is cached and the verification itself takes seconds.
 on:
   pull_request:
     branches:
@@ -17,14 +24,24 @@ on:
       - feature-*
     paths:
       - 'crates/hash-index/**'
+      # The verifier is a rustc driver bound to one toolchain, so a workspace
+      # toolchain bump can invalidate this gate without touching the crate.
+      - 'rust-toolchain.toml'
       # Self-referencing so an edit to this file is exercised by the gate it
       # defines, rather than only when one of the paths above also changes.
       - '.github/workflows/verus_verify.yml'
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   push:
     branches:
       - trunk
     paths:
       - 'crates/hash-index/**'
+      - 'rust-toolchain.toml'
       - '.github/workflows/verus_verify.yml'
   workflow_dispatch:
 
@@ -32,19 +49,27 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
+# The job reads the repository and fetches a public release. It needs nothing
+# else, and it executes a downloaded binary, so it gets the minimum.
+permissions:
+  contents: read
+
 env:
   # The verifier and its specification library ship together and are versioned
-  # together, so these two move as a pair. VERUS_VSTD_VERSION must match the
-  # `vstd` pin in `crates/hash-index/Cargo.toml`; the "check pins agree" step
-  # below fails the build if it drifts.
+  # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
+  # pin in `crates/hash-index/Cargo.toml`, and VERUS_SHA256 pins the exact
+  # bytes of the archive: a release tag names an asset, it does not fix its
+  # contents, and this job executes what it downloads.
   VERUS_RELEASE: release/0.2026.08.30.b432e82
+  VERUS_ASSET: verus-0.2026.08.30.b432e82-x86-linux.zip
+  VERUS_SHA256: 067f5f72a457fe66b77c0c10b180f2a919a9c7481a8baa024ffc716aa931a41b
   VERUS_VSTD_VERSION: 0.0.0-2026-08-30-0159
 
 jobs:
   verus-verify:
     name: Verify hash-index proofs
-    # GitHub-hosted on purpose: a ~15s verification must not queue behind the
-    # saturated self-hosted pool.
+    # GitHub-hosted on purpose: a seconds-long verification must not queue
+    # behind the saturated self-hosted pool.
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -52,8 +77,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # The verifier is a rustc driver, so it is bound to one exact toolchain.
-      # Read it from the release rather than hardcoding a second copy.
       - name: Check pins agree
         run: |
           set -euo pipefail
@@ -65,12 +88,15 @@ jobs:
             exit 1
           fi
 
-      - name: Cache Verus release
+      # Only the archive is cached. It is re-hashed and re-extracted on every
+      # run, so a cache that has been tampered with fails the digest check
+      # rather than silently supplying the binary this job then trusts.
+      - name: Cache Verus archive
         id: cache-verus
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.verus
-          key: verus-${{ env.VERUS_RELEASE }}-x86-linux
+          path: ~/.verus-dl
+          key: verus-${{ env.VERUS_RELEASE }}-${{ env.VERUS_SHA256 }}
 
       - name: Download Verus
         if: steps.cache-verus.outputs.cache-hit != 'true'
@@ -78,19 +104,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.verus
+          mkdir -p ~/.verus-dl
           gh release download --repo verus-lang/verus "$VERUS_RELEASE" \
-            -p 'verus-*-x86-linux.zip' -O /tmp/verus.zip
-          unzip -q /tmp/verus.zip -d ~/.verus
+            -p "$VERUS_ASSET" -O ~/.verus-dl/"$VERUS_ASSET" --clobber
 
-      # The archive's top-level directory name is the release's to choose, so
-      # locate the binary rather than assuming it.
-      - name: Locate Verus
+      - name: Verify the archive digest
         run: |
           set -euo pipefail
+          echo "$VERUS_SHA256  $HOME/.verus-dl/$VERUS_ASSET" | sha256sum -c -
+
+      - name: Extract Verus
+        run: |
+          set -euo pipefail
+          rm -rf ~/.verus && mkdir -p ~/.verus
+          unzip -q ~/.verus-dl/"$VERUS_ASSET" -d ~/.verus
           verus_bin=$(find ~/.verus -maxdepth 2 -name verus -type f -perm -u+x | head -1)
           if [ -z "$verus_bin" ]; then
-            echo "::error::No verus binary found under ~/.verus"
+            echo "::error::No verus binary found in $VERUS_ASSET"
             exit 1
           fi
           echo "VERUS_DIR=$(dirname "$verus_bin")" >> "$GITHUB_ENV"
@@ -108,8 +138,8 @@ jobs:
           if [ "$required" != "$pinned" ]; then
             echo "::error::rust-toolchain.toml pins $pinned but Verus" \
                  "$VERUS_RELEASE is built against $required." \
-                 "Bump VERUS_RELEASE/VERUS_VSTD_VERSION to a release built" \
-                 "against $pinned, or this gate cannot run."
+                 "Bump VERUS_RELEASE/VERUS_ASSET/VERUS_SHA256/VERUS_VSTD_VERSION" \
+                 "to a release built against $pinned, or this gate cannot run."
             exit 1
           fi
 
