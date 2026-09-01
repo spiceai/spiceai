@@ -676,8 +676,10 @@ fn dataset_identity_fields_from_spec(
 /// identity rather than three.
 fn canonical_columns(reference: &str) -> String {
     datafusion_table_providers::util::column_reference::ColumnReference::try_from(reference)
-        .map(|parsed| parsed.iter().collect::<Vec<_>>().join(","))
-        .unwrap_or_else(|_| reference.to_string())
+        .map_or_else(
+            |_| reference.to_string(),
+            |parsed| parsed.iter().collect::<Vec<_>>().join(","),
+        )
 }
 
 /// Dataset-level configuration that changes which rows are stored or what they contain.
