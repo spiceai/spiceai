@@ -84,7 +84,7 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `6bba76c1fed94c62f58c4a99de05d2aa874e5050` | `phillip/statement-cancel-during-execute` |
+| [arrow-adbc](#arrow-adbc) | `389f79316f03fa1e05ea0c7cb5071674ada41131` | `phillip/statement-cancel-during-execute` |
 | [arrow-rs](#arrow-rs) | `18a40370d014a0f8eed12ee0d5a914e8cb2070d8` | `lukim/spiceai-58.3.0` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |

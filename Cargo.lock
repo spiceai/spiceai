@@ -194,7 +194,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=389f79316f03fa1e05ea0c7cb5071674ada41131#389f79316f03fa1e05ea0c7cb5071674ada41131"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -203,7 +203,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=389f79316f03fa1e05ea0c7cb5071674ada41131#389f79316f03fa1e05ea0c7cb5071674ada41131"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -220,7 +220,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=389f79316f03fa1e05ea0c7cb5071674ada41131#389f79316f03fa1e05ea0c7cb5071674ada41131"
 dependencies = [
  "adbc_core",
  "arrow-array",

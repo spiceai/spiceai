@@ -2170,6 +2170,27 @@ mod function_support_tests {
         }
     }
 
+    // The stub never runs a query, so a handle to it cancels nothing; the trait
+    // is implemented because the ADBC table factory now requires statements to
+    // say how a cancellation handle is obtained.
+    impl datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::StatementCancelHandle
+        for StubStatement
+    {
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+    }
+
+    impl datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement
+        for StubStatement
+    {
+        type CancelHandle = Self;
+
+        fn cancel_handle(&self) -> Self::CancelHandle {
+            self.clone()
+        }
+    }
+
     impl Statement for StubStatement {
         fn bind(&mut self, _batch: RecordBatch) -> AdbcResult<()> {
             Err(not_implemented("bind"))
