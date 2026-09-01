@@ -597,7 +597,12 @@ def main() -> int:
                 latest = data_jobs(
                     client, project, location, since, until, (core, ledger), harness_jobs
                 )
-                stable = stable + 1 if len(latest) == len(observed) else 0
+                # Every scenario runs at least one job, so an empty sample means
+                # JOBS_BY_USER has not caught up yet, never that counting is done.
+                if latest and len(latest) == len(observed):
+                    stable += 1
+                else:
+                    stable = 0
                 observed = latest
 
             texts = [job["query"] for job in observed]

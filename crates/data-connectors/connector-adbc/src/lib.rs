@@ -848,10 +848,22 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 
     let mut hasher = blake3::Hasher::new();
     for k in &keys {
-        let v = params.parameters.get(k).expose().ok().unwrap_or("");
+        let v = params.parameters.get(k).expose().ok();
         hasher.update(k.as_bytes());
         hasher.update(b"\0");
-        hasher.update(v.as_bytes());
+        // Presence is part of the key, as it is for the namespace below: an absent
+        // parameter and an empty one are different connection configurations, and
+        // collapsing them here would hand both the same pooled connection.
+        match v {
+            Some(value) => {
+                hasher.update(b"1");
+                hasher.update(b"\0");
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(b"0");
+            }
+        }
         hasher.update(b"\0");
     }
 
@@ -1757,6 +1769,40 @@ mod tests {
         assert_ne!(
             compute_adbc_cache_key(&params_a),
             compute_adbc_cache_key(&params_b)
+        );
+    }
+
+    /// The pool cache decides which connector instance is reused, so it has to make
+    /// the same distinctions the join identity does. If it collapses them, two
+    /// configurations share one pool and the join identity never sees them apart.
+    #[tokio::test]
+    async fn test_cache_key_distinguishes_absent_from_empty_password() {
+        let dataset = test_dataset("adbc:ds.table", "table").await;
+
+        let make_params = |password: Option<&str>| {
+            let mut entries = vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                (
+                    "uri".to_string(),
+                    SecretString::from("bigquery:///my-project"),
+                ),
+            ];
+            if let Some(password) = password {
+                entries.push(("password".to_string(), SecretString::from(password)));
+            }
+
+            ConnectorParams {
+                parameters: Parameters::new(entries, "adbc", PARAMETERS),
+                unsupported_type_action: None,
+                component: ConnectorComponent::from(&dataset),
+                io_runtime: tokio::runtime::Handle::current(),
+            }
+        };
+
+        assert_ne!(
+            compute_adbc_cache_key(&make_params(None)),
+            compute_adbc_cache_key(&make_params(Some(""))),
+            "an absent password and an empty one must not share a pooled connector"
         );
     }
 
