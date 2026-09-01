@@ -31,7 +31,7 @@ limitations under the License.
 //! remote query. Nothing external is needed, so this runs everywhere.
 
 use std::ffi::{c_char, c_int, c_void};
-use std::ptr::null_mut;
+use std::ptr::{dangling_mut, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -54,7 +54,7 @@ const ADBC_STATUS_CANCELLED: AdbcStatusCode = 11;
 /// How long the fake driver stays inside `StatementExecuteQuery` before giving
 /// up. It is the failure timeout: if the cancel never arrives, the test has to
 /// end somehow.
-const EXECUTE_GIVE_UP: Duration = Duration::from_secs(60);
+const EXECUTE_GIVE_UP: Duration = Duration::from_mins(1);
 
 static CANCELLED: Mutex<bool> = Mutex::new(false);
 static CANCEL_SIGNAL: Condvar = Condvar::new();
@@ -133,7 +133,7 @@ unsafe extern "C" fn statement_new(
     statement: *mut adbc_ffi::FFI_AdbcStatement,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
-    unsafe { (*statement).private_data = 1 as *mut c_void };
+    unsafe { (*statement).private_data = dangling_mut::<c_void>() };
     ADBC_STATUS_OK
 }
 
@@ -186,15 +186,15 @@ unsafe extern "C" fn statement_execute_schema(
 /// Blocks like a driver waiting on a remote query, and returns only when
 /// cancelled.
 unsafe extern "C" fn statement_execute_query(
-    _statement: *mut adbc_ffi::FFI_AdbcStatement,
+    statement: *mut adbc_ffi::FFI_AdbcStatement,
     _stream: *mut arrow::ffi_stream::FFI_ArrowArrayStream,
     _rows_affected: *mut i64,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
-    if unsafe { refuse_if_released(_statement) } {
+    if unsafe { refuse_if_released(statement) } {
         return ADBC_STATUS_INVALID_STATE;
     }
-    EXECUTING_STATEMENT.store(_statement as usize, Ordering::SeqCst);
+    EXECUTING_STATEMENT.store(statement as usize, Ordering::SeqCst);
     EXECUTING.store(true, Ordering::SeqCst);
     let mut cancelled = CANCELLED
         .lock()
@@ -218,10 +218,10 @@ unsafe extern "C" fn statement_execute_query(
 }
 
 unsafe extern "C" fn statement_cancel(
-    _statement: *mut adbc_ffi::FFI_AdbcStatement,
+    statement: *mut adbc_ffi::FFI_AdbcStatement,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
-    if unsafe { refuse_if_released(_statement) } {
+    if unsafe { refuse_if_released(statement) } {
         return ADBC_STATUS_INVALID_STATE;
     }
     CANCELS.fetch_add(1, Ordering::SeqCst);

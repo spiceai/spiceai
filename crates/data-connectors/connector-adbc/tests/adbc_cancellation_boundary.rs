@@ -35,7 +35,7 @@ limitations under the License.
 //! * `Connection::cancel` also takes a different lock and so can be called
 //!   concurrently, but a driver is free to scope it to the connection rather
 //!   than to the statement, in which case it does not end the query. The
-//!   BigQuery driver scopes it that way, so this one reports rather than asserts.
+//!   `BigQuery` driver scopes it that way, so this one reports rather than asserts.
 //!
 //! `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs` covers the
 //! same propagation without a driver and runs everywhere; this is how the same
@@ -112,7 +112,7 @@ fn config() -> Result<Option<Config>, String> {
 
 /// Appends a unique trailing comment to the query.
 ///
-/// A database that caches results by query text — BigQuery does — would
+/// A database that caches results by query text — `BigQuery` does — would
 /// otherwise answer the second test in a run from the first one's cached result,
 /// and a query that returns instantly cannot be interrupted.
 fn uncached(sql: &str, tag: &str) -> String {
