@@ -1,0 +1,124 @@
+---
+name: Verus Verification
+
+# `crates/hash-index/src/sbbf_layout.rs` carries proofs, not just tests: the
+# block index it returns subscripts the bloom filter's block vector, so an
+# out-of-range result is a panic on a lock-free read path. The bound is a Verus
+# postcondition discharged for every input, which is a property no test can
+# establish by sampling. Nothing else in the normal build checks it — a normal
+# `cargo build` erases the specifications — so this gate is what keeps the
+# proofs from silently rotting into comments.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - 'crates/hash-index/**'
+      # Self-referencing so an edit to this file is exercised by the gate it
+      # defines, rather than only when one of the paths above also changes.
+      - '.github/workflows/verus_verify.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'crates/hash-index/**'
+      - '.github/workflows/verus_verify.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  # The verifier and its specification library ship together and are versioned
+  # together, so these two move as a pair. VERUS_VSTD_VERSION must match the
+  # `vstd` pin in `crates/hash-index/Cargo.toml`; the "check pins agree" step
+  # below fails the build if it drifts.
+  VERUS_RELEASE: release/0.2026.08.30.b432e82
+  VERUS_VSTD_VERSION: 0.0.0-2026-08-30-0159
+
+jobs:
+  verus-verify:
+    name: Verify hash-index proofs
+    # GitHub-hosted on purpose: a ~15s verification must not queue behind the
+    # saturated self-hosted pool.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The verifier is a rustc driver, so it is bound to one exact toolchain.
+      # Read it from the release rather than hardcoding a second copy.
+      - name: Check pins agree
+        run: |
+          set -euo pipefail
+          pinned=$(grep -oP 'vstd = "=\K[^"]+' crates/hash-index/Cargo.toml)
+          if [ "$pinned" != "$VERUS_VSTD_VERSION" ]; then
+            echo "::error::vstd pin in crates/hash-index/Cargo.toml is '$pinned'," \
+                 "but this workflow runs Verus '$VERUS_VSTD_VERSION'." \
+                 "The verifier and vstd ship together — update both."
+            exit 1
+          fi
+
+      - name: Cache Verus release
+        id: cache-verus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.verus
+          key: verus-${{ env.VERUS_RELEASE }}-x86-linux
+
+      - name: Download Verus
+        if: steps.cache-verus.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.verus
+          gh release download --repo verus-lang/verus "$VERUS_RELEASE" \
+            -p 'verus-*-x86-linux.zip' -O /tmp/verus.zip
+          unzip -q /tmp/verus.zip -d ~/.verus
+
+      # The archive's top-level directory name is the release's to choose, so
+      # locate the binary rather than assuming it.
+      - name: Locate Verus
+        run: |
+          set -euo pipefail
+          verus_bin=$(find ~/.verus -maxdepth 2 -name verus -type f -perm -u+x | head -1)
+          if [ -z "$verus_bin" ]; then
+            echo "::error::No verus binary found under ~/.verus"
+            exit 1
+          fi
+          echo "VERUS_DIR=$(dirname "$verus_bin")" >> "$GITHUB_ENV"
+
+      # Verus is a rustc driver, so it only runs against the exact toolchain it
+      # was built for. `rust-toolchain.toml` is what cargo will actually select,
+      # so compare against that: a workspace toolchain bump ahead of the Verus
+      # release fails here with an explanation instead of an opaque driver error.
+      - name: Check the toolchain matches
+        run: |
+          set -euo pipefail
+          required=$("$VERUS_DIR/verus" --version | awk '/Toolchain:/ {print $2}')
+          required=${required%%-*}
+          pinned=$(awk -F'"' '/^channel/ {print $2}' rust-toolchain.toml)
+          if [ "$required" != "$pinned" ]; then
+            echo "::error::rust-toolchain.toml pins $pinned but Verus" \
+                 "$VERUS_RELEASE is built against $required." \
+                 "Bump VERUS_RELEASE/VERUS_VSTD_VERSION to a release built" \
+                 "against $pinned, or this gate cannot run."
+            exit 1
+          fi
+
+      - name: Verify
+        working-directory: crates/hash-index
+        run: |
+          set -euo pipefail
+          export PATH="$VERUS_DIR:$PATH"
+          cargo verus focus 2>&1 | tee /tmp/verus.log
+          # `cargo verus` exits 0 when a crate opts out of verification and
+          # nothing is checked, so assert the proofs actually ran.
+          grep -qE 'verification results:: [1-9][0-9]* verified, 0 errors' /tmp/verus.log
