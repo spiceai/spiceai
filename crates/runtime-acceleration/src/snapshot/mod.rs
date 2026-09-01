@@ -2439,8 +2439,7 @@ impl SnapshotManager {
                         tracing::debug!(
                             dataset = %dataset_name,
                             schema_id = recorded.schema_id,
-                            "snapshot upload: left recorded schema {} of dataset '{dataset_name}' unchanged, it could not be read: {source}",
-                            recorded.schema_id
+                            "snapshot upload: could not read a recorded schema of dataset '{dataset_name}', so it was left as written. Cause: {source}"
                         );
                         continue;
                     }
@@ -2456,8 +2455,7 @@ impl SnapshotManager {
                     tracing::info!(
                         dataset = %dataset_name,
                         schema_id = recorded.schema_id,
-                        "snapshot upload: recorded schema {} of dataset '{dataset_name}' declared a MAP's `entries` field nullable, which the Arrow layout forbids and no accelerator can hold; rewrote it in place so restoring this snapshot no longer reports a schema mismatch",
-                        recorded.schema_id
+                        "snapshot upload: a recorded schema of dataset '{dataset_name}' declared a MAP's `entries` field nullable, which the Arrow layout forbids; rewrote it so restoring this snapshot no longer reports a schema mismatch"
                     );
                 }
             }
