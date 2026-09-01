@@ -12,9 +12,14 @@ name: Verus Verification
 # That is also why this runs on `merge_group` and not only on the pull request.
 # A proof is a claim about the tree it was checked against; two individually
 # green changes can combine into one the verifier would reject, and no other
-# check in the queue would notice. `merge_group` takes no `paths` filter, so
-# the job runs on every queue entry — acceptable, because the verifier archive
-# is cached and the verification itself takes seconds.
+# check in the queue would notice.
+#
+# The job carries NO `paths` filter, deliberately. It is registered in
+# `REQUIRED_CHECKS` (scripts/signoff), and a required context has to be emitted
+# by every pull request — a workflow that never triggers reports nothing at all,
+# which blocks the PR rather than passing it. So the job always runs and always
+# reports; the change filter below skips only the verification work when nothing
+# it covers was touched. See docs/dev/ci_signoff.md.
 on:
   pull_request:
     branches:
@@ -22,14 +27,6 @@ on:
       - release-*
       - release/*
       - feature-*
-    paths:
-      - 'crates/hash-index/**'
-      # The verifier is a rustc driver bound to one toolchain, so a workspace
-      # toolchain bump can invalidate this gate without touching the crate.
-      - 'rust-toolchain.toml'
-      # Self-referencing so an edit to this file is exercised by the gate it
-      # defines, rather than only when one of the paths above also changes.
-      - '.github/workflows/verus_verify.yml'
   merge_group:
     branches:
       - trunk
@@ -39,10 +36,6 @@ on:
   push:
     branches:
       - trunk
-    paths:
-      - 'crates/hash-index/**'
-      - 'rust-toolchain.toml'
-      - '.github/workflows/verus_verify.yml'
   workflow_dispatch:
 
 concurrency:
@@ -75,9 +68,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # A pull request only needs base + head for the path diff; other
+          # events need history to diff against.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
           persist-credentials: false
 
+      # Decides whether the verification work below runs. The job itself always
+      # runs, so the required context is always reported.
+      - name: Check for changes this gate covers
+        id: changes
+        uses: ./.github/actions/check-code-changes
+        with:
+          filters: |
+            code_changes:
+              - 'crates/hash-index/**'
+              # The verifier is a rustc driver bound to one toolchain, so a
+              # workspace toolchain bump can invalidate this gate without
+              # touching the crate.
+              - 'rust-toolchain.toml'
+              - '.github/workflows/verus_verify.yml'
+
       - name: Check pins agree
+        if: steps.changes.outputs.relevant_changes == 'true'
         run: |
           set -euo pipefail
           pinned=$(grep -oP 'vstd = "=\K[^"]+' crates/hash-index/Cargo.toml)
@@ -93,13 +105,16 @@ jobs:
       # rather than silently supplying the binary this job then trusts.
       - name: Cache Verus archive
         id: cache-verus
+        if: steps.changes.outputs.relevant_changes == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.verus-dl
           key: verus-${{ env.VERUS_RELEASE }}-${{ env.VERUS_SHA256 }}
 
       - name: Download Verus
-        if: steps.cache-verus.outputs.cache-hit != 'true'
+        if: >-
+          steps.changes.outputs.relevant_changes == 'true'
+          && steps.cache-verus.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -109,11 +124,13 @@ jobs:
             -p "$VERUS_ASSET" -O ~/.verus-dl/"$VERUS_ASSET" --clobber
 
       - name: Verify the archive digest
+        if: steps.changes.outputs.relevant_changes == 'true'
         run: |
           set -euo pipefail
           echo "$VERUS_SHA256  $HOME/.verus-dl/$VERUS_ASSET" | sha256sum -c -
 
       - name: Extract Verus
+        if: steps.changes.outputs.relevant_changes == 'true'
         run: |
           set -euo pipefail
           rm -rf ~/.verus && mkdir -p ~/.verus
@@ -126,14 +143,28 @@ jobs:
           echo "VERUS_DIR=$(dirname "$verus_bin")" >> "$GITHUB_ENV"
 
       # Verus is a rustc driver, so it only runs against the exact toolchain it
-      # was built for. `rust-toolchain.toml` is what cargo will actually select,
-      # so compare against that: a workspace toolchain bump ahead of the Verus
-      # release fails here with an explanation instead of an opaque driver error.
+      # was built for. Ask the binary rather than restating the version here:
+      # a second copy of it in this file is one more thing that can drift from
+      # the release the digest above pins. `rust-toolchain.toml` is what cargo
+      # will actually select, so that is what it is compared against — a
+      # workspace toolchain bump ahead of the Verus release then fails here with
+      # an explanation instead of an opaque driver error.
       - name: Check the toolchain matches
+        if: steps.changes.outputs.relevant_changes == 'true'
         run: |
           set -euo pipefail
-          required=$("$VERUS_DIR/verus" --version | awk '/Toolchain:/ {print $2}')
+          if ! version_output=$("$VERUS_DIR/verus" --version 2>&1); then
+            echo "::error::Could not run the Verus driver to read its toolchain." \
+                 "It reported: ${version_output}"
+            exit 1
+          fi
+          required=$(awk '/Toolchain:/ {print $2}' <<<"$version_output")
           required=${required%%-*}
+          if [ -z "$required" ]; then
+            echo "::error::Verus $VERUS_RELEASE did not report a toolchain." \
+                 "It printed: ${version_output}"
+            exit 1
+          fi
           pinned=$(awk -F'"' '/^channel/ {print $2}' rust-toolchain.toml)
           if [ "$required" != "$pinned" ]; then
             echo "::error::rust-toolchain.toml pins $pinned but Verus" \
@@ -144,6 +175,7 @@ jobs:
           fi
 
       - name: Verify
+        if: steps.changes.outputs.relevant_changes == 'true'
         working-directory: crates/hash-index
         run: |
           set -euo pipefail
