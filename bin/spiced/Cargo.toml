@@ -123,7 +123,7 @@ tempfile.workspace = true
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
-# Builds jemalloc with `--enable-prof`, without which `MALLOC_CONF=prof:true,…`
+# Builds jemalloc with `--enable-prof`, without which `_RJEM_MALLOC_CONF=prof:true`
 # is silently ignored. Reports as `jemalloc-profiling`, not `jemalloc`.
 alloc-jemalloc-profiling = ["alloc-jemalloc", "tikv-jemallocator/profiling"]
 alloc-mimalloc = ["dep:mimalloc"]
