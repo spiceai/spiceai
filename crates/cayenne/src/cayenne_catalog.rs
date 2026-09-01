@@ -29,6 +29,7 @@ use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams,
 };
+use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
@@ -2153,7 +2154,19 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
+    async fn create_table(&self, mut options: CreateTableOptions) -> CatalogResult<String> {
+        // A requested schema is brought in line with the Arrow map layout before Cayenne
+        // does anything with it, so the declaration this table is persisted under, compared
+        // against and evolved from is the same conforming one. A producer is free to declare
+        // a `MAP`'s `entries` field nullable, which the layout forbids: the column decodes
+        // and then fails in whichever kernel first rebuilds it, reporting `MapArray entries
+        // cannot contain nulls` whether or not a null is involved. Correcting it is a repair
+        // of an illegal declaration rather than a schema evolution — nullability lives in the
+        // type and not in any buffer, so no file is rewritten — and it has to happen here
+        // because the stored declaration is what every read is planned against and what the
+        // write sink casts each incoming batch to.
+        options.schema = conforming_schema(options.schema);
+
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
 
@@ -2337,28 +2350,14 @@ impl MetadataCatalog for CayenneCatalog {
                     let vortex_config_json = row.get_optional_string(9)?;
                     let current_sequence_number = row.get_optional_i64(10)?.unwrap_or(0);
 
-                    // Deserialize schema using Arrow IPC format
-                    let schema = {
-                        use base64::Engine;
-                        use bytes::Bytes;
-
-                        let schema_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(&schema_json)
-                            .map_err(|e| CatalogError::InvalidOperation {
-                                message: "Failed to decode schema from base64".to_string(),
-                                source: Box::new(e),
-                            })?;
-
-                        let ipc_message = arrow_flight::IpcMessage(Bytes::from(schema_bytes));
-                        arrow_schema::Schema::try_from(ipc_message).map_err(|e| {
-                            CatalogError::InvalidOperation {
-                                message: "Failed to deserialize schema from IPC".to_string(),
-                                source: Box::new(e),
-                            }
-                        })?
-                    };
-
-                    let schema = Arc::new(schema);
+                    // A schema persisted before `create_table` began conforming its input —
+                    // or by a Spice that predates it — still declares its `MAP` entries the way
+                    // its producer did, and nothing else will ever repair it: the retention rule
+                    // that keeps a stored schema canonical across a nullability difference is
+                    // what holds it in place. Repairing it on the way out heals such a table on
+                    // its next load without rewriting a single file.
+                    let schema =
+                        conforming_schema(Arc::new(deserialize_schema_ipc_base64(&schema_json)?));
 
                     // Parse primary key
                     let primary_key = if let Some(pk_json) = primary_key_json {
@@ -3661,6 +3660,33 @@ impl MetadataCatalog for CayenneCatalog {
             )
             .await?;
         Ok(results.into_iter().next())
+    }
+
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Drop both sibling caches for the departed snapshot in ONE transaction
+        // so they can never drift apart (one deleted, the other left to leak).
+        let txn = self.begin_transaction().await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.commit().await
     }
 
     async fn clear_snapshot_file_statistics_except(
@@ -5064,6 +5090,31 @@ fn constraint_violation_message_contains_all(message: &str, required_parts: &[&s
 
 fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Deserialize the base64 Arrow-IPC form stored in `cayenne_table.schema_json` back into an
+/// Arrow schema — the exact inverse of [`serialize_schema_ipc_base64`], and the only place the
+/// stored encoding is read.
+///
+/// It hands back the declaration as it is stored, without the map-layout repair `get_table`
+/// applies on top, so a caller that needs to know what is actually on disk can ask.
+fn deserialize_schema_ipc_base64(schema_json: &str) -> CatalogResult<arrow_schema::Schema> {
+    use base64::Engine;
+    use bytes::Bytes;
+
+    let schema_bytes = base64::engine::general_purpose::STANDARD
+        .decode(schema_json)
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to decode schema from base64".to_string(),
+            source: Box::new(e),
+        })?;
+
+    arrow_schema::Schema::try_from(arrow_flight::IpcMessage(Bytes::from(schema_bytes))).map_err(
+        |e| CatalogError::InvalidOperation {
+            message: "Failed to deserialize schema from IPC".to_string(),
+            source: Box::new(e),
+        },
+    )
 }
 
 /// Serialize an Arrow schema to the base64 Arrow-IPC form stored in
@@ -8360,6 +8411,128 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// Regression test: time-based retention that fully empties a protected
+    /// snapshot must delete that snapshot's `cayenne_snapshot_file` manifest
+    /// rows AND its `cayenne_snapshot_file_statistics` stats-cache rows, not
+    /// only its roster row. The append maintenance lane writes those rows while
+    /// the snapshot is live and populated; once retention removes the physical
+    /// files nothing else reconciles them, so leaving them behind leaks
+    /// metastore rows. A snapshot outside the emptied set stays untouched.
+    #[tokio::test]
+    async fn test_clear_snapshot_cached_metadata_deletes_both_tables_for_target() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_retention_emptied_manifest_gc_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "retention_emptied_manifest_gc".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // Retention empties `emptied`; `survivor` stays live. Each starts with
+        // manifest rows written by the append maintenance lane.
+        let emptied = uuid::Uuid::now_v7().to_string();
+        let survivor = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![],
+        };
+
+        for (snapshot_id, path, seq) in [
+            (&emptied, "e1.vortex", 1),
+            (&emptied, "e2.vortex", 2),
+            (&survivor, "s.vortex", 3),
+        ] {
+            catalog
+                .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
+                .await
+                .expect("seed manifest row");
+            catalog
+                .upsert_snapshot_file_statistics(&seed_stats(snapshot_id, path))
+                .await
+                .expect("seed stats row");
+        }
+
+        catalog
+            .clear_snapshot_cached_metadata(&table_id, &emptied)
+            .await
+            .expect("clear emptied snapshot cached metadata");
+
+        // The emptied snapshot's manifest rows are gone (the leak this fix closes).
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &emptied)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "emptied snapshot manifest rows must be deleted by the cleanup"
+        );
+        // Its stats-cache rows are gone too.
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &emptied, "e1.vortex")
+                .await
+                .expect("read stats")
+                .is_none(),
+            "emptied snapshot stats-cache rows must be deleted by the cleanup"
+        );
+        // A snapshot outside the emptied set is untouched.
+        let survivor_files = catalog
+            .get_snapshot_files(&table_id, &survivor)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            survivor_files.len(),
+            1,
+            "a snapshot outside the emptied set must be untouched"
+        );
+        assert_eq!(survivor_files[0].file_path, "s.vortex");
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &survivor, "s.vortex")
+                .await
+                .expect("read stats")
+                .is_some(),
+            "a snapshot outside the emptied set must keep its stats-cache rows"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
     /// Regression: the merged-away-row deletes must stay INSIDE the CAS guard.
     /// When one input is no longer active — a concurrent compaction already
     /// consumed it — the swap must return `false` and mutate nothing: it must
@@ -9519,5 +9692,319 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// An Arrow `MAP` whose `entries` field is declared the way the layout forbids, alongside
+    /// one declared correctly and a nested one reached through a `Struct`.
+    fn map_entries_schema(entries_nullable: bool) -> Arc<arrow_schema::Schema> {
+        let entries = |nullable: bool| {
+            arrow_schema::Field::new(
+                "entries",
+                arrow_schema::DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new("keys", arrow_schema::DataType::Utf8, false),
+                        arrow_schema::Field::new("values", arrow_schema::DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                nullable,
+            )
+        };
+        let map_of =
+            |nullable: bool| arrow_schema::DataType::Map(Arc::new(entries(nullable)), false);
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("headers", map_of(entries_nullable), true),
+            arrow_schema::Field::new(
+                "wrapped",
+                arrow_schema::DataType::Struct(
+                    vec![arrow_schema::Field::new(
+                        "inner",
+                        map_of(entries_nullable),
+                        true,
+                    )]
+                    .into(),
+                ),
+                true,
+            ),
+        ]))
+    }
+
+    fn map_test_catalog(name: &str) -> (Arc<CayenneCatalog>, String) {
+        let test_db = format!("sqlite://./.test_{name}_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
+        (catalog, test_db)
+    }
+
+    fn remove_test_db(test_db: &str) {
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Read `cayenne_table.schema_json` back exactly as it is stored, without the repair
+    /// `get_table` applies — so a test can ask what was actually persisted rather than what
+    /// the read path hands back.
+    async fn stored_schema_bytes(
+        catalog: &CayenneCatalog,
+        table_name: &str,
+    ) -> arrow_schema::Schema {
+        let schema_json = catalog
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT schema_json FROM cayenne_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("read the stored schema_json");
+        deserialize_schema_ipc_base64(&schema_json).expect("deserialize the stored schema")
+    }
+
+    /// Put the pre-conformance declaration back under `table_name`, the way a metastore
+    /// written by an earlier Spice already holds it.
+    async fn store_legacy_declaration(catalog: &CayenneCatalog, table_name: &str) {
+        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
+            .expect("serialize the legacy declaration");
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
+                params: vec![
+                    MetastoreValue::Text(legacy),
+                    MetastoreValue::Text(table_name.to_string()),
+                ],
+            })
+            .await
+            .expect("store the legacy declaration");
+        assert_eq!(
+            stored_schema_bytes(catalog, table_name).await,
+            *map_entries_schema(true),
+            "the test must start from a genuinely non-conforming stored declaration"
+        );
+    }
+
+    fn map_table_options(
+        table_name: &str,
+        schema: Arc<arrow_schema::Schema>,
+        base_path: String,
+    ) -> CreateTableOptions {
+        CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path,
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        }
+    }
+
+    /// The Arrow map layout forbids a nullable `entries` field, and a table persisted under
+    /// one can never be read: every kernel that rebuilds the column reports `MapArray entries
+    /// cannot contain nulls`. `create_table` therefore has to persist the conforming
+    /// declaration, not the one the producer asked for.
+    ///
+    /// Asserted against the stored bytes rather than `get_table`, whose own repair would
+    /// otherwise hide a create path that still writes the illegal declaration.
+    #[tokio::test]
+    async fn create_table_persists_a_conforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_create");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_create",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        assert_eq!(
+            stored_schema_bytes(&catalog, "map_create").await,
+            *map_entries_schema(false),
+            "the persisted declaration must conform to the Arrow map layout, and only the entries nullability may change — every other field, type and metadata is carried across"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// A table whose stored declaration was persisted before that correction — by an earlier
+    /// Spice, or by any path that wrote the producer's own declaration through — does not
+    /// self-heal on its own: the rule that keeps a stored schema canonical across a
+    /// nullability difference is exactly what holds the illegal declaration in place. Reading
+    /// it back repairs it, which costs no file rewrite because nullability lives in the type
+    /// rather than in any buffer.
+    #[tokio::test]
+    async fn get_table_repairs_a_stored_nonconforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_legacy");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_legacy",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        store_legacy_declaration(&catalog, "map_legacy").await;
+
+        assert_eq!(
+            *catalog
+                .get_table("map_legacy")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
+            "a stored declaration that violates the Arrow map layout must be repaired on read"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// The user-visible consequence of the two mechanisms together. A source that reports the
+    /// conforming declaration — which is what every Arrow decode point now hands over — against
+    /// a table stored under the illegal one is not a configuration change and must not be
+    /// treated as one: the schema difference is a nullability tighten, which keeps the stored
+    /// schema canonical, so the correction would never reach the table and the column would
+    /// stay unreadable for the life of the accelerator.
+    #[tokio::test]
+    async fn a_conforming_source_schema_is_not_a_configuration_change_against_a_stored_one() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_revalidate");
+        catalog.init().await.expect("init catalog");
+
+        let table_id = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(true),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        store_legacy_declaration(&catalog, "map_revalidate").await;
+
+        let reopened = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(false),
+                base_path,
+            ))
+            .await
+            .expect("reopening the table with the conforming declaration must not be refused");
+        assert_eq!(
+            reopened, table_id,
+            "the table must be reopened rather than treated as reconfigured"
+        );
+        assert_eq!(
+            *catalog
+                .get_table("map_revalidate")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
+            "the reopened table must be planned against a readable declaration"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// Why the conform sits at the *entry* of `create_table` rather than where the schema is
+    /// serialized: `options.schema` is compared against the stored one long before anything is
+    /// persisted, by `configuration_matches` — which is not the widening classifier and does
+    /// not normalize. Handed the producer's own declaration it reports a reconfiguration, so a
+    /// producer that never stops sending it would look like one on every load.
+    #[tokio::test]
+    async fn configuration_matching_does_not_normalize_a_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_requested");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_requested",
+                map_entries_schema(false),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        // The source still declares `entries` nullable, as it did before the ingress
+        // correction reached it.
+        let raw = map_table_options("map_requested", map_entries_schema(true), base_path.clone());
+        assert!(
+            matches!(
+                catalog
+                    .validate_existing_table_configuration("map_requested", &raw)
+                    .await,
+                Err(CatalogError::ChangedConfiguration { .. })
+            ),
+            "this comparison is what the entry-of-create_table conform exists to get ahead of"
+        );
+
+        // Conformed first — which is what `create_table` does — it is not a change at all.
+        let conformed = map_table_options("map_requested", map_entries_schema(false), base_path);
+        catalog
+            .validate_existing_table_configuration("map_requested", &conformed)
+            .await
+            .expect("a declaration the Arrow map layout forbids is not a configuration change");
+
+        remove_test_db(&test_db);
+    }
+
+    /// The repair touches map entries and nothing else: a schema carrying no `MAP` — including
+    /// its field and schema metadata, which Cayenne stores and compares — round-trips
+    /// unchanged, so nothing else in the stored declaration moves under it.
+    #[tokio::test]
+    async fn a_schema_without_a_map_round_trips_unchanged() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_untouched");
+        catalog.init().await.expect("init catalog");
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("unit".to_string(), "bytes".to_string());
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("origin".to_string(), "test".to_string());
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("size", arrow_schema::DataType::Int64, true)
+                    .with_metadata(field_metadata),
+            ],
+            schema_metadata,
+        ));
+
+        catalog
+            .create_table(map_table_options(
+                "map_untouched",
+                Arc::clone(&schema),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        assert_eq!(
+            stored_schema_bytes(&catalog, "map_untouched").await,
+            *schema
+        );
+        assert_eq!(
+            *catalog
+                .get_table("map_untouched")
+                .await
+                .expect("get table")
+                .schema,
+            *schema
+        );
+
+        remove_test_db(&test_db);
     }
 }
