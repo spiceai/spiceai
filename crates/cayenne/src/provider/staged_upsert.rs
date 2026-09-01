@@ -52,7 +52,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use super::Error;
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::delta_encoding::WriteClass;
+use super::delta_encoding::WritePolicy;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
@@ -264,6 +264,12 @@ impl CayenneStagedUpsert {
             });
         }
 
+        // Taken before the publish below, which makes this transaction's staged
+        // rows visible while the `num_rows` delta describing them only reaches
+        // the maintenance queue afterwards. Released on drop if the commit
+        // returns early — nothing was published.
+        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
+
         // visibility lock then listing fence — the same order as
         // `apply_under_barrier` and the sync on-conflict publish.
         let _visibility = self.table.visibility_lock_arc().lock_owned().await;
@@ -290,6 +296,11 @@ impl CayenneStagedUpsert {
             .commit_on_conflict_publish(update, Some((&self.new_snapshot_id, new_sequence)))
             .await;
 
+        // The rows are visible now, so the claim survives from here: a commit
+        // that dies after publishing has left rows it will never queue a delta
+        // for.
+        let published_live_rows_delta = reserved_live_rows_delta.published();
+
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)
@@ -301,6 +312,7 @@ impl CayenneStagedUpsert {
             false,
             retention_requested,
             live_rows_delta,
+            published_live_rows_delta,
         );
         if retention_requested {
             self.table.clear_cached_pk_keyset();
@@ -427,6 +439,10 @@ impl PreparedTxnCommit {
     /// Returns an error only if swapping the in-memory deletion caches fails.
     pub fn finish(self) -> Result<u64> {
         let sequence = self.publish.snapshot_sequence;
+        // Taken before the publish below, which makes this transaction's staged
+        // rows visible while the `num_rows` delta describing them only reaches
+        // the maintenance queue afterwards.
+        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
         // The fused transaction publish just made this transaction's staged rows
@@ -439,6 +455,8 @@ impl PreparedTxnCommit {
         // (conservative base-scan fallback); feeding the staged batches as
         // retraction+insert deltas for incremental maintenance is a follow-up.
         self.table.feed_staged_ivm_under_fence(None);
+        // The rows are visible now, so the claim survives from here.
+        let published_live_rows_delta = reserved_live_rows_delta.published();
         let retention_requested = self.table.has_retention_delete_filters();
         let live_rows_delta = i64::try_from(self.row_count)
             .unwrap_or(i64::MAX)
@@ -448,6 +466,7 @@ impl PreparedTxnCommit {
             false,
             retention_requested,
             live_rows_delta,
+            published_live_rows_delta,
         );
         if retention_requested {
             self.table.clear_cached_pk_keyset();
@@ -541,7 +560,7 @@ impl CayenneTableProvider {
                 // Unknown size (the validation stream is consumed lazily); shard
                 // across the full write concurrency, matching `begin_staged_append`.
                 None,
-                WriteClass::Delta,
+                WritePolicy::DELTA,
             )
             .await
         {

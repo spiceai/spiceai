@@ -54,7 +54,6 @@ use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
-use util::{in_tracing_context, in_tracing_context_async};
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -445,17 +444,27 @@ impl RuntimeBuilder {
                         .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
             }
             if let Some(av) = spicepod_rt.params.get(CAYENNE_METASTORE_AUTO_VACUUM_PARAM) {
-                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
-                    "none" => cayenne::SqliteAutoVacuum::None,
-                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
-                    "full" => cayenne::SqliteAutoVacuum::Full,
+                let mode = match av.to_lowercase().as_str() {
+                    "none" => Some(cayenne::SqliteAutoVacuum::None),
+                    "incremental" => Some(cayenne::SqliteAutoVacuum::Incremental),
+                    "full" => Some(cayenne::SqliteAutoVacuum::Full),
                     other => {
                         tracing::warn!(
-                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                            "Invalid `cayenne_metastore_auto_vacuum` value '{other}'; expected none|incremental|full. Keeping the default, so metastore page reclamation is unchanged. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
                         );
-                        cayenne::SqliteAutoVacuum::None
+                        None
                     }
                 };
+                // Like every sibling tunable in this block, an unusable value
+                // leaves `metastore_cfg` on the value it already holds — one
+                // source for the default, which cannot drift when it moves.
+                if let Some(mode) = mode {
+                    metastore_cfg.auto_vacuum = mode;
+                }
+                log_applied_cayenne_param(
+                    CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+                    mode.map(|_| av.to_lowercase()),
+                );
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,
@@ -850,7 +859,11 @@ impl RuntimeBuilder {
             let mut extension = factory.create();
             let extension_name = extension.name();
             if let Err(err) = extension.initialize(&rt).await {
-                eprintln!("Failed to initialize extension {extension_name}: {err}");
+                tracing::error!(
+                    "Failed to initialize extension '{extension_name}', so the features it \
+                     provides are unavailable: {cause} See: https://spiceai.org/docs",
+                    cause = util::single_line(&err.to_string())
+                );
             } else {
                 extensions.insert(extension_name.into(), extension.into());
             }
@@ -866,18 +879,15 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app {
-            // `load_secrets` runs before `spiced::init_tracing` installs the
-            // global subscriber, so any `tracing::*` events emitted by
-            // `Secrets::load_from` and the per-store `init()` paths would
-            // otherwise be dropped on the floor. That hides actionable errors
-            // like "Vault address unreachable" or "AWS credentials missing"
-            // and leaves the operator with only the downstream
-            // "undefined store" message at lookup time. Wrap the await in a
-            // temporary subscriber so those diagnostics surface.
-            if let Err(e) = in_tracing_context_async(secrets.load_from(&app.secrets)).await {
-                eprintln!("Error loading secret stores: {e}");
-            }
+        if let Some(app) = app
+            && let Err(e) = secrets.load_from(&app.secrets).await
+        {
+            tracing::error!(
+                "Failed to load the secret stores declared in the spicepod, so components \
+                 resolving a secret reference will not start: {cause} \
+                 See: https://spiceai.org/docs/components/secret-stores",
+                cause = util::single_line(&e.to_string())
+            );
         }
 
         secrets
@@ -1006,19 +1016,15 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
         .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
-            );
-        });
+        tracing::warn!(
+            "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
+        );
     }
 
     if memory_limit == Some(0) {
-        in_tracing_context(|| {
-            tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
-            );
-        });
+        tracing::warn!(
+            "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
+        );
         None
     } else {
         memory_limit

@@ -3529,15 +3529,37 @@ mod tests {
     /// the dataset loads, and the first query touching a time zone fails, in an
     /// environment that may have no network to install the extension from.
     ///
+    /// An in-memory `DuckDB` cut off from the host's extension cache and from the
+    /// network, so an extension is available only if it is compiled in.
+    ///
+    /// Both guards below need this. `duckdb_extensions()` lets a downloaded copy
+    /// shadow a statically linked one — the disk scan marks the extension
+    /// installed, and the loaded-extension pass then leaves `install_mode` alone —
+    /// so a host with a warm `~/.duckdb` cache reports `REPOSITORY` for an
+    /// extension that is in fact linked in. In the other direction, autoinstall
+    /// would let a download satisfy the behavioural queries on a build that had
+    /// lost the static link. An empty extension directory closes both.
+    ///
+    /// The `TempDir` is returned because dropping it removes the directory.
+    fn isolated_duckdb() -> (tempfile::TempDir, duckdb::Connection) {
+        let dir = tempfile::tempdir().expect("temp extension directory");
+        let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
+        db.execute_batch(&format!(
+            "SET extension_directory = '{}';
+             SET autoinstall_known_extensions = false;
+             SET autoload_known_extensions = false;",
+            dir.path().display()
+        ))
+        .expect("isolates DuckDB from the host extension cache");
+        (dir, db)
+    }
+
     /// How the bundled engine says it obtained `name`.
     ///
     /// `STATICALLY_LINKED` is the only answer that proves the fork patch is
-    /// present. `DuckDB` installs and loads a known extension automatically, so a
-    /// runner with a network or a warm extension cache satisfies a behavioural
-    /// query either way — which would leave the guards below green on a build that
-    /// had lost the static link, and failing only for whoever runs offline.
+    /// present.
     fn bundled_extension_install_mode(name: &str) -> String {
-        let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
+        let (_dir, db) = isolated_duckdb();
         db.query_row(
             "SELECT install_mode FROM duckdb_extensions() WHERE extension_name = ?",
             [name],
@@ -3556,7 +3578,7 @@ mod tests {
             "ICU has to be compiled in, not installed at runtime"
         );
 
-        let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
+        let (_dir, db) = isolated_duckdb();
         let local: String = db
             .query_row(
                 "SELECT strftime(TIMESTAMPTZ '2026-01-01 00:00:00+00' AT TIME ZONE \
@@ -3585,7 +3607,7 @@ mod tests {
             "VSS has to be compiled in, not installed at runtime"
         );
 
-        let db = duckdb::Connection::open_in_memory().expect("opens an in-memory DuckDB");
+        let (_dir, db) = isolated_duckdb();
         db.execute_batch(
             "CREATE TABLE embeddings (v FLOAT[3]);
              INSERT INTO embeddings VALUES ([1.0, 2.0, 3.0]), ([2.0, 3.0, 4.0]);

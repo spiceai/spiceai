@@ -442,6 +442,37 @@ pub fn register_cayenne_telemetry() {
         })
         .build();
 
+    // --- Process-global primary-key keyset byte budget ---
+    // The per-table ceiling (`cayenne_pk_index_budget_bytes`) is derived from
+    // host memory with no view of sibling tables, so several tables can each
+    // believe they may hold gigabytes. This is the aggregate that actually binds:
+    // a table whose index refuses to grow because the FLEET is exhausted looks,
+    // in every per-table gauge, exactly like a table that is simply small.
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_used_bytes")
+        .with_description(
+            "Currently-reserved bytes across all Cayenne primary-key keyset caches; at the total, a table's exact keyset degrades to a bloom instead of growing.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(used) = cayenne::global_pk_keyset_used() {
+                obs.observe(used, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_total_bytes")
+        .with_description(
+            "Total byte ceiling of the process-global Cayenne primary-key keyset budget.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(total) = cayenne::global_pk_keyset_total() {
+                obs.observe(total, &[]);
+            }
+        })
+        .build();
+
     // --- Fleet-wide compaction semaphore ---
     let _ = meter
         .u64_observable_gauge("cayenne_compaction_permits_available")
@@ -2866,6 +2897,83 @@ fn wrap_with_native_vector_indexes(
     }
 }
 
+/// The warning a `mode: memory` acceleration gets when it configures `retention_sql`.
+///
+/// A `retention_sql` predicate reaches the rows only through the deletion sink, which
+/// scans this table's Vortex files — and a memory-mode table has none: its rows live
+/// only in the RAM tier, whose tombstones address rows by primary key rather than by
+/// predicate. Saying so at registration is the point: keeping rows the operator asked
+/// to have deleted, with nothing in the log to explain it, is the worst of the outcomes.
+///
+/// Deliberately NOT extended to `retention_period`, which is a different mechanism:
+/// Cayenne injects it as a scan-time keep filter (`TimeRetentionFilterBuilder`), so
+/// expired rows are hidden from every read whether or not they were physically deleted,
+/// memory mode included. Naming it here would tell the operator their data is exposed
+/// when it is not.
+/// Whether a `mode: memory` acceleration warrants [`memory_mode_retention_warning`].
+///
+/// Deliberately keyed on `retention_sql` alone. `retention_period` is a scan-time keep
+/// filter, so its expired rows are excluded from every read in either mode — warning
+/// about it would tell the operator their data is exposed when it is not. An earlier
+/// revision of this warning did exactly that, which is why the condition is a named
+/// predicate with its own test rather than an inline `||`.
+const fn memory_mode_retention_warning_applies(memory_mode: bool, has_retention_sql: bool) -> bool {
+    memory_mode && has_retention_sql
+}
+
+fn memory_mode_retention_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_sql` is not applied to a `mode: memory` acceleration, so rows matching that predicate stay queryable in the accelerated table. Set `mode: file` to have it applied, or use `retention_period`, which filters expired rows out of every read in either mode. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The warning an acceleration gets when it configures `indexes`.
+///
+/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
+/// none to create — it prunes from the zone maps and primary-key index it derives from
+/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
+/// the half that matters: on the other engines it constrains writes, and here it does
+/// not, which is the kind of difference an operator has to be told about rather than
+/// discover from duplicate rows.
+fn ignored_indexes_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// Whether a `retention_period` acceleration warrants
+/// [`retention_period_never_reclaimed_warning`].
+///
+/// `retention_period` is only ever a scan-time KEEP filter in Cayenne: expired rows are
+/// excluded from every read, and nothing on the engine's write or checkpoint paths
+/// deletes them. Compaction does drop them, but incidentally and only from the files it
+/// happens to rewrite — a full rewrite builds its input from `TableProvider::scan`
+/// (`visible_file_stream_for_rewrite`), and that scan appends the same keep filter, so an
+/// expired row never reaches the new file. Nothing schedules a rewrite on retention's
+/// account, so the reclamation is unpredictable rather than absent, which is what the
+/// warning has to say. The DELETE that reclaims on a schedule comes from the runtime's
+/// periodic retention check, and
+/// `Retention::build` returns `None` unless BOTH `retention_check_enabled` is true and
+/// `retention_check_interval` is set — the interval has no default, so enabling the flag
+/// alone is not enough. Keyed on both for that reason.
+///
+/// `retention_sql` is deliberately absent from this condition: Cayenne applies it through
+/// its own engine-level maintenance, armed by every write, overwrite, and mem-tier
+/// checkpoint, so it runs whatever the periodic check is set to.
+const fn retention_period_never_reclaimed_warning_applies(
+    has_retention_period: bool,
+    retention_check_enabled: bool,
+    has_retention_check_interval: bool,
+) -> bool {
+    has_retention_period && !(retention_check_enabled && has_retention_check_interval)
+}
+
+fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but no scheduled pass deletes them, so their storage comes back only if a compaction happens to rewrite the files holding them — not on any predictable schedule. Reclaiming it reliably needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -3131,15 +3239,6 @@ impl DataAccelerator for CayenneAccelerator {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(
                         "Cannot specify both 'cayenne_s3_zone_ids' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_ids' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
-                    ),
-                }));
-            }
-
-            // Validate that refresh_append_overlap is not specified
-            if acceleration.refresh_append_overlap.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
                     ),
                 }));
             }
@@ -3477,6 +3576,27 @@ impl DataAccelerator for CayenneAccelerator {
         } else {
             Vec::new()
         };
+
+        if memory_mode_retention_warning_applies(memory_mode, !retention_filters.is_empty()) {
+            tracing::warn!("{}", memory_mode_retention_warning(&table_name));
+        }
+
+        if source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
+        {
+            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        }
+
+        if source.acceleration().is_some_and(|acceleration| {
+            retention_period_never_reclaimed_warning_applies(
+                acceleration.retention_period.is_some(),
+                acceleration.retention_check_enabled,
+                acceleration.retention_check_interval.is_some(),
+            )
+        }) {
+            tracing::warn!("{}", retention_period_never_reclaimed_warning(&table_name));
+        }
 
         // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
         // Uses explicit user config if provided, otherwise falls back to federated table constraints
@@ -4493,6 +4613,142 @@ mod tests {
         assert!(
             detail.contains("Boolean"),
             "the error must say the filter must be a Boolean predicate: {detail}"
+        );
+    }
+
+    /// Every ignored-setting warning owes the reader the same three things, so they are
+    /// asserted once over all of them rather than per message.
+    #[test]
+    fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
+        for warning in [
+            memory_mode_retention_warning("events"),
+            ignored_indexes_warning("events"),
+            retention_period_never_reclaimed_warning("events"),
+        ] {
+            assert!(
+                warning.contains("'events'"),
+                "the warning must name the dataset: {warning}"
+            );
+            assert!(
+                warning.contains("https://spiceai.org/docs"),
+                "the warning must link the docs: {warning}"
+            );
+            assert!(
+                !warning.contains('\n'),
+                "log messages stay on one line: {warning}"
+            );
+        }
+    }
+
+    /// The periodic check needs BOTH the flag and an interval — `Retention::build`
+    /// returns `None` without either, and `retention_check_interval` has no default — so
+    /// warning on the flag alone would stay silent for the config that most looks
+    /// enabled: `retention_check_enabled: true` with no interval set.
+    #[test]
+    fn retention_period_reclaim_warning_needs_both_the_flag_and_the_interval() {
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, false),
+            "neither set: nothing reclaims the rows"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, true, false),
+            "enabled but no interval: `Retention::build` still returns None"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, true),
+            "interval but not enabled: the check never runs"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(true, true, true),
+            "both set: the periodic check reclaims, so the warning would be wrong"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(false, false, false),
+            "no `retention_period`: nothing to reclaim and nothing to warn about"
+        );
+    }
+
+    /// `retention_sql` must not trigger this warning: Cayenne applies it through its own
+    /// engine-level maintenance, armed by every write, overwrite, and mem-tier
+    /// checkpoint, so it runs regardless of the periodic check. Warning about it would
+    /// tell the operator their retention is inert when it is not.
+    #[test]
+    fn retention_period_reclaim_warning_states_the_impact_and_both_settings() {
+        let warning = retention_period_never_reclaimed_warning("events");
+        assert!(
+            warning.contains("retention_check_enabled")
+                && warning.contains("retention_check_interval"),
+            "the fix needs both settings named, or it does not work: {warning}"
+        );
+        assert!(
+            !warning.contains("keeps growing") && !warning.contains("nothing deletes them"),
+            "a compaction rebuilds through `TableProvider::scan`, which appends the same keep \
+             filter, so it DOES drop expired rows — an unqualified \"nothing deletes them\" \
+             overstates the impact: {warning}"
+        );
+        assert!(
+            warning.contains("compaction") && warning.contains("not on any predictable schedule"),
+            "the impact is UNSCHEDULED reclamation, not absent reclamation, and the rows are \
+             hidden either way — say which it is and why: {warning}"
+        );
+        assert!(
+            warning.contains("retention_sql"),
+            "the alternative that does run on every write is the actionable escape: {warning}"
+        );
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_covers_retention_sql_and_spares_retention_period() {
+        assert!(
+            memory_mode_retention_warning_applies(true, true),
+            "a memory-mode table with retention_sql keeps rows the predicate matches"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(true, false),
+            "retention_period alone must NOT warn: its keep filter excludes expired rows \
+             from every read in either mode, so warning would claim an exposure that does \
+             not exist"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(false, true),
+            "a file-mode table applies retention_sql, so there is nothing to warn about"
+        );
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_states_the_impact_and_the_fix() {
+        let warning = memory_mode_retention_warning("events");
+
+        assert!(
+            warning.contains("retention_sql"),
+            "the warning must name the setting it covers: {warning}"
+        );
+        assert!(
+            warning.contains("`retention_period`, which filters expired rows out of every read"),
+            "the warning must not leave the operator thinking period retention is affected \
+             too — it is a scan-time keep filter and works in either mode: {warning}"
+        );
+        assert!(
+            warning.contains("stay queryable"),
+            "the warning must say what the user will observe, not just what was skipped: {warning}"
+        );
+        assert!(
+            warning.contains("`mode: file`"),
+            "the warning must give the actionable fix: {warning}"
+        );
+    }
+
+    #[test]
+    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
+        let warning = ignored_indexes_warning("events");
+
+        assert!(
+            warning.contains("does not constrain writes"),
+            "the warning must say what a `unique` entry will not do: {warning}"
+        );
+        assert!(
+            warning.contains("primary_key") && warning.contains("on_conflict"),
+            "the warning must give the actionable alternative: {warning}"
         );
     }
 

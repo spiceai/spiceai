@@ -37,6 +37,41 @@ pub(super) const CTE_DISTANCE_ALIAS: &str = "__spice_dist";
 pub(super) const DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT: usize = 1000;
 pub(super) const EMPTY_PROJECTION_ROW_COLUMN: &str = "__spice_empty_projection_row";
 
+/// The pushed-down filters together with the schema their columns come from.
+///
+/// The two travel together because the DuckDB rendering needs both: it declines the timestamp
+/// normalization only for a column whose *resolved* type proves the normalization unnecessary, and
+/// a render site holding the filters alone renders a timezone-aware timestamp through
+/// `EPOCH_MS`, which truncates it to whole milliseconds and moves which rows a comparison inside
+/// that millisecond selects.
+#[derive(Clone, Copy)]
+pub(super) struct ScopedFilters<'a> {
+    pub(super) filters: &'a [Expr],
+    pub(super) schema: &'a SchemaRef,
+}
+
+impl ScopedFilters<'_> {
+    fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
+    fn render(&self) -> DataFusionResult<Vec<String>> {
+        self.filters
+            .iter()
+            .map(|filter| render_filter(filter, self.schema))
+            .collect()
+    }
+}
+
+/// Render one filter as DuckDB SQL, against the schema its columns come from.
+///
+/// Both the capability probe and the statement render through here, so they cannot disagree about
+/// what is renderable or about how a given column's type is rendered.
+fn render_filter(filter: &Expr, schema: &SchemaRef) -> DataFusionResult<String> {
+    expr::to_sql_with_engine_and_schema(filter, Some(Engine::DuckDB), Some(schema.as_ref()))
+        .map_err(|e| DataFusionError::Plan(e.to_string()))
+}
+
 /// Build vector search SQL for DuckDB.
 ///
 /// When **no filters** are present, uses a CTE that preserves the clean
@@ -56,7 +91,7 @@ pub(super) fn duckdb_vector_sql(
     table_name: &str,
     embedding_column: &str,
     projected_columns: &[String],
-    filters: &[Expr],
+    filters: ScopedFilters<'_>,
     limit: Option<usize>,
     hnsw: &DuckDBHnswOptions,
     vector_literal: &str,
@@ -123,7 +158,7 @@ fn duckdb_vector_sql_flat(
     table_name: &str,
     embedding_column: &str,
     projected_columns: &[String],
-    filters: &[Expr],
+    filters: ScopedFilters<'_>,
     limit: usize,
     hnsw: &DuckDBHnswOptions,
     vector_literal: &str,
@@ -133,11 +168,7 @@ fn duckdb_vector_sql_flat(
 
     let select_exprs = build_select_exprs(projected_columns, &score_expr);
 
-    let filter_exprs: Vec<String> = filters
-        .iter()
-        .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+    let filter_exprs = filters.render()?;
     let mut predicates = Vec::with_capacity(filter_exprs.len() + 1);
     predicates.push(embedding_not_null_predicate(embedding_column));
     predicates.extend(filter_exprs);
@@ -194,7 +225,7 @@ pub(super) fn duckdb_filter_pushdown(
         return TableProviderFilterPushDown::Unsupported;
     }
 
-    match expr::to_sql_with_engine(filter, Some(Engine::DuckDB)) {
+    match render_filter(filter, schema) {
         Ok(_) => TableProviderFilterPushDown::Exact,
         Err(_) => TableProviderFilterPushDown::Unsupported,
     }
@@ -203,19 +234,61 @@ pub(super) fn duckdb_filter_pushdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use datafusion::common::Column;
     use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
 
     use crate::index::duckdb::hnsw::DuckDBHnswOptions;
 
+    /// A schema in the shape `query_result_schema` builds: the source columns plus `_score`.
+    fn docs_schema(extra: Vec<Field>) -> SchemaRef {
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        fields.extend(extra);
+        fields.push(Field::new(
+            SEARCH_SCORE_COLUMN_NAME,
+            DataType::Float64,
+            false,
+        ));
+        Arc::new(Schema::new(fields))
+    }
+
+    /// A microsecond timestamp literal DuckDB renders with its sub-millisecond digits intact.
+    fn micros_literal(micros: i64) -> Expr {
+        lit(ScalarValue::TimestampMicrosecond(
+            Some(micros),
+            Some("UTC".into()),
+        ))
+    }
+
+    /// The flat (filtered) statement for one filter, rendered against `schema`.
+    fn flat_sql(schema: &SchemaRef, filter: &Expr) -> DataFusionResult<String> {
+        duckdb_vector_sql(
+            "docs",
+            "body_embedding",
+            &["id".to_string()],
+            ScopedFilters {
+                filters: std::slice::from_ref(filter),
+                schema,
+            },
+            Some(10),
+            &DuckDBHnswOptions::default(),
+            "[1.0, 0.0]::FLOAT[2]",
+        )
+    }
+
     #[test]
     fn duckdb_vector_sql_orders_by_distance_and_projects_score() {
+        let schema = docs_schema(vec![]);
         let sql = duckdb_vector_sql(
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &[],
+            ScopedFilters {
+                filters: &[],
+                schema: &schema,
+            },
             Some(10),
             &DuckDBHnswOptions::default(),
             "[1.0, 0.0]::FLOAT[2]",
@@ -237,11 +310,15 @@ mod tests {
 
     #[test]
     fn duckdb_vector_sql_handles_empty_projection() {
+        let schema = docs_schema(vec![]);
         let sql = duckdb_vector_sql(
             "docs",
             "body_embedding",
             &[],
-            &[],
+            ScopedFilters {
+                filters: &[],
+                schema: &schema,
+            },
             Some(10),
             &DuckDBHnswOptions::default(),
             "[1.0, 0.0]::FLOAT[2]",
@@ -263,10 +340,7 @@ mod tests {
 
     #[test]
     fn duckdb_filter_pushdown_rejects_score_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
-        ]));
+        let schema = docs_schema(vec![]);
         let filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
 
         assert_eq!(
@@ -277,10 +351,7 @@ mod tests {
 
     #[test]
     fn duckdb_filter_pushdown_allows_base_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
-        ]));
+        let schema = docs_schema(vec![]);
         let filter = col("id").gt(lit(10_i64));
 
         assert_eq!(
@@ -291,10 +362,7 @@ mod tests {
 
     #[test]
     fn duckdb_filter_pushdown_rejects_mixed_score_filter() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
-        ]));
+        let schema = docs_schema(vec![]);
         let filter = col("id")
             .gt(lit(10_i64))
             .and(col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5)));
@@ -307,11 +375,15 @@ mod tests {
 
     #[test]
     fn duckdb_vector_sql_applies_default_limit() {
+        let schema = docs_schema(vec![]);
         let sql = duckdb_vector_sql(
             "docs",
             "body_embedding",
             &["id".to_string()],
-            &[],
+            ScopedFilters {
+                filters: &[],
+                schema: &schema,
+            },
             None,
             &DuckDBHnswOptions::default(),
             "[1.0, 0.0]::FLOAT[2]",
@@ -323,12 +395,16 @@ mod tests {
 
     #[test]
     fn duckdb_vector_sql_uses_flat_query_with_filters() {
-        let filter = col("id").gt(lit(10_i64));
+        let schema = docs_schema(vec![]);
+        let filters = vec![col("id").gt(lit(10_i64))];
         let sql = duckdb_vector_sql(
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &[filter],
+            ScopedFilters {
+                filters: &filters,
+                schema: &schema,
+            },
             Some(10),
             &DuckDBHnswOptions::default(),
             "[1.0, 0.0]::FLOAT[2]",
@@ -346,11 +422,15 @@ mod tests {
 
     #[test]
     fn duckdb_vector_sql_uses_cte_without_filters() {
+        let schema = docs_schema(vec![]);
         let sql = duckdb_vector_sql(
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &[],
+            ScopedFilters {
+                filters: &[],
+                schema: &schema,
+            },
             Some(10),
             &DuckDBHnswOptions::default(),
             "[1.0, 0.0]::FLOAT[2]",
@@ -368,5 +448,147 @@ mod tests {
              FROM __spice_nn \
              ORDER BY __spice_dist ASC"
         );
+    }
+
+    /// regression test for #13144: a timezone-aware timestamp column is already the type and the
+    /// reference frame the rendered literal is in, so it must be compared directly. Rendered
+    /// through `EPOCH_MS` it is truncated to whole milliseconds, and a comparison inside a
+    /// millisecond then selects a different set of rows than the caller asked for. `flat_sql`
+    /// projects `id` alone, so this also covers a filter on a column the projection drops.
+    #[test]
+    fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
+        let schema = docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+        assert!(
+            !sql.contains("EPOCH_MS"),
+            "a timezone-aware column needs no normalization, so it must not be rendered through whole milliseconds: {sql}"
+        );
+        assert!(
+            sql.contains(r#""ts" > "#),
+            "the column must be compared directly: {sql}"
+        );
+        assert!(
+            sql.contains("1767225600000999"),
+            "the literal must keep its sub-millisecond digits: {sql}"
+        );
+    }
+
+    /// The microsecond count is rendered as an integer, so it must survive past
+    /// 2^53 — the point beyond which a `f64` can no longer hold consecutive
+    /// integers, and a literal routed through one names a neighbouring
+    /// microsecond instead. A comparison against that literal then keeps or
+    /// drops the wrong boundary row, with well-formed SQL either way.
+    #[test]
+    fn a_microsecond_count_past_the_double_bound_is_rendered_exactly() {
+        // One above 2^53, which is the first count a f64 cannot represent.
+        let micros = 9_007_199_254_740_993_i64;
+        let schema = docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+
+        let sql =
+            flat_sql(&schema, &col("ts").gt(micros_literal(micros))).expect("SQL should build");
+
+        assert!(
+            sql.contains(&micros.to_string()),
+            "the literal must name the microsecond it was given, not the nearest one a \
+             double can hold ({micros}): {sql}"
+        );
+    }
+
+    /// The normalization is what makes a *naive* timestamp compare against the rendered UTC
+    /// literal at all, so passing a schema must not remove it there.
+    #[test]
+    fn a_naive_timestamp_filter_keeps_the_utc_normalization() {
+        let schema = docs_schema(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+        assert!(
+            sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("ts") / 1000)"#),
+            "a naive column still has to be pinned to UTC to compare with the literal: {sql}"
+        );
+    }
+
+    /// A column the schema does not carry keeps the normalization, which is what makes the types it
+    /// exists for bind. Only a resolved timezone-aware type declines it.
+    #[test]
+    fn an_unresolved_filter_column_keeps_the_normalization() {
+        let schema = docs_schema(vec![]);
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
+
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
+
+        assert!(
+            sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("ts") / 1000)"#),
+            "an unresolved column must keep the normalization: {sql}"
+        );
+    }
+
+    /// The capability probe promises `Exact` for every filter it accepts, so a filter the probe
+    /// accepts has to be one the statement can render — and one it rejects for being unrenderable
+    /// must be one the statement would have failed on. Both go through `render_filter`, and this
+    /// pins the consequence.
+    #[test]
+    fn the_pushdown_probe_accepts_exactly_the_filters_the_statement_can_render() {
+        let schema = docs_schema(vec![
+            Field::new(
+                "aware",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "naive",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]);
+
+        let renderable = [
+            col("aware").gt(micros_literal(1_767_225_600_000_999)),
+            col("naive").gt(micros_literal(1_767_225_600_000_999)),
+            col("id").gt(lit(10_i64)),
+        ];
+        // Two relations in one expression is the shape the renderer refuses; both column *names*
+        // are in the schema, so the probe gets past its own column check and has to ask the
+        // renderer.
+        let unrenderable = [
+            Expr::from(Column::new(Some("a"), "id")).gt(Expr::from(Column::new(Some("b"), "id")))
+        ];
+
+        for filter in &renderable {
+            assert_eq!(
+                duckdb_filter_pushdown(&schema, filter),
+                TableProviderFilterPushDown::Exact,
+                "the probe must accept {filter}"
+            );
+            flat_sql(&schema, filter).expect("a filter the probe accepted must render");
+        }
+
+        for filter in &unrenderable {
+            assert_eq!(
+                duckdb_filter_pushdown(&schema, filter),
+                TableProviderFilterPushDown::Unsupported,
+                "the probe must reject {filter}"
+            );
+            assert!(
+                flat_sql(&schema, filter).is_err(),
+                "a filter the probe rejected must not render: {filter}"
+            );
+        }
     }
 }

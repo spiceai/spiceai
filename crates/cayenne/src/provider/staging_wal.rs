@@ -943,10 +943,8 @@ impl PreparedStagedAppend {
     }
 
     /// Run best-effort maintenance after the deferred snapshot is visible.
-    pub async fn finish_deferred_snapshot_maintenance(&self) {
-        self.table
-            .finish_deferred_append_snapshot(&self.target_snapshot_id)
-            .await;
+    pub fn finish_deferred_snapshot_maintenance(&self) {
+        self.table.finish_deferred_append_snapshot();
         if let Some(source_snapshot_id) = &self.source_snapshot_id {
             self.table
                 .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
@@ -1202,7 +1200,7 @@ impl CayenneTableProvider {
                 // The prepared insert is a lazily-consumed stream of unknown
                 // size; shard across the full write concurrency (prior behavior).
                 None,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {

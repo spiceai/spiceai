@@ -259,6 +259,9 @@ pub enum Error {
     #[snafu(display("Unable to resolve table provider: {source}"))]
     UnableToResolveTableProvider { source: DataConnectorError },
 
+    #[snafu(display("Unable to set up durable write-back delivery: {source}"))]
+    UnableToGetWriteBackDeliverer { source: DataConnectorError },
+
     #[snafu(display(
         "Table {table_name} was marked as read_write, but the underlying provider only supports reads."
     ))]
@@ -1843,13 +1846,22 @@ impl DataFusion {
                 telemetry::cayenne::track_compaction_memory_pool_used_bytes(compaction_used, &[]);
                 // The RSS read touches the filesystem (procfs on Linux), so it
                 // goes to the blocking pool rather than this worker thread. Once
-                // per interval, off the critical path of every other task.
-                if let Ok(Some(rss)) = tokio::task::spawn_blocking(
-                    crate::resource_monitor::process_resident_memory_bytes,
-                )
-                .await
+                // per interval, off the critical path of every other task. The
+                // anonymous/file split comes from the same read, so it costs only
+                // the extra parse — and it is what makes the gap above readable:
+                // the file-backed half is reclaimable page cache, not memory
+                // anyone is accounting for wrongly.
+                if let Ok(Some(resident)) =
+                    tokio::task::spawn_blocking(crate::resource_monitor::process_resident_memory)
+                        .await
                 {
-                    telemetry::track_process_resident_memory_bytes(rss, &[]);
+                    telemetry::track_process_resident_memory_bytes(resident.total, &[]);
+                    // Only where the platform supplies it: a zeroed split would
+                    // read as "this process holds no anonymous memory", which is
+                    // the misattribution these two gauges exist to prevent.
+                    if let Some(split) = resident.split {
+                        telemetry::track_process_resident_split(split.anon, split.file, &[]);
+                    }
                 }
             }
         });
@@ -3195,6 +3207,20 @@ impl DataFusion {
             }
             AcceleratedWriteMode::WriteBack => {
                 accelerated_table_builder.write_back();
+                // Give the delivery worker a connector-owned deliverer when the
+                // source provides one (Postgres owns each delivery transaction so
+                // it can stamp its id for the CDC echo filter). `None` keeps the
+                // worker's `TableProvider` delivery unchanged. A non-durable or
+                // non-Postgres source returns `None` here without connecting.
+                // `Some(Err(_))` means the dataset needs one but it could not be
+                // set up — that fails dataset setup rather than silently falling
+                // back to unsuppressed delivery.
+                let write_back_deliverer = source
+                    .write_back_deliverer(&RuntimeConnectorContext::for_dataset(dataset), dataset)
+                    .await
+                    .transpose()
+                    .context(UnableToGetWriteBackDelivererSnafu)?;
+                accelerated_table_builder.write_back_deliverer(write_back_deliverer);
             }
             AcceleratedWriteMode::WriteThrough => {
                 // Source-sync write; the accelerator catches up through the refresh

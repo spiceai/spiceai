@@ -27,6 +27,10 @@ mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
 #[cfg(not(target_os = "windows"))]
+mod cayenne_append_overlap;
+#[cfg(not(target_os = "windows"))]
+mod cayenne_append_timestamptz;
+#[cfg(not(target_os = "windows"))]
 mod cayenne_maintained_aggregates;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
@@ -64,12 +68,68 @@ mod refresh;
 #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 mod reload_file_accelerated;
 mod retention_arrow;
+#[cfg(not(target_os = "windows"))]
+mod retention_cayenne;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
+
+/// Queue a refresh of `table`. Callers poll for the result rather than waiting on the
+/// returned notifier: completion signals with `notify_waiters`, which stores no permit,
+/// so a refresh that finishes first would leave a later waiter hanging.
+pub(crate) async fn trigger_refresh(
+    rt: &Arc<runtime::Runtime>,
+    table: &str,
+) -> Result<(), anyhow::Error> {
+    rt.datafusion()
+        .refresh_table(&datafusion::sql::TableReference::from(table), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    Ok(())
+}
+
+/// Run a `COUNT(*)` query and read back its single value.
+pub(crate) async fn count(rt: &Arc<runtime::Runtime>, sql: &str) -> Result<i64, anyhow::Error> {
+    let batches = crate::utils::run_query(rt, sql).await?;
+    let batch = batches
+        .iter()
+        .find(|batch| batch.num_rows() > 0)
+        .ok_or_else(|| anyhow::anyhow!("count query returned no rows"))?;
+    Ok(batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("count column is not Int64"))?
+        .value(0))
+}
+
+/// Rows currently in `table`.
+pub(crate) async fn row_count(
+    rt: &Arc<runtime::Runtime>,
+    table: &str,
+) -> Result<i64, anyhow::Error> {
+    count(rt, &format!("SELECT COUNT(*) AS cnt FROM {table}")).await
+}
+
+/// Whether any `.vortex` file exists under `dir` — the gate a Cayenne test uses to
+/// prove its rows reached a file rather than staying in the metastore's inline tier.
+pub(crate) fn has_vortex_file(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            has_vortex_file(&path)
+        } else {
+            path.extension().is_some_and(|ext| ext == "vortex")
+        }
+    })
+}
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file");

@@ -23,8 +23,6 @@ use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
-use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -46,6 +44,14 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
+
+mod table_factory;
+use table_factory::{AdbcTableFactoryWithPolicy, dialect_for_driver};
+
+/// The factory this connector holds: the managed-driver ADBC factory, with the
+/// federation policy attached by its type. Named because it appears in the drop
+/// plumbing as well as the connector itself.
+type ManagedAdbcTableFactory = AdbcTableFactoryWithPolicy<adbc_driver_manager::ManagedDatabase>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -99,7 +105,7 @@ pub struct Adbc {
     /// Wrapped in `Option` so `Drop` can move the factory to a blocking thread
     /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
     /// (e.g. closing network sessions) that must not run on the async runtime.
-    factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    factory: Option<ManagedAdbcTableFactory>,
     pool: Weak<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
@@ -137,10 +143,7 @@ impl Drop for Adbc {
 
 const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
 
-fn offload_adbc_factory_drop(
-    factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
-    reason: &str,
-) {
+fn offload_adbc_factory_drop(factory: ManagedAdbcTableFactory, reason: &str) {
     tracing::warn!("{reason}");
     if std::thread::Builder::new()
         .name("adbc-cleanup-overflow".to_string())
@@ -157,15 +160,11 @@ fn offload_adbc_factory_drop(
 /// background thread. The worker thread is created once (on first use) and
 /// processes drop work sequentially with bounded buffering, avoiding both
 /// unbounded thread spawns and unbounded cleanup backlog growth.
-fn adbc_cleanup_sender()
--> &'static std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
-    static SENDER: OnceLock<
-        std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
-    > = OnceLock::new();
+fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<ManagedAdbcTableFactory> {
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<ManagedAdbcTableFactory>> = OnceLock::new();
     SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<
-            AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
-        >(ADBC_CLEANUP_QUEUE_CAPACITY);
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<ManagedAdbcTableFactory>(ADBC_CLEANUP_QUEUE_CAPACITY);
         if std::thread::Builder::new()
             .name("adbc-cleanup".to_string())
             .spawn(move || {
@@ -396,7 +395,7 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
-        is_query_federation_enabled(&params.parameters).map_err(|e| {
+        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
                 connector_component: params.component.clone(),
@@ -532,7 +531,11 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = AdbcTableFactory::new(Arc::clone(&pool));
+        let adbc_factory = AdbcTableFactoryWithPolicy::new(
+            Arc::clone(&pool),
+            federation_enabled,
+            &driver_name_owned,
+        );
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),
@@ -1108,13 +1111,6 @@ fn build_join_context(
         let _ = write!(hash, "{b:02x}");
         hash
     })
-}
-
-pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
-        _ => None,
-    }
 }
 
 /// Checks if an error message indicates an authentication or authorization failure.
@@ -1969,3 +1965,544 @@ data_connector_api::register_data_connector!(
     CONNECTOR_NAME,
     AdbcFactory
 );
+
+#[cfg(test)]
+mod function_support_tests {
+    //! Regression tests for the federation deny-list on the ADBC table
+    //! factory: [`AdbcTableFactoryWithPolicy`] must install the Spice function
+    //! deny-list and honor the `query_federation` setting. Without the
+    //! deny-list, Spice-only UDFs like `json_get_str` are unparsed into the
+    //! SQL sent to the remote database (e.g. `BigQuery`), which cannot
+    //! evaluate them.
+
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use adbc_core::error::{Error as AdbcError, Result as AdbcResult, Status};
+    use adbc_core::options::{
+        InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
+    };
+    use adbc_core::{Connection, Database, Optionable, PartitionedResult, Statement};
+    use arrow::array::{RecordBatch, RecordBatchReader};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::{TableProvider, provider_as_source};
+    use datafusion::logical_expr::{
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
+        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+    };
+    use datafusion::optimizer::AnalyzerRule;
+    use datafusion::prelude::{col, lit};
+    use datafusion::sql::TableReference;
+    use datafusion_federation::sql::federation_analyzer_rule;
+    use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan};
+    use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
+
+    use super::{AdbcTableFactoryWithPolicy, dialect_for_driver};
+
+    fn not_implemented(what: &str) -> AdbcError {
+        AdbcError::with_message_and_status(
+            format!("{what} is not implemented by the stub ADBC driver"),
+            Status::NotImplemented,
+        )
+    }
+
+    fn table_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ])
+    }
+
+    /// Minimal in-process ADBC driver: enough for the connection pool to hand
+    /// out connections and for `AdbcTableFactory::table_provider` to resolve
+    /// the table schema. Everything else reports `NotImplemented`.
+    struct StubDatabase;
+    struct StubConnection;
+    struct StubStatement;
+
+    impl Optionable for StubDatabase {
+        type Option = OptionDatabase;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Database for StubDatabase {
+        type ConnectionType = StubConnection;
+
+        fn new_connection(&self) -> AdbcResult<StubConnection> {
+            Ok(StubConnection)
+        }
+
+        fn new_connection_with_opts(
+            &self,
+            _opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
+        ) -> AdbcResult<StubConnection> {
+            Ok(StubConnection)
+        }
+    }
+
+    impl Optionable for StubConnection {
+        type Option = OptionConnection;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Connection for StubConnection {
+        type StatementType = StubStatement;
+
+        fn new_statement(&mut self) -> AdbcResult<StubStatement> {
+            Ok(StubStatement)
+        }
+
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+
+        fn get_info(
+            &self,
+            _codes: Option<HashSet<InfoCode>>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_info"))
+        }
+
+        fn get_objects(
+            &self,
+            _depth: ObjectDepth,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: Option<&str>,
+            _table_type: Option<Vec<&str>>,
+            _column_name: Option<&str>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_objects"))
+        }
+
+        fn get_table_schema(
+            &self,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: &str,
+        ) -> AdbcResult<Schema> {
+            Ok(table_schema())
+        }
+
+        fn get_table_types(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_table_types"))
+        }
+
+        fn get_statistic_names(&self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_statistic_names"))
+        }
+
+        fn get_statistics(
+            &self,
+            _catalog: Option<&str>,
+            _db_schema: Option<&str>,
+            _table_name: Option<&str>,
+            _approximate: bool,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("get_statistics"))
+        }
+
+        fn commit(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("commit"))
+        }
+
+        fn rollback(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("rollback"))
+        }
+
+        fn read_partition(
+            &self,
+            _partition: impl AsRef<[u8]>,
+        ) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("read_partition"))
+        }
+    }
+
+    impl Optionable for StubStatement {
+        type Option = OptionStatement;
+        fn set_option(&mut self, _key: Self::Option, _value: OptionValue) -> AdbcResult<()> {
+            Err(not_implemented("set_option"))
+        }
+        fn get_option_string(&self, _key: Self::Option) -> AdbcResult<String> {
+            Err(not_implemented("get_option_string"))
+        }
+        fn get_option_bytes(&self, _key: Self::Option) -> AdbcResult<Vec<u8>> {
+            Err(not_implemented("get_option_bytes"))
+        }
+        fn get_option_int(&self, _key: Self::Option) -> AdbcResult<i64> {
+            Err(not_implemented("get_option_int"))
+        }
+        fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
+            Err(not_implemented("get_option_double"))
+        }
+    }
+
+    impl Statement for StubStatement {
+        fn bind(&mut self, _batch: RecordBatch) -> AdbcResult<()> {
+            Err(not_implemented("bind"))
+        }
+
+        fn bind_stream(&mut self, _reader: Box<dyn RecordBatchReader + Send>) -> AdbcResult<()> {
+            Err(not_implemented("bind_stream"))
+        }
+
+        fn execute(&mut self) -> AdbcResult<Box<dyn RecordBatchReader + Send + 'static>> {
+            Err(not_implemented("execute"))
+        }
+
+        fn execute_update(&mut self) -> AdbcResult<Option<i64>> {
+            Err(not_implemented("execute_update"))
+        }
+
+        fn execute_schema(&mut self) -> AdbcResult<Schema> {
+            Err(not_implemented("execute_schema"))
+        }
+
+        fn execute_partitions(&mut self) -> AdbcResult<PartitionedResult> {
+            Err(not_implemented("execute_partitions"))
+        }
+
+        fn get_parameter_schema(&self) -> AdbcResult<Schema> {
+            Err(not_implemented("get_parameter_schema"))
+        }
+
+        fn prepare(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("prepare"))
+        }
+
+        fn set_sql_query(&mut self, _query: impl AsRef<str>) -> AdbcResult<()> {
+            Err(not_implemented("set_sql_query"))
+        }
+
+        fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> AdbcResult<()> {
+            Err(not_implemented("set_substrait_plan"))
+        }
+
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+    }
+
+    /// A projection over a scan of the stub table, so a plan can carry an
+    /// arbitrary expression through the federation `can_execute_plan` check.
+    fn scan_project(expr: Expr) -> LogicalPlan {
+        let source =
+            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+        LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan the stub table")
+            .project(vec![expr])
+            .expect("project the expression")
+            .build()
+            .expect("build the plan")
+    }
+
+    fn udf_expr(name: &str) -> Expr {
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![col("val")]))
+    }
+
+    /// A provider over the stub driver, built the way the connector builds one
+    /// for `driver_name` — same policy, same dialect.
+    async fn stub_table_provider(
+        federation_enabled: bool,
+        driver_name: &str,
+    ) -> Arc<dyn TableProvider> {
+        let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
+        AdbcTableFactoryWithPolicy::new(pool, federation_enabled, driver_name)
+            .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
+            .await
+            .expect("build the ADBC table provider")
+    }
+
+    #[tokio::test]
+    async fn table_factory_denies_spice_functions_from_federation() {
+        let provider = stub_table_provider(true, "sqlite").await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        let federation = adaptor.source.federation_provider();
+
+        let denied = scan_project(udf_expr("json_get_str"));
+        assert!(
+            matches!(
+                federation.analyzer(&denied),
+                Some(FederationAnalyzerForLogicalPlan::Unable)
+            ),
+            "a plan using a Spice-only UDF must not federate to the remote ADBC database"
+        );
+
+        let allowed = scan_project(col("id"));
+        assert!(
+            matches!(
+                federation.analyzer(&allowed),
+                Some(FederationAnalyzerForLogicalPlan::With(_))
+            ),
+            "a plan without Spice-only UDFs must still federate"
+        );
+    }
+
+    /// A `json_get_*` call over the stub table's `val` column.
+    fn json_call(name: &str, path: Vec<Expr>) -> Expr {
+        let mut args = vec![col("val")];
+        args.extend(path);
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; args.len()],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, args))
+    }
+
+    /// Whether a plan carrying `expr` federates to a provider built for
+    /// `driver_name`.
+    async fn federates(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_project(expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_the_json_calls_its_dialect_can_translate() {
+        assert!(
+            federates("bigquery", json_call("json_get_int", vec![lit("a")])).await,
+            "the BigQuery dialect rewrites this into JSON_VALUE, so it must push down"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_str", vec![lit("a")])).await,
+            "the BigQuery dialect guards JSON_VALUE with JSON_QUERY for the string \
+             form, so it must push down too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_bool", vec![lit("a")])).await,
+            "the BigQuery dialect compares JSON_VALUE's rendering for the bool form"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_float", vec![lit("a")])).await,
+            "BigQuery's SAFE_CAST saturates exactly as Rust's f64::FromStr does, so the \
+             float form is translatable too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_length", vec![lit("a")])).await,
+            "an array's and an object's counts each have a BigQuery equivalent"
+        );
+        assert!(
+            federates("bigquery", json_call("json_object_keys", vec![lit("a")])).await,
+            "JSON_KEYS at depth 1 is the object's own keys, which is what this returns"
+        );
+        assert!(
+            federates(
+                "bigquery",
+                json_call("json_get_int", vec![lit("a"), lit(0_i64)])
+            )
+            .await,
+            "a literal path of any length is translatable"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate() {
+        // BigQuery's JSON path argument must be a constant, so a per-row path
+        // has no translation. Federating it would unparse `json_get_int`
+        // verbatim into BigQuery SQL — issue #10703 all over again — so the
+        // plan must stay local instead.
+        assert!(
+            !federates("bigquery", json_call("json_get_int", vec![col("val")])).await,
+            "a per-row path has no BigQuery translation, so the plan must not federate"
+        );
+        assert!(
+            !federates(
+                "bigquery",
+                json_call("json_get_int", vec![lit("a"), col("val")])
+            )
+            .await,
+            "one non-literal element is enough to make the whole path untranslatable"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_int", vec![lit(r#"a"b"#)])).await,
+            "a key the SQL-literal and JSON-path layers quote differently is left local \
+             rather than escaped across both and silently turned into another path"
+        );
+        // The check is per call, not per function: every translated name owes
+        // the same refusals, or the newest handler is the one that federates a
+        // shape it cannot render.
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![col("val")])).await,
+            "a per-row path has no BigQuery translation for the string form either"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![lit(r#"a"b"#)])).await,
+            "an unquotable key is left local for the string form too"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
+        for name in [
+            // Returns a union of every JSON scalar type, which has no SQL type
+            // to unparse into.
+            "json_get",
+            // Returns the matched node's own bytes; JSON_QUERY re-renders it.
+            "json_as_text",
+            // A JSON `null` and a missing key are indistinguishable in
+            // BigQuery, and json_contains tells them apart.
+            "json_contains",
+        ] {
+            assert!(
+                !federates("bigquery", json_call(name, vec![lit("a")])).await,
+                "{name} has no BigQuery translation and must stay denied"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_driver_without_a_spice_dialect_denies_every_json_function() {
+        // The carve-out is BigQuery's, not ADBC's: another driver gets the
+        // plain deny-list and evaluates these locally.
+        for name in [
+            "json_get_int",
+            "json_get_float",
+            "json_get_str",
+            "json_get_bool",
+        ] {
+            assert!(
+                !federates("sqlite", json_call(name, vec![lit("a")])).await,
+                "{name} must not push down to a driver whose dialect cannot rewrite it"
+            );
+        }
+    }
+
+    /// `SELECT id FROM t WHERE <predicate>` over the stub table, run through
+    /// the federation analyzer. The projection keeps the root off the leaf,
+    /// where the analyzer deliberately leaves a bare scan for the provider to
+    /// handle itself.
+    async fn federated_plan(predicate: Expr) -> LogicalPlan {
+        let provider = stub_table_provider(true, "bigquery").await;
+        let plan = LogicalPlanBuilder::scan("t", provider_as_source(provider), None)
+            .expect("scan the stub table")
+            .filter(predicate)
+            .expect("filter on the JSON value")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build the plan");
+
+        federation_analyzer_rule()
+            .analyze(plan, &ConfigOptions::default())
+            .expect("federate what can be federated")
+    }
+
+    #[tokio::test]
+    async fn a_translatable_predicate_federates_as_one_node_with_the_predicate_inside_it() {
+        let analyzed =
+            federated_plan(json_call("json_get_int", vec![lit("a")]).eq(lit(1_i64))).await;
+
+        assert!(
+            is_federated_node(&analyzed),
+            "the predicate translates, so the whole plan is one remote statement: {analyzed}"
+        );
+        assert_eq!(
+            federated_node_count(&analyzed),
+            1,
+            "one remote statement, not one per side: {analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untranslatable_predicate_is_left_above_the_federated_scan() {
+        let analyzed =
+            federated_plan(json_call("json_get_int", vec![col("val")]).eq(lit(1_i64))).await;
+
+        assert!(
+            !is_federated_node(&analyzed),
+            "a per-row path has no translation, so the plan cannot federate whole: {analyzed}"
+        );
+        assert!(
+            analyzed
+                .apply(|node| {
+                    Ok(if matches!(node, LogicalPlan::Filter(_)) {
+                        datafusion::common::tree_node::TreeNodeRecursion::Stop
+                    } else {
+                        datafusion::common::tree_node::TreeNodeRecursion::Continue
+                    })
+                })
+                .map(|recursion| {
+                    recursion == datafusion::common::tree_node::TreeNodeRecursion::Stop
+                })
+                .expect("walk the plan"),
+            "the predicate must be left for the local engine to evaluate: {analyzed}"
+        );
+    }
+
+    fn is_federated_node(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::Extension(extension) if extension.node.name() == "Federated")
+    }
+
+    fn federated_node_count(plan: &LogicalPlan) -> usize {
+        let mut count = 0;
+        plan.apply(|node| {
+            if is_federated_node(node) {
+                count += 1;
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .expect("walk the plan");
+        count
+    }
+
+    #[tokio::test]
+    async fn table_factory_disables_federation_when_configured() {
+        let provider = stub_table_provider(false, "sqlite").await;
+        assert!(
+            (provider.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<FederatedTableProviderAdaptor>()
+                .is_none(),
+            "`query_federation: disabled` must produce a provider that never federates"
+        );
+    }
+}
