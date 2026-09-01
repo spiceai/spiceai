@@ -941,6 +941,9 @@ struct ResolvedNamespaces {
     connection: ConnectionNamespace,
     /// Identifies the remote engine for join pushdown.
     join: ConnectionNamespace,
+    /// Whether the dataset path named the dataset, and so whether the emitted SQL
+    /// will qualify the table with it.
+    dataset_qualified_path: bool,
 }
 
 /// What a pool takes from its configuration: the namespace its connections
@@ -967,6 +970,7 @@ fn resolve_pool_identity(
     let namespaces = resolve_namespaces(driver_name, &params.component, &params.parameters)?;
     let driver_options = driver_options_for_identity(
         driver_name,
+        namespaces.dataset_qualified_path,
         params.parameters.get("driver_options").expose().ok(),
     );
     let join_context = build_join_context(&JoinIdentity {
@@ -997,10 +1001,12 @@ fn resolve_namespaces(
         return Ok(ResolvedNamespaces {
             connection: explicit.clone(),
             join: explicit,
+            dataset_qualified_path: false,
         });
     }
 
     let inferred = infer_bigquery_namespace(component);
+    let inferred_schema = inferred.schema.clone();
     let connection = ConnectionNamespace {
         catalog: explicit.catalog.clone().or(inferred.catalog),
         schema: explicit.schema.clone().or(inferred.schema),
@@ -1023,7 +1029,11 @@ fn resolve_namespaces(
         schema: explicit.schema,
     };
 
-    Ok(ResolvedNamespaces { connection, join })
+    Ok(ResolvedNamespaces {
+        connection,
+        join,
+        dataset_qualified_path: inferred_schema.is_some(),
+    })
 }
 
 fn infer_bigquery_namespace(component: &ConnectorComponent) -> ConnectionNamespace {
@@ -1159,19 +1169,30 @@ struct JoinIdentity<'a> {
 /// The `BigQuery` driver option naming the dataset a connection defaults to.
 const BIGQUERY_DATASET_OPTION: &str = "adbc.bigquery.sql.dataset_id=";
 
-/// Strips the default dataset out of the driver options for identity purposes.
+/// Strips the default dataset out of the driver options for identity purposes,
+/// but only when the emitted SQL will name the dataset itself.
 ///
 /// A `BigQuery` dataset can reach the connector two ways: as the first part of a
 /// dataset-qualified dataset path, or as `adbc.bigquery.sql.dataset_id` in the
-/// driver options. Neither bounds where a query can execute — `BigQuery` resolves
-/// a dataset-qualified reference anywhere in the project — so neither may divide
-/// the identity. Leaving this one in splits a statement into a query per dataset
-/// exactly as the inferred path would.
+/// driver options. Where the path carries it, the unparsed reference carries it
+/// too, so the dataset does not bound where the query can execute and must not
+/// divide the identity — leaving it in splits a statement into a query per
+/// dataset exactly as the inferred path would.
 ///
-/// Everything else in the options stays, the credential included.
-fn driver_options_for_identity(driver_name: &str, driver_options: Option<&str>) -> Option<String> {
+/// Where the path does **not** carry it, the reference is emitted bare and only
+/// the connection's default dataset says which table it means. Two such
+/// connections are not interchangeable: merging them runs every bare name against
+/// whichever pool executes the statement, which silently reads the wrong table.
+/// So the option stays in the identity there, and the statement stays split.
+///
+/// Everything else in the options stays either way, the credential included.
+fn driver_options_for_identity(
+    driver_name: &str,
+    dataset_qualified_path: bool,
+    driver_options: Option<&str>,
+) -> Option<String> {
     let options = driver_options?;
-    if driver_name != "bigquery" {
+    if driver_name != "bigquery" || !dataset_qualified_path {
         return Some(options.to_string());
     }
 
@@ -1857,11 +1878,56 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         );
     }
 
+    /// A bare dataset path is emitted as a bare table reference, so only the
+    /// connection's default dataset says which table it means. Two such
+    /// connections must stay apart: merging them reads every bare name from
+    /// whichever pool ran the statement.
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_bare_paths_stay_split() {
+        let a = bigquery_pool_identity(
+            "adbc:t",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ds_a;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:t",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ds_b;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "bare table references resolve against the connection's dataset, so two \
+             connections defaulting to different datasets must not share a join context"
+        );
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_keeps_dataset_for_bare_paths() {
+        let options = Some("adbc.bigquery.sql.dataset_id=ds_a;adbc.bigquery.sql.project_id=proj");
+        assert_eq!(
+            driver_options_for_identity("bigquery", false, options).as_deref(),
+            options,
+            "a bare path needs the dataset kept, or two of them merge and read one table"
+        );
+        assert_eq!(
+            driver_options_for_identity("bigquery", true, options).as_deref(),
+            Some("adbc.bigquery.sql.project_id=proj"),
+            "a dataset-qualified path emits the dataset itself, so it leaves the identity"
+        );
+    }
+
     #[test]
     fn test_driver_options_for_identity_leaves_other_drivers_alone() {
         let options = Some("Database=sales;Uid=reader");
         assert_eq!(
-            driver_options_for_identity("postgresql", options).as_deref(),
+            driver_options_for_identity("postgresql", true, options).as_deref(),
             options,
             "only BigQuery's default dataset is stripped"
         );

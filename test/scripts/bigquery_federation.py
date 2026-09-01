@@ -178,6 +178,25 @@ SCENARIOS = {
 
 JSON_SCENARIO = "json-cross-dataset"
 
+# Two datasets hold a table of the same name with different rows, reached by bare
+# paths. Nothing in the emitted SQL says which dataset a bare name means, so if
+# these are merged the statement reads one table twice and answers with the wrong
+# rows -- silently. This scenario is a correctness check, not a job count.
+BARE_SCENARIO = "bare-path-datasets"
+BARE_STATEMENT = """SELECT
+  a.src AS core_src,
+  b.src AS ledger_src,
+  a.n + b.n AS total
+FROM t_core AS a
+CROSS JOIN t_ledger AS b"""
+BARE_CONTROL_TEMPLATE = """SELECT
+  a.src AS core_src,
+  b.src AS ledger_src,
+  a.n + b.n AS total
+FROM {core_t} AS a
+CROSS JOIN {ledger_t} AS b"""
+BARE_EXPECTED_ROWS = [{"core_src": "from_core", "ledger_src": "from_ledger", "total": 3}]
+
 
 class HarnessError(RuntimeError):
     """A harness precondition or assertion failed."""
@@ -235,7 +254,7 @@ def distinct_free_ports() -> tuple[int, int]:
     return first, second
 
 
-def setup_sql(project: str, core: str, ledger: str) -> str:
+def setup_sql(project: str, core: str, ledger: str, bare_table: str) -> str:
     return f"""CREATE OR REPLACE TABLE `{project}.{core}.clients` AS
 SELECT * FROM UNNEST([
   STRUCT(1 AS client_id, 'tok-a' AS token, CAST(NULL AS TIMESTAMP) AS archived_at,
@@ -261,6 +280,10 @@ SELECT * FROM UNNEST([
   STRUCT(4, 3, 42.0)
 ]);
 
+CREATE OR REPLACE TABLE `{project}.{core}.{bare_table}` AS SELECT 'from_core' AS src, 1 AS n;
+
+CREATE OR REPLACE TABLE `{project}.{ledger}.{bare_table}` AS SELECT 'from_ledger' AS src, 2 AS n;
+
 CREATE OR REPLACE TABLE `{project}.{ledger}.entries_ledger` AS
 SELECT * FROM UNNEST([
   STRUCT(1 AS entry_id, 1 AS client_id, 5.5 AS amount),
@@ -271,7 +294,7 @@ SELECT * FROM UNNEST([
 """
 
 
-def spicepod(project: str, core: str, ledger: str, driver: Path) -> str:
+def spicepod(project: str, core: str, ledger: str, driver: Path, bare_table: str) -> str:
     """Build the pod the way a real one is written.
 
     Every dataset shares one URI, one project and one credential, and names its own
@@ -291,12 +314,30 @@ def spicepod(project: str, core: str, ledger: str, driver: Path) -> str:
       connection_pool_size: 8
 """
 
+    def bare_dataset(name: str, schema: str, table: str) -> str:
+        """A dataset named only by its table, with the dataset in the driver options.
+
+        The emitted reference is bare, so these two must not be joined into one
+        statement however alike their configuration looks.
+        """
+        return f"""  - from: adbc:{table}
+    name: {name}
+    params:
+      adbc_driver: bigquery
+      adbc_driver_path: {driver}
+      adbc_driver_options: adbc.bigquery.sql.project_id={project};adbc.bigquery.sql.dataset_id={schema};adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;adbc.bigquery.sql.auth_credentials=${{secrets:BIGQUERY_SERVICE_ACCOUNT_JSON}}
+      adbc_uri: bigquery:///{project}
+      connection_pool_size: 8
+"""
+
     entries = "".join(
         [
             dataset("clients", core, "clients"),
             dataset("advances", core, "advances"),
             dataset("entries_core", core, "entries_core"),
             dataset("entries_ledger", ledger, "entries_ledger"),
+            bare_dataset("t_core", core, bare_table),
+            bare_dataset("t_ledger", ledger, bare_table),
         ]
     )
     return f"""version: v1
@@ -588,6 +629,10 @@ def main() -> int:
     stamp = f"{utc_stamp().lower()}_{os.getpid()}"
     core = f"{DATASET_PREFIX}_{stamp}_core"
     ledger = f"{DATASET_PREFIX}_{stamp}_ledger"
+    # Both datasets hold a table of this name. It is stamped so the job census can
+    # match it: a bare reference does not name its dataset, so the dataset-name
+    # predicate cannot find those jobs.
+    bare_table = f"t_{stamp}"
     for dataset in (core, ledger):
         if not DATASET_ID_PATTERN.fullmatch(dataset):
             raise HarnessError(f"Invalid dataset id: {dataset!r}")
@@ -622,7 +667,7 @@ def main() -> int:
                     f"Dataset {project}.{dataset} already exists; rerun for a fresh stamp"
                 ) from error
 
-        setup = setup_sql(project, core, ledger)
+        setup = setup_sql(project, core, ledger, bare_table)
         (output / "setup.sql").write_text(setup, encoding="utf-8")
         setup_job = client.query(setup, location=location)
         setup_job.result()
@@ -632,7 +677,7 @@ def main() -> int:
         harness_jobs = {setup_job.job_id}
         print(f"setup_job={setup_job.job_id} datasets={project}.{{{core},{ledger}}} location={location}")
 
-        pod = spicepod(project, core, ledger, driver)
+        pod = spicepod(project, core, ledger, driver, bare_table)
         pod_path = output / "spicepod.yaml"
         pod_path.write_text(pod, encoding="utf-8")
 
@@ -707,6 +752,17 @@ def main() -> int:
             )
         )
 
+        plan.append(
+            (
+                BARE_SCENARIO,
+                BARE_STATEMENT,
+                BARE_CONTROL_TEMPLATE.format(
+                    core_t=f"`{project}.{core}.{bare_table}`",
+                    ledger_t=f"`{project}.{ledger}.{bare_table}`",
+                ),
+            )
+        )
+
         for name, statement, control_statement in plan:
             (output / f"{name}.sql").write_text(statement + ";\n", encoding="utf-8")
 
@@ -749,7 +805,13 @@ def main() -> int:
 
             observed = observe_jobs(
                 lambda: data_jobs(
-                    client, project, location, since, until, (core, ledger), harness_jobs
+                    client,
+                    project,
+                    location,
+                    since,
+                    until,
+                    (core, ledger, bare_table),
+                    harness_jobs,
                 ),
                 len(statements),
             )
@@ -782,7 +844,9 @@ def main() -> int:
                     f"{name}: rows differ from the direct BigQuery control\n"
                     f"  spice  ={rows!r}\n  bigquery={control!r}"
                 )
-            expected_single = expect == "single" or name == "same-dataset"
+            expected_single = (
+                expect == "single" or name == "same-dataset"
+            ) and name != BARE_SCENARIO
             if expected_single and len(observed) != 1:
                 failures.append(
                     f"{name}: expected one BigQuery job, observed {len(observed)} "
@@ -793,6 +857,17 @@ def main() -> int:
                     f"{name}: BIGQUERY_EXPECT=split expected more than one BigQuery job, "
                     f"observed {len(observed)}"
                 )
+            if name == BARE_SCENARIO:
+                if rows != BARE_EXPECTED_ROWS:
+                    failures.append(
+                        f"{name}: bare table references were resolved against the wrong "
+                        f"dataset\n  expected={BARE_EXPECTED_ROWS!r}\n  actual  ={rows!r}"
+                    )
+                if len(contexts) < 2:
+                    failures.append(
+                        f"{name}: the two datasets share one compute context, so a merged "
+                        f"statement can read one table twice; contexts={contexts}"
+                    )
             if name == JSON_SCENARIO:
                 pushed = "\n".join(statements)
                 missing = [
