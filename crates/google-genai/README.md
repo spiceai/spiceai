@@ -1,6 +1,6 @@
 # google-genai
 
-A Rust client library for the Google Generative AI (Gemini) REST API.
+A Rust client library for Google's Gemini models on Vertex AI.
 
 ## Features
 
@@ -30,7 +30,8 @@ See [examples](./examples)
 
 ## API Reference
 
-See the [Google AI documentation](https://ai.google.dev/api) for detailed API specifications.
+See the [Vertex AI generative AI documentation](https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest)
+for detailed API specifications.
 
 ### Supported Models
 
@@ -39,26 +40,38 @@ See the [Google AI documentation](https://ai.google.dev/api) for detailed API sp
 
 ## Examples
 
-The `examples/` directory contains complete working examples:
+The `examples/` directory contains:
 
-- **`simple_chat.rs`** - Basic text generation with token usage
-- **`streaming.rs`** - Streaming responses with Server-Sent Events
-- **`embeddings.rs`** - Generate text embeddings with multiple inputs
-- **`function_calling.rs`** - Function calling with weather API example
-- **`tool_config_modes.rs`** - Demonstrates different `ToolConfig` modes (AUTO, NONE, ANY with restrictions)
-- **`thinking.rs`** - Using thinking mode for complex reasoning tasks
-- **`cached_content.rs`** - Using cached content for optimized queries
+- **`cached_content.rs`** - The request structure for cached content, printed rather than sent
 
-Run examples with:
+Run it with:
 ```bash
-cargo run --example simple_chat
-cargo run --example function_calling
-cargo run --example thinking
+cargo run --example cached_content
 ```
 
 ## Authentication
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/app/apikey).
+Requests are authenticated with an `Authorization: Bearer` token sourced from a
+`token_provider::TokenProvider` — for Vertex AI, a GCP service account JWT-bearer exchange via
+`token_provider::gcp_service_account_token::GcpServiceAccountTokenProvider`.
+
+```rust
+let token_provider = GcpServiceAccountTokenProvider::try_new(
+    &service_account_json,
+    "https://www.googleapis.com/auth/cloud-platform",
+).await?;
+// `location: global` uses the non-regional host (`aiplatform.googleapis.com`, no
+// `{location}-` prefix); every other region uses the regional host.
+let host = if location == "global" {
+    "https://aiplatform.googleapis.com".to_string()
+} else {
+    format!("https://{location}-aiplatform.googleapis.com")
+};
+let base_url = format!(
+    "{host}/v1/projects/{project}/locations/{location}/publishers/google"
+);
+let client = google_genai::Client::with_bearer_token(Arc::new(token_provider), base_url)?;
+```
 
 ## License
 

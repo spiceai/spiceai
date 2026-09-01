@@ -27,11 +27,12 @@ use std::{collections::HashMap, fs, sync::Arc};
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 use super::{
+    AcceleratedComponent,
     dataset::{
         Dataset, ReadyState,
         acceleration::{self, Acceleration},
     },
-    validate_identifier,
+    deprecated_ready_state_warning, validate_identifier,
 };
 use spicepod::semantic::Column;
 
@@ -163,6 +164,23 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 a.snapshots_compaction
             });
 
+        // `acceleration.ready_state` is a legitimate member of the acceleration block, so it
+        // parses cleanly on a view as well as on a dataset. A dataset reads it out of the block
+        // and applies it; resolve it the same way here so the key means one thing wherever it is
+        // written, rather than being accepted and dropped on one of the two components. See
+        // `DatasetBuilder::try_from` for the dataset side.
+        #[expect(deprecated)]
+        let ready_state = match view.acceleration.as_ref().map(|a| a.ready_state) {
+            Some(Some(ready_state)) => {
+                tracing::warn!(
+                    "{}",
+                    deprecated_ready_state_warning(AcceleratedComponent::View, &view.name)
+                );
+                ReadyState::from(ready_state)
+            }
+            _ => ReadyState::from(view.ready_state),
+        };
+
         let acceleration = view
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -195,7 +213,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             acceleration,
             acceleration_snapshot_behavior,
             acceleration_snapshot_compaction,
-            ready_state: ReadyState::from(view.ready_state),
+            ready_state,
             vectors: view.vectors,
             params: view
                 .params
@@ -386,5 +404,156 @@ impl ViewBuilder {
             runtime,
             app,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AcceleratedComponent, ReadyState, ViewBuilder, deprecated_ready_state_warning};
+    use spicepod::component::view as spicepod_view;
+
+    /// Resolves a view from its Spicepod YAML, so the test covers the same parse that a
+    /// `spicepod.yaml` goes through rather than a hand-built struct that could disagree with it.
+    fn ready_state_of(view_yaml: &str) -> ReadyState {
+        let view: spicepod_view::View = yaml::from_str(view_yaml).expect("view yaml parses");
+        ViewBuilder::try_from(view)
+            .expect("view builds")
+            .ready_state
+    }
+
+    /// Regression test for #13615. The key parses on a view whether or not anything reads it, so
+    /// assert the value the built view carries rather than that the Spicepod was accepted.
+    #[test]
+    fn acceleration_ready_state_is_applied_to_a_view() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "a view's `acceleration.ready_state` must reach the built view"
+        );
+    }
+
+    /// The block being switched off does not discard the setting, matching the dataset. That is
+    /// what `spicepod`'s `CONSUMED_WHEN_DISABLED` relies on when it leaves `ready_state` out of
+    /// the "discarded because `enabled: false`" warning.
+    #[test]
+    fn acceleration_ready_state_is_applied_even_when_acceleration_is_disabled() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+acceleration:
+  enabled: false
+  ready_state: on_schema_resolved
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnSchemaResolved);
+    }
+
+    /// The deprecated key wins over the view's own field, the same precedence `DatasetBuilder`
+    /// applies, so the two components cannot resolve the same pair of settings differently.
+    ///
+    /// Both values are non-default and differ from each other. `on_load` would be useless on
+    /// either side: it is the `#[default]`, so a written-out `ready_state: on_load` is
+    /// indistinguishable from an omitted one, and the assertion would hold for an implementation
+    /// that ignored one of the two fields entirely.
+    #[test]
+    fn acceleration_ready_state_takes_precedence_over_the_views_own_field() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+acceleration:
+  enabled: true
+  ready_state: on_registration
+",
+        );
+
+        assert_eq!(
+            ready_state,
+            ReadyState::OnRegistration,
+            "the acceleration block's value must win over the view's own"
+        );
+    }
+
+    #[test]
+    fn the_views_own_ready_state_is_used_when_the_acceleration_block_omits_it() {
+        let ready_state = ready_state_of(
+            r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_registration
+acceleration:
+  enabled: true
+",
+        );
+
+        assert_eq!(ready_state, ReadyState::OnRegistration);
+    }
+
+    #[test]
+    fn a_view_with_no_acceleration_block_uses_its_own_ready_state() {
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+ready_state: on_schema_resolved
+"
+            ),
+            ReadyState::OnSchemaResolved
+        );
+        assert_eq!(
+            ready_state_of(
+                r"
+name: daily_totals
+sql: SELECT 1
+"
+            ),
+            ReadyState::OnLoad,
+            "an unset `ready_state` keeps the default"
+        );
+    }
+
+    /// The wording itself is asserted beside the shared builder in `component::tests`. What is
+    /// specific to the view — and what makes that escaping load-bearing rather than decorative — is
+    /// that a name carrying a newline gets through `ViewBuilder::try_from` at all: a *quoted*
+    /// identifier may legally contain a newline, and `validate_identifier` accepts one, so a name
+    /// that passes validation could otherwise break the line in two and forge a second record.
+    /// `disabled_acceleration_warning` escapes for exactly this reason.
+    #[test]
+    fn a_view_name_carrying_a_newline_cannot_forge_a_second_log_line() {
+        let hostile = "\"api\nWARN forged\"";
+
+        // The escaping only matters if such a name reaches the warning at all, so assert that
+        // the builder accepts it rather than assuming it does.
+        let view: spicepod_view::View =
+            yaml::from_str(&format!("name: {hostile:?}\nsql: SELECT 1\n")).expect("yaml parses");
+        assert!(
+            ViewBuilder::try_from(view).is_ok(),
+            "a quoted identifier containing a newline is accepted by the builder, which is what \
+             makes escaping load-bearing rather than decorative"
+        );
+
+        let message = deprecated_ready_state_warning(AcceleratedComponent::View, hostile);
+        assert!(
+            !message.contains('\n'),
+            "an embedded newline must not survive into the log line: {message:?}"
+        );
+        assert!(
+            message.contains("WARN forged"),
+            "the name is still reported in full, only escaped: {message:?}"
+        );
     }
 }

@@ -34,7 +34,9 @@ datafusion-table-providers = { workspace = true, features = ["adbc-federation"] 
 futures.workspace = true
 parking_lot.workspace = true
 runtime-component = { path = "../../runtime-component" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 secrecy.workspace = true
 sha2.workspace = true
 snafu.workspace = true
@@ -44,6 +46,7 @@ tracing.workspace = true
 [dev-dependencies]
 runtime = { path = "../../runtime" }
 app = { path = "../../app" }
+datafusion-federation = { workspace = true }
 
 [features]
 default = []

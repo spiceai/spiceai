@@ -58,17 +58,16 @@ impl Embed for EmbedGoogle {
         let requests: Vec<EmbedContentRequest> = texts
             .into_iter()
             .map(|v| EmbedContentRequest {
-                model: format!("models/{}", self.g.model),
                 content: Content::user(v),
                 output_dimensionality: self.dimensions,
                 task_type: None,
             })
             .collect();
 
-        let response = self
+        let embeddings = self
             .g
             .client
-            .batch_embed_content(&self.g.model, requests)
+            .batch_embed_content(&self.g.model, &requests)
             .await
             .map_err(|e| Error::FailedToCreateEmbedding {
                 source: Box::new(std::io::Error::other(format!(
@@ -76,13 +75,7 @@ impl Embed for EmbedGoogle {
                 ))),
             })?;
 
-        let embeddings = response
-            .embeddings
-            .into_iter()
-            .map(|emb| emb.values)
-            .collect();
-
-        Ok(embeddings)
+        Ok(embeddings.into_iter().map(|emb| emb.values).collect())
     }
 
     fn model_name(&self) -> Option<&str> {
