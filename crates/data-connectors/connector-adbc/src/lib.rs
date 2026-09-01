@@ -370,30 +370,20 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let connection_namespace =
-            resolve_connection_namespace(&driver_name_owned, &params.component, &params.parameters)
-                .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+        let pool_identity =
+            resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
-                })?;
+                }
+            })?;
 
         let conn_options = build_conn_options(
-            connection_namespace.catalog.as_deref(),
-            connection_namespace.schema.as_deref(),
+            pool_identity.connection_namespace.catalog.as_deref(),
+            pool_identity.connection_namespace.schema.as_deref(),
         );
-
-        // Identity used to decide whether two ADBC-backed tables can be joined
-        // in one federated pushdown: DataFusion's federation optimizer only
-        // merges sub-plans whose `compute_context()` strings match, and
-        // `SqlTable::compute_context()` derives that string from this pool's
-        // `join_push_down()`.
-        let join_context = build_join_context(
-            &uri_str,
-            username,
-            connection_namespace.catalog.as_deref(),
-            connection_namespace.schema.as_deref(),
-        );
+        let join_context = pool_identity.join_context;
 
         let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -940,25 +930,98 @@ fn optional_connection_name(params: &Parameters, name: &str) -> Result<Option<St
     }
 }
 
-fn resolve_connection_namespace(
+/// The two namespaces a connector derives from its configuration.
+///
+/// They are not the same thing, and conflating them is what splits a federated
+/// plan: one says where a connection points by default, the other says which
+/// remote engine a table belongs to.
+#[derive(Debug)]
+struct ResolvedNamespaces {
+    /// Applied to every pooled connection as its default catalog and schema.
+    connection: ConnectionNamespace,
+    /// Identifies the remote engine for join pushdown.
+    join: ConnectionNamespace,
+}
+
+/// What a pool takes from its configuration: the namespace its connections
+/// default to, and the identity deciding which tables may be joined in one
+/// pushed-down statement.
+///
+/// The federation optimizer only merges sub-plans whose `compute_context()`
+/// strings match, and `SqlTable::compute_context()` returns this pool's
+/// `join_push_down()` value verbatim — so `join_context` is what decides whether
+/// one inbound statement reaches the remote engine as one query.
+///
+/// `join_context` is a hash, so it is safe to print in `EXPLAIN` and logs.
+#[derive(Debug)]
+struct PoolIdentity {
+    connection_namespace: ConnectionNamespace,
+    join_context: String,
+}
+
+fn resolve_pool_identity(
+    driver_name: &str,
+    uri: &str,
+    params: &ConnectorParams,
+) -> Result<PoolIdentity> {
+    let namespaces = resolve_namespaces(driver_name, &params.component, &params.parameters)?;
+    let join_context = build_join_context(&JoinIdentity {
+        driver: driver_name,
+        uri,
+        username: params.parameters.get("username").expose().ok(),
+        password: params.parameters.get("password").expose().ok(),
+        driver_options: params.parameters.get("driver_options").expose().ok(),
+        catalog: namespaces.join.catalog.as_deref(),
+        schema: namespaces.join.schema.as_deref(),
+    });
+
+    Ok(PoolIdentity {
+        connection_namespace: namespaces.connection,
+        join_context,
+    })
+}
+
+fn resolve_namespaces(
     driver_name: &str,
     component: &ConnectorComponent,
     params: &Parameters,
-) -> Result<ConnectionNamespace> {
+) -> Result<ResolvedNamespaces> {
     let explicit = ConnectionNamespace {
         catalog: optional_connection_name(params, "catalog")?,
         schema: optional_connection_name(params, "schema")?,
     };
 
     if driver_name != "bigquery" {
-        return Ok(explicit);
+        return Ok(ResolvedNamespaces {
+            connection: explicit.clone(),
+            join: explicit,
+        });
     }
 
     let inferred = infer_bigquery_namespace(component);
-    Ok(ConnectionNamespace {
-        catalog: explicit.catalog.or(inferred.catalog),
-        schema: explicit.schema.or(inferred.schema),
-    })
+    let connection = ConnectionNamespace {
+        catalog: explicit.catalog.clone().or(inferred.catalog),
+        schema: explicit.schema.clone().or(inferred.schema),
+    };
+
+    // BigQuery resolves a dataset-qualified reference anywhere in the project, so
+    // one job can span datasets and the dataset a connection defaults to is not
+    // part of the execution boundary. Dividing on it would put each dataset in its
+    // own federated sub-plan and so its own job. The project (catalog) and the
+    // credential do bound execution, and stay in the identity.
+    //
+    // Only the *inferred* dataset is dropped. It exists only when the dataset path
+    // is dataset-qualified, which is exactly when the emitted SQL qualifies the
+    // table, so tables keep resolving correctly inside a merged statement. An
+    // explicitly configured `schema` is kept: a bare table reference resolves
+    // against it, so two connections defaulting to different schemas are not
+    // interchangeable.
+    let join = ConnectionNamespace {
+        catalog: connection.catalog.clone(),
+        schema: explicit.schema,
+    };
+
+    Ok(ResolvedNamespaces { connection, join })
 }
 
 fn infer_bigquery_namespace(component: &ConnectorComponent) -> ConnectionNamespace {
@@ -1075,37 +1138,53 @@ fn build_conn_options(
     if opts.is_empty() { None } else { Some(opts) }
 }
 
+/// Everything that decides which remote engine an ADBC table is executed by.
+///
+/// Two tables may be joined in one pushed-down statement exactly when every field
+/// here matches: same driver, same endpoint, same credential, same namespace.
+struct JoinIdentity<'a> {
+    driver: &'a str,
+    uri: &'a str,
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+    /// Driver-specific options. For `BigQuery` these carry the service-account
+    /// credential, which is why they belong to the identity: the same project
+    /// reached as two identities is two engines, not one.
+    driver_options: Option<&'a str>,
+    catalog: Option<&'a str>,
+    schema: Option<&'a str>,
+}
+
 /// Builds a hashed join-pushdown context identifier for ADBC connections.
 ///
-/// ADBC URIs are driver-vendor-specific and can mix sensitive credentials
-/// with critical identity information (e.g. `bigquery:///project?DatasetId=x`)
-/// in ways that cannot be reliably parsed. We hash all identity-relevant
-/// parts together (similar to the ODBC connector approach) so that:
+/// ADBC URIs and driver options are driver-vendor-specific and can mix sensitive
+/// credentials with critical identity information (e.g.
+/// `bigquery:///project?DatasetId=x`) in ways that cannot be reliably parsed. We
+/// hash all identity-relevant parts together (similar to the ODBC connector
+/// approach) so that:
 ///
 /// - No secrets are ever exposed in `EXPLAIN` plans (`compute_context=...`)
-/// - Two connections to the same database instance produce the same hash,
-///   enabling federated join pushdown
-/// - Different usernames, catalogs, or schemas produce different hashes,
-///   preventing incorrect cross-credential pushdown
-fn build_join_context(
-    uri: &str,
-    username: Option<&str>,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-) -> String {
+/// - Two connections to the same database instance under the same identity
+///   produce the same hash, enabling federated join pushdown
+/// - A different driver, endpoint, credential, catalog or schema produces a
+///   different hash, preventing incorrect cross-credential pushdown
+fn build_join_context(identity: &JoinIdentity<'_>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(uri.as_bytes());
-    hasher.update(b"\0");
-    if let Some(u) = username {
-        hasher.update(u.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(c) = catalog {
-        hasher.update(c.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(s) = schema {
-        hasher.update(s.as_bytes());
+    // A NUL between fields keeps concatenations from colliding; no configuration
+    // value can contain one.
+    for field in [
+        Some(identity.driver),
+        Some(identity.uri),
+        identity.username,
+        identity.password,
+        identity.driver_options,
+        identity.catalog,
+        identity.schema,
+    ] {
+        if let Some(value) = field {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\0");
     }
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
         let _ = write!(hash, "{b:02x}");
@@ -1662,8 +1741,111 @@ mod tests {
         );
     }
 
+    const TEST_CREDENTIAL_A: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
+adbc.bigquery.sql.auth_credentials={\"client_email\":\"a@example.iam.gserviceaccount.com\"}";
+    const TEST_CREDENTIAL_B: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
+adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceaccount.com\"}";
+
+    async fn bigquery_pool_identity(path: &str, uri: &str, credential: &str) -> PoolIdentity {
+        let dataset = test_dataset(path, "t").await;
+        let parameters = Parameters::new(
+            vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                ("uri".to_string(), SecretString::from(uri)),
+                ("driver_options".to_string(), SecretString::from(credential)),
+            ],
+            "adbc",
+            PARAMETERS,
+        );
+
+        let params = ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            io_runtime: tokio::runtime::Handle::current(),
+        };
+
+        resolve_pool_identity("bigquery", uri, &params).expect("pool identity should resolve")
+    }
+
+    /// The customer-shaped case. A statement joining two `BigQuery` datasets in one
+    /// project under one credential is eligible to run as a single `BigQuery` job,
+    /// which requires both tables to carry one federation compute context — the
+    /// optimizer splits the plan into a sub-plan per context, and each sub-plan
+    /// becomes its own job.
     #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_infers_from_hyphenated_project_path() {
+    async fn test_pool_identity_bigquery_datasets_share_join_context() {
+        let core = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let ledger = bigquery_pool_identity(
+            "adbc:ledger_ds.entries",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+
+        assert_eq!(
+            core.join_context, ledger.join_context,
+            "datasets in one project under one credential must share a join context"
+        );
+
+        // Each connection still defaults to its own dataset; only the join
+        // identity is shared.
+        assert_eq!(core.connection_namespace.schema.as_deref(), Some("core_ds"));
+        assert_eq!(
+            ledger.connection_namespace.schema.as_deref(),
+            Some("ledger_ds")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_projects_are_isolated() {
+        let a = bigquery_pool_identity(
+            "adbc:proj-a.shared_ds.t",
+            "bigquery:///proj-a",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:proj-b.shared_ds.t",
+            "bigquery:///proj-b",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "different projects must not share a join context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_credentials_are_isolated() {
+        let a = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_B,
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "different service-account identities must not share a join context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_namespaces_bigquery_infers_from_hyphenated_project_path() {
         let dataset = test_dataset("adbc:my-project.my_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1678,19 +1860,17 @@ mod tests {
             PARAMETERS,
         );
 
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("bigquery namespace should resolve");
+        let namespace =
+            resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+                .expect("bigquery namespace should resolve")
+                .connection;
 
         assert_eq!(namespace.catalog.as_deref(), Some("my-project"));
         assert_eq!(namespace.schema.as_deref(), Some("my_dataset"));
     }
 
     #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_preserves_explicit_values() {
+    async fn test_resolve_namespaces_bigquery_preserves_explicit_values() {
         let dataset = test_dataset("adbc:my-project.path_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1713,19 +1893,17 @@ mod tests {
             PARAMETERS,
         );
 
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("explicit namespace should be preserved");
+        let namespace =
+            resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+                .expect("explicit namespace should be preserved")
+                .connection;
 
         assert_eq!(namespace.catalog.as_deref(), Some("configured-project"));
         assert_eq!(namespace.schema.as_deref(), Some("configured_dataset"));
     }
 
     #[tokio::test]
-    async fn test_resolve_connection_namespace_rejects_empty_schema() {
+    async fn test_resolve_namespaces_rejects_empty_schema() {
         let dataset = test_dataset("adbc:my_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1741,12 +1919,8 @@ mod tests {
             PARAMETERS,
         );
 
-        let err = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect_err("empty schema should be rejected");
+        let err = resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+            .expect_err("empty schema should be rejected");
 
         assert_eq!(
             err.to_string(),
@@ -1894,14 +2068,34 @@ mod tests {
         is_query_federation_enabled(&params).expect_err("should error on invalid value");
     }
 
+    fn bigquery_identity<'a>(
+        uri: &'a str,
+        driver_options: Option<&'a str>,
+        catalog: Option<&'a str>,
+        schema: Option<&'a str>,
+    ) -> JoinIdentity<'a> {
+        JoinIdentity {
+            driver: "bigquery",
+            uri,
+            username: None,
+            password: None,
+            driver_options,
+            catalog,
+            schema,
+        }
+    }
+
     #[test]
     fn test_build_join_context_no_secrets_in_output() {
-        let ctx = build_join_context(
-            "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
-            Some("admin"),
-            Some("my_catalog"),
-            Some("my_schema"),
-        );
+        let ctx = build_join_context(&JoinIdentity {
+            driver: "bigquery",
+            uri: "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
+            username: Some("admin"),
+            password: Some("hunter2"),
+            driver_options: Some("adbc.bigquery.sql.auth_credentials=SECRET_KEY_MATERIAL"),
+            catalog: Some("my_catalog"),
+            schema: Some("my_schema"),
+        });
         // Hash output must not contain any raw URI or credential fragments
         assert!(
             !ctx.contains("SECRET123"),
@@ -1919,6 +2113,14 @@ mod tests {
             !ctx.contains("my_catalog"),
             "context must not contain raw catalog"
         );
+        assert!(
+            !ctx.contains("hunter2"),
+            "context must not contain raw password"
+        );
+        assert!(
+            !ctx.contains("SECRET_KEY_MATERIAL"),
+            "context must not contain raw credential material from driver options"
+        );
         // Must be a fixed-length hex string (SHA-256 = 64 hex chars)
         assert_eq!(
             ctx.len(),
@@ -1931,17 +2133,35 @@ mod tests {
         );
     }
 
+    fn postgres_identity<'a>(uri: &'a str, username: Option<&'a str>) -> JoinIdentity<'a> {
+        JoinIdentity {
+            driver: "postgresql",
+            uri,
+            username,
+            password: None,
+            driver_options: None,
+            catalog: None,
+            schema: None,
+        }
+    }
+
     #[test]
     fn test_build_join_context_deterministic() {
-        let ctx1 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
-        let ctx2 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
+        let ctx1 = build_join_context(&postgres_identity(
+            "postgresql://host:5432/db",
+            Some("user"),
+        ));
+        let ctx2 = build_join_context(&postgres_identity(
+            "postgresql://host:5432/db",
+            Some("user"),
+        ));
         assert_eq!(ctx1, ctx2, "same inputs must produce the same hash");
     }
 
     #[test]
     fn test_build_join_context_differs_by_username() {
-        let ctx_a = build_join_context("postgresql://host/db", Some("alice"), None, None);
-        let ctx_b = build_join_context("postgresql://host/db", Some("bob"), None, None);
+        let ctx_a = build_join_context(&postgres_identity("postgresql://host/db", Some("alice")));
+        let ctx_b = build_join_context(&postgres_identity("postgresql://host/db", Some("bob")));
         assert_ne!(
             ctx_a, ctx_b,
             "different usernames must produce different hashes"
@@ -1950,9 +2170,109 @@ mod tests {
 
     #[test]
     fn test_build_join_context_differs_by_uri() {
-        let ctx_a = build_join_context("bigquery:///project-a?DatasetId=ds1", None, None, None);
-        let ctx_b = build_join_context("bigquery:///project-b?DatasetId=ds1", None, None, None);
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///project-a?DatasetId=ds1",
+            None,
+            None,
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///project-b?DatasetId=ds1",
+            None,
+            None,
+            None,
+        ));
         assert_ne!(ctx_a, ctx_b, "different URIs must produce different hashes");
+    }
+
+    /// Two `BigQuery` datasets in one project under one credential are one remote
+    /// engine, so they must share a join context and federate as a single job.
+    #[test]
+    fn test_build_join_context_bigquery_same_project_spans_datasets() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            None,
+        ));
+        assert_eq!(
+            ctx_a, ctx_b,
+            "datasets in one project under one credential must share a join context"
+        );
+    }
+
+    #[test]
+    fn test_build_join_context_bigquery_differs_by_project() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///project-a",
+            credential,
+            Some("project-a"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///project-b",
+            credential,
+            Some("project-b"),
+            None,
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different projects must not share a join context"
+        );
+    }
+
+    /// The credential lives in the driver options, not the URI, so identity must
+    /// be taken from them; otherwise one project reached as two service accounts
+    /// would look like one engine.
+    #[test]
+    fn test_build_join_context_bigquery_differs_by_credential() {
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            Some("adbc.bigquery.sql.auth_credentials=service-account-a"),
+            Some("my-project"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            Some("adbc.bigquery.sql.auth_credentials=service-account-b"),
+            Some("my-project"),
+            None,
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different service-account identities must not share a join context"
+        );
+    }
+
+    /// A bare table reference resolves against the connection's default schema, so
+    /// two connections defaulting to different schemas are not interchangeable.
+    #[test]
+    fn test_build_join_context_differs_by_explicit_schema() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            Some("configured_a"),
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            Some("configured_b"),
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different explicitly configured schemas must not share a join context"
+        );
     }
 }
 
