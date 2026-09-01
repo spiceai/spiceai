@@ -58208,6 +58208,120 @@ mod tests {
         );
     }
 
+    /// PK uniqueness across the inline/staged overlap: an inline-seeded key whose
+    /// staged replacement lands in a private file, upserted a SECOND time while
+    /// that first staged append is still registered and unpublished, and with the
+    /// PK cache dropped in between so the keyset is rebuilt inside that window.
+    ///
+    /// Guards the end-to-end outcome — one live row per key, carrying the latest
+    /// value, and an exact `COUNT(*)`. It deliberately does NOT claim to isolate
+    /// [`Self::fold_inflight_staged_keys_into_keyset`]: these keys are already in
+    /// the keyset from the durable inline scan, so the fold's `insert_if_absent`
+    /// is a no-op for them and the assertions below hold with the fold disabled.
+    /// The keys-only-in-a-staged-append case the fold does carry is covered by
+    /// [`Self::keyset_rebuild_sees_an_unpublished_staged_appends_keys`].
+    #[tokio::test]
+    async fn staged_upsert_over_inline_key_with_cleared_cache_leaves_one_row() {
+        let ctx = SessionContext::new();
+        const LINE_COUNT: i64 = 128;
+        let (provider, _catalog, _tmp) = create_order_line_cdc_table_with_inline_max_rows(
+            "inline_staged_cleared_cache",
+            ctx.runtime_env(),
+            usize::try_from(LINE_COUNT).expect("line count fits usize"),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed K inline.
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch(Arc::clone(&schema), 42, LINE_COUNT, 0)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed insert should prepare")
+            .finish()
+            .await
+            .expect("finalize seed insert");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            LINE_COUNT,
+            "precondition: the seed batch must live inline"
+        );
+
+        // First staged upsert of K -> replacement rows go to a private file.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch_with_extra_line(
+                    Arc::clone(&schema),
+                    42,
+                    LINE_COUNT,
+                    1,
+                    43,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged upsert should prepare");
+        assert!(
+            first.has_pending_finalize(),
+            "precondition: the first upsert must stage replacement rows on disk"
+        );
+
+        // The rebuild-and-fold path under test: K is still inline-visible while its
+        // staged file replacement is registered but unpublished.
+        provider.clear_cached_pk_keyset();
+
+        // Second staged upsert of the same keys, prepared while the FIRST staged
+        // append is still registered and unpublished -- that window is what makes
+        // the rebuild fold the staged keys over the still-visible inline copies.
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch_with_extra_line(
+                    Arc::clone(&schema),
+                    42,
+                    LINE_COUNT,
+                    2,
+                    43,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged upsert should prepare");
+
+        // Publish both, oldest first.
+        first.finish().await.expect("finalize first staged upsert");
+        second
+            .finish()
+            .await
+            .expect("finalize second staged upsert");
+
+        let rows = collect_order_line_rows(&ctx, &provider, "inline_staged_cleared_cache").await;
+        for line_number in 1..=LINE_COUNT {
+            let hits: Vec<_> = rows
+                .iter()
+                .filter(|(w_id, d_id, o_id, ol_number, _)| {
+                    *w_id == 1 && *d_id == 1 && *o_id == 42 && *ol_number == line_number
+                })
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "line {line_number} must survive exactly once after two staged upserts over an inline seed, got {hits:?}"
+            );
+            assert_eq!(
+                hits[0].4, 2,
+                "line {line_number} must show the LATEST delivery value, got {hits:?}"
+            );
+        }
+        let count_star = query_count_star(&ctx, &provider, "inline_staged_cleared_cache").await;
+        assert_eq!(
+            count_star,
+            LINE_COUNT + 1,
+            "COUNT(*) must not double-count a key whose staged replacement overlapped an inline copy"
+        );
+    }
+
     /// Ch-Bench durable-path regression: the original order lines are small
     /// enough to live in the metastore inline tier, but the delivery update
     /// overflows the inline gate and stages replacement rows on disk. Source
