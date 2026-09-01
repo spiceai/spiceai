@@ -97,7 +97,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `095504d9c05882c300ef60b625280220f2d4298b` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `3ae41f7df7fae14d0fe21495488fa7dd8d9aa191` | `fix/adbc-retry-dropped-cancel` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `6ce9140c111ca7d24e1ccbaba12ee1cd6398afa8` | `fix/adbc-retry-dropped-cancel` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
