@@ -1,0 +1,22 @@
+---
+source: crates/runtime/tests/github/mod.rs
+expression: batches_to_string(&result_batches)
+---
++---------------------+-----------+-------------+
+| column_name         | data_type | is_nullable |
++---------------------+-----------+-------------+
+| id                  | Utf8      | YES         |
+| pull_request_id     | Utf8      | YES         |
+| pull_request_number | Int64     | YES         |
+| is_resolved         | Boolean   | YES         |
+| is_outdated         | Boolean   | YES         |
+| is_collapsed        | Boolean   | YES         |
+| path                | Utf8      | YES         |
+| line                | Int64     | YES         |
+| start_line          | Int64     | YES         |
+| diff_side           | Utf8      | YES         |
+| resolved_by         | Utf8      | YES         |
+| comments_count      | Int64     | YES         |
+| owner               | Utf8      | NO          |
+| repo                | Utf8      | NO          |
++---------------------+-----------+-------------+
