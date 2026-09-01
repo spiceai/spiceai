@@ -187,14 +187,12 @@ Alternative allocator that may perform better for certain memory allocation patt
 docker pull ghcr.io/spiceai/spiceai-nightly:latest-jemalloc
 ```
 
-**Heap profiling:** the shipped jemalloc build has the heap profiler compiled out, so `MALLOC_CONF=prof:true,…` has no effect on it. Build with `alloc-jemalloc-profiling` to turn the profiler on:
+**Heap profiling:** the shipped jemalloc build has the heap profiler compiled out; build with `alloc-jemalloc-profiling` to turn the profiler on:
 
 ```bash
 make install SPICED_NON_DEFAULT_FEATURES="alloc-jemalloc-profiling"
 MALLOC_CONF=prof:true,prof_prefix=/tmp/spiced.prof spiced
 ```
-
-Such a build reports `allocator: jemalloc-profiling` at startup. Profile with it; measure allocator throughput without it.
 
 ### mimalloc
 
