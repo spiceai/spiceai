@@ -432,9 +432,6 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
     Ok(())
 }
 
-/// One "settle" pass. File compacts small files; memory additionally checkpoints
-/// the RAM tier to durable Vortex files and bakes the seq-prefix (the exact
-/// intersection — mem-tier checkpoint + bake — that surfaced the COUNT(*) drift).
 /// Delete rows whose non-PK `value` is in `[lo, hi)`.
 ///
 /// File only: a filtered client DELETE does not remove un-checkpointed mem-tier
