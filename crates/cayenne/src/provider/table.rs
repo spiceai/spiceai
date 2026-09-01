@@ -58222,8 +58222,9 @@ mod tests {
     /// [`Self::keyset_rebuild_sees_an_unpublished_staged_appends_keys`].
     #[tokio::test]
     async fn staged_upsert_over_inline_key_with_cleared_cache_leaves_one_row() {
-        let ctx = SessionContext::new();
         const LINE_COUNT: i64 = 128;
+
+        let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) = create_order_line_cdc_table_with_inline_max_rows(
             "inline_staged_cleared_cache",
             ctx.runtime_env(),
