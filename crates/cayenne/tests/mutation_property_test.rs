@@ -449,6 +449,9 @@ async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -
     .await
 }
 
+/// One "settle" pass. File compacts small files; memory additionally checkpoints
+/// the RAM tier to durable Vortex files and bakes the seq-prefix (the exact
+/// intersection — mem-tier checkpoint + bake — that surfaced the COUNT(*) drift).
 async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> TestResult<()> {
     // Drain debounced post-write maintenance so the persisted stats (the maintained
     // `num_rows` delta) reflect every committed write before we read/compact.
@@ -715,6 +718,7 @@ fn gen_op(
     let total = w.upsert
         + w.delete
         + w.delete_all
+        + w.delete_predicate
         + w.overwrite
         + w.compact
         + w.restart
