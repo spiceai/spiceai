@@ -6831,7 +6831,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=0cb3781608b89f40c6585618ec3071f83345671a#0cb3781608b89f40c6585618ec3071f83345671a"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=09faed2ad69084070fbe968a31a8cd1f98822f30#09faed2ad69084070fbe968a31a8cd1f98822f30"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -7308,7 +7308,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=642e121192fcc4c3430e28e01e660ee5d189d517#642e121192fcc4c3430e28e01e660ee5d189d517"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=66ebd70a1b79f01e33f1f07846b68e96f2ce53cf#66ebd70a1b79f01e33f1f07846b68e96f2ce53cf"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",

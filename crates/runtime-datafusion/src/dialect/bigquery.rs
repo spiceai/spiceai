@@ -744,7 +744,8 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 ///
 /// The two are near relatives, but the differences are silent: a diverging
 /// pattern changes *which rows match*, not whether the query runs. The known
-/// divergences are Unicode and inline modes. The Perl classes and word
+/// divergences are Unicode, inline modes, character-class algebra, and repeat
+/// bounds. The Perl classes and word
 /// boundaries (`\d`, `\w`, `\s`, `\b` and their negations) are Unicode-aware
 /// in Rust's `regex` and ASCII-only in RE2, so `\d` matches an Arabic-Indic
 /// digit locally and not remotely, and `\p{…}`/`\P{…}` lean on each engine's
@@ -755,13 +756,13 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 /// something both engines agree on. Rather than enumerate agreements, this
 /// accepts only patterns built from constructs with one reading: printable
 /// ASCII, with no escape of those class letters and no group options beyond
-/// `i`, `m` and `s`. [`tests::rusts_perl_classes_are_unicode_aware`] and
-/// [`tests::rust_only_inline_modes_exist`] hold the local halves of the
-/// divergences this guards against.
-///
-/// The scan does not model character classes, so a literal `(` followed by
-/// `?` inside `[…]` is over-rejected; over-rejection only costs pushdown,
-/// never a wrong row.
+/// `i`, `m` and `s`. Rust's set operators inside character classes (`&&`,
+/// `--`, `~~`) are rejected because RE2 reads them as literal punctuation,
+/// and counted repetition bounds above RE2's 1000 limit stay local.
+/// [`tests::rusts_perl_classes_are_unicode_aware`],
+/// [`tests::rust_only_inline_modes_exist`], and
+/// [`tests::rust_supports_regex_features_re2_does_not`] hold the local halves
+/// of the divergences this guards against.
 ///
 /// A single quote and control characters are rejected for a different reason:
 /// the pattern is emitted as a `BigQuery` **raw** string literal (see
@@ -769,6 +770,8 @@ fn literal_utf8(expr: &Expr) -> Option<&str> {
 /// spelling in.
 fn pattern_is_engine_agnostic(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
+    let mut in_character_class = false;
+    let mut previous_class_character = None;
     while let Some(c) = chars.next() {
         if !c.is_ascii() || c.is_ascii_control() || c == '\'' {
             return false;
@@ -788,18 +791,92 @@ fn pattern_is_engine_agnostic(pattern: &str) -> bool {
                     ) {
                         return false;
                     }
+                    previous_class_character = None;
                 }
             },
+            '[' if in_character_class && chars.peek() == Some(&':') => {
+                if !consume_posix_class(&mut chars) {
+                    return false;
+                }
+                previous_class_character = None;
+            }
+            '[' if in_character_class => {
+                // Nested character classes participate in Rust's set algebra
+                // but are not a portable RE2 construct.
+                return false;
+            }
+            '[' => {
+                in_character_class = true;
+                previous_class_character = None;
+            }
+            ']' if in_character_class => {
+                in_character_class = false;
+                previous_class_character = None;
+            }
+            '&' | '-' | '~' if in_character_class => {
+                if previous_class_character == Some(c) {
+                    return false;
+                }
+                previous_class_character = Some(c);
+            }
+            _ if in_character_class => previous_class_character = Some(c),
             '(' if chars.peek() == Some(&'?') => {
                 chars.next();
                 if !group_options_are_engine_agnostic(&mut chars) {
                     return false;
                 }
             }
+            '{' if counted_repetition_exceeds_re2_limit(&chars) => return false,
             _ => {}
         }
     }
     true
+}
+
+/// Whether the characters after an unescaped `{` begin a counted repetition
+/// whose lower or upper bound exceeds RE2's hard limit of 1000. Invalid or
+/// non-repetition brace text is left for the local regex compiler to diagnose.
+fn counted_repetition_exceeds_re2_limit(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut chars = chars.clone();
+    let Some(lower) = repetition_bound(&mut chars) else {
+        return false;
+    };
+    if lower > 1000 {
+        return true;
+    }
+    matches!(chars.next(), Some(','))
+        && repetition_bound(&mut chars).is_some_and(|upper| upper > 1000)
+}
+
+fn repetition_bound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
+    let mut value: Option<u32> = None;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        chars.next();
+        value = Some(value.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+    }
+    value
+}
+
+/// Consume the remainder of a POSIX class such as `[:digit:]` after its
+/// opening `[` has already been read. Both engines support these ASCII
+/// classes, and treating the inner `[` as Rust class nesting would otherwise
+/// unnecessarily keep them local.
+fn consume_posix_class(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.next() != Some(':') {
+        return false;
+    }
+    let mut saw_name_character = false;
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&']') {
+            chars.next();
+            return saw_name_character;
+        }
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        saw_name_character = true;
+    }
+    false
 }
 
 /// Reads the `…` of a `(?…` group head, accepting only what both engines
@@ -1439,6 +1516,18 @@ mod tests {
                 vec![col("code"), lit("(ab)?c")],
             ),
             (
+                "counted repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1,1000}")],
+            ),
+            (
+                "an open-ended repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1000,}")],
+            ),
+            (
+                "single class punctuation without a Rust set operator",
+                vec![col("code"), lit("[a&~-]")],
+            ),
+            (
                 "an escaped parenthesis before a question mark",
                 vec![col("code"), lit(r"\(?a")],
             ),
@@ -1505,6 +1594,34 @@ mod tests {
                 vec![col("code"), lit("(?=a)")],
             ),
             ("an empty flag directive", vec![col("code"), lit("(?)a")]),
+            (
+                "an exact repetition above RE2's limit",
+                vec![col("code"), lit("a{1001}")],
+            ),
+            (
+                "an open-ended repetition above RE2's limit",
+                vec![col("code"), lit("a{1001,}")],
+            ),
+            (
+                "an upper repetition bound above RE2's limit",
+                vec![col("code"), lit("a{1,1001}")],
+            ),
+            (
+                "Rust character-class intersection",
+                vec![col("code"), lit("[a&&b]")],
+            ),
+            (
+                "Rust character-class difference",
+                vec![col("code"), lit("[a--b]")],
+            ),
+            (
+                "Rust character-class symmetric difference",
+                vec![col("code"), lit("[a~~b]")],
+            ),
+            (
+                "a nested class used by Rust set algebra",
+                vec![col("code"), lit("[a&&[b]]")],
+            ),
         ] {
             assert!(
                 !can_translate(&call(REGEXP_LIKE_NAME, args)),
@@ -1542,6 +1659,21 @@ mod tests {
         assert!(
             !extended.is_match("a b"),
             "in extended mode the literal space is not part of the pattern"
+        );
+    }
+
+    #[test]
+    fn rust_supports_regex_features_re2_does_not() {
+        assert!(
+            regex::Regex::new("a{1001}").is_ok(),
+            "Rust must accept a repetition above RE2's 1000 limit, or the bound gate is unnecessary"
+        );
+
+        let intersection =
+            regex::Regex::new("^[a&&b]$").expect("Rust reads character-class intersection");
+        assert!(
+            !intersection.is_match("a") && !intersection.is_match("b"),
+            "Rust must read `&&` as set intersection rather than literal ampersands"
         );
     }
 
@@ -1613,11 +1745,10 @@ mod tests {
 
     #[test]
     fn a_rewritten_null_check_unparses_into_regexp_contains() {
-        // The production path end to end, minus the network: the analyzer rule
+        // The production path end to end, minus the network: the optimizer rule
         // rewrites the NULL-check idiom before federation, and this dialect
         // renders what the rewrite produces.
-        use datafusion::config::ConfigOptions;
-        use datafusion::optimizer::AnalyzerRule;
+        use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new("code", DataType::Utf8, true),
@@ -1638,9 +1769,10 @@ mod tests {
             .build()
             .expect("build");
 
-        let rewritten = crate::analyzer_rule::RegexpMatchNullCheckRewrite::new()
-            .analyze(plan, &ConfigOptions::default())
-            .expect("the rewrite analyzes the plan");
+        let rewritten = crate::optimizer_rule::RegexpMatchNullCheckRewrite::new()
+            .rewrite(plan, &OptimizerContext::new())
+            .expect("the optimizer rule rewrites the plan")
+            .data;
         let sql = unparse_plan(new_bigquery_dialect().as_ref(), &rewritten);
 
         assert!(

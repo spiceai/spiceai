@@ -72,9 +72,10 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 ///    non-matching row), and `REGEXP_EXTRACT` refuses a pattern with more than
 ///    one capturing group. The common reason to call it — a NULL-check asking
 ///    "does it match at all" — is rewritten into `regexp_like` before
-///    federation by [`crate::analyzer_rule::RegexpMatchNullCheckRewrite`],
-///    which the dialect *can* translate; every remaining shape evaluates
-///    locally above the federated scan.
+///    the `BigQuery` capability check by
+///    [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], which the dialect
+///    *can* translate; every remaining shape evaluates locally above the
+///    federated scan.
 #[must_use]
 pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()

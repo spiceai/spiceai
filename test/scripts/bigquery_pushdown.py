@@ -105,9 +105,9 @@ ORDER BY grp, ord""",
 FROM window_values
 ORDER BY grp, ord""",
     # The PostgreSQL-idiom NULL-check over regexp_match. Pushes down whole:
-    # the analyzer rule rewrites it into regexp_like before federation, and
-    # the BigQuery dialect renders that as REGEXP_CONTAINS. On a build without
-    # the rewrite this query fails outright with
+    # the BigQuery provider's optimizer rule rewrites it into regexp_like
+    # before its federation capability check, and the BigQuery dialect renders
+    # that as REGEXP_CONTAINS. On a build without the rewrite this query fails with
     # `invalidQuery: Function not found: regexp_match`.
     "regexp-null-check": """SELECT
   id,

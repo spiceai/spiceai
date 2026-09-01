@@ -19,9 +19,6 @@ pub use duplicate_plan_node::*;
 pub mod partitioned_table_scan_rewrite;
 pub use partitioned_table_scan_rewrite::*;
 
-pub mod regexp_match_null_check;
-pub use regexp_match_null_check::*;
-
 use std::sync::Arc;
 
 use datafusion::optimizer::AnalyzerRule;
@@ -63,12 +60,7 @@ impl AnalyzerRulesBuilder {
     /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added first.
     #[must_use]
     pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
-        // Before federation, which decides pushdown against the plan it is
-        // handed: the NULL-check idiom federates only in its rewritten
-        // `regexp_like` form (`regexp_match` itself is deny-listed for
-        // BigQuery). See `RegexpMatchNullCheckRewrite`.
-        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
-            vec![Arc::new(RegexpMatchNullCheckRewrite::new())];
+        let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
         if self.include_federation {
             rules.push(Arc::new(federation_analyzer_rule()));
         }

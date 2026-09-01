@@ -1997,9 +1997,10 @@ mod function_support_tests {
     use datafusion::prelude::{col, lit};
     use datafusion::sql::TableReference;
     use datafusion_federation::sql::federation_analyzer_rule;
-    use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan};
+    use datafusion_federation::{
+        FederatedPlanNode, FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan,
+    };
     use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
-    use runtime_datafusion::analyzer_rule::RegexpMatchNullCheckRewrite;
 
     use super::{AdbcTableFactoryWithPolicy, dialect_for_driver};
 
@@ -2423,8 +2424,8 @@ mod function_support_tests {
     /// the federation analyzer. The projection keeps the root off the leaf,
     /// where the analyzer deliberately leaves a bare scan for the provider to
     /// handle itself.
-    async fn federated_plan(predicate: Expr) -> LogicalPlan {
-        let provider = stub_table_provider(true, "bigquery").await;
+    async fn federated_plan_for_driver(driver_name: &str, predicate: Expr) -> LogicalPlan {
+        let provider = stub_table_provider(true, driver_name).await;
         let plan = LogicalPlanBuilder::scan("t", provider_as_source(provider), None)
             .expect("scan the stub table")
             .filter(predicate)
@@ -2437,6 +2438,10 @@ mod function_support_tests {
         federation_analyzer_rule()
             .analyze(plan, &ConfigOptions::default())
             .expect("federate what can be federated")
+    }
+
+    async fn federated_plan(predicate: Expr) -> LogicalPlan {
+        federated_plan_for_driver("bigquery", predicate).await
     }
 
     #[tokio::test]
@@ -2548,46 +2553,46 @@ mod function_support_tests {
     }
 
     #[tokio::test]
-    async fn an_unrewritten_null_check_stays_above_the_federated_scan() {
+    async fn a_non_bigquery_provider_does_not_run_the_regexp_rewrite() {
+        let analyzed = federated_plan_for_driver(
+            "sqlite",
+            Expr::IsNotNull(Box::new(expr_fn::regexp_match(
+                col("val"),
+                lit("^R[0-9]{2}"),
+                None,
+            ))),
+        )
+        .await;
+        assert!(
+            is_federated_node(&analyzed),
+            "the non-BigQuery provider should still federate its original expression: {analyzed}"
+        );
+        let LogicalPlan::Extension(extension) = &analyzed else {
+            panic!("expected a federated extension: {analyzed}");
+        };
+        let federated = extension
+            .node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("the extension is a federated plan node");
+        let inner = federated.plan().display_indent().to_string();
+        assert!(
+            inner.contains("regexp_match") && !inner.contains("regexp_like"),
+            "the BigQuery-only pre-federation rewrite must not touch another provider: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_null_check_rewrite_lets_the_regexp_predicate_federate_whole() {
+        // The BigQuery provider supplies the shared optimizer rule to the
+        // federation analyzer. It rewrites the provider-owned candidate before
+        // the capability check, without a global analyzer rule.
         let analyzed = federated_plan(Expr::IsNotNull(Box::new(expr_fn::regexp_match(
             col("val"),
             lit("^R[0-9]{2}"),
             None,
         ))))
         .await;
-        assert!(
-            !is_federated_node(&analyzed),
-            "regexp_match is denied for BigQuery, so the raw NULL-check cannot federate whole: {analyzed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_null_check_rewrite_lets_the_regexp_predicate_federate_whole() {
-        // The production sequence, in miniature: RegexpMatchNullCheckRewrite
-        // runs before the federation analyzer (see
-        // `runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder`), so by the
-        // time federation consults the deny-list the plan carries
-        // `regexp_like`, which the BigQuery dialect translates.
-        let provider = stub_table_provider(true, "bigquery").await;
-        let plan = LogicalPlanBuilder::scan("t", provider_as_source(provider), None)
-            .expect("scan the stub table")
-            .filter(Expr::IsNotNull(Box::new(expr_fn::regexp_match(
-                col("val"),
-                lit("^R[0-9]{2}"),
-                None,
-            ))))
-            .expect("filter on the match")
-            .project(vec![col("id")])
-            .expect("project")
-            .build()
-            .expect("build the plan");
-
-        let rewritten = RegexpMatchNullCheckRewrite::new()
-            .analyze(plan, &ConfigOptions::default())
-            .expect("rewrite the NULL-check");
-        let analyzed = federation_analyzer_rule()
-            .analyze(rewritten, &ConfigOptions::default())
-            .expect("federate what can be federated");
 
         assert!(
             is_federated_node(&analyzed),

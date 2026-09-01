@@ -29,13 +29,19 @@ limitations under the License.
 //! `regexp_matches`).
 
 use datafusion::common::Result;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::config::ConfigOptions;
+use std::sync::Arc;
+
+use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::datasource::DefaultTableSource;
 use datafusion::functions::regex;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDFImpl};
-use datafusion::optimizer::AnalyzerRule;
+use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDFImpl, TableSource};
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+
+type TableProviderPredicate = Arc<dyn Fn(&dyn TableProvider) -> bool + Send + Sync>;
+type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
 
 /// Rewrites `regexp_match(…) IS [NOT] NULL` into the equivalent
 /// `regexp_like(…) IS [NOT] TRUE`.
@@ -53,24 +59,118 @@ use datafusion::optimizer::AnalyzerRule;
 /// | does not match      | false               | false          |
 /// | string/pattern NULL | false               | false          |
 ///
-/// Must run **before** the federation analyzer rule (see
-/// [`crate::analyzer_rule::AnalyzerRulesBuilder`]): federation consults the
-/// per-backend deny-list against the plan it is handed, and for `BigQuery`
-/// `regexp_match` is denied while `regexp_like` translates — the rewrite is
-/// what moves the NULL-check idiom from the first bucket into the second.
-#[derive(Debug, Default)]
-pub struct RegexpMatchNullCheckRewrite;
+/// The rule is provider-independent. Callers choose its execution scope: the
+/// `BigQuery` federation provider runs it before its capability check, while
+/// local engines can install the same rule in their ordinary logical optimizer.
+#[derive(Default)]
+pub struct RegexpMatchNullCheckRewrite {
+    table_source_predicate: Option<TableSourcePredicate>,
+}
 
 impl RegexpMatchNullCheckRewrite {
+    /// Create an unscoped rule.
+    ///
+    /// This form is intended for a plan that has already been scoped to one
+    /// provider, such as a candidate subtree selected by the federation
+    /// analyzer.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create a rule scoped to plans containing only matching table providers.
+    ///
+    /// Runtime registration uses this form to enable the local rewrite for
+    /// Cayenne without changing plans backed by non-federated remote providers.
+    #[must_use]
+    pub fn new_with_table_provider_predicate(
+        table_provider_predicate: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let table_provider_predicate: TableProviderPredicate = Arc::new(table_provider_predicate);
+        Self::new_with_table_source_predicate(move |source| {
+            source
+                .downcast_ref::<DefaultTableSource>()
+                .is_some_and(|source| table_provider_predicate(source.table_provider.as_ref()))
+        })
+    }
+
+    /// Create a rule scoped to plans containing only matching table sources.
+    #[must_use]
+    pub fn new_with_table_source_predicate(
+        table_source_predicate: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            table_source_predicate: Some(Arc::new(table_source_predicate)),
+        }
+    }
+
+    fn plan_is_in_scope(&self, plan: &LogicalPlan) -> Result<bool> {
+        let Some(table_source_predicate) = &self.table_source_predicate else {
+            return Ok(true);
+        };
+
+        let mut saw_table_scan = false;
+        let mut all_table_scans_match = true;
+        plan.apply(|plan| {
+            if let LogicalPlan::TableScan(scan) = plan {
+                saw_table_scan = true;
+                if !table_source_predicate(scan.source.as_ref()) {
+                    all_table_scans_match = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        Ok(saw_table_scan && all_table_scans_match)
+    }
+
+    fn plan_has_rewritable_expression(plan: &LogicalPlan) -> Result<bool> {
+        for expr in plan.expressions() {
+            let mut found = false;
+            expr.apply(|expr| {
+                if matches!(expr, Expr::IsNull(inner) | Expr::IsNotNull(inner)
+                    if regexp_match_call(inner).is_some())
+                {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
-impl AnalyzerRule for RegexpMatchNullCheckRewrite {
-    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+impl std::fmt::Debug for RegexpMatchNullCheckRewrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegexpMatchNullCheckRewrite")
+            .field("scoped", &self.table_source_predicate.is_some())
+            .finish()
+    }
+}
+
+impl OptimizerRule for RegexpMatchNullCheckRewrite {
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up_with_subqueries(|plan| {
+            // This rule is present in the ordinary optimizer for Cayenne, so
+            // make the overwhelmingly common path cheap: do not inspect table
+            // ownership or clone/rebuild the plan unless this node actually
+            // contains the exact regexp NULL-check shape.
+            if !Self::plan_has_rewritable_expression(&plan)? {
+                return Ok(Transformed::no(plan));
+            }
+            if !self.plan_is_in_scope(&plan)? {
+                return Ok(Transformed::no(plan));
+            }
+
             // A rewritten projection expression renders differently, which
             // would rename its output column; the saved name pins the schema.
             let name_preserver = NamePreserver::new(&plan);
@@ -80,7 +180,6 @@ impl AnalyzerRule for RegexpMatchNullCheckRewrite {
                     .map(|transformed| transformed.update_data(|expr| saved_name.restore(expr)))
             })
         })
-        .map(|transformed| transformed.data)
     }
 
     fn name(&self) -> &'static str {
@@ -136,18 +235,20 @@ fn is_regexp_like(expr: &Expr) -> bool {
 /// whose `ScalarUDF::call` wraps a fresh clone of the UDF rather than the
 /// registry's singleton.
 fn regexp_like_of(expr: &Expr) -> Option<Expr> {
-    let Expr::ScalarFunction(call) = expr else {
-        return None;
-    };
-    if !is_datafusion_udf::<regex::regexpmatch::RegexpMatchFunc>(call)
-        || !(2..=3).contains(&call.args.len())
-    {
-        return None;
-    }
+    let call = regexp_match_call(expr)?;
     Some(Expr::ScalarFunction(ScalarFunction::new_udf(
         regex::regexp_like(),
         call.args.clone(),
     )))
+}
+
+fn regexp_match_call(expr: &Expr) -> Option<&ScalarFunction> {
+    let Expr::ScalarFunction(call) = expr else {
+        return None;
+    };
+    (is_datafusion_udf::<regex::regexpmatch::RegexpMatchFunc>(call)
+        && (2..=3).contains(&call.args.len()))
+    .then_some(call)
 }
 
 /// Whether this call's implementation is `DataFusion`'s own `F`. See
@@ -169,6 +270,7 @@ mod tests {
         ColumnarValue, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
         builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
+    use datafusion::optimizer::OptimizerContext;
     use datafusion::prelude::{SessionContext, col, lit};
 
     use super::*;
@@ -189,21 +291,24 @@ mod tests {
         ))
     }
 
-    fn analyze(plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite(plan: LogicalPlan) -> LogicalPlan {
         RegexpMatchNullCheckRewrite::new()
-            .analyze(plan, &ConfigOptions::default())
-            .expect("the rewrite analyzes the plan")
+            .rewrite(plan, &OptimizerContext::new())
+            .expect("the rule rewrites the plan")
+            .data
+    }
+
+    fn null_check_plan() -> LogicalPlan {
+        scan()
+            .filter(Expr::IsNotNull(Box::new(regexp_match_call())))
+            .expect("filter")
+            .build()
+            .expect("build")
     }
 
     #[test]
     fn is_not_null_becomes_regexp_like_is_true() {
-        let plan = analyze(
-            scan()
-                .filter(Expr::IsNotNull(Box::new(regexp_match_call())))
-                .expect("filter")
-                .build()
-                .expect("build"),
-        );
+        let plan = rewrite(null_check_plan());
         let rendered = plan.display_indent().to_string();
         assert!(
             rendered.contains("regexp_like(t.v, Utf8(\"^R[0-9]{2}\")) IS TRUE"),
@@ -216,8 +321,51 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_rule_rewrites_only_matching_table_sources() {
+        let matching = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| true)
+            .rewrite(null_check_plan(), &OptimizerContext::new())
+            .expect("run the matching scoped rule")
+            .data
+            .display_indent()
+            .to_string();
+        assert!(
+            matching.contains("regexp_like") && !matching.contains("regexp_match"),
+            "a matching source must be rewritten: {matching}"
+        );
+
+        let non_matching = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| false)
+            .rewrite(null_check_plan(), &OptimizerContext::new())
+            .expect("run the non-matching scoped rule")
+            .data
+            .display_indent()
+            .to_string();
+        assert!(
+            non_matching.contains("regexp_match") && !non_matching.contains("regexp_like"),
+            "a non-matching source must remain untouched: {non_matching}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_rule_does_not_inspect_table_ownership_without_a_rewrite_candidate() {
+        let plan = scan()
+            .project(vec![regexp_match_call()])
+            .expect("project")
+            .build()
+            .expect("build");
+        let rendered = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| {
+            panic!("the table-source predicate must stay cold without a NULL-check")
+        })
+        .rewrite(plan, &OptimizerContext::new())
+        .expect("run the scoped rule")
+        .data
+        .display_indent()
+        .to_string();
+        assert!(rendered.contains("regexp_match"));
+    }
+
+    #[test]
     fn is_null_becomes_regexp_like_is_not_true() {
-        let plan = analyze(
+        let plan = rewrite(
             scan()
                 .filter(Expr::IsNull(Box::new(regexp_match_call())))
                 .expect("filter")
@@ -237,7 +385,7 @@ mod tests {
         // come out as a single `IS TRUE`, not as `NOT (… IS NOT TRUE)`: both
         // are correct, but the double negation is what every reader of the
         // federated SQL would otherwise puzzle over.
-        let plan = analyze(
+        let plan = rewrite(
             scan()
                 .filter(Expr::Not(Box::new(Expr::IsNull(Box::new(
                     regexp_match_call(),
@@ -261,7 +409,7 @@ mod tests {
     fn a_bare_regexp_match_is_left_alone() {
         // Only the NULL-check idiom has a boolean equivalent. A consumed match
         // list must keep its list semantics.
-        let plan = analyze(
+        let plan = rewrite(
             scan()
                 .project(vec![regexp_match_call()])
                 .expect("project")
@@ -289,7 +437,7 @@ mod tests {
             )),
             vec![col("v"), lit("^R[0-9]{2}")],
         ));
-        let plan = analyze(
+        let plan = rewrite(
             scan()
                 .filter(Expr::IsNotNull(Box::new(imposter)))
                 .expect("filter")
@@ -305,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_null_check_of_something_else_is_left_alone() {
-        let plan = analyze(
+        let plan = rewrite(
             scan()
                 .filter(Expr::IsNotNull(Box::new(col("v"))))
                 .expect("filter")
@@ -331,7 +479,7 @@ mod tests {
             .build()
             .expect("build");
         let original_name = original.schema().field(0).name().clone();
-        let rewritten = analyze(original);
+        let rewritten = rewrite(original);
         assert_eq!(
             rewritten.schema().field(0).name(),
             &original_name,
@@ -385,7 +533,7 @@ mod tests {
             .await
             .expect("plan the query");
 
-        let rewritten_plan = analyze(plan.clone());
+        let rewritten_plan = rewrite(plan.clone());
         let rendered = rewritten_plan.display_indent().to_string();
         assert!(
             rendered.contains("regexp_like") && !rendered.contains("regexp_match"),

@@ -95,6 +95,8 @@ use datafusion_optimizer_rules::{
 };
 #[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
+#[cfg(not(windows))]
+use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
@@ -1314,6 +1316,7 @@ fn with_cayenne_logical_optimizers(
         .take()
         .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
 
+    insert_cayenne_regexp_match_null_check_rewrite(&mut optimizer_rules);
     if cayenne_optimizer_rules.filter_propagation() {
         insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
     }
@@ -1331,6 +1334,32 @@ fn with_cayenne_logical_optimizers(
     }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_regexp_match_null_check_rewrite(
+    rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+) {
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "regexp_match_null_check_rewrite")
+    {
+        // Run before expression simplification so the exact NULL-check idiom
+        // is still visible. The provider predicate makes this a no-op for
+        // federated nodes and for non-federated remote table providers.
+        let insert_at = rules
+            .iter()
+            .position(|rule| rule.name() == "simplify_expressions")
+            .unwrap_or(rules.len());
+        rules.insert(
+            insert_at,
+            Arc::new(
+                RegexpMatchNullCheckRewrite::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
+    }
 }
 
 #[cfg(not(windows))]
@@ -2815,6 +2844,58 @@ mod tests {
             assert!(
                 logical_plan_has_inlist_range_rewrite(&cayenne_plan),
                 "Cayenne-backed query should be rewritten to a range predicate; plan was:\n{cayenne_plan}"
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_regexp_null_check_rewrite_runs_only_for_cayenne_backed_queries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        rt.block_on(async {
+            let fields = || {
+                vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("val", DataType::Utf8, true),
+                ]
+            };
+            register_stat_table(&df.ctx, "plain_regexp", fields(), 100, false);
+            register_stat_table(&df.ctx, "cayenne_regexp", fields(), 100, true);
+
+            let plain = optimized_sql_query_plan(
+                &df.ctx,
+                "SELECT id FROM plain_regexp WHERE regexp_match(val, '^R[0-9]{2}') IS NOT NULL",
+            )
+            .await
+            .display_indent()
+            .to_string();
+            assert!(
+                plain.contains("regexp_match") && !plain.contains("regexp_like"),
+                "a non-Cayenne provider must remain untouched: {plain}"
+            );
+
+            let cayenne = optimized_sql_query_plan(
+                &df.ctx,
+                "SELECT id FROM cayenne_regexp WHERE regexp_match(val, '^R[0-9]{2}') IS NOT NULL",
+            )
+            .await
+            .display_indent()
+            .to_string();
+            assert!(
+                cayenne.contains(" IS TRUE") && !cayenne.contains("regexp_match"),
+                "a Cayenne-backed query must use the shared boolean regexp rewrite: {cayenne}"
             );
         });
     }
