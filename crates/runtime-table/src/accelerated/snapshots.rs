@@ -234,6 +234,12 @@ pub fn spawn_snapshot_interval_task(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -297,7 +303,7 @@ pub fn spawn_snapshot_interval_task(
             accelerator.as_ref(),
             Some(&federated_schema),
             refresh_sql.as_deref(),
-            Some(&refresh),
+            provenance.as_ref(),
         )
         .await;
 
@@ -324,7 +330,7 @@ pub fn spawn_snapshot_interval_task(
                 accelerator.as_ref(),
                 Some(&federated_schema),
                 refresh_sql.as_deref(),
-                Some(&refresh),
+                provenance.as_ref(),
             )
             .await;
         }
@@ -349,6 +355,12 @@ pub fn create_periodic_snapshot_callback(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
+    // The refresh whose provenance mark gates publishing, or `None` for a path whose rows
+    // cannot come from a request-scoped refresh override. Only `RefreshTaskRunner` maintains
+    // that mark and it exists only on the refresher path, so passing a `changes` stream's
+    // `refresh` here would gate every snapshot on a mark left at its `false` default —
+    // skipping snapshots forever for exactly the streaming datasets this trigger serves.
+    provenance: Option<Arc<RwLock<Refresh>>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -376,6 +388,7 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
+            let provenance_clone = provenance.clone();
             tokio::spawn(async move {
                 if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
                     return;
@@ -396,7 +409,7 @@ pub fn create_periodic_snapshot_callback(
                         accelerator_clone.as_ref(),
                         Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
-                        Some(&refresh_clone),
+                        provenance_clone.as_ref(),
                     )
                     .await;
                 }
@@ -418,6 +431,7 @@ pub fn create_periodic_snapshot_callback(
                 let last_updated_at = Arc::clone(&last_updated_at);
                 let accelerator = accelerator.clone();
                 let refresh = Arc::clone(&refresh);
+                let provenance = provenance.clone();
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
@@ -446,7 +460,7 @@ pub fn create_periodic_snapshot_callback(
                             accelerator.as_ref(),
                             Some(&federated_schema),
                             refresh_sql.as_deref(),
-                            Some(&refresh),
+                            provenance.as_ref(),
                         )
                         .await;
                     }

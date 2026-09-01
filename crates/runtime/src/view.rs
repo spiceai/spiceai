@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View, embeddings::index::table::wrap_table_as_index,
+    accelerated::AcceleratedTable, component::view::View,
+    embeddings::index::table::wrap_table_as_index,
     search::full_text::table::add_full_text_search_to_table,
 };
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
@@ -27,7 +28,7 @@ use datafusion::{
     logical_expr::LogicalPlan,
     prelude::SessionContext,
 };
-use datafusion_federation::FederatedPlanNode;
+use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor};
 use runtime_acceleration::snapshot::SnapshotPublishGate;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
 use sha2::{Digest, Sha256};
@@ -209,7 +210,41 @@ fn scan_fans_out(scan: &datafusion::logical_expr::TableScan) -> bool {
         // rather than assuming the friendly answer.
         return true;
     };
-    provider.is::<runtime_table_partition::provider::PartitionTableProvider>()
+    provider_fans_out(&provider)
+}
+
+/// Whether `provider`, or any provider beneath it, fans one scan out across child
+/// providers.
+///
+/// A registered accelerated dataset never presents its accelerator directly: the scan
+/// resolves to the layered `SpiceTable`/`AcceleratedTable` stack — with a
+/// `FederatedTableProviderAdaptor` above it when the source is federated — and the
+/// partition provider sits behind `AcceleratedTable::get_accelerator()`. Testing only the
+/// outermost provider reports no fan-out for exactly the accelerated views this gate
+/// exists to refuse, so the layers are peeled first.
+/// `DataFusion::partition_expr_from_table_provider` walks the same shape.
+fn provider_fans_out(provider: &Arc<dyn TableProvider>) -> bool {
+    if provider.is::<runtime_table_partition::provider::PartitionTableProvider>() {
+        return true;
+    }
+
+    if let Some(accelerated) =
+        spice_table::find_layer::<AcceleratedTable>(provider.as_ref(), spice_table::LayerWalk::Read)
+    {
+        return provider_fans_out(&accelerated.get_accelerator());
+    }
+
+    if let Some(layered) = provider.downcast_ref::<spice_table::SpiceTable>() {
+        return provider_fans_out(layered.below());
+    }
+
+    if let Some(adaptor) = provider.downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner) = adaptor.table_provider.as_ref()
+    {
+        return provider_fans_out(inner);
+    }
+
+    false
 }
 
 /// Every table scanned by `plan`, including inside subqueries, **without**
@@ -386,13 +421,11 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             continue;
         }
 
-        let mut matched_any = false;
         for view in app
             .views
             .iter()
             .filter(|candidate| names_match(&candidate.name, &dependency))
         {
-            matched_any = true;
             // `sql_ref` names a FILE. Hashing the path would leave the fingerprint
             // unchanged when the file's contents change, which is precisely the
             // substitution this identity exists to catch, so read it — the same way
@@ -414,11 +447,16 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
                 closure.insert(view.name.clone(), dependency_sql);
             }
         }
-        if matched_any {
-            continue;
-        }
 
-        // Datasets contribute too. A dataset's own snapshot series validates ITS archives,
+        // Datasets contribute too, and are folded in even when a view of the same name
+        // already matched: a bare reference is resolved at planning time, so with a
+        // `sales.inner` view and a `public.inner` dataset it is the DEFAULT-schema dataset
+        // that `inner` reads. Fingerprinting only the view would leave the identity
+        // unchanged when that dataset is rebound, which restores an archive the current
+        // configuration no longer produces. Same reason every view candidate contributes
+        // rather than the first.
+        //
+        // A dataset's own snapshot series validates ITS archives,
         // but it cannot speak for rows already baked into a view's archive: rebind
         // `orders` to a same-schema table and `SELECT * FROM orders` keeps identical SQL
         // while its materialized rows come from somewhere else entirely.
@@ -427,35 +465,37 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             .iter()
             .filter(|candidate| names_match(&candidate.name, &dependency))
         {
-            let params: BTreeMap<String, String> = dataset
-                .params
-                .as_ref()
-                .map(spicepod::param::Params::as_string_map)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
             closure.insert(
                 dataset.name.clone(),
-                dataset_definition_identity(
-                    &dataset.from,
-                    dataset
-                        .acceleration
-                        .as_ref()
-                        .and_then(|acceleration| acceleration.refresh_sql.as_deref()),
-                    &params,
-                ),
+                dataset_definition_identity(&dataset.from, &dataset_identity_fields(dataset)),
             );
         }
     }
 
-    let mut definition = String::from(sql.trim());
+    let mut definition = String::new();
+    push_len_prefixed(&mut definition, sql.trim());
     for (dependency_name, dependency_sql) in closure {
         definition.push_str("\n-- depends on ");
-        definition.push_str(&dependency_name);
+        push_len_prefixed(&mut definition, &dependency_name);
         definition.push('\n');
-        definition.push_str(dependency_sql.trim());
+        push_len_prefixed(&mut definition, dependency_sql.trim());
     }
     definition
+}
+
+/// Appends `value` as `<byte length>:<value>`, so a value can never be mistaken for the
+/// field names and delimiters around it.
+///
+/// Concatenating raw values with separators is not injective: a dependency whose SQL
+/// contains the literal `-- depends on` line, or a parameter whose value contains
+/// `\nparam.k=v`, produces the same string as a genuinely different configuration and so
+/// the same fingerprint — which is an incompatible archive accepted at bootstrap. A reader
+/// of a length-prefixed string knows where every value ends without interpreting its
+/// contents, so distinct inputs cannot collide.
+fn push_len_prefixed(out: &mut String, value: &str) {
+    use std::fmt::Write;
+    // Writing into a `String` cannot fail.
+    let _ = write!(out, "{}:{value}", value.len());
 }
 
 /// The definition string a DATASET's snapshot identity is computed over: what it copies
@@ -481,25 +521,257 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
 /// values, which are only available where the connector is constructed
 /// (`get_params_with_secrets`) — not from this sync, secret-less context.
 ///
+/// The cost of including params in full falls on SHARING a snapshot series between
+/// deployments, and it is significant: two spiced instances that materialize identical rows
+/// but reach the source differently — an IAM role in one and access keys in the other, a
+/// different `endpoint` or pool size — compute different identities, so neither bootstraps
+/// from the other's archive. Both still snapshot and both still bootstrap from their own
+/// series; what they lose is the cross-deployment reuse that is much of the point. Narrowing
+/// this safely means asking the connector which of ITS params select rows, rather than
+/// guessing centrally from the key name, and defaulting to "all of them" where it does not
+/// say — a capability method on `DataConnector` rather than a list maintained here.
+///
+/// `fields` carries everything else — see [`dataset_identity_fields`] and
+/// [`dataset_identity_fields_from_spec`], the two ways it is built.
+///
 /// Ordered by key so the string does not depend on map iteration order.
 #[must_use]
-pub(crate) fn dataset_definition_identity(
-    from: &str,
-    refresh_sql: Option<&str>,
-    params: &BTreeMap<String, String>,
-) -> String {
-    let mut identity = format!("from={from}");
-    if let Some(refresh_sql) = refresh_sql {
-        identity.push_str("\nrefresh_sql=");
-        identity.push_str(refresh_sql.trim());
-    }
-    for (key, value) in params {
-        identity.push_str("\nparam.");
-        identity.push_str(key);
+pub(crate) fn dataset_definition_identity(from: &str, fields: &BTreeMap<String, String>) -> String {
+    let mut identity = String::from("from=");
+    push_len_prefixed(&mut identity, from);
+    for (key, value) in fields {
+        identity.push('\n');
+        push_len_prefixed(&mut identity, key);
         identity.push('=');
-        identity.push_str(value);
+        push_len_prefixed(&mut identity, value);
     }
     identity
+}
+
+/// The identity fields of a dataset as DECLARED in a Spicepod.
+///
+/// Paired with [`dataset_identity_fields_from_spec`], which reads the same fields off the
+/// parsed configuration; the two are kept adjacent, and
+/// `spicepod_and_spec_identities_cover_the_same_fields` fails if one grows a field the
+/// other does not. Each path only has to be internally consistent — the identity has to
+/// CHANGE when the configuration changes — so the two need not agree byte for byte, but
+/// they must cover the same configuration.
+fn dataset_identity_fields(
+    dataset: &spicepod::component::dataset::Dataset,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+
+    let params = dataset
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    for (key, value) in params {
+        fields.insert(format!("param.{key}"), value);
+    }
+
+    push_dataset_shape_fields(
+        &mut fields,
+        dataset.time_column.as_deref(),
+        dataset.time_format.as_ref().map(|f| format!("{f:?}")),
+        &dataset.columns,
+        &dataset.embeddings,
+    );
+
+    if let Some(acceleration) = &dataset.acceleration {
+        push_acceleration_row_policies(
+            &mut fields,
+            acceleration.refresh_sql.as_deref(),
+            acceleration.refresh_mode.as_ref().map(|m| format!("{m:?}")),
+            acceleration.refresh_data_window.as_deref(),
+            acceleration.primary_key.as_deref().map(canonical_columns),
+            acceleration
+                .on_conflict
+                .iter()
+                .map(|(column, behavior)| (canonical_columns(column), format!("{behavior:?}")))
+                .collect(),
+            acceleration
+                .indexes
+                .iter()
+                .map(|(column, index)| (canonical_columns(column), index.to_string()))
+                .collect(),
+            acceleration.retention_period.as_deref(),
+            acceleration.retention_sql.as_deref(),
+            acceleration.retention_check_enabled,
+        );
+    }
+
+    fields
+}
+
+/// A dataset's identity computed from its parsed runtime configuration — the form the
+/// dataset itself is registered from. A view reading this dataset arrives at the same
+/// fields through [`dataset_identity_fields`] instead, off the Spicepod declaration.
+#[must_use]
+pub(crate) fn dataset_definition_identity_from_spec(
+    spec: &crate::component::dataset::DatasetSpec,
+) -> String {
+    dataset_definition_identity(&spec.from, &dataset_identity_fields_from_spec(spec))
+}
+
+/// The identity fields of a dataset as PARSED into its runtime configuration. See
+/// [`dataset_identity_fields`] for why both exist and what keeps them in step.
+fn dataset_identity_fields_from_spec(
+    spec: &crate::component::dataset::DatasetSpec,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+
+    for (key, value) in &spec.params {
+        fields.insert(format!("param.{key}"), value.clone());
+    }
+
+    push_dataset_shape_fields(
+        &mut fields,
+        spec.time_column.as_deref(),
+        spec.time_format.as_ref().map(|f| format!("{f:?}")),
+        &spec.columns,
+        &spec.embeddings,
+    );
+
+    if let Some(acceleration) = &spec.acceleration {
+        push_acceleration_row_policies(
+            &mut fields,
+            acceleration.refresh_sql.as_deref(),
+            acceleration.refresh_mode.as_ref().map(|m| format!("{m:?}")),
+            acceleration.refresh_data_window.as_deref(),
+            acceleration
+                .primary_key
+                .as_ref()
+                .map(|key| key.iter().collect::<Vec<_>>().join(",")),
+            acceleration
+                .on_conflict
+                .iter()
+                .map(|(column, behavior)| {
+                    (
+                        column.iter().collect::<Vec<_>>().join(","),
+                        format!("{behavior:?}"),
+                    )
+                })
+                .collect(),
+            acceleration
+                .indexes
+                .iter()
+                .map(|(column, index)| {
+                    (
+                        column.iter().collect::<Vec<_>>().join(","),
+                        index.to_string(),
+                    )
+                })
+                .collect(),
+            acceleration.retention_period.as_deref(),
+            acceleration.retention_sql.as_deref(),
+            acceleration.retention_check_enabled,
+        );
+    }
+
+    fields
+}
+
+/// A column reference in its parsed form, so `(a, b)`, `(a,b)` and `( a , b )` are one
+/// identity rather than three.
+fn canonical_columns(reference: &str) -> String {
+    datafusion_table_providers::util::column_reference::ColumnReference::try_from(reference)
+        .map(|parsed| parsed.iter().collect::<Vec<_>>().join(","))
+        .unwrap_or_else(|_| reference.to_string())
+}
+
+/// Dataset-level configuration that changes which rows are stored or what they contain.
+fn push_dataset_shape_fields(
+    fields: &mut BTreeMap<String, String>,
+    time_column: Option<&str>,
+    time_format: Option<String>,
+    columns: &[spicepod::semantic::Column],
+    embeddings: &[ColumnEmbeddingConfig],
+) {
+    if let Some(time_column) = time_column {
+        fields.insert("time_column".to_string(), time_column.to_string());
+    }
+    if let Some(time_format) = time_format {
+        fields.insert("time_format".to_string(), time_format);
+    }
+    if !columns.is_empty() {
+        fields.insert("columns".to_string(), identity_value(&columns));
+    }
+    if !embeddings.is_empty() {
+        fields.insert("embeddings".to_string(), identity_value(&embeddings));
+    }
+}
+
+/// Acceleration settings that decide which rows are stored and which survive a write.
+///
+/// Deliberately a subset: snapshot, scheduling, engine and storage settings decide WHEN and
+/// WHERE an archive is written, not what is in it, so tuning them must not strand a series.
+/// Everything that can change the stored row set or its values belongs here — a field
+/// wrongly included costs a refused snapshot and a refresh from source, whereas one wrongly
+/// left out accepts an archive whose rows answer a different question.
+#[expect(clippy::too_many_arguments)]
+fn push_acceleration_row_policies(
+    fields: &mut BTreeMap<String, String>,
+    refresh_sql: Option<&str>,
+    refresh_mode: Option<String>,
+    refresh_data_window: Option<&str>,
+    primary_key: Option<String>,
+    on_conflict: BTreeMap<String, String>,
+    indexes: BTreeMap<String, String>,
+    retention_period: Option<&str>,
+    retention_sql: Option<&str>,
+    retention_check_enabled: bool,
+) {
+    if let Some(refresh_sql) = refresh_sql {
+        fields.insert(
+            "acceleration.refresh_sql".to_string(),
+            refresh_sql.trim().to_string(),
+        );
+    }
+    if let Some(refresh_mode) = refresh_mode {
+        fields.insert("acceleration.refresh_mode".to_string(), refresh_mode);
+    }
+    if let Some(window) = refresh_data_window {
+        fields.insert(
+            "acceleration.refresh_data_window".to_string(),
+            window.to_string(),
+        );
+    }
+    if let Some(primary_key) = primary_key {
+        fields.insert("acceleration.primary_key".to_string(), primary_key);
+    }
+    for (column, behavior) in on_conflict {
+        fields.insert(format!("acceleration.on_conflict.{column}"), behavior);
+    }
+    for (column, index) in indexes {
+        fields.insert(format!("acceleration.index.{column}"), index);
+    }
+    if let Some(period) = retention_period {
+        fields.insert(
+            "acceleration.retention_period".to_string(),
+            period.to_string(),
+        );
+    }
+    if let Some(retention_sql) = retention_sql {
+        fields.insert(
+            "acceleration.retention_sql".to_string(),
+            retention_sql.trim().to_string(),
+        );
+    }
+    if retention_check_enabled {
+        fields.insert(
+            "acceleration.retention_check_enabled".to_string(),
+            "true".to_string(),
+        );
+    }
+}
+
+/// Canonical JSON for a structured identity field.
+///
+/// A marker is recorded rather than the field dropped: dropping it would silently widen
+/// what the identity accepts, which is the direction that restores a wrong archive.
+fn identity_value<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|e| format!("-- unserializable: {e}"))
 }
 
 /// Stable hash of a definition string, recorded alongside a source's snapshots so a
@@ -973,6 +1245,167 @@ mod tests {
                 definition_fingerprint("SELECT id FROM orders"),
                 definition_fingerprint("  SELECT id FROM orders\n")
             );
+        }
+
+        #[test]
+        fn closure_folds_in_a_dataset_shadowed_by_a_same_named_view() {
+            // A bare reference resolves at planning time, and with a qualified view and a
+            // default-schema dataset both answering `inner` it is the DATASET that is read.
+            // Folding in only the view would leave the identity unchanged when the dataset
+            // is rebound, restoring an archive the configuration no longer produces.
+            let outer = TableReference::bare("outer");
+            let closure = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("sales.inner", "SELECT 2")],
+                    &[("public.inner", "s3://a")],
+                ),
+            );
+            assert!(
+                closure.contains("SELECT 2"),
+                "the view candidate must contribute: {closure}"
+            );
+            assert!(
+                closure.contains("s3://a"),
+                "the dataset candidate must contribute even though a view matched: {closure}"
+            );
+        }
+
+        #[test]
+        fn rebinding_a_shadowed_dataset_changes_the_fingerprint() {
+            let outer = TableReference::bare("outer");
+            let before = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("sales.inner", "SELECT 2")],
+                    &[("public.inner", "s3://a")],
+                ),
+            );
+            let after = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("sales.inner", "SELECT 2")],
+                    &[("public.inner", "s3://b")],
+                ),
+            );
+            assert_ne!(
+                definition_fingerprint(&before),
+                definition_fingerprint(&after),
+                "rebinding the dataset a bare reference resolves to must move the identity"
+            );
+        }
+
+        /// A dataset carrying `params`, used to exercise the identity encoding.
+        fn dataset_with_params(params: &[(&str, &str)]) -> spicepod::component::dataset::Dataset {
+            let mut dataset = spicepod::component::dataset::Dataset::new(
+                "s3://bucket/data".to_string(),
+                "data".to_string(),
+            );
+            dataset.params = Some(spicepod::param::Params::from_string_map(
+                params
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            ));
+            dataset
+        }
+
+        #[test]
+        fn a_parameter_value_cannot_forge_another_parameter() {
+            // Concatenating `\nparam.<key>=<value>` is not injective: this one value spells
+            // out a second parameter. Length-prefixing every field is what separates them.
+            let forged = dataset_with_params(&[("a", "b\nparam.c=d")]);
+            let genuine = dataset_with_params(&[("a", "b"), ("c", "d")]);
+            assert_ne!(
+                definition_fingerprint(&dataset_definition_identity(
+                    &forged.from,
+                    &dataset_identity_fields(&forged)
+                )),
+                definition_fingerprint(&dataset_definition_identity(
+                    &genuine.from,
+                    &dataset_identity_fields(&genuine)
+                )),
+                "a parameter value must not be able to spell another parameter"
+            );
+        }
+
+        #[test]
+        fn row_shaping_acceleration_policies_move_the_identity() {
+            // Each of these changes which rows are stored, or which survive a write, while
+            // leaving the schema — and the schema is all the snapshot metadata used to
+            // record. An archive taken under one must not bootstrap under another.
+            fn identity_with(acceleration: spicepod::acceleration::Acceleration) -> String {
+                let mut dataset = dataset_with_params(&[("a", "b")]);
+                dataset.acceleration = Some(acceleration);
+                dataset_definition_identity(&dataset.from, &dataset_identity_fields(&dataset))
+            }
+            fn accelerated() -> spicepod::acceleration::Acceleration {
+                spicepod::acceleration::Acceleration {
+                    enabled: true,
+                    ..Default::default()
+                }
+            }
+
+            let baseline = identity_with(accelerated());
+
+            let mut primary_key = accelerated();
+            primary_key.primary_key = Some("id".to_string());
+            assert_ne!(
+                baseline,
+                identity_with(primary_key),
+                "primary_key decides which rows an upsert replaces"
+            );
+
+            let mut retention_period = accelerated();
+            retention_period.retention_period = Some("1d".to_string());
+            assert_ne!(
+                baseline,
+                identity_with(retention_period),
+                "retention_period prunes stored rows"
+            );
+
+            let mut retention_sql = accelerated();
+            retention_sql.retention_sql = Some("SELECT 1".to_string());
+            assert_ne!(
+                baseline,
+                identity_with(retention_sql),
+                "retention_sql chooses which rows are pruned"
+            );
+
+            let mut window = accelerated();
+            window.refresh_data_window = Some("1h".to_string());
+            assert_ne!(
+                baseline,
+                identity_with(window),
+                "refresh_data_window bounds which rows are loaded"
+            );
+
+            let mut on_conflict = accelerated();
+            on_conflict.on_conflict = std::collections::HashMap::from([(
+                "id".to_string(),
+                spicepod::acceleration::OnConflictBehavior::Drop,
+            )]);
+            assert_ne!(
+                baseline,
+                identity_with(on_conflict),
+                "on_conflict decides which of two colliding rows is kept"
+            );
+        }
+
+        #[test]
+        fn a_column_reference_is_identified_by_its_columns_not_its_spelling() {
+            // Whitespace and column order are spelling: a column reference is sorted when
+            // it is parsed, so `(a, b)` and `(b, a)` are one compound key and must not read
+            // as two different configurations that refuse each other's archives.
+            assert_eq!(canonical_columns("(a, b)"), canonical_columns("(a,b)"));
+            assert_eq!(canonical_columns("(a, b)"), canonical_columns("(b, a)"));
+
+            // A different set of columns is a different key.
+            assert_ne!(canonical_columns("(a, b)"), canonical_columns("(a, c)"));
+            assert_ne!(canonical_columns("a"), canonical_columns("(a, b)"));
         }
     }
 

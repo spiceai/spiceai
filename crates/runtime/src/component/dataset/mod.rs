@@ -273,18 +273,7 @@ impl AccelerationSource for Dataset {
         // this stamp existed, and refusing them would strand every snapshot taken before
         // the upgrade. Mismatches are still refused, so everything published from here on
         // is protected.
-        let params: std::collections::BTreeMap<String, String> = self
-            .params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let identity = crate::view::dataset_definition_identity(
-            &self.from,
-            self.acceleration
-                .as_ref()
-                .and_then(|acceleration| acceleration.refresh_sql.as_deref()),
-            &params,
-        );
+        let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
         Some(
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(&identity),

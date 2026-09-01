@@ -415,7 +415,7 @@ impl RefreshTaskRunner {
         let r = defaults.read().await.clone();
         let inherited = r.materialization_is_configured();
         r.set_materialization_is_configured(false);
-        let (request, overridden) = match overrides_opt {
+        let (mut request, overridden) = match overrides_opt {
             Some(overrides) => {
                 let overridden = overrides.changes_materialization();
                 (r.with_overrides(&overrides), overridden)
@@ -425,6 +425,13 @@ impl RefreshTaskRunner {
         // `request.mode` is the mode this run will actually use, overrides applied.
         let replaces_everything = matches!(request.mode, RefreshMode::Full);
         let configured = !overridden && (replaces_everything || inherited);
+        // Re-establishing provenance rather than carrying it forward: the mark is retracted
+        // and only a real full replacement earns it back. `RefreshTask::run_once` can return
+        // success from the unchanged-source skip without writing anything, which would stamp
+        // an earlier override's rows as the configured definition's result, so that run has
+        // to fetch. Where the mark is merely inherited the rows already carry it and the skip
+        // changes nothing.
+        request.must_materialize = configured && !inherited;
         (request, configured)
     }
 

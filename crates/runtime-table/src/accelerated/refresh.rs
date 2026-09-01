@@ -87,6 +87,17 @@ pub struct Refresh {
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
     pub sql: Option<RefreshSQL>,
+    /// Whether this run must actually re-materialize, rather than take the
+    /// "source unchanged since the last fetch" skip.
+    ///
+    /// Set when the run is the one that will re-establish provenance: the mark is
+    /// currently retracted and a full replacement is what would justify re-asserting it.
+    /// The skip path returns success without writing, so a skipped run would stamp rows
+    /// produced by an earlier overridden refresh as the configured definition's result and
+    /// let the next snapshot publish them under its identity. Forcing the fetch keeps
+    /// "this run succeeded" and "these rows are the configured definition applied to the
+    /// source" the same statement.
+    pub(crate) must_materialize: bool,
     /// Raw SQL string from an override request, not yet parsed.
     /// When set, this should be parsed into a `RefreshSQL` before use.
     pub(crate) override_sql_raw: Option<String>,
@@ -575,6 +586,7 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            must_materialize: false,
             override_sql_raw: None,
             mode: RefreshMode::Full,
             period: None,
@@ -933,6 +945,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // A changes stream returns below without building a
+                            // `RefreshTaskRunner`, so nothing would ever move the provenance
+                            // mark off its `false` default; and it accepts no request-scoped
+                            // override, so there is nothing to gate on.
+                            None,
                         ),
                         None,
                     ),
@@ -951,6 +968,9 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // See the interval arm above: this stream has no runner to
+                            // maintain a provenance mark, and takes no overrides.
+                            None,
                         ),
                     ),
                 };
@@ -1044,6 +1064,9 @@ impl Refresher {
                         Arc::clone(&self.last_updated_at),
                         Some(Arc::clone(&self.accelerator)),
                         Arc::clone(&self.refresh),
+                        // This path builds a `RefreshTaskRunner` below, which maintains the
+                        // mark, so an overridden refresh's rows are not published.
+                        Some(Arc::clone(&self.refresh)),
                     ),
                     false,
                 ),
