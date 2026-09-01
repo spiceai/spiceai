@@ -350,6 +350,8 @@ The extra rule is about *when* those rows become visible, because an overwrite's
 
 Because the buffered batches and the serialized blob stay resident until the overwrite publishes, admission is claimed through a single non-blocking slot on the shared `CayenneContext` — which is what makes the runtime's host-memory reservation of one buffer plus one entry per acceleration true rather than merely generous. The slot is never awaited: parking on it would stall a caller that another writer depends on (spiceai/spiceai#11818), so a writer that cannot claim it writes Vortex files instead.
 
+**A `retention_sql` predicate runs again after every replace.** It is an engine-level delete filter — unlike `retention_period`, which Cayenne injects as a scan-time keep filter, so expired rows are hidden from every read whether or not anything has physically removed them, and whose reclamation is the periodic retention worker's job rather than this path's. An overwrite reloads every source row — so whatever the predicate deleted last time returns with the refresh unless it runs again over the new snapshot. The overwrite therefore arms the same debounced post-write maintenance an append does, and the delete lands once the overwrite's `write_lock` is released; applying it inline would deadlock against the deletion sink, which takes that same lock. Retention never contends with the inline tier on the replace itself, because `inline_overwrite_admissible` already refuses a table carrying delete filters — the whole-table replace writes Vortex files, which is what the deletion sink reads. Inline rows can still reach such a table by the pipelined CDC route, which inlines without consulting the admission rules, or by outliving a `retention_sql` added to an existing dataset; the retention pass flushes the corpus to Vortex before scanning so neither hides rows from the predicate. It defers that flush, though, while an unpublished inline-conflict tombstone or a staged append finalization is in flight — a checkpoint applies no inert tombstone and then clears every one, so flushing inside that window would materialize a superseded row and drop the deletion that hides it. Those windows close in milliseconds, so the deferred pass re-arms itself and the next debounce retries. A **mem-tier seal shadow** defers it as well, because flushing one would serve rows that are still live in RAM a second time — but that deferral deliberately does *not* re-arm. A shadow stands until the next full checkpoint, so re-arming would poll at the debounce interval for that whole span and run the pass's metastore vacuum and WAL-checkpoint tail every time; the checkpoint that clears a shadow arms retention itself instead, which is why every checkpoint exit arms it — including one that publishes only tombstones and no rows. The operational consequence is that this one deletion waits for a checkpoint rather than for a debounce: with the age trigger off and the size gate unmet, or checkpoints otherwise delayed, it waits with them. One tier is out of the deletion sink's reach altogether: under `cdc_durability: memory`, the CDC profile's default, rows live in RAM until a checkpoint makes them durable, so retention is armed from that checkpoint and applies to each epoch as it lands rather than at the write. A `mode: memory` acceleration never checkpoints at all, so its rows stay permanently beyond the sink; the accelerator warns at registration rather than letting `retention_sql` look effective. `retention_period` is unaffected there, because its keep filter runs on the read rather than on the corpus.
+
 **A partitioned dataset does not inline a whole-table replace.** (Its children remain eligible for ordinary small-write CDC inlining, which is gated on the partition-column and retention rules below rather than on the overwrite slot.) Its per-partition child tables share one context and therefore that one slot, and they write concurrently under a single routing demux — so exactly one child would claim the slot and inline while its siblings fell back to Vortex, splitting a whole-table replace across both tiers with the inlined partition decided by whichever child reached admission first. The children each carry `partition_column: None`, so the partition-column rule above does not reach them; they are refused as **coupled writers** (`CayenneContext::is_coupled_writer`) instead. Widening the slot is not the alternative: awaiting it reintroduces the demux hold-and-wait deadlock of #11818, and one permit per child would multiply the buffered-admission reservation by a partition count that is not statically bounded (time-based partitions grow indefinitely). Little is given up by refusing them, because the small-file accumulation that inlining exists to prevent barely applies to a child in the first place: `serialize_partition_child_writes` already clamps a child to `write_concurrency = 1`, so a refresh leaves *one* file per partition, and the next overwrite replaces it rather than adding to it — there is no growing pile for the (disabled) background compactor to have merged. Inlining is also skipped outright when the table holds a mem-tier seal shadow — a durable inline row deliberately kept above the watermark while its rows are still live in RAM — since raising the watermark past it would serve those rows twice; only `cdc_durability: memory` can produce one, which the bulk-overwrite profile never selects.
 
 **The corpus outlives a schema change, so it is adapted on read.** An inline entry is Arrow IPC frozen at the schema that was live when it was written. A *live* widening evolution (`evolve_schema_live`) flushes the corpus to Vortex before it swaps, so nothing stale survives it; the open-time evolution that adopts a source's added column at restart (`on_schema_change: append_new_columns` / `sync_all_columns` / `drop_and_recreate`) commits the widened schema straight to the metastore, leaving the next provider to open onto a corpus one or more widenings behind. Two dataset shapes are excluded from that open-time evolution, and stay pinned to their stored schema: `refresh_mode: caching`, whose hidden `__spice_cache_namespace` column is appended last and so cannot be reconciled with an evolution that also appends at the end; and a **partitioned** dataset, because the config that gates evolution also opens the parent catalog entry — widening the parent while every partition keeps its own schema would have the accelerated table advertise a width its data does not have, and read back a silent narrowing cast. Every decode therefore adapts to the live schema — missing nullable columns null-filled, widened columns cast — which is the same treatment the Vortex opener already gives pre-evolution files, and is the truth for a row written before the widening, since a widening plan admits only added *nullable* columns and lossless casts. A corpus already at the live width short-circuits on a field comparison.
@@ -363,6 +365,8 @@ That has a consequence in the CDC flow, because the apply loop reaches a partiti
 The directories below are produced by a **two-stage write**, so it helps to define the two stages up front, since they reappear throughout. **Stage A** is the *durable* half: the burst's new Vortex files are encoded into a separate *staging* snapshot directory and made crash-safe by a write-ahead-log marker (`_wal.json`, written `tmp + fsync + rename`). It runs on the write path, and once it completes the data is safe on disk but **not yet visible** to readers. (If a crash lands after the files are staged but before that marker is durable, the orphaned staging directory is cleaned up during recovery — see *Staging WAL crash-safety* in Part 3 for the full recovery model.) **Stage B** is the *visibility* half: a background task moves the staged files into their destination snapshot, publishes deletion state, and advances the snapshot pointer where required — at which point the write becomes visible. For a write spanning several Cayenne partitions, every participant first builds a private complete snapshot and exact file manifest; one shared metastore transaction then advances all `current_snapshot_id` pointers and commits the manifests, deletion metadata, protected-snapshot sequences, and statistics invalidation together. The top-level `_partitioned_wal/<commit_id>.json` records the complete participant set before any move. Object-store participants may use distinct client handles, but their canonical backend URL and table-level WAL prefix must match; a shared prefix on heterogeneous backends is rejected before the anchor is written. Recovery treats catalog pointers as the sole durable decision: all targets matching means finish and fully rehydrate every committed participant, none matching means roll back, and a mixed set, an unreadable pointer, or an unavailable participant is a hard error that retains every WAL and physical staged/deletion file. The commit/publication sequence owns its receipts and exact physical cleanup guards through publication, so cancellation while `COMMIT` is in flight cannot unlink a newly-live deletion vector. Splitting the two stages lets the source's change-log offset be acknowledged as soon as Stage A is durable, without waiting for visibility. (See *Flow E — A CDC burst, end to end* in Part 4 for the full sequence, including how back-to-back bursts pipeline.)
 
 Vortex files and Arrow-IPC deletion files live under the data root, grouped by `table_id` and then by snapshot directory. A `<snapshot_id>` is a UUIDv7-named set of immutable files.
+
+**Superseded snapshot directories are reclaimed against live state, not on a timer.** Every commit that advances the snapshot pointer schedules one debounced sweep, coalesced so a burst of commits produces a single pass, and the pass reads the *current* pointer itself rather than an id captured when it was queued — an id captured at schedule time goes stale, and the sweep keeps every directory at or newer than the id it is given. What protects a directory from a reader still using it is the per-snapshot in-flight-scan ref-count (`SnapshotScanRef`), which a reader takes under the listing fence alongside the snapshot ids it captures, so no new reader can reference a superseded directory after the flip and a directory with a live ref is never unlinked however long its work runs. Query scans are not the only readers: the upsert write path also opens a snapshot's Vortex files with no query behind it — the PK-existence keyset rebuild that a CDC apply runs to detect conflicts (`load_existing_pk_index`, and the persisted-checkpoint fast path that folds the protected snapshots) — and takes the same ref-count, so the sweep defers those directories too. Omitting that pin let a rebuild race a supersede-and-sweep and read a file already unlinked, which failed the CDC apply and stopped the dataset replicating (#13683); the time-based grace it replaced had masked the race by outlasting any rebuild. A short static grace (5 s, measured from a directory's own UUIDv7 creation time and from the last scan that listed it) covers only the residual window between a plan resolving a listing and opening the files it resolved. A pass that keeps a directory for a reason that lapses with no commit to notice — inside the grace, a live scan, a recent listing — re-arms itself, spending from a small follow-up budget each commit refills, so a table that stops committing still reaps its last window without heartbeating forever behind a pin that outlives the budget. Because reclamation tracks the live pointer, a table's steady-state warm footprint tracks its live size rather than its commit rate — a rapidly refreshing table used to retain a full grace-window of dead snapshot directories, which at a few commits a second was orders of magnitude more than the table itself (#13657).
 
 **The stored types are not always the source's types.** Vortex cannot represent every Arrow type, so `transform_schema_for_vortex` rewrites `Float16` → `Float32` at table creation and the table stores `Float32` for its lifetime. That is the only unconditional rewrite; the list is published as `CAYENNE_TYPE_REWRITE_RULES` so the acceleration write path can tell an engine-imposed type from a schema that has genuinely drifted. Timestamps are **not** rewritten — Vortex represents second, millisecond, microsecond and nanosecond precision, so a table stores the unit its source reports, timezone included. A `PostgreSQL` `timestamptz`, inferred as `Timestamp(ns, "UTC")`, is created and stored as nanoseconds.
 
@@ -1341,6 +1345,224 @@ When `cayenne_tuning: adaptive`, a per-table closed-feedback controller makes at
 One removal to note (breaking): `cayenne_orphaned_dv_cleanup_min_files` is no longer a recognized parameter — orphaned deletion-vector cleanup is unconditional at a fixed threshold of 20 unreferenced files. A spicepod still setting the key (including `0`, which used to disable the sweep) has it ignored with a runtime warning ("Ignoring parameter … not supported"), so a config that relied on disabling cleanup silently gains it back.
 
 The scan-view cache's freshness for **read-only CDC replicas** is a **process-wide environment variable**, not a per-dataset parameter (it is operational tuning, not data configuration, so it stays out of `configuration_matches`): `CAYENNE_SCAN_VIEW_FRESHNESS_MS` (default `1000`; `0` = read-your-writes) sets the bounded-staleness lag within which concurrent analytical scans on a read-only CDC replica (`access: read` + `refresh_mode: changes`) share one cached `ScanView` instead of rebuilding — the freshness/CPU trade, staleness far inside the freshness SLO. It does **not** affect any other table (read-write datasets, or read-only full-refresh/snapshot/append tables), which always use `0` (read-your-writes). This replaces the retired maintainer's `CAYENNE_SCAN_VIEW_REFRESH_FLOOR_MS` (and its `cayenne_scan_view_builds_total` / `_waits_total` metrics), which no longer exist.
+
+---
+
+# Appendix C — Observability: maintenance and footprint
+
+Cayenne's maintenance passes mostly decide *not* to run. A compaction declines because a lock is held, a budget is exceeded, or a fence caps its inputs; the deletion-vector sweep declines because it cannot prove the current snapshot is empty. Each decline is a correct decision, and each one leaves the table slightly larger than before. So the operational question is never "did maintenance run" but **"which pass is declining, why, and is the footprint growing while it does"** — and answering it needs the declines to be countable, not logged.
+
+Every metric below is emitted on the `cayenne` OpenTelemetry meter and reaches `spiced --metrics <addr>` at `/metrics`. Per-table metrics carry `table`; metastore-wide metrics carry `catalog` (the metastore path), because the metastore is per-dataset and its file is always named `cayenne.db`.
+
+## Which pass ran, and why not
+
+`cayenne_compaction_outcome_total{table, kind, outcome}` counts one row per attempt. `kind` is the same vocabulary as `cayenne_compaction_duration_ms` and `cayenne_compaction_merged_bytes`, so an outcome joins to the duration and bytes of the pass that produced it:
+
+| `kind` | pass |
+|---|---|
+| `full` | full current-snapshot re-encode (also folds the protected set) |
+| `subset_current` | current-snapshot small-file rewrite (hard-links the unpicked files); also carries the declines of the current-snapshot pass as a whole, which fire before the subset/full choice |
+| `subset` | size-tiered merge over the protected-snapshot set |
+| `bake` | seq-prefix bake (consolidate the clean older prefix, prune the deletion index) |
+| `datalake` | cold-tier graduation |
+
+`outcome` has four classes, and the distinction between them is the point:
+
+- **work happened** — `committed`, or `no_op` (the pass ran its selection and found nothing to merge)
+- **work was paid and thrown away** — `aborted_concurrent_change` (the merge finished, then a concurrent append, compaction, or overwrite invalidated its inputs at commit)
+- **the pass errored** — `failed`. Distinct from every decline: a decline is a decision, this is a fault, and it is the one class that warrants a page rather than a dashboard.
+- **the pass never ran** — a `declined_<reason>`
+
+`declined_*` is a single selector, which is how "what is stopping maintenance" becomes one query:
+
+```promql
+sum by (kind, outcome) (rate(cayenne_compaction_outcome_total{outcome=~"declined_.*"}[15m]))
+```
+
+| `outcome` | why the pass declined |
+|---|---|
+| `declined_staging_inflight` | a staged append is mid-finalization, so files are neither cleanly in nor out of the scan |
+| `declined_below_trigger` | no file-count, protected-snapshot, or deletion-index trigger has fired |
+| `declined_lock_busy` | another pass holds the per-table compaction lock |
+| `declined_writer_active` | a writer holds the write lock on a position-delete table, whose rewrite must serialize against writers |
+| `declined_not_key_mode` | position-delete table: out of the bake's scope (its prune is a no-op for file-scoped tombstones) |
+| `declined_apply_backpressure` | the CDC apply is at or over capacity, so the bake yields the shared write path |
+| `declined_no_candidates` | fewer than two inputs qualified |
+| `declined_above_delete_fence` | a pending mem-tier delete caps the fence below the candidates' thresholds, so folding them would mask a deletion |
+| `declined_over_pass_budget` | the qualifying inputs exceed the per-pass memory budget |
+| `declined_no_qualifying_tier` | no size tier has accumulated enough runs |
+| `declined_sizing_failed` | an input could not be sized, and an unknown size cannot count as free against a memory ceiling |
+| `declined_no_clean_prefix` | a live snapshot is not clean past the prefix cutoff, so the bake's prune would be withheld and its write amplification wasted |
+| `declined_not_configured` | the pass is not configured for this table (no cold-tier location) — a permanent state, so a steady count here is the expected shape |
+
+`cayenne_compaction_trigger_total{table, kind, trigger}` names which threshold asked for a pass — `small_file_count`, `protected_snapshot_count`, `protected_snapshot_age`, `deletion_index`, `deletion_index_memory_ceiling`. Read against the outcome counter it separates "the trigger never fired" from "it fired and the pass was declined", which are different problems with different fixes.
+
+The non-compaction passes use the same grammar under `cayenne_maintenance_outcome_total{table, op, outcome}`, with `op` ∈ `orphan_dv_sweep`, `retention`, `retired_dir_sweep`. Its outcomes need a few reading rules of their own:
+
+- `applied` — the pass did its work, but that work returns no space by itself. Retention is the only case: it writes tombstones, and the bytes come back when a later compaction rewrites without the dead rows and the deletion-vector sweep unlinks the vectors. `applied` climbing while `cayenne_maintenance_reclaimed_bytes_total` stays flat for the same table is exactly the "deletes recorded, nothing given back" shape. Watch the **bytes**, not the reclaim family as a whole: the rows that pass tombstoned are counted by `cayenne_maintenance_tombstoned_rows_total`, which climbs alongside `applied` by design and so cannot report the shape.
+- `declined_manifest_unprovable` — the current snapshot's manifest is empty while its directory is not, so the deletion-vector sweep cannot prove no live row is shadowed. **Every** pass returns here until that resolves, so deletion vectors accumulate with the sweep apparently running.
+- `coalesced` — a sweep was already in flight, so this request folded into it.
+- `declined_write_in_flight` vs `declined_awaiting_checkpoint` — the two ways retention yields, and like the pair below they differ in prognosis rather than in what they stopped. A write in flight (a staged inline-conflict tombstone, an append mid-finalization) clears within milliseconds and the next debounce retries. A mem-tier seal shadow does not: the deferred request is consumed rather than re-armed, so retention on that table does not run again until the checkpoint that makes the shadow durable fires. A table reporting `awaiting_checkpoint` steadily has retention that is not coming back on its own.
+- `declined_live_reference` vs `declined_not_due` — for the retired-directory sweep these look alike and have opposite prognoses. `not_due` means nothing had reached its grace window (or every candidate is pinned by an in-flight scan); it resolves itself. `live_reference` means candidates **were** examined and none could be removed, because their files are still referenced in place by a live snapshot or a non-data sidecar keeps the directory alive — which resolves only when the referencing snapshot is itself retired, possibly never. A directory reported `live_reference` indefinitely is space that is not coming back on its own.
+
+`cayenne_maintenance_reclaimed_{files,bytes,rows}_total{table, op}` is what each pass actually gave back — a **physical** release in every series, which is what makes the family summable across `op`. Its `rows` are tombstones a deletion-vector sweep retired from the metastore. A footprint gauge that climbs while its reclaim counter stays flat is the signature of a reclamation path that is scheduled but doing nothing.
+
+`cayenne_maintenance_tombstoned_rows_total{table, op}` is the other half: rows a pass **marked** deleted without freeing anything. Retention is its only producer today.
+
+**The two row counters must never be added together, and neither is a substitute for the other.** They count opposite ends of one row's life — retention writes a tombstone and counts it under `tombstoned_rows`; the deletion-vector sweep later unlinks that same tombstone and counts it under `reclaimed_rows`. A sum therefore counts the row twice and reports the most cleanup on precisely the table whose cleanup is most stalled. Keeping them as two metrics rather than one metric with an `op` label that silently changes the meaning of the value is what lets each be summed across `op` without a per-`op` filter, which is the property a dashboard panel actually relies on.
+
+Two properties of the reclaim family are load-bearing:
+
+- **The units are files and bytes, never directories** — and the bytes are *physical*. The retired-directory sweep counts the files it unlinked, including those it removes from a directory that *survives* because a live snapshot still references others in place, and sizes each one before the unlink. A file whose inode another pathname still links contributes **zero bytes**: subset compaction hard-links an unpicked file into the new snapshot's directory, so unlinking the retired snapshot's name for it frees nothing, and billing its length would claim back space the table still occupies. This is the one family that is physical rather than logical — `cayenne_storage_bytes` and `cayenne_data_dir_bytes` both count pathnames.
+- **The reclaim totals and the outcome are independent.** A pass that cleaned four directories and failed on a fifth reports `failed` — the failure is the actionable half, and the directory that will never go away is what an operator needs — while still publishing everything the pass did give back. Labelling such a pass `reclaimed` because the majority succeeded would hide the one that did not.
+
+## The state the decisions read
+
+The bake's trigger compares two numbers, and both are exported so a `declined_below_trigger` can be read rather than guessed at:
+
+- `cayenne_deletion_index_len{table}` — live tombstones, the trigger input
+- `cayenne_autotune_bake_deletion_index_trigger{table}` — the threshold, read through the same accessor the gate reads (so a pinned value reports itself, not the controller's)
+- `cayenne_deletion_index_reinserts{table}` — re-insert records; their share of `_len` is how much of the index is superseded history
+- `cayenne_deletion_index_bytes{table}` — resident bytes, the quantity the OOM backstop measures against the query memory pool
+
+## Footprint: what is growing, and where
+
+`cayenne_storage_{files,bytes,rows}{table, tier}` splits the table by the layer that produced it — `current`, `protected`, `cold`, `delete_vector`, `inline`. The split is what makes growth attributable: a rising `protected` file count is read amplification, a rising `delete_vector` byte count is a deletion set outgrowing the data it shadows, and rising `inline` bytes are level-0 that no checkpoint has drained. The `inline` tier reports bytes and rows but **no** `files`: level-0 lives in metastore rows, and publishing its entry count under a gauge measured in files would make a sum across tiers overstate the object count. Its entry count is `cayenne_metastore_table_rows{metastore_table="cayenne_inlined_data"}`.
+
+`files` on the `current` and `protected` tiers counts data-file **paths**. A manifest `file_path` is resolved against its own snapshot's directory, so a filename appearing under two live snapshots is two paths and counts twice — even when subset compaction hard-linked them to one inode, which is the usual case for a file a new snapshot inherits. That matches `cayenne_data_dir_bytes`, which walks the filesystem the same way. For bytes actually returned to the disk, read `cayenne_maintenance_reclaimed_bytes_total`, which counts a file only when it removed the file's last link.
+
+### A manifest row count is not a live-state count
+
+`cayenne_snapshot_file` holds one row per **(snapshot, file)** pair, and dead snapshots keep their rows until a compaction or overwrite prunes them. So the raw row count in `cayenne_metastore_table_rows{metastore_table="cayenne_snapshot_file"}` overstates live state by the prune backlog, which on a busy table is most of it.
+
+The split resolves it, and neither half means much alone:
+
+| metric | what it counts |
+|---|---|
+| `cayenne_snapshot_manifest_rows{table, reachable="true"}` | pairs a live snapshot names — equal to `cayenne_storage_files` summed over the `current` and `protected` tiers |
+| `cayenne_snapshot_manifest_rows{table, reachable="false"}` | pairs naming a dead snapshot — metastore weight no query can use |
+
+`reachable="false"` is the prune backlog: rising while compactions commit means the prune is not keeping up with snapshot turnover.
+
+### Metastore size
+
+- `cayenne_metastore_db_bytes{catalog}` and `cayenne_metastore_wal_bytes{catalog}` — the database file and its `-wal`; together, the whole metadata footprint.
+- `cayenne_metastore_table_rows{table, metastore_table}` — per-**dataset-table** row counts across `cayenne_snapshot_file`, `_file_statistics`, `_snapshot_sequence`, `cayenne_delete_file`, `cayenne_insert_record`, `cayenne_inlined_data`, `cayenne_inlined_delete`, `cayenne_cold_tier_file`. These are row counts, not state — see the section above before reading a large `cayenne_snapshot_file` value as a large table.
+
+### What is actually on disk
+
+Everything above is what the metastore *tracks*. The data directory also holds retired snapshot directories awaiting their sweep, deletion vectors nothing reclaimed, and staging left by an interrupted write — none of which appear in any manifest figure. The gap between the two is the leak signal, so the footprint sample measures the directory directly:
+
+- `cayenne_data_dir_bytes{table, kind}` and `cayenne_data_dir_files{table, kind}` — measured by walking the table directory, split by file role: `data` (`.vortex` anywhere under the table, *including* snapshot directories no manifest references), `deletion_vector` (under `deletions/`), `staging` (under `_staging/` — an interrupted write's residue when it outlives the write), `other` (write-ahead logs, temporaries). Role is decided by **position**, not extension: a `.vortex` under `_staging/` is staging residue.
+- `cayenne_data_dir_snapshot_dirs{table}` — snapshot directories present on disk. Far above the live snapshot count means retired directories the sweep has not reclaimed.
+
+Space no query can use shows up as the directory exceeding the manifest. Aggregate the tiers before comparing — a bare `{tier="current"} + {tier="protected"}` matches on labels that differ, so it yields nothing:
+
+```promql
+sum by (table) (cayenne_data_dir_bytes{kind="data"})
+  - sum by (table) (cayenne_storage_bytes{tier=~"current|protected"})
+```
+
+**Local filesystem only.** On object storage the equivalent is a paginated LIST of the whole table prefix — a per-request charge every sample would repeat — so there the manifest figures stand alone. The walk is skipped rather than approximated, so a missing series is never mistaken for an empty directory.
+
+### What each sample costs
+
+Every figure here rides a background tick, never a write path. Two ticks drive it: the background compactor's, and the post-write maintenance loop's. Both are needed — the bulk-overwrite profile sets `cayenne_compaction_background_interval_ms: 0`, so those tables have no compactor, and driving the sample only from it would leave exactly the tables that rewrite themselves wholesale as the ones whose disk usage cannot be seen. The clocks below bound how often either driver does real work, so the second one costs a clock read.
+
+The samples differ by orders of magnitude in cost, so they run on separate clocks rather than one:
+
+| sample | cadence | cost |
+|---|---|---|
+| deletion index, PK index format/size, memory account, inline cache, fleet budgets, write shape | every tick | atomic loads plus one `try_lock`, and one `get_array_memory_size` per inline batch; nothing to throttle |
+| `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows` | ≥ 30 s per table | one aggregate query over the table's own metastore rows; the manifest scan, which is indexed on `table_id` and aggregates without grouping, is the bulk of it |
+| `cayenne_data_dir_*` | ≥ 5 min per table | one `stat` per file — cost scales with exactly the file count it measures |
+
+One detail makes those cadences hold in practice:
+
+- The directory walk runs as a single `spawn_blocking` over `std::fs`, not a sequence of `tokio::fs` awaits. `tokio::fs` dispatches each call to the blocking pool individually, so a per-file `metadata()` would cost one task hop per file — tens of thousands per sample on exactly the runaway table this metric exists to reveal.
+
+A walk that runs long is logged with its duration and file count rather than capped: a silent cap would report a bounded directory for an unbounded one, which is the opposite of what the metric is for.
+
+The per-event counters (`cayenne_pk_index_discard_total` / `_preserved_total`, `cayenne_pk_bloom_split_rows_total`) fire **per batch**, never per row, and the bloom split is accumulated across an apply and emitted once. The encode fan-out is stored in an atomic at the decision and published on the tick, so nothing on the write path allocates for a metric.
+
+## Closing the resident-memory gap
+
+Budgets and pool gauges describe intent; resident memory describes fact. Until the gap can be decomposed, a pod using far more RAM than its pool gauge admits is an unfalsifiable mystery. These gauges are what the gap is closed against.
+
+**Take the gap against `process_resident_anon_bytes`, not against the total.** `process_resident_memory_bytes` includes file-backed pages — mapped metastore and Vortex files — which the kernel reclaims on demand and which no heap profiler can see. On a Cayenne file-mode workload that half has been measured at roughly half of total RSS, so the total overstates the instrumentation gap by more than a factor of two. `process_resident_file_bytes` is that half; it is real RSS and it is not a leak.
+
+Neither figure is the pod-sizing number: the kernel OOM-kills on cgroup accounting, which also charges kernel memory (slab, page tables, socket buffers) that no per-process metric sees. Use `container_memory_working_set_bytes` for capacity; this family is for attributing memory to what allocated it.
+
+**What Cayenne accounts for, and whether it lands.** Two gauges, and their relationship is the whole diagnosis:
+
+- `cayenne_memory_account_bytes{table, kind}` — what Cayenne **computed** and registered against the `DataFusion` query pool, split into `keyset`, `deletion_index`, and `cold_existence`.
+- `cayenne_memory_account_reserved_bytes{table}` — what the table's reservation **actually holds** on that pool.
+
+A resident figure far above `query_memory_pool_used_bytes` has two possible causes, and no single gauge separates them:
+
+| observation | reading |
+|---|---|
+| components ≈ reserved, both small | the accounting lands and the keysets really are small — check `cayenne_pk_index_format`, since a bloom is a few MB where an exact keyset would be gigabytes |
+| components ≈ reserved, both large | the accounting lands and the pool gauge should show it; a low `query_memory_pool_used_bytes` then points at the pool gauge, not at Cayenne |
+| components ≫ reserved | the accounting is not reaching the pool |
+| both small, resident large | the memory is in structures neither bounds — see the off-pool list below |
+
+**Off-pool structures.** Nothing registers these against the query pool, so they are invisible in every pool gauge:
+
+- `cayenne_inline_cache_bytes{table}` and `cayenne_inline_cache_batches{table}` — the decoded inline (level-0) view cache. These are *decoded* Arrow bytes, so they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}` the same rows occupy in the metastore.
+- `cayenne_deletion_index_bytes{table}` — the deletion index's own view of its residency, published beside `cayenne_memory_account_bytes{kind="deletion_index"}`, which is the pool-facing figure. A divergence between the two is itself the finding.
+
+**Fleet ceilings.** A table whose index refuses to grow because the *process-global* budget is exhausted looks, in every per-table gauge, exactly like a table that is simply small:
+
+- `cayenne_pk_keyset_budget_used_bytes` / `_total_bytes` and the pre-existing `cayenne_mem_tier_budget_used_bytes` / `_total_bytes` — the two process-global ceilings. `used` at the total is the reason a keyset degraded to a bloom rather than growing.
+
+Together with `cayenne_pk_index_budget_bytes{table, site}` — the per-table budget the `auto` tier derived, which is what multiplies across tables into a large fleet total — that accounts for the whole PK-keyset hypothesis: how large each table's index is, what it is allowed to reach, whether the fleet is at its ceiling, and which format each table settled on.
+
+All of these are lock-free atomic loads (the inline-cache figure is one `get_array_memory_size` per batch, not per row), so they ride every tick with no throttle.
+
+## The primary-key index
+
+The PK existence index is what an upsert-heavy apply leans on hardest, and its failures are silent: a discarded index is rebuilt from the table, which is correct but costs a full keyset scan.
+
+**Reported per cache, not per table.** A sharded (N>1) table keeps **two** indexes at once — the table-wide keyset and the per-shard index — each bounded by *half* the configured budget, and they transition independently. One can be an exact keyset still growing while the other has already degraded to a bloom, so every metric here carries `site` ∈ `table_keyset`, `sharded_keyset`. A per-table aggregate cannot express that mixed state, and the cache nearing its transition is the one worth knowing about.
+
+Two aggregation rules follow, and getting either wrong is easy:
+
+- **bytes sum across `site`.** Both layouts are resident simultaneously. `cayenne_memory_account_bytes{kind="keyset"}` is already that sum, as the memory account registers it against the query pool — use it rather than re-deriving one.
+- **keys must not.** The two caches are meant to cover the *same* key set in different layouts, so adding them double-counts every key. A divergence between their key counts is itself a staleness signal, which is the second reason not to aggregate them away.
+
+ The index has three shapes, and which one is live decides how its memory behaves:
+
+| `cayenne_pk_index_format` | shape | how its bytes behave |
+|---|---|---|
+| `0` | absent | no index cached — every conflict-validated batch rebuilds one with an O(live rows) scan *inside* the apply |
+| `1` | exact keyset | every live PK with its row location (and, table-wide, its per-key sequence stamp); bytes grow with the live key count until the budget is reached. Required by `on_conflict: do_nothing` |
+| `2` | bounded bloom | fixed bytes, no false negatives, some false positives (which cost a validation, never correctness). What an upsert table degrades to when the exact keyset exceeds its budget |
+
+Reported as a numeric gauge rather than a label for the reason `cayenne_data_storage_class` is: the value is what changes over time, and a label would spread one index across three series with two of them stale.
+
+- `cayenne_pk_index_bytes{table, site}` — approximate resident bytes of that cache, whichever representation it holds
+- `cayenne_pk_index_keys{table, site}` — DISTINCT keys that cache covers, published **only in exact mode**. A bloom cannot enumerate its members, so it reports `cayenne_pk_bloom_insertions` instead (see below); publishing a bloom's tally under a name that says "keys" would make a hot-key workload look like unbounded cardinality growth
+- `cayenne_pk_index_budget_bytes{table, site}` — the *effective* budget for that cache: half the per-table figure on a sharded table, already clamped by whatever the fleet has left (the process-global ceiling itself is `cayenne_pk_keyset_budget_total_bytes`)
+
+The three are only interpretable together. Bytes alone cannot distinguish an **exact keyset growing toward its budget** (which will degrade to a bloom and give most of them back) from a **bloom already at its fixed size** (which will not shrink); the budget alone says nothing about how close the table is to that transition. `bytes / budget_bytes` at `format = 1` is the countdown to a format change.
+
+`bytes` and `budget_bytes` come from the memory-accounting atomics, so they are **always** published — including on a tick where the busy table an operator is looking at cannot spare its cache lock. `format` and `keys` need that lock, taken with `try_lock` because the keyset caches sit on the CDC apply's write path and observability must never queue a writer behind it. A cache whose lock is busy publishes its size and skips its shape for that tick: reporting `absent` for a cache that was merely busy would read as a table rebuilding its index every batch.
+
+- `cayenne_pk_index_discard_total{table, site, kind, reason}` — indexes thrown away rather than cached back. `site` (`table_keyset` / `sharded_keyset`) is the load-bearing label: a discard rate concentrated at one site points at that site's guard rather than at the workload. `reason` is `overflowed` (the pending-key log's byte cap was too small for the commit rate during a validation), `invalidated` (something superseded the table state), or `over_budget` / `replay_over_budget`.
+- `cayenne_pk_index_preserved_total{table, site, kind}` — the positive control. Without it a low discard count could equally mean a healthy preserve path or that nothing ever checked an index out.
+- `cayenne_pk_bloom_bits{table, site}`, `cayenne_pk_bloom_insertions{table, site}`, and `cayenne_pk_bloom_bits_per_insertion{table, site}` — that cache's filter density. A filter resident at many times the bits-per-key the sizing code asks for is invisible in the bytes alone (they look like a large cache) and in the key count alone (it looks correct); only the ratio shows it.
+
+  **The denominator is insertions, not distinct keys.** `PkBloom::insert` tallies calls, because a bloom cannot enumerate its members: re-upserting one key increments it every time, and keys long since superseded still count. So `insertions` is an *upper bound* on the distinct live keys, and `bits_per_insertion` is a *lower bound* on the true bits per distinct key. The bound runs in the useful direction — a value already above the configured target proves over-allocation, since the real density is higher still — but it cannot prove the absence of over-allocation, which is why both are named for what they actually measure.
+
+  Both are emitted on **every** tick and **zeroed when that cache holds no bloom**, not skipped. A skipped gauge keeps its last value, so a cache that rebuilt an exact index would go on reporting the density of a filter that no longer exists — and a stale over-allocation reads exactly like a live one. A live bloom always allocates bits, so zero here unambiguously means "no bloom", which `cayenne_pk_index_format` states independently.
+- `cayenne_pk_bloom_split_rows_total{table, result}` — apply rows the filter split: `miss` rows skip on-conflict validation entirely, `hit` rows are validated. This is the filter's return on its resident bytes, stated directly.
+
+`cayenne_write_shape_shards{table, decision}` reports the encode fan-out a write resolved to together with the branch that chose it — `serial_sort_columns`, `serial_required`, `size_bounded`, `concurrency_bounded`. The shard count alone cannot be acted on: a fan-out of 1 from a configured write concurrency is a knob to raise, while one from a sort order is structural and no knob reaches it.
+
+## A note on resolution
+
+The counters here are cumulative OpenTelemetry counters: they accumulate every recorded event and are exported on the reader's interval, so a `rate()` between two scrapes is exact — no event is lost between them. What the reader interval bounds is *resolution*, not accuracy: a burst finer than one scrape interval is visible only as its total. The gauges are last-value and sampled on the maintenance tick, so they carry the opposite trade — dense in time, but they say nothing about what happened between two samples.
 
 ---
 

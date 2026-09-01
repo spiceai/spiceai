@@ -189,6 +189,31 @@ impl PostWriteMaintenanceState {
     }
 }
 
+/// What one retention pass did.
+///
+/// `Deferred` is not a failure and not an empty delete: the pass declined to run because
+/// materializing the inline corpus while a staged inline-conflict tombstone, a mem-tier
+/// seal shadow, or an append finalization is in flight would resurrect a superseded row
+/// or serve a live one twice. Keeping it distinct from `Deleted(0)` is what lets each
+/// caller pick its own retry — the background loop has a debounce to retry after, the
+/// synchronous drain does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionPass {
+    Deleted(u64),
+    /// Deferred behind something that publishes within milliseconds — an unpublished
+    /// inline-conflict tombstone or a staged append mid-finalize. Worth re-arming: the
+    /// next debounce almost certainly finds the window closed.
+    DeferredTransient,
+    /// Deferred behind a mem-tier seal shadow, which is NOT transient: it stands until
+    /// the next full checkpoint — 10s by default, and indefinitely when the age trigger
+    /// is off and the size gate is unmet. Re-arming would poll at the debounce interval
+    /// for that whole span, dragging `run_maintenance_state`'s metastore vacuum and WAL
+    /// checkpoint tail along on every pass. The checkpoint that clears a shadow arms
+    /// retention itself (see `checkpoint_mem_tier_inner`), so waiting for it costs one
+    /// checkpoint of latency and no polling.
+    DeferredUntilCheckpoint,
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,

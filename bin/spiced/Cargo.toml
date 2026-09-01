@@ -170,7 +170,6 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
-    "scylladb",
     "models",
     "aws-secrets-manager",
     "azure-keyvault",
@@ -210,6 +209,7 @@ postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
+# Opt-in ScyllaDB connector; not in `default`.
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]

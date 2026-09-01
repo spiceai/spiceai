@@ -1854,13 +1854,22 @@ impl DataFusion {
                 telemetry::cayenne::track_compaction_memory_pool_used_bytes(compaction_used, &[]);
                 // The RSS read touches the filesystem (procfs on Linux), so it
                 // goes to the blocking pool rather than this worker thread. Once
-                // per interval, off the critical path of every other task.
-                if let Ok(Some(rss)) = tokio::task::spawn_blocking(
-                    crate::resource_monitor::process_resident_memory_bytes,
-                )
-                .await
+                // per interval, off the critical path of every other task. The
+                // anonymous/file split comes from the same read, so it costs only
+                // the extra parse — and it is what makes the gap above readable:
+                // the file-backed half is reclaimable page cache, not memory
+                // anyone is accounting for wrongly.
+                if let Ok(Some(resident)) =
+                    tokio::task::spawn_blocking(crate::resource_monitor::process_resident_memory)
+                        .await
                 {
-                    telemetry::track_process_resident_memory_bytes(rss, &[]);
+                    telemetry::track_process_resident_memory_bytes(resident.total, &[]);
+                    // Only where the platform supplies it: a zeroed split would
+                    // read as "this process holds no anonymous memory", which is
+                    // the misattribution these two gauges exist to prevent.
+                    if let Some(split) = resident.split {
+                        telemetry::track_process_resident_split(split.anon, split.file, &[]);
+                    }
                 }
             }
         });
