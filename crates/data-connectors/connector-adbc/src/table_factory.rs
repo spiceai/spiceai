@@ -89,6 +89,7 @@ pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     factory: AdbcTableFactory<D>,
 }
@@ -97,6 +98,7 @@ impl<D> AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType: Clone + Send + Unpin + 'static,
 {
     /// Builds the factory with the driver's function-support policy installed
     /// and the `query_federation` setting applied.

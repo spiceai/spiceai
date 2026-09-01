@@ -2020,6 +2020,9 @@ mod function_support_tests {
     /// the table schema. Everything else reports `NotImplemented`.
     struct StubDatabase;
     struct StubConnection;
+    // Clonable because cancelling a running query needs a second handle to the
+    // same statement, which the ADBC table factory requires of every driver.
+    #[derive(Clone)]
     struct StubStatement;
 
     impl Optionable for StubDatabase {
