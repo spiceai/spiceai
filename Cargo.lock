@@ -194,7 +194,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6402ebde5a40d90b929ef180dc82cda8959c813f#6402ebde5a40d90b929ef180dc82cda8959c813f"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -203,7 +203,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6402ebde5a40d90b929ef180dc82cda8959c813f#6402ebde5a40d90b929ef180dc82cda8959c813f"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -220,7 +220,7 @@ dependencies = [
 [[package]]
 name = "adbc_ffi"
 version = "0.23.0"
-source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6402ebde5a40d90b929ef180dc82cda8959c813f#6402ebde5a40d90b929ef180dc82cda8959c813f"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=6bba76c1fed94c62f58c4a99de05d2aa874e5050#6bba76c1fed94c62f58c4a99de05d2aa874e5050"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -6829,7 +6829,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=0cb3781608b89f40c6585618ec3071f83345671a#0cb3781608b89f40c6585618ec3071f83345671a"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=095504d9c05882c300ef60b625280220f2d4298b#095504d9c05882c300ef60b625280220f2d4298b"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -7306,7 +7306,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=a572805881c93c1f83243ac232713fd89967a84b#a572805881c93c1f83243ac232713fd89967a84b"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=d511a53a9eb94741ce7a7d14c203ef5c98db3553#d511a53a9eb94741ce7a7d14c203ef5c98db3553"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",

@@ -605,6 +605,18 @@ def verdict(
                 "so the run proves nothing about cancellation"
             )
             continue
+        # A job that happened to finish on its own just after the client left
+        # would otherwise satisfy the latency bound, which is the behaviour this
+        # harness exists to catch rather than accept.
+        if not record.get("bigquery_terminated_by_cancellation"):
+            failures.append(
+                f"attempt {index}: BigQuery job "
+                f"{(record.get('bigquery_job') or {}).get('job_id')} reached "
+                f"{(record.get('bigquery_job') or {}).get('state')} without being "
+                f"cancelled (error_result="
+                f"{(record.get('bigquery_job') or {}).get('error_result')!r}); it "
+                "ended on its own rather than because the client went away"
+            )
         terminal_after = record.get("bigquery_reached_terminal_after_seconds")
         if terminal_after is None or terminal_after > cancel_latency_bound:
             failures.append(
@@ -652,7 +664,12 @@ def main() -> int:
     pool_probe_deadline = env_float("BIGQUERY_CANCEL_POOL_PROBE_SECONDS", 180.0)
     job_poll_budget = env_float("BIGQUERY_CANCEL_JOB_POLL_SECONDS", 300.0)
     attempts = env_int("BIGQUERY_CANCEL_ATTEMPTS", 3)
-    cancel_latency_bound = env_float("BIGQUERY_CANCEL_LATENCY_BOUND_SECONDS", 20.0)
+    # What proves cancellation is the job's terminal reason, not the clock; this
+    # bound only says it happened promptly. Most of the wait is BigQuery's own:
+    # `jobs.cancel` takes seconds to move a running job to DONE, and this harness
+    # samples every 2s on top of that. It is set well below the time the query
+    # would take to finish on its own, so a job left to complete still fails.
+    cancel_latency_bound = env_float("BIGQUERY_CANCEL_LATENCY_BOUND_SECONDS", 45.0)
     pool_release_bound = env_float("BIGQUERY_CANCEL_POOL_BOUND_SECONDS", 20.0)
     token = f"c{utc_stamp().lower()}_{os.getpid()}"
     mode = os.environ.get("BIGQUERY_CANCEL_MODE", "deadline")

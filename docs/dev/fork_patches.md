@@ -84,7 +84,7 @@ own section below — a count here would be one more thing to keep true by hand.
 
 | Fork | Pinned revision | Branch |
 |---|---|---|
-| [arrow-adbc](#arrow-adbc) | `6402ebde5a40d90b929ef180dc82cda8959c813f` | `phillip/statement-cancel-during-execute` |
+| [arrow-adbc](#arrow-adbc) | `6bba76c1fed94c62f58c4a99de05d2aa874e5050` | `phillip/statement-cancel-during-execute` |
 | [arrow-rs](#arrow-rs) | `18a40370d014a0f8eed12ee0d5a914e8cb2070d8` | `lukim/spiceai-58.3.0` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
@@ -95,9 +95,9 @@ own section below — a count here would be one more thing to keep true by hand.
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
 | [datafusion](#datafusion) | `d7193e96eaada34a126892aca9b0531a821ea5f9` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0cb3781608b89f40c6585618ec3071f83345671a` | `spiceai-54` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `095504d9c05882c300ef60b625280220f2d4298b` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `a572805881c93c1f83243ac232713fd89967a84b` | `phillip/cancel-abandoned-adbc-query` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `d511a53a9eb94741ce7a7d14c203ef5c98db3553` | `phillip/cancel-abandoned-adbc-query` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |

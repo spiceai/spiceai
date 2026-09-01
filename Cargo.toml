@@ -257,7 +257,7 @@ datafusion-common-runtime = "54.1.0"
 datafusion-datasource = "54.1.0"
 datafusion-execution = "54.1.0"
 datafusion-expr = "54.1.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a", features = ["sql"] } # spiceai-54
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "095504d9c05882c300ef60b625280220f2d4298b", features = ["sql"] } # spiceai-54
 datafusion-functions = "54.1.0"
 datafusion-functions-aggregate = "54.1.0"
 datafusion-functions-aggregate-common = "54.1.0"
@@ -272,7 +272,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "a572805881c93c1f83243ac232713fd89967a84b" } # branch: phillip/cancel-abandoned-adbc-query (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "d511a53a9eb94741ce7a7d14c203ef5c98db3553" } # branch: phillip/cancel-abandoned-adbc-query (DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
@@ -504,9 +504,9 @@ lto = "off"
 # call it exists to interrupt, so a cancel cannot reach a running query. Spice
 # needs it to, or an abandoned query holds its pooled connection until the
 # remote query finishes on its own.
-adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6402ebde5a40d90b929ef180dc82cda8959c813f" } # branch: phillip/statement-cancel-during-execute
-adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6402ebde5a40d90b929ef180dc82cda8959c813f" }
-adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6402ebde5a40d90b929ef180dc82cda8959c813f" }
+adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6bba76c1fed94c62f58c4a99de05d2aa874e5050" } # branch: phillip/statement-cancel-during-execute
+adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6bba76c1fed94c62f58c4a99de05d2aa874e5050" }
+adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6bba76c1fed94c62f58c4a99de05d2aa874e5050" }
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "d7193e96eaada34a126892aca9b0531a821ea5f9" } # branch: spiceai-54 (merged PR #210)
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "d7193e96eaada34a126892aca9b0531a821ea5f9" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "d7193e96eaada34a126892aca9b0531a821ea5f9" }

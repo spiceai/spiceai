@@ -48,6 +48,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arr
 type AdbcStatusCode = u8;
 const ADBC_STATUS_OK: AdbcStatusCode = 0;
 const ADBC_STATUS_INTERNAL: AdbcStatusCode = 9;
+const ADBC_STATUS_INVALID_STATE: AdbcStatusCode = 6;
 const ADBC_STATUS_CANCELLED: AdbcStatusCode = 11;
 
 /// How long the fake driver stays inside `StatementExecuteQuery` before giving
@@ -59,6 +60,15 @@ static CANCELLED: Mutex<bool> = Mutex::new(false);
 static CANCEL_SIGNAL: Condvar = Condvar::new();
 static EXECUTING: AtomicBool = AtomicBool::new(false);
 static CANCELS: AtomicUsize = AtomicUsize::new(0);
+/// The statement currently inside `StatementExecuteQuery`, as a pointer value.
+static EXECUTING_STATEMENT: AtomicUsize = AtomicUsize::new(0);
+/// Set if the statement running the query was released while it was still
+/// running it. A handle taken to cancel with is another reference to the same
+/// statement, so releasing when that handle drops pulls the statement out from
+/// under the thread inside the FFI call.
+static RELEASED_WHILE_EXECUTING: AtomicBool = AtomicBool::new(false);
+/// Set if any statement call arrived after that statement had been released.
+static USE_AFTER_RELEASE: AtomicBool = AtomicBool::new(false);
 
 fn reset_driver_state() {
     *CANCELLED
@@ -66,6 +76,9 @@ fn reset_driver_state() {
         .expect("the cancel state should be lockable") = false;
     EXECUTING.store(false, Ordering::SeqCst);
     CANCELS.store(0, Ordering::SeqCst);
+    EXECUTING_STATEMENT.store(0, Ordering::SeqCst);
+    RELEASED_WHILE_EXECUTING.store(false, Ordering::SeqCst);
+    USE_AFTER_RELEASE.store(false, Ordering::SeqCst);
 }
 
 fn wait_until_executing(timeout: Duration) -> bool {
@@ -121,8 +134,21 @@ unsafe extern "C" fn statement_release(
     statement: *mut adbc_ffi::FFI_AdbcStatement,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
+    if EXECUTING_STATEMENT.load(Ordering::SeqCst) == statement as usize {
+        RELEASED_WHILE_EXECUTING.store(true, Ordering::SeqCst);
+    }
     unsafe { (*statement).private_data = null_mut() };
     ADBC_STATUS_OK
+}
+
+/// Records a call that arrived after the statement was released, the way a real
+/// driver reports one rather than working anyway.
+unsafe fn refuse_if_released(statement: *mut adbc_ffi::FFI_AdbcStatement) -> bool {
+    if unsafe { (*statement).private_data }.is_null() {
+        USE_AFTER_RELEASE.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
 }
 
 unsafe extern "C" fn statement_set_sql_query(
@@ -158,6 +184,9 @@ unsafe extern "C" fn statement_execute_query(
     _rows_affected: *mut i64,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
+    if unsafe { refuse_if_released(_statement) } {
+        return ADBC_STATUS_INVALID_STATE;
+    }
     EXECUTING.store(true, Ordering::SeqCst);
     let mut cancelled = CANCELLED
         .lock()
@@ -182,6 +211,9 @@ unsafe extern "C" fn statement_cancel(
     _statement: *mut adbc_ffi::FFI_AdbcStatement,
     _error: *mut adbc_ffi::FFI_AdbcError,
 ) -> AdbcStatusCode {
+    if unsafe { refuse_if_released(_statement) } {
+        return ADBC_STATUS_INVALID_STATE;
+    }
     CANCELS.fetch_add(1, Ordering::SeqCst);
     let mut cancelled = CANCELLED
         .lock()
@@ -274,5 +306,18 @@ async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
         waited.elapsed() < Duration::from_secs(30),
         "the pool connection took {:?} to come back",
         waited.elapsed()
+    );
+
+    // The runtime held two handles to the statement running the query: the one
+    // executing it and the one it cancelled through. Releasing per handle pulls
+    // the statement out from under the thread still inside
+    // StatementExecuteQuery.
+    assert!(
+        !RELEASED_WHILE_EXECUTING.load(Ordering::SeqCst),
+        "the statement was released while it was still running the query"
+    );
+    assert!(
+        !USE_AFTER_RELEASE.load(Ordering::SeqCst),
+        "a statement call arrived after that statement had been released"
     );
 }

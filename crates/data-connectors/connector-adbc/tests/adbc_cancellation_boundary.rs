@@ -25,19 +25,21 @@ limitations under the License.
 //! the way, so what they report is a fact about the ADBC binding and the driver
 //! rather than about Spice.
 //!
-//! Two constraints they exist to keep visible:
+//! What they check, against the driver actually in use:
 //!
-//! * `adbc_driver_manager::ManagedStatement` takes the same
-//!   `Mutex<FFI_AdbcStatement>` in `cancel` and in `execute`, and `execute` holds
-//!   it across the whole FFI call — so `cancel` is serialized behind the call it
-//!   is meant to interrupt, even though the ADBC C API specifies
-//!   `AdbcStatementCancel` as callable during `AdbcStatementExecuteQuery`.
-//! * `Connection::cancel` takes a different lock and so can be called
-//!   concurrently, but a driver is free to scope it to the connection rather than
-//!   to the statement, in which case it does not end the query.
+//! * `Statement::cancel` returns promptly while `execute` is running, and the
+//!   query ends as cancelled. The ADBC C API specifies `AdbcStatementCancel` as
+//!   callable during `AdbcStatementExecuteQuery`, and the `adbc_driver_manager`
+//!   revision this workspace pins issues it without taking the lock the other
+//!   statement functions use, so this is the contract a driver is held to.
+//! * `Connection::cancel` also takes a different lock and so can be called
+//!   concurrently, but a driver is free to scope it to the connection rather
+//!   than to the statement, in which case it does not end the query. The
+//!   BigQuery driver scopes it that way, so this one reports rather than asserts.
 //!
-//! Either test turning into a fast, effective cancel is the signal that
-//! cancellation can be propagated to the ADBC layer
+//! `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs` covers the
+//! same propagation without a driver and runs everywhere; this is how the same
+//! claim is checked against a real one
 //! ([#13781](https://github.com/spiceai/spiceai/issues/13781)).
 //!
 //! Opt-in. It needs a driver and a query that runs long enough to interrupt:
