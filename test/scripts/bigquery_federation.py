@@ -20,7 +20,7 @@ is eligible to run as a single BigQuery job. This harness runs such a statement
 through a real ``spiced`` and counts the jobs BigQuery actually received, so the
 count is observed rather than inferred from a plan.
 
-Two scenarios run against the same pod:
+Three scenarios run against the same pod:
 
 ``same-dataset``
     Every table is in one BigQuery dataset. The statement references a CTE three
@@ -31,8 +31,14 @@ Two scenarios run against the same pod:
     The same statement shape, with one table moved to a second dataset in the
     same project under the same credential.
 
-Both scenarios are compared against the identical statement submitted straight
-to BigQuery, so a job-count change is only meaningful alongside matching rows.
+``json-cross-dataset``
+    The cross-dataset shape, projecting ``json_get_str``. A function the unparser
+    cannot render is left above the federated scan and evaluated locally, which
+    the job count alone would not reveal, so this scenario also asserts that the
+    BigQuery JSON calls appear in the pushed SQL.
+
+Every scenario is compared against the identical statement submitted straight to
+BigQuery, so a job-count change is only meaningful alongside matching rows.
 
 This is an opt-in integration harness, not a vacuous skip. It fails at startup
 unless a service-account credential and the ADBC BigQuery driver are supplied.
@@ -56,7 +62,7 @@ harness never falls back to application-default credentials.
 Job counting reads ``INFORMATION_SCHEMA.JOBS_BY_USER``, which reports the jobs
 this credential itself created, so it needs no project-wide job-list permission.
 
-Exit status is 0 when both scenarios return correct rows as a single BigQuery
+Exit status is 0 when every scenario returns correct rows as a single BigQuery
 job. ``BIGQUERY_EXPECT=split`` inverts the job-count expectation for the
 cross-dataset scenario, which is how the pre-fix reproduction is recorded as a
 pass rather than as a failed run.
