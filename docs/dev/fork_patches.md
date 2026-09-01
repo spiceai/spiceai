@@ -97,7 +97,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `095504d9c05882c300ef60b625280220f2d4298b` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `c92078cb38d07ad8880927316aaac4db399571ca` | `fix/adbc-retry-dropped-cancel` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `3ae41f7df7fae14d0fe21495488fa7dd8d9aa191` | `fix/adbc-retry-dropped-cancel` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
@@ -255,6 +255,7 @@ build failure:
 | DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`, and `sql.rs::a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for; the fourth names the two sentinel counts, so a revert that renders them instead of declining them fails there rather than inside a generated statement |
 | Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the `arrow-adbc` one is missing |
 | Re-send the cancel until the abandoned query is over (fork PR #66) | The cancel handle is published before `Statement::execute` is entered, so a caller that goes away inside that window hands the driver a cancel with no running query to apply it to. A driver may drop it; the query then runs to completion holding its pooled connection, which is what cancelling is for | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::a_cancel_the_driver_drops_is_retried_until_the_query_stops`, whose in-process driver swallows the first cancel |
+| Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | **GAP** |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 
 ## arrow-adbc
@@ -481,7 +482,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**35 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -497,11 +498,13 @@ They are not equal in consequence; this is the order to close them in.
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
 6. `snowflake-rs` chunked JSON responses and record-batch ordering.
 7. `clickhouse-rs` `Date32` range.
-8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+8. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
+   federated date filter matches the wrong rows.
+9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-9. `mistral.rs` `tool_calls` chat-template handling.
-10. `text-embeddings-inference` pooling and model-loading fixes — embeddings differ
-    from the reference implementation.
+10. `mistral.rs` `tool_calls` chat-template handling.
+11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+    differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 

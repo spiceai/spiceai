@@ -27,15 +27,20 @@ limitations under the License.
 //!
 //! What they check, against the driver actually in use:
 //!
-//! * `Statement::cancel` returns promptly while `execute` is running, and the
-//!   query ends as cancelled. The ADBC C API specifies `AdbcStatementCancel` as
-//!   callable during `AdbcStatementExecuteQuery`, and the `adbc_driver_manager`
-//!   revision this workspace pins issues it without taking the lock the other
-//!   statement functions use, so this is the contract a driver is held to.
-//! * `Connection::cancel` also takes a different lock and so can be called
-//!   concurrently, but a driver is free to scope it to the connection rather
-//!   than to the statement, in which case it does not end the query. The
-//!   `BigQuery` driver scopes it that way, so this one reports rather than asserts.
+//! * **Asserted** — `Statement::cancel` returns within
+//!   `ADBC_CANCEL_CALL_BOUND_SECONDS`, the query ends as an error rather than
+//!   returning its rows, and it does so within `ADBC_CANCEL_STOP_BOUND_SECONDS`
+//!   of the cancel. The ADBC C API specifies `AdbcStatementCancel` as callable
+//!   during `AdbcStatementExecuteQuery`, and the `adbc_driver_manager` revision
+//!   this workspace pins issues it without taking the lock the other statement
+//!   functions use, so this is the contract a driver is held to. A driver
+//!   manager that serializes the two instead misses the first bound by the
+//!   length of the query, and the query then ends by finishing rather than by
+//!   being cancelled.
+//! * **Reported, not asserted** — `Connection::cancel` also takes a different
+//!   lock and so can be called concurrently, but a driver is free to scope it to
+//!   the connection rather than to the statement, in which case it does not end
+//!   the query. The `BigQuery` driver scopes it that way.
 //!
 //! `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs` covers the
 //! same propagation without a driver and runs everywhere; this is how the same
@@ -68,6 +73,12 @@ struct Config {
     driver_options: Vec<(String, String)>,
     sql: String,
     wait_before_cancel: Duration,
+    /// How long `Statement::cancel` itself may take. A driver manager that
+    /// serializes cancel behind `execute` blows through this by the length of
+    /// the query, which is the defect this bound exists to catch.
+    cancel_call_bound: Duration,
+    /// How long after the cancel the query may take to end.
+    query_stop_bound: Duration,
 }
 
 /// Reads the configuration, or reports why the test cannot run.
@@ -95,19 +106,25 @@ fn config() -> Result<Option<Config>, String> {
         driver_options.push((key.trim().to_string(), value.trim().to_string()));
     }
 
-    let wait_before_cancel = Duration::from_secs(
-        std::env::var("ADBC_CANCEL_WAIT_SECONDS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(8),
-    );
     Ok(Some(Config {
         driver_path,
         uri,
         driver_options,
         sql,
-        wait_before_cancel,
+        wait_before_cancel: seconds("ADBC_CANCEL_WAIT_SECONDS", 8),
+        cancel_call_bound: seconds("ADBC_CANCEL_CALL_BOUND_SECONDS", 5),
+        query_stop_bound: seconds("ADBC_CANCEL_STOP_BOUND_SECONDS", 30),
     }))
+}
+
+/// Reads a duration in whole seconds, falling back to `default`.
+fn seconds(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default),
+    )
 }
 
 /// Appends a unique trailing comment to the query.
@@ -189,6 +206,26 @@ fn statement_cancel_during_execute() {
     println!(
         "cancel_blocked_until_execute_finished={}",
         cancel_took.as_secs_f64() > 1.0
+    );
+
+    cancel_result.expect("the driver should accept a cancel while the query is running");
+    assert!(
+        cancel_took <= config.cancel_call_bound,
+        "statement.cancel took {cancel_took:?}, over the {:?} bound, so it waited for the \
+         query instead of interrupting it",
+        config.cancel_call_bound
+    );
+
+    // A driver that ignored the cancel returns the rows the query produced,
+    // after running it to the end.
+    let error = execute_outcome
+        .expect_err("the cancelled query should have ended as an error, not returned rows");
+    println!("statement.execute ended with: {error}");
+    let stopped_within = execute_took.saturating_sub(config.wait_before_cancel);
+    assert!(
+        stopped_within <= config.query_stop_bound,
+        "the query took {stopped_within:?} to end after the cancel, over the {:?} bound",
+        config.query_stop_bound
     );
 }
 

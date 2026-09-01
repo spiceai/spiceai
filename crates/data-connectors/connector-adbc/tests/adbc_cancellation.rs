@@ -226,7 +226,9 @@ unsafe extern "C" fn statement_cancel(
     }
     CANCELS.fetch_add(1, Ordering::SeqCst);
     if CANCELS_TO_IGNORE
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
         .is_ok()
     {
         return ADBC_STATUS_OK;
