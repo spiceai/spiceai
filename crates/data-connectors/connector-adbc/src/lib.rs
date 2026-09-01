@@ -1170,8 +1170,6 @@ struct JoinIdentity<'a> {
 ///   different hash, preventing incorrect cross-credential pushdown
 fn build_join_context(identity: &JoinIdentity<'_>) -> String {
     let mut hasher = Sha256::new();
-    // A NUL between fields keeps concatenations from colliding; no configuration
-    // value can contain one.
     for field in [
         Some(identity.driver),
         Some(identity.uri),
@@ -1181,9 +1179,19 @@ fn build_join_context(identity: &JoinIdentity<'_>) -> String {
         identity.catalog,
         identity.schema,
     ] {
-        if let Some(value) = field {
-            hasher.update(value.as_bytes());
+        // The presence marker keeps an absent option distinct from an empty one.
+        // They are different connection configurations -- `build_db_options` sends
+        // no option for the first and an empty-valued one for the second -- and
+        // without the marker each would contribute nothing but the separator.
+        match field {
+            Some(value) => {
+                hasher.update(b"1");
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update(b"0"),
         }
+        // A NUL between fields keeps concatenations from colliding; no
+        // configuration value can contain one.
         hasher.update(b"\0");
     }
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
@@ -2249,6 +2257,35 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         assert_ne!(
             ctx_a, ctx_b,
             "different service-account identities must not share a join context"
+        );
+    }
+
+    /// An absent option and an empty one are different connection configurations --
+    /// `build_db_options` sends no password option for the first and `Password("")`
+    /// for the second -- so they must not share a join context.
+    #[test]
+    fn test_build_join_context_distinguishes_absent_from_empty() {
+        let absent = build_join_context(&JoinIdentity {
+            driver: "postgresql",
+            uri: "postgresql://host/db",
+            username: Some("user"),
+            password: None,
+            driver_options: None,
+            catalog: None,
+            schema: None,
+        });
+        let empty = build_join_context(&JoinIdentity {
+            driver: "postgresql",
+            uri: "postgresql://host/db",
+            username: Some("user"),
+            password: Some(""),
+            driver_options: None,
+            catalog: None,
+            schema: None,
+        });
+        assert_ne!(
+            absent, empty,
+            "an absent option and an empty one must not share a join context"
         );
     }
 
