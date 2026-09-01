@@ -104,6 +104,13 @@ impl DuckLakeCatalogProvider {
     ///
     /// # Arguments
     /// * `pool` - `DuckDB` connection pool with `ducklake` extension loaded
+    /// * `duckdb_factory` - The factory catalog tables are read through. The
+    ///   caller supplies it because the unparser dialect and the federation
+    ///   deny-list are two halves of one decision and both live above this
+    ///   crate: the dialect says what can be rewritten into `DuckDB` SQL, and
+    ///   the deny-list refuses to federate everything else. A bare factory
+    ///   federates a Spice-only UDF and emits it verbatim into SQL `DuckDB`
+    ///   cannot run.
     /// * `catalog_name` - The catalog name as attached in `DuckDB`
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
@@ -111,13 +118,13 @@ impl DuckLakeCatalogProvider {
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
+        duckdb_factory: DuckDBTableFactory,
         catalog_name: String,
         writable: bool,
         ddl_enabled: bool,
         selector: TableSelector,
     ) -> Self {
-        // Create a table factory that uses the same pool (with ducklake already attached)
-        let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
+        let duckdb_factory = Arc::new(duckdb_factory);
         Self {
             pool,
             duckdb_factory,

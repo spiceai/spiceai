@@ -443,6 +443,114 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
 }
 
 /// Tests that INSERT works on a standalone `DuckLake` dataset when `access: read_write` is set.
+/// Both `DuckLake` read paths must install the `DuckDB` federation deny-list.
+///
+/// `connector-ducklake` and `DuckLakeCatalogProvider` each build a
+/// `DuckDBTableFactory` over the same pool, and each installs the `DuckDB`
+/// unparser dialect. The dialect and the deny-list are two halves of one
+/// decision: without the deny-list, `can_execute_plan` lets a plan holding a
+/// Spice-only UDF federate, and the unparser emits it into the SQL sent to
+/// `DuckDB`.
+///
+/// `cosine_distance` is the case that matters (spiceai/spiceai#13728): `DuckDB`
+/// has a similarly-named `array_cosine_distance` that answers a *different
+/// number*, so a missing deny-list here is a wrong result rather than an error.
+/// The argument references a column so the expression cannot be constant-folded
+/// out of the plan before federation is decided.
+#[tokio::test]
+async fn ducklake_does_not_push_down_spice_functions() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_denylist.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir.path().join("data_denylist").display().to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake(&metadata_path, &data_path);
+
+    test_request_context()
+        .scope(async {
+            // One dataset (connector path) and one catalog (catalog-provider
+            // path) over the same DuckLake, so both factories are exercised.
+            let mut dataset = Dataset::new(
+                "ducklake:main.products".to_string(),
+                "standalone_products".to_string(),
+            );
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "ducklake_connection_string".to_string(),
+                metadata_path.clone(),
+            )])));
+
+            let mut catalog = Catalog::new("ducklake".to_string(), "lake".to_string());
+            catalog.params = Some(make_ducklake_catalog_params(&metadata_path));
+
+            let app = AppBuilder::new("ducklake_denylist_test")
+                .with_dataset(dataset)
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            for table in ["standalone_products", "lake.main.products"] {
+                let sql = format!(
+                    "SELECT id, cosine_distance(make_array(price, price, price),                      make_array(1.0, 2.0, 3.0)) AS d FROM {table} ORDER BY id"
+                );
+
+                // 1. The query runs. A federated `cosine_distance` that DuckDB
+                //    could not bind would fail here instead.
+                let result = rt.datafusion().query_builder(&sql).build().run().await?;
+                let rows: Vec<RecordBatch> = result.data.try_collect().await?;
+                let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(total, 2, "expected 2 rows from {table}");
+
+                // 2. The scan is still pushed down, but the function is not.
+                //    Deleting the `.with_function_support(..)` call on either
+                //    factory turns this into `array_cosine_distance`, which
+                //    answers twice the local value.
+                let plan = explain_plan(&rt, &sql).await;
+                let pushed: Vec<&str> = plan
+                    .lines()
+                    .filter(|l| l.contains("base_sql=") || l.contains("DuckSqlExec sql="))
+                    .collect();
+                assert!(
+                    !pushed.is_empty(),
+                    "expected {table} to push a scan down to DuckDB; plan was:\n{plan}"
+                );
+                for line in pushed {
+                    assert!(
+                        !line.contains("array_cosine_distance"),
+                        "{table}: cosine_distance was federated to DuckDB's \
+                         array_cosine_distance, which answers a different number:\n{line}"
+                    );
+                }
+                assert!(
+                    plan.contains("cosine_distance"),
+                    "{table}: cosine_distance must still appear in the plan, \
+                     evaluated locally:\n{plan}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
+
 #[tokio::test]
 async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));

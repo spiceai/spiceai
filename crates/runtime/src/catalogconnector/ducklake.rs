@@ -32,9 +32,12 @@ use data_components::ducklake::provider::DuckLakeCatalogProvider;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
+use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -315,8 +318,17 @@ impl CatalogConnector for DuckLakeCatalog {
             })??;
 
         // Create the catalog provider with the pool (which has ducklake extension and catalog attached)
+        // Same pairing the ducklake *dataset* connector installs: the DuckDB
+        // dialect for what can genuinely be rewritten, and the deny-list so
+        // every other Spice UDF is evaluated locally rather than unparsed into
+        // SQL DuckDB cannot run.
+        let duckdb_factory = DuckDBTableFactory::new(Arc::clone(&pool))
+            .with_dialect(new_duckdb_dialect())
+            .with_function_support(deny_spice_functions_for_duckdb_table_providers());
+
         let catalog_provider = Arc::new(DuckLakeCatalogProvider::new(
             pool,
+            duckdb_factory,
             catalog_name,
             writable,
             ddl_enabled,

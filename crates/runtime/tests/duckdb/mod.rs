@@ -641,8 +641,10 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
 ///
 /// `fed` has no acceleration, so its scan is pushed to `DuckDB`; `local` is
 /// accelerated into Arrow, so it is evaluated by the Spice kernel. Both read the
-/// same rows, so the two must agree — and `inner_product`, which `DuckDB` *does*
-/// implement identically, must still federate.
+/// same rows, so the two must agree — and `inner_product` must still federate,
+/// since `DuckDB`'s `array_inner_product` agrees wherever the result is
+/// representable. Where it is not, the two still diverge (`+Inf` against the
+/// kernel's NULL); that is pinned below and tracked in spiceai/spiceai#13787.
 #[tokio::test]
 async fn duckdb_cosine_distance_is_not_federated_to_a_different_function() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -801,8 +803,9 @@ async fn duckdb_cosine_distance_is_not_federated_to_a_different_function() -> Re
             );
 
             // `inner_product` is the control: DuckDB's `array_inner_product`
-            // computes the same value, so it must still federate and must still
-            // agree across the boundary.
+            // computes the same value wherever that value is representable, so
+            // it must still federate and still agree on those rows. The one row
+            // whose result is not representable is asserted separately below.
             let inner = |table: &str| {
                 format!("SELECT id, inner_product(emb, probe) AS ip FROM {table} ORDER BY id")
             };
