@@ -23,6 +23,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
+use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
@@ -30,6 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::dialect::new_bigquery_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_bigquery_table_providers;
+use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -58,6 +60,15 @@ fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
     match driver_name {
         BIGQUERY_DRIVER => deny_spice_functions_for_bigquery_table_providers(),
         _ => deny_spice_functions_for_table_providers(),
+    }
+}
+
+fn pre_federation_optimizer_rules_for_driver(
+    driver_name: &str,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    match driver_name {
+        BIGQUERY_DRIVER => vec![Arc::new(RegexpMatchNullCheckRewrite::new())],
+        _ => vec![],
     }
 }
 
@@ -108,7 +119,10 @@ where
         Self {
             factory: AdbcTableFactory::new(pool)
                 .with_federation_enabled(federation_enabled)
-                .with_function_support(function_support_for_driver(driver_name)),
+                .with_function_support(function_support_for_driver(driver_name))
+                .with_pre_federation_optimizer_rules(pre_federation_optimizer_rules_for_driver(
+                    driver_name,
+                )),
         }
     }
 

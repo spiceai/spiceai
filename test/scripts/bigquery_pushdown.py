@@ -104,6 +104,43 @@ ORDER BY grp, ord""",
   ) AS running_sum
 FROM window_values
 ORDER BY grp, ord""",
+    # The PostgreSQL-idiom NULL-check over regexp_match. Pushes down whole:
+    # the BigQuery provider's optimizer rule rewrites it into regexp_like
+    # before its federation capability check, and the BigQuery dialect renders
+    # that as REGEXP_CONTAINS. On a build without the rewrite this query fails with
+    # `invalidQuery: Function not found: regexp_match`.
+    "regexp-null-check": """SELECT
+  id,
+  CASE
+    WHEN code IS NULL OR code = '' THEN 'UNKNOWN'
+    WHEN NOT regexp_match(code, '^R[0-9]{2}') IS NULL THEN SUBSTRING(code, 1, 3)
+    ELSE 'OTHER'
+  END AS code_class
+FROM regexp_values
+ORDER BY id""",
+    # Literal flags fold into the pattern as an inline (?i) group.
+    "regexp-like-flags": """SELECT
+  id,
+  regexp_like(code, '^r[0-9]{2}', 'i') IS TRUE AS matches
+FROM regexp_values
+ORDER BY id""",
+    # Control: a consumed match list has no BigQuery rendering (a NULL
+    # top-level ARRAY comes back from BigQuery as an empty one), so the deny
+    # keeps the call local — the scan federates, the NULLs stay NULL.
+    "regexp-match-projection-control": """SELECT
+  id,
+  regexp_match(code, '^R[0-9]{2}') AS first_match
+FROM regexp_values
+ORDER BY id""",
+    # Control: Rust's \d is Unicode-aware where BigQuery's RE2 \d is [0-9],
+    # so this pattern must evaluate locally. If the engine-agreement gate is
+    # ever removed, the pushed-down query keeps different rows (id 2) and this
+    # case fails on its rows, not just its plan.
+    "regexp-like-unicode-digit-control": """SELECT
+  id,
+  regexp_like(word, '^\\d+$') IS TRUE AS all_digits
+FROM regexp_values
+ORDER BY id""",
 }
 
 EXPECTED_ROWS = {
@@ -155,6 +192,38 @@ EXPECTED_ROWS = {
         {"grp": "a", "ord": 2, "amount": 20, "running_sum": 30},
         {"grp": "a", "ord": 3, "amount": 5, "running_sum": 35},
         {"grp": "b", "ord": 1, "amount": 7, "running_sum": 7},
+    ],
+    "regexp-null-check": [
+        {"id": 1, "code_class": "R01"},
+        {"id": 2, "code_class": "OTHER"},
+        {"id": 3, "code_class": "OTHER"},
+        {"id": 4, "code_class": "UNKNOWN"},
+        {"id": 5, "code_class": "UNKNOWN"},
+        {"id": 6, "code_class": "OTHER"},
+    ],
+    "regexp-like-flags": [
+        {"id": 1, "matches": True},
+        {"id": 2, "matches": True},
+        {"id": 3, "matches": False},
+        {"id": 4, "matches": False},
+        {"id": 5, "matches": False},
+        {"id": 6, "matches": False},
+    ],
+    "regexp-match-projection-control": [
+        {"id": 1, "first_match": ["R01"]},
+        {"id": 2, "first_match": None},
+        {"id": 3, "first_match": None},
+        {"id": 4, "first_match": None},
+        {"id": 5, "first_match": None},
+        {"id": 6, "first_match": None},
+    ],
+    "regexp-like-unicode-digit-control": [
+        {"id": 1, "all_digits": True},
+        {"id": 2, "all_digits": True},
+        {"id": 3, "all_digits": False},
+        {"id": 4, "all_digits": False},
+        {"id": 5, "all_digits": False},
+        {"id": 6, "all_digits": True},
     ],
 }
 
@@ -251,6 +320,17 @@ FROM UNNEST([
   STRUCT('a' AS grp, 3 AS ord, 5 AS amount),
   STRUCT('b' AS grp, 1 AS ord, 7 AS amount)
 ]);
+
+CREATE OR REPLACE TABLE {prefix}.regexp_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(1 AS id, 'R01x' AS code, '123' AS word),
+  STRUCT(2, 'r02y', '٣٤٥'),
+  STRUCT(3, 'X99', 'abc'),
+  STRUCT(4, '', ''),
+  STRUCT(5, CAST(NULL AS STRING), CAST(NULL AS STRING)),
+  STRUCT(6, 'zzR03', '42')
+]);
 """
 
 
@@ -273,6 +353,9 @@ datasets:
     params: *bigquery_params
   - from: adbc:window_values
     name: window_values
+    params: *bigquery_params
+  - from: adbc:regexp_values
+    name: regexp_values
     params: *bigquery_params
 """
 
@@ -361,6 +444,30 @@ def assert_generated_sql(name: str, sql: str) -> None:
         required = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
         if required not in sql:
             raise HarnessError(f"the aggregate window frame was lost: {sql}")
+    if name == "regexp-null-check":
+        if "REGEXP_CONTAINS(" not in sql or "IS TRUE" not in sql:
+            raise HarnessError(
+                f"the NULL-check idiom was not pushed as REGEXP_CONTAINS: {sql}"
+            )
+        if "regexp_match" in sql or "regexp_like" in sql:
+            raise HarnessError(
+                f"a DataFusion regexp function leaked into BigQuery SQL: {sql}"
+            )
+    if name == "regexp-like-flags":
+        if "R'(?i)^r[0-9]{2}'" not in sql:
+            raise HarnessError(f"the i flag was not folded into the pattern: {sql}")
+    if name == "regexp-match-projection-control":
+        # Function calls only — the fixture table is itself named
+        # `regexp_values`, so a bare substring check trips on the identifier.
+        if "regexp_match(" in sql or "regexp_like(" in sql or "REGEXP_" in sql:
+            raise HarnessError(
+                f"a consumed match list has no BigQuery rendering and must stay local: {sql}"
+            )
+    if name == "regexp-like-unicode-digit-control":
+        if "REGEXP_CONTAINS" in sql:
+            raise HarnessError(
+                f"a Unicode-divergent pattern must not push down, RE2 reads it differently: {sql}"
+            )
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -522,7 +629,12 @@ def main() -> int:
             query = getattr(job, "query", None)
             if query and not any(
                 table in query
-                for table in ("union_values", "json_values", "window_values")
+                for table in (
+                    "union_values",
+                    "json_values",
+                    "window_values",
+                    "regexp_values",
+                )
             ):
                 continue
             jobs.append(

@@ -257,7 +257,7 @@ datafusion-common-runtime = "54.1.0"
 datafusion-datasource = "54.1.0"
 datafusion-execution = "54.1.0"
 datafusion-expr = "54.1.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "095504d9c05882c300ef60b625280220f2d4298b", features = ["sql"] } # spiceai-54
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "095504d9c05882c300ef60b625280220f2d4298b", features = ["sql"] } # branch: spiceai-54
 datafusion-functions = "54.1.0"
 datafusion-functions-aggregate = "54.1.0"
 datafusion-functions-aggregate-common = "54.1.0"
