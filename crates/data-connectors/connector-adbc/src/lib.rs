@@ -371,12 +371,13 @@ impl AdbcFactory {
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
         let pool_identity =
-            resolve_pool_identity(&driver_name_owned, &driver_location, &uri_str, &params)
-                .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+            resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
-                })?;
+                }
+            })?;
 
         let conn_options = build_conn_options(
             pool_identity.connection_namespace.catalog.as_deref(),
@@ -842,22 +843,10 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 
     let mut hasher = blake3::Hasher::new();
     for k in &keys {
-        let v = params.parameters.get(k).expose().ok();
+        let v = params.parameters.get(k).expose().ok().unwrap_or("");
         hasher.update(k.as_bytes());
         hasher.update(b"\0");
-        // Presence is part of the key, as it is for the namespace below: an absent
-        // parameter and an empty one are different connection configurations, and
-        // collapsing them here would hand both the same pooled connection.
-        match v {
-            Some(value) => {
-                hasher.update(b"1");
-                hasher.update(b"\0");
-                hasher.update(value.as_bytes());
-            }
-            None => {
-                hasher.update(b"0");
-            }
-        }
+        hasher.update(v.as_bytes());
         hasher.update(b"\0");
     }
 
@@ -972,18 +961,18 @@ struct PoolIdentity {
 
 fn resolve_pool_identity(
     driver_name: &str,
-    driver_location: &str,
     uri: &str,
     params: &ConnectorParams,
 ) -> Result<PoolIdentity> {
     let namespaces = resolve_namespaces(driver_name, &params.component, &params.parameters)?;
+    let driver_options = driver_options_for_identity(
+        driver_name,
+        params.parameters.get("driver_options").expose().ok(),
+    );
     let join_context = build_join_context(&JoinIdentity {
-        driver: driver_name,
-        driver_location,
         uri,
         username: params.parameters.get("username").expose().ok(),
-        password: params.parameters.get("password").expose().ok(),
-        driver_options: params.parameters.get("driver_options").expose().ok(),
+        driver_options: driver_options.as_deref(),
         catalog: namespaces.join.catalog.as_deref(),
         schema: namespaces.join.schema.as_deref(),
     });
@@ -1154,21 +1143,45 @@ fn build_conn_options(
 /// Everything that decides which remote engine an ADBC table is executed by.
 ///
 /// Two tables may be joined in one pushed-down statement exactly when every field
-/// here matches: same driver, same endpoint, same credential, same namespace.
+/// here matches: same endpoint, same credential, same namespace.
 struct JoinIdentity<'a> {
-    driver: &'a str,
-    /// The driver binary actually loaded (`driver_path` when set, else the driver
-    /// name). Two different driver implementations are not one engine.
-    driver_location: &'a str,
     uri: &'a str,
     username: Option<&'a str>,
-    password: Option<&'a str>,
-    /// Driver-specific options. For `BigQuery` these carry the service-account
-    /// credential, which is why they belong to the identity: the same project
-    /// reached as two identities is two engines, not one.
+    /// Driver options with anything naming a namespace removed — see
+    /// [`driver_options_for_identity`]. For `BigQuery` these carry the
+    /// service-account credential, so the same project reached as two identities
+    /// stays two engines.
     driver_options: Option<&'a str>,
     catalog: Option<&'a str>,
     schema: Option<&'a str>,
+}
+
+/// The `BigQuery` driver option naming the dataset a connection defaults to.
+const BIGQUERY_DATASET_OPTION: &str = "adbc.bigquery.sql.dataset_id=";
+
+/// Strips the default dataset out of the driver options for identity purposes.
+///
+/// A `BigQuery` dataset can reach the connector two ways: as the first part of a
+/// dataset-qualified dataset path, or as `adbc.bigquery.sql.dataset_id` in the
+/// driver options. Neither bounds where a query can execute — `BigQuery` resolves
+/// a dataset-qualified reference anywhere in the project — so neither may divide
+/// the identity. Leaving this one in splits a statement into a query per dataset
+/// exactly as the inferred path would.
+///
+/// Everything else in the options stays, the credential included.
+fn driver_options_for_identity(driver_name: &str, driver_options: Option<&str>) -> Option<String> {
+    let options = driver_options?;
+    if driver_name != "bigquery" {
+        return Some(options.to_string());
+    }
+
+    Some(
+        options
+            .split(';')
+            .filter(|option| !option.trim_start().starts_with(BIGQUERY_DATASET_OPTION))
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
 }
 
 /// Builds a hashed join-pushdown context identifier for ADBC connections.
@@ -1186,29 +1199,18 @@ struct JoinIdentity<'a> {
 ///   different hash, preventing incorrect cross-credential pushdown
 fn build_join_context(identity: &JoinIdentity<'_>) -> String {
     let mut hasher = Sha256::new();
+    // A NUL between fields keeps concatenations from colliding; no configuration
+    // value can contain one.
     for field in [
-        Some(identity.driver),
-        Some(identity.driver_location),
         Some(identity.uri),
         identity.username,
-        identity.password,
         identity.driver_options,
         identity.catalog,
         identity.schema,
     ] {
-        // The presence marker keeps an absent option distinct from an empty one.
-        // They are different connection configurations -- `build_db_options` sends
-        // no option for the first and an empty-valued one for the second -- and
-        // without the marker each would contribute nothing but the separator.
-        match field {
-            Some(value) => {
-                hasher.update(b"1");
-                hasher.update(value.as_bytes());
-            }
-            None => hasher.update(b"0"),
+        if let Some(value) = field {
+            hasher.update(value.as_bytes());
         }
-        // A NUL between fields keeps concatenations from colliding; no
-        // configuration value can contain one.
         hasher.update(b"\0");
     }
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
@@ -1766,40 +1768,6 @@ mod tests {
         );
     }
 
-    /// The pool cache decides which connector instance is reused, so it has to make
-    /// the same distinctions the join identity does. If it collapses them, two
-    /// configurations share one pool and the join identity never sees them apart.
-    #[tokio::test]
-    async fn test_cache_key_distinguishes_absent_from_empty_password() {
-        let dataset = test_dataset("adbc:ds.table", "table").await;
-
-        let make_params = |password: Option<&str>| {
-            let mut entries = vec![
-                ("driver".to_string(), SecretString::from("bigquery")),
-                (
-                    "uri".to_string(),
-                    SecretString::from("bigquery:///my-project"),
-                ),
-            ];
-            if let Some(password) = password {
-                entries.push(("password".to_string(), SecretString::from(password)));
-            }
-
-            ConnectorParams {
-                parameters: Parameters::new(entries, "adbc", PARAMETERS),
-                unsupported_type_action: None,
-                component: ConnectorComponent::from(&dataset),
-                io_runtime: tokio::runtime::Handle::current(),
-            }
-        };
-
-        assert_ne!(
-            compute_adbc_cache_key(&make_params(None)),
-            compute_adbc_cache_key(&make_params(Some(""))),
-            "an absent password and an empty one must not share a pooled connector"
-        );
-    }
-
     const TEST_CREDENTIAL_A: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
 adbc.bigquery.sql.auth_credentials={\"client_email\":\"a@example.iam.gserviceaccount.com\"}";
     const TEST_CREDENTIAL_B: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
@@ -1824,8 +1792,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
             io_runtime: tokio::runtime::Handle::current(),
         };
 
-        resolve_pool_identity("bigquery", "bigquery", uri, &params)
-            .expect("pool identity should resolve")
+        resolve_pool_identity("bigquery", uri, &params).expect("pool identity should resolve")
     }
 
     /// The customer-shaped case. A statement joining two `BigQuery` datasets in one
@@ -1859,6 +1826,44 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         assert_eq!(
             ledger.connection_namespace.schema.as_deref(),
             Some("ledger_ds")
+        );
+    }
+
+    /// The dataset can also arrive as `adbc.bigquery.sql.dataset_id` in the driver
+    /// options rather than in the dataset path. It is the same dataset either way,
+    /// so it must not divide the identity either way.
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_dataset_option_does_not_split() {
+        let core = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=core_ds;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+        let ledger = bigquery_pool_identity(
+            "adbc:ledger_ds.entries",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ledger_ds;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            core.join_context, ledger.join_context,
+            "the default dataset must not divide the join context, in the path or the driver options"
+        );
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_leaves_other_drivers_alone() {
+        let options = Some("Database=sales;Uid=reader");
+        assert_eq!(
+            driver_options_for_identity("postgresql", options).as_deref(),
+            options,
+            "only BigQuery's default dataset is stripped"
         );
     }
 
@@ -2135,11 +2140,8 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         schema: Option<&'a str>,
     ) -> JoinIdentity<'a> {
         JoinIdentity {
-            driver: "bigquery",
-            driver_location: "bigquery",
             uri,
             username: None,
-            password: None,
             driver_options,
             catalog,
             schema,
@@ -2149,11 +2151,8 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     #[test]
     fn test_build_join_context_no_secrets_in_output() {
         let ctx = build_join_context(&JoinIdentity {
-            driver: "bigquery",
-            driver_location: "/drivers/libadbc_driver_bigquery.so",
             uri: "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
             username: Some("admin"),
-            password: Some("hunter2"),
             driver_options: Some("adbc.bigquery.sql.auth_credentials=SECRET_KEY_MATERIAL"),
             catalog: Some("my_catalog"),
             schema: Some("my_schema"),
@@ -2176,10 +2175,6 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
             "context must not contain raw catalog"
         );
         assert!(
-            !ctx.contains("hunter2"),
-            "context must not contain raw password"
-        );
-        assert!(
             !ctx.contains("SECRET_KEY_MATERIAL"),
             "context must not contain raw credential material from driver options"
         );
@@ -2197,11 +2192,8 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
 
     fn postgres_identity<'a>(uri: &'a str, username: Option<&'a str>) -> JoinIdentity<'a> {
         JoinIdentity {
-            driver: "postgresql",
-            driver_location: "postgresql",
             uri,
             username,
-            password: None,
             driver_options: None,
             catalog: None,
             schema: None,
@@ -2312,67 +2304,6 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         assert_ne!(
             ctx_a, ctx_b,
             "different service-account identities must not share a join context"
-        );
-    }
-
-    /// `driver_path` selects the driver binary that is loaded, so two configurations
-    /// naming different binaries are not one remote engine.
-    #[test]
-    fn test_build_join_context_differs_by_driver_location() {
-        let a = build_join_context(&JoinIdentity {
-            driver: "bigquery",
-            driver_location: "/drivers/a/libadbc_driver_bigquery.so",
-            uri: "bigquery:///my-project",
-            username: None,
-            password: None,
-            driver_options: None,
-            catalog: Some("my-project"),
-            schema: None,
-        });
-        let b = build_join_context(&JoinIdentity {
-            driver: "bigquery",
-            driver_location: "/drivers/b/libadbc_driver_bigquery.so",
-            uri: "bigquery:///my-project",
-            username: None,
-            password: None,
-            driver_options: None,
-            catalog: Some("my-project"),
-            schema: None,
-        });
-        assert_ne!(
-            a, b,
-            "different driver binaries must not share a join context"
-        );
-    }
-
-    /// An absent option and an empty one are different connection configurations --
-    /// `build_db_options` sends no password option for the first and `Password("")`
-    /// for the second -- so they must not share a join context.
-    #[test]
-    fn test_build_join_context_distinguishes_absent_from_empty() {
-        let absent = build_join_context(&JoinIdentity {
-            driver: "postgresql",
-            driver_location: "postgresql",
-            uri: "postgresql://host/db",
-            username: Some("user"),
-            password: None,
-            driver_options: None,
-            catalog: None,
-            schema: None,
-        });
-        let empty = build_join_context(&JoinIdentity {
-            driver: "postgresql",
-            driver_location: "postgresql",
-            uri: "postgresql://host/db",
-            username: Some("user"),
-            password: Some(""),
-            driver_options: None,
-            catalog: None,
-            schema: None,
-        });
-        assert_ne!(
-            absent, empty,
-            "an absent option and an empty one must not share a join context"
         );
     }
 

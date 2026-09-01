@@ -22,4 +22,4 @@ fi
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 exec uv run --with google-cloud-bigquery==3.38.0 \
-  python "$repo_root/test/scripts/bigquery_federation.py"
+  python "$repo_root/test/scripts/bigquery_federation.py" "$@"

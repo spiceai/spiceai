@@ -61,6 +61,10 @@ harness never falls back to application-default credentials.
 
 Job counting reads ``INFORMATION_SCHEMA.JOBS_BY_USER``, which reports the jobs
 this credential itself created, so it needs no project-wide job-list permission.
+That view makes a job visible some time after it is created, so each scenario
+watches it for a fixed window (``JOB_OBSERVATION_SECONDS``) rather than stopping
+when the count settles, and treats the plan's statement count as a floor -- see
+``observe_jobs``. Run ``--self-test`` to check that criterion without credentials.
 
 Exit status is 0 when every scenario returns correct rows as a single BigQuery
 job. ``BIGQUERY_EXPECT=split`` inverts the job-count expectation for the
@@ -94,6 +98,11 @@ DEFAULT_SPICED = ROOT / "target" / "debug" / "spiced"
 DATASET_PREFIX = "spice_bigquery_federation"
 DATASET_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
+
+# How long to watch the job census, and how often to read it. See `observe_jobs`
+# for why this is a fixed window rather than a settle detector.
+JOB_OBSERVATION_SECONDS = 90
+JOB_POLL_SECONDS = 5
 
 # `clients` is referenced three times, so DataFusion inlines three copies of its
 # subtree. The two scenarios differ only in which dataset `entries` is read from.
@@ -263,32 +272,39 @@ SELECT * FROM UNNEST([
 
 
 def spicepod(project: str, core: str, ledger: str, driver: Path) -> str:
-    # One params block, so every dataset shares one URI, one credential and one
-    # project. Paths are dataset-qualified, which is the only difference between
-    # the tables the two scenarios read.
-    params = f"""      adbc_driver: bigquery
+    """Build the pod the way a real one is written.
+
+    Every dataset shares one URI, one project and one credential, and names its own
+    dataset twice over — once as the first part of a dataset-qualified path, and
+    once as `adbc.bigquery.sql.dataset_id` in the driver options. Both are how a
+    dataset actually reaches the connector, so both belong in the fixture.
+    """
+
+    def dataset(name: str, schema: str, table: str) -> str:
+        return f"""  - from: adbc:{schema}.{table}
+    name: {name}
+    params:
+      adbc_driver: bigquery
       adbc_driver_path: {driver}
-      adbc_driver_options: adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;adbc.bigquery.sql.auth_credentials=${{secrets:BIGQUERY_SERVICE_ACCOUNT_JSON}}
-      adbc_uri: bigquery:///{project}"""
+      adbc_driver_options: adbc.bigquery.sql.project_id={project};adbc.bigquery.sql.dataset_id={schema};adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;adbc.bigquery.sql.auth_credentials=${{secrets:BIGQUERY_SERVICE_ACCOUNT_JSON}}
+      adbc_uri: bigquery:///{project}
+      connection_pool_size: 8
+"""
+
+    entries = "".join(
+        [
+            dataset("clients", core, "clients"),
+            dataset("advances", core, "advances"),
+            dataset("entries_core", core, "entries_core"),
+            dataset("entries_ledger", ledger, "entries_ledger"),
+        ]
+    )
     return f"""version: v1
 kind: Spicepod
 name: bigquery-federation
 
 datasets:
-  - from: adbc:{core}.clients
-    name: clients
-    params: &bigquery_params
-{params}
-  - from: adbc:{core}.advances
-    name: advances
-    params: *bigquery_params
-  - from: adbc:{core}.entries_core
-    name: entries_core
-    params: *bigquery_params
-  - from: adbc:{ledger}.entries_ledger
-    name: entries_ledger
-    params: *bigquery_params
-"""
+{entries}"""
 
 
 def http_sql(http_port: int, sql: str, timeout: int = 120) -> tuple[int, dict[str, str], str]:
@@ -417,6 +433,143 @@ ORDER BY creation_time
     )
     rows = list(client.query(sql, location=location, job_config=config).result())
     return [dict(row) for row in rows if row["job_id"] not in exclude]
+
+
+def observe_jobs(
+    sample: Any,
+    expected: int,
+    *,
+    window: int = JOB_OBSERVATION_SECONDS,
+    interval: int = JOB_POLL_SECONDS,
+    sleep: Any = time.sleep,
+    clock: Any = time.monotonic,
+) -> list[dict[str, Any]]:
+    """Watch the job census for a fixed window and return the final reading.
+
+    `INFORMATION_SCHEMA.JOBS_BY_USER` makes a job visible some time after it is
+    created, and nothing the harness can see bounds that lag. Stopping as soon as
+    the count holds steady therefore cannot tell "the engine ran one job" apart
+    from "the rest are not visible yet" — and a split becomes visible one job at a
+    time, so the first steady reading of three jobs is usually one. That criterion
+    fails towards a pass, which is the one direction this measurement must never
+    fail in, since a single job is what the fix claims.
+
+    So the window is fixed and always runs to completion, and `expected` — the
+    number of statements the plan will push — is a floor. A census that never
+    reaches it has not observed the run and says so, rather than returning a
+    partial count for an assertion to read as success.
+    """
+    deadline = clock() + window
+    observed: list[dict[str, Any]] = []
+    while clock() < deadline:
+        sleep(interval)
+        observed = sample()
+    if len(observed) < expected:
+        raise HarnessError(
+            f"the job census saw {len(observed)} job(s) in {window}s but the plan pushes "
+            f"{expected} statement(s); the run was not observed, so its job count is unknown"
+        )
+    return observed
+
+
+class _StepClock:
+    """A clock that only advances when the code under test sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _scheduled_sample(schedule: list[list[str]]) -> Any:
+    """A census that returns `schedule[n]` on the nth read, holding the last entry."""
+    reads = {"n": 0}
+
+    def sample() -> list[dict[str, Any]]:
+        index = min(reads["n"], len(schedule) - 1)
+        reads["n"] += 1
+        return [{"job_id": job_id, "query": ""} for job_id in schedule[index]]
+
+    return sample
+
+
+def _stops_when_steady(
+    sample: Any, *, interval: int, sleep: Any, clock: Any, window: int = 120
+) -> list[dict[str, Any]]:
+    """Stop as soon as the count holds steady for three reads.
+
+    This is the tempting way to end the observation, and `observe_jobs` must never
+    be simplified back into it: a split becomes visible one job at a time, so this
+    returns the first job on its own and an assertion of "exactly one job" reads
+    that as success. `self_test` keeps a counter-example on hand.
+    """
+    deadline = clock() + window
+    observed: list[dict[str, Any]] = []
+    stable = 0
+    while clock() < deadline and stable < 3:
+        sleep(interval)
+        latest = sample()
+        if latest and len(latest) == len(observed):
+            stable += 1
+        else:
+            stable = 0
+        observed = latest
+    return observed
+
+
+def self_test() -> int:
+    """Check the observation criterion without touching BigQuery."""
+    failures: list[str] = []
+
+    # One job visible first, the other two only after four reads -- what a split
+    # looks like through a lagging census.
+    delayed = [["a"], ["a"], ["a"], ["a"], ["a", "b", "c"]]
+
+    clock = _StepClock()
+    steady = _stops_when_steady(
+        _scheduled_sample(delayed), interval=JOB_POLL_SECONDS, sleep=clock.sleep, clock=clock
+    )
+    if len(steady) != 1:
+        failures.append(
+            f"counter-example did not reproduce: a settle detector returned {len(steady)}, expected 1"
+        )
+
+    clock = _StepClock()
+    observed = observe_jobs(
+        _scheduled_sample(delayed), 3, sleep=clock.sleep, clock=clock
+    )
+    if len(observed) != 3:
+        failures.append(
+            f"a delayed split was miscounted: observed {len(observed)} job(s), expected 3"
+        )
+
+    clock = _StepClock()
+    single = observe_jobs(_scheduled_sample([["a"]]), 1, sleep=clock.sleep, clock=clock)
+    if len(single) != 1:
+        failures.append(f"a steady single job was miscounted as {len(single)}")
+
+    clock = _StepClock()
+    try:
+        observe_jobs(_scheduled_sample([["a"]]), 3, sleep=clock.sleep, clock=clock)
+    except HarnessError:
+        pass
+    else:
+        failures.append("a census short of the plan's statement count did not fail")
+
+    for failure in failures:
+        print(f"FAIL: {failure}", file=sys.stderr)
+    if failures:
+        return 1
+    print(
+        "self-test ok: a settle detector reports 1 job for a delayed split; "
+        "the fixed window reports 3, counts a steady single job as 1, and fails "
+        "when the census never reaches the plan's statement count"
+    )
+    return 0
 
 
 def main() -> int:
@@ -594,22 +747,12 @@ def main() -> int:
             # otherwise show up as jobs spiced ran.
             harness_jobs.add(control_job.job_id)
 
-            # JOBS_BY_USER lags job creation, so poll until it stops growing.
-            observed: list[dict[str, Any]] = []
-            stable = 0
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline and stable < 3:
-                time.sleep(5)
-                latest = data_jobs(
+            observed = observe_jobs(
+                lambda: data_jobs(
                     client, project, location, since, until, (core, ledger), harness_jobs
-                )
-                # Every scenario runs at least one job, so an empty sample means
-                # JOBS_BY_USER has not caught up yet, never that counting is done.
-                if latest and len(latest) == len(observed):
-                    stable += 1
-                else:
-                    stable = 0
-                observed = latest
+                ),
+                len(statements),
+            )
 
             texts = [job["query"] for job in observed]
             scenario = {
@@ -686,6 +829,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        if "--self-test" in sys.argv[1:]:
+            raise SystemExit(self_test())
         raise SystemExit(main())
     except HarnessError as error:
         print(f"ERROR: {error}", file=sys.stderr)
