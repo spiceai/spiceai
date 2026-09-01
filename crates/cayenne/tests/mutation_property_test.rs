@@ -442,7 +442,11 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
 /// `delete_predicate` is weighted 0 in memory configs. Once #12008 is fixed,
 /// weighting it there turns this into the regression test.
 async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
-    delete_filter(table, col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi)))).await
+    delete_filter(
+        table,
+        col("value").gt_eq(lit(lo)).and(col("value").lt(lit(hi))),
+    )
+    .await
 }
 
 async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> TestResult<()> {
@@ -644,15 +648,21 @@ async fn verify_aggregate_queries(
 
 #[derive(Clone, Debug)]
 enum Op {
-    Upsert { rows: Vec<(i64, i64)> },
-    Delete { key: i64 },
+    Upsert {
+        rows: Vec<(i64, i64)>,
+    },
+    Delete {
+        key: i64,
+    },
     DeleteAll,
     /// Delete every row whose non-PK `value` falls in `[lo, hi)`.
     DeletePredicate {
         lo: i64,
         hi: i64,
     },
-    Overwrite { rows: Vec<(i64, i64)> },
+    Overwrite {
+        rows: Vec<(i64, i64)>,
+    },
     Compact,
     Restart,
     MoveToColdTier,
@@ -744,10 +754,7 @@ fn gen_op(
                         Some(v) if rng.below(2) == 0 => (v - rng.below_i64(width)).max(0),
                         _ => rng.below_i64(VALUE_SPACE),
                     };
-                    Op::DeletePredicate {
-                        lo,
-                        hi: lo + width,
-                    }
+                    Op::DeletePredicate { lo, hi: lo + width }
                 }
                 3 => Op::Overwrite {
                     rows: random_rows(rng, key_space, batch_size),
@@ -788,11 +795,7 @@ fn apply_model(model: &mut Model, op: &Op) {
 // Harness
 // ============================================================================
 
-async fn run_sequential(
-    fixture: &TestFixture,
-    w: &Workload,
-    seed: u64,
-) -> TestResult<usize> {
+async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<usize> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
