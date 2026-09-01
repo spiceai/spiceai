@@ -127,112 +127,6 @@ impl MetastoreImpl {
         }
     }
 
-    /// Whether a failed observability query means the backend cannot answer it
-    /// at all, as opposed to a transient failure.
-    ///
-    /// `dbstat` is an optional `SQLite` compile-time module and the pragma
-    /// functions are a build option, so a backend lacking either reports "no
-    /// such table/module/function" for every call, forever. That is worth
-    /// degrading quietly. Everything else — a busy database, a closed pool, an
-    /// I/O error — must surface as an error, or the sampling gate treats the
-    /// sample as taken and stops asking for the rest of its interval while the
-    /// gauge holds a fabricated value.
-    fn is_unsupported_by_backend(error: &CatalogError) -> bool {
-        let message = error.to_string();
-        ["no such table", "no such module", "no such function"]
-            .iter()
-            .any(|signature| message.contains(signature))
-    }
-
-    /// Bytes held on the metastore's free page list.
-    ///
-    /// `freelist_count * page_size`: pages that are free inside the database
-    /// file and, under the default `auto_vacuum: none`, reused rather than
-    /// returned to the OS. This is the share of the file's size that churn has
-    /// already released, so a large value against a flat live row count is what
-    /// `auto_vacuum: incremental` would give back.
-    ///
-    /// `Ok(None)` on a backend without the pragma functions — a permanent state,
-    /// so the caller records nothing and stops asking. A transient failure is an
-    /// `Err`, because reporting zero free pages from a failed query would claim
-    /// the churn already released was reclaimed.
-    pub(crate) async fn freelist_bytes(&self) -> CatalogResult<Option<u64>> {
-        // One round trip: two `PRAGMA` statements would each acquire a pooled
-        // connection and hop to its thread for a single integer, and `page_size`
-        // is immutable for the life of the database anyway.
-        let bytes = self
-            .query_row_helper(
-                QueryRowParams {
-                    sql: "SELECT (SELECT freelist_count FROM pragma_freelist_count()) \
-                          * (SELECT page_size FROM pragma_page_size())",
-                    params: Vec::new(),
-                },
-                |row| row.get_i64(0),
-            )
-            .await;
-
-        match bytes {
-            Ok(bytes) => Ok(Some(u64::try_from(bytes).unwrap_or(0))),
-            Err(error) if Self::is_unsupported_by_backend(&error) => {
-                tracing::debug!(
-                    %error,
-                    "Cayenne metastore free-page accounting is unavailable on this backend (no `pragma_freelist_count`); reporting the database total only"
-                );
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Bytes each metastore table occupies inside the database file, indexes
-    /// folded into the table they belong to.
-    ///
-    /// `dbstat` reports one row per B-tree, so an index appears under its own
-    /// name; the join to `sqlite_master` attributes it to its table, because an
-    /// index's pages are that table's footprint and splitting them out would
-    /// under-report every table that carries one.
-    ///
-    /// `Ok(None)` on a backend built without `dbstat` — a permanent state, so the
-    /// caller records nothing and stops asking. A transient failure is an `Err`
-    /// rather than an empty attribution, which would read as every metastore
-    /// table occupying no space.
-    pub(crate) async fn table_bytes(&self) -> CatalogResult<Option<Vec<(String, i64)>>> {
-        let rows = self
-            .query_helper(
-                QueryParams {
-                    // `dbstat('main', 1)` is AGGREGATE mode: one row per B-tree
-                    // rather than one per page. `dbstat` walks every page either
-                    // way, so the saving is the vtab round trips — measured at
-                    // 260ms -> 150ms on a 405 MB metastore, and this cost scales
-                    // with database size rather than table count. Available since
-                    // SQLite 3.31; the error path below declines on a backend
-                    // that lacks it.
-                    sql: r"
-                    SELECT COALESCE(m.tbl_name, d.name) AS owner, SUM(d.pgsize)
-                    FROM dbstat('main', 1) d
-                    LEFT JOIN sqlite_master m ON m.name = d.name
-                    WHERE owner LIKE 'cayenne_%'
-                    GROUP BY owner
-                    ",
-                    params: Vec::new(),
-                },
-                |row| Ok((row.get_string(0)?, row.get_i64(1)?)),
-            )
-            .await;
-
-        match rows {
-            Ok(rows) => Ok(Some(rows)),
-            Err(error) if Self::is_unsupported_by_backend(&error) => {
-                tracing::debug!(
-                    %error,
-                    "Cayenne metastore per-table byte accounting is unavailable (SQLite `dbstat` not present); reporting the database total only"
-                );
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     /// Helper to execute a statement on metastore, working with both `SQLite` and Turso
     pub(crate) async fn execute_helper(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         match self {
@@ -4421,18 +4315,6 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(stats)
     }
 
-    fn metastore_label(&self) -> String {
-        self.db_path().to_string()
-    }
-
-    async fn metastore_table_bytes(&self) -> CatalogResult<Option<Vec<(String, i64)>>> {
-        self.metastore.table_bytes().await
-    }
-
-    async fn metastore_freelist_bytes(&self) -> CatalogResult<Option<u64>> {
-        self.metastore.freelist_bytes().await
-    }
-
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
@@ -5670,40 +5552,6 @@ fn log_configuration_differences(
 
 #[cfg(test)]
 mod tests {
-    /// The freelist and `dbstat` samples degrade quietly only for a backend that
-    /// will never answer. Misclassifying a transient failure as unsupported is
-    /// what publishes a fabricated zero and then advances the sampling gate, so
-    /// the classifier's exact reach is worth pinning.
-    #[test]
-    fn only_a_missing_backend_feature_counts_as_unsupported() {
-        let db = |message: &str| CatalogError::Database {
-            message: message.to_string(),
-        };
-
-        for message in [
-            "no such table: pragma_freelist_count",
-            "no such module: dbstat",
-            "no such function: pragma_page_size",
-        ] {
-            assert!(
-                MetastoreImpl::is_unsupported_by_backend(&db(message)),
-                "a missing backend feature must degrade quietly: {message}"
-            );
-        }
-
-        for message in [
-            "database is locked",
-            "disk I/O error",
-            "attempt to write a readonly database",
-            "interrupted",
-        ] {
-            assert!(
-                !MetastoreImpl::is_unsupported_by_backend(&db(message)),
-                "a transient failure must surface as an error, not a zero: {message}"
-            );
-        }
-    }
-
     use super::*;
     use crate::metadata::DeletionType;
     use std::sync::Arc;

@@ -2974,49 +2974,6 @@ const IN_MEMORY_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// quantity. Thirty-second resolution on it would buy nothing and cost the most.
 const DATA_DIR_SAMPLE_MIN_INTERVAL: Duration = Duration::from_mins(5);
 
-/// Floor on how often the metastore's per-table byte attribution is sampled.
-///
-/// `dbstat` computes each row's page size by walking every B-tree page in the
-/// database, so its cost scales with the whole metastore file rather than with
-/// one table. The database file is also the slowest-moving quantity of the set,
-/// so this runs an order of magnitude less often than anything else and is
-/// deduplicated across the tables sharing a metastore.
-const METASTORE_TABLE_BYTES_SAMPLE_MIN_INTERVAL: Duration = Duration::from_mins(10);
-
-/// When each metastore last had its catalog-wide gauges sampled, keyed by
-/// metastore path.
-///
-/// The metastore is shared by every Cayenne table in a dataset, so its gauges
-/// are properties of the file, not of a table. Without this every table's tick
-/// would repeat the same catalog-wide queries and write the same values to the
-/// same series — N times the cost for one sample's worth of information.
-static METASTORE_SAMPLE_CLOCKS: LazyLock<ParkingMutex<HashMap<String, Arc<MetastoreSampleClock>>>> =
-    LazyLock::new(|| ParkingMutex::new(HashMap::new()));
-
-/// The sample clocks for one metastore, created on first sight.
-fn metastore_sample_clock(label: &str) -> Arc<MetastoreSampleClock> {
-    let mut clocks = METASTORE_SAMPLE_CLOCKS.lock();
-    // `get` before `entry`: the miss happens once per metastore for the life of
-    // the process, and `entry` allocates the key `String` on every hit.
-    if let Some(clock) = clocks.get(label) {
-        return Arc::clone(clock);
-    }
-    Arc::clone(
-        clocks
-            .entry(label.to_string())
-            .or_insert_with(|| Arc::new(MetastoreSampleClock::default())),
-    )
-}
-
-/// Sample clocks for one metastore's catalog-wide gauges.
-#[derive(Debug, Default)]
-struct MetastoreSampleClock {
-    /// The cheap gauges: the freelist pragma.
-    cheap: SampleGate,
-    /// The `dbstat` per-table byte attribution.
-    table_bytes: SampleGate,
-}
-
 /// Admission gate for one throttled sample.
 ///
 /// Three pieces of state, because a bare last-claimed timestamp gets two things
@@ -8632,7 +8589,6 @@ impl CayenneTableProvider {
             if self.sample_storage_metrics().await {
                 guard.succeeded();
             }
-            self.sample_metastore_metrics().await;
         }
         if let Some(guard) = self
             .data_dir_sample_gate
@@ -8886,64 +8842,6 @@ impl CayenneTableProvider {
             )],
         );
         true
-    }
-
-    /// Publish the metastore-wide gauges: the freelist, and the per-table byte
-    /// attribution of the database file.
-    ///
-    /// Labelled `catalog`, not `table`: the metastore is shared by every Cayenne
-    /// table in the dataset, so these describe the file. That sharing is also why
-    /// the throttle lives in a process-global map keyed by metastore path — every
-    /// table's tick would otherwise repeat identical queries and write identical
-    /// values to identical series.
-    async fn sample_metastore_metrics(&self) {
-        let label = self.catalog.metastore_label();
-        let clock = metastore_sample_clock(&label);
-        let dimensions = [telemetry::KeyValue::new("catalog", label)];
-
-        if let Some(guard) = clock.cheap.try_enter(FOOTPRINT_SAMPLE_MIN_INTERVAL) {
-            match self.catalog.metastore_freelist_bytes().await {
-                Ok(bytes) => {
-                    // `None` is a backend that will never answer: nothing to
-                    // publish, and the gate advances so this stops being asked.
-                    if let Some(bytes) = bytes {
-                        telemetry::cayenne::track_metastore_freelist_bytes(bytes, &dimensions);
-                    }
-                    guard.succeeded();
-                }
-                Err(error) => tracing::debug!(
-                    table = self.table_metadata.table_name.as_str(),
-                    %error,
-                    "Failed to sample the Cayenne metastore freelist size"
-                ),
-            }
-        }
-
-        let Some(guard) = clock
-            .table_bytes
-            .try_enter(METASTORE_TABLE_BYTES_SAMPLE_MIN_INTERVAL)
-        else {
-            return;
-        };
-        match self.catalog.metastore_table_bytes().await {
-            Ok(per_table) => {
-                for (metastore_table, bytes) in per_table.into_iter().flatten() {
-                    telemetry::cayenne::track_metastore_table_bytes(
-                        u64::try_from(bytes).unwrap_or(0),
-                        &[
-                            dimensions[0].clone(),
-                            telemetry::KeyValue::new("metastore_table", metastore_table),
-                        ],
-                    );
-                }
-                guard.succeeded();
-            }
-            Err(error) => tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                %error,
-                "Failed to sample the Cayenne metastore per-table byte accounting"
-            ),
-        }
     }
 
     /// Measure and publish what this table's data directory actually holds.

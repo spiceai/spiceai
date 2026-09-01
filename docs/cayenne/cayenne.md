@@ -1438,13 +1438,7 @@ The split resolves it, and neither half means much alone:
 ### Metastore size
 
 - `cayenne_metastore_db_bytes{catalog}` and `cayenne_metastore_wal_bytes{catalog}` — the database file and its `-wal`; together, the whole metadata footprint.
-- `cayenne_metastore_table_bytes{catalog, metastore_table}` — the per-table attribution of `db_bytes`, from `SQLite`'s `dbstat`, with each index folded into the table it belongs to (an index's pages are that table's footprint). The file total says the metastore is growing; this says which table is growing it. Absent on a backend without `dbstat`, rather than approximated.
 - `cayenne_metastore_table_rows{table, metastore_table}` — per-**dataset-table** row counts across `cayenne_snapshot_file`, `_file_statistics`, `_snapshot_sequence`, `cayenne_delete_file`, `cayenne_insert_record`, `cayenne_inlined_data`, `cayenne_inlined_delete`, `cayenne_cold_tier_file`. These are row counts, not state — see the section above before reading a large `cayenne_snapshot_file` value as a large table.
-- `cayenne_metastore_freelist_bytes{catalog}` — the share of `db_bytes` that churn has already released. Under the default `auto_vacuum: none` those pages are reused but never returned to the OS, so a large freelist against a flat live row count is what `auto_vacuum: incremental` would give back.
-
-`table_bytes` is keyed by metastore table and `table_rows` by dataset table, so **one dataset's share of a metastore table** is `table_bytes × (that dataset's table_rows ÷ the metastore table's total rows)` — an estimate, not a measurement: pages are shared between the rows of every dataset in the catalog and cannot be attributed exactly. That is why the two factors are published rather than the product.
-
-`table_bytes` covers every `cayenne_*` table in the file; `table_rows` covers the eight that grow with a dataset's activity. For the remainder (`cayenne_table`, `cayenne_partition`, `cayenne_table_statistics`, `cayenne_pk_index`, `cayenne_pending_write_back`) the division has no denominator — they hold at most a row or two per table, so their bytes are a fixed overhead rather than a growth term.
 
 ### What is actually on disk
 
@@ -1471,13 +1465,11 @@ The samples differ by orders of magnitude in cost, so they run on separate clock
 | sample | cadence | cost |
 |---|---|---|
 | deletion index, PK index format/size, memory account, inline cache, fleet budgets, write shape | every tick | atomic loads plus one `try_lock`, and one `get_array_memory_size` per inline batch; nothing to throttle |
-| `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows`, freelist | ≥ 30 s per table | two aggregate queries over the table's own metastore rows; the manifest scan, which is indexed on `table_id` and aggregates without grouping, is the bulk of it |
+| `cayenne_storage_*`, `cayenne_snapshot_manifest_*`, `cayenne_metastore_table_rows` | ≥ 30 s per table | one aggregate query over the table's own metastore rows; the manifest scan, which is indexed on `table_id` and aggregates without grouping, is the bulk of it |
 | `cayenne_data_dir_*` | ≥ 5 min per table | one `stat` per file — cost scales with exactly the file count it measures |
-| `cayenne_metastore_table_bytes` | ≥ 10 min per **catalog** | `dbstat` walks every B-tree page in the database, so its cost scales with the whole metastore file rather than with one table |
 
-Two details make those cadences hold in practice:
+One detail makes those cadences hold in practice:
 
-- The metastore-wide gauges (freelist, `dbstat`) describe the *file*, which every Cayenne table in the dataset shares. Their clocks are keyed by metastore path, so N tables produce one sample's worth of work rather than N.
 - The directory walk runs as a single `spawn_blocking` over `std::fs`, not a sequence of `tokio::fs` awaits. `tokio::fs` dispatches each call to the blocking pool individually, so a per-file `metadata()` would cost one task hop per file — tens of thousands per sample on exactly the runaway table this metric exists to reveal.
 
 A walk that runs long is logged with its duration and file count rather than capped: a silent cap would report a bounded directory for an unbounded one, which is the opposite of what the metric is for.
