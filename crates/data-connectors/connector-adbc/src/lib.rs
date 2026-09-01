@@ -370,8 +370,13 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let pool_identity =
-            resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
+        let pool_identity = resolve_pool_identity(
+            &driver_name_owned,
+            &driver_location,
+            &uri_str,
+            &params,
+        )
+        .map_err(|e| {
                 DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
@@ -961,12 +966,14 @@ struct PoolIdentity {
 
 fn resolve_pool_identity(
     driver_name: &str,
+    driver_location: &str,
     uri: &str,
     params: &ConnectorParams,
 ) -> Result<PoolIdentity> {
     let namespaces = resolve_namespaces(driver_name, &params.component, &params.parameters)?;
     let join_context = build_join_context(&JoinIdentity {
         driver: driver_name,
+        driver_location,
         uri,
         username: params.parameters.get("username").expose().ok(),
         password: params.parameters.get("password").expose().ok(),
@@ -1144,6 +1151,9 @@ fn build_conn_options(
 /// here matches: same driver, same endpoint, same credential, same namespace.
 struct JoinIdentity<'a> {
     driver: &'a str,
+    /// The driver binary actually loaded (`driver_path` when set, else the driver
+    /// name). Two different driver implementations are not one engine.
+    driver_location: &'a str,
     uri: &'a str,
     username: Option<&'a str>,
     password: Option<&'a str>,
@@ -1172,6 +1182,7 @@ fn build_join_context(identity: &JoinIdentity<'_>) -> String {
     let mut hasher = Sha256::new();
     for field in [
         Some(identity.driver),
+        Some(identity.driver_location),
         Some(identity.uri),
         identity.username,
         identity.password,
@@ -1773,7 +1784,8 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
             io_runtime: tokio::runtime::Handle::current(),
         };
 
-        resolve_pool_identity("bigquery", uri, &params).expect("pool identity should resolve")
+        resolve_pool_identity("bigquery", "bigquery", uri, &params)
+            .expect("pool identity should resolve")
     }
 
     /// The customer-shaped case. A statement joining two `BigQuery` datasets in one
@@ -2084,6 +2096,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     ) -> JoinIdentity<'a> {
         JoinIdentity {
             driver: "bigquery",
+            driver_location: "bigquery",
             uri,
             username: None,
             password: None,
@@ -2097,6 +2110,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     fn test_build_join_context_no_secrets_in_output() {
         let ctx = build_join_context(&JoinIdentity {
             driver: "bigquery",
+            driver_location: "/drivers/libadbc_driver_bigquery.so",
             uri: "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
             username: Some("admin"),
             password: Some("hunter2"),
@@ -2144,6 +2158,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     fn postgres_identity<'a>(uri: &'a str, username: Option<&'a str>) -> JoinIdentity<'a> {
         JoinIdentity {
             driver: "postgresql",
+            driver_location: "postgresql",
             uri,
             username,
             password: None,
@@ -2260,6 +2275,36 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         );
     }
 
+    /// `driver_path` selects the driver binary that is loaded, so two configurations
+    /// naming different binaries are not one remote engine.
+    #[test]
+    fn test_build_join_context_differs_by_driver_location() {
+        let a = build_join_context(&JoinIdentity {
+            driver: "bigquery",
+            driver_location: "/drivers/a/libadbc_driver_bigquery.so",
+            uri: "bigquery:///my-project",
+            username: None,
+            password: None,
+            driver_options: None,
+            catalog: Some("my-project"),
+            schema: None,
+        });
+        let b = build_join_context(&JoinIdentity {
+            driver: "bigquery",
+            driver_location: "/drivers/b/libadbc_driver_bigquery.so",
+            uri: "bigquery:///my-project",
+            username: None,
+            password: None,
+            driver_options: None,
+            catalog: Some("my-project"),
+            schema: None,
+        });
+        assert_ne!(
+            a, b,
+            "different driver binaries must not share a join context"
+        );
+    }
+
     /// An absent option and an empty one are different connection configurations --
     /// `build_db_options` sends no password option for the first and `Password("")`
     /// for the second -- so they must not share a join context.
@@ -2267,6 +2312,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     fn test_build_join_context_distinguishes_absent_from_empty() {
         let absent = build_join_context(&JoinIdentity {
             driver: "postgresql",
+            driver_location: "postgresql",
             uri: "postgresql://host/db",
             username: Some("user"),
             password: None,
@@ -2276,6 +2322,7 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
         });
         let empty = build_join_context(&JoinIdentity {
             driver: "postgresql",
+            driver_location: "postgresql",
             uri: "postgresql://host/db",
             username: Some("user"),
             password: Some(""),

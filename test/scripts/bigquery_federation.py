@@ -117,10 +117,51 @@ LEFT JOIN advance_totals AS a ON a.client_id = c.client_id
 LEFT JOIN entry_totals AS t ON t.client_id = c.client_id
 ORDER BY c.token"""
 
+# `json_get_str` is a Spice function with no BigQuery spelling of its own. If the
+# unparser cannot render it, DataFusion leaves it above the federated scan and the
+# JSON work happens locally, so this scenario asserts the pushed SQL carries the
+# BigQuery JSON calls as well as counting the jobs.
+JSON_STATEMENT = """WITH active_clients AS (
+  SELECT client_id, token, {tier} AS tier
+  FROM {clients}
+  WHERE archived_at IS NULL
+),
+entry_totals AS (
+  SELECT e.client_id, SUM(e.amount) AS entry_total
+  FROM {entries} AS e
+  JOIN active_clients AS c ON c.client_id = e.client_id
+  GROUP BY e.client_id
+)
+SELECT
+  c.token AS token,
+  c.tier AS tier,
+  COALESCE(t.entry_total, 0) AS entry_total
+FROM active_clients AS c
+LEFT JOIN entry_totals AS t ON t.client_id = c.client_id
+ORDER BY c.token"""
+
+SPICE_TIER = "json_get_str(metadata, 'tier')"
+# What `json_get_str` means in BigQuery: the value only when the node is a JSON
+# string, NULL for every other kind.
+BIGQUERY_TIER = (
+    "CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(metadata, '$.\"tier\"')), '\"') "
+    "THEN JSON_VALUE(metadata, '$.\"tier\"') END"
+)
+
+# `json_get_str` answers for a JSON string node only: 'gold' is one, 42 is a number,
+# and tok-d has no `tier` at all. tok-c is archived and filtered out.
+JSON_EXPECTED_ROWS = [
+    {"token": "tok-a", "tier": "gold", "entry_total": 5.5},
+    {"token": "tok-b", "tier": None, "entry_total": 14.5},
+    {"token": "tok-d", "tier": None, "entry_total": 0.0},
+]
+
 SCENARIOS = {
     "same-dataset": {"clients": "clients", "advances": "advances", "entries": "entries_core"},
     "cross-dataset": {"clients": "clients", "advances": "advances", "entries": "entries_ledger"},
 }
+
+JSON_SCENARIO = "json-cross-dataset"
 
 
 class HarnessError(RuntimeError):
@@ -182,10 +223,11 @@ def distinct_free_ports() -> tuple[int, int]:
 def setup_sql(project: str, core: str, ledger: str) -> str:
     return f"""CREATE OR REPLACE TABLE `{project}.{core}.clients` AS
 SELECT * FROM UNNEST([
-  STRUCT(1 AS client_id, 'tok-a' AS token, CAST(NULL AS TIMESTAMP) AS archived_at),
-  STRUCT(2, 'tok-b', CAST(NULL AS TIMESTAMP)),
-  STRUCT(3, 'tok-c', TIMESTAMP '2026-01-01 00:00:00+00'),
-  STRUCT(4, 'tok-d', CAST(NULL AS TIMESTAMP))
+  STRUCT(1 AS client_id, 'tok-a' AS token, CAST(NULL AS TIMESTAMP) AS archived_at,
+         JSON '{{"tier":"gold"}}' AS metadata),
+  STRUCT(2, 'tok-b', CAST(NULL AS TIMESTAMP), JSON '{{"tier":42}}'),
+  STRUCT(3, 'tok-c', TIMESTAMP '2026-01-01 00:00:00+00', JSON '{{"tier":"bronze"}}'),
+  STRUCT(4, 'tok-d', CAST(NULL AS TIMESTAMP), JSON '{{"other":"x"}}')
 ]);
 
 CREATE OR REPLACE TABLE `{project}.{core}.advances` AS
@@ -473,8 +515,36 @@ def main() -> int:
             "scenarios": {},
         }
 
+        plan = []
         for name, tables in SCENARIOS.items():
-            statement = STATEMENT_TEMPLATE.format(**tables)
+            plan.append(
+                (
+                    name,
+                    STATEMENT_TEMPLATE.format(**tables),
+                    STATEMENT_TEMPLATE.format(
+                        clients=f"`{project}.{core}.clients`",
+                        advances=f"`{project}.{core}.advances`",
+                        entries=f"`{project}.{core}.entries_core`"
+                        if name == "same-dataset"
+                        else f"`{project}.{ledger}.entries_ledger`",
+                    ),
+                )
+            )
+        plan.append(
+            (
+                JSON_SCENARIO,
+                JSON_STATEMENT.format(
+                    clients="clients", entries="entries_ledger", tier=SPICE_TIER
+                ),
+                JSON_STATEMENT.format(
+                    clients=f"`{project}.{core}.clients`",
+                    entries=f"`{project}.{ledger}.entries_ledger`",
+                    tier=BIGQUERY_TIER,
+                ),
+            )
+        )
+
+        for name, statement, control_statement in plan:
             (output / f"{name}.sql").write_text(statement + ";\n", encoding="utf-8")
 
             status, _, explain_body = http_sql(http_port, f"EXPLAIN VERBOSE {statement}")
@@ -503,16 +573,10 @@ def main() -> int:
                 raise HarnessError(f"{name} returned HTTP {status}: {body}")
             rows = json.loads(body)
 
-            control_job = client.query(
-                STATEMENT_TEMPLATE.format(
-                    clients=f"`{project}.{core}.clients`",
-                    advances=f"`{project}.{core}.advances`",
-                    entries=f"`{project}.{core}.entries_core`"
-                    if name == "same-dataset"
-                    else f"`{project}.{ledger}.entries_ledger`",
-                ),
-                location=location,
+            (output / f"{name}.control.sql").write_text(
+                control_statement + ";\n", encoding="utf-8"
             )
+            control_job = client.query(control_statement, location=location)
             control = [
                 {key: value for key, value in dict(row).items()} for row in control_job.result()
             ]
@@ -571,6 +635,21 @@ def main() -> int:
                     f"{name}: BIGQUERY_EXPECT=split expected more than one BigQuery job, "
                     f"observed {len(observed)}"
                 )
+            if name == JSON_SCENARIO:
+                pushed = "\n".join(statements)
+                missing = [
+                    call for call in ("JSON_QUERY", "JSON_VALUE") if call not in pushed
+                ]
+                if missing:
+                    failures.append(
+                        f"{name}: json_get_str was not pushed to BigQuery; the generated SQL "
+                        f"is missing {missing}. It is being evaluated locally instead."
+                    )
+                if rows != JSON_EXPECTED_ROWS:
+                    failures.append(
+                        f"{name}: json_get_str returned the wrong rows\n"
+                        f"  expected={JSON_EXPECTED_ROWS!r}\n  actual  ={rows!r}"
+                    )
 
         write_json(output / "summary.json", summary)
         succeeded = not failures
