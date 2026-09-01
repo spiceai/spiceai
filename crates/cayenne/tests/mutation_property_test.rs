@@ -795,7 +795,11 @@ fn apply_model(model: &mut Model, op: &Op) {
 // Harness
 // ============================================================================
 
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<usize> {
+async fn run_sequential(
+    fixture: &TestFixture,
+    w: &Workload,
+    seed: u64,
+) -> TestResult<(usize, usize)> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -810,6 +814,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
     let mut predicate_deleted_rows = 0usize;
+    let mut predicate_delete_ops = 0usize;
 
     for step in 0..w.ops {
         let live_value = sample_live_value(&model, &mut rng);
@@ -863,6 +868,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         apply_model(&mut model, &op);
         let retired_rows = model.len() < rows_before_op;
         if matches!(op, Op::DeletePredicate { .. }) {
+            predicate_delete_ops += 1;
             predicate_deleted_rows += rows_before_op - model.len();
         }
         let live = read_rows(&ctx, &name).await?;
@@ -895,7 +901,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&final_state, &model, &msg);
     verify_aggregate_queries(&c, t.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(predicate_deleted_rows)
+    Ok((predicate_deleted_rows, predicate_delete_ops))
 }
 
 async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
@@ -1049,26 +1055,32 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     Ok(())
 }
 
+/// Predicate deletes needed before "retired nothing" means the op is inert
+/// rather than the workload simply being short.
+const MIN_OPS_TO_JUDGE_INERTNESS: usize = 40;
+
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
     let mut predicate_deleted_rows = 0usize;
+    let mut predicate_delete_ops = 0usize;
     for seed in 0..w.seeds {
         match w.concurrency {
             Concurrency::Sequential => {
-                predicate_deleted_rows += run_sequential(&fixture, &w, seed).await?;
+                let (rows, ops) = run_sequential(&fixture, &w, seed).await?;
+                predicate_deleted_rows += rows;
+                predicate_delete_ops += ops;
             }
             Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
         }
     }
     // An op that never retires a row still runs the delete plan, so it would sit
-    // in the weights looking like coverage. Fail loudly if the window and the
-    // value domain drift apart again.
-    if w.weights.delete_predicate > 0 && matches!(w.concurrency, Concurrency::Sequential) {
+    // in the weights looking like coverage. Only meaningful once enough of them
+    // have run: a reduced-scale pass (`CAYENNE_PROPTEST_*_SCALE`) leaves the
+    // table too small for a window to match, which says nothing about the op.
+    if predicate_delete_ops >= MIN_OPS_TO_JUDGE_INERTNESS {
         assert!(
             predicate_deleted_rows > 0,
-            "delete_predicate is weighted {} but retired 0 rows across {} seeds — the window no \
-             longer intersects the value domain, so the op is inert",
-            w.weights.delete_predicate,
-            w.seeds,
+            "delete_predicate retired 0 rows across {predicate_delete_ops} deletes — the window \
+             no longer intersects the value domain, so the op is inert",
         );
     }
     Ok(())
