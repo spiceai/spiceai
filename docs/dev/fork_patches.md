@@ -94,9 +94,9 @@ own section below — a count here would be one more thing to keep true by hand.
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
 | [datafusion](#datafusion) | `d7193e96eaada34a126892aca9b0531a821ea5f9` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `09faed2ad69084070fbe968a31a8cd1f98822f30` | `phillip/pre-federation-optimizer-rules` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `095504d9c05882c300ef60b625280220f2d4298b` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `66ebd70a1b79f01e33f1f07846b68e96f2ce53cf` | `phillip/adbc-pre-federation-optimizer-rules` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `4a0c194f802e8559c498bd8d82212a1c8ef54d19` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
