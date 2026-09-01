@@ -187,6 +187,7 @@ unsafe extern "C" fn statement_execute_query(
     if unsafe { refuse_if_released(_statement) } {
         return ADBC_STATUS_INVALID_STATE;
     }
+    EXECUTING_STATEMENT.store(_statement as usize, Ordering::SeqCst);
     EXECUTING.store(true, Ordering::SeqCst);
     let mut cancelled = CANCELLED
         .lock()
@@ -196,6 +197,7 @@ unsafe extern "C" fn statement_execute_query(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             EXECUTING.store(false, Ordering::SeqCst);
+            EXECUTING_STATEMENT.store(0, Ordering::SeqCst);
             return ADBC_STATUS_INTERNAL;
         }
         let (guard, _) = CANCEL_SIGNAL
@@ -204,6 +206,7 @@ unsafe extern "C" fn statement_execute_query(
         cancelled = guard;
     }
     EXECUTING.store(false, Ordering::SeqCst);
+    EXECUTING_STATEMENT.store(0, Ordering::SeqCst);
     ADBC_STATUS_CANCELLED
 }
 

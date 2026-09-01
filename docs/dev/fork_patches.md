@@ -1,6 +1,6 @@
 # Fork patches and their guards
 
-Spice builds against forks of 30 upstream crates. Some of those forks carry Spice
+Spice builds against forks of 31 upstream crates. Some of those forks carry Spice
 patches; the rest are pinned for a version or dependency reason and carry no
 behaviour of ours at all.
 
@@ -267,6 +267,7 @@ crates are replaced together through `[patch.crates-io]`: the patch changes an
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `AdbcStatementCancel` issued without the statement lock, and statement release moved from the clonable handle to the shared inner (fork PR #4) | `cancel` is serialized behind the `execute` it exists to interrupt, so it returns only once the query has finished on its own and cancels nothing. A Flight client that goes away then leaves the remote query running — billing, on BigQuery — and holds its pooled connection for the rest of that query's life, which exhausts a small pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection` |
+| Arrow floor raised to 58 (fork PR #4) | The requirement spans 53 to 58, so a workspace that also carries an older arrow subtree — a geospatial stack on an older `DataFusion`, say — may resolve the ADBC crates onto it while the rest of the workspace runs on 58. Two copies of `arrow-schema` then exist and a `Schema` does not match across the ADBC boundary; the enterprise runtime does not compile | build | `cargo check -p connector-adbc` in the enterprise runtime, which fails with `expected arrow_schema::Schema, found arrow_schema::schema::Schema` when the floor is missing |
 
 ## datafusion-functions-json
 
