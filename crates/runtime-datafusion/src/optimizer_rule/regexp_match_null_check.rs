@@ -29,19 +29,13 @@ limitations under the License.
 //! `regexp_matches`).
 
 use datafusion::common::Result;
-use std::sync::Arc;
 
-use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::datasource::DefaultTableSource;
 use datafusion::functions::regex;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDFImpl, TableSource};
+use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDFImpl};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
-
-type TableProviderPredicate = Arc<dyn Fn(&dyn TableProvider) -> bool + Send + Sync>;
-type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
 
 /// Rewrites `regexp_match(…) IS [NOT] NULL` into the equivalent
 /// `regexp_like(…) IS [NOT] TRUE`.
@@ -59,70 +53,18 @@ type TableSourcePredicate = Arc<dyn Fn(&dyn TableSource) -> bool + Send + Sync>;
 /// | does not match      | false               | false          |
 /// | string/pattern NULL | false               | false          |
 ///
-/// The rule is provider-independent. Callers choose its execution scope: the
-/// `BigQuery` federation provider runs it before its capability check, while
-/// local engines can install the same rule in their ordinary logical optimizer.
+/// The rule is provider-independent. The `BigQuery` federation provider runs
+/// it before its capability check. The ordinary logical optimizer runs it
+/// after federation analysis, where federated subplans are opaque leaves, so
+/// the same rule also optimizes every expression that remains local.
 #[derive(Default)]
-pub struct RegexpMatchNullCheckRewrite {
-    table_source_predicate: Option<TableSourcePredicate>,
-}
+pub struct RegexpMatchNullCheckRewrite;
 
 impl RegexpMatchNullCheckRewrite {
-    /// Create an unscoped rule.
-    ///
-    /// This form is intended for a plan that has already been scoped to one
-    /// provider, such as a candidate subtree selected by the federation
-    /// analyzer.
+    /// Create the rewrite rule.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a rule scoped to plans containing only matching table providers.
-    ///
-    /// Runtime registration uses this form to enable the local rewrite for
-    /// Cayenne without changing plans backed by non-federated remote providers.
-    #[must_use]
-    pub fn new_with_table_provider_predicate(
-        table_provider_predicate: impl Fn(&dyn TableProvider) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        let table_provider_predicate: TableProviderPredicate = Arc::new(table_provider_predicate);
-        Self::new_with_table_source_predicate(move |source| {
-            source
-                .downcast_ref::<DefaultTableSource>()
-                .is_some_and(|source| table_provider_predicate(source.table_provider.as_ref()))
-        })
-    }
-
-    /// Create a rule scoped to plans containing only matching table sources.
-    #[must_use]
-    pub fn new_with_table_source_predicate(
-        table_source_predicate: impl Fn(&dyn TableSource) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            table_source_predicate: Some(Arc::new(table_source_predicate)),
-        }
-    }
-
-    fn plan_is_in_scope(&self, plan: &LogicalPlan) -> Result<bool> {
-        let Some(table_source_predicate) = &self.table_source_predicate else {
-            return Ok(true);
-        };
-
-        let mut saw_table_scan = false;
-        let mut all_table_scans_match = true;
-        plan.apply(|plan| {
-            if let LogicalPlan::TableScan(scan) = plan {
-                saw_table_scan = true;
-                if !table_source_predicate(scan.source.as_ref()) {
-                    all_table_scans_match = false;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        Ok(saw_table_scan && all_table_scans_match)
+        Self
     }
 
     fn plan_has_rewritable_expression(plan: &LogicalPlan) -> Result<bool> {
@@ -147,9 +89,7 @@ impl RegexpMatchNullCheckRewrite {
 
 impl std::fmt::Debug for RegexpMatchNullCheckRewrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegexpMatchNullCheckRewrite")
-            .field("scoped", &self.table_source_predicate.is_some())
-            .finish()
+        f.debug_struct("RegexpMatchNullCheckRewrite").finish()
     }
 }
 
@@ -160,14 +100,10 @@ impl OptimizerRule for RegexpMatchNullCheckRewrite {
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up_with_subqueries(|plan| {
-            // This rule is present in the ordinary optimizer for Cayenne, so
-            // make the overwhelmingly common path cheap: do not inspect table
-            // ownership or clone/rebuild the plan unless this node actually
-            // contains the exact regexp NULL-check shape.
+            // Make the overwhelmingly common path cheap: do not clone or
+            // rebuild the plan unless this node actually contains the exact
+            // regexp NULL-check shape.
             if !Self::plan_has_rewritable_expression(&plan)? {
-                return Ok(Transformed::no(plan));
-            }
-            if !self.plan_is_in_scope(&plan)? {
                 return Ok(Transformed::no(plan));
             }
 
@@ -266,12 +202,15 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::catalog::MemTable;
+    use datafusion::execution::context::SessionState;
     use datafusion::logical_expr::{
-        ColumnarValue, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
+        ColumnarValue, Extension, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
         builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
     use datafusion::optimizer::OptimizerContext;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{SessionContext, col, lit};
+    use datafusion_federation::{FederatedPlanNode, FederationPlanner};
 
     use super::*;
 
@@ -320,47 +259,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_scoped_rule_rewrites_only_matching_table_sources() {
-        let matching = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| true)
-            .rewrite(null_check_plan(), &OptimizerContext::new())
-            .expect("run the matching scoped rule")
-            .data
-            .display_indent()
-            .to_string();
-        assert!(
-            matching.contains("regexp_like") && !matching.contains("regexp_match"),
-            "a matching source must be rewritten: {matching}"
-        );
+    #[derive(Debug)]
+    struct UnusedFederationPlanner;
 
-        let non_matching = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| false)
-            .rewrite(null_check_plan(), &OptimizerContext::new())
-            .expect("run the non-matching scoped rule")
-            .data
-            .display_indent()
-            .to_string();
-        assert!(
-            non_matching.contains("regexp_match") && !non_matching.contains("regexp_like"),
-            "a non-matching source must remain untouched: {non_matching}"
-        );
+    #[async_trait::async_trait]
+    impl FederationPlanner for UnusedFederationPlanner {
+        async fn plan_federation(
+            &self,
+            _node: &FederatedPlanNode,
+            _session_state: &SessionState,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            unreachable!("logical rewrite tests never physically plan the federated node")
+        }
     }
 
     #[test]
-    fn a_scoped_rule_does_not_inspect_table_ownership_without_a_rewrite_candidate() {
-        let plan = scan()
-            .project(vec![regexp_match_call()])
-            .expect("project")
-            .build()
-            .expect("build");
-        let rendered = RegexpMatchNullCheckRewrite::new_with_table_source_predicate(|_| {
-            panic!("the table-source predicate must stay cold without a NULL-check")
-        })
-        .rewrite(plan, &OptimizerContext::new())
-        .expect("run the scoped rule")
-        .data
-        .display_indent()
-        .to_string();
-        assert!(rendered.contains("regexp_match"));
+    fn a_federated_subplan_is_an_opaque_leaf() {
+        let federated = LogicalPlan::Extension(Extension {
+            node: Arc::new(FederatedPlanNode::new(
+                null_check_plan(),
+                Arc::new(UnusedFederationPlanner),
+            )),
+        });
+
+        let rewritten = rewrite(federated);
+        let LogicalPlan::Extension(Extension { node }) = rewritten else {
+            panic!("the federated extension node must remain in the plan");
+        };
+        let federated = node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("the extension must remain a federated node");
+        let inner = federated.plan().display_indent().to_string();
+        assert!(
+            inner.contains("regexp_match") && !inner.contains("regexp_like"),
+            "the ordinary optimizer must not rewrite inside a federated subplan: {inner}"
+        );
     }
 
     #[test]

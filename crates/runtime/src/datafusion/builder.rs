@@ -50,7 +50,6 @@ use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
 use datafusion::catalog::TableProvider;
-#[cfg(not(windows))]
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -95,7 +94,6 @@ use datafusion_optimizer_rules::{
 };
 #[cfg(not(windows))]
 use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
-#[cfg(not(windows))]
 use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
@@ -996,6 +994,8 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
 
+        state = with_spice_logical_optimizers(state, self.cayenne_optimizer_rules);
+
         #[cfg(not(windows))]
         {
             // Cayenne is not built on Windows, so its physical optimizer rules
@@ -1007,7 +1007,6 @@ impl DataFusionBuilder {
             // `CayenneJoinRewriter` below (gated on `exact_join_filter`) restores
             // the forked exact in-list accumulator path on top of that default.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
-            state = with_cayenne_logical_optimizers(state, self.cayenne_optimizer_rules);
             if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
                 state = state
                     .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()));
@@ -1305,8 +1304,7 @@ impl DataFusionBuilder {
     }
 }
 
-#[cfg(not(windows))]
-fn with_cayenne_logical_optimizers(
+fn with_spice_logical_optimizers(
     mut state: SessionStateBuilder,
     cayenne_optimizer_rules: CayenneOptimizerRules,
 ) -> SessionStateBuilder {
@@ -1316,49 +1314,45 @@ fn with_cayenne_logical_optimizers(
         .take()
         .map_or_else(|| Optimizer::new().rules, |optimizer| optimizer.rules);
 
-    insert_cayenne_regexp_match_null_check_rewrite(&mut optimizer_rules);
-    if cayenne_optimizer_rules.filter_propagation() {
-        insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
+    insert_regexp_match_null_check_rewrite(&mut optimizer_rules);
+    #[cfg(not(windows))]
+    {
+        if cayenne_optimizer_rules.filter_propagation() {
+            insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
+        }
+        if cayenne_optimizer_rules.cross_join_reassociation() {
+            insert_cayenne_cross_join_reassociation_rule(&mut optimizer_rules);
+        }
+        if cayenne_optimizer_rules.inlist_to_range() {
+            insert_cayenne_inlist_to_range_rewrite(&mut optimizer_rules);
+        }
+        if cayenne_optimizer_rules.semi_join_pushdown() {
+            insert_cayenne_push_down_semi_join(&mut optimizer_rules);
+        }
+        if cayenne_optimizer_rules.join_reorder() {
+            insert_cayenne_join_reorder_rule(&mut optimizer_rules);
+        }
     }
-    if cayenne_optimizer_rules.cross_join_reassociation() {
-        insert_cayenne_cross_join_reassociation_rule(&mut optimizer_rules);
-    }
-    if cayenne_optimizer_rules.inlist_to_range() {
-        insert_cayenne_inlist_to_range_rewrite(&mut optimizer_rules);
-    }
-    if cayenne_optimizer_rules.semi_join_pushdown() {
-        insert_cayenne_push_down_semi_join(&mut optimizer_rules);
-    }
-    if cayenne_optimizer_rules.join_reorder() {
-        insert_cayenne_join_reorder_rule(&mut optimizer_rules);
-    }
+    #[cfg(windows)]
+    let _ = cayenne_optimizer_rules;
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
 }
 
-#[cfg(not(windows))]
-fn insert_cayenne_regexp_match_null_check_rewrite(
-    rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>,
-) {
+fn insert_regexp_match_null_check_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
     if !rules
         .iter()
         .any(|rule| rule.name() == "regexp_match_null_check_rewrite")
     {
         // Run before expression simplification so the exact NULL-check idiom
-        // is still visible. The provider predicate makes this a no-op for
-        // federated nodes and for non-federated remote table providers.
+        // is still visible. Federation analysis has already made remote
+        // subplans opaque, so this rule only sees expressions that remain
+        // local.
         let insert_at = rules
             .iter()
             .position(|rule| rule.name() == "simplify_expressions")
             .unwrap_or(rules.len());
-        rules.insert(
-            insert_at,
-            Arc::new(
-                RegexpMatchNullCheckRewrite::new_with_table_provider_predicate(
-                    is_cayenne_accelerated_table_provider,
-                ),
-            ),
-        );
+        rules.insert(insert_at, Arc::new(RegexpMatchNullCheckRewrite::new()));
     }
 }
 
@@ -2850,7 +2844,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn test_regexp_null_check_rewrite_runs_only_for_cayenne_backed_queries() {
+    fn test_regexp_null_check_rewrite_runs_for_every_local_query() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2882,8 +2876,8 @@ mod tests {
             .display_indent()
             .to_string();
             assert!(
-                plain.contains("regexp_match") && !plain.contains("regexp_like"),
-                "a non-Cayenne provider must remain untouched: {plain}"
+                plain.contains(" IS TRUE") && !plain.contains("regexp_match"),
+                "a non-Cayenne local query must use the shared boolean regexp rewrite: {plain}"
             );
 
             let cayenne = optimized_sql_query_plan(
@@ -2895,7 +2889,7 @@ mod tests {
             .to_string();
             assert!(
                 cayenne.contains(" IS TRUE") && !cayenne.contains("regexp_match"),
-                "a Cayenne-backed query must use the shared boolean regexp rewrite: {cayenne}"
+                "a Cayenne-backed local query must use the shared boolean regexp rewrite: {cayenne}"
             );
         });
     }
