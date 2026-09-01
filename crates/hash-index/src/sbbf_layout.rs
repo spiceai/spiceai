@@ -43,32 +43,44 @@ verus! {
 ///
 /// `num_blocks` of 0 has no block to select and yields 0;
 /// [`crate::SplitBlockBloomFilter::new`] always allocates at least one.
+///
+/// `#[inline]` because every insert and every probe calls this once per hash:
+/// the caller is `SplitBlockBloomFilter`'s own `#[inline]` method, and the
+/// reduction has to keep collapsing into it across the module boundary.
+#[inline]
 pub fn block_index(num_blocks: usize, hash: u64) -> (index: usize)
     ensures
         num_blocks >= 1 ==> index < num_blocks,
 {
-    if num_blocks == 0 {
-        return 0;
-    }
     let hi: u128 = u128::from(hash >> 32);
     let len: u128 = num_blocks as u128;
 
-    // The high half is what the reduction ranges over: at most 2^32 - 1.
-    assert(hash >> 32 <= 0xffff_ffffu64) by (bit_vector);
-    // So the product is under 2^96 and cannot overflow the u128 it widens to.
-    assert(hi * len <= 0xffff_ffffu128 * len) by (nonlinear_arith)
-        requires hi <= 0xffff_ffffu128;
-    assert(0xffff_ffffu128 * len <= 0xffff_ffffu128 * 0x1_0000_0000_0000_0000u128)
-        by (nonlinear_arith)
-        requires len <= 0xffff_ffff_ffff_ffffu128;
+    proof {
+        // The high half is what the reduction ranges over: at most 2^32 - 1.
+        assert(hash >> 32 <= 0xffff_ffffu64) by (bit_vector);
+        // So the product is under 2^96 and cannot overflow the u128 it widens to.
+        assert(hi * len <= 0xffff_ffffu128 * len) by (nonlinear_arith)
+            requires hi <= 0xffff_ffffu128;
+        assert(0xffff_ffffu128 * len <= 0xffff_ffffu128 * 0x1_0000_0000_0000_0000u128)
+            by (nonlinear_arith)
+            requires len <= 0xffff_ffff_ffff_ffffu128;
+    }
 
     let product: u128 = hi * len;
 
-    // Shifting the 32 bits back off divides by exactly what the reduction
-    // multiplied in, so the quotient lands strictly below `num_blocks`.
-    assert(product >> 32 == product / 0x1_0000_0000u128) by (bit_vector);
-    assert(product / 0x1_0000_0000u128 < len) by (nonlinear_arith)
-        requires product <= 0xffff_ffffu128 * len, len >= 1;
+    proof {
+        // Shifting the 32 bits back off divides by exactly what the reduction
+        // multiplied in, so the quotient lands strictly below `num_blocks`.
+        assert(product >> 32 == product / 0x1_0000_0000u128) by (bit_vector);
+        if num_blocks >= 1 {
+            assert(product / 0x1_0000_0000u128 < len) by (nonlinear_arith)
+                requires product <= 0xffff_ffffu128 * len, len >= 1;
+        } else {
+            // No block to select. The reduction already yields 0 here, so the
+            // degenerate case needs no branch in the emitted code.
+            assert(product == 0);
+        }
+    }
 
     (product >> 32) as usize
 }
