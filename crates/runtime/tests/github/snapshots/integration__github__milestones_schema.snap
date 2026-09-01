@@ -1,0 +1,24 @@
+---
+source: crates/runtime/tests/github/mod.rs
+expression: batches_to_string(&result_batches)
+---
++---------------------+---------------+-------------+
+| column_name         | data_type     | is_nullable |
++---------------------+---------------+-------------+
+| id                  | Utf8          | YES         |
+| number              | Int64         | YES         |
+| title               | Utf8          | YES         |
+| description         | Utf8          | YES         |
+| state               | Utf8          | YES         |
+| creator             | Utf8          | YES         |
+| due_on              | Timestamp(ms) | YES         |
+| created_at          | Timestamp(ms) | YES         |
+| updated_at          | Timestamp(ms) | YES         |
+| closed_at           | Timestamp(ms) | YES         |
+| open_issues_count   | Int64         | YES         |
+| closed_issues_count | Int64         | YES         |
+| progress_percentage | Float64       | YES         |
+| url                 | Utf8          | YES         |
+| owner               | Utf8          | NO          |
+| repo                | Utf8          | NO          |
++---------------------+---------------+-------------+

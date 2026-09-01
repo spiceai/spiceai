@@ -87,6 +87,7 @@ pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
 pub(crate) mod maintenance;
+pub(crate) mod maintenance_metrics;
 pub(crate) mod manifest;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;
@@ -1824,6 +1825,310 @@ mod tests {
             catalog.get_table(table).await.expect("get").schema.as_ref(),
             stored_schema.as_ref(),
             "a non-schema config difference must keep the legacy pin path"
+        );
+    }
+
+    /// Repairing the stored declaration rewrites no file, so a table that already holds rows
+    /// ends up with a corpus whose own Arrow IPC schema still declares `entries` nullable while
+    /// the reopened table declares it non-nullable. This pins that the disagreement is readable
+    /// — on both tiers: served from the inline corpus, and again after a checkpoint has flushed
+    /// it to a Vortex file, which has no map dtype and rebuilds one from the table's schema.
+    ///
+    /// Rows are written through the ordinary insert path so the sequence bookkeeping is real,
+    /// then the stored blob is replaced with the same rows re-serialized under the
+    /// pre-conformance declaration — the on-disk state a legacy table is actually in.
+    ///
+    /// Note what this does and does not guard. It is a forward guard against a later change
+    /// making the repair break legacy reads; it is **not** a guard on the repair itself, and it
+    /// cannot be: removing the repair makes the stored declaration agree with the blob again, so
+    /// there is no disagreement left to read. It also records a measured fact — the read path
+    /// tolerates this mismatch, so the unreadable-column shape #13549 describes is not what a
+    /// Cayenne scan does with it. What the repair demonstrably prevents is on the comparison
+    /// side; see `normalize_for_comparison`.
+    #[tokio::test]
+    async fn legacy_inline_map_data_is_readable_once_the_declaration_is_repaired() {
+        use arrow::array::Array;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_legacy_map_data.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+        let batch_with = |entries_nullable: bool| {
+            let entries = arrow::array::StructArray::from(vec![
+                (
+                    Arc::new(Field::new("keys", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(vec!["a", "b"])) as arrow::array::ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(StringArray::from(vec![Some("1"), Some("2")]))
+                        as arrow::array::ArrayRef,
+                ),
+            ]);
+            let offsets = arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
+            let map = arrow::array::make_array(
+                arrow::array::ArrayData::builder(map_of(entries_nullable))
+                    .len(2)
+                    .add_buffer(offsets.into_inner().into_inner())
+                    .add_child_data(entries.to_data())
+                    .build()
+                    .expect("build the map array"),
+            );
+            RecordBatch::try_new(
+                schema_with(entries_nullable),
+                vec![Arc::new(Int32Array::from(vec![1, 2])), map],
+            )
+            .expect("batch")
+        };
+
+        let table_name = "legacy_map_data";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: schema_with(false),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        insert_batch(&provider, batch_with(false)).await;
+        let table_id = catalog
+            .get_table(table_name)
+            .await
+            .expect("get table")
+            .table_id;
+        assert!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count")
+                > 0,
+            "the write must land in the inline corpus, or this test proves nothing about it"
+        );
+
+        // Re-serialize the identical rows under the pre-conformance declaration and put those
+        // bytes back. Only the declaration differs; every key and value is the same.
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema_with(true))
+                    .expect("ipc writer");
+            writer.write(&batch_with(true)).expect("write");
+            writer.finish().expect("finish");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open the metastore directly");
+            let swapped = conn
+                .execute(
+                    "UPDATE cayenne_inlined_data SET data_ipc = ?1 WHERE table_id = ?2",
+                    rusqlite::params![ipc, table_id],
+                )
+                .expect("swap in the legacy blob");
+            assert_eq!(
+                swapped, 1,
+                "exactly one inline blob should have been replaced"
+            );
+        }
+
+        // Reopen: `get_table` repairs the stored declaration; the blob keeps the old one.
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("register");
+
+        let read_back = |ctx: SessionContext| async move {
+            let batches = ctx
+                .sql("SELECT id, headers FROM legacy_map_data ORDER BY id")
+                .await
+                .expect("plan the scan")
+                .collect()
+                .await
+                .expect("a row written under the forbidden declaration must still be readable");
+            pretty_format_batches(&batches).expect("format").to_string()
+        };
+
+        let expected = "\
++----+---------+
+| id | headers |
++----+---------+
+| 1  | {a: 1}  |
+| 2  | {b: 2}  |
++----+---------+";
+        assert_eq!(
+            read_back(ctx.clone()).await,
+            expected,
+            "served from the inline corpus"
+        );
+
+        // Same rows again once they have been flushed to a Vortex file: Vortex has no map dtype
+        // and restores one from the table's schema, so the repaired declaration is what it
+        // rebuilds against.
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush the inline corpus to a Vortex file");
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count"),
+            0,
+            "the corpus must actually be flushed, or the second read repeats the first"
+        );
+        assert_eq!(
+            read_back(ctx).await,
+            expected,
+            "served from a Vortex file written out of the legacy blob"
+        );
+    }
+
+    /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
+    /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
+    /// refuses. Adding such a column under `append_new_columns` must not leave a column no
+    /// kernel can rebuild on a table that was readable a moment earlier.
+    ///
+    /// This is the Cayenne end of the normalization `classify` applies, exercised the way
+    /// production reaches it — the CDC path hands `evolve_schema_live` a plan the classifier
+    /// built. The metastore write and the in-memory swap are asserted separately: they are two
+    /// different stores, and a declaration that reaches only one of them leaves the other
+    /// advertising a type its own catalog disagrees with.
+    #[tokio::test]
+    async fn schema_evolution_live_installs_a_conforming_map_entries_declaration() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_map.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+
+        let table_name = "evolution_map_entries";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        // The source adds a nullable `headers` MAP whose `entries` it declares nullable.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("headers", map_of(true), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        assert_eq!(
+            plan.evolved_schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &map_of(false),
+            "the classifier must not hand on a plan carrying the declaration the Arrow map layout forbids"
+        );
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        let expected = map_of(false);
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the live provider must not advertise a column no kernel can rebuild"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the metastore must hold the conforming declaration too"
         );
     }
 

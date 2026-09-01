@@ -189,6 +189,31 @@ impl PostWriteMaintenanceState {
     }
 }
 
+/// What one retention pass did.
+///
+/// `Deferred` is not a failure and not an empty delete: the pass declined to run because
+/// materializing the inline corpus while a staged inline-conflict tombstone, a mem-tier
+/// seal shadow, or an append finalization is in flight would resurrect a superseded row
+/// or serve a live one twice. Keeping it distinct from `Deleted(0)` is what lets each
+/// caller pick its own retry — the background loop has a debounce to retry after, the
+/// synchronous drain does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionPass {
+    Deleted(u64),
+    /// Deferred behind something that publishes within milliseconds — an unpublished
+    /// inline-conflict tombstone or a staged append mid-finalize. Worth re-arming: the
+    /// next debounce almost certainly finds the window closed.
+    DeferredTransient,
+    /// Deferred behind a mem-tier seal shadow, which is NOT transient: it stands until
+    /// the next full checkpoint — 10s by default, and indefinitely when the age trigger
+    /// is off and the size gate is unmet. Re-arming would poll at the debounce interval
+    /// for that whole span, dragging `run_maintenance_state`'s metastore vacuum and WAL
+    /// checkpoint tail along on every pass. The checkpoint that clears a shadow arms
+    /// retention itself (see `checkpoint_mem_tier_inner`), so waiting for it costs one
+    /// checkpoint of latency and no polling.
+    DeferredUntilCheckpoint,
+}
+
 pub(crate) enum RetentionFailureAction {
     Requeue,
     ReturnError,
@@ -198,9 +223,12 @@ pub(crate) enum RetentionFailureAction {
 pub(crate) struct PostWriteMaintenance {
     pub(crate) state: ParkingMutex<PostWriteMaintenanceState>,
     pub(crate) scheduled: AtomicBool,
-    /// How many queued live-row deltas the persisted `num_rows` does not
-    /// include yet.
-    pub(crate) outstanding_live_rows_deltas: AtomicU64,
+    /// How many live-row deltas the persisted `num_rows` does not include yet.
+    ///
+    /// Shared with every outstanding [`OutstandingLiveRowsDelta`], which is what
+    /// lets a writer mark its delta outstanding before the commit that publishes
+    /// its rows and release it again if that commit never happens.
+    outstanding_live_rows_deltas: Arc<AtomicU64>,
 }
 
 impl PostWriteMaintenance {
@@ -222,13 +250,32 @@ impl PostWriteMaintenance {
         self.outstanding_live_rows_deltas.load(Ordering::Acquire) > 0
     }
 
-    /// Count one delta being folded into the queued state.
+    /// Mark a live-row delta outstanding *before* the commit that publishes the
+    /// rows it describes.
     ///
-    /// Call with [`Self::state`] held, so this and the `live_rows_delta` it
-    /// accounts for become visible to a drain together.
-    pub(crate) fn record_queued_live_rows_delta(&self) {
+    /// Queueing the delta is what normally marks it outstanding, and that
+    /// happens once the commit has returned. Rows are visible to scans from the
+    /// moment the commit publishes them, so between those two points every
+    /// proxy for "rows the persisted count does not describe yet" reads false
+    /// and the short count is served as a provably exact one — which the
+    /// coordinator folds straight into a `COUNT(*)` answer. Reserving first
+    /// means the count is already reported as drifting by the reader's first
+    /// opportunity to see the rows.
+    ///
+    /// Dropping the reservation releases it, which is what a publish that fails
+    /// needs: no rows became visible, so no delta is outstanding. Handing it to
+    /// the maintenance queue with [`OutstandingLiveRowsDelta::queue`] keeps it
+    /// outstanding until a persist retires it through
+    /// [`Self::retire_applied_live_rows_deltas`].
+    ///
+    /// This is the only way to mark a delta outstanding, so that a commit cannot
+    /// stake its claim after publishing the rows the claim is about.
+    pub(crate) fn reserve_live_rows_delta(&self) -> OutstandingLiveRowsDelta {
         self.outstanding_live_rows_deltas
             .fetch_add(1, Ordering::AcqRel);
+        OutstandingLiveRowsDelta {
+            outstanding: Some(Arc::clone(&self.outstanding_live_rows_deltas)),
+        }
     }
 
     /// Retire the `count` deltas a persist folded into `num_rows`.
@@ -241,17 +288,101 @@ impl PostWriteMaintenance {
     /// refuse. Being a count also makes it order-independent: two drains that
     /// finish out of order retire the same total either way.
     pub(crate) fn retire_applied_live_rows_deltas(&self, count: u64) {
-        if count == 0 {
-            return;
+        release_outstanding_live_rows_deltas(&self.outstanding_live_rows_deltas, count);
+    }
+}
+
+/// Take `count` deltas off the outstanding tally.
+///
+/// `saturating_sub` for the arithmetic alone: every release pairs with a
+/// reservation, but wrapping here would read as a permanently outstanding queue
+/// and strand the table on `Inexact` for the life of the process.
+fn release_outstanding_live_rows_deltas(outstanding: &AtomicU64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        Some(remaining.saturating_sub(count))
+    });
+}
+
+/// A live-row delta counted as outstanding before the rows it describes become
+/// visible, from [`PostWriteMaintenance::reserve_live_rows_delta`].
+///
+/// Held across the commit that publishes those rows, so the maintained row
+/// count is never reported as a provably exact live count while it is short by
+/// this delta. It is released on drop and kept by [`Self::queue`]: a commit that
+/// fails publishes nothing, and one that succeeds owes the count a delta until
+/// maintenance persists it.
+#[must_use = "dropping the reservation releases it, reopening the window between the publish and the queued delta"]
+pub(crate) struct OutstandingLiveRowsDelta {
+    /// `None` once the reservation has been handed to the maintenance queue,
+    /// which is what stops the drop from releasing a delta that is still owed.
+    outstanding: Option<Arc<AtomicU64>>,
+}
+
+impl OutstandingLiveRowsDelta {
+    /// The rows this delta describes are now visible to scans.
+    ///
+    /// From here the claim stops being released implicitly. A commit that is
+    /// cancelled or fails *after* publishing has left rows the persisted count
+    /// does not describe and will never queue a delta for them, so releasing on
+    /// drop would restore the pre-write count to `Exact` while short — the wrong
+    /// answer this whole gate exists to refuse. Holding the claim instead costs
+    /// that table the metadata `COUNT(*)` fold until a full-rewrite `Set`
+    /// re-baselines it, which is a scan rather than a wrong number.
+    ///
+    /// Call it as soon as the publish returns, since every suspension point
+    /// between the publish and this call is a cancellation that loses the claim.
+    pub(crate) fn published(mut self) -> PublishedLiveRowsDelta {
+        let outstanding = self
+            .outstanding
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        PublishedLiveRowsDelta { outstanding }
+    }
+}
+
+impl Drop for OutstandingLiveRowsDelta {
+    fn drop(&mut self) {
+        if let Some(outstanding) = self.outstanding.take() {
+            release_outstanding_live_rows_deltas(&outstanding, 1);
         }
-        // `saturating_sub` for the arithmetic alone: every retirement pairs
-        // with recorded deltas, but wrapping here would read as a permanently
-        // outstanding queue and strand the table on `Inexact`.
-        let _ = self.outstanding_live_rows_deltas.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |outstanding| Some(outstanding.saturating_sub(count)),
-        );
+    }
+}
+
+/// A live-row delta whose rows are visible to scans, from
+/// [`OutstandingLiveRowsDelta::published`].
+///
+/// Deliberately has **no** `Drop`: the only way to reach one implicitly is a
+/// commit cancelled or failed between its publish and its
+/// `schedule_post_write_maintenance` call, and that commit really has left the
+/// persisted count short. The two explicit outcomes are [`Self::queue`] — the
+/// delta is on its way to a persist that will retire it — and [`Self::release`],
+/// for a commit whose net row count did not move and so owes the count nothing.
+#[must_use = "a published claim must be queued or released; dropping it holds the table on Inexact"]
+pub(crate) struct PublishedLiveRowsDelta {
+    outstanding: Arc<AtomicU64>,
+}
+
+impl PublishedLiveRowsDelta {
+    /// Hand the claim to the maintenance queue that will persist the delta.
+    ///
+    /// Nothing to do: the claim is already counted, and
+    /// [`PostWriteMaintenance::retire_applied_live_rows_deltas`] is what clears
+    /// it once a persist has folded the delta into `num_rows`. Call it under the
+    /// same lock that folds the delta into the queued state, so the claim and
+    /// the `live_rows_delta_count` that retires it stay paired.
+    pub(crate) fn queue(self) {
+        drop(self);
+    }
+
+    /// Release the claim for a commit that moved no net row count.
+    ///
+    /// The persisted count already describes this commit's rows, so there is no
+    /// delta to persist and nothing would ever retire the claim.
+    pub(crate) fn release(self) {
+        release_outstanding_live_rows_deltas(&self.outstanding, 1);
     }
 }
 
@@ -273,7 +404,7 @@ mod post_write_maintenance_tests {
     fn a_queued_delta_stays_outstanding_until_it_is_applied() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(1);
@@ -286,8 +417,8 @@ mod post_write_maintenance_tests {
     fn one_drain_retires_every_delta_it_coalesced() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
 
         maintenance.retire_applied_live_rows_deltas(2);
@@ -302,9 +433,9 @@ mod post_write_maintenance_tests {
     fn a_later_success_does_not_cover_an_abandoned_delta() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         // Its drain's persist failed, so nothing is retired for it.
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -317,8 +448,8 @@ mod post_write_maintenance_tests {
     fn out_of_order_drains_retire_the_same_total() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
+        maintenance.reserve_live_rows_delta().published().queue();
 
         maintenance.retire_applied_live_rows_deltas(1);
         assert!(maintenance.has_unapplied_live_rows_delta());
@@ -333,11 +464,93 @@ mod post_write_maintenance_tests {
     fn a_write_after_a_drain_re_arms_the_signal() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(1);
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         assert!(maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A reservation counts from the moment it is taken, which is what lets a
+    /// writer claim its delta before publishing the rows the delta describes.
+    #[test]
+    fn a_reservation_is_outstanding_before_it_is_queued() {
+        let maintenance = PostWriteMaintenance::default();
+
+        let reserved = maintenance.reserve_live_rows_delta();
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "a reservation that only counts once queued cannot cover the publish that precedes \
+             the queueing",
+        );
+
+        reserved.published().queue();
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "queueing hands the reservation on; only a persist retires it",
+        );
+
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A commit that never publishes owes the count nothing, so dropping its
+    /// reservation has to release it — otherwise a failed write strands the
+    /// table on `Inexact` with no delta to drain and nothing to retire it.
+    #[test]
+    fn a_dropped_reservation_is_released() {
+        let maintenance = PostWriteMaintenance::default();
+
+        drop(maintenance.reserve_live_rows_delta());
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// Reservations are independent: releasing one must not clear another
+    /// commit's claim.
+    #[test]
+    fn dropping_one_reservation_leaves_the_others_outstanding() {
+        let maintenance = PostWriteMaintenance::default();
+
+        let kept = maintenance.reserve_live_rows_delta();
+        drop(maintenance.reserve_live_rows_delta());
+
+        assert!(maintenance.has_unapplied_live_rows_delta());
+
+        kept.published().queue();
+        maintenance.retire_applied_live_rows_deltas(1);
+        assert!(!maintenance.has_unapplied_live_rows_delta());
+    }
+
+    /// A commit cancelled or failed *after* its publish has left rows the
+    /// persisted count does not describe and will never queue a delta for them,
+    /// so its claim must survive being dropped. Releasing it would restore the
+    /// pre-write count to `Exact` while short, which is the wrong `COUNT(*)`
+    /// this gate exists to refuse.
+    #[test]
+    fn a_published_claim_survives_a_commit_that_never_queues_it() {
+        let maintenance = PostWriteMaintenance::default();
+
+        drop(maintenance.reserve_live_rows_delta().published());
+
+        assert!(
+            maintenance.has_unapplied_live_rows_delta(),
+            "a claim dropped after the rows were published must stay outstanding: the count is \
+             short by a delta nothing will ever queue",
+        );
+    }
+
+    /// The counterpart: a commit whose net row count did not move owes the
+    /// count nothing, and nothing would ever retire a claim it left behind — so
+    /// that one is released explicitly rather than stranding the table on
+    /// `Inexact` for a delta that does not exist.
+    #[test]
+    fn a_published_claim_for_an_unmoved_count_is_released() {
+        let maintenance = PostWriteMaintenance::default();
+
+        maintenance.reserve_live_rows_delta().published().release();
+
+        assert!(!maintenance.has_unapplied_live_rows_delta());
     }
 
     /// Retiring more than is outstanding must not wrap: a wrapped counter
@@ -347,7 +560,7 @@ mod post_write_maintenance_tests {
     fn retiring_more_than_is_outstanding_does_not_wrap() {
         let maintenance = PostWriteMaintenance::default();
 
-        maintenance.record_queued_live_rows_delta();
+        maintenance.reserve_live_rows_delta().published().queue();
         maintenance.retire_applied_live_rows_deltas(5);
 
         assert!(!maintenance.has_unapplied_live_rows_delta());
