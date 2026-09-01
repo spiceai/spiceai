@@ -370,19 +370,13 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let pool_identity = resolve_pool_identity(
-            &driver_name_owned,
-            &driver_location,
-            &uri_str,
-            &params,
-        )
-        .map_err(|e| {
-                DataConnectorError::InvalidConfigurationSourceOnly {
+        let pool_identity =
+            resolve_pool_identity(&driver_name_owned, &driver_location, &uri_str, &params)
+                .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
-                }
-            })?;
+                })?;
 
         let conn_options = build_conn_options(
             pool_identity.connection_namespace.catalog.as_deref(),
