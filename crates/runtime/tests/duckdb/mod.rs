@@ -627,6 +627,225 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
         .await
 }
 
+/// Regression test for spiceai/spiceai#13728: `cosine_distance` must answer the
+/// same number whether or not the subtree it sits in federates.
+///
+/// `DuckDB`'s `array_cosine_distance` is not the same function. It is
+/// `1 - cosine_similarity` over `[0, 2]` where the UDF is
+/// `(1 - cosine_similarity) / 2` over `[0, 1]`, and it evaluates in FLOAT where
+/// the kernel evaluates in f64 — so a pair of *identical* finite vectors whose
+/// squared components underflow FLOAT (`[1e-30, 0, 0]`) comes back as maximally
+/// distant instead of identical. The constant factor could be rescaled in the
+/// emitted SQL; the width cannot, which is why the name is denied rather than
+/// rewritten.
+///
+/// `fed` has no acceleration, so its scan is pushed to `DuckDB`; `local` is
+/// accelerated into Arrow, so it is evaluated by the Spice kernel. Both read the
+/// same rows, so the two must agree — and `inner_product`, which `DuckDB` *does*
+/// implement identically, must still federate.
+#[tokio::test]
+async fn duckdb_cosine_distance_is_not_federated_to_a_different_function() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let duck_tempdir = tempfile::tempdir().expect("duckdb tempdir");
+    let db_path = duck_tempdir.path().join("vectors.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        // Each row is (vector, probe). Rows 1-3 walk an ordinary direction from
+        // near-parallel to opposite; rows 4 and 5 compare a vector with itself at
+        // magnitudes whose squares underflow and overflow FLOAT respectively.
+        // Those two are the rows a rescaling of DuckDB's answer cannot fix: the
+        // correct distance is 0, and DuckDB answers its maximum.
+        conn.execute_batch(
+            "CREATE TABLE vecs (id BIGINT, emb FLOAT[3], probe FLOAT[3]);
+             INSERT INTO vecs VALUES
+               (1, [4.0, 5.0, 6.0],    [1.0, 2.0, 3.0]),
+               (2, [1.0, 2.0, 3.0],    [1.0, 2.0, 3.0]),
+               (3, [-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]),
+               (4, [1e-30, 0.0, 0.0],  [1e-30, 0.0, 0.0]),
+               (5, [1e20, 0.0, 0.0],   [1e20, 0.0, 0.0]);",
+        )
+        .expect("populate duckdb");
+    }
+
+    test_request_context()
+        .scope(async {
+            let duckdb_open =
+                spicepod::param::Params::from_string_map(std::collections::HashMap::from([(
+                    "duckdb_open".to_string(),
+                    db_path.display().to_string(),
+                )]));
+
+            let mut federated = Dataset::new("duckdb:vecs".to_string(), "fed".to_string());
+            federated.params = Some(duckdb_open.clone());
+
+            let mut local = Dataset::new("duckdb:vecs".to_string(), "local".to_string());
+            local.params = Some(duckdb_open);
+            local.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("duckdb_cosine_distance_federation")
+                .with_dataset(federated)
+                .with_dataset(local)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let batches = async |sql: String| -> Result<Vec<RecordBatch>, String> {
+                rt.datafusion()
+                    .query_builder(&sql)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{sql}` failed: {e}"))?
+                    .data
+                    .try_collect()
+                    .await
+                    .map_err(|e| format!("query `{sql}` collect failed: {e}"))
+            };
+
+            // The named column of a query, as `f64`, with NULL mapped to NaN so a
+            // NULL can never silently compare equal to a number.
+            let column = async |sql: String, name: &str| -> Result<Vec<f64>, String> {
+                let mut out = Vec::new();
+                for batch in &batches(sql.clone()).await? {
+                    let col = batch
+                        .column_by_name(name)
+                        .ok_or_else(|| format!("`{sql}` returned no `{name}` column"))?;
+                    let col = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::Float64Array>()
+                        .ok_or_else(|| {
+                            format!("`{name}` is {:?}, expected Float64", col.data_type())
+                        })?;
+                    out.extend(col.iter().map(|v| v.unwrap_or(f64::NAN)));
+                }
+                Ok(out)
+            };
+
+            let cosine = |table: &str| {
+                format!("SELECT id, cosine_distance(emb, probe) AS d FROM {table} ORDER BY id")
+            };
+
+            let federated_d = column(cosine("fed"), "d").await?;
+            let local_d = column(cosine("local"), "d").await?;
+
+            assert_eq!(federated_d.len(), 5, "expected 5 rows, got {federated_d:?}");
+            assert_eq!(
+                local_d.len(),
+                federated_d.len(),
+                "row counts differ: {federated_d:?} vs {local_d:?}"
+            );
+
+            for (row, (fed, loc)) in federated_d.iter().zip(&local_d).enumerate() {
+                assert!(
+                    (fed - loc).abs() < 1e-9,
+                    "row {} of cosine_distance disagrees across the federation \
+                     boundary: fed {fed}, local {loc}. federated={federated_d:?} \
+                     local={local_d:?}",
+                    row + 1
+                );
+            }
+
+            // Rows 4 and 5 are a vector against itself, so the distance is 0. If
+            // the call ever federates to `array_cosine_distance` again these read
+            // 2.0 (or 1.0 if something rescales them), which is why they are
+            // asserted on their own rather than only against each other.
+            assert!(
+                local_d[3] == 0.0 && local_d[4] == 0.0,
+                "a vector's distance to itself must be 0 at every magnitude, got \
+                 {:?} and {:?}",
+                local_d[3],
+                local_d[4]
+            );
+
+            // The scan must still be pushed down, but without the function.
+            let explain = batches(format!("EXPLAIN {}", cosine("fed"))).await?;
+            let plan = arrow::util::pretty::pretty_format_batches(&explain)
+                .map_err(|e| format!("format explain: {e}"))?
+                .to_string();
+            let pushed: Vec<&str> = plan
+                .lines()
+                .filter(|l| l.contains("base_sql=") || l.contains("DuckSqlExec sql="))
+                .collect();
+            assert!(
+                !pushed.is_empty(),
+                "expected the connector to push a scan down to DuckDB; plan was:\n{plan}"
+            );
+            for line in pushed {
+                assert!(
+                    !line.contains("array_cosine_distance"),
+                    "cosine_distance was federated to DuckDB's array_cosine_distance, \
+                     which answers a different number:\n{line}"
+                );
+            }
+            assert!(
+                plan.contains("cosine_distance"),
+                "cosine_distance must still appear in the plan, evaluated locally:\n{plan}"
+            );
+
+            // `inner_product` is the control: DuckDB's `array_inner_product`
+            // computes the same value, so it must still federate and must still
+            // agree across the boundary.
+            let inner = |table: &str| {
+                format!("SELECT id, inner_product(emb, probe) AS ip FROM {table} ORDER BY id")
+            };
+            let federated_ip = column(inner("fed"), "ip").await?;
+            let local_ip = column(inner("local"), "ip").await?;
+            // Rows 1-4, whose dot products are finite, must agree exactly.
+            for (row, (fed, loc)) in federated_ip.iter().zip(&local_ip).take(4).enumerate() {
+                assert!(
+                    (fed - loc).abs() < 1e-9,
+                    "row {} of inner_product disagrees across the federation \
+                     boundary: fed {fed}, local {loc}",
+                    row + 1
+                );
+            }
+            // Row 5's true dot product is 1e40, which no f32 accumulator holds.
+            // The kernel calls that undefined and returns NULL; DuckDB returns
+            // +Inf. That divergence is real but is not what this change is about
+            // — it needs input screening in the emitted SQL rather than a
+            // different function — so it is pinned here rather than left to be
+            // rediscovered. Tracked in spiceai/spiceai#13787.
+            assert!(
+                federated_ip[4].is_infinite() && local_ip[4].is_nan(),
+                "the known non-finite inner_product divergence changed shape: fed \
+                 {}, local {} (NaN here means the kernel returned NULL). If this \
+                 was fixed on purpose, update this assertion and close #13787.",
+                federated_ip[4],
+                local_ip[4]
+            );
+            let inner_explain = batches(format!("EXPLAIN {}", inner("fed"))).await?;
+            let inner_plan = arrow::util::pretty::pretty_format_batches(&inner_explain)
+                .map_err(|e| format!("format explain: {e}"))?
+                .to_string();
+            assert!(
+                inner_plan.contains("array_inner_product"),
+                "inner_product must still federate to DuckDB's array_inner_product:\n\
+                 {inner_plan}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 #[tokio::test]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
     use spicepod::param::Params;

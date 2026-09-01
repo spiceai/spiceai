@@ -78,14 +78,14 @@ impl DuckDB {
     /// `can_execute_plan` refuse such plans so `DataFusion` evaluates the affected
     /// expressions locally instead. We use [`deny_spice_functions_for_duckdb`]
     /// (rather than the generic deny-list) so functions `DuckDB` *does* support
-    /// natively — e.g. `cosine_distance`, which `DuckDB` unparses to
-    /// `array_cosine_distance` — still federate. See issue #10703.
+    /// natively — e.g. `inner_product`, which `DuckDB` unparses to
+    /// `array_inner_product` — still federate. See issue #10703.
     fn with_spice_deny_list(factory: DuckDBTableFactory) -> DuckDBTableFactory {
         // The spiceai table-providers fork restores the `with_function_support`
         // deny-list seam on DuckDBTableFactory (see issue #10703). Install the
         // DuckDB-aware deny-list so Spice-only UDFs that DuckDB can't run are
         // evaluated locally, while functions DuckDB's dialect can rewrite (e.g.
-        // cosine_distance -> array_cosine_distance) still federate. The factory's
+        // inner_product -> array_inner_product) still federate. The factory's
         // seam takes the table-providers FunctionSupport type, so we build the
         // deny-list directly in that type from the runtime's shared name list.
         factory.with_function_support(deny_spice_functions_for_duckdb_table_providers())

@@ -116,15 +116,6 @@ fn spice_array_fn_to_sql(
     Ok(Some(ast_fn))
 }
 
-/// Converts the `cosine_distance` UDF into `DuckDB`'s `array_cosine_distance`:
-/// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
-pub(crate) fn cosine_distance_to_sql(
-    unparser: &datafusion::sql::unparser::Unparser,
-    args: &[Expr],
-) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_cosine_distance")
-}
-
 /// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
 /// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
 /// call to `DuckDB` (>= 1.5.3) is exact.
@@ -428,7 +419,7 @@ mod tests {
         common::{Column, Spans},
         functions_nested::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
-        prelude::{Expr, lit},
+        prelude::Expr,
         scalar::ScalarValue,
         sql::{TableReference, unparser::Unparser},
     };
@@ -445,65 +436,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn test_cosine_distance_to_sql_scalars() {
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            // raw values
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![lit(1.0), lit(2.0), lit(3.0)],
-            )),
-            // values wrapped as literals
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
-                ],
-            )),
-        ];
-        let result = cosine_distance_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression");
-
-        let expected =
-            "array_cosine_distance([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3])";
-
-        assert_eq!(result.to_string(), expected);
-    }
-
-    #[test]
-    fn test_cosine_distance_to_sql_column_and_scalar() {
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            Expr::Column(Column {
-                relation: Some(TableReference::from("table_name")),
-                name: "column_name".to_string(),
-                spans: Spans::new(),
-            }),
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
-                ],
-            )),
-        ];
-
-        let result = cosine_distance_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression");
-        let expected =
-            r#"array_cosine_distance("table_name"."column_name", [4.0, 5.0, 6.0]::FLOAT[3])"#;
-
-        assert_eq!(result.to_string(), expected);
-    }
 
     #[test]
     fn test_inner_product_to_sql_column_and_scalar() {
@@ -590,13 +522,19 @@ mod tests {
 
     #[test]
     fn duckdb_native_function_names_advertises_denylisted_pushables() {
-        // The federation deny-list relies on these names to let `cosine_distance`
-        // and `rand` push down to DuckDB, so the dialect must advertise them.
+        // The federation deny-list derives its carve-out from these names, so a
+        // name here federates and a name missing here stays denied.
         let names = crate::dialect::duckdb_native_function_names();
+
+        // `cosine_distance` must be absent: DuckDB's `array_cosine_distance`
+        // answers a different number (see the comment on
+        // `duckdb_scalar_overrides`), so the deny-list has to keep denying it.
         assert!(
-            names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
-            "duckdb_native_function_names() missing cosine_distance; got {names:?}"
+            !names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
+            "cosine_distance must not be carved out of the DuckDB deny-list — DuckDB's \
+             array_cosine_distance is not the same function; got {names:?}"
         );
+        // `inner_product` and `rand` do have real DuckDB equivalents.
         assert!(
             names.contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
             "duckdb_native_function_names() missing inner_product; got {names:?}"

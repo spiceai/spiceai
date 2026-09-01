@@ -19,7 +19,6 @@ use std::sync::Arc;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
-use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod bigquery;
@@ -47,10 +46,17 @@ const REGEXP_COUNT_NAME: &str = "regexp_count";
 /// and the deny-list carve-out can never drift apart.
 fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
-        (
-            COSINE_DISTANCE_UDF_NAME,
-            Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
-        ),
+        // `cosine_distance` is deliberately absent: `DuckDB`'s
+        // `array_cosine_distance` is a different function, not another spelling
+        // of this one. It ranges over [0, 2] where the UDF ranges over [0, 1],
+        // and it evaluates in FLOAT where the kernel evaluates in f64. The scale
+        // is a constant factor that the emitted SQL could divide out; the width
+        // is not. On DuckDB 1.4.4 a pair of *identical* finite vectors
+        // `[1e-30, 0, 0]` answers 2.0 — maximally distant — because each squared
+        // component underflows FLOAT, where the kernel answers 0; `[1e20, 0, 0]`
+        // overflows to the same answer. So the name stays deny-listed and the UDF
+        // is evaluated locally. See spiceai/spiceai#13728, and #11263 for which
+        // formula `cosine_distance` should define in the first place.
         (
             INNER_PRODUCT_UDF_NAME,
             Box::new(duckdb::inner_product_to_sql) as ScalarFnToSqlHandler,

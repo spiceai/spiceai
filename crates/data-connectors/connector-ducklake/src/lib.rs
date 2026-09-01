@@ -38,6 +38,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -258,7 +259,14 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let factory = DuckDBTableFactory::new(Arc::clone(&pool)).with_dialect(new_duckdb_dialect());
+    // The dialect and the deny-list are two halves of one decision: the dialect
+    // says what can be rewritten, the deny-list refuses to federate everything
+    // else. Installed alone, the dialect lets a plan holding any other Spice UDF
+    // federate and the unparser emits that function verbatim into SQL DuckDB
+    // cannot run. Every other DuckDB-backed factory installs both.
+    let factory = DuckDBTableFactory::new(Arc::clone(&pool))
+        .with_dialect(new_duckdb_dialect())
+        .with_function_support(deny_spice_functions_for_duckdb_table_providers());
     Ok((factory, pool, catalog_name.to_string()))
 }
 
