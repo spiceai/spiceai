@@ -43,9 +43,13 @@ concurrency:
   cancel-in-progress: true
 
 # The job reads the repository and fetches a public release. It needs nothing
-# else, and it executes a downloaded binary, so it gets the minimum.
+# else, and it executes a downloaded binary, so it gets the minimum. Naming any
+# permission drops the rest to none, so `pull-requests: read` has to be explicit:
+# `dorny/paths-filter` reads the changed-file list for a pull request from the
+# REST API, not from the checkout.
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   # The verifier and its specification library ship together and are versioned
@@ -64,6 +68,11 @@ jobs:
     # GitHub-hosted on purpose: a seconds-long verification must not queue
     # behind the saturated self-hosted pool.
     runs-on: ubuntu-24.04
+    # Bounded because this is a required `merge_group` check: an unbounded job
+    # leaves the queue candidate `AWAITING_CHECKS` for GitHub's six-hour default
+    # and stalls every entry behind it (#12717). Observed runtime is ~7 minutes
+    # including a cold archive download.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -87,6 +96,17 @@ jobs:
               # touching the crate.
               - 'rust-toolchain.toml'
               - '.github/workflows/verus_verify.yml'
+
+      # Installs the toolchain `rust-toolchain.toml` pins, which is the one the
+      # Verus driver is built against and the one `cargo verus` will select. The
+      # runner image ships a different stable, so leaving this implicit makes the
+      # job depend on whatever happens to be provisioned. It also carries the
+      # Cargo.lock coherence guard, which matters here specifically: this job runs
+      # on `merge_group`, where a textual lockfile merge is what that guard exists
+      # to name before any cargo work.
+      - name: Set up Rust
+        if: steps.changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
 
       - name: Check pins agree
         if: steps.changes.outputs.relevant_changes == 'true'
