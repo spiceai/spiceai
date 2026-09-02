@@ -107,9 +107,9 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
 /// `MySQLTableFactory::with_function_support`.
 ///
 /// Every Spice function, plus `btrim`, for the reason
-/// [`deny_spice_functions_for_sqlite_table_providers`] gives — MySQL answers a
+/// [`deny_spice_functions_for_sqlite_table_providers`] gives — `MySQL` answers a
 /// federated `trim` with `FUNCTION <db>.btrim does not exist`. Denying is the
-/// only faithful option here rather than merely the available one: MySQL's
+/// only faithful option here rather than merely the available one: `MySQL`'s
 /// `TRIM` has no two-argument form at all, and its `TRIM(BOTH chars FROM str)`
 /// strips repetitions of `chars` as a *string*, where `btrim` strips any
 /// character in it — so a rewrite would trade a failed query for wrong rows.
