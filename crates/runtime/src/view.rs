@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
 };
 
@@ -338,7 +338,13 @@ pub(crate) fn classify_view_read(plan: &LogicalPlan) -> ViewReadShape {
 /// order, and each view is visited once so a cycle (which view loading tolerates and warns
 /// about) terminates rather than recursing forever.
 #[must_use]
-pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &app::App) -> String {
+pub(crate) fn view_definition_closure(
+    name: &TableReference,
+    sql: &str,
+    columns: &[spicepod::semantic::Column],
+    params: &HashMap<String, String>,
+    app: &app::App,
+) -> String {
     /// Every relation the SQL names, wherever it appears.
     ///
     /// Uses `visit_relations` rather than [`get_dependent_table_names`], which walks only
@@ -444,7 +450,23 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
                 pending.extend(dependencies_of(&dependency_sql));
                 // Keyed by the DECLARED name, so two views answering the same bare
                 // reference occupy separate entries instead of overwriting each other.
-                closure.insert(view.name.clone(), dependency_sql);
+                //
+                // Carries the dependency's value-shaping configuration for the same reason
+                // the root view's is carried: a view whose rows are read through another
+                // view's archive can change its embedding model or file format without
+                // touching a line of SQL.
+                closure.insert(
+                    view.name.clone(),
+                    view_definition_identity(
+                        &dependency_sql,
+                        &view.columns,
+                        &view
+                            .params
+                            .as_ref()
+                            .map(spicepod::param::Params::as_string_map)
+                            .unwrap_or_default(),
+                    ),
+                );
             }
         }
 
@@ -472,8 +494,13 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
         }
     }
 
+    // The root view contributes its own value-shaping configuration too, not just its SQL —
+    // see `view_definition_identity`.
     let mut definition = String::new();
-    push_len_prefixed(&mut definition, sql.trim());
+    push_len_prefixed(
+        &mut definition,
+        &view_definition_identity(sql, columns, params),
+    );
     for (dependency_name, dependency_sql) in closure {
         definition.push_str("\n-- depends on ");
         push_len_prefixed(&mut definition, &dependency_name);
@@ -602,6 +629,42 @@ fn dataset_identity_fields(
     }
 
     fields
+}
+
+/// The definition string a VIEW's snapshot identity is computed over: its SQL plus the
+/// configuration that shapes the VALUES its materialization stores.
+///
+/// SQL alone is not the whole definition. `prepare_view` builds embedding and full-text
+/// columns from `columns`, and reads `file_format` out of `params`, so swapping an embedding
+/// model for another of the same vector size changes every stored vector while leaving both
+/// the SQL and the schema identical — and a bootstrap would serve the old model's vectors as
+/// though they were the new model's. Same failure the dataset identity closes, on the path
+/// that reaches it through a view instead.
+///
+/// Used for the root view and for every view in its dependency closure, so a dependency
+/// cannot change its embedding configuration invisibly either.
+fn view_definition_identity(
+    sql: &str,
+    columns: &[spicepod::semantic::Column],
+    params: &HashMap<String, String>,
+) -> String {
+    let mut fields = BTreeMap::new();
+    if !columns.is_empty() {
+        fields.insert("columns".to_string(), identity_value(&columns));
+    }
+    for (key, value) in params {
+        fields.insert(format!("param.{key}"), value.clone());
+    }
+
+    let mut identity = String::from("sql=");
+    push_len_prefixed(&mut identity, sql.trim());
+    for (key, value) in fields {
+        identity.push('\n');
+        push_len_prefixed(&mut identity, &key);
+        identity.push('=');
+        push_len_prefixed(&mut identity, &value);
+    }
+    identity
 }
 
 /// A dataset's identity computed from its parsed runtime configuration — the form the
@@ -1134,6 +1197,8 @@ mod tests {
             let us = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("inner", "SELECT id FROM orders WHERE region = 'us'")],
                     &[],
@@ -1142,6 +1207,8 @@ mod tests {
             let eu = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("inner", "SELECT id FROM orders WHERE region = 'eu'")],
                     &[],
@@ -1162,11 +1229,15 @@ mod tests {
             let old = view_definition_closure(
                 &v,
                 "SELECT * FROM orders",
+                &[],
+                &HashMap::new(),
                 &app_with(&[], &[("orders", "postgres:old_orders")]),
             );
             let new = view_definition_closure(
                 &v,
                 "SELECT * FROM orders",
+                &[],
+                &HashMap::new(),
                 &app_with(&[], &[("orders", "postgres:new_orders")]),
             );
             assert_ne!(
@@ -1185,11 +1256,15 @@ mod tests {
             let us = view_definition_closure(
                 &outer,
                 "SELECT id FROM orders WHERE id IN (SELECT id FROM inner)",
+                &[],
+                &HashMap::new(),
                 &app_with(&[("inner", "SELECT id FROM t WHERE region = 'us'")], &[]),
             );
             let eu = view_definition_closure(
                 &outer,
                 "SELECT id FROM orders WHERE id IN (SELECT id FROM inner)",
+                &[],
+                &HashMap::new(),
                 &app_with(&[("inner", "SELECT id FROM t WHERE region = 'eu'")], &[]),
             );
             assert_ne!(
@@ -1208,6 +1283,8 @@ mod tests {
             let both = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("public.inner", "SELECT 1"), ("sales.inner", "SELECT 2")],
                     &[],
@@ -1227,6 +1304,8 @@ mod tests {
             let matched = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(&[("public.inner", "SELECT 1")], &[]),
             );
             assert!(
@@ -1259,6 +1338,8 @@ mod tests {
             let closure = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("sales.inner", "SELECT 2")],
                     &[("public.inner", "s3://a")],
@@ -1280,6 +1361,8 @@ mod tests {
             let before = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("sales.inner", "SELECT 2")],
                     &[("public.inner", "s3://a")],
@@ -1288,6 +1371,8 @@ mod tests {
             let after = view_definition_closure(
                 &outer,
                 "SELECT * FROM inner",
+                &[],
+                &HashMap::new(),
                 &app_with(
                     &[("sales.inner", "SELECT 2")],
                     &[("public.inner", "s3://b")],
@@ -1394,6 +1479,61 @@ mod tests {
                 baseline,
                 identity_with(on_conflict),
                 "on_conflict decides which of two colliding rows is kept"
+            );
+        }
+
+        #[test]
+        fn swapping_a_views_embedding_model_moves_the_fingerprint() {
+            // `prepare_view` builds the embedding columns, so the model that produced the
+            // stored vectors is part of the definition even though it appears nowhere in
+            // the SQL. Two models of the same vector size leave the SQL and the schema
+            // identical, so without this the archive of one bootstraps as the other's.
+            let view = TableReference::bare("docs_view");
+            let column_with_model = |model: &str| {
+                vec![spicepod::semantic::Column {
+                    name: "body".to_string(),
+                    description: None,
+                    r#type: None,
+                    nullable: None,
+                    embeddings: vec![spicepod::semantic::ColumnLevelEmbeddingConfig::model(model)],
+                    full_text_search: None,
+                    metadata: std::collections::HashMap::default(),
+                }]
+            };
+            let closure_for = |model: &str| {
+                view_definition_closure(
+                    &view,
+                    "SELECT body FROM docs",
+                    &column_with_model(model),
+                    &HashMap::new(),
+                    &app_with(&[], &[("docs", "s3://docs")]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for("model-a")),
+                definition_fingerprint(&closure_for("model-b")),
+                "the embedding model that produced the stored vectors is part of the definition"
+            );
+        }
+
+        #[test]
+        fn a_views_params_are_part_of_its_definition() {
+            // `prepare_view` reads `file_format` out of `params`, which reinterprets the
+            // same bytes — the view analogue of the dataset params rationale.
+            let view = TableReference::bare("docs_view");
+            let closure_for = |format: &str| {
+                view_definition_closure(
+                    &view,
+                    "SELECT body FROM docs",
+                    &[],
+                    &HashMap::from([("file_format".to_string(), format.to_string())]),
+                    &app_with(&[], &[("docs", "s3://docs")]),
+                )
+            };
+            assert_ne!(
+                definition_fingerprint(&closure_for("csv")),
+                definition_fingerprint(&closure_for("parquet")),
+                "a param that reinterprets the source bytes must move the identity"
             );
         }
 

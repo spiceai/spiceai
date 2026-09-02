@@ -67,6 +67,35 @@ where
 }
 
 /// Every `*.tar` / `*.db` published under the snapshot location, at any depth.
+/// Whether a snapshot is fully published — the archive AND the `metadata.json` pointer
+/// that makes it the current snapshot.
+///
+/// `create_snapshot` uploads the archive first and writes the pointer second
+/// (`update_metadata_after_upload`), so waiting on the archive alone can return between the
+/// two and drop the publisher mid-publication, leaving a snapshot no bootstrap will find.
+fn snapshot_is_published(root: &std::path::Path) -> bool {
+    !published_snapshots(root).is_empty() && published_metadata(root)
+}
+
+/// Whether any `metadata.json` pointer exists under `root`.
+fn published_metadata(root: &std::path::Path) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "metadata.json") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn published_snapshots(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -174,9 +203,9 @@ async fn accelerated_view_snapshot_round_trips() -> anyhow::Result<()> {
 
             let snapshot_dir_for_wait = snapshot_dir.clone();
             wait_until(
-                "the accelerated view to publish a snapshot",
+                "the accelerated view to publish a snapshot and its metadata pointer",
                 Duration::from_secs(90),
-                || !published_snapshots(&snapshot_dir_for_wait).is_empty(),
+                || snapshot_is_published(&snapshot_dir_for_wait),
             )
             .await?;
             drop(publisher);
