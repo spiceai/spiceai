@@ -140,6 +140,14 @@ impl SnapshotBehavior {
         SnapshotBehavior::CreateOnly(snapshots, secrets, io_runtime, compaction)
     }
 
+    /// Whether snapshots are off entirely for this source — the question "did the operator
+    /// ask for snapshots at all", as opposed to [`Self::bootstrap_enabled`] /
+    /// [`Self::create_enabled`], which ask which half they asked for.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, SnapshotBehavior::Disabled)
+    }
+
     #[must_use]
     pub fn bootstrap_enabled(&self) -> bool {
         matches!(

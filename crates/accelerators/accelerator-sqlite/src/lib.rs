@@ -463,7 +463,7 @@ impl DataAccelerator for SqliteAccelerator {
                 if file_path.exists() {
                     snapshot_before_recreate(
                         acceleration,
-                        &source.name().to_string(),
+                        source,
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
                             &path,
                         )),

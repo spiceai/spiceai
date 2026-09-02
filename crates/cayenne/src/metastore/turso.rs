@@ -1212,6 +1212,38 @@ impl MetastoreTransaction for TursoTransaction {
         Ok(())
     }
 
+    async fn query_values(
+        &self,
+        params: QueryParams<'_>,
+    ) -> CatalogResult<Vec<Vec<MetastoreValue>>> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let turso_params: Vec<TursoValue> = params.params.into_iter().map(to_turso_value).collect();
+
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        let mut rows = stmt
+            .query(turso_params)
+            .await
+            .map_err(convert_turso_error)?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(convert_turso_error)? {
+            let values = (0..row.column_count())
+                .map(|i| {
+                    row.get_value(i)
+                        .map(convert_turso_value)
+                        .map_err(convert_turso_error)
+                })
+                .collect::<CatalogResult<Vec<MetastoreValue>>>()?;
+            out.push(values);
+        }
+        Ok(out)
+    }
+
     async fn query_row_values(
         &self,
         params: QueryRowParams<'_>,

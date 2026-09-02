@@ -597,6 +597,27 @@ pub trait MetastoreTransaction: Send + Sync {
         params: QueryRowParams<'_>,
     ) -> CatalogResult<Vec<MetastoreValue>>;
 
+    /// Query multiple rows within the transaction, returning each row's column values
+    /// positionally.
+    ///
+    /// Deliberately non-generic, unlike [`MetastoreBackend::query`]: this trait is used
+    /// as `Box<dyn MetastoreTransaction>`, so a closure-generic method would not be
+    /// dyn-safe. Callers that need typed rows map the returned values themselves.
+    ///
+    /// Exists so a multi-table read can be taken as ONE consistent snapshot. Issuing the
+    /// same reads through [`MetastoreBackend::query`] runs each in its own autocommit
+    /// statement, and a commit landing between two of them yields a view of the metastore
+    /// that never existed — a snapshot pointer from before a publish with a file manifest
+    /// from after it, for instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    async fn query_values(
+        &self,
+        params: QueryParams<'_>,
+    ) -> CatalogResult<Vec<Vec<MetastoreValue>>>;
+
     /// Execute a batch of SQL statements within the transaction.
     ///
     /// # Errors

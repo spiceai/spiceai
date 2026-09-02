@@ -27,7 +27,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
 use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
-use runtime_acceleration::acceleration_source::AccelerationSource;
+use runtime_acceleration::acceleration_source::{AccelerationSource, MaterializationSource};
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
@@ -75,15 +75,25 @@ pub async fn download_snapshot_if_needed(
         return BootstrapStatus::none();
     }
 
-    let Some(primary_path) = layout.primary_path().cloned() else {
-        tracing::debug!("No primary path for acceleration layout, skipping download");
+    if !layout.is_enabled() {
+        tracing::debug!("No storage paths for the acceleration layout, skipping download");
         return BootstrapStatus::none();
-    };
+    }
 
-    if primary_path.exists() {
+    // Asks the layout whether an acceleration is already present, rather than testing one
+    // path for existence. For a directory-layout engine the accelerator has already
+    // created its directories by the time this runs — Cayenne's metastore creates the
+    // metadata directory the moment it opens, and that directory is shared by every
+    // Cayenne dataset in the pod — so an existence test on a path would answer "yes"
+    // unconditionally and silently skip every bootstrap.
+    if layout.has_existing_acceleration() {
         tracing::info!(
-            "Acceleration already exists at {}, skipping snapshot download",
-            primary_path.display()
+            "Acceleration for '{}' already exists at {}, skipping snapshot download",
+            source.name(),
+            layout.data_path().map_or_else(
+                || "the configured location".to_string(),
+                |p| p.display().to_string()
+            )
         );
         return BootstrapStatus::none();
     }
@@ -105,6 +115,12 @@ pub async fn download_snapshot_if_needed(
         let mut manager = manager.with_checkpointer_factory(checkpoint_factory);
         if let Some(engine_override) = engine_override {
             manager = manager.with_snapshot_engine(engine_override);
+        }
+        // A source whose rows are the result of a definition (a view's SQL) must not
+        // bootstrap an archive materialized from a different one: the rows would be
+        // wrong rather than merely old, and no schema check would catch it.
+        if let Some(definition) = source.definition_fingerprint() {
+            manager = manager.with_source_definition(definition);
         }
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
@@ -140,7 +156,7 @@ pub async fn download_snapshot_if_needed(
 /// `engine_override` parallels [`download_snapshot_if_needed`].
 pub async fn snapshot_before_recreate(
     acceleration: &Acceleration,
-    dataset_name: &str,
+    source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     schema: Arc<arrow_schema::Schema>,
@@ -148,6 +164,29 @@ pub async fn snapshot_before_recreate(
     refresh_mode: RefreshMode,
 ) {
     if !acceleration.snapshot_behavior.create_enabled() {
+        return;
+    }
+
+    let dataset_name = source.name().to_string();
+
+    // A source whose rows are the result of a query cannot publish from here. This runs
+    // inside the accelerator's `init`, before the runtime has planned the definition, so
+    // there is no way to establish that the outgoing materialization came from a single
+    // read — and publishing makes whatever it holds the store's current snapshot. The live
+    // publish path decides that question with the compiled plan in hand; this one would be
+    // guessing, and the cost of guessing wrong is a durable wrong answer rather than a
+    // missing backup.
+    //
+    // Asks what produced the rows rather than whether a fingerprint exists: a dataset also
+    // carries one (its `from:` and `refresh_sql`), and treating that as "cannot publish"
+    // would silently drop the pre-recreation backup for every dataset.
+    if source
+        .definition_fingerprint()
+        .is_some_and(|definition| definition.materialization == MaterializationSource::PlannedQuery)
+    {
+        tracing::warn!(
+            "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: Spice cannot confirm from here that those rows came from a single consistent read of this view's sources"
+        );
         return;
     }
 
@@ -194,7 +233,7 @@ pub async fn snapshot_before_recreate(
     }
 
     let Some(manager) = SnapshotManager::try_new(
-        dataset_name.to_string(),
+        dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
         layout,
         engine,
@@ -243,11 +282,15 @@ pub async fn snapshot_before_recreate(
     }
 }
 
-/// Rejects a configuration in which two datasets snapshot to the same path.
+/// Rejects a configuration in which two snapshot-enabled components snapshot to the same
+/// path.
+///
+/// Views take part alongside datasets, so the collision is reported with each component's
+/// own label rather than calling everything a dataset.
 ///
 /// # Errors
 ///
-/// Returns [`SharedAccelerationSnapshotError`] naming the datasets that collide.
+/// Returns [`SharedAccelerationSnapshotError`] naming the components that collide.
 pub async fn validate_snapshot_paths(
     sources: Vec<Arc<dyn AccelerationSource>>,
     registry: &AcceleratorEngineRegistry,
@@ -269,23 +312,25 @@ pub async fn validate_snapshot_paths(
 
         match acceleration_file_path(source.as_ref(), registry).await {
             Ok(path) => {
-                paths
-                    .entry(path)
-                    .or_default()
-                    .push(source.name().to_string());
+                paths.entry(path).or_default().push(format!(
+                    "{} '{}'",
+                    source.component_label(),
+                    source.name()
+                ));
             }
             Err(err) => {
                 tracing::warn!(
-                    "Unable to determine acceleration file path for dataset {} while validating snapshot configuration: {err}",
+                    "Failed to resolve the acceleration file path of {} '{}', so Spice cannot check whether it shares that file with another snapshot-enabled component. Cause: {err}",
+                    source.component_label(),
                     source.name()
                 );
             }
         }
     }
 
-    if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
+    if let Some((path, components)) = paths.into_iter().find(|(_, c)| c.len() > 1) {
         return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
-            datasets: datasets.join(", "),
+            components: components.join(", "),
             path: path.display().to_string(),
         });
     }
@@ -296,35 +341,90 @@ pub async fn validate_snapshot_paths(
 #[derive(Debug, Snafu)]
 pub enum SharedAccelerationSnapshotError {
     #[snafu(display(
-        "DuckDB doesn't support snapshots for shared acceleration. \
-        Datasets [{datasets}] share the same file '{path}'. \
-        Configure datasets to point to different location using duckdb_file"
+        "DuckDB doesn't support snapshots for shared acceleration, so none of these can be \
+        snapshotted: {components} all share the acceleration file '{path}'. \
+        Give each one its own file with `duckdb_file`. \
+        See: https://spiceai.org/docs/components/data-accelerators/duckdb"
     ))]
-    DuckDbSharedFile { datasets: String, path: String },
+    DuckDbSharedFile { components: String, path: String },
 }
 
 #[derive(Debug, Snafu)]
 pub enum CayenneSnapshotValidationError {
     #[snafu(display(
-        "Cayenne datasets sharing metadata directory '{metadata_dir}' have inconsistent snapshot settings. \
-        Datasets with snapshots enabled: [{enabled_datasets}]. Datasets with snapshots disabled: [{disabled_datasets}]. \
-        All Cayenne datasets sharing the same metadata directory must have the same snapshot \
-        configuration (either all enabled or all disabled). \
+        "Cayenne components sharing the metadata directory '{metadata_dir}' disagree about \
+        snapshots, so none of them load. Snapshots enabled: {enabled_components}. \
+        Snapshots disabled: {disabled_components}. \
+        Set the same `snapshots` value on all of them, or give them separate metadata directories. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
     ))]
     InconsistentSnapshotSettings {
         metadata_dir: String,
-        enabled_datasets: String,
-        disabled_datasets: String,
+        enabled_components: String,
+        disabled_components: String,
     },
 
     #[snafu(display(
-        "Cayenne doesn't support snapshots for shared acceleration. \
-        Datasets [{datasets}] share metadata directory '{metadata_dir}'. \
-        Only single dataset per spicepod is supported when snapshots are enabled"
+        "Cayenne doesn't support snapshots for shared acceleration, so none of these can be \
+        snapshotted: {components} all share the metadata directory '{metadata_dir}'. \
+        Give each one its own metadata directory. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
     ))]
     SharedAcceleration {
         metadata_dir: String,
-        datasets: String,
+        components: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These messages are the only explanation an operator gets for a component that
+    /// refused to load, and views now reach them alongside datasets — so a reword must not
+    /// quietly go back to calling everything a dataset, drop the resource, or drop the fix.
+    #[test]
+    fn a_shared_file_names_each_component_by_its_own_label() {
+        let message = SharedAccelerationSnapshotError::DuckDbSharedFile {
+            components: "view 'orders_us', dataset 'orders'".to_string(),
+            path: "/data/accel.db".to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("view 'orders_us'") && message.contains("dataset 'orders'"),
+            "each colliding component must be named with its own label: {message}"
+        );
+        assert!(
+            !message.contains("Datasets ["),
+            "a collision involving a view must not be reported as a dataset-only problem: {message}"
+        );
+        assert!(
+            message.contains("/data/accel.db") && message.contains("duckdb_file"),
+            "the message must name the shared file and the parameter that separates them: {message}"
+        );
+    }
+
+    #[test]
+    fn inconsistent_snapshot_settings_names_both_sides_by_label() {
+        let message = CayenneSnapshotValidationError::InconsistentSnapshotSettings {
+            metadata_dir: "/data/cayenne".to_string(),
+            enabled_components: "view 'orders_us'".to_string(),
+            disabled_components: "dataset 'orders'".to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("view 'orders_us'") && message.contains("dataset 'orders'"),
+            "both sides of the disagreement must be named with their own labels: {message}"
+        );
+        assert!(
+            !message.contains("Cayenne datasets sharing"),
+            "a disagreement involving a view must not be reported as dataset-only: {message}"
+        );
+        assert!(
+            message.contains("/data/cayenne") && message.contains("snapshots"),
+            "the message must name the shared directory and the setting to align: {message}"
+        );
+    }
 }

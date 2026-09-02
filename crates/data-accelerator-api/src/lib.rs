@@ -1250,7 +1250,8 @@ pub struct SpicepodWriteProfile {
 /// # Errors
 ///
 /// Returns [`CayenneSnapshotValidationError::InconsistentSnapshotSettings`] naming the
-/// directory and both sides of the disagreement.
+/// directory and both sides of the disagreement. Views take part alongside datasets, so
+/// each side is named with its own component label.
 pub fn validate_snapshot_consistency(
     sources: &[Arc<dyn AccelerationSource>],
 ) -> Result<(), CayenneSnapshotValidationError> {
@@ -1271,22 +1272,22 @@ pub fn validate_snapshot_consistency(
             acceleration.snapshot_behavior,
             runtime_acceleration::snapshot::SnapshotBehavior::Disabled
         );
-        store_groups
-            .entry(store_key)
-            .or_default()
-            .push((source.name().to_string(), snapshots_enabled));
+        store_groups.entry(store_key).or_default().push((
+            format!("{} '{}'", source.component_label(), source.name()),
+            snapshots_enabled,
+        ));
     }
 
-    for (metadata_dir, datasets) in store_groups {
-        if datasets.len() <= 1 {
+    for (metadata_dir, components) in store_groups {
+        if components.len() <= 1 {
             continue;
         }
 
-        let enabled: Vec<&str> = datasets
+        let enabled: Vec<&str> = components
             .iter()
             .filter_map(|(name, enabled)| if *enabled { Some(name.as_str()) } else { None })
             .collect();
-        let disabled: Vec<&str> = datasets
+        let disabled: Vec<&str> = components
             .iter()
             .filter_map(|(name, enabled)| if *enabled { None } else { Some(name.as_str()) })
             .collect();
@@ -1295,13 +1296,13 @@ pub fn validate_snapshot_consistency(
             return Err(
                 CayenneSnapshotValidationError::InconsistentSnapshotSettings {
                     metadata_dir,
-                    enabled_datasets: enabled.join(", "),
-                    disabled_datasets: disabled.join(", "),
+                    enabled_components: enabled.join(", "),
+                    disabled_components: disabled.join(", "),
                 },
             );
         }
 
-        // Several datasets sharing the store with snapshots all enabled is supported:
+        // Several components sharing the store with snapshots all enabled is supported:
         // each snapshot ships a per-dataset metastore slice, so they cannot clobber one
         // another on extract.
     }

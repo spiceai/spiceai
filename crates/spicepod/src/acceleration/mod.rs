@@ -231,6 +231,29 @@ pub enum SnapshotsCreationPolicy {
     OnChange,
 }
 
+/// Whether an accelerated view may publish a snapshot of a materialization that
+/// spans more than one read of its sources.
+///
+/// A view materializes a query, and every table it reads resolves its own read view
+/// independently — so a materialization over two reads captures each source at a
+/// different position, and can store rows that never existed together in the source.
+/// Publishing that as a snapshot makes the discrepancy durable and reusable.
+///
+/// Only meaningful for views; a dataset materializes a single source and always reads
+/// it once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsConsistency {
+    /// Snapshot only a materialization proven to come from a single read (default).
+    /// A view whose query reads more than once is refused at load with an explanation.
+    #[default]
+    ConsistentRead,
+    /// Snapshot regardless, accepting that the stored rows may span several source
+    /// positions. Choose this only when the view's consumers tolerate that.
+    AcceptSkew,
+}
+
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::default()
@@ -249,6 +272,11 @@ fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
     *c == SnapshotsCreationPolicy::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_consistency(c: &SnapshotsConsistency) -> bool {
+    *c == SnapshotsConsistency::default()
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -624,6 +652,13 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
+
+    /// For an accelerated view: whether a snapshot may be published from a
+    /// materialization that spans more than one read of the view's sources.
+    ///
+    /// Options: `consistent_read` (default) / `accept_skew`.
+    #[serde(default, skip_serializing_if = "is_default_snapshots_consistency")]
+    pub snapshots_consistency: SnapshotsConsistency,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -749,6 +784,7 @@ impl Default for Acceleration {
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+            snapshots_consistency: SnapshotsConsistency::default(),
         }
     }
 }

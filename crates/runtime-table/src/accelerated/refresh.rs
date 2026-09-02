@@ -87,6 +87,17 @@ pub struct Refresh {
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
     pub sql: Option<RefreshSQL>,
+    /// Whether this run must actually re-materialize, rather than take the
+    /// "source unchanged since the last fetch" skip.
+    ///
+    /// Set when the run is the one that will re-establish provenance: the mark is
+    /// currently retracted and a full replacement is what would justify re-asserting it.
+    /// The skip path returns success without writing, so a skipped run would stamp rows
+    /// produced by an earlier overridden refresh as the configured definition's result and
+    /// let the next snapshot publish them under its identity. Forcing the fetch keeps
+    /// "this run succeeded" and "these rows are the configured definition applied to the
+    /// source" the same statement.
+    pub(crate) must_materialize: bool,
     /// Raw SQL string from an override request, not yet parsed.
     /// When set, this should be parsed into a `RefreshSQL` before use.
     pub(crate) override_sql_raw: Option<String>,
@@ -101,10 +112,32 @@ pub struct Refresh {
     /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
     /// `DuckDB` and Cayenne apply retention in their own write paths.
     pub write_retention_sql_delete_expr: Option<Expr>,
+    /// Whether the most recent refresh ran with request-scoped overrides.
+    ///
+    /// Shared rather than copied: a per-run [`Refresh`] is a *clone* of the configured one
+    /// with overrides applied to the clone, so the configured value never learns what
+    /// actually ran. Everything downstream that reads the configured `Refresh` — including
+    /// the snapshot path — would otherwise describe rows it did not produce. The `Arc`
+    /// makes the clone and its original point at one cell, so setting it on either is
+    /// visible to both.
+    /// Whether the rows currently in the accelerator are known to be the CONFIGURED
+    /// definition's result.
+    ///
+    /// Stated positively, and defaulting to `false`, so that every state this cell cannot
+    /// vouch for declines a publish instead of authorising one. The cases that matters for:
+    /// a fresh process (the rows on disk came from before the restart and nothing in memory
+    /// knows what produced them), a refresh in flight (the rows are mid-replacement), and a
+    /// refresh that failed or panicked (the rows are whatever survived). Under the opposite
+    /// polarity each of those reads as "not overridden" and publishes.
+    ///
+    /// Shared with every clone of this `Refresh`, which is what lets the refresh runner
+    /// record provenance where the rows are written and the snapshot path read it where the
+    /// rows are archived.
+    pub(crate) materialization_is_configured: Arc<AtomicBool>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RefreshOverrides {
     /// The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any.
@@ -123,6 +156,21 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+impl RefreshOverrides {
+    /// Whether these overrides change WHICH ROWS a refresh lands in the accelerator, and
+    /// so make the result something the configured definition does not describe.
+    ///
+    /// `sql` filters and projects the rows and `mode` decides whether they replace or
+    /// accumulate; `max_jitter` only moves when the refresh starts. An empty request body
+    /// changes nothing at all. Treating a timing-only override as definition-changing
+    /// would suspend snapshots until some later plain refresh — indefinitely for a
+    /// manually refreshed dataset.
+    #[must_use]
+    pub fn changes_materialization(&self) -> bool {
+        self.sql.is_some() || self.mode.is_some()
+    }
 }
 
 fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -234,6 +282,10 @@ impl Refresh {
     /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
+        // Deliberately does NOT record provenance. This runs when a refresh is dequeued,
+        // and the mark describes the rows currently in the accelerator — which are still
+        // the previous run's until this one finishes. `RefreshTaskRunner` publishes it on
+        // successful completion instead; see `set_materialization_is_configured`.
         if let Some(sql_str) = &overrides.sql {
             self.override_sql_raw = Some(sql_str.clone());
         }
@@ -244,6 +296,30 @@ impl Refresh {
             self.max_jitter = Some(max_jitter);
         }
         self
+    }
+
+    /// Records whether the rows now in the accelerator are the configured definition's
+    /// result.
+    ///
+    /// `RefreshTaskRunner` calls this twice per run: `false` when the refresh is dequeued,
+    /// because from that moment the rows are being replaced and no longer describe anything
+    /// definite, and then the run's actual provenance once it has succeeded. Both writes
+    /// move the cell in the safe direction first, so a snapshot landing anywhere in between
+    /// declines rather than publishing rows it cannot account for.
+    pub fn set_materialization_is_configured(&self, configured: bool) {
+        self.materialization_is_configured
+            .store(configured, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the rows currently in the accelerator are known to be the configured
+    /// definition's result, and so may be published under its identity.
+    ///
+    /// Read while holding the accelerator write mutex — see `create_checkpoint_and_snapshot`.
+    /// Read outside it, the answer can go stale between the check and the archive.
+    #[must_use]
+    pub fn materialization_is_configured(&self) -> bool {
+        self.materialization_is_configured
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Checks that the dataset's `time_column` exists in `schema` and that its
@@ -510,6 +586,7 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            must_materialize: false,
             override_sql_raw: None,
             mode: RefreshMode::Full,
             period: None,
@@ -518,6 +595,7 @@ impl Default for Refresh {
             retry_max_attempts: None,
             caching_ttl: None,
             write_retention_sql_delete_expr: None,
+            materialization_is_configured: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -867,6 +945,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // A changes stream returns below without building a
+                            // `RefreshTaskRunner`, so nothing would ever move the provenance
+                            // mark off its `false` default; and it accepts no request-scoped
+                            // override, so there is nothing to gate on.
+                            None,
                         ),
                         None,
                     ),
@@ -885,6 +968,9 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
+                            // See the interval arm above: this stream has no runner to
+                            // maintain a provenance mark, and takes no overrides.
+                            None,
                         ),
                     ),
                 };
@@ -978,6 +1064,9 @@ impl Refresher {
                         Arc::clone(&self.last_updated_at),
                         Some(Arc::clone(&self.accelerator)),
                         Arc::clone(&self.refresh),
+                        // This path builds a `RefreshTaskRunner` below, which maintains the
+                        // mark, so an overridden refresh's rows are not published.
+                        Some(Arc::clone(&self.refresh)),
                     ),
                     false,
                 ),
@@ -1017,12 +1106,10 @@ impl Refresher {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
-                        let refresh_sql = refresh_clone
-                            .read()
-                            .await
-                            .sql
-                            .as_ref()
-                            .map(RefreshSQL::to_sql);
+                        let refresh_sql = {
+                            let refresh = refresh_clone.read().await;
+                            refresh.sql.as_ref().map(RefreshSQL::to_sql)
+                        };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
@@ -1036,6 +1123,7 @@ impl Refresher {
                             // start-time checkpoint schema is current.
                             None,
                             refresh_sql.as_deref(),
+                            Some(&refresh_clone),
                         )
                         .await;
                     }
@@ -1131,9 +1219,15 @@ impl Refresher {
                         }
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                            let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
+                            let refresh_sql = {
+                                let refresh = refresh.read().await;
+                                refresh.sql.as_ref().map(RefreshSQL::to_sql)
+                            };
                             create_checkpoint_and_snapshot(
                                 checkpointer,
+                                // Checkpoint either way; publish only what the configured
+                                // definition can honestly be said to describe, which
+                                // `create_checkpoint_and_snapshot` decides under the lock.
                                 snapshot_manager.as_ref(),
                                 &checkpoint_schema,
                                 &snapshot_mutex,
@@ -1143,6 +1237,7 @@ impl Refresher {
                                 Some(&accelerator),
                                 None,
                                 refresh_sql.as_deref(),
+                                Some(&refresh),
                             ).await;
                         }
 
@@ -1310,6 +1405,47 @@ async fn record_refresh_done(
 
 #[cfg(test)]
 mod tests {
+    /// Only the overrides that decide WHICH ROWS land in the accelerator suspend snapshot
+    /// publication. A timing-only override that counted would disable snapshots until some
+    /// later plain refresh — indefinitely for a manually refreshed dataset.
+    #[test]
+    fn only_row_shaping_overrides_change_the_materialization() {
+        use super::RefreshOverrides;
+
+        let empty = RefreshOverrides::default();
+        assert!(
+            !empty.changes_materialization(),
+            "an empty request body changes nothing"
+        );
+
+        let jitter_only = RefreshOverrides {
+            max_jitter: Some(Duration::from_secs(5)),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            !jitter_only.changes_materialization(),
+            "jitter moves when a refresh starts, not which rows it produces"
+        );
+
+        let sql = RefreshOverrides {
+            sql: Some("SELECT 1".to_string()),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            sql.changes_materialization(),
+            "refresh_sql filters the rows"
+        );
+
+        let mode = RefreshOverrides {
+            mode: Some(RefreshMode::Append),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            mode.changes_materialization(),
+            "refresh_mode decides whether rows replace or accumulate"
+        );
+    }
+
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
         datatypes::{DataType, Field, Fields, Schema},

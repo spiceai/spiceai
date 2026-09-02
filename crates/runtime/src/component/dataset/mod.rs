@@ -254,6 +254,35 @@ impl AccelerationSource for Dataset {
             snapshot_behavior,
         )
     }
+
+    fn component_label(&self) -> &'static str {
+        "dataset"
+    }
+
+    fn definition_fingerprint(
+        &self,
+    ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
+        // A dataset's stored rows ARE the result of an editable definition: `from:` names
+        // the table they are copied from, `acceleration.refresh_sql` filters and projects
+        // them, and the connector `params` decide how the source is read at all — a
+        // `json_pointer` picks a different element of the same document. Any of those can
+        // change what the rows mean while leaving the schema — the only thing snapshot
+        // metadata previously recorded — identical.
+        //
+        // Tolerant of unstamped archives, unlike a view: dataset snapshots shipped before
+        // this stamp existed, and refusing them would strand every snapshot taken before
+        // the upgrade. Mismatches are still refused, so everything published from here on
+        // is protected.
+        let identity = crate::view::dataset_definition_identity_from_spec(&self.spec);
+        Some(
+            runtime_acceleration::acceleration_source::SourceDefinition {
+                fingerprint: crate::view::definition_fingerprint(&identity),
+                accept_unstamped: true,
+                materialization:
+                    runtime_acceleration::acceleration_source::MaterializationSource::SourceTable,
+            },
+        )
+    }
 }
 
 #[cfg(test)]

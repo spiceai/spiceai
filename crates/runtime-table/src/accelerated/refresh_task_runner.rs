@@ -39,6 +39,7 @@ use tokio::sync::{Mutex, RwLock};
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use opentelemetry::KeyValue;
+use runtime_component::dataset::acceleration::RefreshMode;
 use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
@@ -302,6 +303,8 @@ impl RefreshTaskRunner {
             // arriving mid-refresh replaces both together: the running future is
             // dropped by the `select!` below, so it never reports at all.
             let mut running_request: RefreshRequestId = 0;
+            // Provenance of the run in `task_completion`, asserted only once it succeeds.
+            let mut pending_configured = false;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -310,6 +313,12 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
+                                    // Now, and only now, do the accelerator's rows come from
+                                    // this run, so this is when its provenance may be
+                                    // asserted. A failed or panicked run asserts nothing and
+                                    // leaves the mark retracted, which declines a publish of
+                                    // whatever rows survived it.
+                                    base_refresh.read().await.set_materialization_is_configured(pending_configured);
                                     if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
@@ -343,7 +352,8 @@ impl RefreshTaskRunner {
                         },
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
@@ -351,7 +361,8 @@ impl RefreshTaskRunner {
                     select! {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -381,16 +392,47 @@ impl RefreshTaskRunner {
         &self.refresh_task
     }
 
-    /// Create a new [`Refresh`] based on defaults and overrides.
+    /// Create a new [`Refresh`] based on defaults and overrides, and report what this run
+    /// would let us say about the accelerator's provenance if it succeeds.
+    ///
+    /// Also retracts the provenance mark, because from here the accelerator's rows are being
+    /// replaced and describe nothing definite until the run finishes. Retracting up front is
+    /// what makes every window safe: a snapshot that lands mid-refresh, or after a refresh
+    /// that failed, finds "not known configured" and declines. The caller re-asserts the mark
+    /// only once the run has actually succeeded.
+    ///
+    /// A run can only *establish* provenance if it replaces the whole accelerator. An
+    /// incremental run (`Append`, `Changes`) adds to what is already there, so a clean
+    /// incremental refresh on top of rows an override appended leaves those rows in place —
+    /// re-asserting provenance there would stamp the next snapshot as the configured
+    /// definition's result while it still contains rows that definition never produced.
+    /// Incremental runs therefore carry the provenance they inherited forward at best, and
+    /// only a full replace can restore it.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
-    ) -> Refresh {
-        let mut r = defaults.read().await.clone();
-        if let Some(overrides) = overrides_opt {
-            r = r.with_overrides(&overrides);
-        }
-        r
+    ) -> (Refresh, bool) {
+        let r = defaults.read().await.clone();
+        let inherited = r.materialization_is_configured();
+        r.set_materialization_is_configured(false);
+        let (mut request, overridden) = match overrides_opt {
+            Some(overrides) => {
+                let overridden = overrides.changes_materialization();
+                (r.with_overrides(&overrides), overridden)
+            }
+            None => (r, false),
+        };
+        // `request.mode` is the mode this run will actually use, overrides applied.
+        let replaces_everything = matches!(request.mode, RefreshMode::Full);
+        let configured = !overridden && (replaces_everything || inherited);
+        // Re-establishing provenance rather than carrying it forward: the mark is retracted
+        // and only a real full replacement earns it back. `RefreshTask::run_once` can return
+        // success from the unchanged-source skip without writing anything, which would stamp
+        // an earlier override's rows as the configured definition's result, so that run has
+        // to fetch. Where the mark is merely inherited the rows already carry it and the skip
+        // changes nothing.
+        request.must_materialize = configured && !inherited;
+        (request, configured)
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
