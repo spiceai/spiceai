@@ -187,6 +187,13 @@ Alternative allocator that may perform better for certain memory allocation patt
 docker pull ghcr.io/spiceai/spiceai-nightly:latest-jemalloc
 ```
 
+**Heap profiling:** the shipped jemalloc build has the heap profiler compiled out; build with `alloc-jemalloc-profiling` to turn the profiler on. jemalloc is built under the `_rjem_` prefix, so it reads `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`:
+
+```bash
+make install SPICED_NON_DEFAULT_FEATURES="alloc-jemalloc-profiling"
+_RJEM_MALLOC_CONF=prof:true,prof_final:true,prof_prefix:/tmp/spiced.prof spiced
+```
+
 ### mimalloc
 
 Microsoft's mimalloc allocator, designed for performance and security.
