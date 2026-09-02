@@ -35,9 +35,11 @@ on:
           - 'dremio'
           - 'odbc-athena'
           - 'odbc-databricks'
+          - 'oracle'
           - 'duckdb'
           - 'duckdb-zero-results'
           - 'snowflake'
+          - 'snowflake-catalog'
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
@@ -46,9 +48,13 @@ on:
           - 'spicecloud'
           - 'iceberg-hadoop'
           - 'dynamodb'
+          - 'arrow'
+          - 'cayenne'
           - 'postgres-catalog'
           - 'mysql-catalog'
           - 'mssql-catalog'
+          - 'oracle-catalog'
+          - 'ducklake-catalog'
           - 'turso'
           - 'bigquery'
           - 'scylladb'
@@ -80,6 +86,33 @@ jobs:
   run-throughput:
     name: Run throughput test
     runs-on: ${{ github.event.inputs.runner_type }}
+    services:
+      # Local, ephemeral PostgreSQL for TPC-H/TPC-DS SF1/SF10, seeded by the
+      # "Seed postgres..." step below; SF100+ targets the externally
+      # provisioned benchmarking-postgres host instead, which is the only
+      # scale factor pre-loaded there (see #11730). The condition is kept
+      # character-for-character identical to the one in
+      # testoperator_run_bench.yml so the two workflows stay diffable: a
+      # postgres fixture the bench workflow provisions and this one does not
+      # is invisible until a run fails with `database "tpch_sf1" does not
+      # exist`. Excludes ducklake[postgres+s3], which provisions its own local
+      # postgres catalog DB on the same port.
+      postgres_tpch:
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && 'postgres:16' || '' }}
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
+        # is too small for parallel-worker queries against TPC-H/TPC-DS data;
+        # several queries fail with "could not resize shared memory segment"
+        # otherwise.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size=1g
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,6 +177,126 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
+      - name: Seed postgres TPC-H/TPC-DS data if missing
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') }}
+        timeout-minutes: 120
+        env:
+          PGHOST: ${{ (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10') && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          QUERY_SET="${{ github.event.inputs.query_set }}"
+          QUERY_SET="${QUERY_SET%%\[*\]*}"
+          SCALE_FACTOR="${{ github.event.inputs.scale_factor }}"
+          DB_NAME="${QUERY_SET}_sf${SCALE_FACTOR}"
+
+          sudo apt-get update -y
+          # make is needed before the "already seeded" check below, not just by the
+          # seeding path further down: a database that already has data still runs
+          # `make pg-create-index`, and on a runner without make preinstalled that
+          # exits 127 before the later install line is ever reached. Only a
+          # pre-provisioned target takes that branch, so it surfaced solely on
+          # SF100 while the always-empty SF1/SF10 containers stayed green.
+          sudo apt-get install -y postgresql-client make
+
+          echo "Checking whether $DB_NAME already has data on $PGHOST..."
+          set +e
+          PSQL_OUTPUT="$(PGCONNECT_TIMEOUT=10 psql -U postgres -d "$DB_NAME" -tAc 'SELECT count(*) FROM customer;' 2>&1)"
+          PSQL_EXIT=$?
+          set -e
+
+          if [ "$PSQL_EXIT" -eq 0 ]; then
+            EXISTING_ROWS="$PSQL_OUTPUT"
+          elif echo "$PSQL_OUTPUT" | grep -qi "does not exist"; then
+            # Database or the customer table doesn't exist yet - genuinely unseeded.
+            echo "$DB_NAME (or its customer table) doesn't exist yet on $PGHOST."
+            EXISTING_ROWS=0
+          else
+            # Any other failure (auth, network, host unreachable, timeout) is a
+            # real problem, not "unseeded" - don't silently treat it as empty.
+            echo "::error::Could not check $DB_NAME on $PGHOST - this looks like a connectivity or authentication problem, not a missing database:"
+            echo "$PSQL_OUTPUT"
+            exit 1
+          fi
+
+          cd test/tpc-bench
+
+          if [ "${EXISTING_ROWS:-0}" -gt 0 ] 2>/dev/null; then
+            echo "$DB_NAME already has $EXISTING_ROWS rows in 'customer' - skipping data load, but ensuring indexes are up to date (idempotent, no rebuild if already present)."
+            if [ "$QUERY_SET" = "tpcds" ]; then
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
+            else
+              DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+            fi
+            exit 0
+          fi
+
+          # SF1/SF10 always run against the self-contained postgres:16 service
+          # container (PGHOST=127.0.0.1), so generating fresh data inline is
+          # cheap and expected. Anything larger targets the shared hosted
+          # cluster - generating+loading that inline risks a multi-hour job
+          # that can time out or exhaust the runner's disk, and a failure
+          # partway through would leave the shared database partially seeded.
+          # Require those scale factors to be pre-provisioned instead.
+          if [ "$PGHOST" != "127.0.0.1" ]; then
+            echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
+            echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
+            echo "(for a tpcds run: make tpcds-clone tpcds-fleet-gen pg-tpcds-init, then TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load, then make pg-tpcds-create-index)"
+            exit 1
+          fi
+
+          echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
+          sudo apt-get install -y git
+          # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
+          # tpcds-fleet-gen), so nothing is compiled here - the kits are only
+          # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
+          # from any other generator produces data the recorded expected
+          # answers don't match (see the fleet-gen comments in the Makefile).
+          sudo apt-get install -y unzip
+
+          if [ "$QUERY_SET" = "tpcds" ]; then
+            make tpcds-clone
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-fleet-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
+          else
+            make tpch-clone
+            DBGEN_SCALE=$SCALE_FACTOR make tpch-fleet-gen
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-init
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
+          fi
+          echo "Seed complete: $DB_NAME on $PGHOST."
+
+      # Postgres-accelerator spicepods need a *_accelerated database that the
+      # empty postgres:16 container doesn't have yet - create it before spiced
+      # starts (idempotent), matching the PGHOST the spicepod will connect to.
+      - name: Create postgres acceleration databases
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        env:
+          PGHOST: ${{ (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres'))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          SPICEPOD="${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          ACCEL_DBS="$(grep -oE 'pg_db: *[A-Za-z0-9_]+_accelerated' "$SPICEPOD" | awk '{print $2}' | sort -u)"
+          if [ -z "$ACCEL_DBS" ]; then
+            echo "No *_accelerated pg_db in $SPICEPOD - nothing to create."
+            exit 0
+          fi
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update -y && sudo apt-get install -y postgresql-client
+          fi
+          for db in $ACCEL_DBS; do
+            if psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
+              echo "$db already exists on $PGHOST."
+            else
+              createdb -U postgres "$db"
+              echo "Created $db on $PGHOST."
+            fi
+          done
+
       - name: Install ADBC BigQuery Driver
         if: ${{ contains(github.event.inputs.spicepod_path, 'adbc[bigquery]') }}
         uses: ./.github/actions/setup-adbc-bigquery
@@ -197,8 +350,8 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
-          POSTGRES_HOST: ${{ vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ vars.TEST_POSTGRES_HOST }}
+          POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
