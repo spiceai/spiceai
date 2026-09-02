@@ -1869,21 +1869,25 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             let data_dir = temp_dir.path().join("data");
             std::fs::create_dir_all(&data_dir)?;
 
+            // Two phases, because no single end state can prove the deletion happened: six rows
+            // minus three retention matches leaves exactly what loading only the other three
+            // would leave, so a row-loss regression satisfies an end-state assertion unchanged.
+            //
+            // Phase one loads a fixture retention cannot touch — every value is below the
+            // predicate — and asserts all six rows across all three partitions. Nothing about
+            // that assertion races: there is no row for retention to remove, whenever it runs.
+            // Phase two rewrites one row per partition above the predicate, so the three rows
+            // that then disappear are three that were provably there.
             let csv_file = data_dir.join("partitioned_delete_test.csv");
             std::fs::write(
                 &csv_file,
-                // Every partition holds one row retention keeps and one it deletes, so the
-                // surviving state proves all three partitions loaded *and* that retention ran
-                // in each of them. A fixture whose deleted rows all sit in one partition cannot
-                // tell "retention removed that partition" apart from "that partition never
-                // loaded".
                 "id,region,name,value\n\
                  1,us,alpha,100\n\
-                 2,us,beta,500\n\
+                 2,us,beta,150\n\
                  3,eu,gamma,300\n\
-                 4,eu,delta,600\n\
+                 4,eu,delta,350\n\
                  5,asia,epsilon,200\n\
-                 6,asia,zeta,700\n",
+                 6,asia,zeta,250\n",
             )?;
 
             let cayenne_dir = temp_dir.path().join("cayenne_partitioned_delete");
@@ -1940,13 +1944,58 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Cayenne applies `retention_sql` on every write, so the rows with `value > 400` can
-            // be gone before the load has even settled — no value of `retention_check_interval`
-            // holds that off. Asserting the pre-retention contents here is therefore unwinnable
-            // (see #13800). Wait for the deletion to land instead, then assert the surviving
-            // state, which with the fixture above still proves the load and the deletion.
             const COUNT_SQL: &str = "SELECT COUNT(*) as cnt FROM partitioned_delete_test";
+            const BY_REGION_SQL: &str = "SELECT region, COUNT(*) as cnt FROM \
+                 partitioned_delete_test GROUP BY region ORDER BY region";
 
+            // Phase one: the whole fixture, and it stays the whole fixture however often
+            // retention runs, because nothing in it matches `value > 400`. Asserting it here is
+            // what later lets the three missing rows mean "deleted" rather than "never loaded".
+            let result = execute_sql(&rt, COUNT_SQL).await?;
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 6   |", "+-----+"];
+            assert_batches_eq!(expected, &result);
+
+            let result = execute_sql(&rt, BY_REGION_SQL).await?;
+            let expected = [
+                "+--------+-----+",
+                "| region | cnt |",
+                "+--------+-----+",
+                "| asia   | 2   |",
+                "| eu     | 2   |",
+                "| us     | 2   |",
+                "+--------+-----+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // Phase two: lift one row per partition above the predicate, so every partition has
+            // something to delete and something to keep. A fixture whose deleted rows all sat in
+            // one partition could not tell "retention removed that partition" apart from "that
+            // partition never loaded".
+            std::fs::write(
+                &csv_file,
+                "id,region,name,value\n\
+                 1,us,alpha,100\n\
+                 2,us,beta,500\n\
+                 3,eu,gamma,300\n\
+                 4,eu,delta,600\n\
+                 5,asia,epsilon,200\n\
+                 6,asia,zeta,700\n",
+            )?;
+
+            let notifier = rt
+                .datafusion()
+                .refresh_table(&TableReference::from("partitioned_delete_test"), None)
+                .await?;
+            notifier
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no refresh notifier for 'partitioned_delete_test'")
+                })?
+                .wait()
+                .await;
+
+            // Cayenne applies `retention_sql` on every write, so the deletion may land as part of
+            // the refresh itself or on a later interval check. Poll for it rather than assuming
+            // which (see #13800) — and never assert the state before it, which is unwinnable.
             let converged = wait_until_true(std::time::Duration::from_secs(30), || async {
                 let Ok(result) = execute_sql(&rt, COUNT_SQL).await else {
                     return false;
@@ -1963,18 +2012,9 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                 last = pretty_format_batches(&execute_sql(&rt, COUNT_SQL).await?)?
             );
 
-            // Three of the six rows exceed 400, one per partition, so exactly three survive.
-            let result = execute_sql(&rt, COUNT_SQL).await?;
-            let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
-            assert_batches_eq!(expected, &result);
-
             // Every partition must still be present with its one surviving row: a partition that
             // failed to load, or one retention emptied wholesale, fails here.
-            let result = execute_sql(
-                &rt,
-                "SELECT region, COUNT(*) as cnt FROM partitioned_delete_test GROUP BY region ORDER BY region",
-            )
-            .await?;
+            let result = execute_sql(&rt, BY_REGION_SQL).await?;
             let expected = [
                 "+--------+-----+",
                 "| region | cnt |",
@@ -1987,11 +2027,8 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             assert_batches_eq!(expected, &result);
 
             // And the survivors must be exactly the rows retention did not match.
-            let result = execute_sql(
-                &rt,
-                "SELECT id FROM partitioned_delete_test ORDER BY id",
-            )
-            .await?;
+            let result =
+                execute_sql(&rt, "SELECT id FROM partitioned_delete_test ORDER BY id").await?;
             let expected = [
                 "+----+", "| id |", "+----+", "| 1  |", "| 3  |", "| 5  |", "+----+",
             ];
