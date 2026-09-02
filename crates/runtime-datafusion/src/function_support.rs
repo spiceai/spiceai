@@ -85,6 +85,41 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
 }
 
+/// `SQLite`-flavored deny-list as a value, for
+/// `SqliteTableProviderFactory::with_function_support`.
+///
+/// Every Spice function, plus `btrim`. `SQLite` has no `btrim` — a pushed-down
+/// `trim` reaches it under `DataFusion`'s canonical name and fails the query
+/// with `no such function: btrim`, the same defect issue #13794 reports against
+/// `DuckDB`. `SQLite` does have a `trim` that matches, but its unparser dialect
+/// is constructed inside `datafusion-table-providers` with no seam to install a
+/// rewrite through, so the call is denied and evaluates locally above the
+/// federated scan instead. That costs the pushdown for those plans and returns
+/// the right rows, which is the trade the deny-list exists to make.
+#[must_use]
+pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .build()
+}
+
+/// MySQL-flavored deny-list as a value, for
+/// `MySQLTableFactory::with_function_support`.
+///
+/// Every Spice function, plus `btrim`, for the reason
+/// [`deny_spice_functions_for_sqlite_table_providers`] gives — MySQL answers a
+/// federated `trim` with `FUNCTION <db>.btrim does not exist`. Denying is the
+/// only faithful option here rather than merely the available one: MySQL's
+/// `TRIM` has no two-argument form at all, and its `TRIM(BOTH chars FROM str)`
+/// strips repetitions of `chars` as a *string*, where `btrim` strips any
+/// character in it — so a rewrite would trade a failed query for wrong rows.
+#[must_use]
+pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .deny_also([crate::dialect::BTRIM_NAME.to_string()])
+        .build()
+}
+
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
 /// evaluate are denied for `PostgreSQL` and PostgreSQL-wire backends (e.g.
 /// Redshift). The ones that match `PostgreSQL` exactly are listed here so they

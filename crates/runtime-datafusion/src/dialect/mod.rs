@@ -37,6 +37,12 @@ pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 const REGEXP_COUNT_NAME: &str = "regexp_count";
 
+/// `DataFusion`'s canonical name for the `trim` SQL function. `trim` is an
+/// alias, so this is the name the unparser emits — see
+/// [`crate::dialect::duckdb::btrim_to_trim`] and the deny-lists in
+/// [`crate::function_support`] for the two ways a backend without it is handled.
+pub(crate) const BTRIM_NAME: &str = "btrim";
+
 /// The scalar functions the `DuckDB` unparser dialect rewrites to native
 /// `DuckDB` SQL, paired with their handlers.
 ///
@@ -98,6 +104,12 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
                 duckdb::DuckDBRegexpFunction::Count
                     .to_datafusion_function(REGEXP_COUNT_FLAGS_POSITION),
             ) as ScalarFnToSqlHandler,
+        ),
+        (
+            // DuckDB dialect: trim(string[, characters])
+            // DataFusion dialect: btrim(str[, trim_str]) -- `trim` is an alias
+            BTRIM_NAME,
+            Box::new(duckdb::btrim_to_trim) as ScalarFnToSqlHandler,
         ),
     ]
 }

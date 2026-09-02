@@ -624,7 +624,9 @@ pub fn is_code_executing_function(name: &str) -> bool {
 
 pub use runtime_datafusion::function_support::{
     deny_spice_functions_for_duckdb, deny_spice_functions_for_duckdb_table_providers,
+    deny_spice_functions_for_mysql_table_providers,
     deny_spice_functions_for_postgres_table_providers,
+    deny_spice_functions_for_sqlite_table_providers,
 };
 pub use runtime_udfs_api::{
     deny_spice_functions_for_table_providers, deny_spice_specific_functions,
@@ -956,10 +958,10 @@ mod tests {
 
     #[test]
     fn table_providers_default_deny_list_denies_spice_functions() {
-        // The default table-providers-typed deny-list (wired into the SQLite
-        // and Postgres accelerator factories and the MySQL connector factory)
-        // has no dialect carve-out: every built-in Spice UDF must be denied
-        // while ordinary functions still federate.
+        // The default table-providers-typed deny-list (wired into the ADBC
+        // connector for every profile other than BigQuery) has no dialect
+        // carve-out: every built-in Spice UDF must be denied while ordinary
+        // functions still federate.
         let support = deny_spice_functions_for_table_providers();
         let json_name = json_get_str_udf().name().to_string();
         for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
@@ -1050,6 +1052,78 @@ mod tests {
             assert!(
                 known.contains(*name),
                 "{name} is in the Postgres pushable list but is not a DataFusion nested function"
+            );
+        }
+    }
+
+    #[test]
+    fn btrim_is_denied_only_for_the_backends_that_lack_it() {
+        // `trim(col)` resolves to the `btrim` UDF and federates under that
+        // canonical name. Three of the four SQL backends we can reach have no
+        // `btrim` and answer a pushed-down `trim` with an error rather than a
+        // row (issue #13794): DuckDB `Catalog Error: Scalar Function with name
+        // btrim does not exist!`, SQLite `no such function: btrim`, MySQL
+        // `FUNCTION <db>.btrim does not exist`.
+        //
+        // DuckDB is handled in its dialect instead, which rewrites the call to
+        // `trim` and keeps the pushdown, so `btrim` must stay *allowed* there —
+        // denying it as well would silently give up a pushdown that works.
+        // PostgreSQL has `btrim` natively and must keep pushing it down too.
+        for (backend, support, denied) in [
+            (
+                "sqlite",
+                deny_spice_functions_for_sqlite_table_providers(),
+                true,
+            ),
+            (
+                "mysql",
+                deny_spice_functions_for_mysql_table_providers(),
+                true,
+            ),
+            (
+                "postgres",
+                deny_spice_functions_for_postgres_table_providers(),
+                false,
+            ),
+            (
+                "duckdb",
+                deny_spice_functions_for_duckdb_table_providers(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                support.supports(&make_named_expr("btrim")),
+                !denied,
+                "btrim pushdown for {backend} is wrong: expected denied={denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_and_mysql_deny_lists_still_deny_every_spice_function() {
+        // Carving `btrim` into these two lists must not have cost them the Spice
+        // deny-list they were built for: `SqliteTableProviderFactory` and
+        // `MySQLTableFactory` previously took the backend-agnostic default, and
+        // a Spice-only function reaching either backend is the unknown-function
+        // failure of issue #10703.
+        let json_name = json_get_str_udf().name().to_string();
+        for (backend, support) in [
+            ("sqlite", deny_spice_functions_for_sqlite_table_providers()),
+            ("mysql", deny_spice_functions_for_mysql_table_providers()),
+        ] {
+            for name in &builtin_denied_names() {
+                assert!(
+                    !support.supports(&make_named_expr(name)),
+                    "{name} must stay denied for {backend}"
+                );
+            }
+            assert!(
+                !support.supports(&make_named_expr(json_name.as_str())),
+                "{json_name} must stay denied for {backend}"
+            );
+            assert!(
+                support.supports(&make_named_expr("upper")),
+                "an ordinary function must still federate to {backend}"
             );
         }
     }
