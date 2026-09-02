@@ -346,12 +346,20 @@ where
                     continue;
                 }
 
-                if data.data_header.is_empty() && !data.data_body.is_empty() {
+                // A body is counted whichever way the header reads, so the header can only ever
+                // add to what the body already establishes. That floor is what stops reading the
+                // header from *narrowing* the count: a body the client streamed went nowhere, and
+                // a header that parses into something other than a batch does not make those
+                // bytes absent. `Tensor`, `SparseTensor` and any IPC header a later Arrow adds all
+                // land here, so an unsupported message loses rows rather than being acked.
+                if !data.data_body.is_empty() {
                     discarded.total += 1;
                     continue;
                 }
 
                 match declares_ipc_data(&data.data_header) {
+                    // Reached only with an empty body, which a batch legitimately has: a
+                    // zero-row batch is data, and counting by body length alone missed it.
                     Ok(true) => discarded.total += 1,
                     // A schema-only message, a trailer, or anything else carrying no rows.
                     Ok(false) => {}
@@ -1060,19 +1068,20 @@ mod tests {
         );
     }
 
-    /// A body paired with a header that parses but declares no batch — a schema message, a trailer
-    /// — is *not* counted, so a stream ending on one is acked as a complete write even though the
-    /// client sent bytes nothing applied.
+    /// Regression test for #13820: a body paired with a header that parses into something other
+    /// than a batch is still lost client data, and must not be acked as a complete write.
     ///
-    /// Pinned as the current behaviour rather than asserted as correct. `declares_ipc_data` answers
-    /// on the header alone, so the body never reaches the decision, and this case is a client
-    /// protocol violation in the first place: Arrow IPC gives a schema message no body, so those
-    /// bytes are not a record batch that went missing and counting them as discarded *data* would
-    /// overstate what was lost. Whether the write should nonetheless be refused rather than acked
-    /// is tracked in #13820; this test is here so that change shows up as an edit to an expectation
-    /// somebody chose, not as a silent flip of an untested branch.
+    /// Reading the header is what this change is for, but reading it *instead of* the body narrows
+    /// the count: `declares_ipc_data` answers `Ok(false)` for a schema message, a trailer, a
+    /// `Tensor`, or any IPC header a later Arrow version adds, and on that answer alone a
+    /// body-bearing message of those kinds would leave `total` at zero and the early-completion
+    /// path would return `PutResult::default()`. Counting by body length — which this branch
+    /// replaced — got this case right, so it is a floor to keep rather than a case to defer.
+    ///
+    /// A schema message is used because it is the shape a real client is likeliest to send with a
+    /// stray body; the arm it exercises is shared by every non-batch header.
     #[tokio::test]
-    async fn drain_does_not_count_a_body_under_a_non_data_header() {
+    async fn drain_counts_a_body_under_a_non_data_header() {
         use arrow_schema::{DataType, Field, Schema};
 
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
@@ -1089,8 +1098,13 @@ mod tests {
         let mut stream = futures::stream::iter(vec![Ok::<_, Status>(schema_message)]);
         assert_eq!(
             drain_discarded_data_batches(&mut stream).await,
-            DiscardedMessages::default(),
-            "pins the current behaviour: the body under a non-data header is not counted"
+            DiscardedMessages {
+                total: 1,
+                // The header read fine — it simply declared something else — so nothing about
+                // this message is an unreadable header.
+                unreadable_headers: 0
+            },
+            "a body under a non-data header is lost client data, not an absent batch"
         );
     }
 
