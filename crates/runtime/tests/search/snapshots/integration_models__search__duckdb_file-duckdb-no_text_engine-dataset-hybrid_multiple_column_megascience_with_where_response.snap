@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
+      "_score": "0.33",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -18,19 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.01",
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
-        ]
-      },
-      "primary_key": {
-        "id": 890
-      }
-    },
-    {
-      "_score": "0.01",
+      "_score": "0.33",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -42,7 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.01",
+      "_score": "0.30",
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -51,6 +39,18 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1289
+      }
+    },
+    {
+      "_score": "0.29",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": [
+          "How is microsporidia infection typically acquired?"
+        ]
+      },
+      "primary_key": {
+        "id": 446
       }
     }
   ]
