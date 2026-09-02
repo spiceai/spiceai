@@ -42,7 +42,8 @@ use support::inventory::{assert_inventory_complete, build_inventory, inventory_b
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, RowOrder, SortKeyColumn, SortKeyResolution,
-    compare_query_result_batches, compare_query_result_batches_with_sort_check, resolve_sort_key,
+    SortOrderViolation, compare_query_result_batches, compare_query_result_batches_with_sort_check,
+    has_top_level_limit, has_top_level_order_by, resolve_sort_key,
 };
 
 #[test]
@@ -316,7 +317,8 @@ fn sort_check_rejects_unsorted_side_with_identical_rows() {
         &[scrambled],
         RowOrder::Multiset,
     )
-    .expect("sort-checked compare");
+    .expect("sort-checked compare")
+    .result;
     assert!(
         matches!(
             result,
@@ -343,10 +345,9 @@ fn sort_check_tolerates_permuted_ties() {
         RowOrder::Multiset,
     )
     .expect("sort-checked compare");
-    assert_eq!(
-        result,
-        QueryValidationResult::Pass,
-        "tied rows may be returned in any order"
+    assert!(
+        result.is_fully_verified_pass(),
+        "tied rows may be returned in any order: {result:?}"
     );
 }
 
@@ -361,7 +362,8 @@ fn sort_check_honors_desc_and_multi_column_keys() {
             &[descending],
             RowOrder::Multiset,
         )
-        .expect("desc compare"),
+        .expect("desc compare")
+        .result,
         QueryValidationResult::Pass
     );
 
@@ -375,12 +377,13 @@ fn sort_check_honors_desc_and_multi_column_keys() {
         &[bad],
         RowOrder::Multiset,
     )
-    .expect("two-key compare");
+    .expect("two-key compare")
+    .result;
     assert!(
         matches!(
             result,
             QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
-                ref column,
+                violation: SortOrderViolation { ref column, .. },
                 ..
             }) if column == "p"
         ),
@@ -402,6 +405,7 @@ fn sort_key_resolves_ordinals_aliases_and_projected_expressions() {
                 index: 1,
                 name: "revenue".to_string(),
                 descending: true,
+                nulls_first: None,
             }],
         ),
         (
@@ -412,11 +416,13 @@ fn sort_key_resolves_ordinals_aliases_and_projected_expressions() {
                     index: 0,
                     name: "d_year".to_string(),
                     descending: false,
+                    nulls_first: None,
                 },
                 SortKeyColumn {
                     index: 1,
                     name: "revenue".to_string(),
                     descending: true,
+                    nulls_first: None,
                 },
             ],
         ),
@@ -426,12 +432,16 @@ fn sort_key_resolves_ordinals_aliases_and_projected_expressions() {
                 index: 1,
                 name: "revenue".to_string(),
                 descending: false,
+                nulls_first: None,
             }],
         ),
     ] {
         assert_eq!(
             resolve_sort_key(sql, &schema),
-            SortKeyResolution::Resolved(expected),
+            SortKeyResolution::Resolved {
+                key: expected,
+                unresolved_suffix: None
+            },
             "unexpected resolution for {sql}"
         );
     }
@@ -492,7 +502,8 @@ fn sort_check_does_not_police_null_placement() {
             &[nulls_first],
             RowOrder::Multiset,
         )
-        .expect("null compare"),
+        .expect("null compare")
+        .result,
         QueryValidationResult::Pass
     );
 }
@@ -526,7 +537,227 @@ fn sort_check_does_not_consult_tiebreaker_across_a_null_in_a_leading_key() {
             &[batch],
             RowOrder::Multiset,
         )
-        .expect("compare"),
+        .expect("compare")
+        .result,
         QueryValidationResult::Pass
     );
+}
+
+// ---------------------------------------------------------------------------
+// The two false-green paths an adversarial review reproduced against this
+// branch: a NULL key column that swallowed the tiebreaker, and an unverifiable
+// ORDER BY that reported as a clean pass.
+// ---------------------------------------------------------------------------
+
+/// Two rows that are both `NULL` in a key column are tied under every placement
+/// convention, so SQL requires the next key column to decide. Skipping it left
+/// TPC-DS q71's nine `NULL`-`SUM` rows free to come back in any `brand_id` order.
+#[test]
+fn sort_check_consults_the_tiebreaker_inside_a_null_group() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("brand_id", DataType::Int64, false),
+        Field::new("ext_price", DataType::Int64, true),
+    ]));
+    let scrambled_within_null_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 1])),
+            Arc::new(Int64Array::from(vec![None, None])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "null_group_tiebreak",
+        "SELECT brand_id, ext_price FROM t ORDER BY ext_price DESC, brand_id",
+        &[scrambled_within_null_group.clone()],
+        &[scrambled_within_null_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "brand_id"
+        ),
+        "a tie on the NULL key must still require brand_id to ascend, got {result:?}"
+    );
+}
+
+/// `[2, NULL, 1]` is illegal under `NULLS FIRST` and `NULLS LAST` alike, but
+/// neither adjacent pair can be judged on its own. Each key column's non-`NULL`
+/// values are compared as a subsequence so the inversion is still caught.
+#[test]
+fn sort_check_catches_an_inversion_straddling_a_null() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let straddling = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(2), None, Some(1)]))],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "straddling_null",
+        "SELECT v FROM t ORDER BY v",
+        &[straddling.clone()],
+        &[straddling],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "2 before 1 is out of order under either NULL placement, got {result:?}"
+    );
+}
+
+/// An `ORDER BY` the checker cannot locate must not read as a verified pass.
+#[test]
+fn an_unverifiable_sort_key_is_not_reported_as_a_clean_pass() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let scrambled = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "unresolvable",
+        "SELECT v FROM t ORDER BY not_a_projected_column",
+        &[scrambled.clone()],
+        &[scrambled],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+
+    assert_eq!(comparison.result, QueryValidationResult::Pass);
+    assert!(
+        !comparison.is_fully_verified_pass(),
+        "an unchecked ORDER BY must not read as a fully verified pass"
+    );
+    assert_eq!(
+        comparison.unchecked.len(),
+        2,
+        "both sides should report the hole: {:?}",
+        comparison.unchecked
+    );
+}
+
+/// Dropping a whole key because a later term is unmappable left TPC-DS q70's
+/// `lochierarchy` unverified for no reason. The mappable prefix is checked, and
+/// the rest is named.
+#[test]
+fn an_unmappable_term_still_checks_the_prefix_before_it() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("lochierarchy", DataType::Int64, false),
+        Field::new("rank_within_parent", DataType::Int64, false),
+    ]));
+    let sql = "SELECT lochierarchy, rank_within_parent FROM t \
+               ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END, \
+               rank_within_parent";
+
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix,
+    } = resolve_sort_key(sql, &schema)
+    else {
+        panic!("expected the leading term to resolve");
+    };
+    assert_eq!(key.len(), 1, "only the prefix before the CASE resolves");
+    assert_eq!(key[0].name, "lochierarchy");
+    assert!(
+        unresolved_suffix.is_some(),
+        "the dropped suffix must be named"
+    );
+
+    // And the prefix is genuinely enforced.
+    let descending_violated = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![1, 1])),
+        ],
+    )
+    .expect("batch");
+    let comparison = compare_query_result_batches_with_sort_check(
+        "prefix",
+        sql,
+        &[descending_violated.clone()],
+        &[descending_violated],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        matches!(
+            comparison.result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "the resolved prefix must still be enforced, got {:?}",
+        comparison.result
+    );
+}
+
+/// An explicit `NULLS FIRST`/`NULLS LAST` makes placement part of the requested
+/// order, so it is enforced rather than left to the engine.
+#[test]
+fn sort_check_enforces_null_placement_when_the_query_states_it() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let nulls_last = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(1), Some(2), None]))],
+    )
+    .expect("batch");
+
+    let stated_first = compare_query_result_batches_with_sort_check(
+        "nulls_first_stated",
+        "SELECT v FROM t ORDER BY v NULLS FIRST",
+        &[nulls_last.clone()],
+        &[nulls_last.clone()],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            stated_first,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "NULLS FIRST was stated and violated, got {stated_first:?}"
+    );
+
+    let stated_last = compare_query_result_batches_with_sort_check(
+        "nulls_last_stated",
+        "SELECT v FROM t ORDER BY v NULLS LAST",
+        &[nulls_last.clone()],
+        &[nulls_last],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        stated_last.is_fully_verified_pass(),
+        "NULLS LAST was stated and honored: {stated_last:?}"
+    );
+}
+
+/// Both predicates that pick the content-comparison mode must read the top level
+/// only — a subquery's `ORDER BY`/`LIMIT` does not constrain the outer result.
+#[test]
+fn top_level_predicates_ignore_subquery_clauses() {
+    assert!(has_top_level_order_by("SELECT v FROM t ORDER BY v"));
+    assert!(!has_top_level_order_by(
+        "SELECT v FROM (SELECT v FROM t ORDER BY v) AS inner_q"
+    ));
+    assert!(has_top_level_limit("SELECT v FROM t LIMIT 10"));
+    assert!(has_top_level_limit("SELECT v FROM t OFFSET 5"));
+    assert!(!has_top_level_limit(
+        "SELECT v FROM (SELECT v FROM t LIMIT 10) AS inner_q"
+    ));
+    assert!(!has_top_level_limit("SELECT v FROM t"));
 }

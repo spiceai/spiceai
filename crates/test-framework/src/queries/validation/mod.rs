@@ -46,9 +46,34 @@ use super::Query;
 pub mod sort_order;
 
 pub use sort_order::{
-    SortCheck, SortKeyColumn, SortKeyResolution, SortOrderViolation, check_sort_order,
-    has_top_level_order_by, resolve_sort_key, verify_sorted,
+    SortKeyColumn, SortKeyResolution, SortOrderViolation, has_top_level_limit,
+    has_top_level_order_by, resolve_sort_key,
 };
+
+// Not re-exported: the outcome type is plumbing between this module and
+// `sort_order`. Callers consume the reasons via `SortCheckedComparison`.
+use sort_order::SortCheck;
+
+/// A content comparison plus what the row-order check could and could not cover.
+///
+/// `unchecked` exists so a coverage hole cannot masquerade as a pass. A skipped
+/// or partial sort check leaves `result` at whatever the content comparison said
+/// — the rows really were compared — while naming the part of the `ORDER BY`
+/// nobody verified, for the caller to count and report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortCheckedComparison {
+    pub result: QueryValidationResult,
+    /// One entry per side whose `ORDER BY` was not fully verified.
+    pub unchecked: Vec<String>,
+}
+
+impl SortCheckedComparison {
+    /// True when the content matched *and* the whole `ORDER BY` was verified.
+    #[must_use]
+    pub fn is_fully_verified_pass(&self) -> bool {
+        self.result == QueryValidationResult::Pass && self.unchecked.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
@@ -80,10 +105,7 @@ pub enum QueryValidationFailReason {
     /// output rather than of the two results' relationship.
     SortOrderViolation {
         side: String,
-        column: String,
-        row_number: usize,
-        previous: String,
-        current: String,
+        violation: SortOrderViolation,
     },
 }
 
@@ -874,7 +896,10 @@ pub fn row_order_from_sql(sql: &str) -> RowOrder {
 ///
 /// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
 /// sorted into a canonical order so differing physical scan orders do not
-/// produce false mismatches.
+/// produce false mismatches — which means this function says **nothing about the
+/// order an engine returned rows in**. Engine-parity callers want
+/// [`compare_query_result_batches_with_sort_check`], which adds that check; this
+/// one is the content half, kept separate so its own behavior stays testable.
 pub fn compare_query_result_batches(
     query_name: &str,
     left_batches: &[RecordBatch],
@@ -978,6 +1003,12 @@ pub fn compare_query_result_batches(
 /// violation, so the check adds no sensitivity to the engine-dependent ordering
 /// of equal rows that [`RowOrder::Multiset`] exists to absorb.
 ///
+/// **A sort check that could not run is returned, not swallowed.** Whatever the
+/// check could not cover lands in [`SortCheckedComparison::unchecked`], because
+/// a hole that reads as a pass is the failure this check exists to remove. A
+/// caller that ignores that field is back to reporting unverified order as
+/// verified.
+///
 /// `sql` must be the statement that produced *both* result sets. Where the two
 /// engines run textually different SQL, pass the form whose projection matches
 /// the compared results.
@@ -990,37 +1021,53 @@ pub fn compare_query_result_batches_with_sort_check(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     row_order: RowOrder,
-) -> Result<QueryValidationResult> {
+) -> Result<SortCheckedComparison> {
     let content = compare_query_result_batches(query_name, left_batches, right_batches, row_order)?;
     if content != QueryValidationResult::Pass {
-        return Ok(content);
+        return Ok(SortCheckedComparison {
+            result: content,
+            unchecked: Vec::new(),
+        });
     }
 
+    // Parsed once for both sides: the AST does not depend on which engine's rows
+    // are being checked, and the corpus carries multi-kilobyte statements.
+    let statement = sort_order::parse_one_statement(sql);
+    let mut unchecked = Vec::new();
+
     for (side, batches) in [("left", left_batches), ("right", right_batches)] {
-        match sort_order::check_sort_order(sql, batches)? {
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            continue;
+        };
+        let batch = arrow::compute::concat_batches(&schema, batches)?;
+        match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
             SortCheck::Ordered => {}
-            SortCheck::Skipped { reason } => {
+            SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
                 println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                unchecked.push(format!("{side}: {reason}"));
             }
             SortCheck::Violation(v) => {
                 println!(
                     "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
                     v.column, v.row_number, v.previous, v.current
                 );
-                return Ok(QueryValidationResult::Fail(
-                    QueryValidationFailReason::SortOrderViolation {
-                        side: side.to_string(),
-                        column: v.column,
-                        row_number: v.row_number,
-                        previous: v.previous,
-                        current: v.current,
-                    },
-                ));
+                return Ok(SortCheckedComparison {
+                    result: QueryValidationResult::Fail(
+                        QueryValidationFailReason::SortOrderViolation {
+                            side: side.to_string(),
+                            violation: v,
+                        },
+                    ),
+                    unchecked,
+                });
             }
         }
     }
 
-    Ok(QueryValidationResult::Pass)
+    Ok(SortCheckedComparison {
+        result: QueryValidationResult::Pass,
+        unchecked,
+    })
 }
 
 /// Canonical row order for multiset equality: sort by stringified cell values

@@ -171,7 +171,13 @@ async fn run_pair_with_df_baseline(
         (Ok(c), Ok(d)) => {
             // --- Harness compares actual result batches ---
             let direct = compare_actual_results(query, &c, &d);
-            if matches!(direct, ParityOutcome::Pass) {
+            // `OrderUnchecked` means the rows matched and part of the ORDER BY
+            // could not be verified — a coverage note to carry through, not a
+            // mismatch to re-adjudicate against the DataFusion baseline.
+            if matches!(
+                direct,
+                ParityOutcome::Pass | ParityOutcome::OrderUnchecked { .. }
+            ) {
                 return direct;
             }
             if let ParityOutcome::Fail { ref detail } = direct
@@ -184,7 +190,10 @@ async fn run_pair_with_df_baseline(
                     Ok(df_batches) => {
                         // Again: harness compares actual batches only.
                         let vs_df = compare_actual_results(query, &c, &df_batches);
-                        if matches!(vs_df, ParityOutcome::Pass) {
+                        if matches!(
+                            vs_df,
+                            ParityOutcome::Pass | ParityOutcome::OrderUnchecked { .. }
+                        ) {
                             return ParityOutcome::Excluded {
                                 reason: format!(
                                     "harness: Cayenne actual results match DataFusion baseline; \

@@ -69,7 +69,7 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
     QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
-    row_order_from_sql,
+    has_top_level_limit, has_top_level_order_by, row_order_from_sql,
 };
 use test_framework::queries::{
     Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
@@ -81,15 +81,33 @@ use test_framework::queries::{
 #[derive(Debug, Clone)]
 pub enum ParityOutcome {
     Pass,
-    Fail { detail: String },
-    Excluded { reason: String },
-    EngineError { side: &'static str, detail: String },
+    /// Content matched, but the query's `ORDER BY` was not fully verified —
+    /// a term that maps to no output column, an unparseable statement, or a key
+    /// type with no comparator. Not a failure, and deliberately not a `Pass`:
+    /// the whole point of the sort check is that unverified order must not read
+    /// as verified.
+    OrderUnchecked {
+        reasons: Vec<String>,
+    },
+    Fail {
+        detail: String,
+    },
+    Excluded {
+        reason: String,
+    },
+    EngineError {
+        side: &'static str,
+        detail: String,
+    },
 }
 
 impl ParityOutcome {
     #[must_use]
     pub fn is_pass_or_excluded(&self) -> bool {
-        matches!(self, Self::Pass | Self::Excluded { .. })
+        matches!(
+            self,
+            Self::Pass | Self::Excluded { .. } | Self::OrderUnchecked { .. }
+        )
     }
 }
 
@@ -516,15 +534,16 @@ pub fn compare_results(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_order = sql_upper.contains("ORDER BY");
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
     // Positional equality only where the row set itself depends on order. Elsewhere
     // multiset, so an `ORDER BY` on a non-unique key does not fail on the
     // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
     // then verifies each side against its own `ORDER BY`, which ties never violate —
     // so absorbing tie order here no longer costs the sort check with it.
-    let order = if has_order && has_limit {
+    //
+    // Both predicates are parser-backed: a `LIMIT` or `ORDER BY` inside a subquery
+    // does not make the outer result order-dependent, and a substring search cannot
+    // tell that apart from a top-level one.
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
         RowOrder::Preserved
     } else {
         RowOrder::Multiset
@@ -536,9 +555,16 @@ pub fn compare_results(
         reference,
         order,
     ) {
-        Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
-        Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
-            detail: format!("{reason:?}"),
+        Ok(comparison) => match comparison.result {
+            QueryValidationResult::Pass if comparison.unchecked.is_empty() => ParityOutcome::Pass,
+            // Rows matched, but part of the ORDER BY went unverified. That is a
+            // coverage hole, so it is reported as one rather than as a clean pass.
+            QueryValidationResult::Pass => ParityOutcome::OrderUnchecked {
+                reasons: comparison.unchecked,
+            },
+            QueryValidationResult::Fail(reason) => ParityOutcome::Fail {
+                detail: format!("{reason:?}"),
+            },
         },
         Err(e) => ParityOutcome::Fail {
             detail: format!("compare error: {e}"),

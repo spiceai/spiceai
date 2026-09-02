@@ -58,6 +58,7 @@ use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
+    has_top_level_limit, has_top_level_order_by,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,13 +221,12 @@ async fn spice_query(
 }
 
 fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> String {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_order = sql_upper.contains("ORDER BY");
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
     // Multiset unless the row set itself depends on order, so tied rows under a
     // non-unique `ORDER BY` do not fail; the sort check below is tie-tolerant and
-    // verifies each side against its own `ORDER BY` regardless.
-    let order = if has_order && has_limit {
+    // verifies each side against its own `ORDER BY` regardless. Both predicates are
+    // parser-backed so an `ORDER BY`/`LIMIT` in a subquery is not mistaken for a
+    // top-level one.
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
         RowOrder::Preserved
     } else {
         RowOrder::Multiset
@@ -238,8 +238,15 @@ fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> 
         standalone,
         order,
     ) {
-        Ok(QueryValidationResult::Pass) => "PASS".into(),
-        Ok(QueryValidationResult::Fail(reason)) => format!("FAIL {reason:?}"),
+        Ok(comparison) => match comparison.result {
+            QueryValidationResult::Pass if comparison.unchecked.is_empty() => "PASS".into(),
+            // Content matched but the ORDER BY was not fully verified — named, so
+            // it does not read as a clean pass.
+            QueryValidationResult::Pass => {
+                format!("ORDER_UNCHECKED {}", comparison.unchecked.join("; "))
+            }
+            QueryValidationResult::Fail(reason) => format!("FAIL {reason:?}"),
+        },
         Err(e) => format!("COMPARE_ERR {e}"),
     }
 }

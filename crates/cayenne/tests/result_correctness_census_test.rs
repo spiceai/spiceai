@@ -73,7 +73,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use support::inventory::{InventoryEntry, build_inventory};
-use test_framework::queries::validation::has_top_level_order_by;
+use test_framework::queries::validation::{has_top_level_limit, has_top_level_order_by};
 
 /// Engines the inventory carries an exclusion field for.
 const ENGINES: [&str; 3] = ["duckdb", "sqlite", "chdb"];
@@ -261,10 +261,10 @@ fn print_comparison_cell_census() {
         counts.0 += 1;
         // Content is compared positionally only when a LIMIT makes the row set
         // itself order-dependent. Without the sort check, everything else had its
-        // order compared not at all.
-        if entry.sql.to_ascii_uppercase().contains("LIMIT")
-            || entry.sql.to_ascii_uppercase().contains("OFFSET")
-        {
+        // order compared not at all. Parser-backed, so this matches the predicate
+        // the comparison itself uses rather than a substring search that would also
+        // fire on a LIMIT inside a subquery.
+        if has_top_level_limit(&entry.sql) {
             ordered_with_limit += 1;
             counts.1 += 1;
         }

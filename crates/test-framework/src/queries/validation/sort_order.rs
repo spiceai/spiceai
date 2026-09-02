@@ -30,23 +30,42 @@ limitations under the License.
 //! an `ORDER BY` on a non-unique key leaves the relative order of tied rows
 //! engine-dependent, and tied rows never violate the check below.
 //!
-//! Two deliberate limits, both of which report themselves rather than passing
-//! silently (see [`SortCheck::Skipped`]):
+//! # What goes unverified, and why it is reported
 //!
-//! - **`NULL` placement is not checked.** Engines disagree on where `NULL`s sort
-//!   absent an explicit `NULLS FIRST`/`NULLS LAST` — `DataFusion` and `PostgreSQL`
-//!   put them last for `ASC`, `SQLite` puts them first — so once a key column
-//!   holds a `NULL` on either side of a row pair, that pair is left unchecked.
-//!   Later key columns are not consulted for it either: SQL never reaches them
-//!   once an earlier column separates two rows.
-//! - **Only keys that map onto output columns are checked.** An `ORDER BY` over
-//!   an expression absent from the projection resolves to
-//!   [`SortKeyResolution::Unresolved`].
+//! Anything this module cannot check surfaces as [`SortCheck::Skipped`] or
+//! [`SortCheck::PartiallyOrdered`] rather than as a silent success, because a
+//! coverage hole that reads as a pass is the failure mode this whole check
+//! exists to remove. Callers must keep that distinction: see
+//! [`super::compare_query_result_batches_with_sort_check`], which returns the
+//! reasons rather than folding them into `Pass`.
+//!
+//! - **`NULL` placement, unless the query states it.** Engines disagree on where
+//!   `NULL`s sort absent an explicit `NULLS FIRST`/`NULLS LAST` — `DataFusion`
+//!   and `PostgreSQL` put them last for `ASC`, `SQLite` puts them first. So when
+//!   exactly one side of a row pair is `NULL` and the query did not say, that
+//!   pair's relative order is not judged. When the query *does* say, the stated
+//!   placement is enforced like any other key.
+//!
+//!   Two rows that are **both** `NULL` in a key column are tied under every
+//!   convention, so the check continues to the next key column for them, exactly
+//!   as SQL requires.
+//!
+//!   Leaving a pair unjudged would still hide an inversion straddling a `NULL`
+//!   (`[2, NULL, 1]` is illegal under either convention), so the *leading* key
+//!   column's non-`NULL` values are additionally checked as a subsequence. Only
+//!   the leading column: a later one orders rows within a tie of the columns
+//!   before it, so `ORDER BY cnt, state` may legally step `state` backwards the
+//!   moment `cnt` changes.
+//! - **Terms that do not map onto an output column.** `ORDER BY` over an
+//!   expression absent from the projection cannot be located in the result. The
+//!   mappable leading terms are still checked and the rest is named — dropping a
+//!   whole key because its second term is a `CASE` would leave the first term
+//!   unverified for no reason.
 
 use std::cmp::Ordering;
 
 use anyhow::Result;
-use arrow::array::{Array, RecordBatch, make_comparator};
+use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::sqlparser::ast::{
@@ -66,6 +85,9 @@ pub struct SortKeyColumn {
     pub name: String,
     /// `true` for `DESC`.
     pub descending: bool,
+    /// `Some` when the query states `NULLS FIRST`/`NULLS LAST`, which makes the
+    /// placement part of the requested order; `None` leaves it to the engine.
+    pub nulls_first: Option<bool>,
 }
 
 /// Outcome of mapping a query's top-level `ORDER BY` onto its result columns.
@@ -73,10 +95,14 @@ pub struct SortKeyColumn {
 pub enum SortKeyResolution {
     /// No top-level `ORDER BY`: the engine may return rows in any order.
     Unordered,
-    /// The `ORDER BY` maps onto these result columns, in significance order.
-    Resolved(Vec<SortKeyColumn>),
-    /// A top-level `ORDER BY` is present but did not map onto result columns.
-    /// Row order goes unchecked; `reason` says why so the hole stays countable.
+    /// The leading `key` terms map onto result columns, in significance order.
+    /// `unresolved_suffix` names the first term that did not map, if any; the
+    /// terms from there on go unchecked.
+    Resolved {
+        key: Vec<SortKeyColumn>,
+        unresolved_suffix: Option<String>,
+    },
+    /// Not even the first term mapped onto a result column.
     Unresolved { reason: String },
 }
 
@@ -96,12 +122,27 @@ pub struct SortOrderViolation {
 /// Result of checking one engine's rows against its own `ORDER BY`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SortCheck {
-    /// Rows are ordered per the resolved key.
+    /// Every `ORDER BY` term was verified.
     Ordered,
+    /// The terms that could be located were verified; `unchecked` names what
+    /// could not be. Not a clean pass — a partial one, reported as such.
+    PartiallyOrdered { unchecked: String },
+    /// Nothing was verified. Not a pass — a hole, named so it can be counted.
+    Skipped { reason: String },
     /// A row sorts before its predecessor.
     Violation(SortOrderViolation),
-    /// The check did not run. Not a pass — a hole, named so it can be counted.
-    Skipped { reason: String },
+}
+
+impl SortCheck {
+    /// The coverage hole this outcome represents, if any.
+    #[must_use]
+    pub fn unchecked_reason(&self) -> Option<&str> {
+        match self {
+            Self::PartiallyOrdered { unchecked } => Some(unchecked.as_str()),
+            Self::Skipped { reason } => Some(reason.as_str()),
+            Self::Ordered | Self::Violation(_) => None,
+        }
+    }
 }
 
 /// Parse `sql` and map its top-level `ORDER BY` onto the columns of `schema`.
@@ -117,19 +158,27 @@ pub fn resolve_sort_key(sql: &str, schema: &SchemaRef) -> SortKeyResolution {
             reason: "SQL did not parse as a single statement".to_string(),
         };
     };
+    resolve_statement_sort_key(&statement, schema)
+}
+
+/// Same as [`resolve_sort_key`] for a statement already parsed, so a caller
+/// checking both sides of a comparison parses the SQL once rather than per side.
+#[must_use]
+pub fn resolve_statement_sort_key(statement: &Statement, schema: &SchemaRef) -> SortKeyResolution {
     let Statement::Query(query) = statement else {
         return SortKeyResolution::Unordered;
     };
     let Some(order_by) = query.order_by.as_ref() else {
         return SortKeyResolution::Unordered;
     };
-    resolve_order_by(order_by, &query, schema)
+    resolve_order_by(order_by, query, schema)
 }
 
 /// Try each dialect the corpus is written in; the first that yields exactly one
 /// statement wins. A query no dialect parses resolves as `Unresolved`, never as
 /// ordered.
-fn parse_one_statement(sql: &str) -> Option<Statement> {
+#[must_use]
+pub fn parse_one_statement(sql: &str) -> Option<Statement> {
     let dialects: [&dyn Dialect; 2] = [&PostgreSqlDialect {}, &GenericDialect {}];
     for dialect in dialects {
         if let Ok(mut statements) = Parser::parse_sql(dialect, sql)
@@ -152,23 +201,41 @@ fn resolve_order_by(order_by: &OrderBy, query: &SqlQuery, schema: &SchemaRef) ->
     }
 
     let projection = positional_projection(leftmost_projection(&query.body), schema);
-    let mut key = Vec::with_capacity(terms.len());
+    let mut key: Vec<SortKeyColumn> = Vec::with_capacity(terms.len());
+    let mut unresolved_suffix: Option<String> = None;
     for term in terms {
+        // Stop at the first term that cannot be located, keeping the prefix: a
+        // violation on the prefix is a real violation, and the terms after it are
+        // only ever consulted once the prefix ties.
         let Some(index) = resolve_term(&term.expr, projection, schema) else {
-            return SortKeyResolution::Unresolved {
-                reason: format!(
-                    "ORDER BY term '{}' does not map to a result column",
+            unresolved_suffix = Some(match key.last() {
+                Some(last) => format!(
+                    "verified through '{}'; ORDER BY term '{}' does not map to a result column, so it and any term after it are unchecked",
+                    last.name, term.expr
+                ),
+                None => format!(
+                    "nothing about the row order was verified: the first ORDER BY term '{}' does not map to a result column",
                     term.expr
                 ),
-            };
+            });
+            break;
         };
         key.push(SortKeyColumn {
             index,
             name: schema.field(index).name().clone(),
             descending: term.options.asc == Some(false),
+            nulls_first: term.options.nulls_first,
         });
     }
-    SortKeyResolution::Resolved(key)
+
+    match (key.is_empty(), unresolved_suffix) {
+        (true, Some(reason)) => SortKeyResolution::Unresolved { reason },
+        (true, None) => SortKeyResolution::Unordered,
+        (false, unresolved_suffix) => SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        },
+    }
 }
 
 /// Projection of the leftmost `SELECT` in a set expression. A top-level
@@ -264,7 +331,7 @@ fn alias_index(items: &[SelectItem], name: &str) -> Option<usize> {
 /// Rendering both through the parser's own `Display` normalizes the source
 /// text's whitespace and casing of keywords.
 fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
-    let wanted = expr.to_string().to_ascii_lowercase();
+    let wanted = expr.to_string();
     items.iter().position(|item| {
         let (SelectItem::UnnamedExpr(projected)
         | SelectItem::ExprWithAlias {
@@ -273,7 +340,7 @@ fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
         else {
             return false;
         };
-        projected.to_string().to_ascii_lowercase() == wanted
+        projected.to_string().eq_ignore_ascii_case(&wanted)
     })
 }
 
@@ -287,25 +354,56 @@ fn value_string(array: &dyn Array, index: usize) -> String {
     }
 }
 
+/// One key column's array plus the comparators used to judge it.
+struct KeyComparator<'a> {
+    column: &'a SortKeyColumn,
+    array: &'a ArrayRef,
+    /// Honors the query's `NULLS FIRST`/`NULLS LAST` when it stated one.
+    compare: arrow::array::DynComparator,
+}
+
+fn violation(
+    column: &SortKeyColumn,
+    array: &dyn Array,
+    previous_row: usize,
+    row: usize,
+) -> SortCheck {
+    SortCheck::Violation(SortOrderViolation {
+        column: column.name.clone(),
+        row_number: row + 1,
+        previous: value_string(array, previous_row),
+        current: value_string(array, row),
+    })
+}
+
 /// Verify `batches` are ordered by `key`.
 ///
 /// Ties are legal: an `ORDER BY` on a non-unique key leaves the relative order
 /// of equal rows engine-dependent, so only a row that sorts strictly *before*
-/// its predecessor is a violation. Row pairs where either side of a key column
-/// is `NULL` are treated as tied — see the module docs.
+/// its predecessor is a violation. See the module docs for how `NULL`s are
+/// treated.
 ///
 /// # Errors
 /// Returns an error if the batches cannot be concatenated.
 pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<SortCheck> {
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(SortCheck::Ordered);
+    };
+    let batch = arrow::compute::concat_batches(&schema, batches)?;
+    verify_sorted_batch(&batch, key)
+}
+
+/// [`verify_sorted`] over an already-concatenated batch, so a caller that has
+/// one does not copy the result set again.
+///
+/// # Errors
+/// Returns an error if a key column's comparator cannot be built.
+pub fn verify_sorted_batch(batch: &RecordBatch, key: &[SortKeyColumn]) -> Result<SortCheck> {
     if key.is_empty() {
         return Ok(SortCheck::Skipped {
             reason: "empty sort key".to_string(),
         });
     }
-    let Some(schema) = batches.first().map(RecordBatch::schema) else {
-        return Ok(SortCheck::Ordered);
-    };
-    let batch = arrow::compute::concat_batches(&schema, batches)?;
     if batch.num_rows() < 2 {
         return Ok(SortCheck::Ordered);
     }
@@ -323,10 +421,16 @@ pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<S
         };
         let options = SortOptions {
             descending: column.descending,
-            nulls_first: false,
+            // Only consulted for a pair the query pinned with NULLS FIRST/LAST;
+            // otherwise such pairs are skipped before the comparator is called.
+            nulls_first: column.nulls_first.unwrap_or(false),
         };
         match make_comparator(array.as_ref(), array.as_ref(), options) {
-            Ok(compare) => comparators.push((column, array, compare)),
+            Ok(compare) => comparators.push(KeyComparator {
+                column,
+                array,
+                compare,
+            }),
             Err(e) => {
                 return Ok(SortCheck::Skipped {
                     reason: format!(
@@ -339,34 +443,80 @@ pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<S
         }
     }
 
-    for row in 1..batch.num_rows() {
-        for (column, array, compare) in &comparators {
-            // A `NULL` on either side of this column decides the pair's order in a
-            // way the engine chose (`NULLS FIRST`/`NULLS LAST`), so stop rather
-            // than falling through to the next column: under SQL the later
-            // columns are never consulted once an earlier one separates two rows,
-            // and reading them anyway reports a violation on a correctly ordered
-            // result. TPC-DS q71 sorts on a `SUM` that is `NULL` for nine rows,
-            // and comparing the tiebreaker across that boundary flags it.
-            if array.is_null(row - 1) || array.is_null(row) {
+    if let Some(found) = check_adjacent_rows(batch.num_rows(), &comparators) {
+        return Ok(found);
+    }
+    if let Some(found) = check_non_null_subsequences(batch.num_rows(), &comparators) {
+        return Ok(found);
+    }
+    Ok(SortCheck::Ordered)
+}
+
+/// The ordinary walk: each row against the one before it, most significant key
+/// column first.
+fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
+    for row in 1..rows {
+        for KeyComparator {
+            column,
+            array,
+            compare,
+        } in comparators
+        {
+            let previous_null = array.is_null(row - 1);
+            let current_null = array.is_null(row);
+            // Both NULL is a tie under every convention, so SQL requires the next
+            // key column to decide — keep going rather than accepting the pair.
+            if previous_null && current_null {
+                continue;
+            }
+            // Exactly one NULL, and the query did not pin the placement: this
+            // column decides the pair in an engine-specific way, so neither judge
+            // it nor consult the later columns SQL would never reach.
+            if (previous_null || current_null) && column.nulls_first.is_none() {
                 break;
             }
             match compare(row - 1, row) {
                 Ordering::Less => break,
                 Ordering::Equal => {}
-                Ordering::Greater => {
-                    return Ok(SortCheck::Violation(SortOrderViolation {
-                        column: column.name.clone(),
-                        row_number: row + 1,
-                        previous: value_string(array.as_ref(), row - 1),
-                        current: value_string(array.as_ref(), row),
-                    }));
-                }
+                Ordering::Greater => return Some(violation(column, array.as_ref(), row - 1, row)),
             }
         }
     }
+    None
+}
 
-    Ok(SortCheck::Ordered)
+/// Adjacent pairs alone cannot see an inversion that straddles an unjudged
+/// `NULL`: `[2, NULL, 1]` skips both pairs while being illegal under either
+/// placement convention. Comparing each key column's non-`NULL` values against
+/// the previous non-`NULL` value catches that without taking a position on where
+/// `NULL`s belong.
+fn check_non_null_subsequences(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
+    // Only the most significant column is constrained across the whole result.
+    // A later key column orders rows only *within* a tie of the columns before
+    // it, so checking one globally would reject correct results — `ORDER BY cnt,
+    // state` may legally step state backwards the moment cnt changes.
+    let KeyComparator {
+        column,
+        array,
+        compare,
+    } = comparators.first()?;
+    if !(0..rows).any(|row| array.is_null(row)) {
+        // No NULLs, so no pair went unjudged and the adjacent walk covered it.
+        return None;
+    }
+    let mut previous: Option<usize> = None;
+    for row in 0..rows {
+        if array.is_null(row) {
+            continue;
+        }
+        if let Some(previous_row) = previous
+            && compare(previous_row, row) == Ordering::Greater
+        {
+            return Some(violation(column, array.as_ref(), previous_row, row));
+        }
+        previous = Some(row);
+    }
+    None
 }
 
 /// Whether `sql` carries a top-level `ORDER BY`, i.e. whether the order of its
@@ -377,14 +527,36 @@ pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<S
 /// for `ORDER BY` counts all three.
 #[must_use]
 pub fn has_top_level_order_by(sql: &str) -> bool {
-    match parse_one_statement(sql) {
-        Some(Statement::Query(query)) => match query.order_by.as_ref().map(|o| &o.kind) {
-            Some(OrderByKind::Expressions(terms)) => !terms.is_empty(),
-            Some(OrderByKind::All(_)) => true,
-            None => false,
-        },
-        _ => false,
+    parse_one_statement(sql).is_some_and(|statement| statement_has_top_level_order_by(&statement))
+}
+
+fn statement_has_top_level_order_by(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    match query.order_by.as_ref().map(|o| &o.kind) {
+        Some(OrderByKind::Expressions(terms)) => !terms.is_empty(),
+        Some(OrderByKind::All(_)) => true,
+        None => false,
     }
+}
+
+/// Whether `sql` carries a top-level `LIMIT`/`OFFSET`/`FETCH`, i.e. whether the
+/// *set* of returned rows depends on the order.
+///
+/// Parser-backed for the same reason as [`has_top_level_order_by`]: a `LIMIT`
+/// inside a subquery does not make the outer result order-dependent, and a
+/// substring search cannot tell the two apart.
+#[must_use]
+pub fn has_top_level_limit(sql: &str) -> bool {
+    parse_one_statement(sql).is_some_and(|statement| statement_has_top_level_limit(&statement))
+}
+
+fn statement_has_top_level_limit(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    query.limit_clause.is_some() || query.fetch.is_some()
 }
 
 /// Resolve `sql`'s `ORDER BY` against `batches` and verify they honor it.
@@ -395,9 +567,53 @@ pub fn check_sort_order(sql: &str, batches: &[RecordBatch]) -> Result<SortCheck>
     let Some(schema) = batches.first().map(RecordBatch::schema) else {
         return Ok(SortCheck::Ordered);
     };
+    let batch = arrow::compute::concat_batches(&schema, batches)?;
     match resolve_sort_key(sql, &schema) {
         SortKeyResolution::Unordered => Ok(SortCheck::Ordered),
         SortKeyResolution::Unresolved { reason } => Ok(SortCheck::Skipped { reason }),
-        SortKeyResolution::Resolved(key) => verify_sorted(batches, &key),
+        SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        } => Ok(finish_sort_check(
+            verify_sorted_batch(&batch, &key)?,
+            unresolved_suffix,
+        )),
+    }
+}
+
+/// Fold a partially resolved key's unchecked suffix into an otherwise clean
+/// result, so the hole travels with the outcome instead of being dropped.
+fn finish_sort_check(check: SortCheck, unresolved_suffix: Option<String>) -> SortCheck {
+    match (check, unresolved_suffix) {
+        (SortCheck::Ordered, Some(unchecked)) => SortCheck::PartiallyOrdered { unchecked },
+        (check, _) => check,
+    }
+}
+
+/// [`check_sort_order`] for a caller that already parsed the SQL and
+/// concatenated the rows, so neither is repeated per side of a comparison.
+///
+/// # Errors
+/// Returns an error if a key column's comparator cannot be built.
+pub fn check_sort_order_parsed(
+    statement: Option<&Statement>,
+    batch: &RecordBatch,
+) -> Result<SortCheck> {
+    let Some(statement) = statement else {
+        return Ok(SortCheck::Skipped {
+            reason: "SQL did not parse as a single statement".to_string(),
+        });
+    };
+    let schema = batch.schema();
+    match resolve_statement_sort_key(statement, &schema) {
+        SortKeyResolution::Unordered => Ok(SortCheck::Ordered),
+        SortKeyResolution::Unresolved { reason } => Ok(SortCheck::Skipped { reason }),
+        SortKeyResolution::Resolved {
+            key,
+            unresolved_suffix,
+        } => Ok(finish_sort_check(
+            verify_sorted_batch(batch, &key)?,
+            unresolved_suffix,
+        )),
     }
 }

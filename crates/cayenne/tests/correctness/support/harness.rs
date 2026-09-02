@@ -16,9 +16,10 @@
 //! actual returned batches with the shipped validation path.
 //!
 //! Callers (integration tests) must not re-implement comparison or eyeball
-//! logs. The only content check is
-//! [`test_framework::queries::validation::compare_query_result_batches`] via
-//! [`super::compare_results`].
+//! logs. The only check is
+//! [`test_framework::queries::validation::compare_query_result_batches_with_sort_check`]
+//! via [`super::compare_results`], which compares content *and* verifies each
+//! side honors the query's own `ORDER BY`.
 
 use arrow::array::RecordBatch;
 use test_framework::queries::Query;

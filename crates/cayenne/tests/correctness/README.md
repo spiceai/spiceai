@@ -136,16 +136,40 @@ It stays deliberately narrow where engines legitimately differ:
 - **Tied rows are never a violation.** An `ORDER BY` on a non-unique key leaves
   the order of equal rows engine-dependent; only a row that sorts strictly
   *before* its predecessor fails.
-- **`NULL` placement is not policed.** DataFusion and PostgreSQL sort `NULL`s last
-  for `ASC`, SQLite sorts them first, so a key pair involving a `NULL` is treated
-  as tied.
-- **An `ORDER BY` that does not map onto an output column is reported, not
-  passed.** `SortCheck::Skipped` names the reason so the hole stays countable
-  rather than reading as a pass.
+- **`NULL` placement is not policed unless the query states it.** DataFusion and
+  PostgreSQL sort `NULL`s last for `ASC`, SQLite sorts them first, so a pair with
+  a `NULL` on exactly one side is left unjudged. An explicit `NULLS FIRST` /
+  `NULLS LAST` makes the placement part of the requested order, and is enforced.
+
+  Two rows that are **both** `NULL` in a key column are tied under every
+  convention, so the check continues to the next key column for them, as SQL
+  requires. And because leaving a pair unjudged would hide an inversion that
+  straddles a `NULL` — `[2, NULL, 1]` is illegal either way — the leading key
+  column's non-`NULL` values are also checked as a subsequence. Only the leading
+  one: a later column orders rows within a tie of those before it, so
+  `ORDER BY cnt, state` may legally step `state` backwards when `cnt` changes.
+- **A term that maps to no output column does not sink the whole key.** The
+  mappable leading terms are still verified and the rest is named, so an
+  `ORDER BY a, CASE …, b` still enforces `a`.
 
 An `ORDER BY` inside a subquery, a CTE, or a window frame does not constrain the
 result and is not read as a sort key — the check parses the statement rather than
-searching for the text.
+searching for the text. The same parser decides whether a `LIMIT` is top-level,
+which is what selects positional vs multiset content comparison.
+
+### An unverified order is reported, never passed
+
+`compare_query_result_batches_with_sort_check` returns
+`SortCheckedComparison { result, unchecked }`. Anything the check could not
+cover — an unparseable statement, a term that maps to no output column, a key
+type with no comparator — lands in `unchecked` rather than folding into `Pass`.
+The Cayenne harness turns that into `ParityOutcome::OrderUnchecked`, which
+`report.rs` and `summary_line` count in their own bucket.
+
+That distinction is the whole point: a coverage hole that reads as a pass is the
+failure this check exists to remove, so it must not be reintroduced by the check
+itself. A caller that ignores `unchecked` is back to reporting unverified order
+as verified.
 
 ## Who compares results?
 
