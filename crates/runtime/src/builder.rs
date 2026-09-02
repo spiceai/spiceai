@@ -101,6 +101,11 @@ const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memor
 const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
 const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
 const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
+/// Largest sort-merge memory-pool fraction the planner can act on: a gate above
+/// the whole pool would admit a build side larger than the pool itself. `0` is a
+/// supported setting at the low end — it disables the memory gate — so only this
+/// upper bound is enforced on admission.
+const MAX_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 1.0;
 
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
@@ -398,10 +403,8 @@ impl RuntimeBuilder {
             CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
             cayenne_sort_merge_min_rows,
         );
-        let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
-            &spicepod_rt.params,
-            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
-        );
+        let cayenne_sort_merge_memory_pool_fraction =
+            resolve_cayenne_sort_merge_memory_pool_fraction(&spicepod_rt.params);
         log_applied_cayenne_param(
             CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
             cayenne_sort_merge_memory_pool_fraction,
@@ -1862,6 +1865,42 @@ fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
         );
     }
     clamped
+}
+
+/// Resolve the sort-merge memory-pool fraction a spicepod requested into the
+/// one the planner will act on. Composed as a single function so the value
+/// [`log_applied_cayenne_param`] reports and the value that reaches the planner
+/// cannot drift apart at the call site.
+fn resolve_cayenne_sort_merge_memory_pool_fraction(
+    params: &HashMap<String, String>,
+) -> Option<f64> {
+    parse_f64_runtime_param(params, CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM)
+        .map(clamp_cayenne_sort_merge_memory_pool_fraction)
+}
+
+/// Clamp the sort-merge memory-pool fraction to the range the planner acts on,
+/// so [`log_applied_cayenne_param`] reports the threshold actually in force
+/// rather than the requested one.
+///
+/// Only the upper bound is enforced. `0` disables the memory gate and is a
+/// supported setting, so it must not be raised, and
+/// [`parse_f64_runtime_param`] has already rejected negative values before one
+/// reaches here. Any other value passes through untouched — including `NaN`,
+/// which the parser also rejects but which the planner treats as "no gate":
+/// clamping it to the pool here would contradict that, so this returns it
+/// unchanged and leaves the decision where it already lives.
+///
+/// The planner keeps its own clamp on this fraction for callers that build a
+/// `CayenneOptimizerConfig` directly and so never pass through this admission
+/// point; this is an addition to that, not a replacement for it.
+fn clamp_cayenne_sort_merge_memory_pool_fraction(value: f64) -> f64 {
+    if value > MAX_SORT_MERGE_MEMORY_POOL_FRACTION {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM}={value} is outside the supported range [0, {MAX_SORT_MERGE_MEMORY_POOL_FRACTION}]; using {MAX_SORT_MERGE_MEMORY_POOL_FRACTION}"
+        );
+        return MAX_SORT_MERGE_MEMORY_POOL_FRACTION;
+    }
+    value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3452,6 +3491,151 @@ mod test {
         assert_eq!(
             util::levenshtein::closest_match("totally_unrelated_key", &known),
             None,
+        );
+    }
+
+    /// The value reported as applied must be the one the planner acts on. The
+    /// planner gates at `sort_merge_memory_pool_fraction.min(1.0)`, so a
+    /// requested fraction above 1.0 has to be clamped before it is logged —
+    /// otherwise startup diagnostics name a threshold that is not in force and
+    /// an operator has no way to read the effective one. Regression test for
+    /// spiceai/spiceai#13157.
+    #[test]
+    fn resolve_cayenne_sort_merge_memory_pool_fraction_reports_the_effective_value() {
+        let resolve = |raw: &str| {
+            resolve_cayenne_sort_merge_memory_pool_fraction(&HashMap::from([(
+                CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM.to_string(),
+                raw.to_string(),
+            )]))
+        };
+
+        assert_eq!(
+            resolve("4.0"),
+            Some(1.0),
+            "a fraction above the pool must resolve to the whole pool, which is what the planner gates on"
+        );
+        assert_eq!(
+            resolve("0.125"),
+            Some(0.125),
+            "a fraction inside the supported range must pass through untouched"
+        );
+        assert_eq!(
+            resolve("0"),
+            Some(0.0),
+            "0 disables the memory gate and is a supported setting, so it must not be clamped up"
+        );
+        assert_eq!(
+            resolve("-1"),
+            None,
+            "a negative fraction is rejected on parse and leaves the default in force"
+        );
+        assert_eq!(
+            resolve("inf"),
+            None,
+            "a non-finite fraction is rejected on parse; the planner keeps its own clamp for direct callers"
+        );
+        assert_eq!(
+            resolve_cayenne_sort_merge_memory_pool_fraction(&HashMap::new()),
+            None,
+            "an unset param must not log an applied value"
+        );
+    }
+
+    /// Observe the line an operator actually reads. Captures the `tracing`
+    /// output of the admission path for a requested fraction of 4.0: the
+    /// "applied" line must name 1, and the out-of-range value must be called
+    /// out rather than silently swallowed.
+    #[test]
+    fn an_out_of_range_sort_merge_fraction_is_logged_as_clamped() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        let params = HashMap::from([(
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM.to_string(),
+            "4.0".to_string(),
+        )]);
+        tracing::subscriber::with_default(subscriber, || {
+            let resolved = resolve_cayenne_sort_merge_memory_pool_fraction(&params);
+            log_applied_cayenne_param(
+                CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+                resolved,
+            );
+        });
+
+        let logged = String::from_utf8(
+            sink.0
+                .lock()
+                .expect("capture buffer poisoned")
+                .clone(),
+        )
+        .expect("captured log is not valid UTF-8");
+
+        assert!(
+            logged.contains(
+                "Cayenne runtime tunable applied: runtime.params.cayenne_sort_merge_memory_pool_fraction=1"
+            ),
+            "the applied line must name the effective fraction; got: {logged}"
+        );
+        // Scoped to the "applied" line on purpose: the range warning legitimately
+        // quotes the requested `…fraction=4`, and a WARN is captured by an
+        // INFO-level subscriber, so a bare substring check here would contradict
+        // the assertion below.
+        assert!(
+            !logged.contains(
+                "Cayenne runtime tunable applied: runtime.params.cayenne_sort_merge_memory_pool_fraction=4"
+            ),
+            "the requested-but-unused fraction must not be reported as applied; got: {logged}"
+        );
+        assert!(
+            logged.contains("is outside the supported range [0, 1]"),
+            "an out-of-range fraction must be called out; got: {logged}"
+        );
+    }
+
+    /// The clamp is also reachable directly, so pin the edges it is documented
+    /// to leave alone — in particular `NaN`, which the planner reads as "no
+    /// gate" and which must therefore not be clamped up to the whole pool.
+    #[test]
+    fn test_clamp_cayenne_sort_merge_memory_pool_fraction() {
+        for (input, expected) in [(0.0, 0.0), (0.125, 0.125), (1.0, 1.0), (4.0, 1.0)] {
+            let actual = clamp_cayenne_sort_merge_memory_pool_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
+        assert!(
+            clamp_cayenne_sort_merge_memory_pool_fraction(f64::NAN).is_nan(),
+            "NaN must pass through so the planner's own 'no gate' handling still applies"
+        );
+        assert!(
+            (clamp_cayenne_sort_merge_memory_pool_fraction(f64::INFINITY) - 1.0).abs()
+                < f64::EPSILON,
+            "an infinite fraction must clamp to the whole pool"
         );
     }
 
