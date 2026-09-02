@@ -90,7 +90,11 @@ jobs:
           else
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:openapi/${GITHUB_RUN_ID}
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:openapi/${GITHUB_RUN_ID}
             gh pr create \
               --title "Update openapi.json" \
               --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
@@ -100,3 +104,6 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
