@@ -30376,6 +30376,28 @@ impl CayenneTableProvider {
     /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
     /// `InlineMutationPolicy`, so its table can hold one. That caller checks
     /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
+    /// Materialize the in-memory CDC tier before a scanning delete, the way
+    /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
+    /// inline corpus: the deletion-vector sink scans durable tiers only. The
+    /// caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock` itself
+    /// (the `write -> mem` order every other holder settles on). A no-op when the
+    /// tier is empty, and — like every checkpoint — in memory-resident mode, where
+    /// the tier is the permanent store.
+    async fn checkpoint_mem_tier_if_present_for_delete(&self) -> datafusion_common::Result<()> {
+        if self.mem_tier.is_empty() {
+            return Ok(());
+        }
+        self.checkpoint_mem_tier_holding_write_lock()
+            .await
+            .map(|_rows| ())
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to delete from dataset {}: could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
         let inlined_count = self.cached_inlined_row_count();
 
@@ -33467,6 +33489,22 @@ impl TableProvider for CayenneTableProvider {
             }
 
             return self.delete_using_deletion_vectors(&filters).await;
+        }
+
+        // Key-based deletion-vector path. The sink scans main, the protected
+        // snapshots and the cold tier — every durable tier — and never the
+        // in-memory CDC tier, and its liveness probe reads the durable deletion
+        // index alone. A predicate that matches only a RAM-resident row would
+        // leave it alive, and one that matches the durable version an
+        // un-checkpointed upsert has superseded would tombstone the KEY and take
+        // the live RAM replacement with it — the shape #13574 closed for protected
+        // snapshots, one tier over. Materialize the tier first, under `write_lock`
+        // so no CDC apply lands between the checkpoint and the scan-source capture
+        // below, exactly as the two branches above materialize inline rows. Once
+        // durable, the rows are subject to the sink's own tier-aware liveness rule.
+        {
+            let _guard = self.write_lock.lock().await;
+            self.checkpoint_mem_tier_if_present_for_delete().await?;
         }
 
         let file_sink = self
