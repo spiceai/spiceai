@@ -21,6 +21,8 @@ datasets:
         s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}
     columns:
       - name: text
+        metadata:
+          vectors: filterable
         embeddings:
           - from: potion
             row_id:

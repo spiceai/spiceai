@@ -14,6 +14,8 @@ datasets:
       mode: file
     columns:
       - name: text
+        metadata:
+          vectors: filterable
         full_text_search:
           enabled: true
           row_id:

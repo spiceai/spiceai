@@ -12,6 +12,8 @@ datasets:
       enabled: true
     columns:
       - name: text
+        metadata:
+          vectors: filterable
         embeddings:
           - from: minilm_embed
             row_id:
