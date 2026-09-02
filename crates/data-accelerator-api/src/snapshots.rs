@@ -282,11 +282,15 @@ pub async fn snapshot_before_recreate(
     }
 }
 
-/// Rejects a configuration in which two datasets snapshot to the same path.
+/// Rejects a configuration in which two snapshot-enabled components snapshot to the same
+/// path.
+///
+/// Views take part alongside datasets, so the collision is reported with each component's
+/// own label rather than calling everything a dataset.
 ///
 /// # Errors
 ///
-/// Returns [`SharedAccelerationSnapshotError`] naming the datasets that collide.
+/// Returns [`SharedAccelerationSnapshotError`] naming the components that collide.
 pub async fn validate_snapshot_paths(
     sources: Vec<Arc<dyn AccelerationSource>>,
     registry: &AcceleratorEngineRegistry,
@@ -308,10 +312,11 @@ pub async fn validate_snapshot_paths(
 
         match acceleration_file_path(source.as_ref(), registry).await {
             Ok(path) => {
-                paths
-                    .entry(path)
-                    .or_default()
-                    .push(source.name().to_string());
+                paths.entry(path).or_default().push(format!(
+                    "{} '{}'",
+                    source.component_label(),
+                    source.name()
+                ));
             }
             Err(err) => {
                 tracing::warn!(
@@ -323,9 +328,9 @@ pub async fn validate_snapshot_paths(
         }
     }
 
-    if let Some((path, datasets)) = paths.into_iter().find(|(_, ds)| ds.len() > 1) {
+    if let Some((path, components)) = paths.into_iter().find(|(_, c)| c.len() > 1) {
         return Err(SharedAccelerationSnapshotError::DuckDbSharedFile {
-            datasets: datasets.join(", "),
+            components: components.join(", "),
             path: path.display().to_string(),
         });
     }
@@ -336,35 +341,90 @@ pub async fn validate_snapshot_paths(
 #[derive(Debug, Snafu)]
 pub enum SharedAccelerationSnapshotError {
     #[snafu(display(
-        "DuckDB doesn't support snapshots for shared acceleration. \
-        Datasets [{datasets}] share the same file '{path}'. \
-        Configure datasets to point to different location using duckdb_file"
+        "DuckDB doesn't support snapshots for shared acceleration, so none of these can be \
+        snapshotted: {components} all share the acceleration file '{path}'. \
+        Give each one its own file with `duckdb_file`. \
+        See: https://spiceai.org/docs/components/data-accelerators/duckdb"
     ))]
-    DuckDbSharedFile { datasets: String, path: String },
+    DuckDbSharedFile { components: String, path: String },
 }
 
 #[derive(Debug, Snafu)]
 pub enum CayenneSnapshotValidationError {
     #[snafu(display(
-        "Cayenne datasets sharing metadata directory '{metadata_dir}' have inconsistent snapshot settings. \
-        Datasets with snapshots enabled: [{enabled_datasets}]. Datasets with snapshots disabled: [{disabled_datasets}]. \
-        All Cayenne datasets sharing the same metadata directory must have the same snapshot \
-        configuration (either all enabled or all disabled). \
+        "Cayenne components sharing the metadata directory '{metadata_dir}' disagree about \
+        snapshots, so none of them load. Snapshots enabled: {enabled_components}. \
+        Snapshots disabled: {disabled_components}. \
+        Set the same `snapshots` value on all of them, or give them separate metadata directories. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
     ))]
     InconsistentSnapshotSettings {
         metadata_dir: String,
-        enabled_datasets: String,
-        disabled_datasets: String,
+        enabled_components: String,
+        disabled_components: String,
     },
 
     #[snafu(display(
-        "Cayenne doesn't support snapshots for shared acceleration. \
-        Datasets [{datasets}] share metadata directory '{metadata_dir}'. \
-        Only single dataset per spicepod is supported when snapshots are enabled"
+        "Cayenne doesn't support snapshots for shared acceleration, so none of these can be \
+        snapshotted: {components} all share the metadata directory '{metadata_dir}'. \
+        Give each one its own metadata directory. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
     ))]
     SharedAcceleration {
         metadata_dir: String,
-        datasets: String,
+        components: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These messages are the only explanation an operator gets for a component that
+    /// refused to load, and views now reach them alongside datasets — so a reword must not
+    /// quietly go back to calling everything a dataset, drop the resource, or drop the fix.
+    #[test]
+    fn a_shared_file_names_each_component_by_its_own_label() {
+        let message = SharedAccelerationSnapshotError::DuckDbSharedFile {
+            components: "view 'orders_us', dataset 'orders'".to_string(),
+            path: "/data/accel.db".to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("view 'orders_us'") && message.contains("dataset 'orders'"),
+            "each colliding component must be named with its own label: {message}"
+        );
+        assert!(
+            !message.contains("Datasets ["),
+            "a collision involving a view must not be reported as a dataset-only problem: {message}"
+        );
+        assert!(
+            message.contains("/data/accel.db") && message.contains("duckdb_file"),
+            "the message must name the shared file and the parameter that separates them: {message}"
+        );
+    }
+
+    #[test]
+    fn inconsistent_snapshot_settings_names_both_sides_by_label() {
+        let message = CayenneSnapshotValidationError::InconsistentSnapshotSettings {
+            metadata_dir: "/data/cayenne".to_string(),
+            enabled_components: "view 'orders_us'".to_string(),
+            disabled_components: "dataset 'orders'".to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("view 'orders_us'") && message.contains("dataset 'orders'"),
+            "both sides of the disagreement must be named with their own labels: {message}"
+        );
+        assert!(
+            !message.contains("Cayenne datasets sharing"),
+            "a disagreement involving a view must not be reported as dataset-only: {message}"
+        );
+        assert!(
+            message.contains("/data/cayenne") && message.contains("snapshots"),
+            "the message must name the shared directory and the setting to align: {message}"
+        );
+    }
 }
