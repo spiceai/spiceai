@@ -30402,7 +30402,7 @@ impl CayenneTableProvider {
             .map(|_rows| ())
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to delete from dataset {}: could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
+                    "Failed to delete from dataset '{}': could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
                     self.table_metadata.table_name
                 ))
             })
@@ -33520,6 +33520,11 @@ impl TableProvider for CayenneTableProvider {
         // that lands after the capture is invisible to this delete. Nothing under
         // the sink builder takes `write_lock`, so holding it across the build
         // cannot deadlock.
+        //
+        // This lock is released before `DeletionExec` runs the sink, which takes
+        // `write_lock` again; a CDC apply between the two is still invisible to the
+        // scan sources frozen here (#13828). Closing that window means building the
+        // sink inside the execution-time critical section, not here.
         let file_sink = {
             let _guard = self.write_lock.lock().await;
             self.checkpoint_mem_tier_for_delete().await?;
