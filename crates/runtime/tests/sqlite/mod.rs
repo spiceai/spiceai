@@ -281,7 +281,19 @@ async fn sqlite_btrim_evaluates_locally() -> anyhow::Result<()> {
             let csv_path = "./test_sqlite_btrim.csv";
             std::fs::write(
                 csv_path,
-                "id,name\n1,\"  alpha  \"\n2,\"xxbetaxx\"\n3,\"  gamma\"\n",
+                concat!(
+                    "id,name\n",
+                    "1,\"  alpha  \"\n",
+                    "2,\"xxbetaxx\"\n",
+                    "3,\"  gamma\"\n",
+                    // Unicode space separators, which `btrim` does *not* strip.
+                    // Denying the call keeps evaluation local so these cannot
+                    // diverge — this pins that, and would catch a future
+                    // rewrite that federated them to a wider `trim`.
+                    "4,\"\u{a0}nbsp\u{a0}\"\n",
+                    "5,\"\u{2003}emsp\u{2003}\"\n",
+                    "6,\"\u{3000}ideo\u{3000}\"\n",
+                ),
             )?;
             defer! {
                 let _ = std::fs::remove_file(csv_path);

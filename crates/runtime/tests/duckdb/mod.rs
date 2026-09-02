@@ -422,7 +422,27 @@ async fn duckdb_btrim_pushdown() -> Result<(), String> {
             // Quoted so the CSV reader keeps the padding that makes `trim`
             // observable, and one row padded with `x` rather than spaces so the
             // two-argument character-set form has something to strip.
-            let csv_contents = "name\n\"  alpha  \"\n\"xxbetaxx\"\n\"  gamma\"\n\"delta\"\n\"\"\n";
+            //
+            // The last three rows are padded with Unicode space *separators*
+            // (U+00A0, U+2003, U+3000) rather than the ASCII space, and they are
+            // the rows that matter most here: `btrim` strips only the ASCII
+            // space, while DuckDB's bare unary `trim` strips the whole Zs
+            // category. With those rows absent, a rewrite to `trim(x)` passes
+            // every assertion below while answering differently from local
+            // evaluation in production. The tab row pins the other side of that
+            // boundary — DuckDB leaves it alone, so both engines must.
+            let csv_contents = concat!(
+                "name\n",
+                "\"  alpha  \"\n",
+                "\"xxbetaxx\"\n",
+                "\"  gamma\"\n",
+                "\"delta\"\n",
+                "\"\"\n",
+                "\"\u{a0}nbsp\u{a0}\"\n",
+                "\"\u{2003}emsp\u{2003}\"\n",
+                "\"\u{3000}ideo\u{3000}\"\n",
+                "\"\ttab\t\"\n",
+            );
             let temp_file = NamedTempFile::new().expect("Should create temp file");
             std::fs::write(temp_file.path(), csv_contents).expect("failed to write sample file");
             let path = format!("'{}'", temp_file.path().display());

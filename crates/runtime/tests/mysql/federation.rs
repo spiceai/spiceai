@@ -381,7 +381,7 @@ async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<()
                     .await?;
                     assert_eq!(
                         rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                        3,
+                        6,
                         "`{projection}` on `{table}` returned the wrong number of rows"
                     );
                 }
@@ -465,7 +465,12 @@ async fn init_trim_table(port: u16) -> Result<(), anyhow::Error> {
         .await?;
     let _: Vec<Row> = conn
         .exec(
-            "INSERT INTO trim_src VALUES (1, '  alpha  '), (2, 'xxbetaxx'), (3, '  gamma')",
+            // Rows 4-6 are padded with Unicode space *separators*, which
+            // `btrim` does not strip. Denying the call keeps evaluation local so
+            // they cannot diverge; the fixture pins that, and would catch a
+            // future rewrite that federated them to a wider remote `trim`.
+            "INSERT INTO trim_src VALUES (1, '  alpha  '), (2, 'xxbetaxx'), (3, '  gamma'), \
+             (4, '\u{a0}nbsp\u{a0}'), (5, '\u{2003}emsp\u{2003}'), (6, '\u{3000}ideo\u{3000}')",
             Params::Empty,
         )
         .await?;

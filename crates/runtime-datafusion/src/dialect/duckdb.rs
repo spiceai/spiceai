@@ -229,19 +229,38 @@ pub(crate) fn rand_to_random(
 /// query with `Catalog Error: Scalar Function with name btrim does not exist!`
 /// (issue #13794).
 ///
-/// `DuckDB`'s `trim` is the same function: one argument strips spaces from both
-/// ends, and two treats the second as the *set* of characters to strip, which
-/// is what `btrim`'s `TrimBoth` kernel does. Any other arity is not a call this
-/// can render, so it is left to evaluate locally.
+/// `DuckDB`'s two-argument `trim` is the same function: the second argument is
+/// the *set* of characters to strip from both ends, which is what `btrim`'s
+/// `TrimBoth` kernel does.
+///
+/// **The one-argument form is rendered as `trim(arg, ' ')`, not `trim(arg)`.**
+/// The bare unary calls are *not* the same function: `DataFusion` strips the
+/// ASCII space and nothing else (`general_trim` dispatches to
+/// `trim_ascii_char(s, b' ')`), while `DuckDB`'s unary `trim` strips every
+/// Unicode space separator. On `DuckDB` 1.4.4, `length(trim(x))` over values
+/// padded with U+00A0, U+2003 and U+3000 answers 1 where the kernel answers 3 —
+/// so the bare rename would have replaced issue #13794's loud error with
+/// silently different rows depending on whether the call federated, which is
+/// worse than the error. Naming the character set explicitly pins `DuckDB` to
+/// the one character the kernel removes. (A tab agrees either way: `DuckDB`
+/// trims the Zs category, not all whitespace.)
+///
+/// `btrim` admits no arity other than one or two, so anything else is left to
+/// evaluate locally rather than rendered.
 pub(crate) fn btrim_to_trim(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    if args.is_empty() || args.len() > 2 {
-        return Ok(None);
-    }
+    let call = match args {
+        [arg] => unparser.scalar_function_to_sql(
+            "trim",
+            &[arg.clone(), Expr::Literal(ScalarValue::from(" "), None)],
+        )?,
+        [_, _] => unparser.scalar_function_to_sql("trim", args)?,
+        _ => return Ok(None),
+    };
 
-    Ok(Some(unparser.scalar_function_to_sql("trim", args)?))
+    Ok(Some(call))
 }
 
 pub(super) enum DuckDBRegexpFunction {
@@ -629,6 +648,11 @@ mod tests {
             spans: Spans::new(),
         });
 
+        // The one-argument form must name the character set. A bare
+        // `trim("t"."name")` would let DuckDB strip every Unicode space
+        // separator where the kernel strips only the ASCII space, so it would
+        // answer differently for a value padded with U+00A0, U+2003 or U+3000
+        // depending on whether the call federated.
         let one_arg = dialect
             .scalar_function_to_sql_overrides(
                 &unparser,
@@ -637,10 +661,11 @@ mod tests {
             )
             .expect("btrim renders")
             .expect("the dialect has a handler registered for btrim");
-        assert_eq!(one_arg.to_string(), r#"trim("t"."name")"#);
+        assert_eq!(one_arg.to_string(), r#"trim("t"."name", ' ')"#);
 
         // Two arguments: DuckDB's `trim` takes the same character *set* second
-        // argument that `btrim`'s TrimBoth kernel strips.
+        // argument that `btrim`'s TrimBoth kernel strips, so it passes straight
+        // through.
         let two_args = dialect
             .scalar_function_to_sql_overrides(
                 &unparser,
