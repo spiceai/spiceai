@@ -223,6 +223,10 @@ impl CatalogConnector for AdbcCatalog {
 /// Public so `connector-adbc`'s regression tests can drive it: the in-process
 /// stub ADBC driver they need already lives there, and duplicating it here would
 /// cost more than the visibility does.
+///
+/// The `CancellableStatement` bound is what `ADBCPool` and `AdbcTableFactory`
+/// themselves require: an abandoned query is cancelled through the statement, so
+/// a driver whose statements cannot be cancelled cannot back either type.
 #[must_use]
 pub fn build_table_factory<D>(
     pool: Arc<ADBCPool<D>>,
@@ -231,9 +235,6 @@ pub fn build_table_factory<D>(
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
-    // `ADBCPool` and `AdbcTableFactory` both require it: an abandoned query is
-    // cancelled through the statement, so a driver whose statements cannot be
-    // cancelled cannot back either type.
     <D::ConnectionType as adbc_core::Connection>::StatementType:
         datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
