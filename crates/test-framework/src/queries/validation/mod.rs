@@ -43,6 +43,13 @@ use arrow_tools::schema::schema_difference;
 
 use super::Query;
 
+pub mod sort_order;
+
+pub use sort_order::{
+    SortCheck, SortKeyColumn, SortKeyResolution, SortOrderViolation, check_sort_order,
+    has_top_level_order_by, resolve_sort_key, verify_sorted,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
@@ -67,6 +74,16 @@ pub enum QueryValidationFailReason {
         column_name: String,
         left_len: usize,
         right_len: usize,
+    },
+    /// One engine returned rows that do not honor the query's own top-level
+    /// `ORDER BY`. Reported per side, because it is a property of that engine's
+    /// output rather than of the two results' relationship.
+    SortOrderViolation {
+        side: String,
+        column: String,
+        row_number: usize,
+        previous: String,
+        current: String,
     },
 }
 
@@ -945,6 +962,65 @@ pub fn compare_query_result_batches(
         println!("Query '{query_name}' content mismatch: {reason:?}");
     }
     Ok(result)
+}
+
+/// Content equality **plus** a per-side check that each engine honored the
+/// query's own top-level `ORDER BY`.
+///
+/// [`compare_query_result_batches`] under [`RowOrder::Multiset`] canonically
+/// sorts both sides before comparing, so it establishes that the two engines
+/// returned the same rows and nothing about the order they returned them in.
+/// Most of the suite corpus sorts without a `LIMIT` and is compared that way, so
+/// without this check an engine whose sort is wrong compares equal.
+///
+/// Content is compared first: when both the rows and the order differ, the row
+/// difference is the more useful report. A tie under the sort key is never a
+/// violation, so the check adds no sensitivity to the engine-dependent ordering
+/// of equal rows that [`RowOrder::Multiset`] exists to absorb.
+///
+/// `sql` must be the statement that produced *both* result sets. Where the two
+/// engines run textually different SQL, pass the form whose projection matches
+/// the compared results.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn compare_query_result_batches_with_sort_check(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<QueryValidationResult> {
+    let content = compare_query_result_batches(query_name, left_batches, right_batches, row_order)?;
+    if content != QueryValidationResult::Pass {
+        return Ok(content);
+    }
+
+    for (side, batches) in [("left", left_batches), ("right", right_batches)] {
+        match sort_order::check_sort_order(sql, batches)? {
+            SortCheck::Ordered => {}
+            SortCheck::Skipped { reason } => {
+                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+            }
+            SortCheck::Violation(v) => {
+                println!(
+                    "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
+                    v.column, v.row_number, v.previous, v.current
+                );
+                return Ok(QueryValidationResult::Fail(
+                    QueryValidationFailReason::SortOrderViolation {
+                        side: side.to_string(),
+                        column: v.column,
+                        row_number: v.row_number,
+                        previous: v.previous,
+                        current: v.current,
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(QueryValidationResult::Pass)
 }
 
 /// Canonical row order for multiset equality: sort by stringified cell values

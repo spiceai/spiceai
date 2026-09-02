@@ -258,6 +258,10 @@ pub fn ssb_batches(scale: i64) -> Vec<(&'static str, RecordBatch)> {
 }
 
 const REGIONS: [&str; 5] = ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"];
+
+/// `nation_for` spends `key % 5` on the region and `(key / 5) % 5` on the nation,
+/// so the city digit has to start at `key / 25` to be independent of both.
+const CITIES_PER_NATION_STRIDE: usize = REGIONS.len() * 5;
 const NATIONS_PER_REGION: [[&str; 5]; 5] = [
     ["ALGERIA", "ETHIOPIA", "KENYA", "MOROCCO", "MOZAMBIQ"],
     ["ARGENTINA", "BRAZIL", "CANADA", "PERU", "UNITED ST"],
@@ -423,7 +427,15 @@ fn nation_for(key: usize) -> (String, String, String) {
     // truncated to 9 chars (UNITED KI / UNITED ST) keep that form; only city
     // appends the digit so filters like c_nation='UNITED KI1' and
     // c_city='UNITED KI1' both hit for UK, while US stays c_nation='UNITED ST'.
-    let city = format!("{base_nation}{}", (key % 10) + 1);
+    //
+    // The digit must vary independently of `region_i` and `nation_i`, which
+    // consume `key` modulo 5 and 25. Deriving it from `key % 10` instead would
+    // alias it to the region — every nation would get exactly the two digits
+    // congruent to its own region, and the other eight cities would not exist
+    // for any key — including the 'UNITED KI1' and 'UNITED KI5' that Q3.3 and
+    // Q3.4 filter `c_city`/`s_city` on, leaving both queries with no rows to
+    // compare.
+    let city = format!("{base_nation}{}", (key / CITIES_PER_NATION_STRIDE) % 10 + 1);
     let nation = if base_nation == "UNITED KI" {
         // Q3.2 filters c_nation = 'UNITED KI1' (nation with digit in classic SSB).
         format!("UNITED KI{}", (key % 2) + 1)
@@ -676,22 +688,32 @@ fn make_lineorder_batch(
     // Dimension FKs aligned to classic SSB filters (see `nation_for` / part naming).
     // customer key k → nation_for(k); supplier key s → nation_for(s*3).
     // part 6=MFGR#12; 507=MFGR#2221; 16=MFGR#14; 1=MFGR#1; 2=MFGR#2.
-    // supp 2,7: AMERICA (s*3 %5 ==1); 4,9: ASIA; 1,6: EUROPE; 16: UNITED KI;
+    // supp 2,7: AMERICA (s*3 %5 ==1); 4,9: ASIA; 1,6: EUROPE; 16,41: UNITED KI;
     // supp 7: UNITED ST (AMERICA).
     let seed_specs: &[(i32, i32, i32, usize)] = &[
         // (custkey, partkey, suppkey, date_idx)
+        // A seed group that lands entirely inside one `d_year` collapses to a
+        // single output row, which cannot exercise the query's ORDER BY at all —
+        // so each group spans at least two years.
         (1, 6, 2, 400), // Q2.1: MFGR#12 × AMERICA ~1993
         (6, 6, 7, 401),
-        (11, 6, 12, 402),
-        (2, 507, 4, 500), // Q2.2: MFGR#2221 × ASIA
+        (11, 6, 12, 1_500), // ~1996
+        (2, 507, 4, 500),   // Q2.2: MFGR#2221 × ASIA
         (7, 507, 9, 501),
         (12, 507, 14, 502),
-        (3, 507, 1, 800), // Q2.3: MFGR#2221 × EUROPE
-        (8, 507, 6, 801),
-        (23, 6, 16, 1_000), // Q3.2/3.3: UNITED KI × UNITED KI
-        (48, 6, 16, 1_001),
-        (23, 6, 16, 2_165), // Q3.4: UK × UK × Dec1997
-        (48, 6, 16, 2_166),
+        (3, 507, 1, 800),   // Q2.3: MFGR#2221 × EUROPE ~1994
+        (8, 507, 6, 1_600), // ~1996
+        // Q3.2 filters c_nation/s_nation='UNITED KI1'; the nation digit is
+        // `key % 2`, so it needs even UK keys: customer 48, supplier 16 (→ 48).
+        (48, 6, 16, 1_000), // ~1994
+        (48, 6, 16, 1_600), // ~1996
+        // Q3.3/Q3.4 filter c_city/s_city on 'UNITED KI1'/'UNITED KI5' instead.
+        // The city digit is `key / 25`, so those cities are customer 23 (KI1)
+        // and 123 (KI5), and supplier 41 (→ 123 → KI5).
+        (23, 6, 41, 1_002),
+        (123, 6, 41, 1_003),
+        (23, 6, 41, 2_165), // Q3.4: same cities, Dec1997
+        (123, 6, 41, 2_166),
         (2, 6, 4, 900), // Q3.1: ASIA × ASIA
         (7, 6, 9, 901),
         (1, 1, 2, 1_900), // Q4.1/4.2: AMERICA × AMERICA × MFGR#1 ~1997

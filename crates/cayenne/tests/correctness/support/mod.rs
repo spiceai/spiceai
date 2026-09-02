@@ -68,7 +68,8 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches, row_order_from_sql,
+    QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
+    row_order_from_sql,
 };
 use test_framework::queries::{
     Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
@@ -518,14 +519,23 @@ pub fn compare_results(
     let sql_upper = query.sql.to_ascii_uppercase();
     let has_order = sql_upper.contains("ORDER BY");
     let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
+    // Positional equality only where the row set itself depends on order. Elsewhere
+    // multiset, so an `ORDER BY` on a non-unique key does not fail on the
+    // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
+    // then verifies each side against its own `ORDER BY`, which ties never violate —
+    // so absorbing tie order here no longer costs the sort check with it.
     let order = if has_order && has_limit {
         RowOrder::Preserved
     } else {
-        // Full result or unordered: multiset (handles non-unique ORDER BY ties).
         RowOrder::Multiset
     };
-    let _ = row_order_from_sql; // still used by sql_has_order_by
-    match compare_query_result_batches(&query.name, cayenne, reference, order) {
+    match compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        cayenne,
+        reference,
+        order,
+    ) {
         Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
         Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
             detail: format!("{reason:?}"),

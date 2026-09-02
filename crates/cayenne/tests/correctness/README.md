@@ -3,7 +3,8 @@
 **This is not a performance or Criterion benchmark suite.**
 
 These tests assert **exact SQL result equality** (schema + row multiset, or
-ordered rows when `ORDER BY`+`LIMIT` apply) between:
+ordered rows when `ORDER BY`+`LIMIT` apply) and that each side **honors its own
+query's `ORDER BY`** (see [Row order](#row-order)) between:
 
 1. **Standalone engines outside Spice** — raw embedded crates used as oracles  
    (`duckdb`, `rusqlite`, `chdb-rust`)
@@ -93,10 +94,12 @@ cargo test -p cayenne --test result_correctness_inventory_test
 cargo test -p cayenne --features result-correctness-duckdb \
   --test result_correctness_standalone_engines_test
 
-# Cayenne ↔ standalone DuckDB
+# Cayenne ↔ standalone DuckDB. `--test-threads=1` is required, not stylistic:
+# parallel runs have hit allocator aborts in the bundled DuckDB crate, which fail
+# in a way that reads like a correctness mismatch.
 CAYENNE_PARITY_TPCH_SF=1 CAYENNE_PARITY_TPCDS_SF=1 CAYENNE_PARITY_CHBENCH_SF=1 \
   cargo test -p cayenne --features result-correctness-duckdb \
-  --test result_correctness_vs_duckdb_test
+  --test result_correctness_vs_duckdb_test -- --test-threads=1
 
 # Cayenne ↔ standalone chDB
 cargo test -p cayenne --features result-correctness-chdb \
@@ -112,13 +115,46 @@ cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --no
 Optional env: `CAYENNE_PARITY_SCRATCH`, `CAYENNE_PARITY_*_SF`,
 `CAYENNE_PARITY_SSB_SCALE`, `CLICKBENCH_HITS_PARQUET`, `SQLLANCER_EXTRA_SQL`.
 
+## Row order
+
+Content equality is checked as a multiset unless a `LIMIT` makes the row set
+itself order-dependent. Multiset comparison canonically sorts both sides first,
+so on its own it says **nothing about the order an engine returned rows in** —
+and most of the corpus sorts without a `LIMIT` (every CH-benCHmark query, every
+SSB query with an `ORDER BY`, half of TPC-H). A wrong sort over the right rows
+compared equal.
+
+`compare_query_result_batches_with_sort_check` closes that: alongside the content
+comparison it verifies **each side separately** against the query's own top-level
+`ORDER BY`, resolved from the SQL by the parser
+(`validation::sort_order::resolve_sort_key`). Because it is a self-check on one
+engine's output it needs no oracle, so it runs on every lane — including the
+single-oracle ones.
+
+It stays deliberately narrow where engines legitimately differ:
+
+- **Tied rows are never a violation.** An `ORDER BY` on a non-unique key leaves
+  the order of equal rows engine-dependent; only a row that sorts strictly
+  *before* its predecessor fails.
+- **`NULL` placement is not policed.** DataFusion and PostgreSQL sort `NULL`s last
+  for `ASC`, SQLite sorts them first, so a key pair involving a `NULL` is treated
+  as tied.
+- **An `ORDER BY` that does not map onto an output column is reported, not
+  passed.** `SortCheck::Skipped` names the reason so the hole stays countable
+  rather than reading as a pass.
+
+An `ORDER BY` inside a subquery, a CTE, or a window frame does not constrain the
+result and is not read as a sort key — the check parses the statement rather than
+searching for the text.
+
 ## Who compares results?
 
 **The harness / shipped compare path — not a human reading logs.**
 
 1. Execute SQL on each side (standalone crate and/or Spice accelerator).
 2. Pass **actual** `RecordBatch` results into
-   `compare_query_result_batches` (or cayenne `compare_actual_results`).
+   `compare_query_result_batches_with_sort_check` (or cayenne
+   `compare_actual_results`, which wraps it).
 3. **`assert!`** / `assert_all_pass_or_excluded` on outcomes.
 
 Logs under `CAYENNE_PARITY_SCRATCH` are diagnostics only.

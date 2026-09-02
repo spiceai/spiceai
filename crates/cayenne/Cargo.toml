@@ -505,6 +505,12 @@ name = "pk_keyset_present_path"
 name = "result_correctness_inventory_test"
 path = "tests/result_correctness_inventory_test.rs"
 
+# Static comparison-cell census over the inventory. Links no engines; prints the
+# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
+[[test]]
+name = "result_correctness_census_test"
+path = "tests/result_correctness_census_test.rs"
+
 # Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
 [[test]]
 name = "result_correctness_vs_duckdb_test"

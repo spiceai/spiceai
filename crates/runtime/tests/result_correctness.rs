@@ -57,7 +57,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::util::test::MockExec;
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches,
+    QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,12 +223,21 @@ fn compare(query: &Query, spice: &[RecordBatch], standalone: &[RecordBatch]) -> 
     let sql_upper = query.sql.to_ascii_uppercase();
     let has_order = sql_upper.contains("ORDER BY");
     let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
+    // Multiset unless the row set itself depends on order, so tied rows under a
+    // non-unique `ORDER BY` do not fail; the sort check below is tie-tolerant and
+    // verifies each side against its own `ORDER BY` regardless.
     let order = if has_order && has_limit {
         RowOrder::Preserved
     } else {
         RowOrder::Multiset
     };
-    match compare_query_result_batches(&query.name, spice, standalone, order) {
+    match compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        spice,
+        standalone,
+        order,
+    ) {
         Ok(QueryValidationResult::Pass) => "PASS".into(),
         Ok(QueryValidationResult::Fail(reason)) => format!("FAIL {reason:?}"),
         Err(e) => format!("COMPARE_ERR {e}"),
