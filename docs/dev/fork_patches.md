@@ -93,11 +93,11 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `aa8ffacce4a0d309380e00a27a7701cfc4ca3eb0` | `phillip/bigquery-scope-wrapped-grouping-expr` |
+| [datafusion](#datafusion) | `121e0de92cb5db5b68418bc4b8c1d4b4efaf5e74` | `phillip/bigquery-scope-wrapped-grouping-expr` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `59060680199aed42d0f5930ece4ba81962ebb957` | `phillip/federate-subquery-only-tables` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `611e4bccc2df3ef2d5adbd927d4494f19bbf3abc` | `phillip/federate-subquery-only-tables` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `328c926553b0c1727688c1c81d1002fbb66e8d0d` | `phillip/bump-federation-subquery-only-tables` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0fb93c61677917b1dd1c062e0c051efe7c24a676` | `phillip/bump-federation-subquery-only-tables` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
@@ -190,6 +190,7 @@ catch.
 | BigQuery dialect: emit the required `DISTINCT` quantifier for distinct unions | A federated distinct union reaches BigQuery as bare `UNION`, which BigQuery rejects before executing either branch | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_emits_valid_bigquery_set_and_window_syntax`; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | BigQuery dialect: omit frames from numbering functions while retaining aggregate frames | BigQuery rejects `ROW_NUMBER`, `RANK`, and the other numbering functions when DataFusion's normalized frame is emitted; dropping aggregate frames instead changes which rows contribute | silent (query failure / wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_emits_valid_bigquery_set_and_window_syntax`; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Unparser: `Dialect::range_window_default_nulls_first`, and the leading `IS NULL` key a dialect that reports one needs | A federated query with an aggregate window function fails outright: BigQuery accepts no NULL placement but its own inside a `RANGE` clause, and an `ORDER BY` with no explicit frame implies `RANGE` for an aggregate, so the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to `ASC NULLS LAST` is refused. Dropping the clause instead is worse than the failure: BigQuery defaults to NULLs *first* ascending where DataFusion defaults to last, so the NULL rows move to the other end of the ordering and every frame covers different rows — measured on real BigQuery as `(NULL,42) (1,10) (2,30) (3,35)` becoming `(NULL,7) (1,17) (2,37) (3,42)` | build (flag), then silent (query failure; wrong data if "fixed" by dropping the clause) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the RANGE-window arm), and in the fork `plan_to_sql.rs::test_range_window_nulls_placement_becomes_a_leading_key` with `::test_range_window_nulls_placement_left_alone_where_it_binds` as its controls; real-engine guard: `test/scripts/bigquery-pushdown.sh::aggregate-window-range-frame` |
+| Unparser: a `DISTINCT ON` output alias does not capture its own key (fork PR #209) | Naming a `DISTINCT ON`'s computed output changes which key it groups by where the name the output takes is also spelled as a bare column by `on_expr` or `sort_expr`: PostgreSQL resolves a bare name in both clauses against the output list first, so the new alias captures those references and the statement groups by the projected expression instead of the input column. Valid SQL, unchanged reported schema name, wrong rows | silent (wrong data) | **GAP** in this repo. The existing `…::a_derived_projection_names_the_output_its_scope_references` `distinct-on` arms assert the output *is* named, which still holds if this patch is lost, so they do not catch it; the fork's own `plan_to_sql.rs` `DISTINCT ON` tests are what guard it today. Carried in by the pin move for the two rows below rather than for itself |
 | Unparser: `Dialect::group_by_matches_select_subexpressions`, and the aggregate scope a dialect that answers `false` needs | A `Projection` over an `Aggregate` is flattened into one `SELECT`, leaving the grouping expression bare in `GROUP BY` and wrapped inside a select item. BigQuery matches a whole select item and a column reference and nothing in between, so it refuses the statement outright. The two cheaper renderings are worse than the failure: `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the value the projection computes, so a projection that is not injective over the grouping expression collapses distinct groups and sums their aggregates, with no error | build (flag), then silent (query failure) | `crates/data_components/src/federation.rs::a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped`, which reads the flag, so losing the patch fails `cargo check` before it can fail the assertion; real-engine guard: `test/scripts/bigquery-pushdown.sh::group-by-expr-nested-in-select` |
 | `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
@@ -495,7 +496,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -505,18 +506,25 @@ They are not equal in consequence; this is the order to close them in.
 
 1. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
 2. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+3. `datafusion` `DISTINCT ON` output alias capture (fork PR #209) — the alias
+   captures the key, so the statement groups by the projected expression instead of
+   the input column. The fork's own `plan_to_sql.rs` tests cover it; what is missing
+   is a repo-side guard, and the existing `distinct-on` arms of
+   `a_derived_projection_names_the_output_its_scope_references` do not catch it
+   because they assert the output *is* named, which still holds if the patch is
+   lost.
+4. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+5. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+6. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-6. `snowflake-rs` chunked JSON responses and record-batch ordering.
-7. `clickhouse-rs` `Date32` range.
-8. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
+7. `snowflake-rs` chunked JSON responses and record-batch ordering.
+8. `clickhouse-rs` `Date32` range.
+9. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
    federated date filter matches the wrong rows.
-9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+10. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-10. `mistral.rs` `tool_calls` chat-template handling.
-11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+11. `mistral.rs` `tool_calls` chat-template handling.
+12. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
 **Hangs, crashes and failures.** These take a query or the process down:

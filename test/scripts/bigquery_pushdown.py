@@ -179,11 +179,10 @@ ORDER BY keys.k""",
     # refused. `aggregate-window-control` above cannot reach this: it names an
     # explicit ROWS frame, which accepts either placement.
     "aggregate-window-range-frame": """SELECT
-  grp,
-  ord,
-  SUM(amount) OVER (PARTITION BY grp ORDER BY ord) AS running_sum
-FROM window_values
-ORDER BY grp, ord""",
+  tok,
+  COUNT(*) OVER (ORDER BY booked_at) AS running
+FROM bucket_values
+ORDER BY tok""",
     # Control: the same shape whose outer relation is a BigQuery table, which
     # federated whole before this change too. It tells a regression in the
     # scanless case apart from a regression in correlated pushdown generally.
@@ -299,11 +298,16 @@ EXPECTED_ROWS = {
     "correlated-subquery-over-scanning-relation-control": [
         {"value": 3, "n": 1},
     ],
+    # `booked_at` is NULL for tok 'd'. The plan asks for NULLS LAST, so 'd' is the
+    # last row of the ordering and its running count is 4; the other three follow
+    # their timestamps. Under the reversed placement BigQuery would default to,
+    # 'd' would be first and every one of these four numbers would differ — which
+    # is what makes this case test the ordering and not just the SQL shape.
     "aggregate-window-range-frame": [
-        {"grp": "a", "ord": 1, "running_sum": 10},
-        {"grp": "a", "ord": 2, "running_sum": 30},
-        {"grp": "a", "ord": 3, "running_sum": 35},
-        {"grp": "b", "ord": 1, "running_sum": 7},
+        {"tok": "a", "running": 1},
+        {"tok": "b", "running": 2},
+        {"tok": "c", "running": 3},
+        {"tok": "d", "running": 4},
     ],
 }
 
@@ -605,10 +609,11 @@ def assert_generated_sql(name: str, sql: str) -> None:
         # Only the window's own ORDER BY is at issue; the statement's top-level
         # ORDER BY carries its NULLS clause perfectly well.
         over_clause = sql.split("OVER (", 1)[1].split(")", 1)[0]
-        if "IS NULL" not in over_clause:
+        if "IS NULL ASC" not in over_clause:
             raise HarnessError(
-                f"the NULL placement was not spelled as a leading key, so BigQuery "
-                f"refuses this RANGE window: {sql}"
+                f"the NULL placement was not spelled as an ascending leading key, so "
+                f"BigQuery refuses this RANGE window or orders NULLs at the wrong end: "
+                f"{sql}"
             )
         if "NULLS" in over_clause:
             raise HarnessError(
