@@ -231,6 +231,11 @@ pub fn build_table_factory<D>(
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    // `ADBCPool` and `AdbcTableFactory` both require it: an abandoned query is
+    // cancelled through the statement, so a driver whose statements cannot be
+    // cancelled cannot back either type.
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     AdbcTableFactory::new(pool)
         .with_federation_enabled(federation_enabled)
