@@ -82,7 +82,7 @@ pub mod write_back_worker;
 pub(crate) use write::WriteMode;
 
 pub use refresh_completion::{
-    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter,
+    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;

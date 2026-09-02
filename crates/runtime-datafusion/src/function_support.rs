@@ -50,7 +50,7 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
 /// `AdbcTableFactory::with_function_support`.
 ///
-/// Two layers, both derived from [`crate::dialect`] so they cannot drift from
+/// Three layers, all derived from [`crate::dialect`] so they cannot drift from
 /// what the dialect can actually render:
 ///
 /// 1. the name carve-out, so the JSON extraction functions the `BigQuery`
@@ -60,10 +60,27 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 ///    its JSON path argument must be a constant — and without this check that
 ///    call would federate and be unparsed verbatim, which is the
 ///    unknown-function failure the deny-list exists to prevent (issue #10703).
+///    The check also gates the `DataFusion` built-ins the dialect rewrites
+///    (e.g. `regexp_like` → `REGEXP_CONTAINS`), whose untranslatable shapes
+///    must stay local the same way;
+/// 3. `regexp_match` is denied outright. `BigQuery` has no function of that
+///    name — a federated call fails remotely with `Function not found:
+///    regexp_match` — and no faithful rendering exists to rewrite it into: its
+///    list-of-matches result has no `BigQuery` counterpart that survives the
+///    result boundary (`BigQuery` documents that a NULL top-level `ARRAY`
+///    comes back as an empty one, where `regexp_match` is NULL for a
+///    non-matching row), and `REGEXP_EXTRACT` refuses a pattern with more than
+///    one capturing group. The common reason to call it — a NULL-check asking
+///    "does it match at all" — is rewritten into `regexp_like` before
+///    the `BigQuery` capability check by
+///    [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], which the dialect
+///    *can* translate; every remaining shape evaluates locally above the
+///    federated scan.
 #[must_use]
 pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::bigquery_native_function_names())
+        .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .build()
         .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
 }
