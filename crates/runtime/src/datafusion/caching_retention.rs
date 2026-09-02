@@ -129,20 +129,27 @@ pub(crate) fn caching_retention(
 /// retention policy bounds how long an entry is kept while keeping the
 /// stale-on-error fallback, and disabling the fallback gets the derived eviction
 /// back.
+///
+/// It says the accelerator has no retention policy *running*, never that the
+/// dataset declared none. The two are not the same and the difference is the
+/// awkward case this warning exists to cover: a policy that was declared and
+/// then assembled into nothing. Telling that operator their declaration is
+/// absent sends them to write one they have already written.
 pub(crate) fn unbounded_caching_retention_warning(dataset_name: &str) -> String {
     // `escape_debug` rather than the raw name: a Spicepod identifier may be
     // quoted, and a quoted one may legally contain a newline, so a validated
     // name can otherwise break this line in two and forge a second one.
     let dataset_name = dataset_name.escape_debug();
     format!(
-        "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` and declares no retention \
-        policy, so no cached entry is ever evicted and the accelerator grows with every distinct \
+        "Dataset '{dataset_name}' sets `caching_stale_if_error: enabled` and has no retention policy \
+        running, so no cached entry is ever evicted and the accelerator grows with every distinct \
         request it serves. An expired entry is the copy served when the source fails, so \
         `caching_ttl` and `caching_stale_while_revalidate_ttl` bound how long an entry is served \
-        fresh, not how long it is stored. Set `retention_check_enabled: true` with a \
-        `retention_period`, a `retention_check_interval` and the dataset's `time_column` to bound \
-        how long an entry is kept, or set `caching_stale_if_error: disabled` to evict at \
-        `caching_ttl` + `caching_stale_while_revalidate_ttl`. See: {CACHING_DOCS_URL}"
+        fresh, not how long it is stored. To bound how long an entry is kept, set \
+        `retention_check_enabled: true` with a `retention_period`, a `retention_check_interval` and \
+        the dataset's `time_column` — a policy missing any one of those starts nothing, so check \
+        all four if you have already set some. Or set `caching_stale_if_error: disabled` to evict \
+        at `caching_ttl` + `caching_stale_while_revalidate_ttl`. See: {CACHING_DOCS_URL}"
     )
 }
 
@@ -244,6 +251,10 @@ mod tests {
         let warning = unbounded_caching_retention_warning("api_cache");
 
         assert!(warning.contains("'api_cache'"), "{warning}");
+        assert!(warning.contains("no retention policy running"), "{warning}");
+        // Never a claim that the dataset declared nothing: this warning also
+        // covers a policy that was declared and did not build.
+        assert!(!warning.contains("declares no retention"), "{warning}");
         assert!(
             warning.contains("grows with every distinct request"),
             "{warning}"
