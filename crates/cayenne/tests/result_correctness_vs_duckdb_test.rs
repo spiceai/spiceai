@@ -536,10 +536,21 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         let (duck_temp, duck) = load_duckdb_from_parquet(&tpcds_dir, &table_refs);
         let _keep = duck_temp;
 
+        let inventory = build_inventory();
         for q in get_tpcds_test_queries(None, Some(1.0)) {
-            let outcome =
+            // Reviewed exclusions live in the inventory, so the census counts them.
+            let outcome = if let Some(reason) = inventory
+                .iter()
+                .find(|e| e.suite == "tpcds" && e.name == q.name.as_ref())
+                .and_then(|e| e.duckdb_exclusion)
+            {
+                ParityOutcome::Excluded {
+                    reason: reason.to_string(),
+                }
+            } else {
                 run_pair_with_df_baseline("tpcds", &q, &cayenne, &duck, None, Some(&tpcds_dir))
-                    .await;
+                    .await
+            };
             eprintln!("tpcds/{} -> {outcome:?}", q.name);
             results.push(RunResult {
                 suite: "tpcds".into(),
