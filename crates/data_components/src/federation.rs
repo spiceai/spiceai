@@ -451,8 +451,7 @@ mod tests {
     }
 
     fn exists_scan(name: &str) -> LogicalPlanBuilder {
-        LogicalPlanBuilder::scan(name, table_source(exists_fetch_fields()), None)
-            .expect("scan should build")
+        scan_named(name, exists_fetch_fields())
     }
 
     /// The same correlation still pushes down when there is no bound to scope,
@@ -555,27 +554,182 @@ mod tests {
         assert_unbounded_exists_pushdown(&a_correlation_naming_two_build_inputs(None));
     }
 
-    /// Regression test for #13277: the sibling shape, where the correlation's
-    /// only qualifier is one the probe side also answers to. Naming the scope
-    /// anything else rebinds those references to the probe, turning the
-    /// correlation into a comparison of the outer row with itself.
-    ///
-    /// Both readings are wrong — the subquery's own `FROM` already shadows the
-    /// outer relation, so the correlation is lost whatever the bound does — and
-    /// that unscoped output binds and runs. The `EXISTS` then reduces to "this
-    /// table has a row", so the semi join this builds keeps every probe row,
-    /// including the rows that match nothing (an anti join over the same SQL
-    /// drops every row instead). Emitting these correctly needs the
-    /// correlation's qualifiers rewritten to the derived scope, tracked by
-    /// #12840.
-    #[test]
-    fn a_bounded_exists_refuses_a_correlation_qualified_by_the_probe() {
-        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
-            .expect_err("a correlation qualified by the probe side must be refused");
+    /// The refusal every capture below is reported through. Asserted by one
+    /// helper so a reword upstream is a one-place edit here, and matched on the
+    /// whole sentence so a message that merely mentions `EXISTS` cannot pass for
+    /// it.
+    fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
+        let err = federated_sql_result(plan).expect_err(context);
         assert!(
-            err.to_string()
-                .contains("a FROM the emitted SQL introduces would capture the correlation"),
-            "expected the refusal to identify the captured correlation, got: {err}"
+            err.to_string().contains(
+                "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL \
+                 introduces would capture the correlation"
+            ),
+            "{context}, got: {err}"
+        );
+    }
+
+    /// The keep direction, mirroring [`assert_captured_correlation_refused`]: the
+    /// correlation is not captured, so the join still renders as a pushed-down
+    /// `EXISTS`. Named for what it pins rather than asserted inline, so the two
+    /// directions read as one pair.
+    fn assert_exists_pushdown_kept(plan: &LogicalPlan, context: &str) {
+        let sql = federated_sql(plan);
+        assert!(sql.contains("EXISTS"), "{context}, got: {sql}");
+    }
+
+    /// Scan `name` with the given schema. [`exists_scan`] is this with
+    /// [`exists_fetch_fields`]; the shapes whose relations need a schema of
+    /// their own call it directly.
+    fn scan_named(name: &str, fields: Vec<Field>) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(name, table_source(fields), None).expect("scan should build")
+    }
+
+    /// Regression test for #13277 and #12840: the correlation's only qualifier is
+    /// one the subquery's own `FROM` also answers to, so the reference binds
+    /// inside the body instead of to the query it was written against.
+    ///
+    /// `"t"."c" = "t"."c"` is then an inner tautology: `EXISTS` degenerates to
+    /// "this relation has a row", so the semi join this builds keeps every probe
+    /// row — including rows that match nothing — while an anti join over the same
+    /// SQL drops every row instead. That is valid SQL, so the remote engine runs
+    /// it and answers from the wrong rows rather than failing.
+    ///
+    /// **The bound is not what decides this.** SQL's name scoping captures the
+    /// reference on its own, so both the bounded and unbounded plans have to be
+    /// refused, and asserting both is the point of this test: the refusal used to
+    /// live in `exists_scope_name`, which the caller consults only when a row
+    /// bound has to be moved into a scope of its own, so the unbounded plan kept
+    /// emitting the shadowed SQL. Refusing costs the pushdown — and, because
+    /// `datafusion-federation` wraps the plan before unparsing it, costs the
+    /// query — instead of returning wrong rows.
+    ///
+    /// Refusing is not repairing. Emitting these correctly needs the correlated
+    /// qualifiers rewritten onto the scope a derived table introduces, which is
+    /// what #12840 still tracks.
+    #[test]
+    fn an_exists_refuses_a_correlation_the_probe_qualifier_captures_at_any_bound() {
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(Some(5)),
+            "a bounded correlation qualified by the probe side must be refused",
+        );
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(None),
+            "an unbounded correlation qualified by the probe side must be refused too, \
+             because the capture is decided by name scoping rather than by the bound",
+        );
+    }
+
+    /// The probe side for the unqualified-correlation guards: `p`, projected so
+    /// both of its outputs carry a bare name. That projection is what leaves the
+    /// join key unqualified.
+    fn an_unqualified_correlation_semi_join(build_columns: &[&str]) -> LogicalPlan {
+        let probe = exists_scan("p")
+            .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])
+            .expect("project probe")
+            .build()
+            .expect("build probe");
+        let build = scan_named(
+            "b",
+            build_columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, false))
+                .collect(),
+        )
+        .build()
+        .expect("build build side");
+
+        LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                JoinType::LeftSemi,
+                (vec!["c"], vec![build_columns[0]]),
+                None,
+            )
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #12840: a capture needs no shared relation name. An
+    /// unqualified reference names no relation to disagree with, so it binds to
+    /// whichever relation the innermost scope exposes the *column* on.
+    ///
+    /// `p` and `b` share no name here, but the probe projects its key to a bare
+    /// `c` and `b` has a column called `c`, so the body's own `FROM "b"` answers
+    /// to the reference and both halves of `("c" = "c")` bind to `b.c` — the same
+    /// inner tautology the self-join reaches, arrived at without either side
+    /// naming the other.
+    #[test]
+    fn an_exists_refuses_an_unqualified_correlation_the_body_exposes() {
+        assert_captured_correlation_refused(
+            &an_unqualified_correlation_semi_join(&["c", "d"]),
+            "an unqualified correlation the build side exposes a column for must be refused",
+        );
+    }
+
+    /// The keep direction for the same mechanism, which is what stops the guard
+    /// above from being satisfied by refusing everything: an unqualified
+    /// reference to a name the body does *not* expose binds outward, so it keeps
+    /// its pushdown.
+    ///
+    /// Identical to the test above except for `b`'s column names. The name has to
+    /// be absent from the *relation* rather than merely unprojected, because `b`
+    /// is emitted bare and `FROM "b"` exposes every column it has whatever the
+    /// plan projects — hence a different relation rather than the same one
+    /// projected differently.
+    #[test]
+    fn an_exists_keeps_an_unqualified_correlation_the_body_lacks() {
+        assert_exists_pushdown_kept(
+            &an_unqualified_correlation_semi_join(&["e", "f"]),
+            "a correlation no relation in the body exposes must keep its pushdown",
+        );
+    }
+
+    /// The keep direction for the qualifier mechanism, and the reason it is here
+    /// rather than left to upstream: this is the shape the federated TPC-H and
+    /// TPC-DS benchmarks push down. A refusal reaches those as a query *failure*
+    /// rather than a fallback, because `datafusion-federation` wraps the plan in
+    /// a `FederatedPlanNode` before it tries to unparse it.
+    ///
+    /// TPC-H Q22 is `NOT EXISTS (SELECT * FROM orders WHERE o_custkey =
+    /// c_custkey)`: the correlated reference is qualified by `customer`, the
+    /// body's only relation is `orders`, and no column name is shared. Nothing
+    /// about that is captured, so it has to keep rendering.
+    #[test]
+    fn an_exists_keeps_a_correlation_no_relation_in_the_body_answers_to() {
+        let build = scan_named(
+            "orders",
+            vec![
+                Field::new("o_orderkey", DataType::Int32, false),
+                Field::new("o_custkey", DataType::Int32, false),
+            ],
+        )
+        .build()
+        .expect("build orders");
+
+        let plan = scan_named(
+            "customer",
+            vec![
+                Field::new("c_custkey", DataType::Int32, false),
+                Field::new("c_phone", DataType::Utf8, false),
+            ],
+        )
+        .project(vec![col("customer.c_phone")])
+        .expect("project")
+        .join_on(
+            build,
+            JoinType::LeftAnti,
+            [col("customer.c_custkey").eq(col("orders.o_custkey"))],
+        )
+        .expect("anti join")
+        .build()
+        .expect("build plan");
+
+        assert_exists_pushdown_kept(
+            &plan,
+            "a correlation the body neither answers to nor exposes a column for must keep \
+             its pushdown",
         );
     }
 
@@ -586,12 +740,9 @@ mod tests {
     /// without a row bound.
     #[test]
     fn an_unbounded_exists_refuses_a_correlation_shadowed_by_its_build_relation() {
-        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
-            .expect_err("a build relation that shadows the correlation must be refused");
-        assert!(
-            err.to_string()
-                .contains("a FROM the emitted SQL introduces would capture the correlation"),
-            "expected the refusal to identify the captured correlation, got: {err}"
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(None),
+            "a build relation that shadows the correlation must be refused",
         );
     }
 
