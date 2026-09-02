@@ -451,8 +451,7 @@ mod tests {
     }
 
     fn exists_scan(name: &str) -> LogicalPlanBuilder {
-        LogicalPlanBuilder::scan(name, table_source(exists_fetch_fields()), None)
-            .expect("scan should build")
+        scan_named(name, exists_fetch_fields())
     }
 
     /// The same correlation still pushes down when there is no bound to scope,
@@ -579,8 +578,9 @@ mod tests {
         assert!(sql.contains("EXISTS"), "{context}, got: {sql}");
     }
 
-    /// Scan `name` with a schema of its own, for the shapes whose relations do
-    /// not share [`exists_fetch_fields`].
+    /// Scan `name` with the given schema. [`exists_scan`] is this with
+    /// [`exists_fetch_fields`]; the shapes whose relations need a schema of
+    /// their own call it directly.
     fn scan_named(name: &str, fields: Vec<Field>) -> LogicalPlanBuilder {
         LogicalPlanBuilder::scan(name, table_source(fields), None).expect("scan should build")
     }
@@ -740,12 +740,9 @@ mod tests {
     /// without a row bound.
     #[test]
     fn an_unbounded_exists_refuses_a_correlation_shadowed_by_its_build_relation() {
-        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
-            .expect_err("a build relation that shadows the correlation must be refused");
-        assert!(
-            err.to_string()
-                .contains("a FROM the emitted SQL introduces would capture the correlation"),
-            "expected the refusal to identify the captured correlation, got: {err}"
+        assert_captured_correlation_refused(
+            &a_correlation_qualified_by_the_probe(None),
+            "a build relation that shadows the correlation must be refused",
         );
     }
 
