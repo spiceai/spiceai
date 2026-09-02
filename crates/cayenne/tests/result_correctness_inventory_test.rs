@@ -496,3 +496,37 @@ fn sort_check_does_not_police_null_placement() {
         QueryValidationResult::Pass
     );
 }
+
+/// A `NULL` in a leading key must not let the check fall through to the
+/// tiebreaker. TPC-DS q71 sorts on a `SUM` that is `NULL` for nine rows, and
+/// reading the second key across that boundary reported a violation on a result
+/// that was correctly ordered — the engine had simply placed `NULL`s first.
+#[test]
+fn sort_check_does_not_consult_tiebreaker_across_a_null_in_a_leading_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("brand_id", DataType::Int64, false),
+        Field::new("ext_price", DataType::Int64, true),
+    ]));
+    // NULLs first under DESC, then descending values. brand_id descends exactly
+    // at the NULL/non-NULL boundary, which is where the tiebreaker must not run.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 10_005_003, 6_012_008])),
+            Arc::new(Int64Array::from(vec![None, None, None, Some(22_262)])),
+        ],
+    )
+    .expect("batch");
+
+    assert_eq!(
+        compare_query_result_batches_with_sort_check(
+            "null_leading_key",
+            "SELECT brand_id, ext_price FROM t ORDER BY ext_price DESC, brand_id",
+            &[batch.clone()],
+            &[batch],
+            RowOrder::Multiset,
+        )
+        .expect("compare"),
+        QueryValidationResult::Pass
+    );
+}

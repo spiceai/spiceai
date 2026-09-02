@@ -35,8 +35,10 @@ limitations under the License.
 //!
 //! - **`NULL` placement is not checked.** Engines disagree on where `NULL`s sort
 //!   absent an explicit `NULLS FIRST`/`NULLS LAST` — `DataFusion` and `PostgreSQL`
-//!   put them last for `ASC`, `SQLite` puts them first — so a row pair where
-//!   either side of a key column is `NULL` is treated as tied.
+//!   put them last for `ASC`, `SQLite` puts them first — so once a key column
+//!   holds a `NULL` on either side of a row pair, that pair is left unchecked.
+//!   Later key columns are not consulted for it either: SQL never reaches them
+//!   once an earlier column separates two rows.
 //! - **Only keys that map onto output columns are checked.** An `ORDER BY` over
 //!   an expression absent from the projection resolves to
 //!   [`SortKeyResolution::Unresolved`].
@@ -339,8 +341,15 @@ pub fn verify_sorted(batches: &[RecordBatch], key: &[SortKeyColumn]) -> Result<S
 
     for row in 1..batch.num_rows() {
         for (column, array, compare) in &comparators {
+            // A `NULL` on either side of this column decides the pair's order in a
+            // way the engine chose (`NULLS FIRST`/`NULLS LAST`), so stop rather
+            // than falling through to the next column: under SQL the later
+            // columns are never consulted once an earlier one separates two rows,
+            // and reading them anyway reports a violation on a correctly ordered
+            // result. TPC-DS q71 sorts on a `SUM` that is `NULL` for nine rows,
+            // and comparing the tiebreaker across that boundary flags it.
             if array.is_null(row - 1) || array.is_null(row) {
-                continue;
+                break;
             }
             match compare(row - 1, row) {
                 Ordering::Less => break,
