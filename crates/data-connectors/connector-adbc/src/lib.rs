@@ -2499,6 +2499,9 @@ mod function_support_tests {
     /// the table schema. Everything else reports `NotImplemented`.
     struct StubDatabase;
     struct StubConnection;
+    // Clonable because cancelling a running query needs a second handle to the
+    // same statement, which the ADBC table factory requires of every driver.
+    #[derive(Clone)]
     struct StubStatement;
 
     impl Optionable for StubDatabase {
@@ -2643,6 +2646,27 @@ mod function_support_tests {
         }
         fn get_option_double(&self, _key: Self::Option) -> AdbcResult<f64> {
             Err(not_implemented("get_option_double"))
+        }
+    }
+
+    // The stub never runs a query, so a handle to it cancels nothing; the trait
+    // is implemented because the ADBC table factory now requires statements to
+    // say how a cancellation handle is obtained.
+    impl datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::StatementCancelHandle
+        for StubStatement
+    {
+        fn cancel(&mut self) -> AdbcResult<()> {
+            Err(not_implemented("cancel"))
+        }
+    }
+
+    impl datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement
+        for StubStatement
+    {
+        type CancelHandle = Self;
+
+        fn cancel_handle(&self) -> Self::CancelHandle {
+            self.clone()
         }
     }
 
