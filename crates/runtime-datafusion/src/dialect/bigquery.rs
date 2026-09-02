@@ -2118,8 +2118,6 @@ mod tests {
         );
     }
 
-    /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
-    /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
     /// [`timestamp_scan`] plus a value column, for a window function to aggregate.
     fn windowed_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
@@ -2139,6 +2137,8 @@ mod tests {
         datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
     }
 
+    /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
+    /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
     fn timestamp_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new(
