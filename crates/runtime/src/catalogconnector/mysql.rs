@@ -30,6 +30,7 @@ use data_components::RefreshableCatalogProvider;
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use runtime_datafusion::function_support::deny_spice_functions_for_mysql_table_providers;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -88,7 +89,16 @@ impl CatalogConnector for MySQLCatalog {
             })?;
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(MySQLTableFactory::new(Arc::clone(&pool)));
+        // The same deny-list the `mysql` *dataset* connector installs. Without
+        // it every function MySQL cannot evaluate is unparsed into the pushed-down
+        // SQL verbatim and fails the query remotely: `btrim`, which a plain
+        // `trim(col)` becomes (issue #13794), and the whole Spice-only set that
+        // issue #10703 exists to keep local — `json_get_str` reaches MySQL as
+        // `FUNCTION <db>.json_get_str does not exist`.
+        let table_factory = Arc::new(
+            MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_functions_for_mysql_table_providers()),
+        );
 
         // Create a separate mysql_async::Pool for metadata queries.
         // `MySQLTableFactory` requires `MySQLConnectionPool` while metadata discovery uses

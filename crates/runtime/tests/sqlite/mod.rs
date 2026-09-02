@@ -24,7 +24,9 @@ use arrow::{
     datatypes::{DataType, Decimal128Type},
 };
 
+use futures::TryStreamExt;
 use runtime::Runtime;
+use scopeguard::defer;
 use spicepod::acceleration::{Acceleration, Mode};
 use spicepod::component::dataset::Dataset;
 
@@ -249,6 +251,145 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
             if std::path::Path::new(dir_path).exists() {
                 std::fs::remove_dir_all(dir_path).expect("Failed to remove directory");
             }
+
+            Ok(())
+        })
+        .await
+}
+
+/// `trim(col)` resolves to `DataFusion`'s `btrim` UDF and federates under that
+/// canonical name, which `SQLite` has no function for — the query fails with
+/// `no such function: btrim` (the SQLite arm of issue #13794). `SQLite` cannot
+/// be given a rewrite, because `datafusion-table-providers` constructs its
+/// unparser dialect internally, so `btrim` is deny-listed and the projection
+/// evaluates locally instead.
+///
+/// This exercises the wired path the deny-list unit tests cannot see: the
+/// backend-specific deny-list has to actually reach
+/// `SqliteTableProviderFactory`. Take away
+/// `SqliteAccelerator`'s `with_function_support` call and the unit tests still
+/// pass while this one fails.
+#[tokio::test]
+async fn sqlite_btrim_evaluates_locally() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            // Quoted so the CSV reader keeps the padding that makes `trim`
+            // observable, and one row padded with `x` rather than spaces so the
+            // two-argument character-set form has something to strip.
+            let csv_path = "./test_sqlite_btrim.csv";
+            std::fs::write(
+                csv_path,
+                "id,name\n1,\"  alpha  \"\n2,\"xxbetaxx\"\n3,\"  gamma\"\n",
+            )?;
+            defer! {
+                let _ = std::fs::remove_file(csv_path);
+            }
+
+            let mut lite = Dataset::new(format!("file:{csv_path}"), "lite");
+            lite.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("sqlite".to_string()),
+                mode: Mode::Memory,
+                ..Default::default()
+            });
+            let mut local = Dataset::new(format!("file:{csv_path}"), "local");
+            local.acceleration = Some(Acceleration {
+                enabled: true,
+                ..Default::default()
+            });
+
+            let app = AppBuilder::new("sqlite_btrim")
+                .with_dataset(lite)
+                .with_dataset(local)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let run = |query: String| {
+                let rt = rt.clone();
+                async move {
+                    let batches: Vec<RecordBatch> = rt
+                        .datafusion()
+                        .query_builder(&query)
+                        .build()
+                        .run()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("`{query}` failed: {e}"))?
+                        .data
+                        .try_collect()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("`{query}` collection failed: {e}"))?;
+                    Ok::<_, anyhow::Error>(batches)
+                }
+            };
+
+            // The query the deny-list makes possible at all: on an un-denied
+            // `btrim` every one of these fails outright rather than returning a
+            // row, so agreeing with local evaluation is the whole assertion.
+            for projection in [
+                "trim(name)",
+                "trim(name, 'x')",
+                "btrim(name)",
+                "trim(name, cast(null as varchar))",
+                "length(trim(name))",
+            ] {
+                let diff = run(format!(
+                    "WITH pushed AS (SELECT {projection} AS v FROM lite),
+                          plain AS (SELECT {projection} AS v FROM local),
+                          missing_locally AS (SELECT v FROM pushed EXCEPT ALL SELECT v FROM plain),
+                          missing_pushed AS (SELECT v FROM plain EXCEPT ALL SELECT v FROM pushed)
+                     SELECT v FROM missing_locally UNION ALL SELECT v FROM missing_pushed"
+                ))
+                .await?;
+                assert_eq!(
+                    diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    0,
+                    "`{projection}` disagrees between the SQLite accelerator and local evaluation"
+                );
+            }
+
+            // A filter too: the deny-list sees filter expressions on their own
+            // path, and a pushed-down `WHERE btrim(...)` fails the same way.
+            let filtered =
+                run("SELECT id FROM lite WHERE trim(name) = 'alpha'".to_string()).await?;
+            assert_eq!(
+                filtered.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                1,
+                "a filter on trim(name) should match exactly the one padded 'alpha' row"
+            );
+
+            // And the deny-list's mechanism, not just its outcome: `btrim` must
+            // be left out of the SQL sent to SQLite and evaluated above the
+            // scan. Asserting the emitted SQL is what distinguishes "denied"
+            // from "SQLite grew a btrim".
+            let plan = run("EXPLAIN SELECT trim(name) AS v FROM lite".to_string()).await?;
+            let plan = arrow::util::pretty::pretty_format_batches(&plan)?.to_string();
+            let base_sql = plan
+                .split_once("VirtualExecutionPlan name=sqlite")
+                .and_then(|(_, rest)| rest.split_once("base_sql="))
+                .map(|(_, sql)| sql)
+                .ok_or_else(|| anyhow::anyhow!("no SQLite scan in the plan:\n{plan}"))?;
+            assert!(
+                !base_sql.contains("btrim("),
+                "btrim must not reach SQLite; the pushed-down SQL was:\n{base_sql}"
+            );
+            assert!(
+                plan.contains("btrim("),
+                "btrim should still be evaluated locally above the scan; plan was:\n{plan}"
+            );
 
             Ok(())
         })
