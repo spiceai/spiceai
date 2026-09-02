@@ -3820,8 +3820,11 @@ mod tests {
     /// The dialect rewrites it to `DuckDB`'s `trim`. A rewrite is only correct
     /// if the accelerator answers what `DataFusion` answers, so this evaluates
     /// the *same* expression both ways — through a real in-memory `DuckDB` and
-    /// through `DataFusion` — and compares. `assert_ne!` on the two engines is
-    /// what a plausible-looking but unfaithful rename would trip.
+    /// through `DataFusion` — and asserts the two results are equal. That
+    /// equality is what a plausible-looking but unfaithful rename trips: the
+    /// remote SQL is valid and `DuckDB` runs it happily, so nothing else here
+    /// would notice. It is how the one-argument `Zs` divergence below was
+    /// caught.
     #[test]
     fn duckdb_trim_rewrite_agrees_with_datafusion_btrim() {
         use arrow::array::Array as _;
