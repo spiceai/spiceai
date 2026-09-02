@@ -32,6 +32,8 @@ const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argum
 const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
+const BTRIM_NAME: &str = "btrim";
+
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
@@ -102,8 +104,26 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     ]
 }
 
-/// Names of the functions [`new_duckdb_dialect`] rewrites to native `DuckDB`
-/// SQL.
+/// The `DataFusion` built-ins the `DuckDB` dialect rewrites to native `DuckDB`
+/// SQL, paired with their handlers.
+///
+/// Separate from [`duckdb_scalar_overrides`], and deliberately absent from
+/// [`duckdb_native_function_names`]: that list is the federation deny-list's
+/// carve-out, and a built-in federates unless it is denied, so carving one out
+/// would do nothing. What a built-in needs is the handler — without one the
+/// unparser emits the `DataFusion` name verbatim into SQL `DuckDB` rejects.
+fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
+    vec![(
+        // DuckDB dialect: trim(string[, characters])
+        // DataFusion dialect: btrim(str[, trim_str]) — `trim` is only its alias
+        BTRIM_NAME,
+        Box::new(duckdb::btrim_to_trim) as ScalarFnToSqlHandler,
+    )]
+}
+
+/// Names of the Spice functions [`new_duckdb_dialect`] rewrites to native
+/// `DuckDB` SQL. The `DataFusion` built-ins it also rewrites are not here — see
+/// [`duckdb_builtin_scalar_overrides`] for why.
 ///
 /// Any Spice-specific function in this list has a real `DuckDB` equivalent and
 /// can therefore be federated (pushed down) to `DuckDB` rather than denied. The
@@ -118,10 +138,16 @@ pub fn duckdb_native_function_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Creates a new instance of the `DuckDB` dialect with support for Spice internal UDFs
+/// Creates a new instance of the `DuckDB` dialect with support for Spice
+/// internal UDFs ([`duckdb_scalar_overrides`]) and for the `DataFusion`
+/// built-ins `DuckDB` spells differently ([`duckdb_builtin_scalar_overrides`]).
 #[must_use]
 pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
-    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(duckdb_scalar_overrides());
+    let overrides = duckdb_scalar_overrides()
+        .into_iter()
+        .chain(duckdb_builtin_scalar_overrides())
+        .collect();
+    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(overrides);
 
     Arc::new(dialect) as Arc<dyn Dialect>
 }
@@ -186,7 +212,10 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bigquery, bigquery_native_function_names};
+    use super::{
+        bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
+        duckdb_native_function_names,
+    };
 
     #[test]
     fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
@@ -212,6 +241,14 @@ mod tests {
                 !carved_out.contains(&entry.name),
                 "`{name}` is a DataFusion built-in and must not be in the Spice carve-out",
                 name = entry.name
+            );
+        }
+
+        let carved_out = duckdb_native_function_names();
+        for (name, _) in duckdb_builtin_scalar_overrides() {
+            assert!(
+                !carved_out.contains(&name),
+                "`{name}` is a DataFusion built-in and must not be in the Spice carve-out"
             );
         }
     }

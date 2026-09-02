@@ -28,6 +28,63 @@ pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
+/// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
+pub(crate) const TRIM_NAME: &str = "trim";
+
+/// Renders `args` unchanged as a call to `duckdb_fn`.
+///
+/// For a function whose only difference from its `DuckDB` counterpart is the
+/// name: same arity, same argument order, same semantics. A function whose
+/// arguments need reordering, padding or checking does not belong here — see
+/// [`DuckDBRegexpFunction::to_datafusion_function`] for that shape.
+fn renamed_fn_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+    duckdb_fn: &str,
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let ast_args: Vec<FunctionArg> = args
+        .iter()
+        .map(|arg| {
+            Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .try_collect()?;
+
+    Ok(Some(ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: ast_args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
+/// Converts `DataFusion`'s `btrim` into `DuckDB`'s [`TRIM_NAME`].
+///
+/// `trim` is only an alias in `DataFusion`: the function's own name is `btrim`,
+/// so that is what the unparser emits, and `DuckDB` has no function of that
+/// name. `SELECT trim(name) FROM <a DuckDB-accelerated dataset>` therefore
+/// fails with `Catalog Error: Scalar Function with name btrim does not exist!`
+/// (issue #13794).
+///
+/// A rename is faithful here because `DuckDB`'s `trim` is the same function at
+/// both arities `btrim` accepts: `trim(str)` strips spaces from both ends, and
+/// `trim(str, chars)` strips any character of `chars` from both ends.
+pub(crate) fn btrim_to_trim(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    renamed_fn_to_sql(unparser, args, TRIM_NAME)
+}
+
 /// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
 /// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
 /// `array_cosine_distance`, `array_inner_product`).
@@ -586,6 +643,47 @@ mod tests {
             .expect("should execute successfully")
             .expect("should return expression");
         assert_eq!(result.to_string(), "random()");
+    }
+
+    /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
+    /// `trim(x)` to a `btrim` call and the unparser emits the function's own
+    /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
+    #[test]
+    fn btrim_unparses_to_duckdb_trim() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        for (args, expected) in [
+            (vec![column.clone()], r#"trim("t"."name")"#),
+            (vec![column.clone(), lit("xy")], r#"trim("t"."name", 'xy')"#),
+        ] {
+            let rendered = btrim_to_trim(&unparser, &args)
+                .expect("should execute successfully")
+                .expect("should return expression");
+            assert_eq!(rendered.to_string(), expected);
+        }
+    }
+
+    /// The whole `btrim` call, planned from SQL and unparsed through the
+    /// dialect, so a handler that is written but never installed fails here.
+    #[test]
+    fn duckdb_dialect_installs_the_btrim_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::btrim(),
+            vec![lit("  hi  ")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("btrim unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "trim('  hi  ')");
     }
 
     #[test]

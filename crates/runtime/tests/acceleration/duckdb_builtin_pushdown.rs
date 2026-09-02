@@ -1,0 +1,169 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! `DataFusion` built-ins pushed down to a `DuckDB` accelerator must be
+//! unparsed to a function `DuckDB` actually has, and must answer the same as
+//! local evaluation.
+
+use app::AppBuilder;
+use datafusion::assert_batches_eq;
+use runtime::Runtime;
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::component::dataset::Dataset;
+use spicepod::param::Params;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::acceleration::load_runtime_datasets;
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, run_query, test_request_context, to_pretty_display},
+};
+
+const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// The rows the trims are measured on: padded with spaces, padded with a
+/// character set, padded with both, and NULL.
+fn write_csv_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,name\n\
+         1,\"  padded  \"\n\
+         2,xyhelloyx\n\
+         3,\"x hello x\"\n\
+         4,\n",
+    )?;
+    Ok(())
+}
+
+fn duckdb_accelerated(from: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: Mode::Memory,
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+fn unaccelerated(from: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(from, name);
+    dataset.params = Some(Params::from_string_map(
+        vec![("file_format".to_string(), "csv".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+    dataset
+}
+
+/// `trim` is an alias of `btrim` in `DataFusion`, so a `trim(...)` call reaches
+/// the unparser under the name `btrim` — which `DuckDB` has no function for.
+/// Before the dialect rewrote it, this query failed against the accelerator
+/// with `Catalog Error: Scalar Function with name btrim does not exist!`
+/// (regression test for #13794).
+#[tokio::test]
+async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("names.csv");
+            write_csv_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // The call must reach DuckDB for this to be testing anything: an
+            // accelerated query that evaluated the trims locally would pass
+            // even with the rewrite removed. `base_sql` is the SQL the
+            // federated scan sends, so it is the only part of the plan that
+            // says what DuckDB is asked to evaluate — the logical plan above it
+            // names the DataFusion function either way.
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    "EXPLAIN SELECT trim(name), btrim(name, 'xy') FROM accelerated",
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql: String = plan
+                .split("base_sql=")
+                .skip(1)
+                .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                remote_sql.contains("trim("),
+                "the trims must be pushed down to DuckDB, not evaluated locally; plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("btrim("),
+                "DuckDB has no `btrim`; the pushed-down SQL must call `trim`: {remote_sql}"
+            );
+
+            let query = "SELECT id, \
+                         trim(name) AS spaces, \
+                         btrim(name, 'xy') AS chars, \
+                         trim(btrim(name, 'xy')) AS both \
+                         FROM {table} ORDER BY id";
+
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+
+            let expected = [
+                "+----+---------+-----------+-----------+",
+                "| id | spaces  | chars     | both      |",
+                "+----+---------+-----------+-----------+",
+                "| 1  | padded  |   padded  |    padded |",
+                "| 2  | hello   | hello     | hello     |",
+                "| 3  | x hello |  hello    | hello     |",
+                "| 4  |         |           |           |",
+                "+----+---------+-----------+-----------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+
+            // The accelerator's answer is only right if it is the same answer
+            // DataFusion gives; a rename that is not semantics-preserving
+            // shows up as a divergence here, not as a query error.
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated trims must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
