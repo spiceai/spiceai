@@ -23,8 +23,6 @@ use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
-use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -32,7 +30,6 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arr
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
 use runtime_component::dataset::DatasetSpec;
-use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
@@ -47,6 +44,14 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime_parameters::{ParameterSpec, Parameters};
+
+mod table_factory;
+use table_factory::{AdbcTableFactoryWithPolicy, dialect_for_driver};
+
+/// The factory this connector holds: the managed-driver ADBC factory, with the
+/// federation policy attached by its type. Named because it appears in the drop
+/// plumbing as well as the connector itself.
+type ManagedAdbcTableFactory = AdbcTableFactoryWithPolicy<adbc_driver_manager::ManagedDatabase>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -100,7 +105,7 @@ pub struct Adbc {
     /// Wrapped in `Option` so `Drop` can move the factory to a blocking thread
     /// for cleanup. ADBC drivers perform synchronous FFI calls during drop
     /// (e.g. closing network sessions) that must not run on the async runtime.
-    factory: Option<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+    factory: Option<ManagedAdbcTableFactory>,
     pool: Weak<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
     driver_name: String,
 }
@@ -138,10 +143,7 @@ impl Drop for Adbc {
 
 const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
 
-fn offload_adbc_factory_drop(
-    factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
-    reason: &str,
-) {
+fn offload_adbc_factory_drop(factory: ManagedAdbcTableFactory, reason: &str) {
     tracing::warn!("{reason}");
     if std::thread::Builder::new()
         .name("adbc-cleanup-overflow".to_string())
@@ -158,15 +160,11 @@ fn offload_adbc_factory_drop(
 /// background thread. The worker thread is created once (on first use) and
 /// processes drop work sequentially with bounded buffering, avoiding both
 /// unbounded thread spawns and unbounded cleanup backlog growth.
-fn adbc_cleanup_sender()
--> &'static std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
-    static SENDER: OnceLock<
-        std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
-    > = OnceLock::new();
+fn adbc_cleanup_sender() -> &'static std::sync::mpsc::SyncSender<ManagedAdbcTableFactory> {
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<ManagedAdbcTableFactory>> = OnceLock::new();
     SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<
-            AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
-        >(ADBC_CLEANUP_QUEUE_CAPACITY);
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<ManagedAdbcTableFactory>(ADBC_CLEANUP_QUEUE_CAPACITY);
         if std::thread::Builder::new()
             .name("adbc-cleanup".to_string())
             .spawn(move || {
@@ -372,30 +370,20 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let connection_namespace =
-            resolve_connection_namespace(&driver_name_owned, &params.component, &params.parameters)
-                .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+        let pool_identity =
+            resolve_pool_identity(&driver_name_owned, &uri_str, &params).map_err(|e| {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "adbc".to_string(),
                     connector_component: params.component.clone(),
                     source: Box::new(e),
-                })?;
+                }
+            })?;
 
         let conn_options = build_conn_options(
-            connection_namespace.catalog.as_deref(),
-            connection_namespace.schema.as_deref(),
+            pool_identity.connection_namespace.catalog.as_deref(),
+            pool_identity.connection_namespace.schema.as_deref(),
         );
-
-        // Identity used to decide whether two ADBC-backed tables can be joined
-        // in one federated pushdown: DataFusion's federation optimizer only
-        // merges sub-plans whose `compute_context()` strings match, and
-        // `SqlTable::compute_context()` derives that string from this pool's
-        // `join_push_down()`.
-        let join_context = build_join_context(
-            &uri_str,
-            username,
-            connection_namespace.catalog.as_deref(),
-            connection_namespace.schema.as_deref(),
-        );
+        let join_context = pool_identity.join_context;
 
         let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -533,7 +521,11 @@ impl AdbcFactory {
                 }
             })?;
 
-        let adbc_factory = build_table_factory(Arc::clone(&pool), federation_enabled);
+        let adbc_factory = AdbcTableFactoryWithPolicy::new(
+            Arc::clone(&pool),
+            federation_enabled,
+            &driver_name_owned,
+        );
 
         Ok(Arc::new(Adbc {
             factory: Some(adbc_factory),
@@ -541,26 +533,6 @@ impl AdbcFactory {
             driver_name: driver_name_owned,
         }) as Arc<dyn DataConnector>)
     }
-}
-
-/// Builds the [`AdbcTableFactory`] for a dataset, with the Spice function
-/// deny-list installed and the `query_federation` setting applied.
-///
-/// Without the deny-list, federation pushes Spice-only UDFs (`json_get_str`
-/// and the other JSON functions, the embedding/distance UDFs, etc.) into the
-/// SQL sent to the remote database, where those functions don't exist — the
-/// query then fails with an "unknown function" error from the remote (e.g.
-/// `BigQuery`). Installing the deny-list makes the table's `can_execute_plan`
-/// refuse such plans so `DataFusion` evaluates the affected expressions
-/// locally instead. See issue #10703.
-fn build_table_factory<D>(pool: Arc<ADBCPool<D>>, federation_enabled: bool) -> AdbcTableFactory<D>
-where
-    D: adbc_core::Database + Send + 'static,
-    D::ConnectionType: adbc_core::Connection + Send + Sync,
-{
-    AdbcTableFactory::new(pool)
-        .with_federation_enabled(federation_enabled)
-        .with_function_support(deny_spice_functions_for_table_providers())
 }
 
 async fn enrich_with_bigquery_metadata_from_weak_pool(
@@ -902,6 +874,17 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
+/// Applies the `adbc.` prefix a driver-option key takes when it is written without
+/// one. `bigquery.sql.dataset_id` and `adbc.bigquery.sql.dataset_id` name the same
+/// option, so anything matching on a key has to agree on the spelling.
+fn normalize_driver_option_key(key: &str) -> String {
+    if key.starts_with("adbc.") {
+        key.to_string()
+    } else {
+        format!("adbc.{key}")
+    }
+}
+
 pub(crate) fn build_db_options(
     uri: &str,
     username: Option<&str>,
@@ -927,12 +910,10 @@ pub(crate) fn build_db_options(
                     tracing::warn!("Ignoring ADBC driver option with empty key");
                     continue;
                 }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
+                opts.push((
+                    OptionDatabase::Other(normalize_driver_option_key(key)),
+                    value.trim().into(),
+                ));
             } else {
                 tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
             }
@@ -958,24 +939,109 @@ fn optional_connection_name(params: &Parameters, name: &str) -> Result<Option<St
     }
 }
 
-fn resolve_connection_namespace(
+/// The two namespaces a connector derives from its configuration.
+///
+/// They are not the same thing, and conflating them is what splits a federated
+/// plan: one says where a connection points by default, the other says which
+/// remote engine a table belongs to.
+#[derive(Debug)]
+struct ResolvedNamespaces {
+    /// Applied to every pooled connection as its default catalog and schema.
+    connection: ConnectionNamespace,
+    /// Identifies the remote engine for join pushdown.
+    join: ConnectionNamespace,
+    /// Whether the dataset path named the dataset, and so whether the emitted SQL
+    /// will qualify the table with it.
+    dataset_qualified_path: bool,
+}
+
+/// What a pool takes from its configuration: the namespace its connections
+/// default to, and the identity deciding which tables may be joined in one
+/// pushed-down statement.
+///
+/// The federation optimizer only merges sub-plans whose `compute_context()`
+/// strings match, and `SqlTable::compute_context()` returns this pool's
+/// `join_push_down()` value verbatim — so `join_context` is what decides whether
+/// one inbound statement reaches the remote engine as one query.
+///
+/// `join_context` is a hash, so it is safe to print in `EXPLAIN` and logs.
+#[derive(Debug)]
+struct PoolIdentity {
+    connection_namespace: ConnectionNamespace,
+    join_context: String,
+}
+
+fn resolve_pool_identity(
+    driver_name: &str,
+    uri: &str,
+    params: &ConnectorParams,
+) -> Result<PoolIdentity> {
+    let namespaces = resolve_namespaces(driver_name, &params.component, &params.parameters)?;
+    let driver_options = driver_options_for_identity(
+        driver_name,
+        namespaces.dataset_qualified_path,
+        params.parameters.get("driver_options").expose().ok(),
+    );
+    let join_context = build_join_context(&JoinIdentity {
+        uri,
+        username: params.parameters.get("username").expose().ok(),
+        driver_options: driver_options.as_deref(),
+        catalog: namespaces.join.catalog.as_deref(),
+        schema: namespaces.join.schema.as_deref(),
+    });
+
+    Ok(PoolIdentity {
+        connection_namespace: namespaces.connection,
+        join_context,
+    })
+}
+
+fn resolve_namespaces(
     driver_name: &str,
     component: &ConnectorComponent,
     params: &Parameters,
-) -> Result<ConnectionNamespace> {
+) -> Result<ResolvedNamespaces> {
     let explicit = ConnectionNamespace {
         catalog: optional_connection_name(params, "catalog")?,
         schema: optional_connection_name(params, "schema")?,
     };
 
     if driver_name != "bigquery" {
-        return Ok(explicit);
+        return Ok(ResolvedNamespaces {
+            connection: explicit.clone(),
+            join: explicit,
+            dataset_qualified_path: false,
+        });
     }
 
     let inferred = infer_bigquery_namespace(component);
-    Ok(ConnectionNamespace {
-        catalog: explicit.catalog.or(inferred.catalog),
-        schema: explicit.schema.or(inferred.schema),
+    let inferred_schema = inferred.schema.clone();
+    let connection = ConnectionNamespace {
+        catalog: explicit.catalog.clone().or(inferred.catalog),
+        schema: explicit.schema.clone().or(inferred.schema),
+    };
+
+    // BigQuery resolves a dataset-qualified reference anywhere in the project, so
+    // one job can span datasets and the dataset a connection defaults to is not
+    // part of the execution boundary. Dividing on it would put each dataset in its
+    // own federated sub-plan and so its own job. The project (catalog) and the
+    // credential do bound execution, and stay in the identity.
+    //
+    // Only the *inferred* dataset is dropped. It exists only when the dataset path
+    // is dataset-qualified, which is exactly when the emitted SQL qualifies the
+    // table, so tables keep resolving correctly inside a merged statement. An
+    // explicitly configured `schema` is kept: a bare table reference resolves
+    // against it, so two connections defaulting to different schemas are not
+    // interchangeable.
+    let join = ConnectionNamespace {
+        catalog: connection.catalog.clone(),
+        schema: explicit.schema,
+    };
+
+    Ok(ResolvedNamespaces {
+        connection,
+        join,
+        dataset_qualified_path: inferred_schema.is_some(),
     })
 }
 
@@ -1093,49 +1159,104 @@ fn build_conn_options(
     if opts.is_empty() { None } else { Some(opts) }
 }
 
+/// Everything that decides which remote engine an ADBC table is executed by.
+///
+/// Two tables may be joined in one pushed-down statement exactly when every field
+/// here matches: same endpoint, same credential, same namespace.
+struct JoinIdentity<'a> {
+    uri: &'a str,
+    username: Option<&'a str>,
+    /// Driver options with anything naming a namespace removed — see
+    /// [`driver_options_for_identity`]. For `BigQuery` these carry the
+    /// service-account credential, so the same project reached as two identities
+    /// stays two engines.
+    driver_options: Option<&'a str>,
+    catalog: Option<&'a str>,
+    schema: Option<&'a str>,
+}
+
+/// The `BigQuery` driver option naming the dataset a connection defaults to, in the
+/// normalized spelling [`normalize_driver_option_key`] produces.
+const BIGQUERY_DATASET_OPTION: &str = "adbc.bigquery.sql.dataset_id";
+
+/// Strips the default dataset out of the driver options for identity purposes,
+/// but only when the emitted SQL will name the dataset itself.
+///
+/// A `BigQuery` dataset can reach the connector two ways: as the first part of a
+/// dataset-qualified dataset path, or as `adbc.bigquery.sql.dataset_id` in the
+/// driver options. Where the path carries it, the unparsed reference carries it
+/// too, so the dataset does not bound where the query can execute and must not
+/// divide the identity — leaving it in splits a statement into a query per
+/// dataset exactly as the inferred path would.
+///
+/// Where the path does **not** carry it, the reference is emitted bare and only
+/// the connection's default dataset says which table it means. Two such
+/// connections are not interchangeable: merging them runs every bare name against
+/// whichever pool executes the statement, which silently reads the wrong table.
+/// So the option stays in the identity there, and the statement stays split.
+///
+/// Everything else in the options stays either way, the credential included.
+fn driver_options_for_identity(
+    driver_name: &str,
+    dataset_qualified_path: bool,
+    driver_options: Option<&str>,
+) -> Option<String> {
+    let options = driver_options?;
+    if driver_name != "bigquery" || !dataset_qualified_path {
+        return Some(options.to_string());
+    }
+
+    Some(
+        options
+            .split(';')
+            .filter(|option| {
+                // Match the key the way the driver will receive it, not the way it
+                // happens to be written: the prefix is optional and the separator
+                // may be padded.
+                option
+                    .split_once('=')
+                    .map(|(key, _)| normalize_driver_option_key(key.trim()))
+                    .as_deref()
+                    != Some(BIGQUERY_DATASET_OPTION)
+            })
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
 /// Builds a hashed join-pushdown context identifier for ADBC connections.
 ///
-/// ADBC URIs are driver-vendor-specific and can mix sensitive credentials
-/// with critical identity information (e.g. `bigquery:///project?DatasetId=x`)
-/// in ways that cannot be reliably parsed. We hash all identity-relevant
-/// parts together (similar to the ODBC connector approach) so that:
+/// ADBC URIs and driver options are driver-vendor-specific and can mix sensitive
+/// credentials with critical identity information (e.g.
+/// `bigquery:///project?DatasetId=x`) in ways that cannot be reliably parsed. We
+/// hash all identity-relevant parts together (similar to the ODBC connector
+/// approach) so that:
 ///
 /// - No secrets are ever exposed in `EXPLAIN` plans (`compute_context=...`)
-/// - Two connections to the same database instance produce the same hash,
-///   enabling federated join pushdown
-/// - Different usernames, catalogs, or schemas produce different hashes,
-///   preventing incorrect cross-credential pushdown
-fn build_join_context(
-    uri: &str,
-    username: Option<&str>,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-) -> String {
+/// - Two connections to the same database instance under the same identity
+///   produce the same hash, enabling federated join pushdown
+/// - A different driver, endpoint, credential, catalog or schema produces a
+///   different hash, preventing incorrect cross-credential pushdown
+fn build_join_context(identity: &JoinIdentity<'_>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(uri.as_bytes());
-    hasher.update(b"\0");
-    if let Some(u) = username {
-        hasher.update(u.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(c) = catalog {
-        hasher.update(c.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(s) = schema {
-        hasher.update(s.as_bytes());
+    // A NUL between fields keeps concatenations from colliding; no configuration
+    // value can contain one.
+    for field in [
+        Some(identity.uri),
+        identity.username,
+        identity.driver_options,
+        identity.catalog,
+        identity.schema,
+    ] {
+        if let Some(value) = field {
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(b"\0");
     }
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
         let _ = write!(hash, "{b:02x}");
         hash
     })
-}
-
-pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
-        _ => None,
-    }
 }
 
 /// Checks if an error message indicates an authentication or authorization failure.
@@ -1687,8 +1808,210 @@ mod tests {
         );
     }
 
+    const TEST_CREDENTIAL_A: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
+adbc.bigquery.sql.auth_credentials={\"client_email\":\"a@example.iam.gserviceaccount.com\"}";
+    const TEST_CREDENTIAL_B: &str = "adbc.bigquery.sql.auth_type=adbc.bigquery.sql.auth_type.json_credential_string;\
+adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceaccount.com\"}";
+
+    async fn bigquery_pool_identity(path: &str, uri: &str, credential: &str) -> PoolIdentity {
+        let dataset = test_dataset(path, "t").await;
+        let parameters = Parameters::new(
+            vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                ("uri".to_string(), SecretString::from(uri)),
+                ("driver_options".to_string(), SecretString::from(credential)),
+            ],
+            "adbc",
+            PARAMETERS,
+        );
+
+        let params = ConnectorParams {
+            parameters,
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&dataset),
+            io_runtime: tokio::runtime::Handle::current(),
+        };
+
+        resolve_pool_identity("bigquery", uri, &params).expect("pool identity should resolve")
+    }
+
+    /// The customer-shaped case. A statement joining two `BigQuery` datasets in one
+    /// project under one credential is eligible to run as a single `BigQuery` job,
+    /// which requires both tables to carry one federation compute context — the
+    /// optimizer splits the plan into a sub-plan per context, and each sub-plan
+    /// becomes its own job.
     #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_infers_from_hyphenated_project_path() {
+    async fn test_pool_identity_bigquery_datasets_share_join_context() {
+        let core = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let ledger = bigquery_pool_identity(
+            "adbc:ledger_ds.entries",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+
+        assert_eq!(
+            core.join_context, ledger.join_context,
+            "datasets in one project under one credential must share a join context"
+        );
+
+        // Each connection still defaults to its own dataset; only the join
+        // identity is shared.
+        assert_eq!(core.connection_namespace.schema.as_deref(), Some("core_ds"));
+        assert_eq!(
+            ledger.connection_namespace.schema.as_deref(),
+            Some("ledger_ds")
+        );
+    }
+
+    /// The dataset can also arrive as `adbc.bigquery.sql.dataset_id` in the driver
+    /// options rather than in the dataset path. It is the same dataset either way,
+    /// so it must not divide the identity either way.
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_dataset_option_does_not_split() {
+        let core = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=core_ds;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+        let ledger = bigquery_pool_identity(
+            "adbc:ledger_ds.entries",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ledger_ds;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            core.join_context, ledger.join_context,
+            "the default dataset must not divide the join context, in the path or the driver options"
+        );
+    }
+
+    /// A bare dataset path is emitted as a bare table reference, so only the
+    /// connection's default dataset says which table it means. Two such
+    /// connections must stay apart: merging them reads every bare name from
+    /// whichever pool ran the statement.
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_bare_paths_stay_split() {
+        let a = bigquery_pool_identity(
+            "adbc:t",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ds_a;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:t",
+            "bigquery:///proj",
+            &format!(
+                "adbc.bigquery.sql.project_id=proj;adbc.bigquery.sql.dataset_id=ds_b;{TEST_CREDENTIAL_A}"
+            ),
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "bare table references resolve against the connection's dataset, so two \
+             connections defaulting to different datasets must not share a join context"
+        );
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_matches_every_spelling_of_the_key() {
+        for written in [
+            "adbc.bigquery.sql.dataset_id=ds_a",
+            "bigquery.sql.dataset_id=ds_a",
+            " adbc.bigquery.sql.dataset_id = ds_a ",
+        ] {
+            let options = format!("{written};adbc.bigquery.sql.project_id=proj");
+            assert_eq!(
+                driver_options_for_identity("bigquery", true, Some(&options)).as_deref(),
+                Some("adbc.bigquery.sql.project_id=proj"),
+                "the dataset option was not recognised written as `{written}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_keeps_dataset_for_bare_paths() {
+        let options = Some("adbc.bigquery.sql.dataset_id=ds_a;adbc.bigquery.sql.project_id=proj");
+        assert_eq!(
+            driver_options_for_identity("bigquery", false, options).as_deref(),
+            options,
+            "a bare path needs the dataset kept, or two of them merge and read one table"
+        );
+        assert_eq!(
+            driver_options_for_identity("bigquery", true, options).as_deref(),
+            Some("adbc.bigquery.sql.project_id=proj"),
+            "a dataset-qualified path emits the dataset itself, so it leaves the identity"
+        );
+    }
+
+    #[test]
+    fn test_driver_options_for_identity_leaves_other_drivers_alone() {
+        let options = Some("Database=sales;Uid=reader");
+        assert_eq!(
+            driver_options_for_identity("postgresql", true, options).as_deref(),
+            options,
+            "only BigQuery's default dataset is stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_projects_are_isolated() {
+        let a = bigquery_pool_identity(
+            "adbc:proj-a.shared_ds.t",
+            "bigquery:///proj-a",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:proj-b.shared_ds.t",
+            "bigquery:///proj-b",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "different projects must not share a join context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pool_identity_bigquery_credentials_are_isolated() {
+        let a = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_A,
+        )
+        .await;
+        let b = bigquery_pool_identity(
+            "adbc:core_ds.clients",
+            "bigquery:///proj",
+            TEST_CREDENTIAL_B,
+        )
+        .await;
+
+        assert_ne!(
+            a.join_context, b.join_context,
+            "different service-account identities must not share a join context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_namespaces_bigquery_infers_from_hyphenated_project_path() {
         let dataset = test_dataset("adbc:my-project.my_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1703,19 +2026,17 @@ mod tests {
             PARAMETERS,
         );
 
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("bigquery namespace should resolve");
+        let namespace =
+            resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+                .expect("bigquery namespace should resolve")
+                .connection;
 
         assert_eq!(namespace.catalog.as_deref(), Some("my-project"));
         assert_eq!(namespace.schema.as_deref(), Some("my_dataset"));
     }
 
     #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_preserves_explicit_values() {
+    async fn test_resolve_namespaces_bigquery_preserves_explicit_values() {
         let dataset = test_dataset("adbc:my-project.path_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1738,19 +2059,17 @@ mod tests {
             PARAMETERS,
         );
 
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("explicit namespace should be preserved");
+        let namespace =
+            resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+                .expect("explicit namespace should be preserved")
+                .connection;
 
         assert_eq!(namespace.catalog.as_deref(), Some("configured-project"));
         assert_eq!(namespace.schema.as_deref(), Some("configured_dataset"));
     }
 
     #[tokio::test]
-    async fn test_resolve_connection_namespace_rejects_empty_schema() {
+    async fn test_resolve_namespaces_rejects_empty_schema() {
         let dataset = test_dataset("adbc:my_dataset.my_table", "my_table").await;
 
         let parameters = Parameters::new(
@@ -1766,12 +2085,8 @@ mod tests {
             PARAMETERS,
         );
 
-        let err = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect_err("empty schema should be rejected");
+        let err = resolve_namespaces("bigquery", &ConnectorComponent::from(&dataset), &parameters)
+            .expect_err("empty schema should be rejected");
 
         assert_eq!(
             err.to_string(),
@@ -1919,14 +2234,30 @@ mod tests {
         is_query_federation_enabled(&params).expect_err("should error on invalid value");
     }
 
+    fn bigquery_identity<'a>(
+        uri: &'a str,
+        driver_options: Option<&'a str>,
+        catalog: Option<&'a str>,
+        schema: Option<&'a str>,
+    ) -> JoinIdentity<'a> {
+        JoinIdentity {
+            uri,
+            username: None,
+            driver_options,
+            catalog,
+            schema,
+        }
+    }
+
     #[test]
     fn test_build_join_context_no_secrets_in_output() {
-        let ctx = build_join_context(
-            "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
-            Some("admin"),
-            Some("my_catalog"),
-            Some("my_schema"),
-        );
+        let ctx = build_join_context(&JoinIdentity {
+            uri: "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
+            username: Some("admin"),
+            driver_options: Some("adbc.bigquery.sql.auth_credentials=SECRET_KEY_MATERIAL"),
+            catalog: Some("my_catalog"),
+            schema: Some("my_schema"),
+        });
         // Hash output must not contain any raw URI or credential fragments
         assert!(
             !ctx.contains("SECRET123"),
@@ -1944,6 +2275,10 @@ mod tests {
             !ctx.contains("my_catalog"),
             "context must not contain raw catalog"
         );
+        assert!(
+            !ctx.contains("SECRET_KEY_MATERIAL"),
+            "context must not contain raw credential material from driver options"
+        );
         // Must be a fixed-length hex string (SHA-256 = 64 hex chars)
         assert_eq!(
             ctx.len(),
@@ -1956,17 +2291,33 @@ mod tests {
         );
     }
 
+    fn postgres_identity<'a>(uri: &'a str, username: Option<&'a str>) -> JoinIdentity<'a> {
+        JoinIdentity {
+            uri,
+            username,
+            driver_options: None,
+            catalog: None,
+            schema: None,
+        }
+    }
+
     #[test]
     fn test_build_join_context_deterministic() {
-        let ctx1 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
-        let ctx2 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
+        let ctx1 = build_join_context(&postgres_identity(
+            "postgresql://host:5432/db",
+            Some("user"),
+        ));
+        let ctx2 = build_join_context(&postgres_identity(
+            "postgresql://host:5432/db",
+            Some("user"),
+        ));
         assert_eq!(ctx1, ctx2, "same inputs must produce the same hash");
     }
 
     #[test]
     fn test_build_join_context_differs_by_username() {
-        let ctx_a = build_join_context("postgresql://host/db", Some("alice"), None, None);
-        let ctx_b = build_join_context("postgresql://host/db", Some("bob"), None, None);
+        let ctx_a = build_join_context(&postgres_identity("postgresql://host/db", Some("alice")));
+        let ctx_b = build_join_context(&postgres_identity("postgresql://host/db", Some("bob")));
         assert_ne!(
             ctx_a, ctx_b,
             "different usernames must produce different hashes"
@@ -1975,9 +2326,109 @@ mod tests {
 
     #[test]
     fn test_build_join_context_differs_by_uri() {
-        let ctx_a = build_join_context("bigquery:///project-a?DatasetId=ds1", None, None, None);
-        let ctx_b = build_join_context("bigquery:///project-b?DatasetId=ds1", None, None, None);
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///project-a?DatasetId=ds1",
+            None,
+            None,
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///project-b?DatasetId=ds1",
+            None,
+            None,
+            None,
+        ));
         assert_ne!(ctx_a, ctx_b, "different URIs must produce different hashes");
+    }
+
+    /// Two `BigQuery` datasets in one project under one credential are one remote
+    /// engine, so they must share a join context and federate as a single job.
+    #[test]
+    fn test_build_join_context_bigquery_same_project_spans_datasets() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            None,
+        ));
+        assert_eq!(
+            ctx_a, ctx_b,
+            "datasets in one project under one credential must share a join context"
+        );
+    }
+
+    #[test]
+    fn test_build_join_context_bigquery_differs_by_project() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///project-a",
+            credential,
+            Some("project-a"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///project-b",
+            credential,
+            Some("project-b"),
+            None,
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different projects must not share a join context"
+        );
+    }
+
+    /// The credential lives in the driver options, not the URI, so identity must
+    /// be taken from them; otherwise one project reached as two service accounts
+    /// would look like one engine.
+    #[test]
+    fn test_build_join_context_bigquery_differs_by_credential() {
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            Some("adbc.bigquery.sql.auth_credentials=service-account-a"),
+            Some("my-project"),
+            None,
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            Some("adbc.bigquery.sql.auth_credentials=service-account-b"),
+            Some("my-project"),
+            None,
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different service-account identities must not share a join context"
+        );
+    }
+
+    /// A bare table reference resolves against the connection's default schema, so
+    /// two connections defaulting to different schemas are not interchangeable.
+    #[test]
+    fn test_build_join_context_differs_by_explicit_schema() {
+        let credential = Some("adbc.bigquery.sql.auth_credentials=service-account-a");
+        let ctx_a = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            Some("configured_a"),
+        ));
+        let ctx_b = build_join_context(&bigquery_identity(
+            "bigquery:///my-project",
+            credential,
+            Some("my-project"),
+            Some("configured_b"),
+        ));
+        assert_ne!(
+            ctx_a, ctx_b,
+            "different explicitly configured schemas must not share a join context"
+        );
     }
 }
 
@@ -1994,7 +2445,7 @@ data_connector_api::register_data_connector!(
 #[cfg(test)]
 mod function_support_tests {
     //! Regression tests for the federation deny-list on the ADBC table
-    //! factory: [`build_table_factory`] must install the Spice function
+    //! factory: [`AdbcTableFactoryWithPolicy`] must install the Spice function
     //! deny-list and honor the `query_federation` setting. Without the
     //! deny-list, Spice-only UDFs like `json_get_str` are unparsed into the
     //! SQL sent to the remote database (e.g. `BigQuery`), which cannot
@@ -2010,17 +2461,24 @@ mod function_support_tests {
     use adbc_core::{Connection, Database, Optionable, PartitionedResult, Statement};
     use arrow::array::{RecordBatch, RecordBatchReader};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::TableProvider;
+    use datafusion::common::tree_node::TreeNode;
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::{TableProvider, provider_as_source};
+    use datafusion::functions::expr_fn;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
         builder::LogicalTableSource, create_udf, expr::ScalarFunction,
     };
-    use datafusion::prelude::col;
+    use datafusion::optimizer::AnalyzerRule;
+    use datafusion::prelude::{col, lit};
     use datafusion::sql::TableReference;
-    use datafusion_federation::{FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan};
+    use datafusion_federation::sql::federation_analyzer_rule;
+    use datafusion_federation::{
+        FederatedPlanNode, FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan,
+    };
     use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 
-    use super::build_table_factory;
+    use super::{AdbcTableFactoryWithPolicy, dialect_for_driver};
 
     fn not_implemented(what: &str) -> AdbcError {
         AdbcError::with_message_and_status(
@@ -2258,17 +2716,22 @@ mod function_support_tests {
         Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![col("val")]))
     }
 
-    async fn stub_table_provider(federation_enabled: bool) -> Arc<dyn TableProvider> {
+    /// A provider over the stub driver, built the way the connector builds one
+    /// for `driver_name` — same policy, same dialect.
+    async fn stub_table_provider(
+        federation_enabled: bool,
+        driver_name: &str,
+    ) -> Arc<dyn TableProvider> {
         let pool = Arc::new(ADBCPool::new(StubDatabase, None).expect("build the stub ADBC pool"));
-        build_table_factory(pool, federation_enabled)
-            .table_provider(TableReference::bare("t"), None)
+        AdbcTableFactoryWithPolicy::new(pool, federation_enabled, driver_name)
+            .table_provider(TableReference::bare("t"), dialect_for_driver(driver_name))
             .await
             .expect("build the ADBC table provider")
     }
 
     #[tokio::test]
     async fn table_factory_denies_spice_functions_from_federation() {
-        let provider = stub_table_provider(true).await;
+        let provider = stub_table_provider(true, "sqlite").await;
         let adaptor = (provider.as_ref() as &dyn std::any::Any)
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .expect("a federation-enabled factory must produce a federated provider");
@@ -2293,9 +2756,350 @@ mod function_support_tests {
         );
     }
 
+    /// A `json_get_*` call over the stub table's `val` column.
+    fn json_call(name: &str, path: Vec<Expr>) -> Expr {
+        let mut args = vec![col("val")];
+        args.extend(path);
+        let udf = Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8; args.len()],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, args))
+    }
+
+    /// Whether a plan carrying `expr` federates to a provider built for
+    /// `driver_name`.
+    async fn federates(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_project(expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_the_json_calls_its_dialect_can_translate() {
+        assert!(
+            federates("bigquery", json_call("json_get_int", vec![lit("a")])).await,
+            "the BigQuery dialect rewrites this into JSON_VALUE, so it must push down"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_str", vec![lit("a")])).await,
+            "the BigQuery dialect guards JSON_VALUE with JSON_QUERY for the string \
+             form, so it must push down too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_bool", vec![lit("a")])).await,
+            "the BigQuery dialect compares JSON_VALUE's rendering for the bool form"
+        );
+        assert!(
+            federates("bigquery", json_call("json_get_float", vec![lit("a")])).await,
+            "BigQuery's SAFE_CAST saturates exactly as Rust's f64::FromStr does, so the \
+             float form is translatable too"
+        );
+        assert!(
+            federates("bigquery", json_call("json_length", vec![lit("a")])).await,
+            "an array's and an object's counts each have a BigQuery equivalent"
+        );
+        assert!(
+            federates("bigquery", json_call("json_object_keys", vec![lit("a")])).await,
+            "JSON_KEYS at depth 1 is the object's own keys, which is what this returns"
+        );
+        assert!(
+            federates(
+                "bigquery",
+                json_call("json_get_int", vec![lit("a"), lit(0_i64)])
+            )
+            .await,
+            "a literal path of any length is translatable"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate() {
+        // BigQuery's JSON path argument must be a constant, so a per-row path
+        // has no translation. Federating it would unparse `json_get_int`
+        // verbatim into BigQuery SQL — issue #10703 all over again — so the
+        // plan must stay local instead.
+        assert!(
+            !federates("bigquery", json_call("json_get_int", vec![col("val")])).await,
+            "a per-row path has no BigQuery translation, so the plan must not federate"
+        );
+        assert!(
+            !federates(
+                "bigquery",
+                json_call("json_get_int", vec![lit("a"), col("val")])
+            )
+            .await,
+            "one non-literal element is enough to make the whole path untranslatable"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_int", vec![lit(r#"a"b"#)])).await,
+            "a key the SQL-literal and JSON-path layers quote differently is left local \
+             rather than escaped across both and silently turned into another path"
+        );
+        // The check is per call, not per function: every translated name owes
+        // the same refusals, or the newest handler is the one that federates a
+        // shape it cannot render.
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![col("val")])).await,
+            "a per-row path has no BigQuery translation for the string form either"
+        );
+        assert!(
+            !federates("bigquery", json_call("json_get_str", vec![lit(r#"a"b"#)])).await,
+            "an unquotable key is left local for the string form too"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
+        for name in [
+            // Returns a union of every JSON scalar type, which has no SQL type
+            // to unparse into.
+            "json_get",
+            // Returns the matched node's own bytes; JSON_QUERY re-renders it.
+            "json_as_text",
+            // A JSON `null` and a missing key are indistinguishable in
+            // BigQuery, and json_contains tells them apart.
+            "json_contains",
+        ] {
+            assert!(
+                !federates("bigquery", json_call(name, vec![lit("a")])).await,
+                "{name} has no BigQuery translation and must stay denied"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_driver_without_a_spice_dialect_denies_every_json_function() {
+        // The carve-out is BigQuery's, not ADBC's: another driver gets the
+        // plain deny-list and evaluates these locally.
+        for name in [
+            "json_get_int",
+            "json_get_float",
+            "json_get_str",
+            "json_get_bool",
+        ] {
+            assert!(
+                !federates("sqlite", json_call(name, vec![lit("a")])).await,
+                "{name} must not push down to a driver whose dialect cannot rewrite it"
+            );
+        }
+    }
+
+    /// `SELECT id FROM t WHERE <predicate>` over the stub table, run through
+    /// the federation analyzer. The projection keeps the root off the leaf,
+    /// where the analyzer deliberately leaves a bare scan for the provider to
+    /// handle itself.
+    async fn federated_plan_for_driver(driver_name: &str, predicate: Expr) -> LogicalPlan {
+        let provider = stub_table_provider(true, driver_name).await;
+        let plan = LogicalPlanBuilder::scan("t", provider_as_source(provider), None)
+            .expect("scan the stub table")
+            .filter(predicate)
+            .expect("filter on the JSON value")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build the plan");
+
+        federation_analyzer_rule()
+            .analyze(plan, &ConfigOptions::default())
+            .expect("federate what can be federated")
+    }
+
+    async fn federated_plan(predicate: Expr) -> LogicalPlan {
+        federated_plan_for_driver("bigquery", predicate).await
+    }
+
+    #[tokio::test]
+    async fn a_translatable_predicate_federates_as_one_node_with_the_predicate_inside_it() {
+        let analyzed =
+            federated_plan(json_call("json_get_int", vec![lit("a")]).eq(lit(1_i64))).await;
+
+        assert!(
+            is_federated_node(&analyzed),
+            "the predicate translates, so the whole plan is one remote statement: {analyzed}"
+        );
+        assert_eq!(
+            federated_node_count(&analyzed),
+            1,
+            "one remote statement, not one per side: {analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untranslatable_predicate_is_left_above_the_federated_scan() {
+        let analyzed =
+            federated_plan(json_call("json_get_int", vec![col("val")]).eq(lit(1_i64))).await;
+
+        assert!(
+            !is_federated_node(&analyzed),
+            "a per-row path has no translation, so the plan cannot federate whole: {analyzed}"
+        );
+        assert!(
+            analyzed
+                .apply(|node| {
+                    Ok(if matches!(node, LogicalPlan::Filter(_)) {
+                        datafusion::common::tree_node::TreeNodeRecursion::Stop
+                    } else {
+                        datafusion::common::tree_node::TreeNodeRecursion::Continue
+                    })
+                })
+                .map(|recursion| {
+                    recursion == datafusion::common::tree_node::TreeNodeRecursion::Stop
+                })
+                .expect("walk the plan"),
+            "the predicate must be left for the local engine to evaluate: {analyzed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_denies_regexp_match_in_every_shape() {
+        // BigQuery has no `regexp_match`; federating any shape of it fails
+        // remotely with `Function not found: regexp_match`, and its
+        // list-of-matches result has no faithful BigQuery rendering. The
+        // NULL-check idiom federates only through its `regexp_like` rewrite
+        // (`RegexpMatchNullCheckRewrite` runs before federation), so the raw
+        // call must always stay local.
+        let matches = expr_fn::regexp_match(col("val"), lit("^R[0-9]{2}"), None);
+        assert!(
+            !federates("bigquery", matches.clone()).await,
+            "a projected regexp_match must stay local"
+        );
+        assert!(
+            !federates("bigquery", Expr::IsNotNull(Box::new(matches))).await,
+            "an unrewritten NULL-check still carries regexp_match and must stay local"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_the_regexp_like_shapes_its_dialect_can_translate() {
+        assert!(
+            federates(
+                "bigquery",
+                expr_fn::regexp_like(col("val"), lit("^R[0-9]{2}"), None)
+            )
+            .await,
+            "the BigQuery dialect rewrites this into REGEXP_CONTAINS, so it must push down"
+        );
+        assert!(
+            federates(
+                "bigquery",
+                expr_fn::regexp_like(col("val"), lit("^r[0-9]{2}"), Some(lit("i")))
+            )
+            .await,
+            "literal ims flags fold into the pattern as an inline group"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_refuses_the_regexp_like_shapes_its_dialect_cannot_translate() {
+        for (why, expr) in [
+            (
+                "a non-literal pattern cannot be scanned for engine agreement",
+                expr_fn::regexp_like(col("val"), col("val"), None),
+            ),
+            (
+                r"\d is Unicode-aware locally and ASCII in BigQuery's RE2",
+                expr_fn::regexp_like(col("val"), lit(r"^\d+$"), None),
+            ),
+            (
+                "the U flag is unmeasured against BigQuery",
+                expr_fn::regexp_like(col("val"), lit("^r"), Some(lit("U"))),
+            ),
+            (
+                "non-literal flags cannot be folded into the pattern",
+                expr_fn::regexp_like(col("val"), lit("^r"), Some(col("val"))),
+            ),
+        ] {
+            assert!(
+                !federates("bigquery", expr).await,
+                "{why}, so the call must stay local"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_bigquery_provider_does_not_run_the_regexp_rewrite() {
+        let analyzed = federated_plan_for_driver(
+            "sqlite",
+            Expr::IsNotNull(Box::new(expr_fn::regexp_match(
+                col("val"),
+                lit("^R[0-9]{2}"),
+                None,
+            ))),
+        )
+        .await;
+        assert!(
+            is_federated_node(&analyzed),
+            "the non-BigQuery provider should still federate its original expression: {analyzed}"
+        );
+        let LogicalPlan::Extension(extension) = &analyzed else {
+            panic!("expected a federated extension: {analyzed}");
+        };
+        let federated = extension
+            .node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("the extension is a federated plan node");
+        let inner = federated.plan().display_indent().to_string();
+        assert!(
+            inner.contains("regexp_match") && !inner.contains("regexp_like"),
+            "the BigQuery-only pre-federation rewrite must not touch another provider: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_null_check_rewrite_lets_the_regexp_predicate_federate_whole() {
+        // The BigQuery provider supplies the shared optimizer rule to the
+        // federation analyzer. It rewrites the provider-owned candidate before
+        // the capability check, without a global analyzer rule.
+        let analyzed = federated_plan(Expr::IsNotNull(Box::new(expr_fn::regexp_match(
+            col("val"),
+            lit("^R[0-9]{2}"),
+            None,
+        ))))
+        .await;
+
+        assert!(
+            is_federated_node(&analyzed),
+            "the rewritten predicate translates, so the whole plan is one remote statement: {analyzed}"
+        );
+        assert_eq!(
+            federated_node_count(&analyzed),
+            1,
+            "one remote statement, not one per side: {analyzed}"
+        );
+    }
+
+    fn is_federated_node(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::Extension(extension) if extension.node.name() == "Federated")
+    }
+
+    fn federated_node_count(plan: &LogicalPlan) -> usize {
+        let mut count = 0;
+        plan.apply(|node| {
+            if is_federated_node(node) {
+                count += 1;
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .expect("walk the plan");
+        count
+    }
+
     #[tokio::test]
     async fn table_factory_disables_federation_when_configured() {
-        let provider = stub_table_provider(false).await;
+        let provider = stub_table_provider(false, "sqlite").await;
         assert!(
             (provider.as_ref() as &dyn std::any::Any)
                 .downcast_ref::<FederatedTableProviderAdaptor>()
