@@ -192,14 +192,17 @@ impl MemoryVectorIndex {
 
     /// Project the write-output batch down to the stored schema, dropping
     /// rows that cannot be indexed (null primary key, or a null/invalid
-    /// embedding). Returns the filtered batch and its formatted keys.
+    /// embedding). Returns the filtered batch, its formatted keys, and the keys
+    /// whose row was dropped and so must not keep an earlier entry in the store
+    /// (see [`write_util::keys_to_evict`]).
     fn batch_for_store(
         &self,
         output: &RecordBatch,
         primary_keys: &[Option<String>],
         embedding_vectors: &[Option<Vec<f32>>],
-    ) -> Result<(RecordBatch, Vec<String>), Error> {
+    ) -> Result<(RecordBatch, Vec<String>, Vec<String>), Error> {
         let mut keys = Vec::with_capacity(primary_keys.len());
+        let mut rejected = Vec::new();
         let mask: BooleanArray = primary_keys
             .iter()
             .zip(embedding_vectors.iter())
@@ -212,19 +215,27 @@ impl MemoryVectorIndex {
                         if valid {
                             keys.push(key.clone());
                         } else {
+                            rejected.push(key.clone());
                             tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
+                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
                             );
                         }
                         valid
                     }
                     (None, _) => {
+                        // No key to address an earlier entry with, so there is
+                        // nothing this write can evict.
                         tracing::warn!(
                             "Skipping a record for memory vector index '{INDEX_NAME}': the primary key is NULL"
                         );
                         false
                     }
-                    (Some(_), None) => false, // NULL/empty search text — nothing to index.
+                    // NULL/empty search text — nothing to index, and an entry
+                    // stored under this key from an earlier text must go with it.
+                    (Some(key), None) => {
+                        rejected.push(key.clone());
+                        false
+                    }
                 };
                 Some(keep)
             })
@@ -252,7 +263,8 @@ impl MemoryVectorIndex {
                 index: INDEX_NAME.to_string(),
             },
         )?;
-        Ok((batch, keys))
+        let evicted = write_util::keys_to_evict(rejected, keys.iter().map(String::as_str));
+        Ok((batch, keys, evicted))
     }
 }
 
@@ -439,9 +451,9 @@ impl SearchIndex for MemoryVectorIndex {
         let output =
             write_util::sort_columns_alphabetically(updated).map_err(|e| Error::from(*e))?;
 
-        let (store_batch, keys) =
+        let (store_batch, keys, evicted) =
             self.batch_for_store(&output, &primary_keys, &embedding_vectors)?;
-        self.store.write().upsert(store_batch, keys)?;
+        self.store.write().upsert(store_batch, keys, &evicted)?;
 
         Ok(output)
     }
@@ -609,6 +621,111 @@ mod tests {
             .on_write_complete()
             .await
             .expect("the write window closes");
+    }
+
+    /// A batch whose `content` is given per row, so a row can carry text that embeds to a
+    /// vector the write rejects, or no text at all.
+    fn batch_with_contents(ids: &[i64], contents: &[Option<&str>]) -> RecordBatch {
+        assert_eq!(ids.len(), contents.len(), "one content per id");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(contents.to_vec())),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    async fn write_batch(index: &MemoryVectorIndex, record: RecordBatch) {
+        index
+            .compute_index(vec![record])
+            .await
+            .expect("the rows are indexed");
+    }
+
+    /// `\0` embeds to an all-zero vector under [`ByteEmbed`] (`0 / 255.0` per component),
+    /// which is exactly what the write path rejects as having no defined direction.
+    const REJECTED_TEXT: &str = "\0";
+
+    #[tokio::test]
+    async fn the_rejected_text_fixture_really_is_rejected() {
+        assert!(
+            byte_vector(REJECTED_TEXT)
+                .iter()
+                .all(|&v| v == 0.0 || v.is_nan()),
+            "the rewrite tests below are vacuous unless this text embeds to a rejected vector"
+        );
+    }
+
+    /// Regression test for #13504. A row rewritten from indexable text to text whose
+    /// embedding the write rejects was dropped from the write but left in the store, so
+    /// vector search kept returning it at the vector its *previous* text produced — while
+    /// the write's own log line said the row was not indexed.
+    #[tokio::test]
+    async fn a_rewrite_to_a_rejected_embedding_removes_the_previous_vector() {
+        let index = memory_index();
+        write_batch(&index, batch(&[1, 2, 3])).await;
+        assert_eq!(indexed_ids(&index), vec![1, 2, 3]);
+
+        write_batch(&index, batch_with_contents(&[2], &[Some(REJECTED_TEXT)])).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 3],
+            "the write reported row 2 as not indexed, so no vector for it may remain searchable"
+        );
+    }
+
+    /// The same mechanism reached through the other arm: a row whose search text becomes
+    /// NULL produces no embedding at all, and the entry its previous text stored must go
+    /// with it rather than stay searchable under the old value.
+    #[tokio::test]
+    async fn a_rewrite_to_null_text_removes_the_previous_vector() {
+        let index = memory_index();
+        write_batch(&index, batch(&[1, 2, 3])).await;
+
+        write_batch(&index, batch_with_contents(&[2], &[None])).await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 3]);
+    }
+
+    /// The eviction must not reach beyond the rows the write rejected.
+    #[tokio::test]
+    async fn a_rejected_row_does_not_evict_the_rows_written_beside_it() {
+        let index = memory_index();
+        write_batch(&index, batch(&[1, 2, 3])).await;
+
+        write_batch(
+            &index,
+            batch_with_contents(
+                &[1, 2, 3],
+                &[Some("one"), Some(REJECTED_TEXT), Some("three")],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 3],
+            "only the rejected row leaves the index; its neighbours are rewritten as usual"
+        );
+    }
+
+    /// A first write for a key that is rejected has nothing to evict, and must not disturb
+    /// the rest of the index.
+    #[tokio::test]
+    async fn a_first_write_that_is_rejected_leaves_the_index_untouched() {
+        let index = memory_index();
+        write_batch(&index, batch(&[1, 3])).await;
+
+        write_batch(&index, batch_with_contents(&[2], &[Some(REJECTED_TEXT)])).await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 3]);
     }
 
     /// The regression test. A `refresh_mode: full` refresh removes a row by not re-sending

@@ -197,7 +197,7 @@ verify-cli:
 	mkdir -p "$(TARGET_DIR)"; \
 	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
 	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
-	python3 scripts/verify_cli_build.py "$$out" version.txt
+	$(PYTHON) scripts/verify_cli_build.py "$$out" version.txt
 
 .PHONY: nextest-packages
 nextest-packages:
@@ -262,6 +262,22 @@ else
 _FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
 endif
 
+## The guard scripts below need Python 3.11+ (stdlib `tomllib`). The sign-off
+## runners carry more than one interpreter and bare `python3` does not resolve to
+## the same one on every run: github-runner-02 passed this recipe at 03:36 and
+## failed it at 06:58 the same morning on `found 3.9`, which fails the whole
+## sign-off in ~9s with nothing wrong in the branch. Resolve an interpreter that
+## is actually new enough instead of trusting PATH order. Falls back to plain
+## `python3` so a host with nothing newer still gets check_crate_layers.py's own
+## "needs Python 3.11+" message rather than a missing-command error.
+## Override with `make lint-rust PYTHON=python3.12` to pin a specific one.
+ifeq ($(strip $(PYTHON)),)
+PYTHON := $(shell for p in python3.14 python3.13 python3.12 python3.11 python3; do \
+		command -v $$p >/dev/null 2>&1 || continue; \
+		$$p -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null && { echo $$p; exit 0; }; \
+	done; echo python3)
+endif
+
 .PHONY: lint lint-rust
 lint: lint-rust
 
@@ -269,21 +285,21 @@ lint: lint-rust
 lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
-	python3 scripts/check_crate_layers.py
+	$(PYTHON) scripts/check_crate_layers.py
 	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
-	python3 scripts/check_table_layers.py
+	$(PYTHON) scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	## Its derivation is exercised first: the live-tree scan only covers the paths today's workspace happens to contain, so a derivation that stopped working would pass unnoticed on a clean tree
-	python3 scripts/test_check_rust_gate_paths.py
-	python3 scripts/check_rust_gate_paths.py
+	$(PYTHON) scripts/test_check_rust_gate_paths.py
+	$(PYTHON) scripts/check_rust_gate_paths.py
 	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
-	python3 scripts/test_check_module_reachability.py
-	python3 scripts/check_module_reachability.py
+	$(PYTHON) scripts/test_check_module_reachability.py
+	$(PYTHON) scripts/check_module_reachability.py
 	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
 	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
-	python3 scripts/test_check_fork_patches.py
-	python3 scripts/check_fork_patches.py
+	$(PYTHON) scripts/test_check_fork_patches.py
+	$(PYTHON) scripts/check_fork_patches.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
@@ -433,7 +449,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # `default = [...]` array in bin/spiced/Cargo.toml.
 #
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
 
 .PHONY: install
 install: build
@@ -491,6 +507,11 @@ install-odbc:
 .PHONY: install-nfs
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# ScyllaDB variants
+.PHONY: install-scylladb
+install-scylladb:
+	make install SPICED_NON_DEFAULT_FEATURES="scylladb"
 
 # Install from a CI build artifact (branch or commit SHA)
 # Usage:

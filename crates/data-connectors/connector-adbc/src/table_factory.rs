@@ -23,6 +23,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
+use datafusion::optimizer::OptimizerRule;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::adbc::AdbcTableFactory;
@@ -30,6 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::ADBCPool;
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_datafusion::dialect::new_bigquery_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_bigquery_table_providers;
+use runtime_datafusion::optimizer_rule::RegexpMatchNullCheckRewrite;
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -61,6 +63,15 @@ fn function_support_for_driver(driver_name: &str) -> FunctionSupport {
     }
 }
 
+fn pre_federation_optimizer_rules_for_driver(
+    driver_name: &str,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+    match driver_name {
+        BIGQUERY_DRIVER => vec![Arc::new(RegexpMatchNullCheckRewrite::new())],
+        _ => vec![],
+    }
+}
+
 /// An [`AdbcTableFactory`] that carries Spice's federation policy by
 /// construction.
 ///
@@ -89,6 +100,8 @@ pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     factory: AdbcTableFactory<D>,
 }
@@ -97,6 +110,8 @@ impl<D> AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     /// Builds the factory with the driver's function-support policy installed
     /// and the `query_federation` setting applied.
@@ -104,7 +119,10 @@ where
         Self {
             factory: AdbcTableFactory::new(pool)
                 .with_federation_enabled(federation_enabled)
-                .with_function_support(function_support_for_driver(driver_name)),
+                .with_function_support(function_support_for_driver(driver_name))
+                .with_pre_federation_optimizer_rules(pre_federation_optimizer_rules_for_driver(
+                    driver_name,
+                )),
         }
     }
 

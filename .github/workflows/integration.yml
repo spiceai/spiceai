@@ -480,6 +480,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -794,6 +795,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
