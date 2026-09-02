@@ -58,7 +58,9 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 // Function to determine the allocator name at compile time
 const fn get_allocator_name() -> Option<&'static str> {
-    if cfg!(feature = "alloc-jemalloc") {
+    if cfg!(feature = "alloc-jemalloc-profiling") {
+        Some("jemalloc-profiling")
+    } else if cfg!(feature = "alloc-jemalloc") {
         Some("jemalloc")
     } else if cfg!(feature = "alloc-mimalloc") {
         Some("mimalloc")

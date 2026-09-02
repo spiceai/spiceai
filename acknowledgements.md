@@ -855,7 +855,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - tiktoken-rs 0.9.1, MIT 
   <br/>https://github.com/zurawiki/tiktoken-rs
 
-- tikv-jemallocator 0.6.1, Apache-2.0 OR MIT 
+- tikv-jemallocator 0.7.0, Apache-2.0 OR MIT 
   <br/>https://github.com/tikv/jemallocator
 
 - time 0.3.47, Apache-2.0 OR MIT 

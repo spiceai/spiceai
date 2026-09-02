@@ -194,8 +194,7 @@ dependencies = [
 [[package]]
 name = "adbc_core"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46b169525a7c41670fe95874103c7c6ce713ac699123f81a200bc31f9ad3b02e"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=34a465e97fb529075f953adf40bc2e02de755bec#34a465e97fb529075f953adf40bc2e02de755bec"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -204,8 +203,7 @@ dependencies = [
 [[package]]
 name = "adbc_driver_manager"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12aa1ae565ec6d45cfe71c20b5c2b3cbd6ba5d7176ecd0c0a448e970a93c35e4"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=34a465e97fb529075f953adf40bc2e02de755bec#34a465e97fb529075f953adf40bc2e02de755bec"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -216,14 +214,13 @@ dependencies = [
  "regex",
  "toml 1.1.2+spec-1.1.0",
  "windows-registry",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "adbc_ffi"
 version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
+source = "git+https://github.com/spiceai/arrow-adbc.git?rev=34a465e97fb529075f953adf40bc2e02de755bec#34a465e97fb529075f953adf40bc2e02de755bec"
 dependencies = [
  "adbc_core",
  "arrow-array",
@@ -4424,6 +4421,7 @@ version = "2.3.0-unstable"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
+ "adbc_ffi",
  "app",
  "arrow",
  "async-trait",
@@ -7309,7 +7307,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=4a0c194f802e8559c498bd8d82212a1c8ef54d19#4a0c194f802e8559c498bd8d82212a1c8ef54d19"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=174462258f66953cbfb3fcd9caf9df137d2654f9#174462258f66953cbfb3fcd9caf9df137d2654f9"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -21549,9 +21547,9 @@ dependencies = [
 
 [[package]]
 name = "tikv-jemalloc-sys"
-version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
 dependencies = [
  "cc",
  "libc",
@@ -21559,9 +21557,9 @@ dependencies = [
 
 [[package]]
 name = "tikv-jemallocator"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
 dependencies = [
  "libc",
  "tikv-jemalloc-sys",

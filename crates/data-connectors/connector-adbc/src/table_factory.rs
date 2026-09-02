@@ -100,6 +100,8 @@ pub(crate) struct AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     factory: AdbcTableFactory<D>,
 }
@@ -108,6 +110,8 @@ impl<D> AdbcTableFactoryWithPolicy<D>
 where
     D: adbc_core::Database + Send + 'static,
     D::ConnectionType: adbc_core::Connection + Send + Sync,
+    <D::ConnectionType as adbc_core::Connection>::StatementType:
+        datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
     /// Builds the factory with the driver's function-support policy installed
     /// and the `query_federation` setting applied.
