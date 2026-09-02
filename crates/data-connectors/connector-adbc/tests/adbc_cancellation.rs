@@ -323,4 +323,3 @@ async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
         "a statement call arrived after that statement had been released"
     );
 }
-

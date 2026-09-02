@@ -221,6 +221,15 @@ fn statement_cancel_during_execute() {
     let error = execute_outcome
         .expect_err("the cancelled query should have ended as an error, not returned rows");
     println!("statement.execute ended with: {error}");
+    // Nothing above distinguishes a cancelled query from one that failed before
+    // the cancel was even sent: that error also arrives quickly, and the
+    // saturating subtraction below would report it as having stopped instantly.
+    assert!(
+        execute_took >= config.wait_before_cancel,
+        "statement.execute returned after {execute_took:?}, before the {:?} this test waits \
+         before cancelling, so no query was running to cancel and nothing was measured: {error}",
+        config.wait_before_cancel
+    );
     let stopped_within = execute_took.saturating_sub(config.wait_before_cancel);
     assert!(
         stopped_within <= config.query_stop_bound,
