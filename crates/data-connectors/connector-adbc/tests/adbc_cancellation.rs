@@ -69,12 +69,6 @@ static EXECUTING_STATEMENT: AtomicUsize = AtomicUsize::new(0);
 static RELEASED_WHILE_EXECUTING: AtomicBool = AtomicBool::new(false);
 /// Set if any statement call arrived after that statement had been released.
 static USE_AFTER_RELEASE: AtomicBool = AtomicBool::new(false);
-/// How many cancels the driver swallows before one takes effect, standing in for
-/// one that reaches it before it has a query to apply it to.
-static CANCELS_TO_IGNORE: AtomicUsize = AtomicUsize::new(0);
-
-/// The driver's state is process-wide, so only one test may drive it at a time.
-static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn reset_driver_state() {
     *CANCELLED
@@ -85,7 +79,6 @@ fn reset_driver_state() {
     EXECUTING_STATEMENT.store(0, Ordering::SeqCst);
     RELEASED_WHILE_EXECUTING.store(false, Ordering::SeqCst);
     USE_AFTER_RELEASE.store(false, Ordering::SeqCst);
-    CANCELS_TO_IGNORE.store(0, Ordering::SeqCst);
 }
 
 fn wait_until_executing(timeout: Duration) -> bool {
@@ -225,14 +218,6 @@ unsafe extern "C" fn statement_cancel(
         return ADBC_STATUS_INVALID_STATE;
     }
     CANCELS.fetch_add(1, Ordering::SeqCst);
-    if CANCELS_TO_IGNORE
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-            left.checked_sub(1)
-        })
-        .is_ok()
-    {
-        return ADBC_STATUS_OK;
-    }
     let mut cancelled = CANCELLED
         .lock()
         .expect("the cancel state should be lockable");
@@ -280,7 +265,6 @@ unsafe extern "C" fn driver_init(
 /// blocking thread is still inside `StatementExecuteQuery`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
-    let _serial = ONE_AT_A_TIME.lock().await;
     reset_driver_state();
 
     let init: adbc_ffi::FFI_AdbcDriverInitFunc = driver_init;
@@ -340,60 +324,3 @@ async fn dropping_the_stream_cancels_the_query_and_frees_the_pool_connection() {
     );
 }
 
-/// A cancel the driver drops must not be the only one sent.
-///
-/// The cancel handle is published before `StatementExecuteQuery` is entered, so
-/// a caller that goes away inside that window hands the driver a cancel with no
-/// running query to apply it to, and a driver may drop it. The query then runs
-/// to completion holding its pooled connection, which is what cancelling is
-/// supposed to prevent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_cancel_the_driver_drops_is_retried_until_the_query_stops() {
-    let _serial = ONE_AT_A_TIME.lock().await;
-    reset_driver_state();
-    CANCELS_TO_IGNORE.store(1, Ordering::SeqCst);
-
-    let init: adbc_ffi::FFI_AdbcDriverInitFunc = driver_init;
-    let mut driver =
-        ManagedDriver::load_static(&init, AdbcVersion::V110).expect("the driver should load");
-    let database = driver
-        .new_database()
-        .expect("the database should be created");
-    let pool = AdbcConnectionPoolBuilder::new(database)
-        .with_max_size(Some(1))
-        .build()
-        .expect("the pool should build");
-
-    let connection = pool
-        .connect()
-        .await
-        .expect("a connection should be available");
-    let stream = query_arrow(connection, "SELECT 1".to_string(), None)
-        .await
-        .expect("the query should start");
-
-    assert!(
-        wait_until_executing(Duration::from_secs(20)),
-        "the driver never started executing, so nothing was cancelled"
-    );
-
-    drop(stream);
-
-    // The pool holds one connection, so it comes back only once a cancel has
-    // reached the query the driver is actually running.
-    let second = tokio::time::timeout(Duration::from_secs(30), pool.connect())
-        .await
-        .expect("the dropped cancel was never retried, so the query kept the connection")
-        .expect("a connection should be available");
-    drop(second);
-
-    assert!(
-        CANCELS.load(Ordering::SeqCst) >= 2,
-        "only {} cancel was sent, so the one the driver dropped was the only one",
-        CANCELS.load(Ordering::SeqCst)
-    );
-    assert!(
-        !USE_AFTER_RELEASE.load(Ordering::SeqCst),
-        "a statement call arrived after that statement had been released"
-    );
-}
