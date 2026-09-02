@@ -442,7 +442,6 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Tests that INSERT works on a standalone `DuckLake` dataset when `access: read_write` is set.
 /// Both `DuckLake` read paths must install the `DuckDB` federation deny-list.
 ///
 /// `connector-ducklake` and `DuckLakeCatalogProvider` each build a
@@ -452,9 +451,11 @@ async fn ducklake_standalone_dataset() -> Result<(), anyhow::Error> {
 /// Spice-only UDF federate, and the unparser emits it into the SQL sent to
 /// `DuckDB`.
 ///
-/// `cosine_distance` is the case that matters (spiceai/spiceai#13728): `DuckDB`
-/// has a similarly-named `array_cosine_distance` that answers a *different
-/// number*, so a missing deny-list here is a wrong result rather than an error.
+/// `cosine_distance` is the case that matters (spiceai/spiceai#13728). No
+/// handler renders it any more, so an un-denied call is emitted verbatim and
+/// `DuckDB`, which has no `cosine_distance`, refuses to bind the query: the
+/// deny-list is what keeps the refusal a Spice-side planner decision instead
+/// of a binder error on pushed-down SQL.
 /// The argument references a column so the expression cannot be constant-folded
 /// out of the plan before federation is decided.
 #[tokio::test]
@@ -521,8 +522,8 @@ async fn ducklake_does_not_push_down_spice_functions() -> Result<(), anyhow::Err
 
                 // 2. The scan is still pushed down, but the function is not.
                 //    Deleting the `.with_function_support(..)` call on either
-                //    factory turns this into `array_cosine_distance`, which
-                //    answers twice the local value.
+                //    factory pushes `cosine_distance` down verbatim, which
+                //    DuckDB cannot bind.
                 let plan = explain_plan(&rt, &sql).await;
                 let pushed: Vec<&str> = plan
                     .lines()
@@ -551,6 +552,7 @@ async fn ducklake_does_not_push_down_spice_functions() -> Result<(), anyhow::Err
         .await
 }
 
+/// Tests that INSERT works on a standalone `DuckLake` dataset when `access: read_write` is set.
 #[tokio::test]
 async fn ducklake_standalone_read_write_insert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
