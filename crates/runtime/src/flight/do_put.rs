@@ -1026,6 +1026,13 @@ mod tests {
     /// the metadata-only message Flight allows: its bytes are undecodable rather than absent,
     /// and the write never applied them. Reading the header alone reports it as nothing at all,
     /// so a stream ending on one was acked as a complete write.
+    ///
+    /// It counts toward `total` but *not* `unreadable_headers`, which is the one distinction this
+    /// case exists to pin: that counter is documented as headers that could not be read, and this
+    /// message has no header to fail on. Counting it there would conflate "the client sent a header
+    /// we could not parse" — worth investigating as a client or version problem — with "the client
+    /// sent no header at all", and the operator reading the pair could no longer tell which
+    /// happened. The rows are lost either way, so `total` covers the part that sizes the report.
     #[tokio::test]
     async fn drain_counts_a_body_with_no_header() {
         let body_only = || FlightData {
@@ -1048,8 +1055,42 @@ mod tests {
             drain_discarded_data_batches(&mut stream).await,
             DiscardedMessages {
                 total: 1,
-                unreadable_headers: 1
+                unreadable_headers: 0
             }
+        );
+    }
+
+    /// A body paired with a header that parses but declares no batch — a schema message, a trailer
+    /// — is *not* counted, so a stream ending on one is acked as a complete write even though the
+    /// client sent bytes nothing applied.
+    ///
+    /// Pinned as the current behaviour rather than asserted as correct. `declares_ipc_data` answers
+    /// on the header alone, so the body never reaches the decision, and this case is a client
+    /// protocol violation in the first place: Arrow IPC gives a schema message no body, so those
+    /// bytes are not a record batch that went missing and counting them as discarded *data* would
+    /// overstate what was lost. Whether the write should nonetheless be refused rather than acked
+    /// is tracked in #13820; this test is here so that change shows up as an edit to an expectation
+    /// somebody chose, not as a silent flip of an untested branch.
+    #[tokio::test]
+    async fn drain_does_not_count_a_body_under_a_non_data_header() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let mut schema_message = arrow_flight::utils::batches_to_flight_data(&schema, vec![])
+            .expect("encoding a schema as flight data")
+            .remove(0);
+        schema_message.data_body = (&b"rows the client sent"[..]).into();
+
+        assert!(
+            !schema_message.data_header.is_empty() && !schema_message.data_body.is_empty(),
+            "the case is a parseable non-data header carrying a body"
+        );
+
+        let mut stream = futures::stream::iter(vec![Ok::<_, Status>(schema_message)]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages::default(),
+            "pins the current behaviour: the body under a non-data header is not counted"
         );
     }
 
