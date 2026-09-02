@@ -16,10 +16,9 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Audit probe (cayenne-perf audit 2026-09-01, finding I-2): a predicate
-//! `DELETE` on a `cdc_durability: memory` upsert table whose newest row
-//! versions live only in the RAM tier (no checkpoint yet) must delete exactly
-//! the rows whose *live* version matches the predicate — SQL semantics.
+//! A predicate `DELETE` on a `cdc_durability: memory` upsert table whose newest
+//! row versions live only in the RAM tier (no checkpoint yet) must delete
+//! exactly the rows whose *live* version matches the predicate — SQL semantics.
 //!
 //! Scenario A: CDC `(7,10),(8,5)` → checkpoint (durable); CDC `(7,60),(9,20)`
 //! with no checkpoint (RAM only); `DELETE WHERE value < 50` must leave exactly
@@ -30,8 +29,8 @@ limitations under the License.
 //! Scenario B: CDC `(8,5)` → checkpoint; CDC `(9,20)` with no checkpoint;
 //! `DELETE WHERE value = 20` must leave exactly `[(8,5)]`.
 //!
-//! Every observed row set is printed (`--nocapture`) so the run is evidence
-//! whichever way the assertions go.
+//! Every observed row set is printed (`--nocapture`) so a run documents what
+//! the table actually served, whichever way the assertions go.
 
 mod common;
 
@@ -52,8 +51,8 @@ use datafusion_table_providers::util::{
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-test_with_backends!(i2_predicate_delete_spanning_durable_and_ram_rows_impl);
-test_with_backends!(i2_predicate_delete_ram_only_row_impl);
+test_with_backends!(predicate_delete_spanning_durable_and_ram_rows_impl);
+test_with_backends!(predicate_delete_ram_only_row_impl);
 
 struct NoopSlotAdvancer;
 #[async_trait::async_trait]
@@ -199,19 +198,19 @@ fn count_files(dir: &std::path::Path) -> usize {
     n
 }
 
-async fn i2_predicate_delete_spanning_durable_and_ram_rows_impl(
+async fn predicate_delete_spanning_durable_and_ram_rows_impl(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
     let schema = id_value_schema();
-    let (ctx, table) = make_memory_cdc_table(&fixture, "i2_a", &schema).await?;
-    let sql = "SELECT id, value FROM i2_a ORDER BY id";
+    let (ctx, table) = make_memory_cdc_table(&fixture, "durable_and_ram", &schema).await?;
+    let sql = "SELECT id, value FROM durable_and_ram ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(7, 10), (8, 5)]).await?;
     let durable_epoch = table.checkpoint_mem_tier().await?;
     let files_after_checkpoint = count_files(&fixture.data_path);
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
-        "[i2-A] durable CDC (7,10),(8,5) + checkpoint (epoch {durable_epoch}, {files_after_checkpoint} data files): {rows:?}"
+        "[durable+ram] durable CDC (7,10),(8,5) + checkpoint (epoch {durable_epoch}, {files_after_checkpoint} data files): {rows:?}"
     );
     assert_eq!(rows, vec![(7, 10), (8, 5)], "durable baseline");
 
@@ -219,8 +218,11 @@ async fn i2_predicate_delete_spanning_durable_and_ram_rows_impl(
     let files_after_ram_write = count_files(&fixture.data_path);
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
-        "[i2-A] RAM-only CDC (7,60),(9,20), no checkpoint ({files_after_ram_write} data files; RAM-resident precondition = {}): {rows:?}",
-        files_after_ram_write == files_after_checkpoint
+        "[durable+ram] RAM-only CDC (7,60),(9,20), no checkpoint ({files_after_ram_write} data files): {rows:?}"
+    );
+    assert_eq!(
+        files_after_ram_write, files_after_checkpoint,
+        "the second write must stay in the RAM tier (no new data file) for this test to exercise the RAM-tier path"
     );
     assert_eq!(
         rows,
@@ -231,30 +233,34 @@ async fn i2_predicate_delete_spanning_durable_and_ram_rows_impl(
     let deleted = delete_where(&table, &ctx, col("value").lt(lit(50i64))).await?;
     let after_delete = collect_pairs(&ctx, sql).await?;
     eprintln!(
-        "[i2-A] DELETE WHERE value < 50 reported {deleted} row(s); visible now: {after_delete:?} — expected [(7, 60)]"
+        "[durable+ram] DELETE WHERE value < 50 reported {deleted} row(s); visible now: {after_delete:?} — expected [(7, 60)]"
+    );
+    assert_eq!(
+        deleted, 2,
+        "exactly two live rows match `value < 50`: (8,5) and (9,20)"
     );
 
     let _ = table.checkpoint_mem_tier().await?;
     let after_checkpoint = collect_pairs(&ctx, sql).await?;
-    eprintln!("[i2-A] after the next checkpoint: {after_checkpoint:?} — expected [(7, 60)]");
+    eprintln!("[durable+ram] after the next checkpoint: {after_checkpoint:?} — expected [(7, 60)]");
 
     assert_eq!(
         after_delete,
         vec![(7, 60)],
-        "I-2: rows visible right after a predicate DELETE spanning durable and RAM versions"
+        "rows visible right after a predicate DELETE spanning durable and RAM versions"
     );
     assert_eq!(
         after_checkpoint,
         vec![(7, 60)],
-        "I-2: rows visible after the following checkpoint"
+        "rows visible after the following checkpoint"
     );
     Ok(())
 }
 
-async fn i2_predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> TestResult<()> {
+async fn predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> TestResult<()> {
     let schema = id_value_schema();
-    let (ctx, table) = make_memory_cdc_table(&fixture, "i2_b", &schema).await?;
-    let sql = "SELECT id, value FROM i2_b ORDER BY id";
+    let (ctx, table) = make_memory_cdc_table(&fixture, "ram_only", &schema).await?;
+    let sql = "SELECT id, value FROM ram_only ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(8, 5)]).await?;
     let _ = table.checkpoint_mem_tier().await?;
@@ -263,9 +269,10 @@ async fn i2_predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> 
     cdc_upsert(&table, &schema, &[(9, 20)]).await?;
     let files_after_ram_write = count_files(&fixture.data_path);
     let rows = collect_pairs(&ctx, sql).await?;
-    eprintln!(
-        "[i2-B] durable (8,5) + checkpoint, then RAM-only (9,20) (RAM-resident precondition = {}): {rows:?}",
-        files_after_ram_write == files_after_checkpoint
+    eprintln!("[ram-only] durable (8,5) + checkpoint, then RAM-only (9,20): {rows:?}");
+    assert_eq!(
+        files_after_ram_write, files_after_checkpoint,
+        "the second write must stay in the RAM tier (no new data file) for this test to exercise the RAM-tier path"
     );
     assert_eq!(
         rows,
@@ -276,22 +283,26 @@ async fn i2_predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> 
     let deleted = delete_where(&table, &ctx, col("value").eq(lit(20i64))).await?;
     let after_delete = collect_pairs(&ctx, sql).await?;
     eprintln!(
-        "[i2-B] DELETE WHERE value = 20 reported {deleted} row(s); visible now: {after_delete:?} — expected [(8, 5)]"
+        "[ram-only] DELETE WHERE value = 20 reported {deleted} row(s); visible now: {after_delete:?} — expected [(8, 5)]"
+    );
+    assert_eq!(
+        deleted, 1,
+        "exactly one live row matches `value = 20`: (9,20)"
     );
 
     let _ = table.checkpoint_mem_tier().await?;
     let after_checkpoint = collect_pairs(&ctx, sql).await?;
-    eprintln!("[i2-B] after the next checkpoint: {after_checkpoint:?} — expected [(8, 5)]");
+    eprintln!("[ram-only] after the next checkpoint: {after_checkpoint:?} — expected [(8, 5)]");
 
     assert_eq!(
         after_delete,
         vec![(8, 5)],
-        "I-2: a RAM-only row matching the predicate must be deleted"
+        "a RAM-only row matching the predicate must be deleted"
     );
     assert_eq!(
         after_checkpoint,
         vec![(8, 5)],
-        "I-2: and stay deleted across the next checkpoint"
+        "and stay deleted across the next checkpoint"
     );
     Ok(())
 }
