@@ -949,7 +949,10 @@ impl CpuBudget {
         // Every pool comes from `ceil(millicores / 1000)`, so lowering to the ceiling
         // only shrinks one when the ceiling rounds down to a smaller whole-core
         // count. Under a fractional ceiling both round to the same number, so
-        // promising that lowering resizes anything would over-claim — but lowering
+        // promising that lowering resizes anything would over-claim. Note the
+        // claim below is about pools not *changing*, never about their values
+        // being equal to the core budget: only some are (see
+        // `not_every_pool_equals_the_core_budget`) — but lowering
         // is still a real fix there, because `cpu_busy_fraction` divides by the
         // exact `millicores` rather than the rounded count, and an entitlement above
         // the wall makes a saturated process report itself as idle by the ratio
@@ -967,9 +970,10 @@ impl CpuBudget {
         }
         Some(format!(
             "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so {consequence}. \
-             Lower it to {ceiling_value} or {raise_to} {entitlement}. Lowering leaves every pool \
-             at {pool_cores} cores — {ceiling_value} already rounds up to that — but it corrects \
-             the busy fraction this process reports against its entitlement. See: {DOCS_URL}",
+             Lower it to {ceiling_value} or {raise_to} {entitlement}. Lowering resizes no pool — \
+             {ceiling_value} already rounds up to the same {pool_cores}-core budget — but it \
+             corrects the busy fraction this process reports against its entitlement. \
+             See: {DOCS_URL}",
             origin = self.origin(),
             entitlement = format_millicores(self.millicores),
             ceiling_value = format_millicores(ceiling),
@@ -2029,6 +2033,40 @@ mod tests {
         );
     }
 
+    /// The claim in `configured_above_ceiling_warning` is that lowering changes
+    /// no pool size — not that every pool equals the core budget, which is false
+    /// and was what the message said. Three of the fifteen derived quantities
+    /// diverge from `cores` at `cores = 3`, and a reword checked only against
+    /// `derived_sizing()` being *unchanged* cannot see that, because unchanged
+    /// and equal are different properties. This pins the divergence itself, so
+    /// the sentence cannot be rebuilt from a premise the accessors do not hold.
+    #[test]
+    fn not_every_pool_equals_the_core_budget() {
+        let over = CpuBudget::resolve(
+            &CpuConfig::from_sources(None, None, Some("3")),
+            &quota(2, 2500),
+        )
+        .expect("valid");
+        assert_eq!(over.cores, 3, "the premise");
+
+        let divergent: Vec<_> = over
+            .derived_sizing()
+            .into_iter()
+            .filter(|(_, value)| *value != over.cores)
+            .collect();
+
+        assert_eq!(
+            divergent,
+            vec![
+                ("dedicated_runtime_worker_threads", 2),
+                ("max_concurrent_queries", 12),
+                ("cayenne_encode_permits", 1),
+            ],
+            "a pool that stops tracking `cores` belongs in this list, and any message \
+             saying \"every pool at N cores\" is wrong while the list is non-empty"
+        );
+    }
+
     /// Lowering to a fractional ceiling resizes no pool but still fixes the reported
     /// busy fraction, so the warning must keep it as a remedy while scoping the
     /// "unchanged" claim to pool sizes.
@@ -2083,9 +2121,16 @@ mod tests {
             "and so does raising the wall: {warning}"
         );
         assert!(
-            warning.contains("Lowering leaves every pool at 3 cores — 2.5 cores already rounds up"),
+            warning.contains(
+                "Lowering resizes no pool — 2.5 cores already rounds up to the same 3-core budget"
+            ),
             "explains why lowering preserves the pools by naming the ceiling, not restating the \
              entitlement: {warning}"
+        );
+        assert!(
+            !warning.contains("every pool at 3 cores"),
+            "the pools are not all equal to the core budget — say they do not CHANGE, not that \
+             they are all 3: {warning}"
         );
         assert!(
             warning.contains("busy fraction"),
