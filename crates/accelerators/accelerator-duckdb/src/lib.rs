@@ -3853,6 +3853,16 @@ mod tests {
             ("", Some("x")),
             ("  \u{e9}\u{e9}  ", None),
             ("\u{e9}\u{e9}u\u{e9}\u{e9}", Some("\u{e9}")),
+            // Unicode Zs separators. DataFusion's one-argument `btrim` strips
+            // ASCII U+0020 and nothing else; a `trim` that strips every Zs
+            // would silently disagree here rather than fail.
+            ("\u{a0}x\u{a0}", None),
+            ("\u{2003}x\u{2003}", None),
+            ("\u{3000}x\u{3000}", None),
+            ("\u{a0} x \u{a0}", None),
+            ("\u{a0}x\u{a0}", Some(" ")),
+            ("\u{a0}x\u{a0}", Some("\u{a0}")),
+            ("\tx\n", None),
         ];
 
         for (input, trim_chars) in cases {

@@ -31,12 +31,17 @@ pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 /// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
 pub(crate) const TRIM_NAME: &str = "trim";
 
-/// Renders `args` unchanged as a call to `duckdb_fn`.
+/// The trim set `btrim` uses when called with one argument — see
+/// [`btrim_to_trim`] for why it has to be passed to `DuckDB` explicitly.
+const ASCII_SPACE: &str = " ";
+
+/// Renders `args` as a call to `duckdb_fn`, in the order given.
 ///
-/// For a function whose only difference from its `DuckDB` counterpart is the
-/// name: same arity, same argument order, same semantics. A function whose
-/// arguments need reordering, padding or checking does not belong here — see
-/// [`DuckDBRegexpFunction::to_datafusion_function`] for that shape.
+/// The caller is responsible for having already put `args` into the shape
+/// `duckdb_fn` expects — see [`btrim_to_trim`], which has to supply a trim set
+/// the `DataFusion` call left implicit. A function needing per-argument
+/// inspection or rejection wants
+/// [`DuckDBRegexpFunction::to_datafusion_function`]'s shape instead.
 fn renamed_fn_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
@@ -75,14 +80,36 @@ fn renamed_fn_to_sql(
 /// fails with `Catalog Error: Scalar Function with name btrim does not exist!`
 /// (issue #13794).
 ///
-/// A rename is faithful here because `DuckDB`'s `trim` is the same function at
-/// both arities `btrim` accepts: `trim(str)` strips spaces from both ends, and
-/// `trim(str, chars)` strips any character of `chars` from both ends.
+/// **The one-argument form is not a bare rename.** `btrim(str)` strips ASCII
+/// `U+0020` and nothing else — `general_trim` calls `trim_ascii_char(s, b' ')` —
+/// whereas `DuckDB`'s one-argument `trim(str)` strips every Unicode `Zs`
+/// separator. On `U+00A0 'x' U+00A0` `DataFusion` returns the string unchanged
+/// and `DuckDB` returns `x`, so renaming it would turn a remote error into a
+/// silently different answer, which is worse. Passing the trim set explicitly
+/// as `trim(str, ' ')` puts `DuckDB` on the character-set path, where it strips
+/// exactly the characters given.
+///
+/// The two-argument form *is* a rename: both engines strip any character of the
+/// set from both ends.
 pub(crate) fn btrim_to_trim(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<ast::Expr>, DataFusionError> {
-    renamed_fn_to_sql(unparser, args, TRIM_NAME)
+    match args {
+        [input] => renamed_fn_to_sql(
+            unparser,
+            &[input.clone(), datafusion::prelude::lit(ASCII_SPACE)],
+            TRIM_NAME,
+        ),
+        [_, _] => renamed_fn_to_sql(unparser, args, TRIM_NAME),
+        // `btrim`'s signature admits one or two arguments, so the planner
+        // cannot build this. Fail rather than fall through to `Ok(None)`,
+        // which would put `btrim` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "btrim takes one or two arguments, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
 }
 
 /// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
@@ -648,6 +675,9 @@ mod tests {
     /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
     /// `trim(x)` to a `btrim` call and the unparser emits the function's own
     /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
+    ///
+    /// The one-argument call must carry the trim set: a bare `trim(x)` puts
+    /// `DuckDB` on its Unicode-`Zs` path, which `btrim` is not.
     #[test]
     fn btrim_unparses_to_duckdb_trim() {
         let dialect = new_duckdb_dialect();
@@ -659,7 +689,7 @@ mod tests {
         });
 
         for (args, expected) in [
-            (vec![column.clone()], r#"trim("t"."name")"#),
+            (vec![column.clone()], r#"trim("t"."name", ' ')"#),
             (vec![column.clone(), lit("xy")], r#"trim("t"."name", 'xy')"#),
         ] {
             let rendered = btrim_to_trim(&unparser, &args)
@@ -667,6 +697,24 @@ mod tests {
                 .expect("should return expression");
             assert_eq!(rendered.to_string(), expected);
         }
+    }
+
+    /// `btrim`'s own signature admits only one or two arguments, so this is a
+    /// defensive arm — but it must be an error, not `Ok(None)`, which would
+    /// hand `btrim` straight back to `DuckDB`.
+    #[test]
+    fn btrim_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = btrim_to_trim(&unparser, &[lit("a"), lit("b"), lit("c")])
+            .expect_err("three arguments cannot be rendered");
+        assert!(
+            error
+                .to_string()
+                .contains("btrim takes one or two arguments"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The whole `btrim` call, planned from SQL and unparsed through the
@@ -683,7 +731,7 @@ mod tests {
         let rendered = unparser
             .expr_to_sql(&call)
             .expect("btrim unparses for DuckDB");
-        assert_eq!(rendered.to_string(), "trim('  hi  ')");
+        assert_eq!(rendered.to_string(), "trim('  hi  ', ' ')");
     }
 
     #[test]

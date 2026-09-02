@@ -50,6 +50,25 @@ fn write_csv_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// A row padded with Unicode `Zs` separators rather than ASCII spaces:
+/// `U+00A0`, then `U+2003`, then `U+3000`.
+///
+/// `btrim(str)` strips ASCII `U+0020` and nothing else, so all three rows come
+/// back unchanged. DuckDB's *one-argument* `trim` strips every `Zs`, which is
+/// why the dialect renders the one-argument call as `trim(str, ' ')` — without
+/// that, these rows would come back shortened and the accelerated dataset would
+/// silently disagree with the unaccelerated one instead of erroring.
+fn write_unicode_space_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,name\n\
+         1,\"\u{a0}x\u{a0}\"\n\
+         2,\"\u{2003}x\u{2003}\"\n\
+         3,\"\u{3000}x\u{3000}\"\n",
+    )?;
+    Ok(())
+}
+
 fn duckdb_accelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(Params::from_string_map(
@@ -142,14 +161,14 @@ async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), 
             let local = run_query(&rt, &query.replace("{table}", "local")).await?;
 
             let expected = [
-                "+----+---------+-----------+-----------+",
-                "| id | spaces  | chars     | both      |",
-                "+----+---------+-----------+-----------+",
-                "| 1  | padded  |   padded  |    padded |",
-                "| 2  | hello   | hello     | hello     |",
-                "| 3  | x hello |  hello    | hello     |",
-                "| 4  |         |           |           |",
-                "+----+---------+-----------+-----------+",
+                "+----+-----------+------------+--------+",
+                "| id | spaces    | chars      | both   |",
+                "+----+-----------+------------+--------+",
+                "| 1  | padded    |   padded   | padded |",
+                "| 2  | xyhelloyx | hello      | hello  |",
+                "| 3  | x hello x |  hello     | hello  |",
+                "| 4  |           |            |        |",
+                "+----+-----------+------------+--------+",
             ];
             assert_batches_eq!(expected, &accelerated);
 
@@ -160,6 +179,63 @@ async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), 
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "DuckDB-accelerated trims must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `btrim(str)` strips ASCII `U+0020` only, so a `Zs`-padded string is returned
+/// unchanged. DuckDB's one-argument `trim` strips every `Zs` instead, which
+/// would make the accelerated dataset answer differently from the
+/// unaccelerated one — a silently wrong result rather than the loud
+/// unknown-function error of #13794. Measured by length, so the comparison does
+/// not depend on how the separators render.
+#[tokio::test]
+async fn duckdb_accelerated_btrim_leaves_unicode_separators_alone() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("unicode_spaces.csv");
+            write_unicode_space_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_unicode")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // Every input is separator + "x" + separator, so `btrim` leaves all
+            // three characters in place. A `trim` that stripped the separators
+            // would report 1.
+            let query = "SELECT id, character_length(trim(name)) AS len \
+                         FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+
+            let expected = [
+                "+----+-----+",
+                "| id | len |",
+                "+----+-----+",
+                "| 1  | 3   |",
+                "| 2  | 3   |",
+                "| 3  | 3   |",
+                "+----+-----+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "a Zs-padded string must trim identically accelerated and local"
             );
 
             rt.shutdown().await;
