@@ -1002,6 +1002,21 @@ impl PkDeletionSnapshot {
         }
     }
 
+    /// Count of re-insert records in this snapshot — keys whose tombstone is
+    /// superseded by a later insert.
+    ///
+    /// Its ratio to [`Self::delete_len`] is how much of the index is dead
+    /// weight: in an upsert workload most tombstones are immediately superseded,
+    /// so a high ratio means the index's size is carrying history the probe no
+    /// longer needs. `0` for `PositionBased`, matching `delete_len`.
+    pub(crate) fn insert_len(&self) -> usize {
+        match self {
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.insert_len(),
+            Self::RowConverterBased { tombstones } => tombstones.insert_len(),
+        }
+    }
+
     /// Merge a mem-tier tombstone map into this file-side snapshot — the scan
     /// path passes the cross-shard UNION (`ShardedMemTier::union_tombstones`). At
     /// N==1 the union is shard 0's tombstone map.

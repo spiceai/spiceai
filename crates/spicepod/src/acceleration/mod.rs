@@ -541,7 +541,10 @@ pub struct Acceleration {
     pub on_zero_results: ZeroResultsAction,
 
     #[serde(default)]
-    #[deprecated(since = "1.0.0-rc.1", note = "Use `dataset.ready_state` instead.")]
+    #[deprecated(
+        since = "1.0.0-rc.1",
+        note = "Use the dataset's or view's own `ready_state` instead."
+    )]
     pub ready_state: Option<ReadyState>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -651,14 +654,10 @@ const fn default_true() -> bool {
 /// `enabled: false`": the switch itself, and `ready_state`.
 ///
 /// `ready_state` is excluded for both components that carry an acceleration
-/// block, but not for the same reason. A dataset reads
-/// `acceleration.ready_state` out of the block and applies it whether or not
-/// acceleration is enabled (deprecated, but honoured) — so it is genuinely not
-/// discarded. `ViewBuilder` never reads it at all, enabled or disabled, so for
-/// a view it *is* dropped — but unconditionally, not because of `enabled:
-/// false`, which makes "remove `enabled: false` to apply them" a false remedy
-/// for it. Either way this warning is the wrong place to raise it; the view
-/// case is #13615.
+/// block, for the same reason on each: `DatasetBuilder` and `ViewBuilder` both
+/// read `acceleration.ready_state` out of the block and apply it whether or not
+/// acceleration is enabled (deprecated, but honoured), so it is genuinely not
+/// discarded by `enabled: false` on either component.
 const CONSUMED_WHEN_DISABLED: [&str; 2] = ["enabled", "ready_state"];
 
 impl Acceleration {
