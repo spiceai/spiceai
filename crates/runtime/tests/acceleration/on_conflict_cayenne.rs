@@ -1865,6 +1865,10 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
 
     no_cache_context
         .scope(async {
+            const COUNT_SQL: &str = "SELECT COUNT(*) as cnt FROM partitioned_delete_test";
+            const BY_REGION_SQL: &str = "SELECT region, COUNT(*) as cnt FROM \
+                 partitioned_delete_test GROUP BY region ORDER BY region";
+
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("data");
             std::fs::create_dir_all(&data_dir)?;
@@ -1943,10 +1947,6 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
             }
 
             runtime_ready_check(&rt).await;
-
-            const COUNT_SQL: &str = "SELECT COUNT(*) as cnt FROM partitioned_delete_test";
-            const BY_REGION_SQL: &str = "SELECT region, COUNT(*) as cnt FROM \
-                 partitioned_delete_test GROUP BY region ORDER BY region";
 
             // Phase one: the whole fixture, and it stays the whole fixture however often
             // retention runs, because nothing in it matches `value > 400`. Asserting it here is
