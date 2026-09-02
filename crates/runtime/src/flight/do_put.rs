@@ -554,15 +554,18 @@ fn create_response_stream(
                             let drained = drain_discarded_data_batches(&mut streaming_flight).await;
                             let discarded = drained.total;
                             if discarded > 0 {
+                                let message = discarded_data_message(
+                                    &path,
+                                    SinkFinishedEarly::WhileClientStreaming,
+                                    discarded,
+                                );
                                 tracing::error!(
                                     dataset = %path,
                                     discarded_messages = discarded,
                                     unreadable_headers = drained.unreadable_headers,
-                                    "Write sink completed before the client finished streaming; {discarded} client data message(s) were not written",
+                                    "{message}",
                                 );
-                                yield Err(Status::data_loss(format!(
-                                    "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data message(s) streamed by the client were not written",
-                                )));
+                                yield Err(Status::data_loss(message));
                                 break;
                             }
                             tracing::warn!("Write operation completed before stream ended for dataset: {path}");
@@ -652,15 +655,18 @@ fn create_response_stream(
                                             // wire; fail loudly rather than ack a partial ingest.
                                             let drained = drain_discarded_data_batches(&mut streaming_flight).await;
                                             let discarded = 1 + drained.total;
+                                            let message = discarded_data_message(
+                                                &path,
+                                                SinkFinishedEarly::WithBatchPending,
+                                                discarded,
+                                            );
                                             tracing::error!(
                                                 dataset = %path,
                                                 discarded_messages = discarded,
                                                 unreadable_headers = drained.unreadable_headers,
-                                                "Write sink completed while a client batch was still pending; {discarded} client data message(s) were not written",
+                                                "{message}",
                                             );
-                                            yield Err(Status::data_loss(format!(
-                                                "Write sink for dataset `{path}` finished before the client stream ended; {discarded} data message(s) streamed by the client were not written",
-                                            )));
+                                            yield Err(Status::data_loss(message));
                                             break;
                                         }
                                         Err(e) => {
@@ -733,6 +739,51 @@ fn decode_failure_message(path: &TableReference, source: &impl std::fmt::Display
     format!(
         "Failed to read the Arrow data sent for dataset '{path}' ({source}), so the write did not complete. \
          Send each message as an Arrow IPC record batch matching the schema the stream declared. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    )
+}
+
+/// Which of the two ways the write sink can finish ahead of the client's stream a discarded-data
+/// failure is reporting. Both lose client rows the same way and differ only in whether a batch had
+/// already been handed to the sink, which changes the count but not the remedy.
+#[derive(Clone, Copy, Debug)]
+enum SinkFinishedEarly {
+    /// The sink completed while the client was still streaming, with no batch handed to it.
+    WhileClientStreaming,
+    /// The sink completed with a batch already handed to it, which it therefore never accepted.
+    WithBatchPending,
+}
+
+impl std::fmt::Display for SinkFinishedEarly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WhileClientStreaming => {
+                f.write_str("the write sink completed before the client finished streaming")
+            }
+            Self::WithBatchPending => {
+                f.write_str("the write sink completed while a client batch was still pending")
+            }
+        }
+    }
+}
+
+/// The failure a client sees, and the operator reads in the log, when the write sink finished ahead
+/// of the client's stream and data messages the client streamed were therefore never written.
+///
+/// This is the `data_loss` path, which makes two parts of the wording load-bearing. The dataset goes
+/// in the message text rather than only in a `tracing` field, because this line is the operator's
+/// only record of *which* dataset dropped rows and a consumer reading the rendered message would
+/// otherwise lose it. And the remedy cannot be a bare "send it again": the sink accepted an unknown
+/// number of batches before it finished, so on an append table an unreconciled re-send duplicates
+/// exactly the rows that did land.
+fn discarded_data_message(
+    path: &TableReference,
+    cause: SinkFinishedEarly,
+    discarded: usize,
+) -> String {
+    format!(
+        "Failed to write every message the client streamed to dataset '{path}' ({cause}), so {discarded} data message(s) were dropped and the rows they carried are absent from the dataset. \
+         Re-send those rows, reconciling against the batches the sink did accept before it finished — on an append table an unreconciled re-send duplicates them. \
          See: https://spiceai.org/docs/api/arrow-flight-sql"
     )
 }
@@ -969,6 +1020,87 @@ mod tests {
                 unreadable_headers: 2
             }
         );
+    }
+
+    /// A message carrying a body with no header to describe it is malformed client input, not
+    /// the metadata-only message Flight allows: its bytes are undecodable rather than absent,
+    /// and the write never applied them. Reading the header alone reports it as nothing at all,
+    /// so a stream ending on one was acked as a complete write.
+    #[tokio::test]
+    async fn drain_counts_a_body_with_no_header() {
+        let body_only = || FlightData {
+            data_body: (&b"rows the client sent"[..]).into(),
+            ..Default::default()
+        };
+
+        assert!(
+            body_only().data_header.is_empty(),
+            "the case is a body with no header; with a header it exercises nothing"
+        );
+
+        let mut stream = futures::stream::iter(vec![
+            Ok::<_, Status>(body_only()),
+            Ok(keepalive_message()),
+            // A message carrying neither loses nothing and must still not be counted.
+            Ok(FlightData::default()),
+        ]);
+        assert_eq!(
+            drain_discarded_data_batches(&mut stream).await,
+            DiscardedMessages {
+                total: 1,
+                unreadable_headers: 1
+            }
+        );
+    }
+
+    /// The `data_loss` failure a client sees — and the line an operator reads in the log — when the
+    /// sink finished ahead of the client's stream. It is the operator's only record of which dataset
+    /// dropped rows, so it has to name the dataset *in the text*, say how many messages were lost,
+    /// state that those rows are absent, give a remedy that survives an append, and point at the
+    /// docs. A reword must not quietly drop any of them.
+    ///
+    /// Asserted for both causes, because the two call sites differ only in the cause they pass and a
+    /// message built for one of them must hold for the other.
+    #[test]
+    fn the_discarded_data_failure_names_the_dataset_the_loss_and_a_safe_remedy() {
+        for (cause, expected_cause) in [
+            (
+                super::SinkFinishedEarly::WhileClientStreaming,
+                "before the client finished streaming",
+            ),
+            (
+                super::SinkFinishedEarly::WithBatchPending,
+                "while a client batch was still pending",
+            ),
+        ] {
+            let message = super::discarded_data_message(
+                &TableReference::partial("sales", "orders"),
+                cause,
+                3,
+            );
+
+            assert!(
+                message.contains("'sales.orders'"),
+                "the dataset belongs in the text, not only a tracing field: {message}"
+            );
+            assert!(message.contains(expected_cause), "{message}");
+            assert!(
+                message.contains("3 data message(s) were dropped"),
+                "{message}"
+            );
+            assert!(
+                message.contains("absent from the dataset"),
+                "a data_loss message must state that the rows are gone: {message}"
+            );
+            assert!(
+                message.contains("reconciling against the batches the sink did accept"),
+                "a bare re-send duplicates the batches that did land: {message}"
+            );
+            assert!(
+                message.contains("https://spiceai.org/docs/api/arrow-flight-sql"),
+                "{message}"
+            );
+        }
     }
 
     /// The failure a client sees when its `MAP` column cannot be brought in line with the Arrow
