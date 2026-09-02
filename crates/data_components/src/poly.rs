@@ -20,6 +20,7 @@ use datafusion::{
     datasource::TableProvider,
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown},
+    optimizer::OptimizerRule,
     prelude::Expr,
 };
 use datafusion_federation::{
@@ -107,6 +108,11 @@ impl FederationProvider for PolyTableProvider {
     fn compute_context(&self) -> Option<String> {
         self.get_federation_provider()
             .and_then(|f| f.compute_context())
+    }
+
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.get_federation_provider()
+            .map_or_else(Vec::new, |f| f.pre_federation_optimizer_rules())
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {

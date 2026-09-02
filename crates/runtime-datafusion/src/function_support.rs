@@ -47,6 +47,44 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
         .build()
 }
 
+/// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
+/// `AdbcTableFactory::with_function_support`.
+///
+/// Three layers, all derived from [`crate::dialect`] so they cannot drift from
+/// what the dialect can actually render:
+///
+/// 1. the name carve-out, so the JSON extraction functions the `BigQuery`
+///    dialect rewrites into `JSON_VALUE` federate instead of being denied;
+/// 2. a per-call check, because a carved-out *name* is not a carved-out *call*.
+///    `json_get_int(doc, key_col)` is legal and has no `BigQuery` translation —
+///    its JSON path argument must be a constant — and without this check that
+///    call would federate and be unparsed verbatim, which is the
+///    unknown-function failure the deny-list exists to prevent (issue #10703).
+///    The check also gates the `DataFusion` built-ins the dialect rewrites
+///    (e.g. `regexp_like` → `REGEXP_CONTAINS`), whose untranslatable shapes
+///    must stay local the same way;
+/// 3. `regexp_match` is denied outright. `BigQuery` has no function of that
+///    name — a federated call fails remotely with `Function not found:
+///    regexp_match` — and no faithful rendering exists to rewrite it into: its
+///    list-of-matches result has no `BigQuery` counterpart that survives the
+///    result boundary (`BigQuery` documents that a NULL top-level `ARRAY`
+///    comes back as an empty one, where `regexp_match` is NULL for a
+///    non-matching row), and `REGEXP_EXTRACT` refuses a pattern with more than
+///    one capturing group. The common reason to call it — a NULL-check asking
+///    "does it match at all" — is rewritten into `regexp_like` before
+///    the `BigQuery` capability check by
+///    [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], which the dialect
+///    *can* translate; every remaining shape evaluates locally above the
+///    federated scan.
+#[must_use]
+pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .native(&crate::dialect::bigquery_native_function_names())
+        .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
+        .build()
+        .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
+}
+
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
 /// evaluate are denied for `PostgreSQL` and PostgreSQL-wire backends (e.g.
 /// Redshift). The ones that match `PostgreSQL` exactly are listed here so they

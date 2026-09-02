@@ -619,7 +619,11 @@ jobs:
             if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
               git pull --rebase origin ${BRANCH_NAME}
             fi
-            git push origin ${BRANCH_NAME}
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
+            git -c credential.helper='' -c credential.interactive=false \
+              push origin ${BRANCH_NAME}
 
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then
@@ -646,3 +650,6 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
