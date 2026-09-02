@@ -529,33 +529,33 @@ They are not equal in consequence; this is the order to close them in.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-12. `vortex` session lock re-entry in writer init (fork PR #29).
-13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+13. `vortex` session lock re-entry in writer init (fork PR #29).
+14. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-14. `async-openai` null-suppression in requests.
-15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-16. `model2vec-rs` optional `config.json`.
-17. `snowflake-rs` async query response support — long-running queries time out.
+15. `async-openai` null-suppression in requests.
+16. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+17. `model2vec-rs` optional `config.json`.
+18. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-21. `model2vec-rs` HF cache directory read from the environment — models are
+22. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-24. `graph-rs-sdk` tower middleware application.
+24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+25. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -563,7 +563,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
