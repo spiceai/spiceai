@@ -141,6 +141,58 @@ ORDER BY id""",
   regexp_like(word, '^\\d+$') IS TRUE AS all_digits
 FROM regexp_values
 ORDER BY id""",
+    # A GROUP BY expression reached through a wrapper in the SELECT list.
+    # BigQuery matches a whole select item and a column reference and nothing in
+    # between, so flattening the Projection onto the Aggregate makes it report
+    # `booked_at` as neither grouped nor aggregated and refuse the statement. The
+    # aggregate has to reach it in a scope of its own.
+    "group-by-expr-nested-in-select": """SELECT
+  CAST(CAST(date_trunc('week', booked_at) AS DATE) AS VARCHAR) AS week_start,
+  COUNT(*) AS n
+FROM bucket_values
+GROUP BY date_trunc('week', booked_at)
+ORDER BY week_start""",
+    # Control: a grouped *column* wrapped in the select list needs no scope — a
+    # column reference is matched wherever it appears. Without this the scope
+    # would be paid on most grouped statements a BigQuery connector emits.
+    "group-by-column-nested-in-select-control": """SELECT
+  UPPER(tok) AS k,
+  COUNT(*) AS n
+FROM bucket_values
+GROUP BY tok
+ORDER BY k""",
+    # A correlated subquery whose *outer* relation scans nothing. The federation
+    # provider map is keyed off relations that scan something, so the constant
+    # relation is absent from it; the whole statement still has to reach BigQuery
+    # as one query rather than one scan per table reference.
+    "correlated-subquery-over-constant-relation": """WITH keys AS (
+  SELECT 1 AS k UNION ALL SELECT 2 AS k UNION ALL SELECT 3 AS k
+)
+SELECT
+  keys.k,
+  (SELECT COUNT(*) FROM union_values WHERE union_values.value = keys.k) AS n
+FROM keys
+ORDER BY keys.k""",
+    # An aggregate window whose frame a plan normalizes to RANGE. BigQuery accepts
+    # no NULL placement but its own inside a RANGE clause, and an ORDER BY with no
+    # explicit frame implies RANGE for an aggregate, so `ASC NULLS LAST` is
+    # refused. `aggregate-window-control` above cannot reach this: it names an
+    # explicit ROWS frame, which accepts either placement.
+    "aggregate-window-range-frame": """SELECT
+  grp,
+  ord,
+  SUM(amount) OVER (PARTITION BY grp ORDER BY ord) AS running_sum
+FROM window_values
+ORDER BY grp, ord""",
+    # Control: the same shape whose outer relation is a BigQuery table, which
+    # federated whole before this change too. It tells a regression in the
+    # scanless case apart from a regression in correlated pushdown generally.
+    "correlated-subquery-over-scanning-relation-control": """SELECT
+  u.value,
+  (SELECT COUNT(*) FROM union_values v WHERE v.value = u.value) AS n
+FROM union_values u
+WHERE u.value = 3
+ORDER BY u.value""",
 }
 
 EXPECTED_ROWS = {
@@ -224,6 +276,34 @@ EXPECTED_ROWS = {
         {"id": 4, "all_digits": False},
         {"id": 5, "all_digits": False},
         {"id": 6, "all_digits": True},
+    ],
+    # The NULL timestamp buckets on its own, and sorts last: the plan's ORDER BY
+    # normalizes to NULLS LAST, and the scope must carry that out to the caller
+    # rather than leaving it inside the derived table.
+    "group-by-expr-nested-in-select": [
+        {"week_start": "2026-05-11", "n": 2},
+        {"week_start": "2026-05-18", "n": 1},
+        {"week_start": None, "n": 1},
+    ],
+    "group-by-column-nested-in-select-control": [
+        {"k": "A", "n": 1},
+        {"k": "B", "n": 1},
+        {"k": "C", "n": 1},
+        {"k": "D", "n": 1},
+    ],
+    "correlated-subquery-over-constant-relation": [
+        {"k": 1, "n": 2},
+        {"k": 2, "n": 2},
+        {"k": 3, "n": 1},
+    ],
+    "correlated-subquery-over-scanning-relation-control": [
+        {"value": 3, "n": 1},
+    ],
+    "aggregate-window-range-frame": [
+        {"grp": "a", "ord": 1, "running_sum": 10},
+        {"grp": "a", "ord": 2, "running_sum": 30},
+        {"grp": "a", "ord": 3, "running_sum": 35},
+        {"grp": "b", "ord": 1, "running_sum": 7},
     ],
 }
 
@@ -321,6 +401,15 @@ FROM UNNEST([
   STRUCT('b' AS grp, 1 AS ord, 7 AS amount)
 ]);
 
+CREATE OR REPLACE TABLE {prefix}.bucket_values` AS
+SELECT *
+FROM UNNEST([
+  STRUCT(TIMESTAMP '2026-05-11 03:00:00' AS booked_at, 'a' AS tok),
+  STRUCT(TIMESTAMP '2026-05-12 04:00:00', 'b'),
+  STRUCT(TIMESTAMP '2026-05-19 05:00:00', 'c'),
+  STRUCT(CAST(NULL AS TIMESTAMP), 'd')
+]);
+
 CREATE OR REPLACE TABLE {prefix}.regexp_values` AS
 SELECT *
 FROM UNNEST([
@@ -356,6 +445,9 @@ datasets:
     params: *bigquery_params
   - from: adbc:regexp_values
     name: regexp_values
+    params: *bigquery_params
+  - from: adbc:bucket_values
+    name: bucket_values
     params: *bigquery_params
 """
 
@@ -422,6 +514,32 @@ def initial_physical_sql(explain_body: str) -> str:
     return plan.split("base_sql=", 1)[1].strip()
 
 
+def pushed_statement_count(explain_body: str) -> int:
+    """How many statements the plan sends BigQuery, one per federated node.
+
+    `initial_physical_sql` returns the first, which is all a dialect check needs.
+    A pushdown check needs the count: a plan the federation analyzer refuses
+    degrades to one scan per table reference, and every one of those is a
+    separate BigQuery job.
+    """
+    plans = json.loads(explain_body)
+    plan = next(
+        (
+            entry["plan"]
+            for entry in plans
+            if entry["plan_type"] == "initial_physical_plan"
+        ),
+        None,
+    )
+    if plan is None:
+        raise HarnessError("EXPLAIN VERBOSE did not contain an initial physical plan")
+    return sum(
+        1
+        for line in plan.splitlines()
+        if "base_sql=" in line and "VirtualExecutionPlan" in line
+    )
+
+
 def assert_generated_sql(name: str, sql: str) -> None:
     if name == "union-distinct" and " UNION DISTINCT " not in sql:
         raise HarnessError(f"distinct union is not explicit in pushed SQL: {sql}")
@@ -467,6 +585,43 @@ def assert_generated_sql(name: str, sql: str) -> None:
         if "REGEXP_CONTAINS" in sql:
             raise HarnessError(
                 f"a Unicode-divergent pattern must not push down, RE2 reads it differently: {sql}"
+            )
+    if name == "group-by-expr-nested-in-select":
+        # The grouping expression must be rendered only inside the scope. Checked
+        # on the rendered call, not on the base column: the dialect sanitises the
+        # derived output's alias out of the schema name, which spells the base
+        # column inside it.
+        outer_select = sql.split(" FROM ", 1)[0]
+        if "TIMESTAMP_TRUNC" in outer_select:
+            raise HarnessError(
+                f"the outer select list still re-derives the grouping expression, which "
+                f"BigQuery cannot bind against its GROUP BY: {sql}"
+            )
+        if "GROUP BY" not in sql or "TIMESTAMP_TRUNC" not in sql:
+            raise HarnessError(
+                f"the scope has to carry the grouping expression and its GROUP BY: {sql}"
+            )
+    if name == "aggregate-window-range-frame":
+        # Only the window's own ORDER BY is at issue; the statement's top-level
+        # ORDER BY carries its NULLS clause perfectly well.
+        over_clause = sql.split("OVER (", 1)[1].split(")", 1)[0]
+        if "IS NULL" not in over_clause:
+            raise HarnessError(
+                f"the NULL placement was not spelled as a leading key, so BigQuery "
+                f"refuses this RANGE window: {sql}"
+            )
+        if "NULLS" in over_clause:
+            raise HarnessError(
+                f"a NULLS clause survived inside the RANGE frame: {sql}"
+            )
+        if "RANGE" not in over_clause:
+            raise HarnessError(f"the RANGE frame itself was lost: {sql}")
+    if name == "group-by-column-nested-in-select-control":
+        # A grouped column binds flattened, so the scope must not be paid here:
+        # one statement, one SELECT, no derived table.
+        if "FROM (SELECT" in sql:
+            raise HarnessError(
+                f"{name} binds as one SELECT for BigQuery, so it must not be scoped: {sql}"
             )
 
 
@@ -615,10 +770,16 @@ def main() -> int:
                 raise HarnessError(
                     f"EXPLAIN VERBOSE for {name} returned HTTP {explain_status}: {explain_body}"
                 )
+            statements = pushed_statement_count(explain_body)
+            if statements != 1:
+                raise HarnessError(
+                    f"{name} reaches BigQuery as {statements} statements, not one; "
+                    f"every extra one is another BigQuery job:\n{explain_body[:2000]}"
+                )
             pushed_sql = initial_physical_sql(explain_body)
             assert_generated_sql(name, pushed_sql)
             generated_sql[name] = pushed_sql
-            print(f"{name}: ok")
+            print(f"{name}: ok ({statements} statement)")
 
         write_json(output / "generated-sql.json", generated_sql)
         jobs = []
@@ -634,6 +795,7 @@ def main() -> int:
                     "json_values",
                     "window_values",
                     "regexp_values",
+                    "bucket_values",
                 )
             ):
                 continue

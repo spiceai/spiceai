@@ -819,6 +819,100 @@ mod tests {
         }
     }
 
+    /// The `Projection` over `Aggregate` shape a grouped dashboard card plans to:
+    /// group by a truncated timestamp, then project a *wrapped* form of that same
+    /// grouping expression. The projection reads the aggregate's own output columns,
+    /// whose names come from the schema rather than being spelled here, so this shape
+    /// survives a rename of how `DataFusion` names an unaliased group expression.
+    fn projection_wrapping_a_grouping_expression() -> LogicalPlan {
+        let grouped = LogicalPlanBuilder::scan(
+            "advances",
+            table_source(vec![Field::new(
+                "funded_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )]),
+            None,
+        )
+        .expect("scan advances")
+        .aggregate(
+            vec![date_trunc(lit("week"), col("advances.funded_ts"))],
+            vec![count(lit(1u8))],
+        )
+        .expect("aggregate")
+        .build()
+        .expect("build aggregate");
+
+        let mut outputs = grouped.schema().columns().into_iter();
+        let group_output = outputs
+            .next()
+            .expect("the group expression's output column");
+        let count_output = outputs.next().expect("the aggregate's output column");
+
+        LogicalPlanBuilder::from(grouped)
+            .project(vec![
+                cast(
+                    cast(Expr::Column(group_output), DataType::Date32),
+                    DataType::Utf8,
+                )
+                .alias("week_start"),
+                Expr::Column(count_output).alias("advances_funded"),
+            ])
+            .expect("projection over the aggregate")
+            .build()
+            .expect("build projection")
+    }
+
+    /// Regression test for the projection-over-aggregate fix: a `SELECT` list that
+    /// *wraps* a grouping expression needs the `Aggregate` in a scope of its own for
+    /// any dialect that resolves `GROUP BY` against whole select items only.
+    ///
+    /// `GoogleSQL` is such a dialect. Flattening the two nodes into one `SELECT`
+    /// leaves the grouping expression bare in `GROUP BY` and wrapped in the select
+    /// list, and `BigQuery` rejects the statement outright with "SELECT list
+    /// expression references column `funded_ts` which is neither grouped nor
+    /// aggregated" — the whole statement fails, not one row of it.
+    ///
+    /// The two cheaper renderings are both wrong rather than merely different:
+    /// `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the *wrapped*
+    /// value, so a wrapper that is not injective over the grouping expression merges
+    /// groups and sums their aggregates — fewer rows than the plan asked for, with no
+    /// error. Only a derived table reproduces the plan's grouping for every wrapper,
+    /// which is why this guard asserts the scope and not just that the statement
+    /// parses.
+    #[test]
+    fn a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped() {
+        let plan = projection_wrapping_a_grouping_expression();
+
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let grouping_at = first_offset_of(&sql, "GROUP BY");
+
+            if dialect.group_by_matches_select_subexpressions() {
+                // The dialect binds the wrapped select item against the grouping
+                // expression it contains, so one SELECT is a faithful rendering.
+                continue;
+            }
+
+            assert!(
+                paren_depth_at(&sql, grouping_at) >= 1,
+                "{dialect_name}: this dialect matches GROUP BY against whole select items, so the \
+                 grouping has to be a scope of its own — flattened, the select list references \
+                 columns the statement never grouped: {sql}"
+            );
+            // Asserted on the rendered grouping call rather than on the base column:
+            // a dialect may sanitise the derived output's alias out of the schema
+            // name, which spells the base column inside it.
+            let outer_select = &sql[..first_offset_of(&sql, "FROM")];
+            assert!(
+                !outer_select.contains("TIMESTAMP_TRUNC") && !outer_select.contains("date_trunc("),
+                "{dialect_name}: the outer select list still re-derives the grouping expression \
+                 instead of reading the grouped scope's output, which is the reference this \
+                 dialect cannot bind: {sql}"
+            );
+        }
+    }
+
     /// The semi-join shape every bound guard below shares: a probe side, a build side
     /// rendered as a correlated `EXISTS`, and an output projection. Only the build side
     /// differs between them, so each guard can assert what its own bound changes rather
