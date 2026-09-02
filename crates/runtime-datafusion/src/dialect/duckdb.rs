@@ -630,7 +630,11 @@ mod tests {
         });
 
         let one_arg = dialect
-            .scalar_function_to_sql_overrides(&unparser, crate::dialect::BTRIM_NAME, &[col.clone()])
+            .scalar_function_to_sql_overrides(
+                &unparser,
+                crate::dialect::BTRIM_NAME,
+                std::slice::from_ref(&col),
+            )
             .expect("btrim renders")
             .expect("the dialect has a handler registered for btrim");
         assert_eq!(one_arg.to_string(), r#"trim("t"."name")"#);

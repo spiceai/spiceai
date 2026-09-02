@@ -259,7 +259,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
 
 /// `trim(col)` resolves to `DataFusion`'s `btrim` UDF and federates under that
 /// canonical name, which `SQLite` has no function for — the query fails with
-/// `no such function: btrim` (the SQLite arm of issue #13794). `SQLite` cannot
+/// `no such function: btrim` (the `SQLite` arm of issue #13794). `SQLite` cannot
 /// be given a rewrite, because `datafusion-table-providers` constructs its
 /// unparser dialect internally, so `btrim` is deny-listed and the projection
 /// evaluates locally instead.
