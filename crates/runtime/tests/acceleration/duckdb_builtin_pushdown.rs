@@ -54,7 +54,7 @@ fn write_csv_source(path: &Path) -> Result<(), anyhow::Error> {
 /// `U+00A0`, then `U+2003`, then `U+3000`.
 ///
 /// `btrim(str)` strips ASCII `U+0020` and nothing else, so all three rows come
-/// back unchanged. DuckDB's *one-argument* `trim` strips every `Zs`, which is
+/// back unchanged. `DuckDB`'s *one-argument* `trim` strips every `Zs`, which is
 /// why the dialect renders the one-argument call as `trim(str, ' ')` — without
 /// that, these rows would come back shortened and the accelerated dataset would
 /// silently disagree with the unaccelerated one instead of erroring.
@@ -188,7 +188,7 @@ async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), 
 }
 
 /// `btrim(str)` strips ASCII `U+0020` only, so a `Zs`-padded string is returned
-/// unchanged. DuckDB's one-argument `trim` strips every `Zs` instead, which
+/// unchanged. `DuckDB`'s one-argument `trim` strips every `Zs` instead, which
 /// would make the accelerated dataset answer differently from the
 /// unaccelerated one — a silently wrong result rather than the loud
 /// unknown-function error of #13794. Measured by length, so the comparison does

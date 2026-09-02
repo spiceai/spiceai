@@ -690,7 +690,7 @@ mod tests {
 
         for (args, expected) in [
             (vec![column.clone()], r#"trim("t"."name", ' ')"#),
-            (vec![column.clone(), lit("xy")], r#"trim("t"."name", 'xy')"#),
+            (vec![column, lit("xy")], r#"trim("t"."name", 'xy')"#),
         ] {
             let rendered = btrim_to_trim(&unparser, &args)
                 .expect("should execute successfully")
