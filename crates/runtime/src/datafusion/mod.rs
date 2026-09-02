@@ -137,6 +137,7 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
@@ -2974,6 +2975,13 @@ impl DataFusion {
             .delete_expr(retention_delete_expr)
             .build();
 
+        // Whether a retention task will actually run, which is not the same as
+        // the dataset having configured one: the builder returns `None` for a
+        // policy it cannot assemble — no `retention_check_interval`, no
+        // `time_column`, no period or expression — and the caching branch below
+        // has to tell "bounded" from "configured to be bounded".
+        let declared_retention_runs = retention.is_some();
+
         accelerated_table_builder.retention(retention);
 
         accelerated_table_builder
@@ -3019,33 +3027,45 @@ impl DataFusion {
                 );
             }
 
-            // Auto-configure cache retention when stale_if_error is disabled.
-            // Expired cache entries (past max_age + SWR) are never served and waste storage.
-            if !acceleration_settings.caching_stale_if_error.is_enabled() {
-                if dataset.retention_period().is_some() {
+            // Nothing in the caching read path removes an entry, so the
+            // accelerator is bounded by a retention policy or by nothing at all.
+            match caching_retention::caching_retention(
+                acceleration_settings.caching_stale_if_error.is_enabled(),
+                acceleration_settings.caching_ttl,
+                acceleration_settings.caching_stale_while_revalidate_ttl,
+                declared_retention_runs,
+            ) {
+                caching_retention::CachingRetention::Derive {
+                    period,
+                    check_interval,
+                } => {
+                    if dataset.retention_period().is_some() {
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                        );
+                    }
+
+                    let cache_retention = Retention::builder()
+                        .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
+                        .time_period(Some(period))
+                        .check_interval(Some(check_interval))
+                        .enabled(true)
+                        .build();
+
+                    accelerated_table_builder.retention(cache_retention);
+                }
+                // The policy built above this block is the dataset's own, and it
+                // is the only thing that can bound a stale-on-error cache.
+                caching_retention::CachingRetention::LeaveDeclared => {}
+                caching_retention::CachingRetention::Unbounded => {
                     tracing::warn!(
-                        dataset = %dataset.name,
-                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                        "{}",
+                        caching_retention::unbounded_caching_retention_warning(
+                            &dataset.name.to_string()
+                        )
                     );
                 }
-
-                let max_age = acceleration_settings
-                    .caching_ttl
-                    .unwrap_or(Duration::from_secs(30));
-                let swr = acceleration_settings
-                    .caching_stale_while_revalidate_ttl
-                    .unwrap_or_default();
-                let retention_period = max_age + swr;
-                let check_interval = retention_period.max(Duration::from_secs(30));
-
-                let cache_retention = Retention::builder()
-                    .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
-                    .time_period(Some(retention_period))
-                    .check_interval(Some(check_interval))
-                    .enabled(true)
-                    .build();
-
-                accelerated_table_builder.retention(cache_retention);
             }
 
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
