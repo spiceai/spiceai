@@ -93,11 +93,11 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `121e0de92cb5db5b68418bc4b8c1d4b4efaf5e74` | `phillip/bigquery-scope-wrapped-grouping-expr` |
+| [datafusion](#datafusion) | `3664717f04a9df223928a0d50a8609108112737d` | `phillip/bigquery-scope-wrapped-grouping-expr` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
-| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `611e4bccc2df3ef2d5adbd927d4494f19bbf3abc` | `phillip/federate-subquery-only-tables` |
+| [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `6ec264ec6e8c4e720ced9f7ccf8b5f6664e6106d` | `phillip/federate-subquery-only-tables` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `0fb93c61677917b1dd1c062e0c051efe7c24a676` | `phillip/bump-federation-subquery-only-tables` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `94c6199434f637a9716412e190e97320b2e7b5ff` | `phillip/bump-federation-subquery-only-tables` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
