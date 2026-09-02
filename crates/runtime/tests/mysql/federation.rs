@@ -290,9 +290,9 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 }
 
 /// `trim(col)` resolves to `DataFusion`'s `btrim` UDF and federates under that
-/// canonical name, which MySQL has no function for — the query fails remotely
-/// with `FUNCTION <db>.btrim does not exist` (the MySQL arm of issue #13794).
-/// MySQL cannot be given a rewrite: its `TRIM` has no two-argument form, and
+/// canonical name, which `MySQL` has no function for — the query fails remotely
+/// with `FUNCTION <db>.btrim does not exist` (the `MySQL` arm of issue #13794).
+/// `MySQL` cannot be given a rewrite: its `TRIM` has no two-argument form, and
 /// `TRIM(BOTH chars FROM str)` strips `chars` as a substring where `btrim`
 /// strips any character in it, so a rewrite would trade a failed query for
 /// wrong rows. `btrim` is deny-listed instead and evaluates locally.
