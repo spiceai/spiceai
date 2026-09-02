@@ -30378,15 +30378,25 @@ impl CayenneTableProvider {
     /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
     /// Materialize the in-memory CDC tier before a scanning delete, the way
     /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
-    /// inline corpus: the deletion-vector sink scans durable tiers only. The
-    /// caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock` itself
-    /// (the `write -> mem` order every other holder settles on). A no-op when the
-    /// tier is empty, and — like every checkpoint — in memory-resident mode, where
-    /// the tier is the permanent store.
-    async fn checkpoint_mem_tier_if_present_for_delete(&self) -> datafusion_common::Result<()> {
-        if self.mem_tier.is_empty() {
-            return Ok(());
-        }
+    /// inline corpus: the deletion-vector sink scans durable tiers only, and it
+    /// scans its `ListingTable`s directly rather than under `listing_fence`, so it
+    /// carries no barrier of its own against a checkpoint still in flight.
+    ///
+    /// There is deliberately no empty-tier fast path. An empty tier does not imply
+    /// nothing is in flight: [`Self::purge_mem_tier_all`] clears a captured but
+    /// not-yet-published prefix while holding only `write_lock`, so a checkpoint
+    /// that captured those rows and is still encoding off-lock leaves the tier
+    /// reading empty with its snapshot unpublished. Awaiting `mem_checkpoint_lock`
+    /// unconditionally is what makes that checkpoint's snapshot visible before the
+    /// caller captures its scan sources.
+    ///
+    /// The caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock`
+    /// itself — the `write -> mem` order every other holder settles on, and the one
+    /// [`Self::acquire_capture_locks_blocking`] yields to rather than invert. On an
+    /// empty tier the checkpoint is a storage no-op that re-fires the last durable
+    /// slot advancer and returns; in memory-resident mode it returns immediately,
+    /// since there the tier is the permanent store.
+    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -33498,18 +33508,24 @@ impl TableProvider for CayenneTableProvider {
         // leave it alive, and one that matches the durable version an
         // un-checkpointed upsert has superseded would tombstone the KEY and take
         // the live RAM replacement with it — the shape #13574 closed for protected
-        // snapshots, one tier over. Materialize the tier first, under `write_lock`
-        // so no CDC apply lands between the checkpoint and the scan-source capture
-        // below, exactly as the two branches above materialize inline rows. Once
-        // durable, the rows are subject to the sink's own tier-aware liveness rule.
-        {
+        // snapshots, one tier over. Materialize the tier, exactly as the two
+        // branches above materialize inline rows; once durable, the rows are
+        // subject to the sink's own tier-aware liveness rule.
+        //
+        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
+        // so no CDC apply can land between them. They are not separable: a
+        // checkpoint publishes its rows as a PROTECTED snapshot, and
+        // `build_deletion_vector_sink` freezes the protected set the sink will scan
+        // (the sink re-reads only the main listing at execution), so a checkpoint
+        // that lands after the capture is invisible to this delete. Nothing under
+        // the sink builder takes `write_lock`, so holding it across the build
+        // cannot deadlock.
+        let file_sink = {
             let _guard = self.write_lock.lock().await;
-            self.checkpoint_mem_tier_if_present_for_delete().await?;
-        }
-
-        let file_sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-            .await?;
+            self.checkpoint_mem_tier_for_delete().await?;
+            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+                .await?
+        };
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
