@@ -3119,7 +3119,7 @@ impl DataFusion {
             accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
         }
 
-        let retention = Retention::builder()
+        let retention = Retention::builder(dataset.name.to_string())
             .time_column(dataset.time_column.clone())
             .time_format(dataset.time_format)
             .time_partition_column(dataset.time_partition_column.clone())
@@ -3201,7 +3201,7 @@ impl DataFusion {
                         );
                     }
 
-                    let cache_retention = Retention::builder()
+                    let cache_retention = Retention::builder(dataset.name.to_string())
                         .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
                         .time_period(Some(period))
                         .check_interval(Some(check_interval))

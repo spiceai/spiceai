@@ -174,7 +174,7 @@ impl SpiceExtension {
         runtime: Arc<Runtime>,
         from: String,
     ) -> Result<()> {
-        let retention = Retention::builder()
+        let retention = Retention::builder(get_metrics_table_reference().to_string())
             .time_column(Some("timestamp".to_string()))
             .time_format(Some(TimeFormat::UnixSeconds))
             .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes

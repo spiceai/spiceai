@@ -2318,6 +2318,7 @@ pub enum DataRetentionFilter {
 }
 
 pub struct RetentionBuilder {
+    dataset_name: Arc<str>,
     time_column: Option<String>,
     time_format: Option<TimeFormat>,
     time_period: Option<Duration>,
@@ -2330,8 +2331,9 @@ pub struct RetentionBuilder {
 
 impl RetentionBuilder {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(dataset_name: impl Into<Arc<str>>) -> Self {
         Self {
+            dataset_name: dataset_name.into(),
             time_column: None,
             time_format: None,
             time_partition_column: None,
@@ -2394,22 +2396,37 @@ impl RetentionBuilder {
         self
     }
 
+    /// Assemble the policy, reporting a refusal that leaves the dataset unbounded.
+    ///
+    /// `enabled: false` is the one `None` that is not a refusal — the operator asked
+    /// for no retention — so it returns before [`Self::assemble`] and stays silent.
     #[must_use]
     pub fn build(self) -> Option<Retention> {
         if !self.enabled {
             return None;
         }
 
-        let check_interval = self.check_interval?;
+        let dataset_name = Arc::clone(&self.dataset_name);
+        match self.assemble() {
+            Ok(retention) => Some(retention),
+            Err(refusal) => {
+                tracing::error!("{}", refusal.message(&dataset_name));
+                None
+            }
+        }
+    }
+
+    /// The policy this configuration describes, or why it describes none.
+    ///
+    /// Split from [`Self::build`] so the refusal is a value a test can assert on
+    /// rather than a log line, and so every refusal is reported by one call site.
+    fn assemble(self) -> Result<Retention, RetentionRefusal> {
         let mut filters = Vec::new();
 
         // Add time-based filter if period and time_column are provided
         if let Some(period) = self.time_period {
             let Some(time_column) = self.time_column else {
-                tracing::error!(
-                    "[retention] The `time_column` must be specified for time-based retention"
-                );
-                return None;
+                return Err(RetentionRefusal::NoTimeColumn);
             };
 
             filters.push(DataRetentionFilter::Time {
@@ -2429,22 +2446,59 @@ impl RetentionBuilder {
         }
 
         if filters.is_empty() {
-            tracing::error!(
-                "[retention] The `retention_period` or `retention_sql` must be specified for retention"
-            );
-            return None;
+            return Err(RetentionRefusal::NoFilter);
         }
 
-        Some(Retention {
+        // Checked after the filters so that a configuration missing both is still
+        // reported by the filter arm, as it was before the interval had an arm at
+        // all: `retention_check_interval` has no default, so this is the arm a
+        // dataset reaches when it configures everything else a policy needs.
+        let check_interval = self
+            .check_interval
+            .ok_or(RetentionRefusal::NoCheckInterval)?;
+
+        Ok(Retention {
             filters,
             check_interval,
         })
     }
 }
 
-impl Default for RetentionBuilder {
-    fn default() -> Self {
-        Self::new()
+/// The docs page every retention refusal points at.
+const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accelerators";
+
+/// Why [`RetentionBuilder::assemble`] could not assemble a retention policy.
+///
+/// Every variant has the same user-visible outcome — no retention pass runs, so the
+/// accelerated table is unbounded — reached through a different missing setting, so
+/// [`Self::message`] states that impact once and each variant supplies its own cause
+/// and fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionRefusal {
+    /// Neither `retention_period` nor `retention_sql` says what to delete.
+    NoFilter,
+    /// `retention_period` is set but `time_column` does not say what to compare.
+    NoTimeColumn,
+    /// Nothing says how often to delete, and `retention_check_interval` has no default.
+    NoCheckInterval,
+}
+
+impl RetentionRefusal {
+    fn message(self, dataset_name: &str) -> String {
+        let cause_and_fix = match self {
+            Self::NoFilter => {
+                "Cause: neither `retention_period` nor `retention_sql` is set, so nothing says which rows to delete. Set one of them."
+            }
+            Self::NoTimeColumn => {
+                "Cause: time-based retention compares `time_column` against the cutoff, and it is not set. Set `time_column` on the dataset, or delete by expression with `retention_sql` instead."
+            }
+            Self::NoCheckInterval => {
+                "Cause: `retention_check_interval` is missing or is not a valid duration, and it has no default. Set it, for example `retention_check_interval: 1h`."
+            }
+        };
+        format!(
+            "[retention] Retention is enabled for dataset '{dataset_name}' but no retention pass runs, so no data is ever evicted and the accelerated table grows without limit. {cause_and_fix} See: {RETENTION_DOCS_URL}"
+        )
     }
 }
 
@@ -2455,8 +2509,8 @@ pub struct Retention {
 
 impl Retention {
     #[must_use]
-    pub fn builder() -> RetentionBuilder {
-        RetentionBuilder::new()
+    pub fn builder(dataset_name: impl Into<Arc<str>>) -> RetentionBuilder {
+        RetentionBuilder::new(dataset_name)
     }
 }
 
@@ -2737,6 +2791,116 @@ mod tests {
 
         assert!(
             matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
+        );
+    }
+
+    /// A retention policy an operator would reasonably think complete, minus the one
+    /// setting that has no default.
+    fn interval_less_builder() -> RetentionBuilder {
+        Retention::builder("events")
+            .time_column(Some("ts"))
+            .time_period(Some(Duration::from_secs(30)))
+            .enabled(true)
+    }
+
+    #[test]
+    fn test_a_retention_policy_without_a_check_interval_is_refused_and_named() {
+        assert_eq!(
+            interval_less_builder().assemble().err(),
+            Some(RetentionRefusal::NoCheckInterval),
+            "a policy whose only missing setting is `retention_check_interval` must refuse with that reason, not silently"
+        );
+        assert!(
+            interval_less_builder().build().is_none(),
+            "an unassemblable policy still builds into no retention task"
+        );
+    }
+
+    #[test]
+    fn test_a_complete_retention_policy_builds() {
+        let retention = interval_less_builder()
+            .check_interval(Some(Duration::from_secs(1)))
+            .build()
+            .expect("a policy with a time column, a period and a check interval must build");
+        assert_eq!(retention.check_interval, Duration::from_secs(1));
+        assert_eq!(retention.filters.len(), 1);
+    }
+
+    #[test]
+    fn test_retention_disabled_is_not_a_refusal() {
+        assert!(
+            Retention::builder("events")
+                .enabled(false)
+                .build()
+                .is_none(),
+            "`retention_check_enabled: false` is an operator opting out, so it must not report a refusal"
+        );
+    }
+
+    #[test]
+    fn test_a_period_without_a_time_column_is_refused() {
+        assert_eq!(
+            Retention::builder("events")
+                .time_period(Some(Duration::from_secs(30)))
+                .check_interval(Some(Duration::from_secs(1)))
+                .enabled(true)
+                .assemble()
+                .err(),
+            Some(RetentionRefusal::NoTimeColumn)
+        );
+    }
+
+    #[test]
+    fn test_a_policy_with_nothing_to_delete_is_refused_on_the_filter() {
+        // Precedence: a configuration missing both a filter and the interval keeps
+        // reporting the filter, which is the message it reported before the interval
+        // had an arm of its own.
+        for check_interval in [None, Some(Duration::from_secs(1))] {
+            assert_eq!(
+                Retention::builder("events")
+                    .check_interval(check_interval)
+                    .enabled(true)
+                    .assemble()
+                    .err(),
+                Some(RetentionRefusal::NoFilter),
+                "check_interval={check_interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_retention_refusal_names_the_dataset_the_impact_and_the_fix() {
+        for refusal in [
+            RetentionRefusal::NoFilter,
+            RetentionRefusal::NoTimeColumn,
+            RetentionRefusal::NoCheckInterval,
+        ] {
+            let message = refusal.message("events");
+            assert!(
+                message.contains("dataset 'events'"),
+                "{refusal:?} must name the dataset: {message}"
+            );
+            assert!(
+                message.contains("grows without limit"),
+                "{refusal:?} must state what the operator will observe: {message}"
+            );
+            assert!(
+                message.contains(RETENTION_DOCS_URL),
+                "{refusal:?} must link the docs: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "{refusal:?} must stay on one line: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_missing_check_interval_refusal_names_the_setting_that_has_no_default() {
+        let message = RetentionRefusal::NoCheckInterval.message("events");
+        assert!(
+            message.contains("`retention_check_interval`") && message.contains("no default"),
+            "the refusal must name the unset setting and say it has no default: {message}"
         );
     }
 }
