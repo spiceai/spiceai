@@ -148,9 +148,6 @@ async fn commit(
     Ok(())
 }
 
-/// Commit one upsert of `key` on a durable-write-back table keyed by that shape,
-/// then assert the commit left exactly one marker and that decoding it returns
-/// the key that was written.
 /// The claim cursor for a page's last marker. Markers are `(pk_bytes, sequence)`
 /// and the cursor is `(sequence, pk_bytes)`, so the flip is stated once.
 fn cursor_after(page: &[(Vec<u8>, i64)]) -> Option<(i64, Vec<u8>)> {
@@ -176,6 +173,9 @@ async fn page_all_markers(
     Ok(paged)
 }
 
+/// Commit one upsert of `key` on a durable-write-back table keyed by that shape,
+/// then assert the commit left exactly one marker and that decoding it returns
+/// the key that was written.
 async fn assert_marker_round_trip(
     fixture: &common::TestFixture,
     key: ArrayRef,

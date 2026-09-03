@@ -188,6 +188,9 @@ pub(crate) struct WriteBackWorker {
     /// pass could not deliver all of it; `None` claims from the oldest marker.
     /// See *Claim window*.
     claim_after: Option<(i64, Vec<u8>)>,
+    /// Consecutive sweeps whose first page was wholly unreadable; the
+    /// stuck-delivery warning fires on the second.
+    unreadable_first_pages: u32,
     /// Rate limiter for the stuck-delivery warning. A stall persists, and the
     /// operator who starts reading logs after it began still needs to be told
     /// why the backlog is not falling, so the message repeats on an interval
@@ -271,6 +274,7 @@ impl WriteBackWorker {
 
         Ok(Self {
             claim_after: None,
+            unreadable_first_pages: 0,
             withheld_tracer: SpacedTracer::new(WITHHELD_WARNING_INTERVAL),
             provider: Arc::new(provider),
             federated,
@@ -379,6 +383,9 @@ impl WriteBackWorker {
             .map_err(to_df_err)?;
         if claimed.is_empty() {
             self.claim_after = None;
+            if claimed_from_oldest {
+                self.unreadable_first_pages = 0;
+            }
             return Ok(PassOutcome {
                 claimed_from_oldest,
                 claimed: 0,
@@ -423,13 +430,24 @@ impl WriteBackWorker {
         // claimed keys, so the two agree, and this one cannot deliver a row that
         // no marker will retire.
         let has_present = !deliverable.is_empty();
+        if claimed_from_oldest {
+            // Counted on a sweep's first page only. A withheld marker keeps its
+            // sequence number, so a key that never becomes readable settles on
+            // that page and is claimed there again every sweep.
+            if has_present {
+                self.unreadable_first_pages = 0;
+            } else {
+                self.unreadable_first_pages += 1;
+            }
+        }
         if deliverable.len() < claimed.len() {
             let withheld = claimed.len() - deliverable.len();
             // A withhold is usually a commit the scan cannot see yet, gone by the
-            // next pass. A whole page of them is not: it is the shape of keys
-            // that will never become readable, and the only other signal is a
+            // next pass. A first page still wholly unreadable a sweep later is
+            // not: it is the shape of keys that will never become readable, and
+            // the only other signal is a
             // `dataset_acceleration_write_back_pending_keys` that stops falling.
-            if deliverable.is_empty() {
+            if claimed_from_oldest && self.unreadable_first_pages >= 2 {
                 let message = stuck_delivery_warning(&self.dataset_name, withheld);
                 warn_spaced!(self.withheld_tracer, "{}{message}", "");
             } else {
@@ -566,7 +584,8 @@ struct PassOutcome {
     delivered: usize,
 }
 
-/// The warning a dataset gets when a whole claimed page is unreadable.
+/// The warning a dataset gets when a sweep's first page is wholly unreadable two
+/// sweeps running.
 ///
 /// This is the only account an operator gets of a backlog that stops falling, so
 /// it names the dataset, what it means for the data, and the one cause that does

@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
-/// `PRAGMA auto_vacuum` integer value for INCREMENTAL (0 = NONE, 1 = FULL, 2 = INCREMENTAL).
+/// `PRAGMA auto_vacuum` integer values (0 = NONE, 1 = FULL, 2 = INCREMENTAL).
+const SQLITE_AUTO_VACUUM_NONE: i64 = 0;
 const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
 
 /// Read the database's live `auto_vacuum` mode. Fixed at file creation — the
@@ -45,17 +46,28 @@ fn read_auto_vacuum_mode(conn: &mut rusqlite::Connection) -> Result<i64, rusqlit
 /// Boundedly reclaim freelist pages on a connection already known to be in
 /// INCREMENTAL auto-vacuum mode.
 ///
-/// Returns pages reclaimed (0 when the freelist is empty). Holds the write lock
-/// only for the duration of `PRAGMA incremental_vacuum(N)`, and only when there
-/// is actually work to do.
+/// Returns pages reclaimed (0 when there is not yet a full slice to reclaim).
+/// Holds the write lock only for the duration of `PRAGMA incremental_vacuum(N)`,
+/// and only when there is actually work to do.
 fn reclaim_freelist_pages(
     conn: &mut rusqlite::Connection,
     max_pages: u32,
 ) -> Result<u64, rusqlite::Error> {
-    // Cheap counter read; skip the write lock entirely when there is nothing to
-    // reclaim, which is the steady state once the freelist has drained.
+    // Cheap counter read; skip the write lock entirely unless enough pages are
+    // waiting to be worth taking it. The caller is the per-table maintenance tick
+    // (~100 ms under load, and every table of a catalog shares this one
+    // database), so reclaiming whenever any single page is free would take the
+    // write lock on essentially every tick and turn each relocated page into a
+    // WAL frame the following checkpoint must copy back. A high-update table's
+    // freelist churns — pages are freed and immediately reused — so holding out
+    // for a batch leaves at most a slice unreclaimed while converging just as
+    // fast on the case that matters: the large freelist a bulk delete leaves.
+    //
+    // Capped by `max_pages` so raising the per-tick cap to drain a big freelist
+    // faster cannot raise the bar for starting at all.
+    let floor = i64::from(max_pages.min(DEFAULT_INCREMENTAL_VACUUM_PAGES)).max(1);
     let free_before: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-    if free_before <= 0 {
+    if free_before < floor {
         return Ok(0);
     }
     // Bounded: reclaims at most `max_pages`, leaving the rest for later ticks
@@ -97,22 +109,25 @@ const DEFAULT_INCREMENTAL_VACUUM_PAGES: u32 = 256;
 /// `auto_vacuum` mode for the metastore DB.
 ///
 /// A high-update upsert table (e.g. `district`) frees pages as it supersedes
-/// rows; with the default `None` those pages stay on the freelist and are reused,
-/// so the file plateaus at its high-water mark rather than growing unboundedly.
-/// The page cache already keeps the *live* working set resident, so the freelist
-/// pages are never read and reclaiming them is a disk-footprint concern, not a
-/// latency one — and every reclaiming mode taxes the write path (see the
-/// variants), so reclamation is opt-in and `None` is the default.
+/// rows. Under `None` those pages stay on the freelist and are reused, so the
+/// file plateaus at its high-water mark — but that mark is set by the largest
+/// transient the metastore ever held, and an operator reading `du` cannot tell a
+/// plateau from a leak. `Incremental` is the default so the space comes back:
+/// the mode itself does no vacuuming (it only maintains the pointer map that
+/// makes reclamation possible), and the reclaiming
+/// `PRAGMA incremental_vacuum(N)` runs bounded, off the hot path, on the
+/// maintenance tick. `None` remains available for a deployment that wants the
+/// pointer-map overhead off its write path and is content with the plateau.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SqliteAutoVacuum {
-    /// `SQLite` default: freed pages stay on the freelist and are reused for new
-    /// inserts; the file plateaus. No write-path overhead. Recommended.
-    #[default]
+    /// `SQLite`'s own default: no pointer map, and so no write-path overhead at
+    /// all.
     None,
     /// Freed pages are tracked for reclamation by an explicit
     /// `PRAGMA incremental_vacuum`, which holds the write lock while it relocates
     /// and truncates — so reclamation must be driven off the hot path, never
     /// inside a CDC burst.
+    #[default]
     Incremental,
     /// Reclaim each commit's freed pages as part of that commit: the file stays
     /// small continuously, at the cost of page-relocation work on *every*
@@ -197,8 +212,13 @@ pub struct SqliteMetastoreConfig {
     /// not to tax writers, yet the file stays bounded if a tick lags. `0` makes
     /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
     pub wal_truncate_threshold_bytes: u64,
-    /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
-    /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
+    /// `auto_vacuum` mode. Takes effect only on a fresh DB: moving an existing
+    /// one off NONE takes `PRAGMA auto_vacuum = <mode>` FOLLOWED by a full
+    /// `VACUUM` — the pragma alone is a no-op there, and a bare `VACUUM`
+    /// preserves whatever mode the file already has. So a metastore created
+    /// before this defaulted to [`SqliteAutoVacuum::Incremental`] keeps its old
+    /// mode, and the driver gates on the file's real mode rather than on this
+    /// setting.
     pub auto_vacuum: SqliteAutoVacuum,
     /// Freelist pages reclaimed per maintenance tick when the database is in
     /// INCREMENTAL auto-vacuum mode. Ignored in every other mode.
@@ -232,7 +252,7 @@ impl Default for SqliteMetastoreConfig {
             // tick. See the field doc for the full drain contract.
             wal_autocheckpoint_pages: 0,
             wal_truncate_threshold_bytes: DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES,
-            auto_vacuum: SqliteAutoVacuum::None,
+            auto_vacuum: SqliteAutoVacuum::Incremental,
             incremental_vacuum_pages: DEFAULT_INCREMENTAL_VACUUM_PAGES,
         }
     }
@@ -1207,13 +1227,23 @@ impl MetastoreBackend for SqliteMetastore {
                 conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, [])?;
-                conn.execute(Self::PENDING_WRITE_BACK_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await
             .map_err(
                 |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                     message: duplicate_delete_file_index_error_message("SQLite", e),
+                },
+            )?;
+
+        // Kept out of the block above: that one reports every failure as duplicate
+        // `cayenne_delete_file` paths, with remediation against that table.
+        guard
+            .call(|conn| conn.execute(Self::PENDING_WRITE_BACK_INDEX_DDL, []))
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to create pending write-back index: {e}"),
                 },
             )?;
 
@@ -1608,7 +1638,7 @@ impl MetastoreBackend for SqliteMetastore {
         // METRIC 2 (WAL bytes): sample the -wal file size right after the
         // checkpoint copied as many frames as it could. A cheap stat(); a missing
         // file (just truncated) reports 0.
-        self.sample_wal_bytes().await;
+        self.sample_file_footprint().await;
         Ok(())
     }
 
@@ -1657,23 +1687,42 @@ impl MetastoreBackend for SqliteMetastore {
                 .await
                 .map_err(map_err)?
         } else {
-            let (is_incremental, reclaimed) = guard
+            let (mode, reclaimed) = guard
                 .call(move |conn| {
                     // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. FULL already reclaims
-                    // at commit time, so it needs nothing here either.
+                    // at commit time, so it needs nothing here either. The mode
+                    // itself is returned, not just "is it INCREMENTAL", so the
+                    // caller can tell a FULL database (reclaiming, fine) from a
+                    // NONE one (never reclaiming, worth saying so).
                     let mode = read_auto_vacuum_mode(conn)?;
-                    let is_inc = mode == SQLITE_AUTO_VACUUM_INCREMENTAL;
-                    if !is_inc {
-                        return Ok((false, 0));
+                    if mode != SQLITE_AUTO_VACUUM_INCREMENTAL {
+                        return Ok((mode, 0));
                     }
                     let n = reclaim_freelist_pages(conn, max_pages)?;
-                    Ok((true, n))
+                    Ok((mode, n))
                 })
                 .await
                 .map_err(map_err)?;
+            let is_incremental = mode == SQLITE_AUTO_VACUUM_INCREMENTAL;
             // Racing first probes may both try to set; the value is deterministic
             // for a given file so a failed set is fine.
-            let _ = self.db_auto_vacuum_is_incremental.set(is_incremental);
+            // One-shot: this branch runs only until the mode is cached, so the
+            // warning fires at most once per metastore file per process. Without
+            // it a database created under the old `none` default is silently
+            // never reclaimed, and the only symptom is a `.db` that never shrinks.
+            // FULL is excluded — it reclaims on every commit, so it needs neither
+            // this driver nor a migration.
+            if self
+                .db_auto_vacuum_is_incremental
+                .set(is_incremental)
+                .is_ok()
+                && mode == SQLITE_AUTO_VACUUM_NONE
+            {
+                tracing::warn!(
+                    "Metastore '{}' was created with `auto_vacuum` disabled, so freed pages are reused but never returned to the filesystem and the file stays at its high-water size. SQLite fixes this mode at file creation: to adopt the `incremental` default, stop the runtime and run `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;` against the file, then restart — a `VACUUM` on its own keeps the file on `none`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    self.db_path()
+                );
+            }
             if !is_incremental {
                 return Ok(0);
             }
@@ -1701,12 +1750,65 @@ impl SqliteMetastore {
         tokio::fs::metadata(&wal_path).await.map_or(0, |m| m.len())
     }
 
-    /// Sample the current `-wal` file size and publish it to the METRIC 2
-    /// `cayenne_metastore_wal_bytes` gauge.
-    async fn sample_wal_bytes(&self) {
-        let bytes = self.read_wal_bytes().await;
-        telemetry::cayenne::track_metastore_wal_bytes(bytes, &[]);
+    /// Sample the metastore's on-disk footprint — the database file and its
+    /// `-wal` — and publish both gauges.
+    ///
+    /// Two `stat()` calls on a background tick. The WAL half was already
+    /// exported; the database half is the larger and slower-moving of the two,
+    /// and without it the total metadata footprint could not be read off
+    /// `/metrics` at all.
+    ///
+    /// Both carry a `catalog` label. The metastore is per-dataset and its file
+    /// is always named `cayenne.db`, so an unlabelled gauge has every dataset's
+    /// sample overwriting the others on one series — which is what the WAL gauge
+    /// did before this.
+    async fn sample_file_footprint(&self) {
+        // Both stats in ONE `spawn_blocking`. `tokio::fs` dispatches each call to
+        // the blocking pool individually, and this runs on the post-write
+        // maintenance loop's ~100 ms debounce — so two `tokio::fs::metadata`
+        // calls would be two task hops per pass under sustained CDC, for two
+        // numbers a scrape reads once a second.
+        let db_path = self.db_path().to_string();
+        let wal_path = format!("{db_path}-wal");
+        let Ok((db_bytes, wal_bytes)) =
+            tokio::task::spawn_blocking(move || measure_file_footprint(&db_path, &wal_path)).await
+        else {
+            return;
+        };
+
+        let dimensions = [telemetry::KeyValue::new(
+            "catalog",
+            self.db_path().to_string(),
+        )];
+        if let Some(wal_bytes) = wal_bytes {
+            telemetry::cayenne::track_metastore_wal_bytes(wal_bytes, &dimensions);
+        }
+        if let Some(db_bytes) = db_bytes {
+            telemetry::cayenne::track_metastore_db_bytes(db_bytes, &dimensions);
+        }
     }
+}
+
+/// `stat` the metastore file and its `-wal`, as `(database bytes, WAL bytes)`.
+///
+/// `None` means NOT MEASURED, and the caller leaves that gauge at its previous
+/// value. Publishing a failed `stat` as `0` would say the metastore shrank to
+/// nothing — a louder and more wrong statement than saying nothing at all, and
+/// the same rule the table footprint sample follows when its query fails.
+///
+/// A missing `-wal` is the one real zero: the WAL is created on the first write
+/// and removed on a clean close, so its absence means no WAL bytes rather than a
+/// measurement that failed. `NotFound` on the database itself is NOT the same
+/// statement — an open `SQLite` database stays live and allocated after its
+/// pathname is unlinked, so its size is unknown, not zero.
+fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option<u64>) {
+    let db = std::fs::metadata(db_path).map(|m| m.len()).ok();
+    let wal = match std::fs::metadata(wal_path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    };
+    (db, wal)
 }
 
 /// A transaction on a `SQLite` metastore connection.
@@ -2101,7 +2203,8 @@ mod tests {
     async fn test_incremental_vacuum_reclaims_freelist_and_shrinks_the_file() {
         let _guard = CONFIG_LOCK.lock().await;
         set_sqlite_metastore_config(SqliteMetastoreConfig {
-            auto_vacuum: SqliteAutoVacuum::Incremental,
+            // `auto_vacuum` is deliberately left at its default, so this doubles
+            // as the proof that a metastore configured by nobody reclaims.
             // TRUNCATE every checkpoint so the file size is deterministic here.
             wal_truncate_threshold_bytes: 0,
             // Big enough to drain this freelist in one pass.
@@ -2145,12 +2248,26 @@ mod tests {
         );
     }
 
-    /// The default mode must stay a no-op — freed pages are reused and the file
-    /// plateaus, which is the documented trade and costs the write path nothing.
+    /// Freed metastore pages are returned to the filesystem out of the box. The
+    /// reclaim itself is proved above; this pins the default that reaches it, so
+    /// flipping it back cannot pass unnoticed.
+    #[test]
+    fn test_auto_vacuum_defaults_to_incremental() {
+        assert_eq!(
+            SqliteMetastoreConfig::default().auto_vacuum,
+            SqliteAutoVacuum::Incremental
+        );
+    }
+
+    /// `None` opts back out: freed pages are reused and the file plateaus, which
+    /// costs the write path nothing — not even the pointer map.
     #[tokio::test]
-    async fn test_incremental_vacuum_is_a_noop_in_the_default_mode() {
+    async fn test_incremental_vacuum_is_a_noop_when_auto_vacuum_is_none() {
         let _guard = CONFIG_LOCK.lock().await;
-        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            auto_vacuum: SqliteAutoVacuum::None,
+            ..SqliteMetastoreConfig::default()
+        });
 
         let (_dir, metastore) = temp_metastore();
         metastore.init_schema().await.expect("init schema");
@@ -2169,15 +2286,19 @@ mod tests {
         );
     }
 
-    /// A database created in the default mode does not become reclaimable just
-    /// because the config later says INCREMENTAL — `auto_vacuum` only takes
-    /// effect on a fresh file. The driver gates on the DB's real mode so it does
-    /// not take the write lock every tick forever on such a database.
+    /// A database created in NONE mode does not become reclaimable just because
+    /// the config later says INCREMENTAL — `auto_vacuum` only takes effect on a
+    /// fresh file. This is the shape every metastore created before INCREMENTAL
+    /// became the default has, so the driver gates on the DB's real mode rather
+    /// than take the write lock every tick forever on such a database.
     #[tokio::test]
     async fn test_incremental_vacuum_gates_on_the_databases_actual_mode() {
         let (_dir, metastore) = {
             let _guard = CONFIG_LOCK.lock().await;
-            set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+            set_sqlite_metastore_config(SqliteMetastoreConfig {
+                auto_vacuum: SqliteAutoVacuum::None,
+                ..SqliteMetastoreConfig::default()
+            });
             let (dir, metastore) = temp_metastore();
             metastore.init_schema().await.expect("init schema");
             grow_wal(&metastore, 16, 64).await;
@@ -2797,6 +2918,46 @@ mod tests {
             read_user_version(&metastore).await,
             newer,
             "a refused open must leave the newer stamp untouched"
+        );
+    }
+
+    /// A `stat` that fails must leave its gauge alone, because the alternative
+    /// reading — zero — says the metastore shrank to nothing. The exception is a
+    /// missing `-wal`, which is a real zero: the WAL is created on the first
+    /// write and removed on a clean close.
+    ///
+    /// The database's own absence is deliberately NOT that exception. An open
+    /// `SQLite` database stays live and allocated after its pathname is unlinked,
+    /// so a failed `stat` on it means "unknown", never "empty".
+    #[test]
+    fn a_failed_stat_is_not_a_zero_byte_metastore() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("cayenne.db");
+        let wal = dir.path().join("cayenne.db-wal");
+        std::fs::write(&db, vec![0_u8; 4096]).expect("write the database file");
+        std::fs::write(&wal, vec![0_u8; 512]).expect("write the WAL file");
+
+        let db_path = db.to_string_lossy().to_string();
+        let wal_path = wal.to_string_lossy().to_string();
+
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (Some(4096), Some(512)),
+            "both files present: both measured"
+        );
+
+        std::fs::remove_file(&wal).expect("remove the WAL file");
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (Some(4096), Some(0)),
+            "a checkpointed-away WAL holds zero bytes, which is a measurement"
+        );
+
+        std::fs::remove_file(&db).expect("unlink the database file");
+        assert_eq!(
+            measure_file_footprint(&db_path, &wal_path),
+            (None, Some(0)),
+            "an unlinked database is unknown, not empty: an open handle keeps its pages allocated"
         );
     }
 }

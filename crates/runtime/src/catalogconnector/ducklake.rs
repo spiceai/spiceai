@@ -28,13 +28,15 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
-use data_components::ducklake::provider::DuckLakeCatalogProvider;
+use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -321,6 +323,7 @@ impl CatalogConnector for DuckLakeCatalog {
             writable,
             ddl_enabled,
             table_selector(catalog),
+            ducklake_federation(),
         ));
 
         // Initial refresh to populate schemas and tables
@@ -334,6 +337,30 @@ impl CatalogConnector for DuckLakeCatalog {
             })?;
 
         Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}
+
+/// The dialect and deny-list a `DuckLake` catalog federates with.
+///
+/// The dialect is `DuckDB`'s, because `DuckLake` is `DuckDB`: without it the
+/// `DataFusion` `regexp_*` built-ins are unparsed with `DataFusion`'s flag
+/// argument in `DataFusion`'s position, which `DuckDB` reads differently. Those
+/// are built-ins rather than Spice functions, so no deny-list ever withholds
+/// them and only the dialect can make them right.
+///
+/// The deny-list is the plain one, **not** the `DuckDB`-flavored
+/// `deny_spice_functions_for_duckdb_table_providers`. That variant carves out the
+/// vector UDFs on the grounds that the dialect rewrites them into `DuckDB`
+/// natives, but the rewrite is not value-preserving for `cosine_distance`: the
+/// local kernel returns `(1 - cosine_similarity) / 2` while `DuckDB`'s
+/// `array_cosine_distance` returns `1 - cosine_similarity`, so a federated call
+/// answers twice the local one. Carving it out here would turn today's
+/// unknown-function error into a silently wrong number, so these are denied and
+/// evaluated locally instead. The divergence itself is #13728.
+fn ducklake_federation() -> DuckLakeFederation {
+    DuckLakeFederation {
+        dialect: new_duckdb_dialect(),
+        function_support: deny_spice_functions_for_table_providers(),
     }
 }
 
@@ -371,5 +398,87 @@ mod tests {
                 .map(ExposeSecret::expose_secret),
             Some("FwoSessionToken")
         );
+    }
+}
+
+#[cfg(test)]
+mod federation_tests {
+    use super::*;
+    use crate::catalogconnector::stub_udf;
+    use datafusion::prelude::col;
+    use datafusion::sql::unparser::Unparser;
+
+    /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
+    /// `DataFusion` evaluates them locally instead of unparsing them into the
+    /// statement sent to `DuckDB`. See issue #13664.
+    #[test]
+    fn the_catalog_denies_the_spice_functions_duckdb_cannot_run() {
+        let support = ducklake_federation().function_support;
+        assert!(
+            !support.supports(&stub_udf("json_get_str", 2)),
+            "json_get_str must be denied so federation falls back to local DataFusion"
+        );
+        assert!(
+            support.supports(&stub_udf("upper", 1)),
+            "a non-Spice function like upper() must still federate"
+        );
+    }
+
+    /// The vector UDFs must be denied too, not carved out. The `DuckDB`-flavored
+    /// deny-list allows them on the grounds that the dialect rewrites them into
+    /// `DuckDB` natives, but `cosine_distance` -> `array_cosine_distance` is not
+    /// value-preserving -- local is `(1 - cos) / 2`, `DuckDB` is `1 - cos` -- so
+    /// a federated call answers twice the local one. `inner_product` is denied
+    /// on the same conservative footing without that parity having been
+    /// measured either way. See #13728.
+    #[test]
+    fn the_vector_udfs_are_denied_rather_than_carved_out() {
+        let support = ducklake_federation().function_support;
+        // `array_distance` is a `DataFusion` built-in rather than a Spice
+        // function, so no Spice deny-list withholds it from any backend -- it is
+        // not in scope for this assertion. #13728 covers whether its `DuckDB`
+        // rewrite is value-preserving.
+        for name in ["cosine_distance", "inner_product"] {
+            assert!(
+                !support.supports(&stub_udf(name, 2)),
+                "{name} must be evaluated locally: its DuckDB equivalent is not established to \
+                 be value-preserving, so it is denied pending that parity check rather than \
+                 carved out. Verified for cosine_distance; unverified for inner_product (#13728)"
+            );
+        }
+    }
+
+    /// The dialect half. `DataFusion`'s `regexp_*` built-ins are not Spice
+    /// functions, so no deny-list withholds them and they federate no matter
+    /// what -- only the installed dialect decides whether `DuckDB` receives them
+    /// with the right argument shape.
+    ///
+    /// `scalar_function_to_sql_overrides` answers `Ok(None)` exactly when the
+    /// dialect has no handler for the name, which is what the stock `DuckDB`
+    /// dialect returns for all of these.
+    #[test]
+    fn the_installed_dialect_translates_the_regexp_builtins() {
+        let federation = ducklake_federation();
+        let unparser = Unparser::new(federation.dialect.as_ref());
+        let args = [col("c0"), col("c1")];
+
+        for name in [
+            "regexp_like",
+            "regexp_match",
+            "regexp_replace",
+            "regexp_count",
+        ] {
+            let handled = !matches!(
+                federation
+                    .dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args),
+                Ok(None)
+            );
+            assert!(
+                handled,
+                "{name} federates whatever the deny-list says, so the installed dialect must \
+                 translate it -- the stock DuckDB dialect does not"
+            );
+        }
     }
 }

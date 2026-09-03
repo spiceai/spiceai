@@ -25,13 +25,18 @@ pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use cayenne::CayennePartitionCreator;
+// The by-name half of the metastore-collision check is shared with the Cayenne catalog
+// connector, so both configuration surfaces refuse the same overlap. The delete-path
+// half — a metastore on disk that no parameter names — stays in this file, beside the
+// teardown it guards.
+use cayenne::metastore_layout::{fs_probe_path, is_local_path, overlapping_metastore_dir};
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -479,6 +484,37 @@ pub fn register_cayenne_telemetry() {
         .with_unit("By")
         .with_callback(|obs| {
             if let Some(total) = cayenne::global_mem_tier_total() {
+                obs.observe(total, &[]);
+            }
+        })
+        .build();
+
+    // --- Process-global primary-key keyset byte budget ---
+    // The per-table ceiling (`cayenne_pk_index_budget_bytes`) is derived from
+    // host memory with no view of sibling tables, so several tables can each
+    // believe they may hold gigabytes. This is the aggregate that actually binds:
+    // a table whose index refuses to grow because the FLEET is exhausted looks,
+    // in every per-table gauge, exactly like a table that is simply small.
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_used_bytes")
+        .with_description(
+            "Currently-reserved bytes across all Cayenne primary-key keyset caches; at the total, a table's exact keyset degrades to a bloom instead of growing.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(used) = cayenne::global_pk_keyset_used() {
+                obs.observe(used, &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("cayenne_pk_keyset_budget_total_bytes")
+        .with_description(
+            "Total byte ceiling of the process-global Cayenne primary-key keyset budget.",
+        )
+        .with_unit("By")
+        .with_callback(|obs| {
+            if let Some(total) = cayenne::global_pk_keyset_total() {
                 obs.observe(total, &[]);
             }
         })
@@ -996,189 +1032,6 @@ fn build_workload_profile(
         is_upsert_on_conflict(on_conflict),
         &inferred,
     )
-}
-
-/// Returns true if the path is a local filesystem path (not a remote object store).
-///
-/// Local paths include:
-/// - Absolute paths: `/data/cayenne`
-/// - Relative paths: `./data`
-/// - file:// URIs: `file:///data/cayenne`
-///
-/// Remote paths (S3, etc.) return false.
-fn is_local_path(path: &str) -> bool {
-    !path.contains("://") || path.starts_with("file://")
-}
-
-/// Strip a `file:`/`file://` scheme (including an optional authority such as
-/// `localhost`) so on-disk storage detection receives a real filesystem path.
-/// `resolve_metadata_dir` can return such URIs (since `cayenne_file_path` accepts
-/// them); feeding `file:///x` or `file://localhost/x` into `Path::new` would make
-/// `Auto` storage detection misclassify it as `Unknown`. Returns a borrowed slice
-/// (no owned path), so callers can pass the result directly as `&str`.
-fn fs_probe_path(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("file://") {
-        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
-        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
-        // begins at the first '/'.
-        match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => rest,
-        }
-    } else {
-        path.strip_prefix("file:").unwrap_or(path)
-    }
-}
-
-/// Make a configured Cayenne directory absolute without resolving it, treating it as a
-/// filesystem path unconditionally.
-///
-/// `Err` when the path cannot be placed — a relative path whose `current_dir()` lookup
-/// fails. Everything downstream guards `remove_dir_all`, so a path this cannot place is
-/// a path whose overlap with the metastore is unknown, and the caller must refuse rather
-/// than assume.
-fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
-    let raw = Path::new(fs_probe_path(path));
-    if raw.is_absolute() {
-        Ok(raw.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(raw))
-    }
-}
-
-/// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
-/// object-store location (`s3://…`) — which can never contain the metastore, since
-/// `SQLite`/Turso cannot run on object storage.
-///
-/// The exemption belongs to the data path alone, because it is the data path a recursive
-/// delete walks. It must not be applied to a metadata path: [`is_local_path`] is a
-/// substring test, so a value merely *containing* `://` would be exempted while the
-/// catalog code goes on treating it as the filesystem path it creates `cayenne.db` at —
-/// disabling the guard on a directory that never reached an object store.
-///
-/// `Err`, never the exemption, when the path cannot be placed: the exemption waves the
-/// delete through, so "cannot possibly overlap" and "cannot tell" must stay
-/// distinguishable.
-fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
-    if !is_local_path(path) {
-        return Ok(None);
-    }
-    absolute_dir(path).map(Some)
-}
-
-/// Resolve `absolute` component by component, in the order the filesystem would.
-///
-/// The order is the whole point: `..` names the parent of the directory the preceding
-/// component *resolves to*, not its lexical parent. Collapsing `..` up front and
-/// canonicalizing afterwards gets this backwards — with `link -> /data/subdir`,
-/// `link/../catalog` is `/data/catalog`, but a lexical collapse yields `/catalog` and a
-/// containment check against `/data` then passes something it must refuse. Resolving in
-/// order keeps the accumulated path symlink-free, so `..` may simply pop it.
-///
-/// A component that does not exist yet resolves to itself — neither directory
-/// necessarily exists when this runs at open time. That is the *only* `canonicalize`
-/// failure this absorbs. Any other one (`PermissionDenied`, a transient filesystem
-/// error) means the component could not be resolved, so a symlink may still be
-/// unresolved and the containment check would run against a path the delete never walks;
-/// those propagate, so the caller refuses the delete instead of comparing a lexical
-/// path.
-async fn resolve_in_filesystem_order(absolute: &Path) -> std::io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Prefix(_) | Component::RootDir => resolved.push(component),
-            Component::Normal(name) => {
-                resolved.push(name);
-                match tokio::fs::canonicalize(&resolved).await {
-                    Ok(real) => resolved = real,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    Ok(resolved)
-}
-
-/// Every location a recursive delete of `path` could reach, or `Err` when the path
-/// cannot be resolved.
-///
-/// There is no object-store exemption here: this resolves a *metastore* directory, and
-/// the metastore is only ever local — see [`absolute_data_dir`] for why applying the
-/// exemption to this side disables the guard rather than skipping an impossible case.
-///
-/// Two forms, because a symlink is both a place and a name:
-///
-/// 1. **Fully resolved** — where the directory's contents actually live.
-/// 2. **The entry**: parent resolved, final component left literal. `remove_dir_all`
-///    unlinks the *entry* it walks onto rather than following it, so a metastore
-///    directory whose own last component is a symlink pointing out of the tree still
-///    loses its link — the catalog file survives with nothing naming it, and the
-///    connection pool keeps writing through handles nothing can reopen.
-async fn overlap_candidates(path: &str) -> std::io::Result<Vec<PathBuf>> {
-    let absolute = absolute_dir(path)?;
-
-    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await?];
-    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
-        let entry = resolve_in_filesystem_order(parent).await?.join(name);
-        if !candidates.contains(&entry) {
-            candidates.push(entry);
-        }
-    }
-    Ok(candidates)
-}
-
-/// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
-/// of `outer` takes `inner` with it. Compares whole components, so `…/meta` does not
-/// read as containing `…/metadata`.
-fn dir_contains(outer: &Path, inner: &Path) -> bool {
-    inner.starts_with(outer)
-}
-
-/// Detect the configuration in which a Cayenne recreate destroys the metastore.
-///
-/// One metastore holds the catalog — manifests, snapshot pointers, partition rows —
-/// for *every* Cayenne dataset sharing a `cayenne_metadata_dir`, and both recreate
-/// paths (`mode: file_create` in [`CayenneAccelerator::init`] and
-/// [`DataAccelerator::drop_table`] for a `file_update` schema rebuild) recursively
-/// delete a single dataset's data directory. When the metastore directory resolves
-/// onto or beneath that data directory the delete unlinks the shared catalog, and
-/// because the connection pool already holds handles to the now-unlinked file the run
-/// appears healthy while the metastore is simply gone on the next restart.
-///
-/// The stock defaults collide on their own for a dataset named `metadata`:
-/// `resolve_default_data_path` yields `{spice_data}/metadata/` and
-/// `resolve_metadata_dir` yields `{spice_data}/metadata`. An explicit
-/// `cayenne_metadata_dir` set beneath the data directory collides the same way.
-///
-/// Returns `Ok(Some((data_dir, metadata_dir)))` — resolved — when they overlap, naming
-/// whichever metastore location the delete would reach; `Ok(None)` when they provably
-/// cannot overlap — the data path is on object storage; and `Err` when either path
-/// cannot be resolved, which the caller must treat as a refusal rather than as `Ok(None)`.
-///
-/// The data directory is compared in its fully resolved form only, because that is where
-/// the recursive walk happens: `remove_dir_all` unlinks a final-component symlink rather
-/// than descending it (pinned by
-/// `remove_dir_all_unlinks_a_symlink_rather_than_descending_it`), so nothing beneath the
-/// target is deleted. What the unlink does cost is every *name* under the alias, and a
-/// metastore configured through one is not compared here — #13465.
-async fn overlapping_metastore_dir(
-    data_dir: &str,
-    metadata_dir: &str,
-) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
-    let Some(absolute_data) = absolute_data_dir(data_dir)? else {
-        return Ok(None);
-    };
-    let data = resolve_in_filesystem_order(&absolute_data).await?;
-    Ok(overlap_candidates(metadata_dir)
-        .await?
-        .into_iter()
-        .find(|candidate| dir_contains(&data, candidate))
-        .map(|metadata| (data, metadata)))
 }
 
 /// The `SQLite`/Turso database a Cayenne metastore lives in, inside its metadata
@@ -3150,6 +3003,83 @@ fn wrap_with_native_vector_indexes(
     }
 }
 
+/// The warning a `mode: memory` acceleration gets when it configures `retention_sql`.
+///
+/// A `retention_sql` predicate reaches the rows only through the deletion sink, which
+/// scans this table's Vortex files — and a memory-mode table has none: its rows live
+/// only in the RAM tier, whose tombstones address rows by primary key rather than by
+/// predicate. Saying so at registration is the point: keeping rows the operator asked
+/// to have deleted, with nothing in the log to explain it, is the worst of the outcomes.
+///
+/// Deliberately NOT extended to `retention_period`, which is a different mechanism:
+/// Cayenne injects it as a scan-time keep filter (`TimeRetentionFilterBuilder`), so
+/// expired rows are hidden from every read whether or not they were physically deleted,
+/// memory mode included. Naming it here would tell the operator their data is exposed
+/// when it is not.
+/// Whether a `mode: memory` acceleration warrants [`memory_mode_retention_warning`].
+///
+/// Deliberately keyed on `retention_sql` alone. `retention_period` is a scan-time keep
+/// filter, so its expired rows are excluded from every read in either mode — warning
+/// about it would tell the operator their data is exposed when it is not. An earlier
+/// revision of this warning did exactly that, which is why the condition is a named
+/// predicate with its own test rather than an inline `||`.
+const fn memory_mode_retention_warning_applies(memory_mode: bool, has_retention_sql: bool) -> bool {
+    memory_mode && has_retention_sql
+}
+
+fn memory_mode_retention_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_sql` is not applied to a `mode: memory` acceleration, so rows matching that predicate stay queryable in the accelerated table. Set `mode: file` to have it applied, or use `retention_period`, which filters expired rows out of every read in either mode. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// The warning an acceleration gets when it configures `indexes`.
+///
+/// Every other accelerator turns `indexes` into a real secondary index; Cayenne has
+/// none to create — it prunes from the zone maps and primary-key index it derives from
+/// the data — so the setting reaches the engine and does nothing. A `unique` entry is
+/// the half that matters: on the other engines it constrains writes, and here it does
+/// not, which is the kind of difference an operator has to be told about rather than
+/// discover from duplicate rows.
+fn ignored_indexes_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `indexes` is not applied to a Cayenne acceleration, which prunes with the zone maps and primary-key index it builds from the data itself, so a `unique` entry here does not constrain writes and duplicate rows are not rejected. Remove `indexes`, or set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
+/// Whether a `retention_period` acceleration warrants
+/// [`retention_period_never_reclaimed_warning`].
+///
+/// `retention_period` is only ever a scan-time KEEP filter in Cayenne: expired rows are
+/// excluded from every read, and nothing on the engine's write or checkpoint paths
+/// deletes them. Compaction does drop them, but incidentally and only from the files it
+/// happens to rewrite — a full rewrite builds its input from `TableProvider::scan`
+/// (`visible_file_stream_for_rewrite`), and that scan appends the same keep filter, so an
+/// expired row never reaches the new file. Nothing schedules a rewrite on retention's
+/// account, so the reclamation is unpredictable rather than absent, which is what the
+/// warning has to say. The DELETE that reclaims on a schedule comes from the runtime's
+/// periodic retention check, and
+/// `Retention::build` returns `None` unless BOTH `retention_check_enabled` is true and
+/// `retention_check_interval` is set — the interval has no default, so enabling the flag
+/// alone is not enough. Keyed on both for that reason.
+///
+/// `retention_sql` is deliberately absent from this condition: Cayenne applies it through
+/// its own engine-level maintenance, armed by every write, overwrite, and mem-tier
+/// checkpoint, so it runs whatever the periodic check is set to.
+const fn retention_period_never_reclaimed_warning_applies(
+    has_retention_period: bool,
+    retention_check_enabled: bool,
+    has_retention_check_interval: bool,
+) -> bool {
+    has_retention_period && !(retention_check_enabled && has_retention_check_interval)
+}
+
+fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): `retention_period` hides expired rows from every read, but no scheduled pass deletes them, so their storage comes back only if a compaction happens to rewrite the files holding them — not on any predictable schedule. Reclaiming it reliably needs both `retention_check_enabled: true` and `retention_check_interval` (which has no default). Set both, or use `retention_sql`, which Cayenne applies on every write. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
@@ -3577,15 +3507,6 @@ impl DataAccelerator for CayenneAccelerator {
                     ),
                 }));
             }
-
-            // Validate that refresh_append_overlap is not specified
-            if acceleration.refresh_append_overlap.is_some() {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
-                    ),
-                }));
-            }
         }
 
         let dir_path = self.file_path(source)?;
@@ -3931,6 +3852,27 @@ impl DataAccelerator for CayenneAccelerator {
         } else {
             Vec::new()
         };
+
+        if memory_mode_retention_warning_applies(memory_mode, !retention_filters.is_empty()) {
+            tracing::warn!("{}", memory_mode_retention_warning(&table_name));
+        }
+
+        if source
+            .acceleration()
+            .is_some_and(|acceleration| !acceleration.indexes.is_empty())
+        {
+            tracing::warn!("{}", ignored_indexes_warning(&table_name));
+        }
+
+        if source.acceleration().is_some_and(|acceleration| {
+            retention_period_never_reclaimed_warning_applies(
+                acceleration.retention_period.is_some(),
+                acceleration.retention_check_enabled,
+                acceleration.retention_check_interval.is_some(),
+            )
+        }) {
+            tracing::warn!("{}", retention_period_never_reclaimed_warning(&table_name));
+        }
 
         // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
         // Uses explicit user config if provided, otherwise falls back to federated table constraints
@@ -4501,6 +4443,9 @@ data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Ca
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Exercised only by the tests below; the delete-path guard reaches it through
+    // `overlapping_metastore_dir` rather than calling it directly.
+    use cayenne::metastore_layout::absolute_data_dir;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;
 
@@ -4955,6 +4900,142 @@ mod tests {
         );
     }
 
+    /// Every ignored-setting warning owes the reader the same three things, so they are
+    /// asserted once over all of them rather than per message.
+    #[test]
+    fn ignored_setting_warnings_name_the_dataset_and_link_the_docs() {
+        for warning in [
+            memory_mode_retention_warning("events"),
+            ignored_indexes_warning("events"),
+            retention_period_never_reclaimed_warning("events"),
+        ] {
+            assert!(
+                warning.contains("'events'"),
+                "the warning must name the dataset: {warning}"
+            );
+            assert!(
+                warning.contains("https://spiceai.org/docs"),
+                "the warning must link the docs: {warning}"
+            );
+            assert!(
+                !warning.contains('\n'),
+                "log messages stay on one line: {warning}"
+            );
+        }
+    }
+
+    /// The periodic check needs BOTH the flag and an interval — `Retention::build`
+    /// returns `None` without either, and `retention_check_interval` has no default — so
+    /// warning on the flag alone would stay silent for the config that most looks
+    /// enabled: `retention_check_enabled: true` with no interval set.
+    #[test]
+    fn retention_period_reclaim_warning_needs_both_the_flag_and_the_interval() {
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, false),
+            "neither set: nothing reclaims the rows"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, true, false),
+            "enabled but no interval: `Retention::build` still returns None"
+        );
+        assert!(
+            retention_period_never_reclaimed_warning_applies(true, false, true),
+            "interval but not enabled: the check never runs"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(true, true, true),
+            "both set: the periodic check reclaims, so the warning would be wrong"
+        );
+        assert!(
+            !retention_period_never_reclaimed_warning_applies(false, false, false),
+            "no `retention_period`: nothing to reclaim and nothing to warn about"
+        );
+    }
+
+    /// `retention_sql` must not trigger this warning: Cayenne applies it through its own
+    /// engine-level maintenance, armed by every write, overwrite, and mem-tier
+    /// checkpoint, so it runs regardless of the periodic check. Warning about it would
+    /// tell the operator their retention is inert when it is not.
+    #[test]
+    fn retention_period_reclaim_warning_states_the_impact_and_both_settings() {
+        let warning = retention_period_never_reclaimed_warning("events");
+        assert!(
+            warning.contains("retention_check_enabled")
+                && warning.contains("retention_check_interval"),
+            "the fix needs both settings named, or it does not work: {warning}"
+        );
+        assert!(
+            !warning.contains("keeps growing") && !warning.contains("nothing deletes them"),
+            "a compaction rebuilds through `TableProvider::scan`, which appends the same keep \
+             filter, so it DOES drop expired rows — an unqualified \"nothing deletes them\" \
+             overstates the impact: {warning}"
+        );
+        assert!(
+            warning.contains("compaction") && warning.contains("not on any predictable schedule"),
+            "the impact is UNSCHEDULED reclamation, not absent reclamation, and the rows are \
+             hidden either way — say which it is and why: {warning}"
+        );
+        assert!(
+            warning.contains("retention_sql"),
+            "the alternative that does run on every write is the actionable escape: {warning}"
+        );
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_covers_retention_sql_and_spares_retention_period() {
+        assert!(
+            memory_mode_retention_warning_applies(true, true),
+            "a memory-mode table with retention_sql keeps rows the predicate matches"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(true, false),
+            "retention_period alone must NOT warn: its keep filter excludes expired rows \
+             from every read in either mode, so warning would claim an exposure that does \
+             not exist"
+        );
+        assert!(
+            !memory_mode_retention_warning_applies(false, true),
+            "a file-mode table applies retention_sql, so there is nothing to warn about"
+        );
+    }
+
+    #[test]
+    fn memory_mode_retention_warning_states_the_impact_and_the_fix() {
+        let warning = memory_mode_retention_warning("events");
+
+        assert!(
+            warning.contains("retention_sql"),
+            "the warning must name the setting it covers: {warning}"
+        );
+        assert!(
+            warning.contains("`retention_period`, which filters expired rows out of every read"),
+            "the warning must not leave the operator thinking period retention is affected \
+             too — it is a scan-time keep filter and works in either mode: {warning}"
+        );
+        assert!(
+            warning.contains("stay queryable"),
+            "the warning must say what the user will observe, not just what was skipped: {warning}"
+        );
+        assert!(
+            warning.contains("`mode: file`"),
+            "the warning must give the actionable fix: {warning}"
+        );
+    }
+
+    #[test]
+    fn ignored_indexes_warning_states_the_impact_and_the_alternative() {
+        let warning = ignored_indexes_warning("events");
+
+        assert!(
+            warning.contains("does not constrain writes"),
+            "the warning must say what a `unique` entry will not do: {warning}"
+        );
+        assert!(
+            warning.contains("primary_key") && warning.contains("on_conflict"),
+            "the warning must give the actionable alternative: {warning}"
+        );
+    }
+
     #[test]
     fn native_vector_indexes_skips_non_vector_schemas() {
         let schema = Schema::new(vec![
@@ -5335,50 +5416,6 @@ mod tests {
             }
             other => panic!("expected UnsupportedDataTypes error, got: {other}"),
         }
-    }
-
-    #[test]
-    fn test_is_local_path() {
-        // Local absolute paths
-        assert!(is_local_path("/data/cayenne"));
-        assert!(is_local_path("/var/spice/data"));
-
-        // Local relative paths
-        assert!(is_local_path("./data"));
-        assert!(is_local_path("data/cayenne"));
-
-        // file:// URIs are local
-        assert!(is_local_path("file:///data/cayenne"));
-        assert!(is_local_path("file://localhost/data"));
-
-        // S3 paths are NOT local
-        assert!(!is_local_path("s3://bucket/prefix"));
-        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
-
-        // Other remote schemes are NOT local
-        assert!(!is_local_path("gs://bucket/prefix"));
-        assert!(!is_local_path("az://container/blob"));
-    }
-
-    #[test]
-    fn test_fs_probe_path_strips_file_scheme() {
-        // file:// URIs are reduced to their filesystem path for storage detection.
-        assert_eq!(
-            fs_probe_path("file:///data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
-        // An explicit authority (e.g. localhost) is dropped down to the path.
-        assert_eq!(
-            fs_probe_path("file://localhost/data/cayenne"),
-            "/data/cayenne"
-        );
-        // Plain paths pass through unchanged.
-        assert_eq!(
-            fs_probe_path("/data/cayenne/metadata"),
-            "/data/cayenne/metadata"
-        );
-        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
     }
 
     #[test]
