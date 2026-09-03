@@ -248,6 +248,11 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// The cache keys a write is pending for, shared with the caching scan and
+    /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
+    /// replaces the entries it refreshes, so it has to claim each key for the
+    /// same reason every other writer does — see [`caching::CacheKeyClaim`].
+    in_flight_revalidations: super::caching::InFlightRevalidations,
 }
 
 impl RefreshTaskBuilder {
@@ -281,6 +286,9 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
+            in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -369,6 +377,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Share the caching accelerator's claim set, so the periodic stale-row
+    /// refresh claims the keys it replaces.
+    #[must_use]
+    pub fn with_in_flight_revalidations(
+        mut self,
+        in_flight_revalidations: super::caching::InFlightRevalidations,
+    ) -> RefreshTaskBuilder {
+        self.in_flight_revalidations = in_flight_revalidations;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides. These layer on top of
     /// the process-global [`changes::CdcConfig`] only for this dataset's
     /// changes stream.
@@ -444,6 +463,7 @@ impl RefreshTaskBuilder {
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
+            in_flight_revalidations: self.in_flight_revalidations,
         }
     }
 }
@@ -522,6 +542,7 @@ pub struct RefreshTask {
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    in_flight_revalidations: super::caching::InFlightRevalidations,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1208,6 +1229,7 @@ impl RefreshTask {
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
+            Arc::clone(&self.in_flight_revalidations),
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
