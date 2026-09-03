@@ -1844,7 +1844,14 @@ mod tests {
         let dialect = new_bigquery_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         for entry in super::BUILTIN_SCALAR_OVERRIDES {
-            let args = [col("code"), lit("^R[0-9]{2}")];
+            // One call per entry, because an entry's `can_translate` accepts the
+            // shapes its own handler renders and those differ: `array_element`
+            // takes an array and a non-negative integer index where the regex
+            // entries take a column and a pattern.
+            let args: [Expr; 2] = match entry.name {
+                "array_element" => [col("arr"), lit(1_i64)],
+                _ => [col("code"), lit("^R[0-9]{2}")],
+            };
             assert!(
                 (entry.can_translate)(&args),
                 "`{name}`'s representative call must be translatable",
@@ -2268,6 +2275,24 @@ mod tests {
         datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
     }
 
+    /// A scan of one `DATE` column and one naive timestamp column, for the
+    /// renderings that depend on an operand being a date or a civil timestamp.
+    fn date_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("d", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new("e", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new(
+                "naive",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("d", source, None).expect("scan d")
+    }
+
     /// The SQL `dialect` renders for `plan`.
     fn unparse_plan(
         dialect: &dyn datafusion::sql::unparser::dialect::Dialect,
@@ -2359,6 +2384,43 @@ mod tests {
         .expect("outer projection")
         .build()
         .expect("build");
+
+        // #212's renderings. Each is a BigQuery type or name fact the fork
+        // carries; a re-cut that drops one leaves the wrapper forwarding to a
+        // dialect that renders generic SQL, which the `missing_trait_methods`
+        // deny cannot see.
+        let date_difference = date_scan()
+            .project(vec![col("d.d") - col("d.e")])
+            .expect("date difference projection")
+            .build()
+            .expect("build");
+
+        let date_to_integer = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.d"),
+                DataType::Int64,
+            )])
+            .expect("date to integer projection")
+            .build()
+            .expect("build");
+
+        let naive_timestamp_cast = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.naive"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+            )])
+            .expect("naive timestamp cast projection")
+            .build()
+            .expect("build");
+
+        let constant_group_by = date_scan()
+            .aggregate(
+                vec![lit("POOLED")],
+                vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+            )
+            .expect("aggregate on a constant key")
+            .build()
+            .expect("build");
 
         let truncated = timestamp_scan()
             .project(vec![datafusion::functions::expr_fn::date_trunc(
@@ -2485,6 +2547,38 @@ mod tests {
                 &range_window,
                 "IS NULL ASC",
                 "NULLS LAST",
+            ),
+            (
+                // DATE - DATE is an INTERVAL in BigQuery and an Int64 day count
+                // in the plan, so a bare `-` hands the next operator a duration.
+                "date difference becomes DATE_DIFF (fork PR #212)",
+                &date_difference,
+                "DATE_DIFF(",
+                "`d`.`d` - `d`.`e`",
+            ),
+            (
+                // BigQuery has no cast from DATE to INT64.
+                "date to integer becomes UNIX_DATE (fork PR #212)",
+                &date_to_integer,
+                "UNIX_DATE(",
+                "AS INT64)",
+            ),
+            (
+                // BigQuery puts no timezone qualifier on a timestamp type:
+                // TIMESTAMP is the instant, DATETIME the civil value, so a naive
+                // operand typed TIMESTAMP has no supertype with a DATETIME column.
+                "a tz-naive timestamp cast is DATETIME (fork PR #212)",
+                &naive_timestamp_cast,
+                "DATETIME",
+                "AS TIMESTAMP)",
+            ),
+            (
+                // BigQuery refuses a literal grouping key outright, and an engine
+                // reading a bare integer there takes it as a select-list ordinal.
+                "a constant GROUP BY key is cast (fork PR #212)",
+                &constant_group_by,
+                "GROUP BY CAST('POOLED' AS STRING)",
+                "GROUP BY 'POOLED'",
             ),
         ] {
             let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
