@@ -3119,7 +3119,7 @@ impl DataFusion {
             accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
         }
 
-        let retention = Retention::builder(dataset.name.to_string())
+        let retention_builder = Retention::builder(dataset.name.to_string())
             .time_column(dataset.time_column.clone())
             .time_format(dataset.time_format)
             .time_partition_column(dataset.time_partition_column.clone())
@@ -3127,8 +3127,18 @@ impl DataFusion {
             .time_period(dataset.retention_period())
             .check_interval(dataset.retention_check_interval())
             .enabled(acceleration_settings.retention_check_enabled)
-            .delete_expr(retention_delete_expr)
-            .build();
+            .delete_expr(retention_delete_expr);
+
+        // Caching mode decides what bounds the accelerator in the block below, and
+        // can install a policy derived from the caching parameters over this one — so
+        // a refusal reported here would say nothing evicts while something does.
+        // `caching_retention` reports that case instead, keyed on the
+        // `declared_retention_runs` this produces.
+        let retention = if matches!(refresh_mode, RefreshMode::Caching) {
+            retention_builder.build_unreported()
+        } else {
+            retention_builder.build()
+        };
 
         // Whether a retention task will actually run, which is not the same as
         // the dataset having configured one: the builder returns `None` for a

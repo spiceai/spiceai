@@ -2397,23 +2397,43 @@ impl RetentionBuilder {
     }
 
     /// Assemble the policy, reporting a refusal that leaves the dataset unbounded.
-    ///
-    /// `enabled: false` is the one `None` that is not a refusal — the operator asked
-    /// for no retention — so it returns before [`Self::assemble`] and stays silent.
     #[must_use]
     pub fn build(self) -> Option<Retention> {
-        if !self.enabled {
-            return None;
-        }
-
         let dataset_name = Arc::clone(&self.dataset_name);
-        match self.assemble() {
-            Ok(retention) => Some(retention),
+        match self.declared_policy() {
+            Ok(retention) => retention,
             Err(refusal) => {
                 tracing::error!("{}", refusal.message(&dataset_name));
                 None
             }
         }
+    }
+
+    /// [`Self::build`], but silent about a refusal because the caller decides what
+    /// bounds the accelerator and reports that itself.
+    ///
+    /// Caching mode is the one such caller. When `caching_stale_if_error` is disabled
+    /// the caching parameters derive a retention policy of their own and install it
+    /// over whatever this builder produced, so a refusal reported here would say
+    /// nothing evicts while a policy that does was about to replace it.
+    /// `caching_retention` owns that decision, and its unbounded arm carries a warning
+    /// that already explains a declared policy which started nothing.
+    #[must_use]
+    pub fn build_unreported(self) -> Option<Retention> {
+        self.declared_policy().unwrap_or_default()
+    }
+
+    /// The policy this configuration declares — `None` for an operator who opted out —
+    /// or why a configuration that asked for one describes none.
+    ///
+    /// `enabled: false` is the one absent policy that is not a refusal, and it lives
+    /// here rather than in each `build` so the two cannot come to disagree about it.
+    fn declared_policy(self) -> Result<Option<Retention>, RetentionRefusal> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        self.assemble().map(Some)
     }
 
     /// The policy this configuration describes, or why it describes none.
@@ -2485,6 +2505,11 @@ enum RetentionRefusal {
 
 impl RetentionRefusal {
     fn message(self, dataset_name: &str) -> String {
+        // `escape_debug` rather than the raw name, matching
+        // `unbounded_caching_retention_warning`: a Spicepod identifier may be quoted,
+        // and a quoted one may legally contain a newline, so a validated name can
+        // otherwise break this line in two and forge a second one.
+        let dataset_name = dataset_name.escape_debug();
         let cause_and_fix = match self {
             Self::NoFilter => {
                 "Cause: neither `retention_period` nor `retention_sql` is set, so nothing says which rows to delete. Set one of them."
@@ -2893,6 +2918,42 @@ mod tests {
                 "{refusal:?} must stay on one line: {message}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_refusal_cannot_forge_a_second_log_line_through_the_dataset_name() {
+        // A quoted Spicepod identifier may legally contain a newline.
+        let message = RetentionRefusal::NoCheckInterval
+            .message("events\n2026-01-01T00:00:00Z ERROR forged: line");
+        assert!(
+            !message.contains('\n'),
+            "the dataset name must be escaped, not break the line: {message}"
+        );
+        assert!(
+            message.contains(r"events\n"),
+            "the newline must survive as an escape rather than vanish: {message}"
+        );
+    }
+
+    #[test]
+    fn test_build_unreported_refuses_the_same_policies_build_does() {
+        // The caching call site swaps `build` for this, so the only difference must
+        // be whether the refusal is logged.
+        assert!(interval_less_builder().build_unreported().is_none());
+        assert!(
+            Retention::builder("events")
+                .enabled(true)
+                .build_unreported()
+                .is_none(),
+            "a policy with nothing to delete assembles into nothing either way"
+        );
+        assert!(
+            interval_less_builder()
+                .check_interval(Some(Duration::from_secs(1)))
+                .build_unreported()
+                .is_some(),
+            "a complete policy must still build when the caller owns the reporting"
+        );
     }
 
     #[test]
