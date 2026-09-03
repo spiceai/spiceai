@@ -3013,7 +3013,9 @@ fn is_object_generation_changed_error(error: &DataFusionError) -> bool {
 
 fn looks_like_generation_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("precondition") || lower.contains("if-match") || lower.contains("412")
+    // Match the store's precondition failure, not a bare "412" that can
+    // appear in an object key (`…/archive/412/data.parquet`).
+    lower.contains("precondition") || lower.contains("if-match")
 }
 
 fn looks_like_parquet_decode(text: &str) -> bool {
@@ -3299,6 +3301,19 @@ mod tests {
         assert_eq!(
             refresh_error_reason(inner_err_from_retry_ref(&classified)),
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let path_digits = DataFusionError::External(Box::new(std::io::Error::other(
+            "Object at path listing/archive/412/data.parquet: AccessDenied",
+        )));
+        assert!(
+            !is_object_generation_changed_error(&path_digits),
+            "a 412 in the object key is not a generation change"
+        );
+        let classified = retry_from_df_error(path_digits);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "AccessDenied must stay permanent even when the key contains 412"
         );
 
         let plan = DataFusionError::Plan("column not found".to_string());
