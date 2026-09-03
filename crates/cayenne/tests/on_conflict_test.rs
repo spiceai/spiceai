@@ -447,3 +447,108 @@ async fn test_upsert_in_batch_duplicate_composite_pk_impl(
     );
     Ok(())
 }
+
+// --- Null primary key values ---
+// A composite key is only actionable if the rejection says which of its columns
+// carried the null.
+
+test_with_backends!(test_null_composite_pk_names_the_null_column_impl);
+test_with_backends!(test_null_composite_pk_names_the_null_column_blind_append_impl);
+
+/// A table keyed on `(region, id)` whose `region` is nullable, so a null reaches the
+/// write path's validation instead of `DataFusion`'s non-nullable column check.
+async fn nullable_composite_pk_table(
+    fixture: &common::TestFixture,
+    table_name: &str,
+    vortex_config: VortexConfig,
+    on_conflict: Option<OnConflict>,
+) -> Result<SessionContext, Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, true),
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, true),
+    ]));
+    let table_options = CreateTableOptions {
+        table_name: table_name.to_string(),
+        schema,
+        primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict,
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config,
+    };
+    let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?,
+    );
+    ctx.register_table(
+        table_name,
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+    Ok(ctx)
+}
+
+fn assert_names_the_null_pk_column(err: &dyn std::error::Error, table_name: &str) {
+    let message = err.to_string();
+    assert!(
+        message.contains("Primary key column 'region' has null values"),
+        "the rejection must name the null column of the composite key: {message}"
+    );
+    assert!(
+        message.contains(table_name),
+        "the rejection must name the table: {message}"
+    );
+    assert!(
+        message.contains("https://spiceai.org/docs/features/data-acceleration/constraints"),
+        "the rejection must link the constraints docs: {message}"
+    );
+}
+
+async fn test_null_composite_pk_names_the_null_column_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = nullable_composite_pk_table(
+        &fixture,
+        "null_composite_pk",
+        VortexConfig::default(),
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "region".to_string(),
+            "id".to_string(),
+        ]))),
+    )
+    .await?;
+
+    let err = ctx
+        .sql("INSERT INTO null_composite_pk VALUES ('US', 1, 100), (NULL, 2, 200)")
+        .await?
+        .collect()
+        .await
+        .expect_err("a null in a primary key column must be rejected");
+
+    assert_names_the_null_pk_column(&err, "null_composite_pk");
+    Ok(())
+}
+
+/// `pk_conflict_detection: none` skips the existence lookup but not the validation,
+/// and it reports the null column the same way.
+async fn test_null_composite_pk_names_the_null_column_blind_append_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vortex_config = VortexConfig {
+        pk_conflict_detection: PkConflictDetection::None,
+        ..VortexConfig::default()
+    };
+    let ctx = nullable_composite_pk_table(&fixture, "null_composite_pk_blind", vortex_config, None)
+        .await?;
+
+    let err = ctx
+        .sql("INSERT INTO null_composite_pk_blind VALUES ('US', 1, 100), (NULL, 2, 200)")
+        .await?
+        .collect()
+        .await
+        .expect_err("a null in a primary key column must be rejected");
+
+    assert_names_the_null_pk_column(&err, "null_composite_pk_blind");
+    Ok(())
+}

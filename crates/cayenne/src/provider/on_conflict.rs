@@ -26,6 +26,7 @@ use super::pk_index::{
     CachedPkIndex, CheckedOutShardedPkIndex, PendingPkExistence, PkCheckoutGuard, PkDigestSet,
     PkExistenceRef,
 };
+use super::pk_validation::null_primary_key_message;
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -708,8 +709,9 @@ impl futures::Stream for PrimaryKeyValidationStream {
                 {
                     Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
                         format!(
-                            "Data validation failed for table '{}': Primary key values must be non-null",
-                            this.table_name
+                            "Data validation failed for table '{}': {}",
+                            this.table_name,
+                            null_primary_key_message(&batch, &this.pk_indices)
                         ),
                     ))))
                 } else {

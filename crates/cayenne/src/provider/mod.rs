@@ -98,6 +98,7 @@ pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
+pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;

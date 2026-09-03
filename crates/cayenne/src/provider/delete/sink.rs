@@ -52,6 +52,7 @@ use super::super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategyWithCache, RowConverterDeletionSnapshot,
 };
 use super::super::memory_account::CayenneMemoryAccount;
+use super::super::pk_validation::null_primary_key_message;
 use super::super::utils::{bytes_key, convert_to_u64_box, i64_key};
 use super::filter_exec::{InsertRecordHandling, is_pk_visible_i64, is_pk_visible_row_key};
 use super::vector_io::DeletionVectorWriteResult;
@@ -635,7 +636,7 @@ impl CayenneDeletionSink {
                         if pk_columns.iter().any(|column| column.null_count() > 0) {
                             return Err(Error::DataValidation {
                                 table: table_name.clone(),
-                                message: "Primary key values must be non-null".to_string(),
+                                message: null_primary_key_message(&batch, &projected_indices),
                             });
                         }
                         let rows = row_converter.convert_columns(&pk_columns)?;
@@ -719,7 +720,7 @@ impl CayenneDeletionSink {
         if pk_array.null_count() > 0 {
             return Err(Error::DataValidation {
                 table: table_name.clone(),
-                message: "Primary key values must be non-null".to_string(),
+                message: null_primary_key_message(batch, std::slice::from_ref(pk_column_index)),
             });
         }
 
