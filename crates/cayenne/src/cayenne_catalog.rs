@@ -20,7 +20,7 @@ use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSeque
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
     InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics,
+    TableMetadata, TableStatistics, TableStorageStats,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -29,6 +29,7 @@ use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams,
 };
+use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::collections::HashMap;
@@ -836,8 +837,16 @@ impl CayenneCatalog {
         }
 
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        // Drop the merged-away inputs' non-authoritative cached rows in the SAME
+        // transaction as the roster swap: the `cayenne_snapshot_file` manifest and
+        // the `cayenne_snapshot_file_statistics` per-file stats cache. The physical
+        // `.vortex` dirs are reclaimed LATER via retire+sweep.
         let batch_sql = format!(
             "DELETE FROM cayenne_snapshot_sequence \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             DELETE FROM cayenne_snapshot_file \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             DELETE FROM cayenne_snapshot_file_statistics \
                 WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
              INSERT OR REPLACE INTO cayenne_snapshot_sequence \
                 (table_id, snapshot_id, sequence_number) \
@@ -2145,7 +2154,19 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
+    async fn create_table(&self, mut options: CreateTableOptions) -> CatalogResult<String> {
+        // A requested schema is brought in line with the Arrow map layout before Cayenne
+        // does anything with it, so the declaration this table is persisted under, compared
+        // against and evolved from is the same conforming one. A producer is free to declare
+        // a `MAP`'s `entries` field nullable, which the layout forbids: the column decodes
+        // and then fails in whichever kernel first rebuilds it, reporting `MapArray entries
+        // cannot contain nulls` whether or not a null is involved. Correcting it is a repair
+        // of an illegal declaration rather than a schema evolution — nullability lives in the
+        // type and not in any buffer, so no file is rewritten — and it has to happen here
+        // because the stored declaration is what every read is planned against and what the
+        // write sink casts each incoming batch to.
+        options.schema = conforming_schema(options.schema);
+
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
 
@@ -2329,28 +2350,14 @@ impl MetadataCatalog for CayenneCatalog {
                     let vortex_config_json = row.get_optional_string(9)?;
                     let current_sequence_number = row.get_optional_i64(10)?.unwrap_or(0);
 
-                    // Deserialize schema using Arrow IPC format
-                    let schema = {
-                        use base64::Engine;
-                        use bytes::Bytes;
-
-                        let schema_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(&schema_json)
-                            .map_err(|e| CatalogError::InvalidOperation {
-                                message: "Failed to decode schema from base64".to_string(),
-                                source: Box::new(e),
-                            })?;
-
-                        let ipc_message = arrow_flight::IpcMessage(Bytes::from(schema_bytes));
-                        arrow_schema::Schema::try_from(ipc_message).map_err(|e| {
-                            CatalogError::InvalidOperation {
-                                message: "Failed to deserialize schema from IPC".to_string(),
-                                source: Box::new(e),
-                            }
-                        })?
-                    };
-
-                    let schema = Arc::new(schema);
+                    // A schema persisted before `create_table` began conforming its input —
+                    // or by a Spice that predates it — still declares its `MAP` entries the way
+                    // its producer did, and nothing else will ever repair it: the retention rule
+                    // that keeps a stored schema canonical across a nullability difference is
+                    // what holds it in place. Repairing it on the way out heals such a table on
+                    // its next load without rewriting a single file.
+                    let schema =
+                        conforming_schema(Arc::new(deserialize_schema_ipc_base64(&schema_json)?));
 
                     // Parse primary key
                     let primary_key = if let Some(pk_json) = primary_key_json {
@@ -3655,6 +3662,33 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(results.into_iter().next())
     }
 
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        // Drop both sibling caches for the departed snapshot in ONE transaction
+        // so they can never drift apart (one deleted, the other left to leak).
+        let txn = self.begin_transaction().await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1 AND snapshot_id = ?2",
+            params: vec![
+                MetastoreValue::Text(table_id.to_string()),
+                MetastoreValue::Text(snapshot_id.to_string()),
+            ],
+        })
+        .await?;
+        txn.commit().await
+    }
+
     async fn clear_snapshot_file_statistics_except(
         &self,
         table_id: &str,
@@ -4096,11 +4130,22 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .query_row_helper(
                 QueryRowParams {
+                    // The tombstone aggregates ride the same round trip as the
+                    // corpus ones: both callers need both tables, and on a
+                    // network metastore a second query costs 10-50 ms. Both
+                    // subqueries seek through `idx_cayenne_inlined_delete_table_seq`
+                    // rather than scanning the table; only the `COUNT(*)` is
+                    // answered from the index alone, since `delete_ipc` is not in
+                    // it and `LENGTH` has to visit each row — though it reads the
+                    // size out of the record header without loading the blob's
+                    // overflow pages.
                     sql: r"
                     SELECT
                         COALESCE(SUM(record_count), 0),
                         COUNT(*),
-                        COALESCE(SUM(LENGTH(data_ipc)), 0)
+                        COALESCE(SUM(LENGTH(data_ipc)), 0),
+                        (SELECT COUNT(*) FROM cayenne_inlined_delete WHERE table_id = ?1),
+                        (SELECT COALESCE(SUM(LENGTH(delete_ipc)), 0) FROM cayenne_inlined_delete WHERE table_id = ?1)
                     FROM cayenne_inlined_data
                     WHERE table_id = ?1
                     ",
@@ -4111,10 +4156,162 @@ impl MetadataCatalog for CayenneCatalog {
                         record_count: row.get_i64(0)?,
                         entry_count: row.get_i64(1)?,
                         ipc_bytes: row.get_i64(2)?,
+                        tombstone_entry_count: row.get_i64(3)?,
+                        tombstone_ipc_bytes: row.get_i64(4)?,
                     })
                 },
             )
             .await
+    }
+
+    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats> {
+        // ONE statement, deliberately. A row moves BETWEEN these tiers — an
+        // inline checkpoint drains level-0 into a Vortex file and a manifest row,
+        // a compaction retires manifest rows — and each of those commits is a
+        // single metastore transaction. Read as two queries, the sample could
+        // take its inline half before such a commit and its manifest half after,
+        // publishing the same rows twice (or, in the other order, neither), and
+        // that wrong value would stand until the next throttled sample. Two
+        // queries can also land on two pooled connections, so they need not even
+        // agree on a snapshot. A single statement runs in one implicit read
+        // transaction, so every tier below is read as of one instant.
+        //
+        // A snapshot is LIVE when it is the table's `current_snapshot_id` or it
+        // carries a registered sequence. Rows naming anything else are
+        // unreachable: no scan can reach them, and they persist until a
+        // compaction or overwrite prunes the manifest.
+        //
+        // PATHNAMES, not inodes. `file_path` is a bare filename resolved
+        // against its OWN row's snapshot directory (see
+        // `manifest_partitioned_files`), so the same filename under two
+        // snapshots is two distinct paths, and every live manifest row
+        // contributes. Merging by bare filename would fuse unrelated files and
+        // under-report the table; grouping by `(snapshot_id, file_path)` is the
+        // manifest's own primary key, so a plain per-row sum is already
+        // duplicate-free.
+        //
+        // What a pathname sum does NOT give is physical bytes: subset compaction
+        // carries an unpicked file into the new snapshot's directory with a hard
+        // link, so two live snapshots can name one inode and each is counted.
+        // That matches `cayenne_data_dir_bytes`, which walks the filesystem the
+        // same way, and it is the right figure for "what the manifest describes".
+        // `cayenne_maintenance_reclaimed_bytes_total` is the physical
+        // counterpart: it only counts a file whose last link it removed.
+        //
+        // The non-manifest tiers are cross-joined derived tables rather than one
+        // scalar subquery per COLUMN: three of those aggregates read
+        // `cayenne_delete_file` with the same predicate, three read
+        // `cayenne_cold_tier_file`, and as separate subqueries each would be its
+        // own index scan. Measured 55ms -> 35ms on a metastore with 50k delete
+        // files and 100k cold-tier files.
+        //
+        // `cayenne_insert_record` keys `table_id` as the raw UUID bytes, so it
+        // takes its own parameter rather than the text id every other table
+        // stores.
+        let stats = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: r"
+                    WITH live AS (
+                        SELECT
+                            CASE WHEN sf.snapshot_id = t.current_snapshot_id THEN 1 ELSE 0 END AS in_current,
+                            sf.file_size_bytes,
+                            sf.row_count
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                          AND (sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL)
+                    ),
+                    rows_total AS (
+                        SELECT
+                            COUNT(*) AS all_rows,
+                            COALESCE(SUM(CASE
+                                WHEN sf.snapshot_id = t.current_snapshot_id OR ss.snapshot_id IS NOT NULL
+                                THEN 1 ELSE 0
+                            END), 0) AS reachable_rows
+                        FROM cayenne_snapshot_file sf
+                        JOIN cayenne_table t ON t.table_id = sf.table_id
+                        LEFT JOIN cayenne_snapshot_sequence ss
+                            ON ss.table_id = sf.table_id AND ss.snapshot_id = sf.snapshot_id
+                        WHERE sf.table_id = ?1
+                    )
+                    SELECT
+                        COALESCE((SELECT SUM(in_current) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 1 THEN row_count ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN 1 ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN file_size_bytes ELSE 0 END) FROM live), 0),
+                        COALESCE((SELECT SUM(CASE WHEN in_current = 0 THEN row_count ELSE 0 END) FROM live), 0),
+                        (SELECT all_rows FROM rows_total),
+                        (SELECT reachable_rows FROM rows_total),
+                        df.n, df.bytes, df.deletes,
+                        ctf.n, ctf.bytes, ctf.row_total,
+                        (SELECT COUNT(*) FROM cayenne_snapshot_sequence WHERE table_id = ?1),
+                        (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
+                        (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
+                        idt.n, idt.row_total, idt.bytes,
+                        idl.n, idl.deletes
+                    FROM
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_delete_file WHERE table_id = ?1) df,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(file_size_bytes), 0) AS bytes,
+                                COALESCE(SUM(row_count), 0) AS row_total
+                         FROM cayenne_cold_tier_file WHERE table_id = ?1) ctf,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(record_count), 0) AS row_total,
+                                COALESCE(SUM(LENGTH(data_ipc)), 0) AS bytes
+                         FROM cayenne_inlined_data WHERE table_id = ?1) idt,
+                        (SELECT COUNT(*) AS n,
+                                COALESCE(SUM(delete_count), 0) AS deletes
+                         FROM cayenne_inlined_delete WHERE table_id = ?1) idl
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        insert_record_table_id_value(table_id),
+                    ],
+                },
+                |row| {
+                    let manifest_rows = row.get_i64(6)?;
+                    let reachable_manifest_rows = row.get_i64(7)?;
+                    Ok(TableStorageStats {
+                        current_files: row.get_i64(0)?,
+                        current_bytes: row.get_i64(1)?,
+                        current_rows: row.get_i64(2)?,
+                        protected_files: row.get_i64(3)?,
+                        protected_bytes: row.get_i64(4)?,
+                        protected_rows: row.get_i64(5)?,
+                        // Both counts come from the same statement, hence the
+                        // same snapshot, so the difference cannot be negative.
+                        // The clamp is what keeps that true if the query is ever
+                        // split again.
+                        unreachable_manifest_rows: (manifest_rows - reachable_manifest_rows).max(0),
+                        reachable_manifest_rows,
+                        delete_files: row.get_i64(8)?,
+                        delete_file_bytes: row.get_i64(9)?,
+                        delete_file_tombstones: row.get_i64(10)?,
+                        cold_files: row.get_i64(11)?,
+                        cold_bytes: row.get_i64(12)?,
+                        cold_rows: row.get_i64(13)?,
+                        snapshot_sequences: row.get_i64(14)?,
+                        file_statistics_rows: row.get_i64(15)?,
+                        insert_records: row.get_i64(16)?,
+                        inlined_entries: row.get_i64(17)?,
+                        inlined_rows: row.get_i64(18)?,
+                        inlined_bytes: row.get_i64(19)?,
+                        inlined_delete_entries: row.get_i64(20)?,
+                        inlined_delete_rows: row.get_i64(21)?,
+                    })
+                },
+            )
+            .await?;
+
+        Ok(stats)
     }
 
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
@@ -5045,6 +5242,31 @@ fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Deserialize the base64 Arrow-IPC form stored in `cayenne_table.schema_json` back into an
+/// Arrow schema — the exact inverse of [`serialize_schema_ipc_base64`], and the only place the
+/// stored encoding is read.
+///
+/// It hands back the declaration as it is stored, without the map-layout repair `get_table`
+/// applies on top, so a caller that needs to know what is actually on disk can ask.
+fn deserialize_schema_ipc_base64(schema_json: &str) -> CatalogResult<arrow_schema::Schema> {
+    use base64::Engine;
+    use bytes::Bytes;
+
+    let schema_bytes = base64::engine::general_purpose::STANDARD
+        .decode(schema_json)
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Failed to decode schema from base64".to_string(),
+            source: Box::new(e),
+        })?;
+
+    arrow_schema::Schema::try_from(arrow_flight::IpcMessage(Bytes::from(schema_bytes))).map_err(
+        |e| CatalogError::InvalidOperation {
+            message: "Failed to deserialize schema from IPC".to_string(),
+            source: Box::new(e),
+        },
+    )
+}
+
 /// Serialize an Arrow schema to the base64 Arrow-IPC form stored in
 /// `cayenne_table.schema_json`. Shared by `create_table` and
 /// `update_table_schema` so both persist byte-identical encodings.
@@ -5358,6 +5580,58 @@ mod tests {
     use crate::metadata::DeletionType;
     use std::sync::Arc;
 
+    /// A table root of this test's own, and the `base_path` string to hand to
+    /// [`CreateTableOptions`].
+    ///
+    /// `base_path` is a real filesystem location, not a label: for every non-S3,
+    /// non-memory-mode table `create_table` creates `<base_path>/<table_id>/<snapshot_id>`.
+    /// A root pinned under `/tmp` is therefore shared with every other account on the
+    /// machine — where these tests also run under CI, that account owns the directory
+    /// already and `create_dir_all` fails with `PermissionDenied`, which `/tmp`'s sticky
+    /// bit leaves unfixable for everyone else (#13527). Concurrent runs collide there too.
+    ///
+    /// Bind the returned [`tempfile::TempDir`] for the whole test: dropping it removes
+    /// the tree, so a test that keeps only the `String` deletes its own table root.
+    ///
+    /// The path must be UTF-8 rather than lossily converted, because `base_path` is a
+    /// `String` that Cayenne turns back into a path: a lossy conversion would build the
+    /// table tree at the replacement-character path while the guard deletes the real one,
+    /// which is the isolation this helper exists to provide.
+    fn test_table_root() -> (tempfile::TempDir, String) {
+        let root = tempfile::tempdir().expect("create a temporary table root");
+        let base_path = root
+            .path()
+            .to_str()
+            .expect("the temporary table root is a UTF-8 path")
+            .to_owned();
+        (root, base_path)
+    }
+
+    /// Every table root named in this file must come from [`test_table_root`].
+    ///
+    /// The guard is textual because what it prevents is environmental: a pinned
+    /// `/tmp` root passes wherever the running account happens to own the directory
+    /// and fails everywhere else, so no run of the suite can be trusted to catch a
+    /// new one being added (#13527).
+    #[test]
+    fn no_table_root_is_pinned_under_tmp() {
+        let pinned: Vec<String> = include_str!("cayenne_catalog.rs")
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let line = line.trim();
+                ((line.starts_with("base_path:") || line.starts_with("let base_path ="))
+                    && line.contains("\"/tmp/"))
+                .then(|| format!("line {}: {line}", index + 1))
+            })
+            .collect();
+        assert!(
+            pinned.is_empty(),
+            "cayenne_catalog.rs pins these table roots under /tmp, which another account may \
+             already own; call test_table_root() instead: {pinned:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_catalog_creation() {
         let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
@@ -5370,6 +5644,7 @@ mod tests {
     /// `None` (the legacy / over-cap fallback the keyset rebuild relies on).
     #[tokio::test]
     async fn cold_tier_file_pk_bloom_round_trips() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_cold_bloom_{}.db", uuid::Uuid::now_v7());
         let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
         catalog.init().await.expect("Failed to initialize catalog");
@@ -5384,7 +5659,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test_cold_bloom".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5467,7 +5742,7 @@ mod tests {
         ]));
 
         let table_name = "test_concurrent_table";
-        let base_path = "/tmp/cayenne_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Spawn multiple tasks that all try to create the same table concurrently
         let mut handles = vec![];
@@ -5475,7 +5750,7 @@ mod tests {
             let catalog_clone = Arc::clone(&catalog);
             let schema_clone = Arc::clone(&schema);
             let table_name = table_name.to_string();
-            let base_path = base_path.to_string();
+            let base_path = base_path.clone();
 
             let handle = tokio::spawn(async move {
                 let options = CreateTableOptions {
@@ -5529,6 +5804,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_partition_creation() {
         // Create a unique test database to avoid conflicts with other tests
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_partition_{}.db",
             uuid::Uuid::now_v7()
@@ -5549,7 +5825,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test_partition".to_string(),
+            base_path: base_path.clone(),
             partition_column: Some("date".to_string()),
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5621,6 +5897,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_delete_file_creation() {
         // Create a unique test database to avoid conflicts with other tests
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_delete_file_{}.db",
             uuid::Uuid::now_v7()
@@ -5641,7 +5918,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5714,6 +5991,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_delete_file_creation_is_idempotent_for_same_path() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_delete_file_same_path_{}.db",
             uuid::Uuid::now_v7()
@@ -5732,7 +6010,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5800,6 +6078,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_delete_file_path_rejects_conflicting_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_conflicting_delete_file_same_path_{}.db",
             uuid::Uuid::now_v7()
@@ -5818,7 +6097,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6067,6 +6346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_is_idempotent_for_same_delete_file() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_idempotent_{}.db",
             uuid::Uuid::now_v7()
@@ -6085,7 +6365,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6152,6 +6432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_rejects_conflicting_delete_file_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_conflict_{}.db",
             uuid::Uuid::now_v7()
@@ -6170,7 +6451,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6270,6 +6551,7 @@ mod tests {
         // Exercises the batched multi-VALUES INSERT path: multiple distinct
         // delete files committed in a single transaction must all be visible
         // afterward and produce a single row per (table_id, path).
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_batched_{}.db",
             uuid::Uuid::now_v7()
@@ -6288,7 +6570,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6357,6 +6639,7 @@ mod tests {
         // protected-snapshot sequence + the Option-D inline tombstone must all be
         // committed by a single call, and the tombstone must land
         // `published = false` (inert) with the returned id.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_with_tombstone_fold_{}.db",
             uuid::Uuid::now_v7()
@@ -6374,7 +6657,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6490,6 +6773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_prepared_on_conflict_inline_tombstone_replay() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_prepared_inline_replay_{}.db",
             uuid::Uuid::now_v7()
@@ -6506,7 +6790,7 @@ mod tests {
                 )])),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6590,6 +6874,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_combined_delete_and_inline_rewrite_rolls_back_on_missing_inline_row() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_combined_delete_rewrite_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -6606,7 +6891,7 @@ mod tests {
                 )])),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6683,6 +6968,7 @@ mod tests {
         // `… inlined_id IN (…)` UPDATE is exactly equivalent to the prior per-row
         // loop. Stage several inert tombstones, then ride their ids as
         // `pending_durable_flips` on a later commit and assert every one flips.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_tombstone_flip_batch_{}.db",
             uuid::Uuid::now_v7()
@@ -6701,7 +6987,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6813,6 +7099,7 @@ mod tests {
     async fn test_commit_on_conflict_deletions_with_tombstone_none_returns_none() {
         // With no tombstone, the fold behaves exactly like
         // `commit_on_conflict_deletions` and returns `Ok(None)`.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_with_tombstone_none_{}.db",
             uuid::Uuid::now_v7()
@@ -6830,7 +7117,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6891,6 +7178,8 @@ mod tests {
         const TASK_COUNT: usize = 16;
         const BLOCK_SIZE: u32 = 2;
 
+        let (_table_root, base_path) = test_table_root();
+
         let test_db = format!(
             "sqlite://./.test_sequence_reservation_concurrency_{}.db",
             uuid::Uuid::now_v7()
@@ -6909,7 +7198,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7012,7 +7301,7 @@ mod tests {
         ]));
 
         let table_name = "test_shutdown_table";
-        let base_path = "/tmp/cayenne_shutdown_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Phase 1: Create catalog, add data, shutdown
         let table_id;
@@ -7026,7 +7315,7 @@ mod tests {
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: base_path.to_string(),
+                base_path: base_path.clone(),
                 partition_column: Some("name".to_string()),
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7155,7 +7444,7 @@ mod tests {
         )]));
 
         let table_name = "cycle_test_table";
-        let base_path = "/tmp/cayenne_cycle_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Cycle 1: Create table
         let table_id;
@@ -7168,7 +7457,7 @@ mod tests {
                 schema: Arc::clone(&schema),
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: base_path.to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7267,6 +7556,7 @@ mod tests {
     /// Test that data persists even without explicit shutdown (WAL should still be readable).
     #[tokio::test]
     async fn test_data_persists_without_explicit_shutdown() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_no_shutdown_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
@@ -7289,7 +7579,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/no_shutdown_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7337,6 +7627,7 @@ mod tests {
     /// Test insert records persist across shutdown/reload.
     #[tokio::test]
     async fn test_insert_records_persist_across_restart() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_insert_records_{}.db",
             uuid::Uuid::now_v7()
@@ -7360,7 +7651,7 @@ mod tests {
                 schema,
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/insert_record_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7437,6 +7728,7 @@ mod tests {
     /// so the 16-byte encoding path (not the non-UUID fallback) is taken.
     #[tokio::test]
     async fn test_insert_record_delete_reinsert_visibility_roundtrip_blob_key() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_insert_record_vis_{}.db",
             uuid::Uuid::now_v7()
@@ -7458,7 +7750,7 @@ mod tests {
                 schema,
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/vis_roundtrip".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -7548,6 +7840,7 @@ mod tests {
     /// Test snapshot sequences persist across restart.
     #[tokio::test]
     async fn test_snapshot_sequences_persist_across_restart() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_snapshot_seq_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
@@ -7572,7 +7865,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/snapshot_seq_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7637,6 +7930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_falls_back_on_config_change() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7652,7 +7946,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7676,7 +7970,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7703,7 +7997,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7724,6 +8018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_falls_back_on_sort_columns_change() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7739,7 +8034,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_sort_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7758,7 +8053,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_sort_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config,
         };
@@ -7780,6 +8075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_cache_change_does_not_recreate() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_cache_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7796,7 +8092,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_cache_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7819,7 +8115,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_cache_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config,
         };
@@ -7842,6 +8138,7 @@ mod tests {
     /// snapshot sequences, and updates the active snapshot pointer.
     #[tokio::test]
     async fn test_commit_compaction_clears_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_commit_compaction_{}.db",
             uuid::Uuid::now_v7()
@@ -7861,7 +8158,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_compaction_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8006,6 +8303,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replace_snapshot_files_rejects_invalid_row_without_mutation() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_manifest_replacement_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -8022,7 +8320,7 @@ mod tests {
                 )])),
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_manifest_rollback".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8077,8 +8375,626 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
+    /// The footprint sample's whole value rests on the reachability split: a
+    /// manifest row naming a dead snapshot is metastore weight no query can use,
+    /// and a sample that counts it as live reports a table far larger than the
+    /// one that exists.
+    ///
+    /// The negative control here is the third snapshot: it has a manifest row but
+    /// no `cayenne_snapshot_sequence` entry and is not the current snapshot, so
+    /// if the query resolved reachability by anything other than those two
+    /// sources it would land in `protected_*` and this assertion would fail.
+    #[tokio::test]
+    async fn table_storage_stats_splits_live_snapshots_from_dead_manifest_rows() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_table_storage_stats_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "storage_stats".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+        let current_snapshot_id = catalog
+            .get_table("storage_stats")
+            .await
+            .expect("get table")
+            .current_snapshot_id;
+
+        let protected_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let dead_snapshot_id = uuid::Uuid::now_v7().to_string();
+        catalog
+            .set_snapshot_sequence(&table_id, &protected_snapshot_id, 7)
+            .await
+            .expect("register the protected snapshot");
+
+        let row = |snapshot_id: &str, file: &str, rows: i64, bytes: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: file.to_string(),
+            row_count: rows,
+            file_size_bytes: bytes,
+            min_sequence: 1,
+            max_sequence: 1,
+            digest: None,
+        };
+        for file in [
+            row(&current_snapshot_id, "c0.vortex", 10, 100),
+            row(&current_snapshot_id, "c1.vortex", 20, 200),
+            row(&protected_snapshot_id, "p0.vortex", 30, 300),
+            // The same FILENAME under a second live snapshot. `file_path` is
+            // resolved against its own row's snapshot directory, so this is a
+            // second path — one that subset compaction typically hard-links to
+            // the first row's inode. Two live paths; the bytes behind them may
+            // be shared.
+            row(&protected_snapshot_id, "c0.vortex", 10, 100),
+            row(&dead_snapshot_id, "d0.vortex", 40, 400),
+            row(&dead_snapshot_id, "d1.vortex", 50, 500),
+        ] {
+            catalog
+                .upsert_snapshot_file(&file)
+                .await
+                .expect("seed manifest row");
+        }
+
+        catalog
+            .add_delete_file(DeleteFile {
+                delete_file_id: String::new(),
+                table_id: table_id.clone(),
+                source_data_file_path: None,
+                path: "/tmp/storage_stats_dv.arrow".to_string(),
+                path_is_relative: false,
+                format: "arrow".to_string(),
+                delete_count: 9,
+                file_size_bytes: 640,
+                deletion_type: DeletionType::default(),
+                sequence_number: 3,
+                reinsert_sequence: None,
+            })
+            .await
+            .expect("add delete file");
+
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("sample storage stats");
+
+        assert_eq!(stats.current_files, 2, "current-snapshot file count");
+        assert_eq!(stats.current_bytes, 300, "current-snapshot bytes");
+        assert_eq!(stats.current_rows, 30, "current-snapshot rows");
+        // The protected snapshot names `p0.vortex` AND its own `c0.vortex`. The
+        // second is a distinct path — `file_path` is resolved against its own
+        // snapshot's directory — so both count. Merging the two `c0.vortex` rows
+        // by filename would fuse two paths that the loader treats as separate
+        // files and under-report the table.
+        assert_eq!(
+            stats.protected_files, 2,
+            "a filename repeated under a second snapshot is a second path"
+        );
+        assert_eq!(stats.protected_bytes, 400, "300 (p0) + 100 (its own c0)");
+        assert_eq!(stats.protected_rows, 40);
+        assert_eq!(
+            stats.live_data_bytes(),
+            700,
+            "100 + 200 (current) + 300 + 100 (protected) = 700 — every live path, \
+             which is also how `cayenne_data_dir_bytes` walks the filesystem"
+        );
+        assert_eq!(
+            stats.unreachable_manifest_rows, 2,
+            "the dead snapshot's rows must not be counted as live"
+        );
+        // The tiers partition the live manifest rows, so their file counts sum
+        // to the reachable row count exactly.
+        assert_eq!(stats.reachable_manifest_rows, 4);
+        assert_eq!(
+            stats.current_files + stats.protected_files,
+            stats.reachable_manifest_rows,
+            "the tiers must partition the live rows, not overlap or drop any"
+        );
+        assert_eq!(stats.snapshot_sequences, 1);
+        assert_eq!(stats.delete_files, 1);
+        assert_eq!(stats.delete_file_bytes, 640);
+        assert_eq!(stats.delete_file_tombstones, 9);
+        assert_eq!(stats.cold_files, 0);
+        assert_eq!(stats.inlined_entries, 0);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// A table whose metastore rows are all absent must report zeroes, not fail:
+    /// the aggregate query joins through `cayenne_table`, and a join that yields
+    /// no rows still has to produce one all-zero result row for the gauges.
+    #[tokio::test]
+    async fn table_storage_stats_of_an_untouched_table_is_all_zero() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_table_storage_stats_empty_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "storage_stats_empty".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("sample storage stats for an empty table");
+        assert_eq!(stats, crate::metadata::TableStorageStats::default());
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression: protected-snapshot subset compaction must delete the
+    /// merged-away inputs' non-authoritative cached rows — both the
+    /// `cayenne_snapshot_file` manifest and the `cayenne_snapshot_file_statistics`
+    /// per-file stats cache — in the SAME transaction as the roster swap. Before
+    /// the fix the swap deleted only the inputs' `cayenne_snapshot_sequence` rows
+    /// and left both cached tables to leak until an unrelated full rewrite pruned
+    /// them.
+    #[tokio::test]
+    async fn test_swap_protected_snapshots_deletes_merged_away_cached_rows() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_protected_swap_manifest_gc_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "protected_swap_manifest_gc".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // The subset merge folds `input_a` + `input_b` into `p_new`; `survivor`
+        // stays on the roster untouched. Each snapshot starts with one manifest
+        // row; the two inputs and the survivor also start on the roster.
+        let input_a = uuid::Uuid::now_v7().to_string();
+        let input_b = uuid::Uuid::now_v7().to_string();
+        let survivor = uuid::Uuid::now_v7().to_string();
+        let p_new = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+
+        // The per-file stats cache (`cayenne_snapshot_file_statistics`) is the
+        // sibling of the manifest and leaks on the same path, so seed it in lockstep.
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![1, 2, 3],
+        };
+
+        for (snapshot_id, path, seq) in [
+            (&input_a, "a.vortex", 1),
+            (&input_b, "b.vortex", 2),
+            (&survivor, "s.vortex", 3),
+            (&p_new, "p_new.vortex", 4),
+        ] {
+            catalog
+                .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
+                .await
+                .expect("seed manifest row");
+            catalog
+                .upsert_snapshot_file_statistics(&seed_stats(snapshot_id, path))
+                .await
+                .expect("seed stats-cache row");
+        }
+        // `p_new` is placed on the roster by the swap itself, so it is not seeded here.
+        for (snapshot_id, seq) in [(&input_a, 1), (&input_b, 2), (&survivor, 3)] {
+            catalog
+                .set_snapshot_sequence(&table_id, snapshot_id, seq)
+                .await
+                .expect("seed roster row");
+        }
+
+        let swapped = catalog
+            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .await
+            .expect("swap protected snapshots");
+        assert!(
+            swapped,
+            "the CAS must commit when every input is still active"
+        );
+
+        // The merged-away inputs' manifest rows are gone (the leak this fix closes).
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &input_a)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "input_a manifest rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &input_b)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "input_b manifest rows must be deleted at the compaction commit"
+        );
+        // The rewrite output keeps its freshly-written manifest rows.
+        let p_new_files = catalog
+            .get_snapshot_files(&table_id, &p_new)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            p_new_files.len(),
+            1,
+            "the rewrite output's manifest rows must remain"
+        );
+        assert_eq!(p_new_files[0].file_path, "p_new.vortex");
+        // A protected snapshot outside the merge set is untouched.
+        let survivor_files = catalog
+            .get_snapshot_files(&table_id, &survivor)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            survivor_files.len(),
+            1,
+            "a snapshot outside the merge set must be untouched"
+        );
+        assert_eq!(survivor_files[0].file_path, "s.vortex");
+
+        // The stats cache follows the manifest: the inputs' rows are gone, and the
+        // rewrite output's and the survivor's rows remain.
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_a, "a.vortex")
+                .await
+                .expect("read stats cache")
+                .is_none(),
+            "input_a stats-cache rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_b, "b.vortex")
+                .await
+                .expect("read stats cache")
+                .is_none(),
+            "input_b stats-cache rows must be deleted at the compaction commit"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &p_new, "p_new.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "the rewrite output's stats-cache rows must remain"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &survivor, "s.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "a snapshot outside the merge set must keep its stats-cache rows"
+        );
+
+        // Roster invariant preserved: inputs off, survivor and p_new on.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read roster");
+        assert!(!sequences.contains_key(&input_a));
+        assert!(!sequences.contains_key(&input_b));
+        assert!(sequences.contains_key(&survivor));
+        assert_eq!(sequences.get(&p_new), Some(&4));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression test: time-based retention that fully empties a protected
+    /// snapshot must delete that snapshot's `cayenne_snapshot_file` manifest
+    /// rows AND its `cayenne_snapshot_file_statistics` stats-cache rows, not
+    /// only its roster row. The append maintenance lane writes those rows while
+    /// the snapshot is live and populated; once retention removes the physical
+    /// files nothing else reconciles them, so leaving them behind leaks
+    /// metastore rows. A snapshot outside the emptied set stays untouched.
+    #[tokio::test]
+    async fn test_clear_snapshot_cached_metadata_deletes_both_tables_for_target() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_retention_emptied_manifest_gc_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "retention_emptied_manifest_gc".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // Retention empties `emptied`; `survivor` stays live. Each starts with
+        // manifest rows written by the append maintenance lane.
+        let emptied = uuid::Uuid::now_v7().to_string();
+        let survivor = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![],
+        };
+
+        for (snapshot_id, path, seq) in [
+            (&emptied, "e1.vortex", 1),
+            (&emptied, "e2.vortex", 2),
+            (&survivor, "s.vortex", 3),
+        ] {
+            catalog
+                .upsert_snapshot_file(&seed_file(snapshot_id, path, seq))
+                .await
+                .expect("seed manifest row");
+            catalog
+                .upsert_snapshot_file_statistics(&seed_stats(snapshot_id, path))
+                .await
+                .expect("seed stats row");
+        }
+
+        catalog
+            .clear_snapshot_cached_metadata(&table_id, &emptied)
+            .await
+            .expect("clear emptied snapshot cached metadata");
+
+        // The emptied snapshot's manifest rows are gone (the leak this fix closes).
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &emptied)
+                .await
+                .expect("read manifest")
+                .is_empty(),
+            "emptied snapshot manifest rows must be deleted by the cleanup"
+        );
+        // Its stats-cache rows are gone too.
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &emptied, "e1.vortex")
+                .await
+                .expect("read stats")
+                .is_none(),
+            "emptied snapshot stats-cache rows must be deleted by the cleanup"
+        );
+        // A snapshot outside the emptied set is untouched.
+        let survivor_files = catalog
+            .get_snapshot_files(&table_id, &survivor)
+            .await
+            .expect("read manifest");
+        assert_eq!(
+            survivor_files.len(),
+            1,
+            "a snapshot outside the emptied set must be untouched"
+        );
+        assert_eq!(survivor_files[0].file_path, "s.vortex");
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &survivor, "s.vortex")
+                .await
+                .expect("read stats")
+                .is_some(),
+            "a snapshot outside the emptied set must keep its stats-cache rows"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression: the merged-away-row deletes must stay INSIDE the CAS guard.
+    /// When one input is no longer active — a concurrent compaction already
+    /// consumed it — the swap must return `false` and mutate nothing: it must
+    /// not delete the still-active input's manifest or stats-cache rows, must
+    /// leave every roster row in place, and must not add the output snapshot to
+    /// the roster. This guards against a future reordering of the deletes ahead
+    /// of the guard, which would reintroduce the data loss the guard prevents.
+    #[tokio::test]
+    async fn test_swap_protected_snapshots_failed_cas_deletes_nothing() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_protected_swap_failed_cas_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("initialize catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "protected_swap_failed_cas".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.clone(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // The swap is asked to fold `input_a` + `input_b` into `p_new`, but
+        // `input_b` is no longer active: a concurrent compaction already
+        // consumed it, so it is absent from the roster. `input_a` is still
+        // active with its manifest and stats-cache rows. The CAS must abort.
+        let input_a = uuid::Uuid::now_v7().to_string();
+        let input_b = uuid::Uuid::now_v7().to_string();
+        let p_new = uuid::Uuid::now_v7().to_string();
+
+        let seed_file = |snapshot_id: &str, path: &str, seq: i64| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            row_count: 10,
+            file_size_bytes: 100,
+            min_sequence: seq,
+            max_sequence: seq,
+            digest: None,
+        };
+        let seed_stats = |snapshot_id: &str, path: &str| SnapshotFileStatistics {
+            table_id: table_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            file_path: path.to_string(),
+            file_size_bytes: 100,
+            num_rows: 10,
+            statistics_blob: vec![1, 2, 3],
+        };
+
+        catalog
+            .upsert_snapshot_file(&seed_file(&input_a, "a.vortex", 1))
+            .await
+            .expect("seed manifest row");
+        catalog
+            .upsert_snapshot_file_statistics(&seed_stats(&input_a, "a.vortex"))
+            .await
+            .expect("seed stats-cache row");
+        catalog
+            .set_snapshot_sequence(&table_id, &input_a, 1)
+            .await
+            .expect("seed roster row");
+
+        let swapped = catalog
+            .swap_protected_snapshots(&table_id, &[input_a.clone(), input_b.clone()], &p_new, 4)
+            .await
+            .expect("swap protected snapshots");
+        assert!(
+            !swapped,
+            "the CAS must abort when an input is no longer active"
+        );
+
+        // The still-active input's cached rows survive: the failed CAS deleted
+        // nothing.
+        assert_eq!(
+            catalog
+                .get_snapshot_files(&table_id, &input_a)
+                .await
+                .expect("read manifest")
+                .len(),
+            1,
+            "a failed CAS must not delete the still-active input's manifest rows"
+        );
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(&table_id, &input_a, "a.vortex")
+                .await
+                .expect("read stats cache")
+                .is_some(),
+            "a failed CAS must not delete the still-active input's stats-cache rows"
+        );
+
+        // The roster is unchanged: the input stays on, and the output is not
+        // added.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("read roster");
+        assert_eq!(
+            sequences.get(&input_a),
+            Some(&1),
+            "a failed CAS must leave the still-active input on the roster"
+        );
+        assert!(
+            !sequences.contains_key(&p_new),
+            "a failed CAS must not add the output snapshot to the roster"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
     #[tokio::test]
     async fn test_clear_inlined_data_and_deletes_clears_both_tables() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_clear_inline_metadata_{}.db",
             uuid::Uuid::now_v7()
@@ -8097,7 +9013,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/clear_inline_metadata".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8173,6 +9089,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_and_clear_inlined_publishes_sequence_atomically() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_commit_inline_checkpoint_{}.db",
             uuid::Uuid::now_v7()
@@ -8191,7 +9108,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/commit_inline_checkpoint".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8269,12 +9186,17 @@ mod tests {
     /// `commit_compaction`: snapshot pointer advances, delete files cleared.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_single_partition_parity() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_in_txn_parity_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "in_txn_parity", "/tmp/in_txn_parity").await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "in_txn_parity",
+            &format!("{base_path}/in_txn_parity"),
+        )
+        .await;
 
         // Sanity: delete file exists before the in_txn call.
         let before = catalog
@@ -8333,6 +9255,7 @@ mod tests {
     /// folded in — and deleting that row here loses its rows durably.
     #[tokio::test]
     async fn test_commit_compaction_fenced_unbounded_cutoff_retains_unfolded_snapshots() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_fenced_unbounded_{}.db",
             uuid::Uuid::now_v7()
@@ -8340,9 +9263,12 @@ mod tests {
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "fenced_unbounded", "/tmp/fenced_unbounded")
-                .await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "fenced_unbounded",
+            &format!("{base_path}/fenced_unbounded"),
+        )
+        .await;
 
         // Two protected snapshots the rewrite folded in, and one published after
         // its scan (the racing checkpoint).
@@ -8426,6 +9352,7 @@ mod tests {
     /// pointers have advanced together.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_cross_partition_atomicity() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_in_txn_cross_atomic_{}.db",
             uuid::Uuid::now_v7()
@@ -8435,8 +9362,18 @@ mod tests {
 
         // Two "partitions": independent tables, treated as a single atomic
         // commit unit by the (future) cross-partition coordinator.
-        let table_a = setup_table_with_delete_file(&catalog, "partition_a", "/tmp/p_a").await;
-        let table_b = setup_table_with_delete_file(&catalog, "partition_b", "/tmp/p_b").await;
+        let table_a = setup_table_with_delete_file(
+            &catalog,
+            "partition_a",
+            &format!("{base_path}/partition_a"),
+        )
+        .await;
+        let table_b = setup_table_with_delete_file(
+            &catalog,
+            "partition_b",
+            &format!("{base_path}/partition_b"),
+        )
+        .await;
 
         let snap_a = uuid::Uuid::now_v7().to_string();
         let snap_b = uuid::Uuid::now_v7().to_string();
@@ -8473,6 +9410,7 @@ mod tests {
     /// is left exactly as it was before the transaction opened.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_rolls_back_on_drop() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_in_txn_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -8480,8 +9418,12 @@ mod tests {
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "in_txn_rollback", "/tmp/in_txn_rb").await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "in_txn_rollback",
+            &format!("{base_path}/in_txn_rollback"),
+        )
+        .await;
 
         // Capture pre-commit state.
         let before = catalog.get_table("in_txn_rollback").await.expect("get");
@@ -8652,7 +9594,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8661,7 +9603,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8682,7 +9624,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8691,7 +9633,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8713,7 +9655,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8722,7 +9664,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8743,7 +9685,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8756,7 +9698,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: changed_vortex,
         };
@@ -8777,7 +9719,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/old_path",
+            "table-root-old",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8786,7 +9728,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/new_path".to_string(),
+            base_path: "table-root-new".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8807,7 +9749,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8816,7 +9758,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8836,7 +9778,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8845,7 +9787,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8865,7 +9807,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/old",
+            "table-root-old",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8878,7 +9820,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/new".to_string(),
+            base_path: "table-root-new".to_string(),
             partition_column: Some("region".to_string()),
             vortex_config: changed_vortex,
         };
@@ -8889,6 +9831,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_on_conflict_change_falls_back() {
         use datafusion_table_providers::util::on_conflict::OnConflict;
+
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_change_{}.db",
             uuid::Uuid::now_v7()
@@ -8907,7 +9851,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_oc_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8922,7 +9866,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/cayenne_oc_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8954,6 +9898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_existing_table_configuration_returns_error_on_mismatch() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_validate_mismatch_{}.db",
             uuid::Uuid::now_v7()
@@ -8973,7 +9918,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8988,7 +9933,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -9006,7 +9951,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -9027,6 +9972,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_existing_table_configuration_allows_configured_footer_cache_drift() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_footer_cache_validate_{}.db",
             uuid::Uuid::now_v7()
@@ -9045,7 +9991,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig {
                 footer_cache_mb: Some(128),
@@ -9062,7 +10008,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig {
                 footer_cache_mb: Some(256),
@@ -9081,5 +10027,319 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// An Arrow `MAP` whose `entries` field is declared the way the layout forbids, alongside
+    /// one declared correctly and a nested one reached through a `Struct`.
+    fn map_entries_schema(entries_nullable: bool) -> Arc<arrow_schema::Schema> {
+        let entries = |nullable: bool| {
+            arrow_schema::Field::new(
+                "entries",
+                arrow_schema::DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new("keys", arrow_schema::DataType::Utf8, false),
+                        arrow_schema::Field::new("values", arrow_schema::DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                nullable,
+            )
+        };
+        let map_of =
+            |nullable: bool| arrow_schema::DataType::Map(Arc::new(entries(nullable)), false);
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("headers", map_of(entries_nullable), true),
+            arrow_schema::Field::new(
+                "wrapped",
+                arrow_schema::DataType::Struct(
+                    vec![arrow_schema::Field::new(
+                        "inner",
+                        map_of(entries_nullable),
+                        true,
+                    )]
+                    .into(),
+                ),
+                true,
+            ),
+        ]))
+    }
+
+    fn map_test_catalog(name: &str) -> (Arc<CayenneCatalog>, String) {
+        let test_db = format!("sqlite://./.test_{name}_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("create catalog"));
+        (catalog, test_db)
+    }
+
+    fn remove_test_db(test_db: &str) {
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Read `cayenne_table.schema_json` back exactly as it is stored, without the repair
+    /// `get_table` applies — so a test can ask what was actually persisted rather than what
+    /// the read path hands back.
+    async fn stored_schema_bytes(
+        catalog: &CayenneCatalog,
+        table_name: &str,
+    ) -> arrow_schema::Schema {
+        let schema_json = catalog
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT schema_json FROM cayenne_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .expect("read the stored schema_json");
+        deserialize_schema_ipc_base64(&schema_json).expect("deserialize the stored schema")
+    }
+
+    /// Put the pre-conformance declaration back under `table_name`, the way a metastore
+    /// written by an earlier Spice already holds it.
+    async fn store_legacy_declaration(catalog: &CayenneCatalog, table_name: &str) {
+        let legacy = serialize_schema_ipc_base64(map_entries_schema(true).as_ref())
+            .expect("serialize the legacy declaration");
+        catalog
+            .metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_name = ?2",
+                params: vec![
+                    MetastoreValue::Text(legacy),
+                    MetastoreValue::Text(table_name.to_string()),
+                ],
+            })
+            .await
+            .expect("store the legacy declaration");
+        assert_eq!(
+            stored_schema_bytes(catalog, table_name).await,
+            *map_entries_schema(true),
+            "the test must start from a genuinely non-conforming stored declaration"
+        );
+    }
+
+    fn map_table_options(
+        table_name: &str,
+        schema: Arc<arrow_schema::Schema>,
+        base_path: String,
+    ) -> CreateTableOptions {
+        CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path,
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        }
+    }
+
+    /// The Arrow map layout forbids a nullable `entries` field, and a table persisted under
+    /// one can never be read: every kernel that rebuilds the column reports `MapArray entries
+    /// cannot contain nulls`. `create_table` therefore has to persist the conforming
+    /// declaration, not the one the producer asked for.
+    ///
+    /// Asserted against the stored bytes rather than `get_table`, whose own repair would
+    /// otherwise hide a create path that still writes the illegal declaration.
+    #[tokio::test]
+    async fn create_table_persists_a_conforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_create");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_create",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        assert_eq!(
+            stored_schema_bytes(&catalog, "map_create").await,
+            *map_entries_schema(false),
+            "the persisted declaration must conform to the Arrow map layout, and only the entries nullability may change — every other field, type and metadata is carried across"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// A table whose stored declaration was persisted before that correction — by an earlier
+    /// Spice, or by any path that wrote the producer's own declaration through — does not
+    /// self-heal on its own: the rule that keeps a stored schema canonical across a
+    /// nullability difference is exactly what holds the illegal declaration in place. Reading
+    /// it back repairs it, which costs no file rewrite because nullability lives in the type
+    /// rather than in any buffer.
+    #[tokio::test]
+    async fn get_table_repairs_a_stored_nonconforming_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_legacy");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_legacy",
+                map_entries_schema(true),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        store_legacy_declaration(&catalog, "map_legacy").await;
+
+        assert_eq!(
+            *catalog
+                .get_table("map_legacy")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
+            "a stored declaration that violates the Arrow map layout must be repaired on read"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// The user-visible consequence of the two mechanisms together. A source that reports the
+    /// conforming declaration — which is what every Arrow decode point now hands over — against
+    /// a table stored under the illegal one is not a configuration change and must not be
+    /// treated as one: the schema difference is a nullability tighten, which keeps the stored
+    /// schema canonical, so the correction would never reach the table and the column would
+    /// stay unreadable for the life of the accelerator.
+    #[tokio::test]
+    async fn a_conforming_source_schema_is_not_a_configuration_change_against_a_stored_one() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_revalidate");
+        catalog.init().await.expect("init catalog");
+
+        let table_id = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(true),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        store_legacy_declaration(&catalog, "map_revalidate").await;
+
+        let reopened = catalog
+            .create_table(map_table_options(
+                "map_revalidate",
+                map_entries_schema(false),
+                base_path,
+            ))
+            .await
+            .expect("reopening the table with the conforming declaration must not be refused");
+        assert_eq!(
+            reopened, table_id,
+            "the table must be reopened rather than treated as reconfigured"
+        );
+        assert_eq!(
+            *catalog
+                .get_table("map_revalidate")
+                .await
+                .expect("get table")
+                .schema,
+            *map_entries_schema(false),
+            "the reopened table must be planned against a readable declaration"
+        );
+
+        remove_test_db(&test_db);
+    }
+
+    /// Why the conform sits at the *entry* of `create_table` rather than where the schema is
+    /// serialized: `options.schema` is compared against the stored one long before anything is
+    /// persisted, by `configuration_matches` — which is not the widening classifier and does
+    /// not normalize. Handed the producer's own declaration it reports a reconfiguration, so a
+    /// producer that never stops sending it would look like one on every load.
+    #[tokio::test]
+    async fn configuration_matching_does_not_normalize_a_map_entries_declaration() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_requested");
+        catalog.init().await.expect("init catalog");
+
+        catalog
+            .create_table(map_table_options(
+                "map_requested",
+                map_entries_schema(false),
+                base_path.clone(),
+            ))
+            .await
+            .expect("create table");
+
+        // The source still declares `entries` nullable, as it did before the ingress
+        // correction reached it.
+        let raw = map_table_options("map_requested", map_entries_schema(true), base_path.clone());
+        assert!(
+            matches!(
+                catalog
+                    .validate_existing_table_configuration("map_requested", &raw)
+                    .await,
+                Err(CatalogError::ChangedConfiguration { .. })
+            ),
+            "this comparison is what the entry-of-create_table conform exists to get ahead of"
+        );
+
+        // Conformed first — which is what `create_table` does — it is not a change at all.
+        let conformed = map_table_options("map_requested", map_entries_schema(false), base_path);
+        catalog
+            .validate_existing_table_configuration("map_requested", &conformed)
+            .await
+            .expect("a declaration the Arrow map layout forbids is not a configuration change");
+
+        remove_test_db(&test_db);
+    }
+
+    /// The repair touches map entries and nothing else: a schema carrying no `MAP` — including
+    /// its field and schema metadata, which Cayenne stores and compares — round-trips
+    /// unchanged, so nothing else in the stored declaration moves under it.
+    #[tokio::test]
+    async fn a_schema_without_a_map_round_trips_unchanged() {
+        let (_table_root, base_path) = test_table_root();
+        let (catalog, test_db) = map_test_catalog("map_entries_untouched");
+        catalog.init().await.expect("init catalog");
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("unit".to_string(), "bytes".to_string());
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("origin".to_string(), "test".to_string());
+        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("size", arrow_schema::DataType::Int64, true)
+                    .with_metadata(field_metadata),
+            ],
+            schema_metadata,
+        ));
+
+        catalog
+            .create_table(map_table_options(
+                "map_untouched",
+                Arc::clone(&schema),
+                base_path,
+            ))
+            .await
+            .expect("create table");
+
+        assert_eq!(
+            stored_schema_bytes(&catalog, "map_untouched").await,
+            *schema
+        );
+        assert_eq!(
+            *catalog
+                .get_table("map_untouched")
+                .await
+                .expect("get table")
+                .schema,
+            *schema
+        );
+
+        remove_test_db(&test_db);
     }
 }

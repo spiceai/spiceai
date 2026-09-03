@@ -491,7 +491,7 @@ impl VortexFormat {
     /// paths — this format's decoded segments and the file footers in
     /// `DataFusion`'s shared
     /// [`FileMetadataCache`](datafusion_execution::cache::cache_manager::FileMetadataCache)
-    /// — and physically evicts them before returning.
+    /// — evicting the ones it can reach before returning.
     ///
     /// Callers pass the paths of objects a retirement has confirmed absent.
     /// Neither cache has a TTL or any invalidation of its own, so a retired
@@ -505,13 +505,31 @@ impl VortexFormat {
     ///
     /// The two halves are not equally ordered against reads already in flight.
     /// The segment half is: `SharedSegmentCache` registers per-path state and
-    /// drains in-flight puts before enumerating keys. The footer half is not —
+    /// drains in-flight puts before enumerating keys. Both of those waits are
+    /// bounded, so a host too saturated to finish them gives up rather than
+    /// holding this caller — returning means the wait is over, not always that
+    /// every segment is gone. Which segments stay has three outcomes, not two:
+    ///
+    /// - giving up on the key search leaves every key it would have found cached
+    ///   until capacity evicts them;
+    /// - giving up on an in-flight write whose put then **completes** costs only a
+    ///   moment of residency, because that put removes its own entry once it sees
+    ///   the path retired — that self-removal is what makes the bounded drain safe;
+    /// - giving up on one that is then **cancelled between its insert and that
+    ///   self-removal** leaves the entry cached until capacity evicts it, exactly
+    ///   as the search case does. Closing that window needs the retirement
+    ///   tombstone tracked in <https://github.com/spiceai/spiceai/issues/12963>.
+    ///
+    /// The footer half is not ordered against in-flight reads at all —
     /// `infer_schema` and `infer_stats` miss the cache, `await` the object-store
     /// read, and only then insert what they read, so a scan that missed before
     /// this call can insert after it and leave one entry per raced path behind,
     /// on the same terms as any other un-evicted entry above. Giving the footer
     /// side the same coordination is tracked in
     /// <https://github.com/spiceai/spiceai/issues/13447>.
+    ///
+    /// No entry either half leaves behind can serve stale data, because every
+    /// caller has already deleted the underlying file.
     ///
     /// Both caches key on the object-store location, so one path set addresses
     /// both; taking them together is what stops a caller releasing one and

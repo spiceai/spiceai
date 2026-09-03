@@ -140,7 +140,7 @@ impl Client {
     ) -> Result<GenerateContentResponse> {
         let url = self.build_url(&format!("/models/{model}:generateContent"));
 
-        let headers = self.add_api_key_header(HeaderMap::new());
+        let headers = self.auth_headers(HeaderMap::new());
 
         let response = self
             .http_client()
@@ -171,7 +171,7 @@ impl Client {
             self.build_url(&format!("/models/{model}:streamGenerateContent"))
         );
 
-        let headers = self.add_api_key_header(HeaderMap::new());
+        let headers = self.auth_headers(HeaderMap::new());
 
         let response = self
             .http_client()

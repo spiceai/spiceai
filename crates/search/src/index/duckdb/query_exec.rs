@@ -32,13 +32,19 @@ use futures::TryStreamExt;
 use llms::embeddings::{Embed, EmbeddingInput};
 
 use super::{
-    DuckDBVectorQueryContext, hnsw::DuckDBHnswOptions, resolve_current_table_name,
-    sql::duckdb_vector_sql, to_execution_error, validate_vector, vector_literal,
+    DuckDBVectorQueryContext,
+    hnsw::DuckDBHnswOptions,
+    resolve_current_table_name,
+    sql::{ScopedFilters, duckdb_vector_sql},
+    to_execution_error, validate_vector, vector_literal,
 };
 
 #[derive(Debug, Clone)]
 pub(super) struct DuckDBVectorQueryExec {
     pub(super) projected_schema: SchemaRef,
+    /// The whole table's schema, which the pushed-down filters are rendered against. A filter may
+    /// reference a column the projection drops, so `projected_schema` cannot answer for it.
+    pub(super) table_schema: SchemaRef,
     pub(super) projected_columns: Vec<String>,
     pub(super) filters: Vec<Expr>,
     pub(super) limit: Option<usize>,
@@ -71,7 +77,10 @@ impl DuckDBVectorQueryExec {
             table_name,
             &self.embedded_column,
             &self.projected_columns,
-            &self.filters,
+            ScopedFilters {
+                filters: &self.filters,
+                schema: &self.table_schema,
+            },
             self.limit,
             &self.hnsw,
             &vector_lit,
@@ -278,6 +287,19 @@ fn empty_projected_batch(schema: SchemaRef, row_count: usize) -> DataFusionResul
 mod tests {
     use super::*;
 
+    use arrow_schema::TimeUnit;
+    use async_trait::async_trait;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
+    use datafusion::prelude::{SessionContext, col, lit};
+    use datafusion::scalar::ScalarValue;
+    use datafusion_table_providers::duckdb::{RelationName, TableDefinition};
+    use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+    use llms::embeddings::EmbeddingInput;
+
+    use crate::SEARCH_SCORE_COLUMN_NAME;
+    use crate::index::duckdb::query_table::DuckDBVectorQueryTable;
+
     #[test]
     fn empty_projected_batch_preserves_row_count() {
         let schema = Arc::new(Schema::empty());
@@ -285,5 +307,84 @@ mod tests {
 
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[derive(Debug)]
+    struct NoopEmbed;
+
+    #[async_trait]
+    impl Embed for NoopEmbed {
+        async fn embed(&self, _input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            Ok(vec![])
+        }
+
+        fn size(&self) -> i32 {
+            2
+        }
+    }
+
+    /// regression test for #13144: the filters are rendered against the whole table's schema, so a
+    /// timezone-aware timestamp column keeps its sub-millisecond digits even when the projection
+    /// drops it. Against the projected schema — or against no schema — that column is unresolved,
+    /// so it normalizes through `EPOCH_MS` and the comparison is truncated to whole milliseconds.
+    #[tokio::test]
+    async fn scan_renders_filters_against_the_whole_table_schema() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_memory().expect("in-memory DuckDB pool should build"),
+        );
+        let table = DuckDBVectorQueryTable {
+            query_text: "hello".to_string(),
+            embedded_column: "body_embedding".to_string(),
+            compute_query: Arc::new(NoopEmbed),
+            dims: 2,
+            schema: Arc::clone(&schema),
+            hnsw: DuckDBHnswOptions::default(),
+            context: DuckDBVectorQueryContext {
+                pool,
+                table_definition: Arc::new(TableDefinition::new(
+                    RelationName::from(TableReference::bare("docs")),
+                    Arc::clone(&schema),
+                )),
+            },
+        };
+
+        let filter = col("ts").gt(lit(ScalarValue::TimestampMicrosecond(
+            Some(1_767_225_600_000_999),
+            Some("UTC".into()),
+        )));
+        let state = SessionContext::new().state();
+        // Project `id` alone: the filter's column is deliberately outside the projection.
+        let plan = table
+            .scan(
+                &state,
+                Some(&vec![0]),
+                std::slice::from_ref(&filter),
+                Some(10),
+            )
+            .await
+            .expect("scan should plan");
+        let exec = plan
+            .downcast_ref::<DuckDBVectorQueryExec>()
+            .expect("scan returns a DuckDBVectorQueryExec");
+
+        let sql = exec.sql("docs", &[1.0, 0.0]).expect("SQL should build");
+
+        assert!(
+            !sql.contains("EPOCH_MS"),
+            "a timezone-aware column must not be rendered through whole milliseconds: {sql}"
+        );
+        assert!(
+            sql.contains(r#""ts" > make_timestamptz(1767225600000999)"#),
+            "the comparison must name the microsecond the literal holds: {sql}"
+        );
     }
 }
