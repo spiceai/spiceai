@@ -107,6 +107,8 @@ mod databricks_spark_m2m;
 #[cfg(feature = "databricks")]
 mod databricks_sql_warehouse;
 #[cfg(feature = "databricks")]
+mod databricks_sql_warehouse_m2m;
+#[cfg(feature = "databricks")]
 mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
