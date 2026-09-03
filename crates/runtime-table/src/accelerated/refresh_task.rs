@@ -3099,10 +3099,10 @@ fn is_object_generation_changed_error(error: &DataFusionError) -> bool {
 fn looks_like_generation_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // object_store::Error::Precondition displays as "Request precondition
-    // failure for path …"; HTTP 412 as "412 Precondition Failed". A bare
-    // "precondition" or "if-match" also matches planner/SQL errors and
-    // object keys like `listing/if-match/data.parquet`.
-    lower.contains("request precondition failure") || lower.contains("412 precondition failed")
+    // failure for path …". "412 Precondition Failed" also appears on unrelated
+    // HTTP 412s, including GraphQL `HTTP 412 Precondition Failed: …` wrapped as
+    // `DataFusionError::Execution`.
+    lower.contains("request precondition failure")
 }
 
 fn looks_like_parquet_decode(text: &str) -> bool {
@@ -3193,6 +3193,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use data_components::arrow::write::MemTable;
+    use datafusion::catalog::Session;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::memory::MemoryStream;
@@ -3467,6 +3469,32 @@ mod tests {
             refresh_error_reason(inner_err_from_retry_ref(&classified)),
             metrics::REFRESH_ERROR_REASON_OTHER
         );
+
+        // GraphQL formats HTTP 412 as `HTTP {status}: {message}` and wraps it
+        // as `DataFusionError::Execution`. That is not an object-store
+        // generation pin (`Request precondition failure for path …`).
+        let graphql_412 = DataFusionError::Execution(
+            "HTTP 412 Precondition Failed: resource version conflict".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&graphql_412),
+            "an unrelated HTTP 412 must not be a listing-table generation change"
+        );
+        let classified = retry_from_df_error(graphql_412);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "GraphQL HTTP 412 must not become a transient generation-change retry"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message(
+                "HTTP 412 Precondition Failed: resource version conflict"
+            ),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
     }
 
     #[test]
@@ -3735,39 +3763,97 @@ mod tests {
         );
     }
 
-    /// A persistent non-generation failure with unlimited retries increments
-    /// the metric on every attempt, not only once at the end.
-    #[test]
-    fn non_generation_attempt_error_increments_on_each_retry() {
+    /// A persistent non-generation failure on the real `RefreshTask::run`
+    /// retry path increments `dataset_acceleration_refresh_errors` on every
+    /// attempt. Removing the per-attempt `record_refresh_error` call in `run`
+    /// makes this fail (terminal generation-change counting does not apply).
+    #[tokio::test]
+    async fn non_generation_attempt_error_increments_on_each_retry() {
         let registry = super::test_prometheus_registry().clone();
 
-        let dataset = "non_gen_attempt_test";
+        let dataset = "non_gen_run_retry_metric";
         let reason = metrics::REFRESH_ERROR_REASON_OTHER;
-        let labels = vec![vec![
-            KeyValue::new("dataset", dataset),
-            KeyValue::new("mode", "full"),
-        ]];
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(AlwaysFailingScan {
+            schema: Arc::clone(&schema),
+            attempts: Arc::clone(&attempts),
+        })));
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare(dataset),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
 
         let before = refresh_error_count(&registry, dataset, reason);
+        let refresh = Refresh::new(RefreshMode::Full).with_retry(true, Some(2));
+        let result = task.run(refresh).await;
+        assert!(
+            result.is_err(),
+            "a persistent connector failure must exhaust retries: {result:?}"
+        );
 
-        // Simulate three failed attempts, each calling emit_refresh_errors as
-        // attempt_refresh_error would trigger from run().
-        for _ in 0..3 {
-            let err = RetryError::permanent(super::super::Error::FailedToRefreshDataset {
-                source: DataFusionError::External(Box::new(std::io::Error::other(
-                    "connection reset by peer",
-                ))),
-            });
-            if let Some(e) = attempt_refresh_error(&err) {
-                emit_refresh_errors(labels.clone(), refresh_error_reason(e));
-            }
-        }
+        let scans = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            scans, 3,
+            "max_retries=2 must attempt once plus two retries (got {scans})"
+        );
 
         let after = refresh_error_count(&registry, dataset, reason);
         assert!(
-            (after - before - 3.0).abs() < f64::EPSILON,
-            "three failed attempts must emit three refresh-error points (before={before} after={after})"
+            (after - before - f64::from(scans)).abs() < f64::EPSILON,
+            "each failed RefreshTask::run attempt must emit one refresh-error point (before={before} after={after} scans={scans})"
         );
+        let generation_count = refresh_error_count(
+            &registry,
+            dataset,
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            generation_count.abs() < f64::EPSILON,
+            "a non-generation connector failure must not be labeled object_generation_changed (got {generation_count})"
+        );
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailingScan {
+        schema: SchemaRef,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for AlwaysFailingScan {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DataFusionError::Execution(
+                "connection reset by peer".to_string(),
+            ))
+        }
     }
 
     /// `terminal_generation_change_refresh_error` is `None` for non-generation errors

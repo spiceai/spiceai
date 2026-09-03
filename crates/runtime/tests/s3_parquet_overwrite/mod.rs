@@ -432,8 +432,7 @@ fn request_line(headers: &[u8]) -> &str {
         .split(|&b| b == b'\n')
         .next()
         .and_then(|line| std::str::from_utf8(line).ok())
-        .map(str::trim)
-        .unwrap_or("")
+        .map_or("", str::trim)
 }
 
 fn http_header_present(headers: &str, name: &str) -> bool {
@@ -448,7 +447,7 @@ fn is_object_get_request(headers: &[u8]) -> bool {
     line.starts_with("GET ") && line.contains(OBJECT_KEY)
 }
 
-/// A listing-table scan pin: `If-Match` on the listed ETag, or `versionId` on
+/// A listing-table scan pin: `If-Match` on the listed `ETag`, or `versionId` on
 /// a versioned bucket. Schema inference GETs the same key without either.
 fn is_generation_pinned_object_get(headers: &[u8]) -> bool {
     if !is_object_get_request(headers) {
@@ -801,9 +800,8 @@ async fn accelerated_refresh_retries_a_replaced_object(
     mix.wait_for_first_pinned_object_get().await?;
     ensure!(
         mix.unpinned_object_gets() >= 1,
-        "schema inference must GET '{}' without If-Match/versionId before the refresh scan pins it; \
-         otherwise waiting for any object GET would overwrite during inference",
-        OBJECT_KEY
+        "schema inference must GET '{OBJECT_KEY}' without If-Match/versionId before the refresh scan pins it; \
+         otherwise waiting for any object GET would overwrite during inference"
     );
     overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
     let rt = load
