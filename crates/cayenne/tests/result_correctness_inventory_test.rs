@@ -761,3 +761,110 @@ fn top_level_predicates_ignore_subquery_clauses() {
     ));
     assert!(!has_top_level_limit("SELECT v FROM t"));
 }
+
+/// A later key column is still constrained *within* a run of rows tied on the
+/// columns before it, so a `NULL` there can hide an inversion the same way one
+/// in the leading column can. Both adjacent pairs below are unjudged.
+#[test]
+fn sort_check_catches_an_inversion_straddling_a_null_in_a_later_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let inverted_within_a_tie = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1])),
+            Arc::new(Int64Array::from(vec![Some(2), None, Some(1)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "later_key_null",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[inverted_within_a_tie.clone()],
+        &[inverted_within_a_tie],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2 goes 2 then 1 inside a k1 tie, which no NULL placement makes legal: {result:?}"
+    );
+}
+
+/// The same shape must stay legal once an earlier key separates the rows: a
+/// secondary key only orders within a tie, so it may step backwards freely.
+#[test]
+fn sort_check_allows_a_later_key_to_restart_when_an_earlier_one_changes() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cnt", DataType::Int64, false),
+        Field::new("state", DataType::Int64, true),
+    ]));
+    let restarts_per_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(5), None, Some(1), Some(3)])),
+        ],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "group_restart",
+        "SELECT cnt, state FROM t ORDER BY cnt, state",
+        &[restarts_per_group.clone()],
+        &[restarts_per_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        comparison.is_fully_verified_pass(),
+        "state may drop from 5 to 1 when cnt changes: {comparison:?}"
+    );
+}
+
+/// A bare name matching two output columns identifies neither. Guessing the
+/// first would check the wrong column; the hole is reported instead.
+#[test]
+fn an_ambiguous_column_name_is_not_guessed() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let resolution = resolve_sort_key("SELECT a.id, b.id FROM a, b ORDER BY id", &schema);
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "an ambiguous name must report, not pick the first: {resolution:?}"
+    );
+}
+
+/// A qualified term still resolves when the projection names it exactly, even
+/// though the bare name is ambiguous across the result columns.
+#[test]
+fn a_qualified_name_resolves_through_the_projection() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    assert_eq!(
+        resolve_sort_key("SELECT a.id, b.id FROM a, b ORDER BY b.id", &schema),
+        SortKeyResolution::Resolved {
+            key: vec![SortKeyColumn {
+                index: 1,
+                name: "id".to_string(),
+                descending: false,
+                nulls_first: None,
+            }],
+            unresolved_suffix: None,
+        }
+    );
+}

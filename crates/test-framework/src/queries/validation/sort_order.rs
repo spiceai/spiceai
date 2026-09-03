@@ -290,10 +290,13 @@ fn resolve_term(
     }
 
     // `ORDER BY revenue` / `ORDER BY o.o_orderdate` — a name that survives into
-    // the result schema, or a projection alias.
+    // the result schema, or a projection alias. Only when the name picks out one
+    // column: a join can project two columns sharing a name, and taking the first
+    // would silently check the wrong one. An ambiguous name falls through to the
+    // projection, where `o.o_orderdate` still matches its own item exactly.
     if let Some(name) = simple_name(expr) {
-        if let Some(index) = field_index(schema, name) {
-            return Some(index);
+        if let [only] = field_indices(schema, name).as_slice() {
+            return Some(*only);
         }
         if let Some(index) = projection.and_then(|items| alias_index(items, name)) {
             return Some(index);
@@ -313,11 +316,17 @@ fn simple_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn field_index(schema: &SchemaRef, name: &str) -> Option<usize> {
+/// Every result column carrying `name`. More than one means the name alone does
+/// not identify a column, so the caller must resolve it some other way rather
+/// than guessing at the first.
+fn field_indices(schema: &SchemaRef, name: &str) -> Vec<usize> {
     schema
         .fields()
         .iter()
-        .position(|field| field.name().eq_ignore_ascii_case(name))
+        .enumerate()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(name))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn alias_index(items: &[SelectItem], name: &str) -> Option<usize> {
@@ -487,36 +496,56 @@ fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<Sor
 
 /// Adjacent pairs alone cannot see an inversion that straddles an unjudged
 /// `NULL`: `[2, NULL, 1]` skips both pairs while being illegal under either
-/// placement convention. Comparing each key column's non-`NULL` values against
-/// the previous non-`NULL` value catches that without taking a position on where
+/// placement convention. Comparing a key column's non-`NULL` values against the
+/// previous non-`NULL` value catches that without taking a position on where
 /// `NULL`s belong.
+///
+/// Every key column needs this, not just the leading one, because a later column
+/// is still constrained *within* a run of rows tied on the columns before it:
+/// `ORDER BY k1, k2` over `[(1, 2), (1, NULL), (1, 1)]` is illegal, and both of
+/// its adjacent pairs are unjudged. So each column is checked inside its own tie
+/// group, which is what keeps `ORDER BY cnt, state` free to step `state`
+/// backwards the moment `cnt` changes.
 fn check_non_null_subsequences(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
-    // Only the most significant column is constrained across the whole result.
-    // A later key column orders rows only *within* a tie of the columns before
-    // it, so checking one globally would reject correct results — `ORDER BY cnt,
-    // state` may legally step state backwards the moment cnt changes.
-    let KeyComparator {
-        column,
-        array,
-        compare,
-    } = comparators.first()?;
-    if !(0..rows).any(|row| array.is_null(row)) {
-        // No NULLs, so no pair went unjudged and the adjacent walk covered it.
-        return None;
-    }
-    let mut previous: Option<usize> = None;
-    for row in 0..rows {
-        if array.is_null(row) {
+    for (depth, key) in comparators.iter().enumerate() {
+        let KeyComparator {
+            column,
+            array,
+            compare,
+        } = key;
+        if !(0..rows).any(|row| array.is_null(row)) {
+            // No NULLs, so no pair went unjudged and the adjacent walk covered it.
             continue;
         }
-        if let Some(previous_row) = previous
-            && compare(previous_row, row) == Ordering::Greater
-        {
-            return Some(violation(column, array.as_ref(), previous_row, row));
+        let preceding = &comparators[..depth];
+        let mut previous: Option<usize> = None;
+        for row in 0..rows {
+            if row > 0 && !tied_on(preceding, row - 1, row) {
+                // An earlier key separated these rows (or left them unjudged), so
+                // this column's ordering starts over.
+                previous = None;
+            }
+            if array.is_null(row) {
+                continue;
+            }
+            if let Some(previous_row) = previous
+                && compare(previous_row, row) == Ordering::Greater
+            {
+                return Some(violation(column, array.as_ref(), previous_row, row));
+            }
+            previous = Some(row);
         }
-        previous = Some(row);
     }
     None
+}
+
+/// Whether two adjacent rows are *known* equal on every one of `keys`. A pair a
+/// `NULL` leaves unjudged is not known-equal, so it ends the tie group rather
+/// than silently extending it.
+fn tied_on(keys: &[KeyComparator], a: usize, b: usize) -> bool {
+    keys.iter().all(|KeyComparator { array, compare, .. }| {
+        !array.is_null(a) && !array.is_null(b) && compare(a, b) == Ordering::Equal
+    })
 }
 
 /// Whether `sql` carries a top-level `ORDER BY`, i.e. whether the order of its
