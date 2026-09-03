@@ -611,9 +611,7 @@ impl RefreshTask {
         // Count once for the failure that ended the refresh. A 412 that retries
         // successfully is not an error; an exhausted generation-change still
         // carries `reason=object_generation_changed` so it can be filtered.
-        if let Err(e) = &result
-            && !self.runtime_status.is_shutdown()
-        {
+        if let Some(e) = terminal_refresh_error(&result, self.runtime_status.is_shutdown()) {
             tracing::error!(
                 "Failed to refresh {} {}: {e}",
                 self.component_type(),
@@ -2973,6 +2971,20 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     })
 }
 
+/// The error that ended a refresh retry loop, if it should increment
+/// `dataset_acceleration_refresh_errors`.
+///
+/// A recovered retry (`Ok`) and a shutdown abort are not refresh errors. The
+/// metric is incremented from this value only, so a transient 412 that later
+/// succeeds cannot emit a point and an exhausted failure emits exactly one.
+#[must_use]
+fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
+    if shutdown {
+        return None;
+    }
+    result.as_ref().err()
+}
+
 /// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
 ///
 /// Generation-change is checked first so a 412 wrapped in a Parquet fetch
@@ -3023,7 +3035,9 @@ fn looks_like_generation_change(text: &str) -> bool {
 
 fn looks_like_parquet_decode(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("snappy")
+    // `snappy:` is the codec prefix on `snappy: corrupt input`. A bare
+    // "snappy" also matches object keys like `snappy/archive/data.parquet`.
+    lower.contains("snappy:")
         || lower.contains("corrupt input")
         || lower.contains("corrupt footer")
         || lower.contains("invalid page header")
@@ -3112,8 +3126,10 @@ mod tests {
     use runtime_metrics::acceleration as metrics;
     use spice_table::IndexLayer;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
-    use util::RetryError;
+    use util::fibonacci_backoff::FibonacciBackoffBuilder;
+    use util::{RetryError, retry};
 
     #[derive(Debug)]
     struct TestRefreshIndex;
@@ -3396,6 +3412,96 @@ mod tests {
         assert_ne!(
             refresh_error_reason_from_message(footer),
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let snappy_path = "Object at path snappy/archive/data.parquet: AccessDenied";
+        assert_eq!(
+            refresh_error_reason_from_message(snappy_path),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        let path_classified = retry_from_df_error(DataFusionError::External(Box::new(
+            std::io::Error::other(snappy_path),
+        )));
+        assert!(
+            matches!(&path_classified, RetryError::Permanent(_)),
+            "AccessDenied on a snappy-named path must stay permanent"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&path_classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message(
+                "Parquet error: Arrow: Parquet argument error: External: snappy: corrupt input \
+                 (expected copy read of length 1; remaining src: 0)"
+            ),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_generation_change_does_not_record_a_refresh_error() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(3))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let result: super::super::Result<()> = retry(retry_strategy, || async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Err(retry_from_df_error(DataFusionError::External(Box::new(
+                    std::io::Error::other(
+                        "Request precondition failure for path listing/data.parquet: \
+                         412 Precondition Failed",
+                    ),
+                ))));
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok(), "a 412 must recover on retry: {result:?}");
+        assert!(
+            terminal_refresh_error(&result, false).is_none(),
+            "a successful retry must not increment dataset_acceleration_refresh_errors"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the recovered path must have retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_generation_change_records_one_reason_labeled_error() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(0))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let result: super::super::Result<()> = retry(retry_strategy, || async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(retry_from_df_error(DataFusionError::External(Box::new(
+                std::io::Error::other(
+                    "Request precondition failure for path listing/data.parquet: \
+                     412 Precondition Failed",
+                ),
+            ))))
+        })
+        .await;
+        let recorded = terminal_refresh_error(&result, false)
+            .expect("an exhausted generation-change is a refresh error");
+        assert_eq!(
+            refresh_error_reason(recorded),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+        assert!(
+            terminal_refresh_error(&result, true).is_none(),
+            "shutdown must not increment dataset_acceleration_refresh_errors"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "max_retries=0 must attempt once and then count exactly one terminal error"
         );
     }
 

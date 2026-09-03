@@ -96,15 +96,28 @@ fn snappy_properties() -> WriterProperties {
         .build()
 }
 
+/// Payload for row `i` of generation `seed`.
+///
+/// Every generation pads with `seed` extra `x` characters so a mixed scan of
+/// two generations cannot share either generation's `sum(char_length(payload))`.
+/// Putting `{seed}` in the payload changes content but almost never length, so a
+/// replaced row group would otherwise keep the listed generation's sum.
+fn generation_payload(seed: i64, i: i64) -> String {
+    let pad_len = usize::try_from(seed).expect("generation seed is non-negative");
+    format!(
+        "pay-{seed}-{i:08}-{}-{}",
+        (i * 17 + seed * 31) % 1_000_000,
+        "x".repeat(pad_len)
+    )
+}
+
 fn generation_table(seed: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("payload", DataType::Utf8, false),
     ]));
     let ids: Vec<i64> = (0..ROWS).collect();
-    let payload: Vec<String> = (0..ROWS)
-        .map(|i| format!("pay-{seed}-{i:08}-{}", (i * 17 + seed * 31) % 1_000_000))
-        .collect();
+    let payload: Vec<String> = (0..ROWS).map(|i| generation_payload(seed, i)).collect();
     RecordBatch::try_new(
         schema,
         vec![
@@ -130,10 +143,39 @@ fn write_snappy_parquet(batch: &RecordBatch) -> Vec<u8> {
 fn expected_payload_char_len(seed: i64) -> i64 {
     (0..ROWS)
         .map(|i| {
-            let payload = format!("pay-{seed}-{i:08}-{}", (i * 17 + seed * 31) % 1_000_000);
-            i64::try_from(payload.chars().count()).expect("payload char length fits i64")
+            i64::try_from(generation_payload(seed, i).chars().count())
+                .expect("payload char length fits i64")
         })
         .sum()
+}
+
+#[test]
+fn a_mixed_row_group_does_not_share_either_generation_payload_sum() {
+    let sum_a = expected_payload_char_len(1);
+    let sum_b = expected_payload_char_len(2);
+    assert_ne!(
+        sum_a, sum_b,
+        "generations must differ in payload-length sum"
+    );
+    let group = i64::try_from(ROW_GROUP_SIZE).expect("row group size fits i64");
+    let mixed: i64 = (0..ROWS)
+        .map(|i| {
+            let seed = if (group..2 * group).contains(&i) {
+                2
+            } else {
+                1
+            };
+            i64::try_from(generation_payload(seed, i).chars().count()).expect("fits i64")
+        })
+        .sum();
+    assert_ne!(
+        mixed, sum_a,
+        "replacing one row group with generation B must not keep generation A's payload-length sum"
+    );
+    assert_ne!(
+        mixed, sum_b,
+        "replacing one row group with generation B must not equal generation B's payload-length sum"
+    );
 }
 
 fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
@@ -402,7 +444,7 @@ fn sum_i64_column(column: &arrow::array::ArrayRef) -> Result<i64, String> {
 fn is_mixed_generation_failure(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("invalid page header")
-        || e.contains("snappy")
+        || e.contains("snappy:")
         || e.contains("corrupt input")
         || e.contains("failed to fill whole buffer")
         || e.contains("range length must match")
