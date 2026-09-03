@@ -45,10 +45,9 @@ async fn explain_plan(rt: &Runtime, sql: &str) -> String {
         .to_string()
 }
 
-/// Bootstrap a `DuckLake` catalog at the given metadata path with test tables.
-///
-/// Creates tables: `orders`, `customers`, `products` under the `main` schema.
-fn bootstrap_ducklake(metadata_path: &str, data_path: &str) {
+/// Opens an in-memory `DuckDB` connection with the `ducklake` extension loaded
+/// and the lake at `metadata_path` attached under `alias`.
+fn attach_ducklake(alias: &str, metadata_path: &str, data_path: &str) -> duckdb::Connection {
     let db = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
     db.execute("INSTALL ducklake", [])
         .expect("install ducklake");
@@ -57,8 +56,17 @@ fn bootstrap_ducklake(metadata_path: &str, data_path: &str) {
     let escaped_metadata = metadata_path.replace('\'', "''");
     let escaped_data = data_path.replace('\'', "''");
     let attach_sql =
-        format!("ATTACH 'ducklake:{escaped_metadata}' AS test_lake (DATA_PATH '{escaped_data}')");
+        format!("ATTACH 'ducklake:{escaped_metadata}' AS {alias} (DATA_PATH '{escaped_data}')");
     db.execute(&attach_sql, []).expect("attach ducklake");
+
+    db
+}
+
+/// Bootstrap a `DuckLake` catalog at the given metadata path with test tables.
+///
+/// Creates tables: `orders`, `customers`, `products` under the `main` schema.
+fn bootstrap_ducklake(metadata_path: &str, data_path: &str) {
+    let db = attach_ducklake("test_lake", metadata_path, data_path);
 
     db.execute(
         "CREATE TABLE test_lake.main.orders (id INTEGER, customer_id INTEGER, total DOUBLE)",
@@ -650,6 +658,170 @@ async fn ducklake_catalog_read_write_insert() -> Result<(), anyhow::Error> {
                     "+----+-------------+-------+",
                 ],
                 &results
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A `DuckLake` catalog whose one table carries the strings the rewritten
+/// built-ins are measured on: space-padded, character-padded, neither, and
+/// NULL.
+///
+/// Deliberately a separate lake from [`bootstrap_ducklake`]: the tests above
+/// assert the exact set of tables `information_schema` reports, so adding a
+/// table to the shared fixture would change what they see.
+fn bootstrap_ducklake_names(metadata_path: &str, data_path: &str) {
+    let db = attach_ducklake("name_lake", metadata_path, data_path);
+
+    db.execute(
+        "CREATE TABLE name_lake.main.names (id INTEGER, name VARCHAR)",
+        [],
+    )
+    .expect("create names");
+    db.execute(
+        "INSERT INTO name_lake.main.names VALUES \
+         (1, '  padded  '), (2, 'xyhelloyx'), (3, 'Alpha'), (4, NULL)",
+        [],
+    )
+    .expect("insert names");
+}
+
+/// The `DuckDB` unparser dialect has to be installed on the **catalog** route,
+/// not only the dataset one.
+///
+/// `DuckLake` is `DuckDB`, so the SQL a federated scan sends it has to be
+/// spelled the way `DuckDB` spells it. Two `DataFusion` built-ins federate to a
+/// name `DuckDB` does not have: `trim` reaches the unparser as `btrim` (its own
+/// name — `trim` is only an alias), and `regexp_like` has to become
+/// `regexp_matches`. Only the dialect rewrites either, and nothing withholds a
+/// built-in from pushdown, so a catalog built with the stock dialect sends
+/// `DuckDB` a statement it rejects with
+/// `Catalog Error: Scalar Function with name btrim does not exist!`.
+///
+/// The dataset route in the same app is the control: it registers the same
+/// table through the connector, which has always attached the dialect, so the
+/// two routes disagreeing is the asymmetry this pins (regression test for
+/// #13825).
+///
+/// The `base_sql` assertions are what make this a guard rather than a smoke
+/// test. They read the statement `DuckDB` is actually asked to run, so the test
+/// fails if the call stops being pushed down at all — which is the other way an
+/// answer-only assertion could go green with the dialect removed.
+#[tokio::test]
+async fn ducklake_catalog_route_installs_the_duckdb_dialect() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("runtime=DEBUG,data_components=DEBUG"));
+    register_test_connectors().await;
+
+    let tmp_dir = TempDir::new()?;
+    let metadata_path = tmp_dir
+        .path()
+        .join("test_names.ducklake")
+        .display()
+        .to_string();
+    let data_path = tmp_dir.path().join("data_names").display().to_string();
+    std::fs::create_dir_all(&data_path)?;
+
+    bootstrap_ducklake_names(&metadata_path, &data_path);
+
+    test_request_context()
+        .scope(async {
+            let mut catalog = Catalog::new("ducklake".to_string(), "name_lake".to_string());
+            catalog.params = Some(make_ducklake_catalog_params(&metadata_path));
+
+            let mut dataset =
+                Dataset::new("ducklake:main.names".to_string(), "names_ds".to_string());
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "ducklake_connection_string".to_string(),
+                metadata_path.clone(),
+            )])));
+
+            let app = AppBuilder::new("ducklake_dialect_test")
+                .with_catalog(catalog)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT id, trim(name) AS trimmed, \
+                         regexp_like(name, 'ell') AS matched \
+                         FROM {table} ORDER BY id";
+            let catalog_query = query.replace("{table}", "name_lake.main.names");
+
+            // `base_sql` is the statement the federated scan sends DuckDB, and
+            // the only part of the plan that says how the call is spelled: the
+            // logical plan above it names the DataFusion function either way.
+            let plan = explain_plan(&rt, &catalog_query).await;
+            let remote_sql: String = plan
+                .split("base_sql=")
+                .skip(1)
+                .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                remote_sql.contains("trim(") && !remote_sql.contains("btrim("),
+                "DuckDB has no `btrim`; the catalog route must push down `trim`. Plan was:\n{plan}"
+            );
+            assert!(
+                remote_sql.contains("regexp_matches(") && !remote_sql.contains("regexp_like("),
+                "DuckDB has no `regexp_like`; the catalog route must push down \
+                 `regexp_matches`. Plan was:\n{plan}"
+            );
+
+            let from_catalog: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&catalog_query)
+                .build()
+                .run()
+                .await?
+                .data
+                .try_collect()
+                .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+----+-----------+---------+",
+                    "| id | trimmed   | matched |",
+                    "+----+-----------+---------+",
+                    "| 1  | padded    | false   |",
+                    "| 2  | xyhelloyx | true    |",
+                    "| 3  | Alpha     | false   |",
+                    "| 4  |           |         |",
+                    "+----+-----------+---------+",
+                ],
+                &from_catalog
+            );
+
+            // The dataset route over the same table, which has always carried
+            // the dialect. Answering the same thing is the point: a rewrite
+            // that reached DuckDB but changed the answer would pass every
+            // assertion above and fail here.
+            let from_dataset: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&query.replace("{table}", "names_ds"))
+                .build()
+                .run()
+                .await?
+                .data
+                .try_collect()
+                .await?;
+
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(&from_catalog)?.to_string(),
+                arrow::util::pretty::pretty_format_batches(&from_dataset)?.to_string(),
+                "the catalog and dataset routes over one DuckLake table must agree"
             );
 
             Ok(())
