@@ -314,7 +314,7 @@ where
     /// The window `keys_matching` leaves — an entry admitted after its shard was walked —
     /// is the same one moka's predicate-based invalidation leaves, since a moka predicate
     /// only matches entries last modified before it was registered. For served results it
-    /// is closed on the write side by `TableInvalidationClock`, which refuses a cache write
+    /// is closed on the write side by `TableChangeClock`, which refuses a cache write
     /// whose read began before the invalidation. In the other direction, a key matched by
     /// the scan and then rewritten by a concurrent `insert` is removed on the strength of
     /// the value the scan saw, so a fresh entry can be dropped — a cache miss, never a

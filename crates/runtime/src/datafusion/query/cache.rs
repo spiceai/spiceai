@@ -615,7 +615,7 @@ impl Query {
             // This is only an early exit that avoids encoding a result already
             // known to be unservable; correctness comes from the check every
             // cache hit performs against the entry's `read_started_at`.
-            if cache_provider.tables_invalidated_since(&input_tables, revalidation_started_at) {
+            if cache_provider.tables_changed_since(&input_tables, revalidation_started_at) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
                     "An input table was invalidated during background revalidation, discarding the result rather than repopulating the cache"

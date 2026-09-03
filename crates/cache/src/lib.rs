@@ -470,27 +470,33 @@ impl Caching {
     }
 }
 
-/// Records, per table, when that table was last invalidated.
+/// Records, per table, when that table's contents last changed.
 ///
-/// Invalidating a cache can only remove entries that already exist. A query
-/// that read a table *before* it was invalidated but finishes writing its
-/// result *after* would otherwise repopulate the cache with pre-invalidation
-/// data, and that entry survives — [`moka`] invalidation closures only match
-/// entries last modified at or before the closure was registered.
+/// Deliberately says nothing about what is *done* about a change: an
+/// accelerated refresh, a CDC batch and a DML write all stamp it the same way,
+/// and [`QueryResultsCacheProvider::entry_validity`] decides at read time
+/// whether that means eviction or stale-serving. Naming the record after one
+/// of those outcomes would be wrong for the other.
+///
+/// Evicting a cache can only remove entries that already exist. A query that
+/// read a table *before* it changed but finishes writing its result *after*
+/// would otherwise repopulate the cache with pre-change data, and that entry
+/// survives — [`moka`] invalidation closures only match entries last modified
+/// at or before the closure was registered.
 ///
 /// An entry therefore records when its read began, and every cache *hit*
-/// consults this clock: an entry whose tables were invalidated since it read
-/// them is never served *as fresh*, no matter when it was stored — see
+/// consults this clock: an entry whose tables changed since it read them is
+/// never served *as fresh*, no matter when it was stored — see
 /// [`QueryResultsCacheProvider::entry_validity`] for what happens to it
 /// instead. Checking on read rather than on write is what makes this airtight —
 /// a check before storing leaves the entry observable in the window between the
 /// check and the store, however small. Reads are far more frequent than
-/// invalidations, so this is an `RwLock` rather than a lock-free map, and
+/// changes, so this is an `RwLock` rather than a lock-free map, and
 /// lookups hash table names directly rather than building a key string, keeping
 /// the hit path allocation-free.
 ///
 /// Memory is bounded at [`MAX_TRACKED_TABLES`] regardless of how many distinct
-/// tables are invalidated over a process lifetime. Table identities are not
+/// tables change over a process lifetime. Table identities are not
 /// bounded by configuration — where DDL is enabled a client can create and
 /// write to arbitrarily many tables, and dataset names also churn across
 /// hot-reloads — so the map cannot be allowed to grow with all-time history.
@@ -499,11 +505,11 @@ impl Caching {
 /// outlives any age-based cutoff. Instead, over-capacity collapses the map into
 /// a single conservative `discarded_floor`, which rejects *every* write whose
 /// read began before that point. That is sound (it can only over-reject) and
-/// self-healing (later invalidations repopulate per-table entries), at the cost
+/// self-healing (later changes repopulate per-table entries), at the cost
 /// of some lost cache entries in the moments after a collapse.
 #[derive(Default)]
-struct TableInvalidationClock {
-    state: parking_lot::RwLock<TableInvalidationState>,
+struct TableChangeClock {
+    state: parking_lot::RwLock<TableChangeState>,
 }
 
 /// Upper bound on individually-tracked tables. Each entry is a `u64` hash of
@@ -513,16 +519,16 @@ struct TableInvalidationClock {
 const MAX_TRACKED_TABLES: usize = 4096;
 
 #[derive(Default)]
-struct TableInvalidationState {
-    invalidated_at: std::collections::HashMap<u64, std::time::Instant>,
-    /// Stands in for every table dropped from `invalidated_at`. Holds the
+struct TableChangeState {
+    changed_at: std::collections::HashMap<u64, std::time::Instant>,
+    /// Stands in for every table dropped from `changed_at`. Holds the
     /// newest instant among the dropped entries, which is `>=` the true
-    /// invalidation instant of each of them, so treating it as their stamp can
+    /// change instant of each of them, so treating it as their stamp can
     /// only reject writes that a per-table entry would have allowed.
     discarded_floor: Option<std::time::Instant>,
 }
 
-impl TableInvalidationClock {
+impl TableChangeClock {
     /// Key a table by a hash of its fully-resolved `catalog.schema.table`
     /// form, so that differently-qualified references to the same physical
     /// table collide — matching [`resolved_table_match`].
@@ -548,28 +554,26 @@ impl TableInvalidationClock {
         hasher.finish()
     }
 
-    fn mark_invalidated(&self, table_ref: &TableReference, at: std::time::Instant) {
+    fn record_change(&self, table_ref: &TableReference, at: std::time::Instant) {
         let key = Self::resolved_key(table_ref);
         let mut state = self.state.write();
 
-        if state.invalidated_at.len() >= MAX_TRACKED_TABLES
-            && !state.invalidated_at.contains_key(&key)
-        {
-            let newest = state.invalidated_at.values().copied().max();
+        if state.changed_at.len() >= MAX_TRACKED_TABLES && !state.changed_at.contains_key(&key) {
+            let newest = state.changed_at.values().copied().max();
             state.discarded_floor = state.discarded_floor.max(newest);
-            state.invalidated_at.clear();
+            state.changed_at.clear();
         }
 
-        state.invalidated_at.insert(key, at);
+        state.changed_at.insert(key, at);
     }
 
-    /// Returns the newest instant at which any of `tables` was invalidated, or
+    /// Returns the newest instant at which any of `tables` changed, or
     /// `None` if none of them has been.
     ///
     /// The newest is what a result reading all of them is measured against: any
     /// one of its tables moving on is enough to leave the result behind, so the
     /// most recent such move is the one that matters.
-    fn latest_invalidation<S: std::hash::BuildHasher>(
+    fn latest_change<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
     ) -> Option<std::time::Instant> {
@@ -584,7 +588,7 @@ impl TableInvalidationClock {
         for table_ref in tables {
             latest = latest.max(
                 state
-                    .invalidated_at
+                    .changed_at
                     .get(&Self::resolved_key(table_ref))
                     .copied(),
             );
@@ -592,27 +596,26 @@ impl TableInvalidationClock {
         latest
     }
 
-    /// Returns `true` if any of `tables` was invalidated at or after `since`.
+    /// Returns `true` if any of `tables` changed at or after `since`.
     ///
-    /// Ties count as invalidated: an invalidation recorded in the same instant
+    /// Ties count as changed: a change recorded in the same instant
     /// as the read began must be assumed to have happened first, since serving
     /// stale data is worse than losing a cache entry.
-    fn invalidated_since<S: std::hash::BuildHasher>(
+    fn changed_since<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
         since: std::time::Instant,
     ) -> bool {
-        self.latest_invalidation(tables)
-            .is_some_and(|at| at >= since)
+        self.latest_change(tables).is_some_and(|at| at >= since)
     }
 
     #[cfg(test)]
     fn tracked_tables(&self) -> usize {
-        self.state.read().invalidated_at.len()
+        self.state.read().changed_at.len()
     }
 }
 
-/// How a cached SQL result stands against the table-invalidation clock at the
+/// How a cached SQL result stands against the table-change clock at the
 /// moment it is looked up.
 ///
 /// Produced by [`QueryResultsCacheProvider::entry_validity`], which documents
@@ -620,17 +623,16 @@ impl TableInvalidationClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EntryValidity {
-    /// No table this entry read has been invalidated since it read them. The
-    /// entry follows the ordinary TTL and stale-while-revalidate rules.
+    /// No table this entry read has changed since it read them. The entry
+    /// follows the ordinary TTL and stale-while-revalidate rules.
     Valid = 0,
-    /// A table this entry read was invalidated after the read began, and the
-    /// invalidation is still inside the configured `stale_while_revalidate_ttl`.
-    /// The entry may be served once more, marked stale, while a background
-    /// revalidation replaces it.
+    /// A table this entry read changed after the read began, and that change is
+    /// still inside the configured `stale_while_revalidate_ttl`. The entry may
+    /// be served, marked stale, while a background revalidation replaces it.
     StaleWhileRevalidate = 1,
-    /// A table this entry read was invalidated after the read began and the
-    /// entry cannot be served at all: either no `stale_while_revalidate_ttl` is
-    /// configured, or the invalidation has fallen out of that window.
+    /// A table this entry read changed after the read began and the entry
+    /// cannot be served at all: either no `stale_while_revalidate_ttl` is
+    /// configured, or the change has fallen out of that window.
     Invalidated = 2,
 }
 
@@ -661,7 +663,7 @@ pub struct QueryResultsCacheProvider {
     encoder: Option<Arc<dyn encoding::Encoder>>,
     encoding: spicepod::component::caching::Encoding,
     hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
-    table_invalidations: TableInvalidationClock,
+    table_changes: TableChangeClock,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -734,7 +736,7 @@ impl QueryResultsCacheProvider {
             encoder,
             encoding: config.encoding,
             hashing_algorithm: config.hashing_algorithm,
-            table_invalidations: TableInvalidationClock::default(),
+            table_changes: TableChangeClock::default(),
         };
 
         Ok(cache_provider)
@@ -759,7 +761,7 @@ impl QueryResultsCacheProvider {
     }
 
     /// Like [`Self::get_raw_key`], but also returns an entry the
-    /// table-invalidation clock has degraded to
+    /// table-change clock has degraded to
     /// [`EntryValidity::StaleWhileRevalidate`], along with the state it was
     /// found in.
     ///
@@ -781,9 +783,8 @@ impl QueryResultsCacheProvider {
             .await)
     }
 
-    /// Looks `raw_key` up and rules the entry found against the
-    /// table-invalidation clock, serving it only if `accepts` takes the state
-    /// it is in.
+    /// Looks `raw_key` up and rules the entry found against the table-change
+    /// clock, serving it only if `accepts` takes the state it is in.
     ///
     /// Validating here, on the read, is what makes stale results unservable
     /// rather than merely short-lived. Removing an entry after storing it
@@ -874,12 +875,12 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        // Record the invalidation before removing entries, never after. A
+        // Record the change before removing entries, never after. A
         // writer that started before this point must be rejected by
-        // `tables_invalidated_since`, and stamping afterwards leaves exactly
+        // `tables_changed_since`, and stamping afterwards leaves exactly
         // the same gap one step earlier.
-        self.table_invalidations
-            .mark_invalidated(&table_name, std::time::Instant::now());
+        self.table_changes
+            .record_change(&table_name, std::time::Instant::now());
 
         // With `stale_while_revalidate_ttl` configured, the mark *is* the
         // invalidation: dependent entries stay resident so that a hit inside
@@ -909,12 +910,12 @@ impl QueryResultsCacheProvider {
     }
 
     /// Rules a cache entry that read `tables` starting at `read_started_at`
-    /// against the table-invalidation clock, as of `now`.
+    /// against the table-change clock, as of `now`.
     ///
-    /// An entry's mark is the *latest* invalidation instant among the tables it
-    /// read. A mark strictly older than the read leaves the entry
-    /// [`EntryValidity::Valid`] — it was computed after that invalidation, so
-    /// the invalidation says nothing about it.
+    /// An entry's mark is the *latest* change instant among the tables it read.
+    /// A mark strictly older than the read leaves the entry
+    /// [`EntryValidity::Valid`] — it was computed after that change, so the
+    /// change says nothing about it.
     ///
     /// A mark at or after the read means the entry may hold data the table has
     /// since moved past, and what happens then depends on whether the operator
@@ -934,14 +935,14 @@ impl QueryResultsCacheProvider {
     /// The mark-anchored window is an upper bound on servability, not a
     /// guarantee of residency. The backend expires an entry `item_ttl +
     /// stale_while_revalidate_ttl` after it was *stored*, regardless of any
-    /// mark, so an invalidation landing late in an entry's life opens a window
+    /// mark, so a change landing late in an entry's life opens a window
     /// the entry may not survive: the effective window is the shorter of the
     /// two. That can only end the stale-serving period early, never extend it
     /// past the mark, so it is safe — it just yields fewer absorbed misses than
     /// the window alone would suggest.
     ///
-    /// Ties count as invalidated: an invalidation recorded in the same instant
-    /// as the read began must be assumed to have happened first.
+    /// Ties count as changed: a change recorded in the same instant as the
+    /// read began must be assumed to have happened first.
     #[must_use]
     pub fn entry_validity<S: std::hash::BuildHasher>(
         &self,
@@ -949,7 +950,7 @@ impl QueryResultsCacheProvider {
         read_started_at: std::time::Instant,
         now: std::time::Instant,
     ) -> EntryValidity {
-        let Some(mark) = self.table_invalidations.latest_invalidation(tables) else {
+        let Some(mark) = self.table_changes.latest_change(tables) else {
             return EntryValidity::Valid;
         };
         if mark < read_started_at {
@@ -981,9 +982,9 @@ impl QueryResultsCacheProvider {
             .filter(|stale_ttl| !stale_ttl.is_zero())
     }
 
-    /// Returns `true` if any of `tables` has been invalidated at or after
-    /// `read_started_at`, meaning a result read at that point may predate the
-    /// invalidation and so cannot be stored as a fresh cache entry.
+    /// Returns `true` if any of `tables` changed at or after `read_started_at`,
+    /// meaning a result read at that point may predate the change and so cannot
+    /// be stored as a fresh cache entry.
     ///
     /// This is the coarse form of [`Self::entry_validity`], for the write side:
     /// a result already known not to be storable as fresh is not worth encoding
@@ -1013,13 +1014,12 @@ impl QueryResultsCacheProvider {
     /// invalidations arriving on a refresh interval (typically minutes), so it
     /// should rarely fire at all.
     #[must_use]
-    pub fn tables_invalidated_since<S: std::hash::BuildHasher>(
+    pub fn tables_changed_since<S: std::hash::BuildHasher>(
         &self,
         tables: &HashSet<TableReference, S>,
         read_started_at: std::time::Instant,
     ) -> bool {
-        self.table_invalidations
-            .invalidated_since(tables, read_started_at)
+        self.table_changes.changed_since(tables, read_started_at)
     }
 
     #[must_use]
@@ -1213,23 +1213,23 @@ mod tests {
     /// deterministic instead of depending on clock granularity.
     #[test]
     fn table_invalidation_clock_orders_reads_against_invalidations() {
-        let clock = TableInvalidationClock::default();
+        let clock = TableChangeClock::default();
         let base = std::time::Instant::now();
         let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
 
         // Nothing invalidated yet.
-        assert!(!clock.invalidated_since(&tables, base));
+        assert!(!clock.changed_since(&tables, base));
 
-        clock.mark_invalidated(&TableReference::bare("customer"), base);
+        clock.record_change(&TableReference::bare("customer"), base);
 
         // A read that began at or after the invalidation is unaffected by it.
-        assert!(!clock.invalidated_since(&tables, base + std::time::Duration::from_millis(1)));
+        assert!(!clock.changed_since(&tables, base + std::time::Duration::from_millis(1)));
 
         // A read that began before the invalidation must be discarded, and a
         // read beginning in the very same instant is treated the same way.
-        assert!(clock.invalidated_since(&tables, base));
+        assert!(clock.changed_since(&tables, base));
         assert!(
-            clock.invalidated_since(
+            clock.changed_since(
                 &tables,
                 base.checked_sub(std::time::Duration::from_millis(1))
                     .unwrap_or(base)
@@ -1245,32 +1245,32 @@ mod tests {
         let base = std::time::Instant::now();
         let read_started_at = base + std::time::Duration::from_millis(1);
 
-        let clock = TableInvalidationClock::default();
-        clock.mark_invalidated(&TableReference::bare("customer"), read_started_at);
+        let clock = TableChangeClock::default();
+        clock.record_change(&TableReference::bare("customer"), read_started_at);
         let stored: HashSet<TableReference> = HashSet::from([TableReference::full(
             SPICE_DEFAULT_CATALOG,
             SPICE_DEFAULT_SCHEMA,
             "customer",
         )]);
-        assert!(clock.invalidated_since(&stored, base));
+        assert!(clock.changed_since(&stored, base));
 
-        let clock = TableInvalidationClock::default();
-        clock.mark_invalidated(
+        let clock = TableChangeClock::default();
+        clock.record_change(
             &TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "customer"),
             read_started_at,
         );
         let stored: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
-        assert!(clock.invalidated_since(&stored, base));
+        assert!(clock.changed_since(&stored, base));
 
         // A different physical table must not reject the write.
         let other: HashSet<TableReference> = HashSet::from([TableReference::bare("orders")]);
-        assert!(!clock.invalidated_since(&other, base));
+        assert!(!clock.changed_since(&other, base));
         let other_schema: HashSet<TableReference> = HashSet::from([TableReference::full(
             SPICE_DEFAULT_CATALOG,
             "other",
             "customer",
         )]);
-        assert!(!clock.invalidated_since(&other_schema, base));
+        assert!(!clock.changed_since(&other_schema, base));
     }
 
     /// The clock must stay bounded no matter how many distinct tables are
@@ -1281,13 +1281,13 @@ mod tests {
     /// simply forgotten.
     #[test]
     fn table_invalidation_clock_stays_bounded_under_table_churn() {
-        let clock = TableInvalidationClock::default();
+        let clock = TableChangeClock::default();
         let base = std::time::Instant::now();
         let read_started_at = base + std::time::Duration::from_millis(1);
         let churn = MAX_TRACKED_TABLES * 2 + 7;
 
         for i in 0..churn {
-            clock.mark_invalidated(
+            clock.record_change(
                 &TableReference::bare(format!("transient_table_{i}")),
                 read_started_at,
             );
@@ -1305,7 +1305,7 @@ mod tests {
         let discarded: HashSet<TableReference> =
             HashSet::from([TableReference::bare("transient_table_0")]);
         assert!(
-            clock.invalidated_since(&discarded, base),
+            clock.changed_since(&discarded, base),
             "a discarded table must still reject writes from reads that predate its invalidation"
         );
 
@@ -1313,7 +1313,7 @@ mod tests {
         // unaffected, so caching resumes rather than being wedged off.
         let later = read_started_at + std::time::Duration::from_millis(1);
         assert!(
-            !clock.invalidated_since(&discarded, later),
+            !clock.changed_since(&discarded, later),
             "a read beginning after every recorded invalidation must still be cacheable"
         );
     }
@@ -1323,39 +1323,39 @@ mod tests {
     /// recent such move is what its stale window is anchored to.
     #[test]
     fn table_invalidation_clock_reports_the_latest_mark_among_tables() {
-        let clock = TableInvalidationClock::default();
+        let clock = TableChangeClock::default();
         let base = std::time::Instant::now();
         let later = base + std::time::Duration::from_secs(1);
 
-        clock.mark_invalidated(&TableReference::bare("orders"), base);
-        clock.mark_invalidated(&TableReference::bare("customer"), later);
+        clock.record_change(&TableReference::bare("orders"), base);
+        clock.record_change(&TableReference::bare("customer"), later);
 
         let both: HashSet<TableReference> = HashSet::from([
             TableReference::bare("orders"),
             TableReference::bare("customer"),
         ]);
-        assert_eq!(clock.latest_invalidation(&both), Some(later));
+        assert_eq!(clock.latest_change(&both), Some(later));
 
         let only_orders: HashSet<TableReference> = HashSet::from([TableReference::bare("orders")]);
-        assert_eq!(clock.latest_invalidation(&only_orders), Some(base));
+        assert_eq!(clock.latest_change(&only_orders), Some(base));
 
         let untouched: HashSet<TableReference> = HashSet::from([TableReference::bare("lineitem")]);
-        assert_eq!(clock.latest_invalidation(&untouched), None);
+        assert_eq!(clock.latest_change(&untouched), None);
 
         let empty: HashSet<TableReference> = HashSet::new();
-        assert_eq!(clock.latest_invalidation(&empty), None);
+        assert_eq!(clock.latest_change(&empty), None);
     }
 
     /// A table-less result (e.g. `SELECT 1`) records no input tables and must
     /// stay cacheable — an empty set is not "everything".
     #[test]
     fn table_invalidation_clock_ignores_empty_table_set() {
-        let clock = TableInvalidationClock::default();
+        let clock = TableChangeClock::default();
         let base = std::time::Instant::now();
-        clock.mark_invalidated(&TableReference::bare("customer"), base);
+        clock.record_change(&TableReference::bare("customer"), base);
 
         let empty: HashSet<TableReference> = HashSet::new();
-        assert!(!clock.invalidated_since(&empty, base));
+        assert!(!clock.changed_since(&empty, base));
     }
 
     async fn cached_result_for(table: &str, read_started_at: Instant) -> CachedQueryResult {
@@ -1489,7 +1489,7 @@ mod tests {
 
         let read_started_at = std::time::Instant::now();
         let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
-        assert!(!provider.tables_invalidated_since(&tables, read_started_at));
+        assert!(!provider.tables_changed_since(&tables, read_started_at));
 
         provider
             .invalidate_for_table(TableReference::bare("customer"))
@@ -1497,7 +1497,7 @@ mod tests {
             .expect("invalidation should succeed");
 
         assert!(
-            provider.tables_invalidated_since(&tables, read_started_at),
+            provider.tables_changed_since(&tables, read_started_at),
             "a result whose read began before the invalidation must not be stored"
         );
     }
