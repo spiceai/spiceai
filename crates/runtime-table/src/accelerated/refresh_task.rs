@@ -2322,11 +2322,10 @@ impl RefreshTask {
     }
 
     async fn record_refresh_error(&self, error: &super::Error, mode: &RefreshMode) {
-        let reason = refresh_error_reason(error);
-        for mut label_set in self.get_dataset_label_sets(mode).await {
-            label_set.push(KeyValue::new(metrics::REFRESH_ERROR_REASON, reason));
-            metrics::REFRESH_ERRORS.add(1, &label_set);
-        }
+        emit_refresh_errors(
+            self.get_dataset_label_sets(mode).await,
+            refresh_error_reason(error),
+        );
     }
 
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
@@ -2971,6 +2970,13 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     })
 }
 
+fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
+    for mut label_set in label_sets {
+        label_set.push(KeyValue::new(metrics::REFRESH_ERROR_REASON, reason));
+        metrics::REFRESH_ERRORS.add(1, &label_set);
+    }
+}
+
 /// The error that ended a refresh retry loop, if it should increment
 /// `dataset_acceleration_refresh_errors`.
 ///
@@ -3124,6 +3130,10 @@ mod tests {
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
+    use opentelemetry::KeyValue;
+    use opentelemetry::global;
+    use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+    use prometheus::proto::MetricType;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
     use runtime_metrics::acceleration as metrics;
     use spice_table::IndexLayer;
@@ -3530,6 +3540,119 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "max_retries=0 must attempt once and then count exactly one terminal error"
+        );
+    }
+
+    fn install_refresh_error_test_meter() -> prometheus::Registry {
+        let registry = prometheus::Registry::new();
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build prometheus exporter");
+        let provider = SdkMeterProvider::builder()
+            .with_resource(Resource::builder().build())
+            .with_reader(prometheus_exporter)
+            .build();
+        global::set_meter_provider(provider);
+        registry
+    }
+
+    fn refresh_error_count(registry: &prometheus::Registry, dataset: &str, reason: &str) -> f64 {
+        for family in registry.gather() {
+            if family.name() != "dataset_acceleration_refresh_errors"
+                || family.get_field_type() != MetricType::COUNTER
+            {
+                continue;
+            }
+            for series in family.get_metric() {
+                let labels = series.get_label();
+                let dataset_ok = labels
+                    .iter()
+                    .any(|label| label.name() == "dataset" && label.value() == dataset);
+                let reason_ok = labels
+                    .iter()
+                    .any(|label| label.name() == "reason" && label.value() == reason);
+                if dataset_ok
+                    && reason_ok
+                    && let Some(counter) = series.get_counter().as_ref()
+                {
+                    return counter.value();
+                }
+            }
+        }
+        0.0
+    }
+
+    fn generation_change_labels() -> Vec<Vec<KeyValue>> {
+        vec![vec![
+            KeyValue::new("dataset", "generation_change_metric_test"),
+            KeyValue::new("mode", "full"),
+        ]]
+    }
+
+    fn generation_change_df_error() -> DataFusionError {
+        DataFusionError::External(Box::new(std::io::Error::other(
+            "Request precondition failure for path listing/data.parquet: \
+             412 Precondition Failed",
+        )))
+    }
+
+    #[tokio::test]
+    async fn generation_change_refresh_errors_are_scraped_once_from_the_terminal_outcome() {
+        let registry = install_refresh_error_test_meter();
+        let recovered_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(3))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let recovered: super::super::Result<()> = retry(recovered_strategy, || async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Err(retry_from_df_error(generation_change_df_error()));
+            }
+            Ok(())
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "a 412 must recover on retry: {recovered:?}"
+        );
+        if let Some(error) = terminal_refresh_error(&recovered, false) {
+            emit_refresh_errors(generation_change_labels(), refresh_error_reason(error));
+        }
+        assert_eq!(
+            refresh_error_count(
+                &registry,
+                "generation_change_metric_test",
+                metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+            ),
+            0.0,
+            "a recovered 412 must emit zero dataset_acceleration_refresh_errors points"
+        );
+
+        let exhausted_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(0))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let exhausted: super::super::Result<()> = retry(exhausted_strategy, || async {
+            Err(retry_from_df_error(generation_change_df_error()))
+        })
+        .await;
+        let recorded = terminal_refresh_error(&exhausted, false)
+            .expect("an exhausted generation-change is a refresh error");
+        emit_refresh_errors(generation_change_labels(), refresh_error_reason(recorded));
+        assert_eq!(
+            refresh_error_count(
+                &registry,
+                "generation_change_metric_test",
+                metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+            ),
+            1.0,
+            "an exhausted 412 must emit exactly one reason-labeled refresh error"
         );
     }
 

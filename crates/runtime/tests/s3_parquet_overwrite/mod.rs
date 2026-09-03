@@ -23,7 +23,7 @@ limitations under the License.
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -178,6 +178,19 @@ fn a_mixed_row_group_does_not_share_either_generation_payload_sum() {
     );
 }
 
+#[test]
+fn http_response_status_reads_412_from_the_status_line() {
+    assert_eq!(
+        http_response_status(b"HTTP/1.1 412 Precondition Failed\r\n"),
+        Some(412)
+    );
+    assert_eq!(
+        http_response_status(b"GET /listing/data.parquet HTTP/1.1\r\n"),
+        None
+    );
+    assert_eq!(http_response_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
+}
+
 fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
     let creds = Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test");
     let config = aws_sdk_s3::Config::builder()
@@ -266,12 +279,15 @@ async fn start_minio() -> Result<RunningContainer<'static>, anyhow::Error> {
 /// Delay object GETs after the first one so a replacement can land mid-scan.
 struct MixProxy {
     seen_first_get: Arc<AtomicBool>,
+    precondition_failures: Arc<AtomicU64>,
 }
 
 impl MixProxy {
     fn start() -> Self {
         let seen_first_get = Arc::new(AtomicBool::new(false));
+        let precondition_failures = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&seen_first_get);
+        let preconditions = Arc::clone(&precondition_failures);
         tokio::spawn(async move {
             let listener = TcpListener::bind(("127.0.0.1", PROXY_PORT))
                 .await
@@ -281,18 +297,27 @@ impl MixProxy {
                     continue;
                 };
                 let seen = Arc::clone(&seen);
+                let preconditions = Arc::clone(&preconditions);
                 tokio::spawn(async move {
-                    if let Err(err) = proxy_connection(client, &seen).await {
+                    if let Err(err) = proxy_connection(client, &seen, &preconditions).await {
                         tracing::debug!("overwrite-race proxy connection ended: {err}");
                     }
                 });
             }
         });
-        Self { seen_first_get }
+        Self {
+            seen_first_get,
+            precondition_failures,
+        }
     }
 
     fn reset(&self) {
         self.seen_first_get.store(false, Ordering::SeqCst);
+        self.precondition_failures.store(0, Ordering::SeqCst);
+    }
+
+    fn precondition_failures(&self) -> u64 {
+        self.precondition_failures.load(Ordering::SeqCst)
     }
 
     async fn wait_for_first_object_get(&self) -> Result<(), anyhow::Error> {
@@ -308,9 +333,21 @@ impl MixProxy {
     }
 }
 
+fn http_response_status(headers: &[u8]) -> Option<u16> {
+    let first = headers.split(|&b| b == b'\n').next()?;
+    let line = std::str::from_utf8(first).ok()?.trim();
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
 async fn proxy_connection(
     mut client: TcpStream,
     seen_first_get: &AtomicBool,
+    precondition_failures: &AtomicU64,
 ) -> Result<(), anyhow::Error> {
     loop {
         let Some((headers, body)) = read_http_message(&mut client, true).await? else {
@@ -334,6 +371,9 @@ async fn proxy_connection(
         else {
             return Ok(());
         };
+        if http_response_status(&resp_headers) == Some(412) {
+            precondition_failures.fetch_add(1, Ordering::SeqCst);
+        }
         client.write_all(&resp_headers).await?;
         client.write_all(&resp_body).await?;
         if is_object_get {
@@ -644,6 +684,11 @@ async fn accelerated_refresh_retries_a_replaced_object(
     let total = scan_payload_char_len(rt.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("accelerated scan after overwrite retry: {e}"))?;
+    ensure!(
+        mix.precondition_failures() >= 1,
+        "accelerated refresh must observe a 412 from the replaced object before succeeding, saw {}",
+        mix.precondition_failures()
+    );
     ensure!(
         total == generations.sum_a || total == generations.sum_b,
         "retry after a replaced object must return one generation ({} or {}), got {total}",
