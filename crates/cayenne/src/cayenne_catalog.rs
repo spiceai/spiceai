@@ -19,8 +19,8 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics,
+    InlinedDelete, PartitionMetadata, PkConflictDetection, PkDeletionStrategyKind, SnapshotFile,
+    SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -1826,7 +1826,7 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String> {
+    async fn create_table(&self, mut options: CreateTableOptions) -> CatalogResult<String> {
         let table_name = options.table_name.clone();
         let base_path = options.base_path.clone();
 
@@ -1913,6 +1913,17 @@ impl MetadataCatalog for CayenneCatalog {
                 })
                 .await;
             }
+        }
+
+        // Pin the PK deletion strategy at creation time so it is stable across
+        // reopens: the durable key stores (deletion vectors, insert records) are
+        // strategy-dependent — `Int64Pk` stores raw 8-byte i64 keys, while
+        // `RowConverterBased` stores 9-byte RowConverter keys. A nullable
+        // single-Int64 PK must use the byte-key strategy, since the raw-i64 fast
+        // path has no representation for a null key.
+        if options.vortex_config.pk_deletion_strategy.is_none() {
+            options.vortex_config.pk_deletion_strategy =
+                resolve_pk_deletion_strategy_kind(options.schema.as_ref(), &options.primary_key);
         }
 
         // Serialize Vortex config to JSON
@@ -5063,6 +5074,36 @@ fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<
     }
 
     Ok(())
+}
+
+/// Resolve the PK deletion-strategy kind for a table being created, from its
+/// schema + primary key. This is the single source of truth for the choice,
+/// pinned into `VortexConfig` at creation so it (and the durable key encoding
+/// it implies) is stable across reopens.
+///
+/// - No primary key: no key-based strategy (the provider uses
+///   `PositionBased`); returns `None`.
+/// - Single **NOT NULL** Int64 PK: the `Int64Pk` fast path (8-byte keys).
+/// - Everything else — composite, non-integer, or a **nullable** PK (which
+///   needs the null sentinel) — the `RowConverterBased` byte-key strategy.
+fn resolve_pk_deletion_strategy_kind(
+    schema: &arrow_schema::Schema,
+    primary_key: &[String],
+) -> Option<PkDeletionStrategyKind> {
+    if primary_key.is_empty() {
+        return None;
+    }
+    let single_not_null_int64_pk = primary_key.len() == 1
+        && schema
+            .field_with_name(primary_key[0].as_str())
+            .is_ok_and(|field| {
+                field.data_type() == &arrow_schema::DataType::Int64 && !field.is_nullable()
+            });
+    Some(if single_not_null_int64_pk {
+        PkDeletionStrategyKind::Int64Pk
+    } else {
+        PkDeletionStrategyKind::RowConverterBased
+    })
 }
 
 fn log_runtime_footer_cache_drift(

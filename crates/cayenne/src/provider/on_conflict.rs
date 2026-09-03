@@ -568,6 +568,11 @@ pub(crate) struct PrimaryKeyValidationStream {
     inner: SendableRecordBatchStream,
     schema: SchemaRef,
     pk_indices: Vec<usize>,
+    /// Whether a null value in each PK column is a legal, coalescing key,
+    /// aligned with `pk_indices`. `true` only when the byte-key strategy is in
+    /// use AND the column is declared nullable; a null in a NOT NULL PK column
+    /// (or on the raw-Int64 fast path) is a validation error.
+    pk_null_allowed: Vec<bool>,
     table_name: String,
 }
 
@@ -575,6 +580,7 @@ impl PrimaryKeyValidationStream {
     pub(crate) fn new(
         inner: SendableRecordBatchStream,
         pk_indices: Vec<usize>,
+        pk_null_allowed: Vec<bool>,
         table_name: String,
     ) -> Self {
         let schema = inner.schema();
@@ -582,6 +588,7 @@ impl PrimaryKeyValidationStream {
             inner,
             schema,
             pk_indices,
+            pk_null_allowed,
             table_name,
         }
     }
@@ -594,10 +601,13 @@ impl futures::Stream for PrimaryKeyValidationStream {
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
+                // A null in a NOT NULL-declared PK column is a validation error;
+                // a null in a nullable PK column is a legal, coalescing key.
                 if this
                     .pk_indices
                     .iter()
-                    .any(|&index| batch.column(index).null_count() > 0)
+                    .zip(this.pk_null_allowed.iter())
+                    .any(|(&index, nullable)| !nullable && batch.column(index).null_count() > 0)
                 {
                     Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
                         format!(

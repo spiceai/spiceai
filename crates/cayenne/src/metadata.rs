@@ -565,6 +565,33 @@ impl DeletionMode {
     }
 }
 
+/// The PK deletion-strategy kind a table was created with, persisted so the
+/// choice is stable across reopens.
+///
+/// The durable key stores (deletion vectors' `row_key` column,
+/// `cayenne_insert_record`) are **strategy-dependent**: the `Int64Pk` fast path
+/// stores raw 8-byte big-endian `i64` keys, while `RowConverterBased` stores
+/// `RowConverter` byte keys (9 bytes for a single Int64, including the null
+/// sentinel). The strategy is therefore a property of the table's *stored data*,
+/// not something that may be re-derived from the schema on every open — a
+/// nullable single-Int64 PK in particular must keep the byte-key strategy so its
+/// null keys remain representable.
+///
+/// `None` (the serde default for pre-existing tables) means "derive by the
+/// legacy rule": a single **NOT NULL** Int64 PK used `Int64Pk`, everything else
+/// used `RowConverterBased`. That is exactly the pre-feature behavior, so
+/// legacy tables read back unchanged; new tables pin their choice explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PkDeletionStrategyKind {
+    /// Single-column Int64 primary key — direct `HashSet<i64>` lookup (8-byte
+    /// big-endian keys).
+    Int64Pk,
+    /// Composite, non-integer, or nullable primary key — `RowConverter` byte
+    /// keys (nulls encode to a distinct sentinel key).
+    RowConverterBased,
+}
+
 /// Durability mode for the inline CDC write path (`refresh_mode: changes`).
 ///
 /// In [`Self::File`] (the explicit conservative opt-out — byte-identical to
@@ -882,6 +909,14 @@ pub struct VortexConfig {
     /// param is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
+    /// The PK deletion-strategy kind this table was created with, persisted so
+    /// the choice (and the durable key encoding it implies) is stable across
+    /// reopens. `None` (pre-existing tables) means "derive by the legacy rule"
+    /// — a single NOT NULL Int64 PK used `Int64Pk`, everything else
+    /// `RowConverterBased` — which is exactly the pre-feature behavior. New
+    /// tables pin their choice at creation (see [`PkDeletionStrategyKind`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pk_deletion_strategy: Option<PkDeletionStrategyKind>,
     /// How primary-key deletions are recorded and applied for PK tables.
     /// Defaults to [`DeletionMode::Auto`], which resolves to `position`
     /// (merge-on-read): deletes are pushed into the Vortex scan as per-file
@@ -1461,6 +1496,7 @@ impl Default for VortexConfig {
             stream_publish_interval_ms: default_stream_publish_interval_ms(),
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
+            pk_deletion_strategy: None,
             deletion_mode: DeletionMode::default(),
             memory_mode: false,
             cdc_durability: CdcDurability::default(),

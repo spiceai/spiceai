@@ -411,6 +411,15 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
+    /// Whether a null value in each primary key column is a legal, coalescing
+    /// key, aligned with [`Self::pk_column_indices`]. `true` only when the
+    /// byte-key (`RowConverterBased`) strategy is in use AND the column is
+    /// declared nullable — nulls then encode to the `RowConverter` null
+    /// sentinel. A NOT NULL PK column, or a column on the raw-Int64 fast path
+    /// (which has no representation for a null key), keeps nulls a validation
+    /// error. Computed from the stored schema + the deletion strategy, so it
+    /// always agrees with the provider.
+    pk_null_allowed: Vec<bool>,
     /// Extra listing tables to also scan for deletion keys, beyond the main
     /// listing table — the protected snapshots and (for cold-tier tables) the
     /// cold-tier files. The sink treats every entry uniformly.
@@ -457,6 +466,20 @@ impl CayenneDeletionSink {
         write_lock: Option<Arc<TokioMutex<()>>>,
         seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
     ) -> Self {
+        // Whether a null PK value is a legal, coalescing key for this table:
+        // only under the byte-key (RowConverter) strategy AND for a
+        // declared-nullable column. Nulls on the raw-Int64 fast path (or in a
+        // NOT NULL column) are a validation error. Read from the stored table
+        // schema + the deletion strategy — the same sources the provider uses,
+        // so the sink and provider agree on which PK nulls are legal.
+        let byte_keys = matches!(
+            pk_deletion_strategy,
+            PkDeletionStrategyWithCache::RowConverterBased { .. }
+        );
+        let pk_null_allowed: Vec<bool> = pk_column_indices
+            .iter()
+            .map(|&idx| table_metadata.schema.field(idx).is_nullable() && byte_keys)
+            .collect();
         Self {
             table_metadata,
             catalog,
@@ -467,6 +490,7 @@ impl CayenneDeletionSink {
             table_memory,
             pk_row_converter,
             pk_column_indices,
+            pk_null_allowed,
             additional_scan_tables,
             runtime_env,
             write_lock,
@@ -583,7 +607,14 @@ impl CayenneDeletionSink {
                             .iter()
                             .map(|&index| Arc::clone(batch.column(index)))
                             .collect();
-                        if pk_columns.iter().any(|column| column.null_count() > 0) {
+                        // A null in a NOT NULL-declared PK column is a validation
+                        // error; a null in a nullable PK column is a legal,
+                        // coalescing key.
+                        if pk_columns
+                            .iter()
+                            .zip(self.pk_null_allowed.iter())
+                            .any(|(column, nullable)| !nullable && column.null_count() > 0)
+                        {
                             return Err(Error::DataValidation {
                                 table: table_name.clone(),
                                 message: "Primary key values must be non-null".to_string(),

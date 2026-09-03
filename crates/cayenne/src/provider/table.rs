@@ -67,7 +67,7 @@ use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSeque
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PkDeletionStrategyKind, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
@@ -1060,6 +1060,15 @@ pub struct CayenneTableProvider {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
+    /// Whether a null value in each primary key column is a legal, coalescing
+    /// key, aligned with [`Self::pk_column_indices`]. `true` only when the
+    /// byte-key (`RowConverterBased`) strategy is in use AND the column is
+    /// declared nullable — nulls then encode to the `RowConverter` null
+    /// sentinel. A NOT NULL PK column, or a column on the raw-Int64 fast path
+    /// (which has no representation for a null key), keeps nulls a validation
+    /// error. Pinned to the stored creation schema + persisted strategy, so it
+    /// is stable across reopens and always agrees with the deletion strategy.
+    pk_null_allowed: Vec<bool>,
     /// Durable federated write-back (#11838): when set, every committed write on
     /// this table durably marks its primary keys in `cayenne_pending_write_back`
     /// (inside the commit transaction) so a per-table delivery worker can
@@ -4878,50 +4887,87 @@ impl CayenneTableProvider {
         // Determine if this table has a primary key for key-based deletion
         let has_primary_key = !table_metadata.primary_key.is_empty();
 
-        // Determine PK deletion strategy kind and build RowConverter if needed
-        let (pk_deletion_strategy_kind, pk_row_converter, pk_column_indices) = if has_primary_key {
-            let schema = &table_metadata.schema;
-            let mut indices = Vec::with_capacity(table_metadata.primary_key.len());
-            let mut pk_fields = Vec::with_capacity(table_metadata.primary_key.len());
+        // Determine PK deletion strategy kind and build RowConverter if needed.
+        //
+        // The strategy is a stable property of the table's *stored data*, not
+        // something re-derived from the schema on every open: the durable key
+        // stores (deletion vectors' `row_key`, `cayenne_insert_record`) are
+        // strategy-dependent — `Int64Pk` stores raw 8-byte big-endian i64 keys,
+        // `RowConverterBased` stores RowConverter byte keys (9 bytes for a
+        // single Int64, including the null sentinel). A nullable single-Int64
+        // PK in particular must keep the byte-key strategy so its null keys
+        // remain representable.
+        //
+        // `pk_null_allowed` records, per PK column (aligned with
+        // `pk_column_indices`), whether a null value is a legal, coalescing
+        // key: only when the byte-key strategy is in use AND the column is
+        // declared nullable. A NOT NULL PK column keeps nulls a validation
+        // error; the raw-Int64 fast path has no representation for a null key.
+        let (pk_deletion_strategy_kind, pk_row_converter, pk_column_indices, pk_null_allowed) =
+            if has_primary_key {
+                let schema = &table_metadata.schema;
+                let mut indices = Vec::with_capacity(table_metadata.primary_key.len());
+                let mut pk_fields = Vec::with_capacity(table_metadata.primary_key.len());
 
-            for pk_col in &table_metadata.primary_key {
-                let (idx, field) =
-                    schema
-                        .column_with_name(pk_col)
-                        .ok_or_else(|| Error::DataValidation {
-                            table: table_name.to_string(),
-                            message: format!("Primary key column '{pk_col}' not found in schema"),
-                        })?;
-                indices.push(idx);
-                pk_fields.push(field.clone());
-            }
+                for pk_col in &table_metadata.primary_key {
+                    let (idx, field) =
+                        schema
+                            .column_with_name(pk_col)
+                            .ok_or_else(|| Error::DataValidation {
+                                table: table_name.to_string(),
+                                message: format!("Primary key column '{pk_col}' not found in schema"),
+                            })?;
+                    indices.push(idx);
+                    pk_fields.push(field.clone());
+                }
 
-            // Check if we can use the optimized Int64 PK strategy:
-            // - Single column primary key
-            // - Column type is Int64
-            if pk_fields.len() == 1
-                && *pk_fields[0].data_type() == arrow::datatypes::DataType::Int64
-            {
-                // Optimized path: single Int64 PK - no RowConverter needed
-                (PkDeletionStrategy::Int64Pk, None, indices)
+                // Declared nullability of each PK column, aligned with `indices`.
+                let pk_nullable: Vec<bool> = pk_fields.iter().map(|f| f.is_nullable()).collect();
+
+                // Honor the persisted strategy choice when present; otherwise fall
+                // back to the legacy rule (single Int64 PK -> Int64Pk, everything
+                // else -> RowConverterBased), which is exactly the pre-feature
+                // behavior, so pre-existing tables read back unchanged.
+                let single_int64_pk = pk_fields.len() == 1
+                    && *pk_fields[0].data_type() == arrow::datatypes::DataType::Int64;
+                let legacy_kind = if single_int64_pk {
+                    PkDeletionStrategyKind::Int64Pk
+                } else {
+                    PkDeletionStrategyKind::RowConverterBased
+                };
+                let effective_kind =
+                    table_metadata.vortex_config.pk_deletion_strategy.unwrap_or(legacy_kind);
+
+                // Nulls are a legal, coalescing key only under the byte-key
+                // strategy AND for a declared-nullable column.
+                let byte_keys =
+                    matches!(effective_kind, PkDeletionStrategyKind::RowConverterBased);
+                let pk_null_allowed: Vec<bool> =
+                    pk_nullable.iter().map(|n| *n && byte_keys).collect();
+
+                if effective_kind == PkDeletionStrategyKind::Int64Pk {
+                    // Optimized path: single NOT NULL Int64 PK - no RowConverter needed
+                    (PkDeletionStrategy::Int64Pk, None, indices, pk_null_allowed)
+                } else {
+                    // General path: composite, non-integer, or nullable single-Int64
+                    // PK - use RowConverter (which encodes nulls as a distinct key).
+                    let sort_fields: Vec<SortField> = pk_fields
+                        .iter()
+                        .map(|f| SortField::new(f.data_type().clone()))
+                        .collect();
+
+                    let row_converter = RowConverter::new(sort_fields).map_err(Error::from)?;
+
+                    (
+                        PkDeletionStrategy::RowConverterBased,
+                        Some(Arc::new(row_converter)),
+                        indices,
+                        pk_null_allowed,
+                    )
+                }
             } else {
-                // General path: composite or non-integer PK - use RowConverter
-                let sort_fields: Vec<SortField> = pk_fields
-                    .iter()
-                    .map(|f| SortField::new(f.data_type().clone()))
-                    .collect();
-
-                let row_converter = RowConverter::new(sort_fields).map_err(Error::from)?;
-
-                (
-                    PkDeletionStrategy::RowConverterBased,
-                    Some(Arc::new(row_converter)),
-                    indices,
-                )
-            }
-        } else {
-            (PkDeletionStrategy::PositionBased, None, Vec::new())
-        };
+                (PkDeletionStrategy::PositionBased, None, Vec::new(), Vec::new())
+            };
 
         // Load deletion vectors and insert records once at initialization
         // to avoid repeated SQLite queries on every scan.
@@ -5078,6 +5124,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
+            pk_null_allowed,
             durable_write_back,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6166,6 +6213,7 @@ impl CayenneTableProvider {
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
+            pk_null_allowed: self.pk_null_allowed.clone(),
             durable_write_back: self.durable_write_back,
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
@@ -7118,6 +7166,30 @@ impl CayenneTableProvider {
         Ok(RowConverter::new(sort_fields)?)
     }
 
+    /// Whether `row_idx` carries a null in a PK column that is declared NOT NULL.
+    ///
+    /// Such a null is a validation error. A null in a *nullable* PK column is a
+    /// legal, coalescing key and is NOT flagged. `pk_columns` must be aligned
+    /// with [`Self::pk_column_indices`] (the table's PK columns, in order), which
+    /// is how every caller builds it.
+    fn row_has_invalid_null_pk(&self, pk_columns: &[arrow::array::ArrayRef], row_idx: usize) -> bool {
+        pk_columns
+            .iter()
+            .zip(self.pk_null_allowed.iter())
+            .any(|(col, nullable)| !nullable && col.is_null(row_idx))
+    }
+
+    /// Batch-level analog of [`Self::row_has_invalid_null_pk`]: `true` when any
+    /// row of `pk_columns` has a null in a NOT NULL-declared PK column. A null in
+    /// a nullable PK column is legal and does not flag the batch. `pk_columns`
+    /// must be aligned with [`Self::pk_column_indices`].
+    fn batch_has_invalid_null_pk(&self, pk_columns: &[arrow::array::ArrayRef]) -> bool {
+        pk_columns
+            .iter()
+            .zip(self.pk_null_allowed.iter())
+            .any(|(col, nullable)| !nullable && col.null_count() > 0)
+    }
+
     /// Partition `batch` into `n` sub-batches by `hash(pk) % n`, where the PK is
     /// the `RowConverter` `OwnedRow` of `pk_indices` (see [`shard_of_pk`]). Row
     /// order within each shard is preserved. Returns exactly `n` batches (some may
@@ -7334,6 +7406,7 @@ impl CayenneTableProvider {
             main_stream,
             &self.pk_deletion_strategy,
             pk_indices,
+            &self.pk_null_allowed,
             converter,
             &projected_pk_indices,
             deleted_pk_i64.as_deref(),
@@ -7366,6 +7439,7 @@ impl CayenneTableProvider {
                 snapshot_stream,
                 &self.pk_deletion_strategy,
                 pk_indices,
+                &self.pk_null_allowed,
                 converter,
                 &projected_pk_indices,
                 deleted_pk_i64.as_deref(),
@@ -7410,6 +7484,7 @@ impl CayenneTableProvider {
                 cold_stream,
                 &self.pk_deletion_strategy,
                 pk_indices,
+                &self.pk_null_allowed,
                 converter,
                 &projected_pk_indices,
                 deleted_pk_i64.as_deref(),
@@ -7828,8 +7903,10 @@ impl CayenneTableProvider {
                 .collect();
             let rows = converter.convert_columns(&pk_columns)?;
 
+            // A null in a NOT NULL-declared PK column is a validation error; a
+            // null in a nullable PK column is a legal, coalescing key.
             for row_index in 0..batch.num_rows() {
-                if pk_columns.iter().any(|column| column.is_null(row_index)) {
+                if self.row_has_invalid_null_pk(&pk_columns, row_index) {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
                         message: format!(
@@ -7862,6 +7939,7 @@ impl CayenneTableProvider {
         mut stream: SendableRecordBatchStream,
         pk_deletion_strategy: &PkDeletionStrategyWithCache,
         pk_indices: &[usize],
+        pk_null_allowed: &[bool],
         converter: &RowConverter,
         projected_pk_indices: &[usize],
         deleted_pk_i64: Option<&DeletionIndex>,
@@ -7932,8 +8010,13 @@ impl CayenneTableProvider {
                     continue;
                 }
 
-                // Enforce non-null primary key values
-                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+                // Enforce non-null primary key values in NOT NULL-declared PK
+                // columns. A null in a nullable PK column is a legal, coalescing
+                // key and is NOT an error.
+                let has_null = pk_columns
+                    .iter()
+                    .zip(pk_null_allowed.iter())
+                    .any(|(col, nullable)| !nullable && col.is_null(row_idx));
                 if has_null {
                     return Err(Error::DataValidation {
                         table: table_name.to_string(),
@@ -8013,6 +8096,7 @@ impl CayenneTableProvider {
             let validation_stream = super::on_conflict::PrimaryKeyValidationStream::new(
                 stream,
                 pk_indices,
+                self.pk_null_allowed.clone(),
                 self.table_metadata.table_name.clone(),
             );
             return Ok(PreparedInsertStream::immediate(Box::pin(validation_stream)));
@@ -8437,14 +8521,16 @@ impl CayenneTableProvider {
                 }
             };
 
-        // Hoist the PK-null check out of the per-row loop: an Arrow column with no
-        // null buffer reports `null_count() == 0` in O(1), so when no PK column is
-        // nullable we skip the per-row `is_null` scan across all PK columns
-        // entirely (the common case — PK columns are NOT NULL). Only when a PK
-        // column actually carries nulls do we pay the per-row check to locate and
-        // reject them. On the hot CDC apply path this removes an O(rows x pk_cols)
-        // scan from every coalesced batch (16K+ envelopes).
-        let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
+        // Hoist the invalid-null-PK check out of the per-row loop: a null in a
+        // NOT NULL-declared PK column is a validation error, while a null in a
+        // nullable PK column is a legal, coalescing key. An Arrow column with no
+        // null buffer reports `null_count() == 0` in O(1), so when no NOT NULL PK
+        // column carries nulls we skip the per-row `is_null` scan across all PK
+        // columns entirely (the common case — PK columns are NOT NULL). Only when
+        // a NOT NULL PK column actually carries nulls do we pay the per-row check
+        // to locate and reject them. On the hot CDC apply path this removes an
+        // O(rows x pk_cols) scan from every coalesced batch (16K+ envelopes).
+        let any_invalid_null_pk = self.batch_has_invalid_null_pk(&pk_columns);
 
         // Build each row's PK key once, then run an IN-BATCH dedup pre-pass:
         // `ctx.incoming_keys` only covers PRIOR batches, so duplicate PKs WITHIN
@@ -8484,7 +8570,7 @@ impl CayenneTableProvider {
         };
 
         for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
-            if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+            if any_invalid_null_pk && self.row_has_invalid_null_pk(&pk_columns, row_idx) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Primary key values must be non-null".to_string(),
@@ -8720,6 +8806,7 @@ impl CayenneTableProvider {
         bloom: &PkBloom,
         cold_existence: Option<&ColdPkExistence>,
         pk_indices: &[usize],
+        pk_null_allowed: &[bool],
         converter: &RowConverter,
         incoming_keys: &PkDigestSet,
     ) -> Result<(Option<RecordBatch>, Option<RecordBatch>, PkDigestSet)> {
@@ -8729,17 +8816,26 @@ impl CayenneTableProvider {
             .collect();
         let rows = converter.convert_columns(&pk_columns)?;
 
-        // A PK null is a validation error (the HIT path raises it); route any
-        // null-PK row to the HIT side so the existing, single error site reports
-        // it rather than silently fast-pathing an invalid row.
-        let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
+        // A null in a NOT NULL-declared PK column is a validation error (the HIT
+        // path raises it); route any such row to the HIT side so the existing,
+        // single error site reports it rather than silently fast-pathing an
+        // invalid row. A null in a *nullable* PK column is a legal, coalescing
+        // key and stays eligible for the MISS fast path.
+        let any_invalid_null_pk = pk_columns
+            .iter()
+            .zip(pk_null_allowed.iter())
+            .any(|(col, nullable)| !nullable && col.null_count() > 0);
 
         let mut miss_mask = Vec::with_capacity(batch.num_rows());
         // Sized to the row count: in the common split case most rows are MISSes,
         // so this keeps the set at one allocation on the CDC apply hot path.
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
-            let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
+            let null_pk = any_invalid_null_pk
+                && pk_columns
+                    .iter()
+                    .zip(pk_null_allowed.iter())
+                    .any(|(col, nullable)| !nullable && col.is_null(row_idx));
             let key = rows.row(row_idx).owned();
             // A datalake (cold) file MAY hold the key — route it to the HIT path
             // so `apply_on_conflict_to_batch` records the cold supersede. Without
@@ -8837,11 +8933,14 @@ impl CayenneTableProvider {
             }
             let Some(index) = sharded_index else {
                 // Conflict detection is disabled, but the PK validity contract
-                // remains mandatory.
-                if pk_indices
+                // remains mandatory. A null in a NOT NULL-declared PK column is a
+                // validation error; a null in a nullable PK column is a legal,
+                // coalescing key.
+                let pk_columns: Vec<_> = pk_indices
                     .iter()
-                    .any(|&index| batch.column(index).null_count() > 0)
-                {
+                    .map(|&idx| Arc::clone(batch.column(idx)))
+                    .collect();
+                if self.batch_has_invalid_null_pk(&pk_columns) {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
                         message: "Primary key values must be non-null".to_string(),
@@ -8863,6 +8962,7 @@ impl CayenneTableProvider {
                         bloom,
                         cold_existence.as_deref(),
                         pk_indices,
+                        &self.pk_null_allowed,
                         converter,
                         &incoming_keys,
                     )?;
@@ -9399,7 +9499,10 @@ impl CayenneTableProvider {
                 let rows = converter.convert_columns(&pk_columns)?;
 
                 for row_index in 0..batch.num_rows() {
-                    if pk_columns.iter().any(|column| column.is_null(row_index)) {
+                    // A null in a NOT NULL-declared PK column is a validation
+                    // error; a null in a nullable PK column is a legal,
+                    // coalescing key.
+                    if self.row_has_invalid_null_pk(&pk_columns, row_index) {
                         return Err(Error::DataValidation {
                             table: self.table_metadata.table_name.clone(),
                             message: "Primary key values must be non-null".to_string(),
@@ -16611,7 +16714,7 @@ impl CayenneTableProvider {
         }
         let batch_schema = batch.schema();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
-        for &table_idx in &self.pk_column_indices {
+        for (i, &table_idx) in self.pk_column_indices.iter().enumerate() {
             let field = self.table_metadata.schema.field(table_idx);
             let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
                 return Ok(None);
@@ -16622,7 +16725,10 @@ impl CayenneTableProvider {
             } else {
                 arrow::compute::cast(column, field.data_type())?
             };
-            if column.null_count() > 0 {
+            // A null in a NOT NULL-declared PK column means the rows can't be
+            // keyed (bail to the durable path). A null in a *nullable* PK column
+            // is a legal, coalescing key and is kept.
+            if !self.pk_null_allowed[i] && column.null_count() > 0 {
                 return Ok(None);
             }
             columns.push(column);
@@ -18873,32 +18979,35 @@ impl CayenneTableProvider {
                     .iter()
                     .map(|idx| Arc::clone(batch.column(*idx)))
                     .collect();
-                let pk_has_nulls = pk_columns.iter().any(|column| column.null_count() > 0);
+                // A null in a NOT NULL-declared PK column is a validation error;
+                // a null in a nullable PK column is a legal, coalescing key.
+                let pk_has_invalid_nulls = self.batch_has_invalid_null_pk(&pk_columns);
 
                 // [no-tombstone short-circuit] The composite-PK analog of the
                 // Int64 arm's disjoint min/max fast path above. When no row-key
                 // DELETE is live (the file-side index carries no deletions and the
-                // in-RAM tier has no deletion keys) and the PK columns have no
-                // nulls, no scanned row can be hidden and the batch is valid — pass
-                // it through and skip the O(rows x pk_cols) `RowConverter` encode +
-                // `filter_record_batch` copy entirely. We gate on the file index's
-                // `has_deletions()`, NOT `is_empty()`: the `KeyDeletionIndex` also
-                // tracks insert-only (upsert re-insertion) records, which `get_batch`
-                // treats as absent and which never hide a row, so an insert-only
-                // index (deletes == 0) is still a valid skip. The Int64 arm's
-                // disjoint *range* check needs the encoding for composite keys (the
-                // very cost being avoided), so the no-deletions check is the sound,
-                // cheap equivalent; gating on no-nulls preserves the null-PK
+                // in-RAM tier has no deletion keys) and no NOT NULL PK column
+                // carries a null, no scanned row can be hidden and the batch is
+                // valid — pass it through and skip the O(rows x pk_cols)
+                // `RowConverter` encode + `filter_record_batch` copy entirely. We
+                // gate on the file index's `has_deletions()`, NOT `is_empty()`:
+                // the `KeyDeletionIndex` also tracks insert-only (upsert
+                // re-insertion) records, which `get_batch` treats as absent and
+                // which never hide a row, so an insert-only index (deletes == 0)
+                // is still a valid skip. The Int64 arm's disjoint *range* check
+                // needs the encoding for composite keys (the very cost being
+                // avoided), so the no-deletions check is the sound, cheap
+                // equivalent; gating on no-invalid-nulls preserves the null-PK
                 // validation error below. Mem-tier scans of an INSERT-heavy table
                 // take this between updates.
-                if !pk_has_nulls
+                if !pk_has_invalid_nulls
                     && !deleted_row_keys.has_deletions()
                     && inlined_deletions.row_keys.is_empty()
                 {
                     return Ok(Some(batch));
                 }
 
-                if pk_has_nulls {
+                if pk_has_invalid_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
                         message: "Primary key values must be non-null".to_string(),
@@ -19523,7 +19632,7 @@ impl CayenneTableProvider {
         }
         let batch_schema = batch.schema();
         let mut pk_columns: Vec<ArrayRef> = Vec::with_capacity(self.pk_column_indices.len());
-        for &table_idx in &self.pk_column_indices {
+        for (i, &table_idx) in self.pk_column_indices.iter().enumerate() {
             let field = self.table_metadata.schema.field(table_idx);
             let Ok(batch_idx) = batch_schema.index_of(field.name()) else {
                 return Ok(None);
@@ -19534,7 +19643,10 @@ impl CayenneTableProvider {
             } else {
                 arrow::compute::cast(column, field.data_type())?
             };
-            if column.null_count() > 0 {
+            // A null in a NOT NULL-declared PK column means the rows can't be
+            // keyed (bail to the durable path). A null in a *nullable* PK column
+            // is a legal, coalescing key and is kept.
+            if !self.pk_null_allowed[i] && column.null_count() > 0 {
                 return Ok(None);
             }
             pk_columns.push(column);
@@ -22434,7 +22546,10 @@ impl CayenneTableProvider {
                 let rows = converter.convert_columns(&pk_columns)?;
                 let mut row_keys = Vec::with_capacity(batch.num_rows());
                 for row_index in 0..batch.num_rows() {
-                    if pk_columns.iter().any(|column| column.is_null(row_index)) {
+                    // A null in a NOT NULL-declared PK column is a validation
+                    // error; a null in a nullable PK column is a legal,
+                    // coalescing key.
+                    if self.row_has_invalid_null_pk(&pk_columns, row_index) {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
                             "Primary key values must be non-null for table {}",
                             self.table_metadata.table_name
@@ -28408,6 +28523,7 @@ mod tests {
             single_batch_stream(batch),
             &strategy,
             &[0],
+            &[false],
             &converter,
             &[0],
             Some(&deleted_index),
@@ -28446,6 +28562,7 @@ mod tests {
             single_batch_stream(batch),
             &strategy,
             &[0],
+            &[false],
             &converter,
             &[0],
             Some(&deleted_index),
@@ -28480,6 +28597,7 @@ mod tests {
             single_batch_stream(batch),
             &strategy,
             &[0],
+            &[false],
             &converter,
             &[0],
             None,
