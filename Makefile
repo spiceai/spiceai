@@ -145,12 +145,25 @@ endif
 # also the only coverage of the enrollment, reconnect, command-dispatch and
 # heartbeat wire paths; `--lib` cannot reach a running client at all.
 #
+# `runtime`'s `result_correctness` binary is named rather than taking all of
+# `package(=runtime) & kind(=test)`: it is the accelerator-vs-standalone-oracle
+# parity gate and needs no credentials, while `runtime`'s other integration
+# binaries do and stay in the nightly suites.
+#
 # The credential-free Spice CLI integration binaries exercise the shipped
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
-NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+# `--features` here, not a per-crate default, because the result-correctness
+# lanes are the only reason the gate links an engine at all. Cargo skips a test
+# target whose `required-features` are unmet *without saying so*, so before this
+# the filterset below selected `result_correctness_vs_duckdb_test` and cargo
+# silently never built it — selection looked complete while three lanes never
+# ran. `runtime/duckdb,runtime/sqlite` likewise unlock `runtime`'s accelerator
+# parity binary. See `crates/cayenne/tests/correctness/README.md`.
+NEXTEST_SELECTION := --all --exclude libnfs \
+	--features cayenne/result-correctness-duckdb,runtime/duckdb,runtime/sqlite
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime) & binary(=result_correctness)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

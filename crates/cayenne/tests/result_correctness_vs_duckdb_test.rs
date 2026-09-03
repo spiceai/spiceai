@@ -27,12 +27,21 @@
 //! Scale defaults SF1 (`CAYENNE_PARITY_*_SF`). ClickBench: `CLICKBENCH_HITS_PARQUET`
 //! or ranking-deterministic fixture + env-failure log under `CAYENNE_PARITY_SCRATCH`.
 
+// Same set the sibling `..._vs_sqlite_test.rs` carries. These went unenforced
+// while the binary's `required-features` were unmet — clippy never built the
+// target, so it never linted it either.
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![allow(clippy::used_underscore_binding)]
 
 #[path = "correctness/support/mod.rs"]
 mod support;
@@ -78,25 +87,10 @@ fn duckdb_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>
     Ok(batches)
 }
 
-fn generate_tpch_parquet(out_dir: &Path, sf: f64) -> PathBuf {
-    std::fs::create_dir_all(out_dir).expect("tpch out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for tpch gen");
-    conn.execute_batch(&format!(
-        "INSTALL tpch;
-         LOAD tpch;
-         CALL dbgen(sf={sf});"
-    ))
-    .expect("dbgen");
-    for table in TPCH_TABLES {
-        let path = out_dir.join(format!("{table}.parquet"));
-        conn.execute_batch(&format!(
-            "COPY {table} TO '{}' (FORMAT PARQUET);",
-            path.display()
-        ))
-        .unwrap_or_else(|e| panic!("copy {table}: {e}"));
-    }
-    out_dir.to_path_buf()
+/// Generated in-process by `tpchgen`, so this needs no network and cannot fail
+/// for environmental reasons — see `support::tpch_data`.
+fn generate_tpch_parquet(out_dir: &Path, sf: f64) {
+    support::tpch_data::write_tpch_parquet(out_dir, sf);
 }
 
 fn load_duckdb_from_parquet(
@@ -362,6 +356,14 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
     );
 }
 
+/// Make sure the TPC-H fixture is on disk. Shared by the TPC-H and SpiceBench
+/// lanes, which load the same generated tables.
+fn ensure_tpch_fixture(dir: &Path, sf: f64) {
+    if !dir.join("lineitem.parquet").exists() {
+        generate_tpch_parquet(dir, sf);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_full_result_parity_vs_duckdb() {
     let scratch = scratch_dir();
@@ -370,9 +372,7 @@ async fn tpch_full_result_parity_vs_duckdb() {
     eprintln!("TPC-H parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
@@ -457,16 +457,19 @@ const TPCDS_TABLES: &[&str] = &[
     "web_site",
 ];
 
-fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
+/// Needs network for `INSTALL tpcds`; see [`generate_tpch_parquet`].
+fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
     let gen_db = out_dir.join("gen.duckdb");
     let conn = Connection::open(&gen_db).expect("duckdb open for tpcds gen");
-    conn.execute_batch(&format!(
+    if let Err(e) = conn.execute_batch(&format!(
         "INSTALL tpcds;
          LOAD tpcds;
          CALL dsdgen(sf={sf});"
-    ))
-    .expect("dsdgen");
+    )) {
+        eprintln!("TPC-DS fixture unavailable: {e}");
+        return None;
+    }
 
     // Export every base table that exists after dsdgen.
     let mut stmt = conn
@@ -489,7 +492,7 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
             eprintln!("skip copy {table}: {e}");
         }
     }
-    out_dir.to_path_buf()
+    Some(out_dir.to_path_buf())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -502,11 +505,9 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     let sf = env_f64("CAYENNE_PARITY_TPCDS_SF", 1.0);
     eprintln!("TPC-DS parity at SF={sf}");
     let tpcds_dir = scratch.join(format!("tpcds_sf{sf}"));
-    if !tpcds_dir.join("store_sales.parquet").exists()
+    let tpcds_fixture_missing = !tpcds_dir.join("store_sales.parquet").exists()
         && !tpcds_dir.join("date_dim.parquet").exists()
-    {
-        generate_tpcds_parquet(&tpcds_dir, sf);
-    }
+        && generate_tpcds_parquet(&tpcds_dir, sf).is_none();
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)
@@ -522,13 +523,15 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         .unwrap_or_default();
     let table_refs: Vec<&str> = exported.iter().map(String::as_str).collect();
 
-    if table_refs.is_empty() {
+    if tpcds_fixture_missing || table_refs.is_empty() {
         results.push(RunResult {
             suite: "tpcds".into(),
             name: "*".into(),
             engine_pair: "cayenne-duckdb",
             outcome: ParityOutcome::Excluded {
-                reason: "TPC-DS parquet generation produced no tables in this environment".into(),
+                reason: "TPC-DS fixture unavailable: DuckDB's tpcds extension could not be \
+                         installed in this environment (needs network), or dsdgen produced no tables"
+                    .into(),
             },
         });
     } else {
@@ -581,11 +584,11 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             )
         }
         None => {
-            let note = format!(
+            let note =
                 "CLICKBENCH_HITS_PARQUET unset; S3 spicepod clickbench/sf1 requires credentials \
                  not available in this environment. Using ranking-deterministic local fixture \
                  (power-law group counts, unique top-K ORDER BY keys) for full-content parity."
-            );
+                    .to_string();
             let capture = scratch.join("clickbench_sf1_env_failure.log");
             std::fs::write(
                 &capture,
@@ -964,7 +967,6 @@ fn make_reduced_hits(rows: usize) -> RecordBatch {
 }
 
 // Silence unused constant warning when tables list is for documentation only.
-#[allow(dead_code)]
 fn _tpcds_tables_doc() -> &'static [&'static str] {
     TPCDS_TABLES
 }
@@ -1245,9 +1247,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
     eprintln!("SpiceBench SF1 (TPC-H scenario) parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);

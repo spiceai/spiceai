@@ -47,6 +47,7 @@ pub mod sqlite_engine;
 pub mod sqllancer;
 pub mod ssb_data;
 pub mod standalone_engines;
+pub mod tpch_data;
 
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{

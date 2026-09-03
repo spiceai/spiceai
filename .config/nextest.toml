@@ -17,6 +17,15 @@ test-threads = "num-cpus"
 [test-groups]
 cayenne-property-tests = { max-threads = 2 }
 
+# The result-correctness lanes generate their SF1 TPC-H/TPC-DS fixtures into one
+# shared scratch directory — `tpch_full_result_parity_vs_duckdb` and
+# `spicebench_sf1_tpch_scenario_parity_vs_duckdb` read the very same `tpch_sf1`
+# tree — so two of them running at once would race on `dbgen` output that neither
+# wrote atomically. Serializing the group also keeps one bundled DuckDB instance
+# per machine, which is how #12098 ran this lane when it hit allocator aborts
+# under parallelism.
+result-correctness = { max-threads = 1 }
+
 # Every GitHub test authenticates as the same account, and GitHub's secondary
 # rate limit is per account rather than per connection. nextest runs each test in
 # its own process, so the connector's rate controller — a process-global that
@@ -146,3 +155,29 @@ test-group = 'github-api-tests'
 [[profile.default.overrides]]
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
+
+# Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
+# standalone DuckDB/SQLite on the same rows.
+#
+# `retries = 0` for the same reason the convergence binaries have it: these
+# compare two engines' answers to the same SQL over the same data, so a mismatch
+# is deterministic and a retry cannot turn a real one into a pass — it only pays
+# the ~250s runtime up to five more times before reporting the failure it already
+# had. The one genuinely environmental step, installing DuckDB's tpch/tpcds
+# extensions, is handled in the test: an unavailable fixture is reported as a
+# counted exclusion rather than a failure, so there is nothing here for a retry
+# to rescue.
+#
+# `slow-timeout` raises the wall-clock ceiling from the global 360s (120s x 3) to
+# 1200s (120s x 10). The slowest test is the SF1 TPC-DS + ClickBench comparison,
+# measured at 127.7s locally with fixtures already generated; CI pays `dsdgen` on
+# every fresh runner on top of that, and contention on the shared pool has been
+# measured multiplying runtimes 4.6x. With `retries = 0` a wall-clock kill is an
+# unrecoverable merge-queue failure, so this needs room rather than the global
+# ceiling. See `.github/scripts/check_nextest_config.py`, which holds this
+# binary's baseline and fails if the ceiling stops clearing it.
+[[profile.default.overrides]]
+filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test) | binary(=result_correctness)'
+test-group = "result-correctness"
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 10 }

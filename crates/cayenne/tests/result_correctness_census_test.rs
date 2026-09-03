@@ -230,7 +230,7 @@ fn print_comparison_cell_census() {
     let mut mode_cells_total = 0usize;
     let mut flat_cells_total = 0usize;
     for (suite, engines) in &by_suite {
-        let modes = load_modes_for(*suite);
+        let modes = load_modes_for(suite);
         let flat: usize = engines.values().map(|c| c.compared).sum();
         let with_modes = flat * modes.len();
         mode_cells_total += with_modes;
@@ -291,7 +291,7 @@ fn print_comparison_cell_census() {
     // one dialect shim away from becoming that many cells of real coverage.
     println!("\n### Static exclusion reasons by cells blocked\n");
     let mut ranked: Vec<_> = reasons.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
     println!("| cells | engine | reason |");
     println!("|---|---|---|");
     for ((engine, reason), count) in ranked {
