@@ -3109,10 +3109,11 @@ fn looks_like_parquet_decode(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // `snappy:` is the codec prefix on `snappy: corrupt input`. A bare
     // "snappy" also matches object keys like `snappy/archive/data.parquet`.
-    // Generic I/O (`unexpected eof`, `failed to fill whole buffer`, `eof:`)
-    // also appears on connector disconnects, so those need Parquet context.
+    // A bare "corrupt input" is any decompressor (CSV, gzip, …), so it is
+    // not a Parquet label. Generic I/O (`unexpected eof`, `failed to fill
+    // whole buffer`, `eof:`) also appears on connector disconnects, so
+    // those need Parquet context.
     lower.contains("snappy:")
-        || lower.contains("corrupt input")
         || lower.contains("corrupt footer")
         || lower.contains("invalid page header")
         || lower.contains("parquet argument error")
@@ -3567,6 +3568,22 @@ mod tests {
         assert_eq!(
             refresh_error_reason_from_message("Parquet error: Arrow: failed to fill whole buffer"),
             metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        let csv_corrupt = "CSV decompression failed: corrupt input";
+        assert_eq!(
+            refresh_error_reason_from_message(csv_corrupt),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        let csv_classified = retry_from_df_error(DataFusionError::External(Box::new(
+            std::io::Error::other(csv_corrupt),
+        )));
+        assert!(
+            matches!(&csv_classified, RetryError::Permanent(_)),
+            "unrelated corrupt-input text must stay a permanent non-Parquet error"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&csv_classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
         );
     }
 
