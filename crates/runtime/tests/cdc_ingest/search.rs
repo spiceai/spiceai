@@ -118,27 +118,29 @@ async fn start(with_embeddings: bool, with_fts: bool) -> anyhow::Result<Arc<Runt
     Ok(rt)
 }
 
-/// Push one Debezium change event and wait for the accelerator to ack the apply.
-async fn push_change(
-    op: &str,
-    before: Option<(i64, &str)>,
-    after: Option<(i64, &str)>,
-) -> anyhow::Result<()> {
+/// One Debezium change event: the op, and the row before and after it.
+type Event<'a> = (&'a str, Option<(i64, &'a str)>, Option<(i64, &'a str)>);
+
+fn render_event((op, before, after): &Event<'_>) -> String {
+    let render = |row: Option<(i64, &str)>| match row {
+        Some((id, content)) => format!(r#"{{"id":{id},"content":"{content}"}}"#),
+        None => "null".to_string(),
+    };
+    format!(
+        r#"{{"before":{},"after":{},"op":"{op}","ts_ms":1,"source":{{}}}}"#,
+        render(*before),
+        render(*after)
+    )
+}
+
+/// Push one request body onto the dataset's changes stream and wait for the
+/// accelerator to ack the apply.
+async fn push_body(body: String) -> anyhow::Result<()> {
     let registered = wait_until_true(SEARCH_TIMEOUT, || async {
         runtime::dataconnector::cdc_ingest::lookup("docs").is_some()
     })
     .await;
     anyhow::ensure!(registered, "CDC ingest handle never registered for `docs`");
-
-    let render = |row: Option<(i64, &str)>| match row {
-        Some((id, content)) => format!(r#"{{"id":{id},"content":"{content}"}}"#),
-        None => "null".to_string(),
-    };
-    let body = format!(
-        r#"{{"before":{},"after":{},"op":"{op}","ts_ms":1,"source":{{}}}}"#,
-        render(before),
-        render(after)
-    );
 
     let handle =
         runtime::dataconnector::cdc_ingest::lookup("docs").expect("cdc ingest handle registered");
@@ -153,6 +155,31 @@ async fn push_change(
         .await
         .map_err(|e| anyhow::anyhow!("cdc ingest failed: {e}"))?;
     Ok(())
+}
+
+/// Push one Debezium change event and wait for the accelerator to ack the apply.
+async fn push_change(
+    op: &str,
+    before: Option<(i64, &str)>,
+    after: Option<(i64, &str)>,
+) -> anyhow::Result<()> {
+    push_body(render_event(&(op, before, after))).await
+}
+
+/// Push several change events as **one** request body, which is what a source
+/// producing more than one change for a row inside a single poll looks like: a
+/// Debezium JSON array decodes to one `ChangeBatch`, so every event reaches the
+/// indexes in the same batch rather than one batch each.
+async fn push_events(events: &[Event<'_>]) -> anyhow::Result<()> {
+    let body = format!(
+        "[{}]",
+        events
+            .iter()
+            .map(render_event)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    push_body(body).await
 }
 
 async fn query_ids(rt: &Arc<Runtime>, sql: &str) -> anyhow::Result<Vec<i64>> {
@@ -299,6 +326,65 @@ async fn cdc_with_embeddings_and_full_text_search_indexes_changed_row() -> anyho
                 "text_search cannot find the updated row on a dataset with both \
                  embeddings and full_text_search"
             );
+            Ok(())
+        })
+        .await
+}
+
+/// A source can produce more than one change for a row inside a single poll, and the
+/// whole poll reaches the indexes as one batch. The accelerated table resolves such a
+/// key to its last change; the index has to agree, or a search answers for text the
+/// table no longer holds.
+#[tokio::test]
+async fn one_batch_with_two_changes_for_a_row_indexes_only_the_last() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    test_request_context()
+        .scope(async {
+            let rt = start(false, true).await?;
+
+            // Both changes in ONE body, so they arrive in one batch. Pushed as `c` then
+            // `u` because that is what a create followed by an update in the same poll
+            // looks like; the index sees one two-row batch either way.
+            push_events(&[
+                ("c", None, Some((1, "the quick brown fox"))),
+                (
+                    "u",
+                    Some((1, "the quick brown fox")),
+                    Some((1, "a peregrine falcon in flight")),
+                ),
+            ])
+            .await?;
+
+            // The accelerator resolved the duplicated key last-write-wins, which is the
+            // state the index is an index *of*.
+            assert_row_applied(&rt, 1, "a peregrine falcon in flight").await?;
+
+            // Asserted first, so the negative below is read against an index that has
+            // certainly processed this batch rather than one that has not started.
+            anyhow::ensure!(
+                eventually_finds(
+                    &rt,
+                    "SELECT id FROM text_search(docs, 'peregrine', content) LIMIT 4",
+                    1,
+                )
+                .await,
+                "the surviving change is in the accelerator but text_search cannot find it"
+            );
+
+            // `quick` occurs only in the superseded text. A hit here is the index
+            // disagreeing with its table: the row is searchable by a word its current
+            // content does not contain.
+            let stale = query_ids(
+                &rt,
+                "SELECT id FROM text_search(docs, 'quick', content) LIMIT 4",
+            )
+            .await?;
+            anyhow::ensure!(
+                stale.is_empty(),
+                "text_search matched the superseded text of row(s) {stale:?}: both changes \
+                 for the key were indexed, so the index holds content the table replaced"
+            );
+
             Ok(())
         })
         .await

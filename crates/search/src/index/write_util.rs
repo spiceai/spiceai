@@ -14,16 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Store-agnostic helpers shared by external-store [`crate::index::VectorIndex`]
-//! implementations (S3 Vectors, in-memory): primary-key formatting, search-column
-//! embedding, and embedding-column construction on write.
+//! Store-agnostic helpers shared by [`crate::index::SearchIndex`] implementations on the
+//! write path: primary-key formatting, search-column embedding, embedding-column
+//! construction, and resolving a key a single batch carries more than once.
+//!
+//! Most of it serves the external-store vector indexes (S3 Vectors, in-memory);
+//! [`deciding_rows_for_repeated_keys`] is shared with the full-text index and the chunked
+//! wrapper, which are keyed the same way and inherit the same hazard.
 
-use std::{num::TryFromIntError, sync::Arc};
+use std::{collections::HashMap, num::TryFromIntError, sync::Arc};
 
 use arrow::array::{
-    Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray,
+    Array, BooleanArray, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray,
 };
+use arrow::buffer::BooleanBuffer;
+use arrow::row::{Row, RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema};
 use itertools::Itertools;
 use llms::embeddings::{Embed, EmbeddingInput};
@@ -378,6 +384,99 @@ pub fn keys_to_evict<'a>(
         .collect()
 }
 
+/// For every distinct key tuple in `keys`, the row that decides it: the last row the key
+/// occurs at, taking `keys` in order. Returns one mask per batch — `true` for a deciding
+/// row — or `None` when no key occurs twice anywhere, which is the ordinary write and the
+/// case a caller must not pay a filter for.
+///
+/// One batch can carry the same primary key more than once. A change envelope holds every
+/// change the source produced in one poll, so two updates to one row inside that window
+/// arrive as two rows of one batch, and the table those rows land in resolves the key
+/// last-write-wins. An index keyed by that column can address only one entry per key, so an
+/// index that stores every occurrence ends up holding one key with an entry per occurrence
+/// — and a search then answers from a value the table has already replaced
+/// ([spiceai#13713](https://github.com/spiceai/spiceai/issues/13713)). Which occurrence is
+/// right is not a choice: it is whichever one the table resolved the key to, the last.
+///
+/// `keys` carries one batch per input batch, each already projected to the index's key
+/// columns. Projecting is left to the caller so an index that reports a column-resolution
+/// failure of its own keeps that error, rather than inheriting one worded for a different
+/// caller; a batch of no columns is a key that addresses nothing, and returns `None`.
+///
+/// Keys are compared through Arrow's row encoding, which orders NULLs alongside values, so
+/// two rows keyed NULL are one key here. That matches what a keyed index can express — a
+/// delete for that key reaches both entries — and the backends that cannot address a NULL
+/// key skip such rows before they reach this.
+pub fn deciding_rows_for_repeated_keys(
+    index_name: &str,
+    keys: &[RecordBatch],
+) -> Result<Option<Vec<BooleanArray>>, Box<Error>> {
+    let Some(first) = keys.first() else {
+        return Ok(None);
+    };
+    if first.num_columns() == 0 {
+        return Ok(None);
+    }
+    let total_rows: usize = keys.iter().map(RecordBatch::num_rows).sum();
+    if total_rows < 2 {
+        return Ok(None);
+    }
+    // Every batch has to encode under one converter for its rows to be comparable, so they
+    // have to agree on a schema. The batches of one write normally do; a call that mixes
+    // them has no comparable keys, and nothing is treated as a repeat rather than failing a
+    // write that used to land.
+    if keys.iter().any(|batch| batch.schema() != first.schema()) {
+        return Ok(None);
+    }
+
+    // One converter for all of `keys`: a `Row` compares by its encoded bytes, so rows from
+    // different batches are only comparable when the same converter produced them.
+    let converter = RowConverter::new(
+        first
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect(),
+    )
+    .context(IssueWithArrowProcessingSnafu { index: index_name })?;
+
+    let mut encoded = Vec::with_capacity(keys.len());
+    for batch in keys {
+        encoded.push(
+            converter
+                .convert_columns(batch.columns())
+                .context(IssueWithArrowProcessingSnafu { index: index_name })?,
+        );
+    }
+
+    // Insertion order is batch order, so the last write for a key is the one that stands.
+    let mut deciding: HashMap<Row<'_>, (usize, usize)> = HashMap::with_capacity(total_rows);
+    for (batch_idx, rows) in encoded.iter().enumerate() {
+        for row_idx in 0..rows.num_rows() {
+            deciding.insert(rows.row(row_idx), (batch_idx, row_idx));
+        }
+    }
+    if deciding.len() == total_rows {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        encoded
+            .iter()
+            .enumerate()
+            .map(|(batch_idx, rows)| {
+                BooleanArray::new(
+                    BooleanBuffer::collect_bool(rows.num_rows(), |row_idx| {
+                        deciding.get(&rows.row(row_idx)) == Some(&(batch_idx, row_idx))
+                    }),
+                    None,
+                )
+            })
+            .collect(),
+    ))
+}
+
 /// Reorder a [`RecordBatch`]'s columns alphabetically by field name.
 ///
 /// Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
@@ -404,6 +503,100 @@ mod tests {
     use super::*;
     use arrow::array::{FixedSizeListArray, Float32Array, Float32Builder, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Schema};
+
+    /// A one-column key batch, `None` for a NULL key.
+    fn key_batch(ids: &[Option<i32>]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .expect("the test column matches the test schema")
+    }
+
+    /// The mask per batch as plain bools, so an expectation reads as the rows it keeps.
+    fn deciding(keys: &[RecordBatch]) -> Option<Vec<Vec<bool>>> {
+        deciding_rows_for_repeated_keys("test", keys)
+            .expect("the key columns are comparable")
+            .map(|masks| {
+                masks
+                    .iter()
+                    .map(|m| (0..m.len()).map(|i| m.value(i)).collect())
+                    .collect()
+            })
+    }
+
+    #[test]
+    fn every_key_distinct_asks_the_caller_to_filter_nothing() {
+        assert!(
+            deciding(&[key_batch(&[Some(1), Some(2), Some(3)])]).is_none(),
+            "no key repeats, so no row is superseded and the caller must not pay a filter"
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_is_decided_by_its_last_row() {
+        assert_eq!(
+            deciding(&[key_batch(&[Some(1), Some(2), Some(1)])]),
+            Some(vec![vec![false, true, true]])
+        );
+    }
+
+    #[test]
+    fn a_key_repeated_across_batches_is_decided_in_the_last_one() {
+        assert_eq!(
+            deciding(&[
+                key_batch(&[Some(1), Some(2)]),
+                key_batch(&[Some(3)]),
+                key_batch(&[Some(1)]),
+            ]),
+            Some(vec![vec![false, true], vec![true], vec![true]]),
+            "a call carrying several batches is one sequence: the last batch holding the \
+             key decides it"
+        );
+    }
+
+    #[test]
+    fn a_composite_key_is_compared_whole() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let keys = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x", "y"])),
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+            ],
+        )
+        .expect("the test columns match the test schema");
+
+        assert!(
+            deciding(&[keys]).is_none(),
+            "('x',1), ('x',2) and ('y',1) are three keys — only a whole tuple repeats"
+        );
+    }
+
+    /// NULLs compare equal under the row encoding, which is what a keyed index can
+    /// express: a delete for that key reaches every entry stored under it.
+    #[test]
+    fn two_null_keys_are_one_key() {
+        assert_eq!(
+            deciding(&[key_batch(&[None, Some(1), None])]),
+            Some(vec![vec![false, true, true]])
+        );
+    }
+
+    #[test]
+    fn a_key_of_no_columns_supersedes_nothing() {
+        let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        assert!(deciding(&[empty]).is_none());
+    }
+
+    #[test]
+    fn a_single_row_needs_no_comparison() {
+        assert!(deciding(&[key_batch(&[Some(1)])]).is_none());
+        assert!(deciding(&[]).is_none());
+    }
 
     // Helper function to create a test RecordBatch with text and embedding columns
     #[expect(clippy::cast_sign_loss)]

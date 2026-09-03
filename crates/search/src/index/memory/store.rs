@@ -22,7 +22,7 @@ limitations under the License.
 //! drop superseded rows with a single Arrow `filter` pass — zero-copy for
 //! untouched rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use arrow::array::{BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
@@ -116,6 +116,14 @@ impl MemoryVectorStore {
     ) -> Result<(), DataFusionError> {
         debug_assert_eq!(batch.num_rows(), keys.len());
 
+        // The deletes below clear what the store already held for these keys, but `batch`
+        // is then pushed whole — so a key this batch carries twice would land twice and the
+        // store would hold one key with a row per occurrence. That happens on the ordinary
+        // CDC path: a change envelope holds every change the source produced in one poll,
+        // so two updates to one row inside that window arrive as two rows of one batch. A
+        // search would then answer from a row the table has already replaced (#13713).
+        let (batch, keys) = keep_deciding_row_per_key(batch, keys)?;
+
         if evicted.is_empty() {
             self.delete_by_keys(&keys)?;
         } else {
@@ -202,6 +210,39 @@ impl MemoryVectorStore {
     }
 }
 
+/// Reduce `batch` to one row per key: the last row each key occurs at, which is the row the
+/// table resolved that key to. Returns its inputs untouched when every key is already
+/// distinct, so an ordinary write copies nothing.
+fn keep_deciding_row_per_key(
+    batch: RecordBatch,
+    keys: Vec<String>,
+) -> Result<(RecordBatch, Vec<String>), DataFusionError> {
+    let mut last: HashMap<&str, usize> = HashMap::with_capacity(keys.len());
+    for (row, key) in keys.iter().enumerate() {
+        last.insert(key.as_str(), row);
+    }
+    if last.len() == keys.len() {
+        return Ok((batch, keys));
+    }
+
+    let decides: Vec<bool> = keys
+        .iter()
+        .enumerate()
+        .map(|(row, key)| last.get(key.as_str()) == Some(&row))
+        .collect();
+    drop(last);
+
+    let mask: BooleanArray = decides.iter().map(|&keep| Some(keep)).collect();
+    let filtered = filter_record_batch(&batch, &mask)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let kept = keys
+        .into_iter()
+        .zip(&decides)
+        .filter_map(|(key, &keep)| keep.then_some(key))
+        .collect();
+    Ok((filtered, kept))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -260,6 +301,83 @@ mod tests {
                     .to_vec()
             })
             .collect()
+    }
+
+    /// A batch built with a distinct body per row, so which row survived is visible.
+    fn batch_of(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, body)| *body).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("test columns match the test schema")
+    }
+
+    /// The (id, body) pairs the store holds, flattened across its batches.
+    fn stored_rows(store: &MemoryVectorStore) -> Vec<(i64, String)> {
+        store
+            .batches()
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("column 0 is the id column");
+                let bodies = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column 1 is the body column");
+                (0..b.num_rows())
+                    .map(|r| (ids.value(r), bodies.value(r).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// One batch can carry the same key more than once: a change envelope holds every
+    /// change the source produced in one poll. The store is keyed, so it must end up
+    /// holding the row the table resolved that key to — its last. Regression test for
+    /// #13713.
+    #[test]
+    fn a_key_a_batch_carries_twice_is_stored_at_its_last_row() {
+        let mut store = MemoryVectorStore::new(schema());
+
+        store
+            .upsert(
+                batch_of(&[(1, "first"), (2, "other"), (1, "last")]),
+                keys(&[1, 2, 1]),
+                &[],
+            )
+            .expect("the batch's keys are parallel to its rows");
+
+        assert_eq!(
+            stored_rows(&store),
+            vec![(2, "other".to_string()), (1, "last".to_string())],
+            "the key carried twice must be stored once, at the row that decides it"
+        );
+    }
+
+    /// The control for the case above: with every key distinct, nothing is dropped.
+    #[test]
+    fn an_upsert_with_no_repeated_key_stores_every_row() {
+        let mut store = MemoryVectorStore::new(schema());
+
+        store
+            .upsert(batch_of(&[(1, "a"), (2, "b")]), keys(&[1, 2]), &[])
+            .expect("the batch's keys are parallel to its rows");
+
+        assert_eq!(
+            stored_rows(&store),
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
     }
 
     #[test]

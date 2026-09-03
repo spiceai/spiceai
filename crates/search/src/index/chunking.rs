@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    slice,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME,
-    index::{SearchIndex, VectorIndex, embedding_col},
+    index::{SearchIndex, VectorIndex, embedding_col, write_util},
     metadata::MetadataColumn,
 };
 
@@ -20,7 +20,6 @@ use arrow::{
     },
     buffer::{BooleanBuffer, OffsetBuffer},
     compute::{concat, filter_record_batch},
-    row::{RowConverter, SortField},
 };
 
 use crate::index::primary_key_projection;
@@ -424,32 +423,20 @@ impl ChunkedSearchIndex {
         // embedding vectors only to discard them.
         let keys = record.project(&key_indices)?;
 
-        // Compare whole key tuples, whatever their column types, through Arrow's comparable row
-        // encoding.
-        let converter = RowConverter::new(
-            keys.columns()
-                .iter()
-                .map(|a| SortField::new(a.data_type().clone()))
-                .collect(),
-        )?;
-        let rows = converter.convert_columns(keys.columns())?;
-
         // A key's *last* row in the batch is the one that survives downstream, so that is the
-        // row that decides. Later inserts overwrite earlier ones, leaving each key mapped to its
-        // final occurrence.
-        let mut last_occurrence = HashMap::with_capacity(record.num_rows());
-        for i in 0..record.num_rows() {
-            last_occurrence.insert(rows.row(i), i);
-        }
+        // row that decides. `None` back means no key repeats, so every row decides its own.
+        let deciding =
+            write_util::deciding_rows_for_repeated_keys(self.inner.name(), slice::from_ref(&keys))
+                .map_err(|e| DataFusionError::External(e))?
+                .and_then(|masks| masks.into_iter().next());
+        let decides = |i: usize| deciding.as_ref().is_none_or(|mask| mask.value(i));
 
         // Evict a key exactly once, on its deciding row, and only when that row chunked into
         // nothing. A key whose last row still has text keeps what this write wrote for it; a key
         // whose last row is empty loses everything under it, including chunks an earlier row of
         // the same batch just produced — which is the state the surviving row calls for.
         let evict = BooleanArray::new(
-            BooleanBuffer::collect_bool(keys.num_rows(), |i| {
-                repeats[i] == 0 && last_occurrence.get(&rows.row(i)) == Some(&i)
-            }),
+            BooleanBuffer::collect_bool(keys.num_rows(), |i| repeats[i] == 0 && decides(i)),
             None,
         );
         if evict.true_count() == 0 {

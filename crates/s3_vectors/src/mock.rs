@@ -70,7 +70,10 @@ pub struct MockData {
     pub indexes: HashMap<String, Vec<aws_sdk_s3vectors::types::IndexSummary>>,
     pub vectors: HashMap<String, Vec<ListOutputVector>>,
     pub vector_counts: HashMap<String, usize>, // Track number of vectors per index
-    pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
+    /// The keys each `put_vectors` request carried, in call order. `vectors`/`vector_counts`
+    /// upsert by key and so cannot show a request that named one key twice.
+    pub put_requests: Vec<Vec<String>>,
+    pub quota_limits: HashMap<String, usize>, // Configurable quota limits per index
     pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
     pub create_index_calls: usize,
     pub get_vector_bucket_calls: usize,
@@ -121,6 +124,17 @@ impl MockClient {
             .unwrap_or_default();
         keys.sort();
         keys
+    }
+
+    /// The keys each `put_vectors` request carried, in call order — so a test can assert a
+    /// request named a key once, which the stored set cannot show (it upserts by key).
+    #[must_use]
+    pub fn put_requests(&self) -> Vec<Vec<String>> {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.put_requests.clone()
     }
 
     /// Get the call count for `list_indexes` on a specific bucket
@@ -429,6 +443,14 @@ impl S3Vectors for MockClient {
                     .build(),
             ));
         }
+
+        data.put_requests.push(
+            input
+                .vectors()
+                .iter()
+                .map(|v| v.key().to_string())
+                .collect(),
+        );
 
         // Upsert each vector into the tracked store, keyed by its S3 Vectors key, so tests can
         // assert exactly which entries a later `delete_vectors` removes. The quota check above

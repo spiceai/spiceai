@@ -48,7 +48,7 @@ use crate::generation::text_search::{
     TextSearchIndexingSnafu,
 };
 use crate::generation::util::get_primary_keys;
-use crate::index::SearchIndex;
+use crate::index::{SearchIndex, write_util};
 
 /// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
 /// A larger budget reduces the number of segment flushes and subsequent merges,
@@ -556,6 +556,60 @@ impl FullTextDatabaseIndex {
             .collect())
     }
 
+    /// The rows of `rb` that decide their primary key, when a key occurs more than once
+    /// across this call's batches — see [`write_util::deciding_rows_for_repeated_keys`] for
+    /// why an index keyed by that column can hold only the last of them.
+    ///
+    /// `None` when every key occurs once, and also when a batch does not carry the whole
+    /// primary key: there is then nothing to compare keys with, and this path must not be
+    /// the one that reports it. The rest of the write already tolerates a missing primary
+    /// key column (it produces no delete term and sets no document value for it), so
+    /// nothing is treated as a repeat rather than failing a write that used to land.
+    fn rows_deciding_each_key(
+        &self,
+        rb: &[RecordBatch],
+    ) -> Result<Option<Vec<RecordBatch>>, super::Error> {
+        let arrow_err =
+            |e: arrow::error::ArrowError| super::Error::FailedToRetrieveDataFromSource {
+                source: DataFusionError::ArrowError(Box::new(e), None),
+            };
+
+        let mut keys = Vec::with_capacity(rb.len());
+        for batch in rb {
+            let schema = batch.schema();
+            let Some(indices) = self
+                .primary_key
+                .iter()
+                .map(|pk| schema.column_with_name(pk.as_str()).map(|(idx, _)| idx))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            keys.push(batch.project(&indices).map_err(arrow_err)?);
+        }
+
+        let Some(masks) =
+            write_util::deciding_rows_for_repeated_keys(self.name(), &keys).map_err(|e| {
+                super::Error::InvalidIndexingError {
+                    source: e,
+                    context: "Failed to resolve which row decides a primary key the batch carries \
+                          more than once"
+                        .to_string(),
+                }
+            })?
+        else {
+            return Ok(None);
+        };
+
+        rb.iter()
+            .zip(&masks)
+            .map(|(batch, mask)| {
+                arrow::compute::filter_record_batch(batch, mask).map_err(arrow_err)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     /// Update the underlying [`tantivy::Index`] with new data from [`RecordBatch`]s. Additional
     /// columns present will be ignored.
     ///
@@ -564,6 +618,14 @@ impl FullTextDatabaseIndex {
     /// an additional column is used in the [`tantivy::Index`] for unique lookup (required since
     /// updates = deletion -> insertion).
     async fn update_index(&self, rb: &[RecordBatch]) -> Result<(), super::Error> {
+        // An update here is a deletion then an insertion, and every document is added
+        // after every delete term is applied — so a row this same call supersedes is not
+        // removed by the row that supersedes it. Keep each key's deciding row: otherwise
+        // one primary key ends up with a document per occurrence, one of them holding
+        // text the table has already replaced, and a search answers from it (#13713).
+        let coalesced = self.rows_deciding_each_key(rb)?;
+        let rb: &[RecordBatch] = coalesced.as_deref().unwrap_or(rb);
+
         // Construct column for `INDEX_UNIQUE_FIELD_NAME` if needed.
         let rb = if needs_unique_field(&self.primary_key, &self.search_fields) {
             rb.iter()
@@ -1194,6 +1256,54 @@ mod tests {
             ],
         )
         .expect("Failed to create test batch")
+    }
+
+    /// One batch can carry the same primary key more than once — a change envelope holds
+    /// every change the source produced in one poll, so two updates to one row inside that
+    /// window arrive as two rows of one batch. An update here is a delete then an insert
+    /// and every document is added after every delete term, so the superseded row is not
+    /// removed by the row that supersedes it: both would stay searchable, and the index
+    /// would answer for text the table has already replaced. Regression test for #13713.
+    #[tokio::test]
+    async fn a_key_carried_twice_in_one_batch_indexes_only_its_last_row() {
+        let index = new_test_index();
+
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 1]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple banana", "dog elephant", "mango nectarine"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        assert_eq!(
+            bm25_collection_size(&index),
+            2,
+            "the batch names two keys, so it must leave two documents — not one per row"
+        );
+
+        assert_eq!(
+            search_ids(&index, "mango").await,
+            vec![1],
+            "the row that decides the key is the one indexed"
+        );
+        assert_eq!(
+            search_ids(&index, "apple").await,
+            Vec::<i32>::new(),
+            "the superseded row's text must not be searchable: the table does not hold it"
+        );
+        assert_eq!(
+            search_ids(&index, "elephant").await,
+            vec![2],
+            "a key the batch carries once is untouched"
+        );
     }
 
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {

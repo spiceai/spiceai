@@ -445,12 +445,28 @@ impl S3VectorsTable {
     ) -> Result<()> {
         let start = std::time::Instant::now();
 
+        // One batch can carry the same key more than once — a change envelope holds every
+        // change the source produced in one poll, so two updates to one row inside that
+        // window arrive as two rows of one batch. An index is keyed, so it can hold only
+        // one of them, and which one is not a choice: it is the row the table resolved the
+        // key to, its last. Sending both leaves the stored vector to whatever `PutVectors`
+        // does with a key repeated inside one request, which is not something to rely on
+        // (#13713). `i` still addresses `metadata`, so this only ever skips a row.
+        let deciding_row: HashMap<&str, usize> = key
+            .iter()
+            .enumerate()
+            .filter_map(|(i, key)| key.as_deref().map(|key| (key, i)))
+            .collect();
+
         let vectors: Vec<PutInputVector> = data
             .into_iter()
-            .zip(key)
+            .zip(&key)
             .enumerate()
             .filter_map(|(i, (data, key))| {
-                let key = key?;
+                let key = key.as_deref()?;
+                if deciding_row.get(key) != Some(&i) {
+                    return None;
+                }
                 let data = data?;
                 let meta: HashMap<String, Document> = metadata
                     .iter()
@@ -749,6 +765,69 @@ mod tests {
 
         assert!(exists);
         assert_eq!(mock_client.get_vector_bucket_call_count(), 0);
+    }
+
+    /// One batch can carry the same key more than once — a change envelope holds every
+    /// change the source produced in one poll. The index is keyed, so exactly one vector
+    /// may be put for it, and it must be the one the table resolved the key to: its last
+    /// row. Regression test for #13713.
+    #[tokio::test]
+    async fn a_key_a_batch_carries_twice_is_put_once() -> Result<(), Box<dyn std::error::Error>> {
+        let mock_client = Arc::new(MockClient::new());
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
+
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
+
+        // `a` twice with different vectors, `b` once. The second `a` is the deciding row.
+        table
+            .write_data(
+                vec![
+                    Some(vec![1.0, 0.0, 0.0]),
+                    Some(vec![0.0, 1.0, 0.0]),
+                    Some(vec![0.0, 0.0, 1.0]),
+                ],
+                vec![
+                    Some("a".to_string()),
+                    Some("b".to_string()),
+                    Some("a".to_string()),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await?;
+
+        assert_eq!(
+            mock_client.put_requests(),
+            vec![vec!["b".to_string(), "a".to_string()]],
+            "the request must name the repeated key once, at its deciding row — what \
+             `PutVectors` does with a key repeated inside one request is not something to \
+             rely on"
+        );
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["a", "b"]);
+
+        Ok(())
     }
 
     #[tokio::test]
