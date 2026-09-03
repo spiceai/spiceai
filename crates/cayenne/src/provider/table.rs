@@ -22518,7 +22518,13 @@ impl CayenneTableProvider {
         // duration); this body reports every decline, so the two together
         // account for every attempt.
         let table_name = self.table_metadata.table_name.as_str();
-        if self.should_capture_positions() || self.pk_deletion_strategy.is_position_based() {
+        // GATE: PK-based strategies only. The PositionBased strategy (PK-less
+        // tables) has no key-based index to prune, and its position deletes are
+        // file-scoped (the prune is a no-op for them) — out of the bake's scope.
+        // PK-based strategies (Int64Pk / RowConverterBased) hold a key-based
+        // tombstone index in BOTH key and position mode, so the bake runs for
+        // both — that is what bounds the index in position mode.
+        if self.pk_deletion_strategy.is_position_based() {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::Bake,
@@ -34137,7 +34143,14 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // legitimate shrink — becomes MANDATORY: it overrides BOTH the count
         // trigger and the apply-back-pressure defer below. Key-mode only (position
         // mode is excluded, mirroring the count gate).
-        let key_mode = !self.should_capture_positions();
+        // The seq-prefix bake prunes the key-based deletion index (Int64Pk /
+        // RowConverterBased), which is maintained in BOTH deletion modes. Gate
+        // the bake on the strategy, not the mode: a PK table in position mode
+        // still holds a key-based tombstone index, and that index is the
+        // unbounded grower when the bake is skipped (the position-mode RSS leak).
+        // The PositionBased strategy (PK-less tables) has no key-based index to
+        // prune, so it stays out of the bake's scope.
+        let key_mode = !self.pk_deletion_strategy.is_position_based();
         let over_mem_ceiling = key_mode && self.deletion_index_over_memory_ceiling();
         let bake_table_name = self.table_metadata.table_name.as_str();
         if !key_mode {
@@ -46884,80 +46897,85 @@ mod tests {
         );
     }
 
-    /// STAGE-2 DELIVERABLE TEST (4). The bake is a NO-OP on a position-delete
-    /// table: `should_capture_positions()` is true (default `auto` resolves to
-    /// position for a PK table), so the seq-prefix bake returns `Ok(false)`
-    /// without merging — even with enough protected snapshots to otherwise bake.
+    /// The seq-prefix bake now RUNS for PK-based tables in POSITION mode
+    /// (auto → position). The key-based deletion index (Int64Pk /
+    /// RowConverterBased) is maintained in BOTH deletion modes, so the bake —
+    /// its only shrink path — must run in position mode too, or the index grows
+    /// unboundedly (the position-mode RSS leak this fix closes). This pins that
+    /// a PK table in position mode bakes (protected set shrinks) and a
+    /// tombstone at or below the cutoff is pruned WITHOUT resurrecting its row.
+    ///
+    /// Uses the pinned-threshold fixture (like the key-mode fixture) so the
+    /// tombstone seq (15) is known to sit between the oldest snapshot's
+    /// threshold (10) and the cutoff T (20) — the clean-prefix condition that
+    /// makes the prune safe. In production, position-mode deletions are
+    /// tracked as BOTH a key tombstone and a per-file position-deletion vector
+    /// (written together by the sink), so the rewrite always excludes the row;
+    /// the key-based filter applied here stands in for that.
+    ///
+    /// The bake `try_lock`s the compaction lock; a debounced post-write pass
+    /// (position capture / size-tier) may hold it transiently after the
+    /// fixture releases it, so retry — `LockBusy` is the intended "retry next
+    /// tick" outcome, not a failure.
     #[tokio::test]
-    async fn seq_prefix_bake_is_noop_on_position_delete_table() {
-        use arrow::datatypes::{DataType, Field, Schema};
+    async fn seq_prefix_bake_runs_on_pk_position_mode_table() {
         let ctx = SessionContext::new();
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
-        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
-            as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("catalog initialized");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        let options = CreateTableOptions {
-            table_name: "bake_noop_position".to_string(),
-            schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "id".to_string(),
-                ]),
-            )),
-            base_path: data_dir,
-            partition_column: None,
-            vortex_config: VortexConfig {
-                inline_max_rows: 0,
-                // Default deletion mode left as auto → resolves to POSITION for a
-                // PK table, which the bake gate must skip.
-                compaction_background_interval_ms: 3_600_000,
-                ..VortexConfig::default()
-            },
+        // auto → resolves to POSITION for a PK table (the default deletion mode).
+        let vortex_config = VortexConfig {
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Auto,
+            ..VortexConfig::default()
         };
-        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
-            .create(options)
-            .await
-            .expect("table created");
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture_with_config(
+            "bake_position_mode",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+            vortex_config,
+        )
+        .await;
         assert!(
             provider.should_capture_positions(),
             "fixture must resolve to position mode or this test pins nothing"
         );
 
-        // Enough distinct-key inserts to clear the K+2 floor if it were key-mode.
-        for id in 0..6_i64 {
-            insert_batch(
-                &provider,
-                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
-            )
-            .await;
-        }
-        {
-            let _guard = provider.compaction_lock.lock().await;
-            provider.rebuild_live_snapshot_manifests().await;
-        }
-        let before = provider.protected_snapshots.load_full().len();
+        // Delete key 0 (written at seq 10, in the oldest snapshot) at delete_seq
+        // 15 — between the snapshot's threshold (10) and T (20), so the rewrite's
+        // key filter (`> threshold`) applies it and the row is excluded.
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_position_mode").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
 
-        let baked = provider
-            .bake_seq_prefix_protected_snapshots()
-            .await
-            .expect("bake should not error");
+        let before = provider.protected_snapshots.load_full().len();
+        // Retry: a debounced post-write pass may transiently hold the compaction
+        // lock (LockBusy); the next attempt (like the next compaction tick) bakes.
+        let mut baked = false;
+        for _ in 0..100 {
+            match provider.bake_seq_prefix_protected_snapshots().await {
+                Ok(b) => {
+                    baked = b;
+                    if b {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
-            !baked,
-            "the seq-prefix bake must be a no-op on a position-delete table"
+            baked,
+            "the seq-prefix bake must RUN for a PK table in position mode (bounds the key index)"
+        );
+        assert!(
+            provider.protected_snapshots.load_full().len() < before,
+            "a position-mode bake must merge the older prefix (protected set shrinks)"
         );
         assert_eq!(
-            provider.protected_snapshots.load_full().len(),
-            before,
-            "a position-mode bake must not touch the protected set"
+            collect_id_value_pairs(&ctx, &provider, "bake_position_mode").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "the baked tombstone must stay pruned (no resurrection of key 0)"
         );
     }
 
