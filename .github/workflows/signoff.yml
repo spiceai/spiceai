@@ -425,6 +425,14 @@ jobs:
       - name: Check the work volume before setting up the toolchain
         run: .trusted-ci/signoff preflight-disk
 
+      # Before the toolchain, because every status this job posts goes through
+      # `gh` — including the failure and cancellation handlers at the end. The
+      # Linux pool's image does not carry it, and scripts/signoff requires it
+      # unconditionally, so without this the run dies at `require_tools` having
+      # done nothing but leave its `pending` behind.
+      - name: Set up the GitHub CLI
+        uses: ./.trusted-ci/actions/setup-gh
+
       - name: Set up Rust
         uses: ./.trusted-ci/actions/setup-rust
 

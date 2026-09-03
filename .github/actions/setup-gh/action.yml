@@ -1,0 +1,115 @@
+name: Set up the GitHub CLI
+description: 'composite action'
+
+# `gh` is how a job reports back: scripts/signoff posts every `signoff` commit
+# status through it, and parses PR and workflow-run JSON with `gh --jq`. The
+# macOS pool carries it in the image; the Linux pool does not, so a job that
+# needs it there dies at `require_tools` before running a single check
+# ("GitHub CLI (gh) not found") and leaves whatever status it had already
+# posted (see run 33705847562).
+#
+# Probe before installing. A runner that already has `gh` — every macOS host,
+# and any Linux host once someone bakes it into the image — costs one `command
+# -v` and no network.
+#
+# Pinned, not `latest`. scripts/signoff reads structured `gh` output on the
+# path that decides whether a commit is merge-eligible, so a release that
+# changes a JSON shape or a flag would break the gate on hosts that happened
+# to install that day. Bump `version` deliberately.
+
+inputs:
+  version:
+    description: 'Version of the GitHub CLI to install when the runner has none, without the leading "v".'
+    required: false
+    default: '2.99.0'
+  token:
+    description: 'GitHub token for release API requests (avoids unauthenticated api.github.com rate limits). Defaults to the workflow github.token.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install the GitHub CLI
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_TOKEN: ${{ inputs.token || github.token }}
+      run: |
+        set -euo pipefail
+
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh already present: $(command -v gh) ($(gh --version | head -1))"
+          exit 0
+        fi
+
+        # Only Linux has an install path here. Refusing loudly beats installing
+        # nothing and letting the caller fail later with `gh` still missing.
+        os="$(uname -s)"
+        if [ "$os" != "Linux" ]; then
+          echo "::error::'gh' is not on PATH and this action installs it on Linux only (this runner is ${os}). Install the GitHub CLI on this runner: https://cli.github.com"
+          exit 1
+        fi
+
+        case "$(uname -m)" in
+          x86_64)  arch="amd64" ;;
+          aarch64|arm64) arch="arm64" ;;
+          *)
+            echo "::error::Failed to install the GitHub CLI: no release asset is mapped for architecture '$(uname -m)'. Add it to .github/actions/setup-gh, or install gh on this runner."
+            exit 1
+            ;;
+        esac
+
+        version="${INPUT_VERSION#v}"
+        filename="gh_${version}_linux_${arch}.tar.gz"
+        url="https://github.com/cli/cli/releases/download/v${version}/${filename}"
+
+        # Same shape as install-protoc: take the expected digest from the
+        # release metadata rather than trusting the download, and authenticate
+        # the API call so a shared runner IP does not hit the anonymous rate
+        # limit mid-run.
+        api_curl() {
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            curl -fsSL --retry 5 --retry-connrefused \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          else
+            curl -fsSL --retry 5 --retry-connrefused "$1"
+          fi
+        }
+
+        if ! command -v jq >/dev/null 2>&1; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+        fi
+
+        release_json="$(api_curl "https://api.github.com/repos/cli/cli/releases/tags/v${version}")"
+        expected="$(jq -r --arg name "$filename" \
+          '.assets[] | select(.name == $name) | .digest' <<<"$release_json" | sed 's/^sha256://')"
+        if [ -z "$expected" ] || [ "$expected" = "null" ]; then
+          echo "::error::Failed to install the GitHub CLI: release v${version} publishes no SHA256 digest for '${filename}'. Check the version pinned in .github/actions/setup-gh."
+          exit 1
+        fi
+
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        echo "Downloading gh v${version}: ${url}"
+        curl -fsSL --retry 5 --retry-connrefused -o "${tmp}/${filename}" "$url"
+
+        actual="$(sha256sum "${tmp}/${filename}" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::Failed to install the GitHub CLI: SHA256 mismatch for '${filename}' (expected ${expected}, got ${actual}). The download did not match the digest the release publishes; do not use it."
+          exit 1
+        fi
+        echo "SHA256 verified: ${actual}"
+
+        install_dir="${HOME}/.local/bin"
+        mkdir -p "$install_dir"
+        tar -xzf "${tmp}/${filename}" -C "$tmp"
+        mv "${tmp}/gh_${version}_linux_${arch}/bin/gh" "${install_dir}/gh"
+        chmod +x "${install_dir}/gh"
+        echo "$install_dir" >> "$GITHUB_PATH"
+
+        echo "gh installed: ${install_dir}/gh"
+        "${install_dir}/gh" --version
