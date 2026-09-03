@@ -86,6 +86,20 @@ fn write_hex_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// The SQL each federated scan in `plan` sends to `DuckDB`, one per line.
+///
+/// `base_sql` is the only part of an `EXPLAIN` that says what `DuckDB` is asked
+/// to evaluate — the logical plan above it names the `DataFusion` function
+/// whether or not the dialect rewrote the call — so every test here that claims
+/// a rewrite reached the remote engine reads it rather than the whole plan.
+fn pushed_down_sql(plan: &str) -> String {
+    plan.split("base_sql=")
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn duckdb_accelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(Params::from_string_map(
@@ -153,12 +167,7 @@ async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), 
                 .await?,
             )?
             .to_string();
-            let remote_sql: String = plan
-                .split("base_sql=")
-                .skip(1)
-                .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let remote_sql = pushed_down_sql(&plan);
             assert!(
                 remote_sql.contains("trim("),
                 "the trims must be pushed down to DuckDB, not evaluated locally; plan was:\n{plan}"
@@ -294,19 +303,12 @@ async fn duckdb_accelerated_to_hex_agrees_with_local() -> Result<(), anyhow::Err
 
             // The call must reach DuckDB for this to be testing anything: an
             // accelerated query that evaluated `to_hex` locally would agree
-            // with the control even with the rewrite removed. `base_sql` is the
-            // SQL the federated scan sends, so it is the only part of the plan
-            // that says what DuckDB is asked to evaluate.
+            // with the control even with the rewrite removed.
             let plan = to_pretty_display(
                 &run_query(&rt, "EXPLAIN SELECT to_hex(h) FROM accelerated").await?,
             )?
             .to_string();
-            let remote_sql: String = plan
-                .split("base_sql=")
-                .skip(1)
-                .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let remote_sql = pushed_down_sql(&plan);
             assert!(
                 remote_sql.contains("lower(to_hex("),
                 "the hex rendering must be pushed down to DuckDB inside a `lower(..)`; \

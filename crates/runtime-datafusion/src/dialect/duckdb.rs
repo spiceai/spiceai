@@ -160,12 +160,8 @@ pub(crate) fn to_hex_to_lowercase_hex(
     args: &[Expr],
 ) -> Result<Option<ast::Expr>, DataFusionError> {
     match args {
-        [_] => {
-            let Some(hex) = renamed_fn_to_sql(unparser, args, TO_HEX_NAME)? else {
-                return Ok(None);
-            };
-            Ok(Some(wrap_in_call(hex, LOWER_NAME)))
-        }
+        [_] => Ok(renamed_fn_to_sql(unparser, args, TO_HEX_NAME)?
+            .map(|hex| wrap_in_call(hex, LOWER_NAME))),
         // `to_hex` is a single-argument function, so the planner cannot build
         // this. Fail rather than fall through to `Ok(None)`, which would put
         // the un-lowered `to_hex` back into the DuckDB SQL.
