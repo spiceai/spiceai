@@ -673,6 +673,15 @@ impl Refresher {
         self
     }
 
+    /// Mark the accelerated table as changed now.
+    ///
+    /// For a write path that only learns whether its write is allowed once it
+    /// executes: it stamps the table itself when the write lands, so a refused one
+    /// leaves the freshness timestamp alone.
+    pub fn mark_updated_now(&self) {
+        crate::accelerated::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
+    }
+
     pub fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
         self.last_updated_at = last_updated_at;
         self
