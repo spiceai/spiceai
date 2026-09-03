@@ -258,6 +258,23 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeliverableKey {
+        dataset_name: String,
+        pk_columns: usize,
+    },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back marks and delivers each committed row keyed on '{resolved}', the primary key this dataset's accelerator resolved, but its source connector was configured to upsert on '{declared}'. Delivering on a different column would write a second row at the source instead of updating the one that was marked. Set 'acceleration.primary_key' to '{resolved}', or recreate the acceleration so it resolves the declared key. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackKeyMismatch {
+        dataset_name: String,
+        resolved: String,
+        declared: String,
+    },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -583,8 +600,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes commit to the local accelerator first,
-    /// then asynchronously persist to the federated source.
+    /// Enable write-back mode: writes commit to the local accelerator inside a
+    /// transaction, and a delivery worker carries them to the federated source
+    /// afterwards.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -997,6 +1015,39 @@ impl Builder {
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source.
+        //
+        // Built before ANY background task starts, because building it can fail: a
+        // key the worker could never deliver on refuses the table rather than
+        // letting it accept writes it would never carry to the source. Every
+        // `return` after this point abandons whatever tasks already exist, and
+        // dropping a `JoinHandle` detaches its task rather than aborting it — only
+        // `Drop for AcceleratedTable` aborts them, and that never runs for a table
+        // that was never built. `refresher.start` below is the first such task, so
+        // this has to come before it, not merely before `handlers`.
+        //
+        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
+        // further down.
+        let write_back_worker = if self.write_back && !self.dual_write {
+            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+                Some(write::CayenneWriteTarget::Staged(cayenne))
+                    if cayenne.is_durable_write_back() =>
+                {
+                    Some(write_back_worker::WriteBackWorker::new(
+                        *cayenne,
+                        Arc::clone(&self.federated),
+                        self.dataset_name.to_string(),
+                        self.write_back_deliverer.clone(),
+                    )?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
                 // Accelerated tables aren't loaded locally on the scheduler —
@@ -1240,21 +1291,14 @@ impl Builder {
             WriteMode::WriteThrough
         };
 
-        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
-        // commit path marks dirty keys gets a per-table delivery worker that
-        // reconciles those keys to the federated source. Aborted on drop with
-        // the other handlers.
-        if matches!(write_mode, WriteMode::WriteBack)
-            && let Some(write::CayenneWriteTarget::Staged(cayenne)) =
-                write::dual_write::extract_cayenne_write_target(&self.accelerator)
-            && cayenne.is_durable_write_back()
-        {
-            handlers.push(write_back_worker::WriteBackWorker::spawn(
-                *cayenne,
-                Arc::clone(&self.federated),
-                self.dataset_name.to_string(),
-                self.write_back_deliverer.clone(),
-            ));
+        // Started here rather than where it was built, so it is aborted on drop
+        // with the other handlers.
+        if let Some(worker) = write_back_worker {
+            debug_assert!(
+                matches!(write_mode, WriteMode::WriteBack),
+                "a delivery worker was built for a table that did not resolve to write-back"
+            );
+            handlers.push(worker.start());
         }
 
         Ok(AcceleratedTable {
@@ -2027,7 +2071,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2054,9 +2105,9 @@ impl TableLayer for AcceleratedTable {
                     input,
                     overwrite,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
                     Arc::clone(&self.refresher),
                     self.schema(),
+                    &self.dataset_name.to_string(),
                 )
             }
             WriteMode::DualWrite {
@@ -2086,6 +2137,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(self.write_mode, WriteMode::WriteBack) {
+            return Err(write::write_back::delete_not_supported(
+                &self.dataset_name.to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2094,15 +2153,7 @@ impl TableLayer for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.delete_from(state, filters).await
             }
-            WriteMode::WriteBack => {
-                write::write_back::delete_write_back(
-                    state,
-                    filters,
-                    Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
-                )
-                .await
-            }
+            WriteMode::WriteBack => unreachable!("refused above, before the timestamp moves"),
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
@@ -2132,7 +2183,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2148,7 +2206,8 @@ impl TableLayer for AcceleratedTable {
                     assignments,
                     filters,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
+                    &self.dataset_name.to_string(),
+                    Arc::clone(&self.last_updated_at),
                 )
                 .await
             }
@@ -2180,6 +2239,18 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(
+            self.write_mode,
+            WriteMode::WriteBack | WriteMode::DualWrite { .. }
+        ) {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                    .to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2189,10 +2260,7 @@ impl TableLayer for AcceleratedTable {
                 federated_table.truncate(state).await
             }
             WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
-                Err(datafusion::error::DataFusionError::Plan(
-                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
-                        .to_string(),
-                ))
+                unreachable!("refused above, before the timestamp moves")
             }
         }
     }
