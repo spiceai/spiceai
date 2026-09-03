@@ -21,6 +21,8 @@ use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::execution::RecordBatchStream;
 use futures::TryStreamExt;
 
 use crate::{
@@ -75,17 +77,23 @@ fn get_params() -> Params {
     )
 }
 
-async fn collect(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    rt.datafusion()
+/// Runs `sql` and returns the result schema alongside the batches. The schema
+/// comes from the stream, so it is available even when no rows come back.
+async fn collect(rt: &Runtime, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), anyhow::Error> {
+    let stream = rt
+        .datafusion()
         .query_builder(sql)
         .build()
         .run()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .data
+        .data;
+    let schema = stream.schema();
+    let batches = stream
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((schema, batches))
 }
 
 /// A dataset pointed at a Unity Catalog `STREAMING_TABLE` must become ready
@@ -129,7 +137,7 @@ async fn databricks_sql_warehouse_m2m_streaming_table_test() -> Result<(), anyho
             runtime_ready_check(&rt).await;
 
             // The count exercises the full scan path on the warehouse.
-            let count = collect(&rt, "SELECT COUNT(*) AS n FROM streaming_table").await?;
+            let (_, count) = collect(&rt, "SELECT COUNT(*) AS n FROM streaming_table").await?;
             let count_column = count
                 .first()
                 .and_then(|batch| batch.column(0).as_any().downcast_ref::<Int64Array>())
@@ -137,19 +145,18 @@ async fn databricks_sql_warehouse_m2m_streaming_table_test() -> Result<(), anyho
             assert_eq!(count_column.len(), 1, "COUNT(*) should return one row");
             assert!(!count_column.is_null(0), "COUNT(*) should not be NULL");
 
-            // A projected read confirms the schema probe produced usable columns.
-            let sample = collect(&rt, "SELECT * FROM streaming_table LIMIT 5").await?;
+            // A projected read confirms the schema probe produced usable
+            // columns; the schema is checked independently of the row count so
+            // an empty or not-yet-refreshed table cannot pass vacuously.
+            let (schema, sample) = collect(&rt, "SELECT * FROM streaming_table LIMIT 5").await?;
+            assert!(
+                !schema.fields().is_empty(),
+                "streaming table should expose at least one column"
+            );
             let sample_rows: usize = sample.iter().map(RecordBatch::num_rows).sum();
             assert!(
                 sample_rows <= 5,
                 "expected at most 5 rows, got {sample_rows}"
-            );
-            let columns = sample
-                .first()
-                .map_or(0, |batch| batch.schema().fields().len());
-            assert!(
-                columns > 0 || sample_rows == 0,
-                "streaming table should expose at least one column"
             );
 
             Ok(())
