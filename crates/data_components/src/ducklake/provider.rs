@@ -27,9 +27,11 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
@@ -97,6 +99,23 @@ impl std::fmt::Debug for DuckLakeCatalogProvider {
     }
 }
 
+/// The dialect a `DuckLake` catalog unparses with, and the functions federation
+/// may push down to it.
+///
+/// One value because they are one decision. What a deny-list may safely allow
+/// depends on what the dialect beside it can translate: a name the deny-list lets
+/// through is emitted by that dialect, verbatim if it has no handler for it. So a
+/// caller supplying one without the other has not made half the decision -- it has
+/// made a different one, and the result shows up as remote SQL rather than as a
+/// type error. Taking them together is what stops that.
+pub struct DuckLakeFederation {
+    /// The unparser dialect. Every name `function_support` allows through is
+    /// emitted by this dialect, so it has to be one that can spell them.
+    pub dialect: Arc<dyn Dialect + Send + Sync>,
+    /// Which functions may be pushed into the SQL sent to `DuckDB`.
+    pub function_support: FunctionSupport,
+}
+
 impl DuckLakeCatalogProvider {
     /// Creates a new `DuckLakeCatalogProvider` with the given `DuckDB` pool.
     ///
@@ -108,6 +127,12 @@ impl DuckLakeCatalogProvider {
     /// * `writable` - Whether write operations (INSERT, UPDATE, DELETE) are allowed
     /// * `ddl_enabled` - Whether DDL operations (CREATE TABLE, DROP TABLE) are allowed
     /// * `selector` - Which discovered tables the catalog registers
+    /// * `federation` - How this catalog unparses and what it may push down.
+    ///   Required rather than defaulted: the factory's own defaults federate
+    ///   everything with no deny-list, so every Spice-only UDF (`json_get_str`
+    ///   and the rest of the JSON set, the embedding/distance UDFs, every
+    ///   user-registered function) is unparsed verbatim into the statement sent
+    ///   to `DuckDB`, where it does not exist. See issues #10703 and #13664.
     #[must_use]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
@@ -115,9 +140,14 @@ impl DuckLakeCatalogProvider {
         writable: bool,
         ddl_enabled: bool,
         selector: TableSelector,
+        federation: DuckLakeFederation,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
-        let duckdb_factory = Arc::new(DuckDBTableFactory::new(Arc::clone(&pool)));
+        let duckdb_factory = Arc::new(
+            DuckDBTableFactory::new(Arc::clone(&pool))
+                .with_dialect(federation.dialect)
+                .with_function_support(federation.function_support),
+        );
         Self {
             pool,
             duckdb_factory,

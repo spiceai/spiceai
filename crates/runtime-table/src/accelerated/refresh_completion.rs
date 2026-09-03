@@ -226,9 +226,11 @@ impl RefreshCompletion {
 ///
 /// `Answered` says the refresh this waiter was taken for completed — a `next`
 /// waiter is bound to its own request by [`RefreshRequestId`] — but not that the
-/// table it was taken from is still the live one. Revalidating a completion
-/// against a table that may have been removed or rebuilt while it ran is tracked
-/// in <https://github.com/spiceai/spiceai/issues/13603>.
+/// table it was taken from is still the live one. This type cannot answer that
+/// second question: it has no view of the registry. So a caller that acts on a
+/// completion re-resolves the table itself, capturing it before the wait and
+/// waiting via `DataFusion::await_refresh_completion`, which reports a removed or
+/// rebuilt table separately from an abandoned one.
 ///
 /// Deliberately not `#[must_use]`: most waits are taken by a caller that acts on
 /// nothing afterwards and only wants to block, and marking the type would make

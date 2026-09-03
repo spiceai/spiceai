@@ -31,6 +31,7 @@ use data_components::snowflake::SnowflakeTableFactory;
 use data_components::snowflake::provider::SnowflakeCatalogProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -152,7 +153,7 @@ impl CatalogConnector for SnowflakeCatalog {
         let pool: Arc<dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync> =
             Arc::new(pool);
 
-        let table_factory = Arc::new(SnowflakeTableFactory::new(pool));
+        let table_factory = Arc::new(build_table_factory(pool));
 
         let catalog_provider = if catalog.access.allows_write() {
             Arc::new(SnowflakeCatalogProvider::new_read_write(
@@ -181,5 +182,93 @@ impl CatalogConnector for SnowflakeCatalog {
             })?;
 
         Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}
+
+/// Builds the [`SnowflakeTableFactory`] for a catalog, with the Spice function
+/// deny-list installed.
+///
+/// A bare `SnowflakeTableFactory::new(pool)` installs no deny-list, so
+/// federation unparses Spice-only UDFs (`json_get_str` and the rest of the JSON
+/// set, the embedding/distance UDFs, every user-registered function) into the
+/// SQL sent to Snowflake, which rejects them with "Unknown function". The
+/// deny-list makes the table's `can_execute_plan` refuse those plans so
+/// `DataFusion` evaluates the affected expressions locally instead.
+///
+/// This mirrors the Snowflake *dataset* connector's
+/// `build_snowflake_table_factory`; see issues #10703 and #13664.
+#[must_use]
+fn build_table_factory(
+    pool: Arc<dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync>,
+) -> SnowflakeTableFactory {
+    SnowflakeTableFactory::new(pool)
+        .with_function_support(deny_spice_specific_functions().as_ref().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalogconnector::stub_udf;
+    use async_trait::async_trait;
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
+    use std::error::Error as StdError;
+
+    struct MockConn;
+
+    impl DbConnection<Arc<SnowflakeApi>, &'static dyn Sync> for MockConn {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct MockPool;
+
+    #[async_trait]
+    impl DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> for MockPool {
+        async fn connect(
+            &self,
+        ) -> std::result::Result<
+            Box<dyn DbConnection<Arc<SnowflakeApi>, &'static dyn Sync>>,
+            Box<dyn StdError + Send + Sync>,
+        > {
+            Ok(Box::new(MockConn))
+        }
+
+        fn join_push_down(
+            &self,
+        ) -> datafusion_table_providers::sql::db_connection_pool::JoinPushDown {
+            datafusion_table_providers::sql::db_connection_pool::JoinPushDown::Disallow
+        }
+    }
+
+    /// The catalog connector must install the same deny-list its dataset
+    /// counterpart installs. It did not, so a Snowflake source registered as a
+    /// `catalogs:` entry pushed every Spice-only UDF into the remote SQL and the
+    /// query failed with "Unknown function". See issue #13664.
+    #[test]
+    fn catalog_table_factory_installs_the_spice_deny_list() {
+        let pool: Arc<dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync> =
+            Arc::new(MockPool);
+        let function_support = build_table_factory(pool)
+            .function_support()
+            .expect("the Snowflake catalog connector must install the Spice deny-list")
+            .clone();
+
+        assert!(
+            !function_support.supports(&stub_udf("json_get_str", 2)),
+            "json_get_str must be denied so federation falls back to local DataFusion"
+        );
+        assert!(
+            !function_support.supports(&stub_udf("cosine_distance", 2)),
+            "cosine_distance must be denied (Snowflake has no exact equivalent)"
+        );
+        assert!(
+            function_support.supports(&stub_udf("upper", 1)),
+            "a non-Spice function like upper() must still federate to Snowflake"
+        );
     }
 }
