@@ -1319,8 +1319,6 @@ mod tests {
         catalog::Session, datasource::TableType, physical_plan::ExecutionPlan,
         physical_plan::collect, prelude::SessionContext,
     };
-    use opentelemetry::global;
-    use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
     use prometheus::proto::MetricType;
     use tokio::{
         sync::{mpsc, watch},
@@ -1930,24 +1928,7 @@ mod tests {
             false
         }
 
-        let registry = prometheus::Registry::new();
-
-        let resource = Resource::builder().build();
-
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()
-            .expect("to build prometheus exporter");
-
-        let provider = SdkMeterProvider::builder()
-            .with_resource(resource)
-            .with_reader(prometheus_exporter)
-            .build();
-        global::set_meter_provider(provider);
+        let registry = crate::accelerated::refresh_task::test_prometheus_registry().clone();
 
         let status = status::RuntimeStatus::new();
         status.update_dataset(

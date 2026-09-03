@@ -2977,6 +2977,33 @@ fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
     }
 }
 
+/// One Prometheus registry + meter provider for this crate's tests.
+///
+/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
+/// provider after the first instrument is built binds the counter to the
+/// other registry, so tests that scrape would read zero. Share this installer.
+#[cfg(test)]
+pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
+    static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry = prometheus::Registry::new();
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build prometheus exporter");
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(prometheus_exporter)
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+        registry
+    })
+}
+
 /// The error that ended a refresh retry loop, if it should increment
 /// `dataset_acceleration_refresh_errors`.
 ///
@@ -3131,8 +3158,6 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
     use opentelemetry::KeyValue;
-    use opentelemetry::global;
-    use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
     use prometheus::proto::MetricType;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
     use runtime_metrics::acceleration as metrics;
@@ -3543,24 +3568,6 @@ mod tests {
         );
     }
 
-    fn install_refresh_error_test_meter() -> prometheus::Registry {
-        let registry = prometheus::Registry::new();
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()
-            .expect("to build prometheus exporter");
-        let provider = SdkMeterProvider::builder()
-            .with_resource(Resource::builder().build())
-            .with_reader(prometheus_exporter)
-            .build();
-        global::set_meter_provider(provider);
-        registry
-    }
-
     fn refresh_error_count(registry: &prometheus::Registry, dataset: &str, reason: &str) -> f64 {
         for family in registry.gather() {
             if family.name() != "dataset_acceleration_refresh_errors"
@@ -3603,7 +3610,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_change_refresh_errors_are_scraped_once_from_the_terminal_outcome() {
-        let registry = install_refresh_error_test_meter();
+        let registry = super::test_prometheus_registry().clone();
         let recovered_strategy = FibonacciBackoffBuilder::new()
             .max_retries(Some(3))
             .max_duration(Some(Duration::from_millis(1)))
