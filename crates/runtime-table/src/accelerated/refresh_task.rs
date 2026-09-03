@@ -3046,10 +3046,10 @@ fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Err
 /// An exhausted generation-change after the retry loop. A recovered 412 is
 /// `Ok` and is not counted; a non-generation terminal was already counted
 /// per attempt.
-fn terminal_generation_change_refresh_error<'a>(
-    result: &'a super::Result<()>,
+fn terminal_generation_change_refresh_error(
+    result: &super::Result<()>,
     shutdown: bool,
-) -> Option<&'a super::Error> {
+) -> Option<&super::Error> {
     let error = terminal_refresh_error(result, shutdown)?;
     if refresh_error_reason(error) == metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED {
         Some(error)

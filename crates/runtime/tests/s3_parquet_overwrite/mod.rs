@@ -191,6 +191,54 @@ fn http_response_status_reads_412_from_the_status_line() {
     assert_eq!(http_response_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
 }
 
+/// Schema inference GETs the listed object with a Range footer read and no pin.
+/// The refresh scan is the first GET that carries `If-Match` or `versionId`.
+#[test]
+fn generation_pin_is_only_if_match_or_version_id() {
+    let inference = b"GET /overwrite-race/listing/data.parquet HTTP/1.1\r\n\
+Host: 127.0.0.1\r\n\
+Range: bytes=-8\r\n\r\n";
+    assert!(
+        is_object_get_request(inference),
+        "inference still GETs the listed object"
+    );
+    assert!(
+        !is_generation_pinned_object_get(inference),
+        "an unpinned inference GET must not trigger the overwrite wait"
+    );
+
+    let if_match = b"GET /overwrite-race/listing/data.parquet HTTP/1.1\r\n\
+Host: 127.0.0.1\r\n\
+If-Match: \"etag-a\"\r\n\
+Range: bytes=0-8191\r\n\r\n";
+    assert!(
+        is_generation_pinned_object_get(if_match),
+        "a scan GET with If-Match is the refresh pin"
+    );
+
+    let versioned = b"GET /overwrite-race/listing/data.parquet?versionId=v1 HTTP/1.1\r\n\
+Host: 127.0.0.1\r\n\
+Range: bytes=0-8191\r\n\r\n";
+    assert!(
+        is_generation_pinned_object_get(versioned),
+        "a scan GET with versionId is the refresh pin"
+    );
+
+    let if_none_match = b"GET /overwrite-race/listing/data.parquet HTTP/1.1\r\n\
+If-None-Match: \"etag-a\"\r\n\r\n";
+    assert!(
+        !is_generation_pinned_object_get(if_none_match),
+        "If-None-Match is not a generation pin"
+    );
+
+    let other_key = b"GET /overwrite-race/listing/other.parquet HTTP/1.1\r\n\
+If-Match: \"etag-a\"\r\n\r\n";
+    assert!(
+        !is_generation_pinned_object_get(other_key),
+        "a different object is not the listed key"
+    );
+}
+
 fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
     let creds = Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test");
     let config = aws_sdk_s3::Config::builder()
@@ -277,16 +325,29 @@ async fn start_minio() -> Result<RunningContainer<'static>, anyhow::Error> {
 }
 
 /// Delay object GETs after the first one so a replacement can land mid-scan.
+///
+/// Schema/statistics inference GETs the object without a generation pin.
+/// The refresh scan pins via `If-Match` or `versionId`. Overwrite waits must
+/// use the pinned GET, or they fire during inference and miss the 412 path.
 struct MixProxy {
     seen_first_get: Arc<AtomicBool>,
+    seen_first_pinned_get: Arc<AtomicBool>,
+    unpinned_object_gets: Arc<AtomicU64>,
+    pinned_object_gets: Arc<AtomicU64>,
     precondition_failures: Arc<AtomicU64>,
 }
 
 impl MixProxy {
     fn start() -> Self {
         let seen_first_get = Arc::new(AtomicBool::new(false));
+        let seen_first_pinned_get = Arc::new(AtomicBool::new(false));
+        let unpinned_object_gets = Arc::new(AtomicU64::new(0));
+        let pinned_object_gets = Arc::new(AtomicU64::new(0));
         let precondition_failures = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&seen_first_get);
+        let seen_pinned = Arc::clone(&seen_first_pinned_get);
+        let unpinned = Arc::clone(&unpinned_object_gets);
+        let pinned = Arc::clone(&pinned_object_gets);
         let preconditions = Arc::clone(&precondition_failures);
         tokio::spawn(async move {
             let listener = TcpListener::bind(("127.0.0.1", PROXY_PORT))
@@ -297,9 +358,21 @@ impl MixProxy {
                     continue;
                 };
                 let seen = Arc::clone(&seen);
+                let seen_pinned = Arc::clone(&seen_pinned);
+                let unpinned = Arc::clone(&unpinned);
+                let pinned = Arc::clone(&pinned);
                 let preconditions = Arc::clone(&preconditions);
                 tokio::spawn(async move {
-                    if let Err(err) = proxy_connection(client, &seen, &preconditions).await {
+                    if let Err(err) = proxy_connection(
+                        client,
+                        &seen,
+                        &seen_pinned,
+                        &unpinned,
+                        &pinned,
+                        &preconditions,
+                    )
+                    .await
+                    {
                         tracing::debug!("overwrite-race proxy connection ended: {err}");
                     }
                 });
@@ -307,12 +380,18 @@ impl MixProxy {
         });
         Self {
             seen_first_get,
+            seen_first_pinned_get,
+            unpinned_object_gets,
+            pinned_object_gets,
             precondition_failures,
         }
     }
 
     fn reset(&self) {
         self.seen_first_get.store(false, Ordering::SeqCst);
+        self.seen_first_pinned_get.store(false, Ordering::SeqCst);
+        self.unpinned_object_gets.store(0, Ordering::SeqCst);
+        self.pinned_object_gets.store(0, Ordering::SeqCst);
         self.precondition_failures.store(0, Ordering::SeqCst);
     }
 
@@ -320,12 +399,16 @@ impl MixProxy {
         self.precondition_failures.load(Ordering::SeqCst)
     }
 
-    async fn wait_for_first_object_get(&self) -> Result<(), anyhow::Error> {
+    fn unpinned_object_gets(&self) -> u64 {
+        self.unpinned_object_gets.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_first_pinned_object_get(&self) -> Result<(), anyhow::Error> {
         let started = std::time::Instant::now();
-        while !self.seen_first_get.load(Ordering::SeqCst) {
+        while !self.seen_first_pinned_get.load(Ordering::SeqCst) {
             ensure!(
                 started.elapsed() < Duration::from_secs(15),
-                "timed out waiting for the first object GET"
+                "timed out waiting for the first generation-pinned object GET (If-Match or versionId)"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -344,22 +427,54 @@ fn http_response_status(headers: &[u8]) -> Option<u16> {
     parts.next()?.parse().ok()
 }
 
+fn request_line(headers: &[u8]) -> &str {
+    headers
+        .split(|&b| b == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+fn http_header_present(headers: &str, name: &str) -> bool {
+    headers.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn is_object_get_request(headers: &[u8]) -> bool {
+    let line = request_line(headers);
+    line.starts_with("GET ") && line.contains(OBJECT_KEY)
+}
+
+/// A listing-table scan pin: `If-Match` on the listed ETag, or `versionId` on
+/// a versioned bucket. Schema inference GETs the same key without either.
+fn is_generation_pinned_object_get(headers: &[u8]) -> bool {
+    if !is_object_get_request(headers) {
+        return false;
+    }
+    let line = request_line(headers);
+    let text = String::from_utf8_lossy(headers);
+    http_header_present(&text, "if-match") || line.contains("versionId=")
+}
+
 async fn proxy_connection(
     mut client: TcpStream,
     seen_first_get: &AtomicBool,
+    seen_first_pinned_get: &AtomicBool,
+    unpinned_object_gets: &AtomicU64,
+    pinned_object_gets: &AtomicU64,
     precondition_failures: &AtomicU64,
 ) -> Result<(), anyhow::Error> {
     loop {
         let Some((headers, body)) = read_http_message(&mut client, true).await? else {
             return Ok(());
         };
-        let first_line = headers
-            .split(|&b| b == b'\n')
-            .next()
-            .unwrap_or(&headers[..]);
-        let line = String::from_utf8_lossy(first_line);
+        let line = request_line(&headers);
         let is_head = line.starts_with("HEAD ");
-        let is_object_get = line.starts_with("GET ") && line.contains(OBJECT_KEY);
+        let is_object_get = is_object_get_request(&headers);
+        let is_pinned_get = is_generation_pinned_object_get(&headers);
         let delay_later_gets = is_object_get && seen_first_get.load(Ordering::SeqCst);
         if delay_later_gets {
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -377,6 +492,12 @@ async fn proxy_connection(
         client.write_all(&resp_headers).await?;
         client.write_all(&resp_body).await?;
         if is_object_get {
+            if is_pinned_get {
+                pinned_object_gets.fetch_add(1, Ordering::SeqCst);
+                seen_first_pinned_get.store(true, Ordering::SeqCst);
+            } else {
+                unpinned_object_gets.fetch_add(1, Ordering::SeqCst);
+            }
             seen_first_get.store(true, Ordering::SeqCst);
         }
     }
@@ -563,7 +684,7 @@ async fn race_listing_scan(
         let rt = Arc::clone(&rt);
         async move { scan_payload_char_len(rt.as_ref()).await }
     });
-    mix.wait_for_first_object_get().await?;
+    mix.wait_for_first_pinned_object_get().await?;
     overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
     let raced = query
         .await
@@ -675,7 +796,15 @@ async fn accelerated_refresh_retries_a_replaced_object(
         let bucket = bucket.to_string();
         async move { run_runtime_with_dataset(accelerated_listing_dataset(&proxy, &bucket)).await }
     });
-    mix.wait_for_first_object_get().await?;
+    // Inference GETs the object first without a pin. Overwrite only after the
+    // refresh scan sends If-Match, or the 412 path is never exercised.
+    mix.wait_for_first_pinned_object_get().await?;
+    ensure!(
+        mix.unpinned_object_gets() >= 1,
+        "schema inference must GET '{}' without If-Match/versionId before the refresh scan pins it; \
+         otherwise waiting for any object GET would overwrite during inference",
+        OBJECT_KEY
+    );
     overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
     let rt = load
         .await
