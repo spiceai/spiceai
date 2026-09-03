@@ -38,6 +38,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -258,7 +259,19 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let factory = DuckDBTableFactory::new(Arc::clone(&pool)).with_dialect(new_duckdb_dialect());
+    // The dialect was installed without a deny-list, so every Spice-only UDF was
+    // unparsed verbatim into the statement sent to DuckDB. See #10703 / #13664.
+    //
+    // This keeps the DuckDB-flavored deny-list, which carves out the functions
+    // the dialect rewrites -- unlike the DuckLake *catalog*, which uses the plain
+    // one. The difference is what each path does today, not a disagreement about
+    // the carve-out: `cosine_distance` already federates and is already rewritten
+    // here, so carving it out changes nothing about it, whereas on the catalog it
+    // currently errors and carving it out would newly return a different number
+    // (#13728). Fix only what is broken on each path; #13728 settles the rest.
+    let factory = DuckDBTableFactory::new(Arc::clone(&pool))
+        .with_dialect(new_duckdb_dialect())
+        .with_function_support(deny_spice_functions_for_duckdb_table_providers());
     Ok((factory, pool, catalog_name.to_string()))
 }
 

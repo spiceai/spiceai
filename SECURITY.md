@@ -8,6 +8,7 @@ In the latest major version, the last 2 minor version series are supported for s
 
 | Version | Supported          |
 |---------|--------------------|
+| 2.2.1   | :white_check_mark: |
 | 2.2.0   | :white_check_mark: |
 | 2.1.5   | :white_check_mark: |
 | 2.1.4   | :white_check_mark: |

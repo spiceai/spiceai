@@ -72,6 +72,45 @@ impl AcceleratedComponent {
             Self::View => "https://spiceai.org/docs/reference/spicepod/views#acceleration",
         }
     }
+
+    /// This component's Spicepod reference, unanchored. The `#acceleration` anchor
+    /// is wrong for a setting whose remedy is a field *outside* the acceleration
+    /// block, which is what the `ready_state` deprecation asks for.
+    const fn reference_url(self) -> &'static str {
+        match self {
+            Self::Dataset => "https://spiceai.org/docs/reference/spicepod/datasets",
+            Self::View => "https://spiceai.org/docs/reference/spicepod/views",
+        }
+    }
+}
+
+/// Warns that a component set `acceleration.ready_state`, which is honoured but
+/// deprecated in favour of the component's own top-level `ready_state`.
+///
+/// One function for both components because it is one deprecation of one key: a
+/// dataset and a view that write the same thing should be told the same thing,
+/// and a second copy is where the two drift apart.
+///
+/// Built as a pure function so the wording an operator acts on — which component,
+/// the field to move the setting to, and the reference page — is asserted by a
+/// test rather than through whatever a log capture happens to retain.
+pub(crate) fn deprecated_ready_state_warning(
+    component: AcceleratedComponent,
+    name: &str,
+) -> String {
+    // `escape_debug` for the same reason as `disabled_acceleration_warning`:
+    // `validate_identifier` accepts a *quoted* identifier, and a quoted one may
+    // legally contain a newline, so a validated name can still break this line in
+    // two and forge a second one.
+    let name = name.escape_debug();
+    let noun = component.noun();
+    let reference = component.reference_url();
+    format!(
+        "{titled} '{name}' sets `acceleration.ready_state`, which is deprecated and will be removed. \
+        Move the setting to the {noun}'s own `ready_state` to keep it working. \
+        See: {reference}",
+        titled = component.titled_noun()
+    )
 }
 
 /// What to tell an operator whose dataset or view sets `acceleration.enabled:
@@ -122,7 +161,9 @@ pub(crate) fn disabled_acceleration_warning(
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceleratedComponent, disabled_acceleration_warning};
+    use super::{
+        AcceleratedComponent, deprecated_ready_state_warning, disabled_acceleration_warning,
+    };
 
     #[test]
     fn the_warning_names_the_component_the_fields_and_the_remedy() {
@@ -213,5 +254,64 @@ mod tests {
             "the message must scope itself to the listed fields: {warning}"
         );
         assert!(!warning.contains("ready_state"), "{warning}");
+    }
+
+    #[test]
+    fn the_ready_state_deprecation_names_the_replacement_and_the_components_reference() {
+        // The operator has to learn three things from this line: that the key is
+        // going away, which field to move it to, and where that field is written
+        // up. The reference is the component's page *unanchored* — the remedy is
+        // a top-level field, so `#acceleration` would land them back inside the
+        // block they are being told to move the setting out of.
+        let warning = deprecated_ready_state_warning(AcceleratedComponent::Dataset, "api_data");
+        assert!(warning.starts_with("Dataset 'api_data'"), "{warning}");
+        assert!(warning.contains("`acceleration.ready_state`"), "{warning}");
+        assert!(warning.contains("deprecated"), "{warning}");
+        assert!(
+            warning.contains("the dataset's own `ready_state`"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("/reference/spicepod/datasets"),
+            "{warning}"
+        );
+        assert!(!warning.contains("#acceleration"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+    }
+
+    #[test]
+    fn the_ready_state_deprecation_calls_a_view_a_view() {
+        // One function serves both components, so the noun and the link have to
+        // follow the component rather than defaulting to the dataset — a view
+        // told to edit "the dataset's" field is sent to a component it is not.
+        //
+        // Asserted on the specific phrases rather than `!contains("dataset")`:
+        // the datasets URL legitimately contains that substring.
+        let warning = deprecated_ready_state_warning(AcceleratedComponent::View, "daily_totals");
+        assert!(warning.starts_with("View 'daily_totals'"), "{warning}");
+        assert!(
+            warning.contains("the view's own `ready_state`"),
+            "{warning}"
+        );
+        assert!(warning.contains("/reference/spicepod/views"), "{warning}");
+        assert!(!warning.contains("Dataset"), "{warning}");
+        assert!(!warning.contains("the dataset"), "{warning}");
+    }
+
+    #[test]
+    fn a_control_character_in_the_name_cannot_break_the_ready_state_line_in_two() {
+        // Same exposure as `disabled_acceleration_warning`, and the same reason:
+        // `validate_identifier` accepts a quoted identifier, which may legally
+        // carry a newline, so an unescaped name could write a second log record.
+        let warning =
+            deprecated_ready_state_warning(AcceleratedComponent::View, "api\nWARN forged");
+        assert!(
+            !warning.contains('\n'),
+            "the message must stay one line: {warning}"
+        );
+        assert!(
+            warning.contains("WARN forged"),
+            "the name is still reported, only escaped: {warning}"
+        );
     }
 }

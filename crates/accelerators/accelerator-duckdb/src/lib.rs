@@ -3810,4 +3810,113 @@ mod tests {
             "the nearest neighbour of a stored vector is itself, at distance 0, not {nearest}"
         );
     }
+
+    /// `trim(...)` resolves to `DataFusion`'s `btrim`, which is the name the
+    /// unparser emits — and `DuckDB` has no function called `btrim`, so a
+    /// federated call into the accelerated store failed outright with
+    /// `Catalog Error: Scalar Function with name btrim does not exist!`
+    /// (issue #13794).
+    ///
+    /// The dialect rewrites it to `DuckDB`'s `trim`. A rewrite is only correct
+    /// if the accelerator answers what `DataFusion` answers, so this evaluates
+    /// the *same* expression both ways — through a real in-memory `DuckDB` and
+    /// through `DataFusion` — and asserts the two results are equal. That
+    /// equality is what a plausible-looking but unfaithful rename trips: the
+    /// remote SQL is valid and `DuckDB` runs it happily, so nothing else here
+    /// would notice. It is how the one-argument `Zs` divergence below was
+    /// caught.
+    #[test]
+    fn duckdb_trim_rewrite_agrees_with_datafusion_btrim() {
+        use arrow::array::Array as _;
+        use datafusion::logical_expr::expr::ScalarFunction;
+        use datafusion::prelude::Expr;
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let ctx = SessionContext::new();
+
+        // Spaces on both sides, a character set, both together, an empty trim
+        // set, a string that trims away entirely, and multi-byte characters —
+        // the shapes where a trim implementation can disagree.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("  padded  ", None),
+            ("nopad", None),
+            ("", None),
+            ("   ", None),
+            ("xyhelloyx", Some("xy")),
+            ("x hello x", Some("xy")),
+            ("xxx", Some("x")),
+            ("nopad", Some("")),
+            ("", Some("x")),
+            ("  \u{e9}\u{e9}  ", None),
+            ("\u{e9}\u{e9}u\u{e9}\u{e9}", Some("\u{e9}")),
+            // Unicode Zs separators. DataFusion's one-argument `btrim` strips
+            // ASCII U+0020 and nothing else; a `trim` that strips every Zs
+            // would silently disagree here rather than fail.
+            ("\u{a0}x\u{a0}", None),
+            ("\u{2003}x\u{2003}", None),
+            ("\u{3000}x\u{3000}", None),
+            ("\u{a0} x \u{a0}", None),
+            ("\u{a0}x\u{a0}", Some(" ")),
+            ("\u{a0}x\u{a0}", Some("\u{a0}")),
+            ("\tx\n", None),
+        ];
+
+        for (input, trim_chars) in cases {
+            let mut args = vec![lit(*input)];
+            if let Some(chars) = trim_chars {
+                args.push(lit(*chars));
+            }
+            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                datafusion::functions::string::btrim(),
+                args,
+            ));
+
+            let sql = unparser
+                .expr_to_sql(&call)
+                .expect("btrim unparses for DuckDB")
+                .to_string();
+            assert!(
+                sql.starts_with("trim("),
+                "DuckDB has no `btrim`; the dialect must emit `trim`, got {sql}"
+            );
+
+            let from_duckdb: Option<String> = duck
+                .query_row(&format!("SELECT {sql}"), [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("DuckDB rejected `SELECT {sql}`: {e}"));
+
+            let batches = tokio_rt
+                .block_on(async {
+                    ctx.read_empty()?
+                        .select(vec![call.alias("v")])?
+                        .collect()
+                        .await
+                })
+                .expect("DataFusion evaluates btrim");
+            let column = batches
+                .first()
+                .expect("one batch")
+                .column_by_name("v")
+                .expect("column v")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("btrim returns Utf8 for a Utf8 literal");
+            let from_datafusion = if column.is_null(0) {
+                None
+            } else {
+                Some(column.value(0).to_string())
+            };
+
+            assert_eq!(
+                from_duckdb, from_datafusion,
+                "DuckDB `{sql}` and DataFusion btrim({input:?}, {trim_chars:?}) must agree"
+            );
+        }
+    }
 }

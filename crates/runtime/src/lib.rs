@@ -42,6 +42,7 @@ use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
+use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
@@ -1020,6 +1021,13 @@ impl Runtime {
             assignments,
         ));
 
+        // The ack below reports that *this* table instance loaded these
+        // partitions, so the identity has to be the one the assignments are
+        // about — captured ahead of the update that installs them, not after.
+        // Capturing later would tie the ack to whatever the name resolves to by
+        // then, which is a different table if a rebuild has landed in between.
+        let instance = self.datafusion().capture_table_instance(&table_ref).await;
+
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
         self.datafusion()
@@ -1065,17 +1073,30 @@ impl Runtime {
             // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
             // case here would leave the dataset stuck in `Refreshing`.
             let table_name = table.to_string();
+            let df = self.datafusion();
             tokio::spawn(async move {
-                if let Some(completion) = notifier
-                    && completion.wait().await.is_abandoned()
-                {
-                    // The table was removed before the refresh we triggered
-                    // landed. Acking readiness here would tell the scheduler a
-                    // partition set is loaded that never was.
-                    tracing::debug!(
-                        "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
-                    );
-                    return;
+                // Acking readiness for a table that did not load this partition
+                // set tells the scheduler a lie it then caches, so wait for the
+                // refresh *and* re-resolve the table before broadcasting.
+                match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => {}
+                    DeferredRefreshOutcome::Abandoned => {
+                        // The table was removed before the refresh we triggered
+                        // landed, so the partition set was never loaded.
+                        tracing::debug!(
+                            "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
+                    DeferredRefreshOutcome::TableChanged => {
+                        // A refresh did land, but not on the table this ack is
+                        // about — the name has since been removed or rebuilt,
+                        // and a rebuild carries its own partition set.
+                        tracing::debug!(
+                            "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
+                        );
+                        return;
+                    }
                 }
                 // Statistics flow via the periodic ExecutorStatistics reporter, not
                 // this readiness ack.

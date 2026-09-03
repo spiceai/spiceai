@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `BigQuery` translations for the JSON extraction functions, and the
-//! `BigQuery` dialect that installs them.
+//! `BigQuery` translations for the JSON extraction functions and the regexp
+//! predicate, and the `BigQuery` dialect that installs them.
 //!
 //! `datafusion-functions-json` takes a **variadic path**, not a `JSONPath`
 //! string: `json_get_int(col, 'a', 'b', 0)` reads key `a`, then key `b`, then
@@ -61,14 +61,16 @@ pub(crate) const JSON_OBJECT_KEYS_NAME: &str = "json_object_keys";
 /// `json_object_keys`'s alias, carried for the reason [`JSON_LEN_NAME`] gives.
 pub(crate) const JSON_KEYS_NAME: &str = "json_keys";
 
-/// The first byte of a JSON string node's own token, as `JSON_QUERY` returns it.
+/// The first byte of a JSON string node's normalized JSON token.
 ///
 /// `json_get_str` answers only for a JSON **string** — `jiter`'s `Peek::String`
 /// — and NULL for every other node. `JSON_VALUE` cannot express that on its
 /// own: it renders a number as its digits and a bool as `true`/`false`, where
-/// `json_get_str` returns NULL. `JSON_QUERY` returns the node's raw JSON token
-/// instead, and a leading double quote is what distinguishes a string node from
-/// every other type. See [`json_get_str_to_sql`].
+/// `json_get_str` returns NULL. `JSON_QUERY` returns either a native `JSON`
+/// value or a JSON-formatted `STRING`, matching the document's input type;
+/// `FORMAT('%t', …)` normalizes both forms to printable JSON text. A leading
+/// double quote then distinguishes a string node from every other type. See
+/// [`json_get_str_to_sql`].
 const JSON_STRING_TOKEN_PREFIX: &str = "\"";
 
 /// The grammar Rust's `i64::FromStr` accepts, which is what
@@ -199,13 +201,17 @@ fn json_path_is_renderable(args: &[Expr]) -> bool {
 /// Whether the `BigQuery` dialect can translate this call, for the pushdown
 /// policy to consult.
 ///
-/// A function with no entry in [`SCALAR_OVERRIDES`] is not this check's
-/// business: the deny-list has not carved it out, so it is already denied.
+/// A function with no entry in [`SCALAR_OVERRIDES`] or
+/// [`BUILTIN_SCALAR_OVERRIDES`] is not this check's business: a Spice function
+/// the deny-list has not carved out is already denied, and a `DataFusion`
+/// built-in with no handler here is either denied by name (`regexp_match`) or
+/// unparses through the inner dialect.
 #[must_use]
 pub fn can_translate(call: &ScalarFunction) -> bool {
     let name = call.func.name();
     SCALAR_OVERRIDES
         .iter()
+        .chain(BUILTIN_SCALAR_OVERRIDES)
         .find(|entry| entry.name == name)
         .is_none_or(|entry| (entry.can_translate)(&call.args))
 }
@@ -271,6 +277,21 @@ pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
         can_translate: json_path_is_renderable,
     },
 ];
+
+/// The `DataFusion` built-ins the `BigQuery` dialect rewrites into native SQL.
+///
+/// A separate table from [`SCALAR_OVERRIDES`] because the deny-list treats the
+/// two differently: a Spice function must be carved out of the deny-list by
+/// name to federate at all, while a built-in federates unless denied, so
+/// putting one in the carve-out would do nothing. What a built-in needs is the
+/// other two pieces — a handler, because the unparser otherwise emits the call
+/// verbatim into SQL `BigQuery` rejects, and a per-call check, because the
+/// handler can only render some call shapes and the rest must stay local.
+pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[ScalarOverride {
+    name: super::REGEXP_LIKE_NAME,
+    handler: regexp_like_to_sql,
+    can_translate: regexp_like_is_renderable,
+}];
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
 /// and hands both to `render` as `BigQuery` SQL.
@@ -338,7 +359,7 @@ pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
 }
 
 /// `json_get_str(doc, path…)` →
-/// `CASE WHEN STARTS_WITH(JSON_QUERY(doc, '<path>'), '"') THEN JSON_VALUE(doc, '<path>') END`.
+/// `CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(doc, '<path>')), '"') THEN JSON_VALUE(doc, '<path>') END`.
 ///
 /// `json_get_str` answers only for a JSON **string** node and NULL for every
 /// other kind. `JSON_VALUE` alone is wider than that: it renders a number as
@@ -346,11 +367,13 @@ pub(crate) fn json_get_int_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
 /// `json_get_str` answers NULL — on rows a `WHERE … IS NOT NULL` then keeps
 /// remotely and drops locally.
 ///
-/// `JSON_QUERY` returns the node's own JSON token rather than its value, and
-/// only a string node's token opens with a double quote — a number, a bool, a
+/// `JSON_QUERY` preserves the document representation: it returns `JSON` for a
+/// native `JSON` document and `STRING` for a JSON-formatted string document.
+/// `FORMAT('%t', …)` turns both results into the node's printable JSON token,
+/// where only a string node opens with a double quote — a number, a bool, a
 /// JSON `null`, an object and an array all render bare. Testing that first byte
-/// is what narrows `JSON_VALUE` to exactly the nodes the local function
-/// answers for, so the guard is the whole reason this is translatable at all.
+/// is what narrows `JSON_VALUE` to exactly the nodes the local function answers
+/// for, so the guard is the whole reason this is translatable at all.
 ///
 /// Where the two already agree, no guard is needed: `JSON_QUERY` returns SQL
 /// NULL for a missing path, and `STARTS_WITH` over NULL is NULL, so the `CASE`
@@ -365,10 +388,17 @@ pub(crate) fn json_get_str_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<
         JSON_GET_STR_NAME,
         ast::DataType::String(None),
         |document, path| {
+            let normalized_json_token = call_function(
+                "FORMAT",
+                vec![
+                    ast::Expr::Value(ast::Value::SingleQuotedString("%t".to_string()).into()),
+                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
+                ],
+            );
             let is_string_node = call_function(
                 "STARTS_WITH",
                 vec![
-                    call_function("JSON_QUERY", vec![document.clone(), path.clone()]),
+                    normalized_json_token,
                     ast::Expr::Value(
                         ast::Value::SingleQuotedString(JSON_STRING_TOKEN_PREFIX.to_string()).into(),
                     ),
@@ -618,6 +648,283 @@ fn json_get_number_to_sql(
     )
 }
 
+/// `regexp_like(str, pattern[, flags])` →
+/// `REGEXP_CONTAINS(str, r'<pattern>')`, with literal flags folded into the
+/// pattern as an inline `(?ims)` group.
+///
+/// The two agree call-for-call: both answer whether the pattern matches
+/// anywhere in the string, both are a plain `BOOL`, and both are NULL when the
+/// string or the pattern is NULL. That exactness holds only for a pattern both
+/// regex engines read identically, which is what [`regexp_contains`] holds the
+/// translation to; every other shape is refused by the per-call check and
+/// evaluated locally.
+///
+/// The failure below is written for the same reason [`json_call_to_sql`]'s is:
+/// unreachable with the deny-list's per-call check installed, and the
+/// alternative — `Ok(None)` — makes the unparser emit `regexp_like` verbatim
+/// into `BigQuery` SQL, which fails remotely as `Function not found`.
+pub(crate) fn regexp_like_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let Some(call) = regexp_contains(args) else {
+        return Err(DataFusionError::Plan(format!(
+            "Failed to run this query against BigQuery: '{name}' was called in a form BigQuery \
+             cannot express, so the query cannot be completed. BigQuery needs a constant pattern \
+             both regular-expression engines read identically: the pattern and any flags must be \
+             literals, the only supported flags are 'i', 'm' and 's' (as the flags argument or \
+             an inline (?...) group), and the pattern cannot contain a quote, a control or \
+             non-ASCII character, or the classes \\d, \\D, \\w, \\W, \\s, \\S, \\b, \\B, \\p or \
+             \\P. Use a plain constant pattern, or set 'query_federation: disabled' on the \
+             dataset to evaluate it locally instead. \
+             See: https://spiceai.org/docs/components/data-connectors/adbc",
+            name = super::REGEXP_LIKE_NAME,
+        )));
+    };
+    Ok(Some(call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            unparser.expr_to_sql(call.input)?,
+            ast::Expr::Value(raw_string(&call.pattern).into()),
+        ],
+    )))
+}
+
+/// Whether the arguments of a `regexp_like` call can be rendered. Reads
+/// [`regexp_contains`], so it answers exactly the question the handler can
+/// answer.
+fn regexp_like_is_renderable(args: &[Expr]) -> bool {
+    regexp_contains(args).is_some()
+}
+
+/// The `REGEXP_CONTAINS` call a `regexp_like` invocation translates into.
+struct RegexpContains<'a> {
+    input: &'a Expr,
+    /// The pattern with any flags already folded in as an inline group.
+    pattern: String,
+}
+
+/// Builds the `REGEXP_CONTAINS` arguments for a `regexp_like` call, or `None`
+/// when the call has a shape whose remote behavior is not pinned to the local
+/// one: a non-literal pattern or flags argument, a flag with no `BigQuery`
+/// equivalent, or a pattern the two engines read differently — see
+/// [`pattern_is_engine_agnostic`].
+fn regexp_contains(args: &[Expr]) -> Option<RegexpContains<'_>> {
+    let (input, pattern, flags) = match args {
+        [input, pattern] => (input, pattern, ""),
+        [input, pattern, flags] => (input, pattern, literal_utf8(flags)?),
+        _ => return None,
+    };
+    let pattern = literal_utf8(pattern)?;
+    if !pattern_is_engine_agnostic(pattern) {
+        return None;
+    }
+    let flags = folded_flags(flags)?;
+    let pattern = if flags.is_empty() {
+        pattern.to_string()
+    } else {
+        format!("(?{flags}){pattern}")
+    };
+    Some(RegexpContains { input, pattern })
+}
+
+/// The text of a Utf8-family literal, or `None` for anything else — including
+/// a typed NULL, which has no text to scan.
+fn literal_utf8(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::LargeUtf8(Some(text))
+            | ScalarValue::Utf8View(Some(text)),
+            _,
+        ) => Some(text),
+        _ => None,
+    }
+}
+
+/// Whether the local engine — Rust's `regex` crate — and `BigQuery`'s RE2 read
+/// this pattern to mean the same thing.
+///
+/// The two are near relatives, but the differences are silent: a diverging
+/// pattern changes *which rows match*, not whether the query runs. The known
+/// divergences are Unicode, inline modes, character-class algebra, and repeat
+/// bounds. The Perl classes and word
+/// boundaries (`\d`, `\w`, `\s`, `\b` and their negations) are Unicode-aware
+/// in Rust's `regex` and ASCII-only in RE2, so `\d` matches an Arabic-Indic
+/// digit locally and not remotely, and `\p{…}`/`\P{…}` lean on each engine's
+/// Unicode tables. Inline `(?…)` modifier groups carry the same hazard in
+/// mode form: Rust reads modes RE2 does not have — `(?x)a b` (extended mode)
+/// matches `ab` locally and is a syntax error remotely — so a group head is
+/// accepted only when [`group_options_are_engine_agnostic`] can read it as
+/// something both engines agree on. Rather than enumerate agreements, this
+/// accepts only patterns built from constructs with one reading: printable
+/// ASCII, with no escape of those class letters and no group options beyond
+/// `i`, `m` and `s`. Rust's set operators inside character classes (`&&`,
+/// `--`, `~~`) are rejected because RE2 reads them as literal punctuation,
+/// and counted repetition bounds above RE2's 1000 limit stay local.
+/// [`tests::rusts_perl_classes_are_unicode_aware`],
+/// [`tests::rust_only_inline_modes_exist`], and
+/// [`tests::rust_supports_regex_features_re2_does_not`] hold the local halves
+/// of the divergences this guards against.
+///
+/// A single quote and control characters are rejected for a different reason:
+/// the pattern is emitted as a `BigQuery` **raw** string literal (see
+/// [`raw_string`]), which a `'` would terminate and a control character has no
+/// spelling in.
+fn pattern_is_engine_agnostic(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    let mut in_character_class = false;
+    let mut previous_class_character = None;
+    while let Some(c) = chars.next() {
+        if !c.is_ascii() || c.is_ascii_control() || c == '\'' {
+            return false;
+        }
+        match c {
+            '\\' => match chars.next() {
+                // A trailing backslash is an invalid pattern; refuse rather
+                // than reason about which engine rejects it first.
+                None => return false,
+                Some(escaped) => {
+                    if !escaped.is_ascii() || escaped.is_ascii_control() || escaped == '\'' {
+                        return false;
+                    }
+                    if matches!(
+                        escaped,
+                        'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'p' | 'P'
+                    ) {
+                        return false;
+                    }
+                    previous_class_character = None;
+                }
+            },
+            '[' if in_character_class && chars.peek() == Some(&':') => {
+                if !consume_posix_class(&mut chars) {
+                    return false;
+                }
+                previous_class_character = None;
+            }
+            '[' if in_character_class => {
+                // Nested character classes participate in Rust's set algebra
+                // but are not a portable RE2 construct.
+                return false;
+            }
+            '[' => {
+                in_character_class = true;
+                previous_class_character = None;
+            }
+            ']' if in_character_class => {
+                in_character_class = false;
+                previous_class_character = None;
+            }
+            '&' | '-' | '~' if in_character_class => {
+                if previous_class_character == Some(c) {
+                    return false;
+                }
+                previous_class_character = Some(c);
+            }
+            _ if in_character_class => previous_class_character = Some(c),
+            '(' if chars.peek() == Some(&'?') => {
+                chars.next();
+                if !group_options_are_engine_agnostic(&mut chars) {
+                    return false;
+                }
+            }
+            '{' if counted_repetition_exceeds_re2_limit(&chars) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether the characters after an unescaped `{` begin a counted repetition
+/// whose lower or upper bound exceeds RE2's hard limit of 1000. Invalid or
+/// non-repetition brace text is left for the local regex compiler to diagnose.
+fn counted_repetition_exceeds_re2_limit(chars: &std::iter::Peekable<std::str::Chars>) -> bool {
+    let mut chars = chars.clone();
+    let Some(lower) = repetition_bound(&mut chars) else {
+        return false;
+    };
+    if lower > 1000 {
+        return true;
+    }
+    matches!(chars.next(), Some(','))
+        && repetition_bound(&mut chars).is_some_and(|upper| upper > 1000)
+}
+
+fn repetition_bound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
+    let mut value: Option<u32> = None;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        chars.next();
+        value = Some(value.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+    }
+    value
+}
+
+/// Consume the remainder of a POSIX class such as `[:digit:]` after its
+/// opening `[` has already been read. Both engines support these ASCII
+/// classes, and treating the inner `[` as Rust class nesting would otherwise
+/// unnecessarily keep them local.
+fn consume_posix_class(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.next() != Some(':') {
+        return false;
+    }
+    let mut saw_name_character = false;
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&']') {
+            chars.next();
+            return saw_name_character;
+        }
+        if !c.is_ascii_alphabetic() {
+            return false;
+        }
+        saw_name_character = true;
+    }
+    false
+}
+
+/// Reads the `…` of a `(?…` group head, accepting only what both engines
+/// agree on: `:` (a plain non-capturing group), or inline flags from
+/// `i`/`m`/`s` — optionally negated after one `-` — closed by `)` (a flag
+/// directive) or `:` (a scoped group). Everything else is refused: Rust-only
+/// modes (`x` extended, `R` CRLF, `u` Unicode toggles), `U` (deliberately
+/// refused as a flags argument, so its inline spelling must not slip
+/// through), named groups, and lookarounds. An empty directive like `(?)` is
+/// refused too — both engines reject it, and the local error is the readable
+/// one.
+fn group_options_are_engine_agnostic(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    if chars.peek() == Some(&':') {
+        chars.next();
+        return true;
+    }
+    let mut saw_flag = false;
+    let mut saw_dash = false;
+    loop {
+        match chars.next() {
+            Some('i' | 'm' | 's') => saw_flag = true,
+            Some('-') if !saw_dash => saw_dash = true,
+            Some(')' | ':') => return saw_flag,
+            _ => return false,
+        }
+    }
+}
+
+/// The flags to fold into the pattern as an inline `(?…)` group, deduplicated
+/// into a canonical order, or `None` when a flag has no `BigQuery` equivalent.
+///
+/// RE2 accepts inline `i`, `m` and `s` with the meanings the local engine
+/// gives them. `R` (CRLF mode) has no RE2 counterpart, and it changes where
+/// `^`/`$` match, so it cannot be dropped. RE2 documents `U` (swap greediness)
+/// too, but whether `BigQuery`'s build honors it has not been measured against
+/// a real `BigQuery`, so it is refused rather than assumed.
+fn folded_flags(flags: &str) -> Option<String> {
+    if flags.chars().any(|flag| !matches!(flag, 'i' | 'm' | 's')) {
+        return None;
+    }
+    Some(
+        ['i', 'm', 's']
+            .into_iter()
+            .filter(|flag| flags.contains(*flag))
+            .collect(),
+    )
+}
+
 /// `SAFE.PARSE_JSON(value)` — SAFE so a document it will not parse is a NULL
 /// carried out through the call rather than a failed query.
 fn parse_json(value: ast::Expr) -> ast::Expr {
@@ -827,6 +1134,10 @@ impl Dialect for SpiceBigQueryDialect {
             .window_func_support_window_frame(func_name, start_bound, end_bound)
     }
 
+    fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
+        self.inner.union_distinct_set_quantifier()
+    }
+
     fn full_qualified_col(&self) -> bool {
         self.inner.full_qualified_col()
     }
@@ -858,6 +1169,14 @@ impl Dialect for SpiceBigQueryDialect {
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
         self.inner.string_literal_to_sql(s)
     }
+
+    fn group_by_matches_select_subexpressions(&self) -> bool {
+        self.inner.group_by_matches_select_subexpressions()
+    }
+
+    fn range_window_default_nulls_first(&self, asc: bool) -> Option<bool> {
+        self.inner.range_window_default_nulls_first(asc)
+    }
 }
 
 #[cfg(test)]
@@ -865,7 +1184,10 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+    use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionParams};
+    use datafusion::logical_expr::{
+        ColumnarValue, ScalarUDF, Volatility, WindowFrame, WindowFunctionDefinition, create_udf,
+    };
     use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
 
@@ -874,7 +1196,7 @@ mod tests {
         JSON_GET_INT_NAME, JSON_GET_STR_NAME, JSON_KEYS_NAME, JSON_LEN_NAME, JSON_LENGTH_NAME,
         JSON_OBJECT_KEYS_NAME, JsonPath, SpiceBigQueryDialect, can_translate, json_path,
     };
-    use crate::dialect::new_bigquery_dialect;
+    use crate::dialect::{REGEXP_LIKE_NAME, new_bigquery_dialect};
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::Expr;
     use datafusion::logical_expr::expr::ScalarFunction;
@@ -1052,12 +1374,13 @@ mod tests {
 
     #[test]
     fn json_get_str_renders_as_a_guarded_json_value() {
-        // The STARTS_WITH/JSON_QUERY guard is the whole reason this is
+        // The STARTS_WITH/FORMAT/JSON_QUERY guard is the whole reason this is
         // translatable: JSON_VALUE alone renders a JSON number as its digits,
-        // where `json_get_str` returns NULL.
+        // where `json_get_str` returns NULL. FORMAT normalizes JSON_QUERY's
+        // native JSON and JSON-formatted string result types before the guard.
         assert_eq!(
             render(JSON_GET_STR_NAME, vec![col("doc"), lit("a")]),
-            r#"CASE WHEN STARTS_WITH(JSON_QUERY(`doc`, R'$."a"'), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
+            r#"CASE WHEN STARTS_WITH(FORMAT('%t', JSON_QUERY(`doc`, R'$."a"')), '"') THEN JSON_VALUE(`doc`, R'$."a"') END"#
         );
     }
 
@@ -1138,6 +1461,336 @@ mod tests {
                 "`{rejected}` must actually fail in Rust, or this test is asserting the wrong thing"
             );
         }
+    }
+
+    #[test]
+    fn regexp_like_renders_as_regexp_contains() {
+        assert_eq!(
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^R[0-9]{2}")]),
+            r"REGEXP_CONTAINS(`code`, R'^R[0-9]{2}')"
+        );
+    }
+
+    #[test]
+    fn regexp_like_folds_literal_flags_into_the_pattern() {
+        // BigQuery's REGEXP_CONTAINS has no flags argument; RE2 reads the same
+        // flags inline. Deduplicated into a canonical order so the rendering
+        // is deterministic.
+        assert_eq!(
+            render(
+                REGEXP_LIKE_NAME,
+                vec![col("code"), lit("^r[0-9]{2}"), lit("si")]
+            ),
+            r"REGEXP_CONTAINS(`code`, R'(?is)^r[0-9]{2}')"
+        );
+        assert_eq!(
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^r"), lit("")]),
+            render(REGEXP_LIKE_NAME, vec![col("code"), lit("^r")]),
+            "empty flags are the two-argument call"
+        );
+    }
+
+    #[test]
+    fn regexp_like_translates_only_the_shapes_both_engines_read_identically() {
+        for (accepted, args) in [
+            (
+                "a plain literal pattern",
+                vec![col("code"), lit("^R[0-9]{2}$")],
+            ),
+            ("an escaped metacharacter", vec![col("code"), lit(r"^R\.")]),
+            (
+                "a POSIX class, which is ASCII in both engines",
+                vec![col("code"), lit("[[:digit:]]+")],
+            ),
+            (
+                "literal ims flags",
+                vec![col("code"), lit("^r"), lit("ims")],
+            ),
+            (
+                "an inline flag directive both engines read",
+                vec![col("code"), lit("(?i)^r[0-9]{2}")],
+            ),
+            (
+                "a scoped inline flag group",
+                vec![col("code"), lit("(?im-s:foo)bar")],
+            ),
+            (
+                "a plain non-capturing group",
+                vec![col("code"), lit("(?:ab)+")],
+            ),
+            ("a negated inline flag", vec![col("code"), lit("(?-i)r")]),
+            (
+                "a capture group followed by a quantifier",
+                vec![col("code"), lit("(ab)?c")],
+            ),
+            (
+                "counted repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1,1000}")],
+            ),
+            (
+                "an open-ended repetition at RE2's inclusive limit",
+                vec![col("code"), lit("a{1000,}")],
+            ),
+            (
+                "single class punctuation without a Rust set operator",
+                vec![col("code"), lit("[a&~-]")],
+            ),
+            (
+                "an escaped parenthesis before a question mark",
+                vec![col("code"), lit(r"\(?a")],
+            ),
+        ] {
+            assert!(
+                can_translate(&call(REGEXP_LIKE_NAME, args)),
+                "{accepted} must translate"
+            );
+        }
+        for (rejected, args) in [
+            (
+                "a non-literal pattern, which cannot be scanned",
+                vec![col("code"), col("pattern")],
+            ),
+            (
+                "a NULL pattern, which has no text to scan",
+                vec![col("code"), Expr::Literal(ScalarValue::Utf8(None), None)],
+            ),
+            (
+                r"\d, Unicode-aware locally and ASCII in RE2",
+                vec![col("code"), lit(r"^\d+$")],
+            ),
+            (
+                r"\b, whose word boundary is Unicode-dependent",
+                vec![col("code"), lit(r"\bR01\b")],
+            ),
+            ("a non-ASCII pattern", vec![col("code"), lit("^caf\u{e9}")]),
+            (
+                "a quote, which would end the raw string literal",
+                vec![col("code"), lit("^'R")],
+            ),
+            ("a trailing backslash", vec![col("code"), lit(r"^R\")]),
+            (
+                "the U flag, unmeasured against BigQuery",
+                vec![col("code"), lit("^r"), lit("U")],
+            ),
+            (
+                "the R flag, which has no RE2 counterpart",
+                vec![col("code"), lit("^r"), lit("R")],
+            ),
+            (
+                "non-literal flags",
+                vec![col("code"), lit("^r"), col("flags")],
+            ),
+            (
+                "the inline x mode, which RE2 does not have",
+                vec![col("code"), lit("(?x)a b")],
+            ),
+            (
+                "the inline U flag, refused for the same reason as the U flags argument",
+                vec![col("code"), lit("(?U)a+")],
+            ),
+            (
+                "the inline R CRLF mode, which has no RE2 counterpart",
+                vec![col("code"), lit("(?R)^a")],
+            ),
+            ("an inline Unicode toggle", vec![col("code"), lit("(?u)a")]),
+            (
+                "a named capture group, which the two engines spell differently",
+                vec![col("code"), lit("(?P<n>a)")],
+            ),
+            (
+                "a lookahead, which neither engine supports",
+                vec![col("code"), lit("(?=a)")],
+            ),
+            ("an empty flag directive", vec![col("code"), lit("(?)a")]),
+            (
+                "an exact repetition above RE2's limit",
+                vec![col("code"), lit("a{1001}")],
+            ),
+            (
+                "an open-ended repetition above RE2's limit",
+                vec![col("code"), lit("a{1001,}")],
+            ),
+            (
+                "an upper repetition bound above RE2's limit",
+                vec![col("code"), lit("a{1,1001}")],
+            ),
+            (
+                "Rust character-class intersection",
+                vec![col("code"), lit("[a&&b]")],
+            ),
+            (
+                "Rust character-class difference",
+                vec![col("code"), lit("[a--b]")],
+            ),
+            (
+                "Rust character-class symmetric difference",
+                vec![col("code"), lit("[a~~b]")],
+            ),
+            (
+                "a nested class used by Rust set algebra",
+                vec![col("code"), lit("[a&&[b]]")],
+            ),
+        ] {
+            assert!(
+                !can_translate(&call(REGEXP_LIKE_NAME, args)),
+                "{rejected} must stay local"
+            );
+        }
+    }
+
+    #[test]
+    fn rusts_perl_classes_are_unicode_aware() {
+        // The local half of the divergence the pattern gate guards against:
+        // Rust's `\d` matches a Unicode digit where RE2's is `[0-9]`, so a
+        // pattern carrying it federated to BigQuery would silently keep
+        // different rows. If this stops matching, the gate guards nothing and
+        // can be relaxed.
+        let digits = regex::Regex::new(r"^\d+$").expect("the digit pattern compiles");
+        assert!(
+            digits.is_match("\u{663}\u{664}\u{665}"),
+            "Rust's \\d must match Arabic-Indic digits, or the gate is pointless"
+        );
+    }
+
+    #[test]
+    fn rust_only_inline_modes_exist() {
+        // The local half of the inline-modifier divergence the gate guards
+        // against: Rust's regex reads `(?x)` (extended mode, whitespace
+        // ignored), which RE2 does not have — so `(?x)a b` matches `ab`
+        // locally and is a syntax error remotely. If Rust ever drops the
+        // mode, the group-options gate can be relaxed.
+        let extended = regex::Regex::new("(?x)a b").expect("Rust reads extended mode");
+        assert!(
+            extended.is_match("ab"),
+            "extended mode must ignore the space, or the gate guards nothing"
+        );
+        assert!(
+            !extended.is_match("a b"),
+            "in extended mode the literal space is not part of the pattern"
+        );
+    }
+
+    #[test]
+    fn rust_supports_regex_features_re2_does_not() {
+        assert!(
+            regex::Regex::new("a{1001}").is_ok(),
+            "Rust must accept a repetition above RE2's 1000 limit, or the bound gate is unnecessary"
+        );
+
+        let intersection =
+            regex::Regex::new("^[a&&b]$").expect("Rust reads character-class intersection");
+        assert!(
+            !intersection.is_match("a") && !intersection.is_match("b"),
+            "Rust must read `&&` as set intersection rather than literal ampersands"
+        );
+    }
+
+    #[test]
+    fn regexp_like_never_renders_verbatim() {
+        for args in [
+            vec![col("code"), lit("^R[0-9]{2}")],
+            vec![col("code"), lit("^r"), lit("i")],
+        ] {
+            let sql = render(REGEXP_LIKE_NAME, args);
+            assert!(
+                !sql.contains(REGEXP_LIKE_NAME),
+                "{REGEXP_LIKE_NAME} must not reach BigQuery SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untranslatable_regexp_like_fails_rather_than_unparsing_verbatim() {
+        // Unreachable with the deny-list's per-call check installed; see
+        // `an_untranslatable_call_fails_rather_than_unparsing_verbatim` for why
+        // the alternative is worse.
+        let dialect = new_bigquery_dialect();
+        let error = Unparser::new(dialect.as_ref())
+            .expr_to_sql(&Expr::ScalarFunction(call(
+                REGEXP_LIKE_NAME,
+                vec![col("code"), col("pattern")],
+            )))
+            .expect_err("a non-literal pattern has no BigQuery translation");
+        let message = error.to_string();
+        for expected in [
+            "must be literals",
+            "query_federation",
+            "https://spiceai.org/docs/components/data-connectors/adbc",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the error must carry {expected:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dialect_renders_every_builtin_it_overrides() {
+        // The mirror of `the_dialect_renders_every_name_the_deny_list_carves_out`
+        // for the built-in table: an entry whose handler cannot render the
+        // shape its own `can_translate` accepts would fail at execution.
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for entry in super::BUILTIN_SCALAR_OVERRIDES {
+            let args = [col("code"), lit("^R[0-9]{2}")];
+            assert!(
+                (entry.can_translate)(&args),
+                "`{name}`'s representative call must be translatable",
+                name = entry.name
+            );
+            let rendered = dialect
+                .scalar_function_to_sql_overrides(&unparser, entry.name, &args)
+                .unwrap_or_else(|error| {
+                    panic!("the dialect must render `{}`: {error}", entry.name)
+                });
+            assert!(
+                rendered.is_some(),
+                "`{name}` has an override entry but no handler answered for it",
+                name = entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewritten_null_check_unparses_into_regexp_contains() {
+        // The production path end to end, minus the network: the optimizer rule
+        // rewrites the NULL-check idiom before federation, and this dialect
+        // renders what the rewrite produces.
+        use datafusion::optimizer::{OptimizerContext, OptimizerRule};
+
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("code", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let matches = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::regex::regexp_match(),
+            vec![col("code"), lit("^R[0-9]{2}")],
+        ));
+        let plan = datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan t")
+            .filter(Expr::IsNotNull(Box::new(matches)))
+            .expect("filter")
+            .project(vec![col("code")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let rewritten = crate::optimizer_rule::RegexpMatchNullCheckRewrite::new()
+            .rewrite(plan, &OptimizerContext::new())
+            .expect("the optimizer rule rewrites the plan")
+            .data;
+        let sql = unparse_plan(new_bigquery_dialect().as_ref(), &rewritten);
+
+        assert!(
+            sql.contains("REGEXP_CONTAINS(") && sql.contains("IS TRUE"),
+            "the NULL-check must reach BigQuery as a REGEXP_CONTAINS predicate: {sql}"
+        );
+        assert!(
+            !sql.contains("regexp_"),
+            "no DataFusion regexp function may reach BigQuery SQL: {sql}"
+        );
     }
 
     #[test]
@@ -1365,6 +2018,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_wrapper_emits_valid_bigquery_set_and_window_syntax() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, false),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            Arc::clone(&schema),
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        let scan = |name: &'static str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(name, Arc::clone(&source), None)
+                .expect("build table scan")
+                .project(vec![col(format!("{name}.id"))])
+                .expect("project id")
+                .build()
+                .expect("build scan plan")
+        };
+
+        let left = scan("left_table");
+        let right = scan("right_table");
+        let distinct = datafusion::logical_expr::LogicalPlanBuilder::from(left.clone())
+            .union_distinct(right.clone())
+            .expect("build distinct union")
+            .build()
+            .expect("build distinct union plan");
+        let all = datafusion::logical_expr::LogicalPlanBuilder::from(left)
+            .union(right)
+            .expect("build all union")
+            .build()
+            .expect("build all union plan");
+
+        let distinct_sql = unparse_plan(new_bigquery_dialect().as_ref(), &distinct);
+        let all_sql = unparse_plan(new_bigquery_dialect().as_ref(), &all);
+        assert!(
+            distinct_sql.contains(" UNION DISTINCT "),
+            "BigQuery requires an explicit DISTINCT quantifier: {distinct_sql}"
+        );
+        assert!(
+            all_sql.contains(" UNION ALL "),
+            "UNION ALL must retain duplicate rows: {all_sql}"
+        );
+
+        let input = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "window_values",
+            Arc::clone(&source),
+            None,
+        )
+        .expect("build window table scan")
+        .build()
+        .expect("build window input");
+        let order_by = vec![col("window_values.id").sort(true, true)];
+        let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![],
+                partition_by: vec![],
+                order_by: order_by.clone(),
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("row_num");
+        let running_sum = Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(
+                datafusion::functions_aggregate::sum::sum_udaf(),
+            ),
+            params: WindowFunctionParams {
+                args: vec![col("window_values.id")],
+                partition_by: vec![],
+                order_by,
+                window_frame: WindowFrame::new(Some(true)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("running_sum");
+        let window = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+            .window(vec![row_number, running_sum])
+            .expect("build window expressions")
+            .build()
+            .expect("build window plan");
+        let window_sql = unparse_plan(new_bigquery_dialect().as_ref(), &window);
+        assert!(
+            window_sql.contains(
+                "row_number() OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST) AS `row_num`"
+            ),
+            "BigQuery rejects a window frame on ROW_NUMBER: {window_sql}"
+        );
+        assert!(
+            window_sql.contains(
+                "sum(`window_values`.`id`) OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `running_sum`"
+            ),
+            "aggregate window frames change which rows contribute and must be retained: {window_sql}"
+        );
+    }
+
+    /// [`timestamp_scan`] plus a value column, for a window function to aggregate.
+    fn windowed_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+            datafusion::arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
+    }
+
     /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
     /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
     fn timestamp_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
@@ -1485,6 +2257,71 @@ mod tests {
             .build()
             .expect("build");
 
+        // A grouped timestamp projected through a wrapper. Nothing else in this
+        // test reaches `group_by_matches_select_subexpressions`, and a wrapper
+        // that inherits its permissive default renders one flat SELECT that
+        // BigQuery refuses with "neither grouped nor aggregated".
+        let wrapped_grouping = {
+            let grouped = timestamp_scan()
+                .aggregate(
+                    vec![datafusion::functions::expr_fn::date_trunc(
+                        lit("week"),
+                        col("t.ts"),
+                    )],
+                    vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+                )
+                .expect("aggregate")
+                .build()
+                .expect("build aggregate");
+            let mut outputs = grouped.schema().columns().into_iter();
+            let group_output = outputs.next().expect("the grouping expression's output");
+            let count_output = outputs.next().expect("the aggregate's output");
+            datafusion::logical_expr::LogicalPlanBuilder::from(grouped)
+                .project(vec![
+                    datafusion::logical_expr::cast(
+                        datafusion::logical_expr::Expr::Column(group_output),
+                        DataType::Date32,
+                    )
+                    .alias("week_start"),
+                    datafusion::logical_expr::Expr::Column(count_output).alias("n"),
+                ])
+                .expect("projection over the aggregate")
+                .build()
+                .expect("build")
+        };
+
+        // `SUM(v) OVER (ORDER BY ts)`, whose frame a plan normalizes to RANGE and
+        // whose placement it normalizes to ASC NULLS LAST — the combination
+        // BigQuery refuses. A wrapper inheriting the permissive default renders
+        // the NULLS clause and the statement fails.
+        let range_window = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                        datafusion::functions_aggregate::sum::sum_udaf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new(Some(false)),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
         for (property, plan, must_contain, must_not_contain) in [
             (
                 "timestamp literal offset (fork PR #144)",
@@ -1515,6 +2352,27 @@ mod tests {
                 &truncated,
                 "TIMESTAMP_TRUNC(`t`.`ts`, MONTH)",
                 "date_trunc",
+            ),
+            (
+                // BigQuery matches a GROUP BY entry against a whole select item
+                // and a column reference and nothing in between, so the aggregate
+                // has to reach it in a scope of its own. `FROM (SELECT` is that
+                // scope; a flat rendering puts the grouping expression in the
+                // outer select list, where the statement is refused.
+                "grouping expression a select item wraps",
+                &wrapped_grouping,
+                "FROM (SELECT",
+                "CAST(TIMESTAMP_TRUNC",
+            ),
+            (
+                // BigQuery accepts no NULL placement but its own inside a RANGE
+                // clause, and an ORDER BY with no explicit frame implies RANGE for
+                // an aggregate. The placement has to be spelled as a leading key;
+                // a surviving NULLS clause is the rendering BigQuery refuses.
+                "RANGE window NULL placement",
+                &range_window,
+                "IS NULL ASC",
+                "NULLS LAST",
             ),
         ] {
             let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
