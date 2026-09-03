@@ -3027,26 +3027,28 @@ fn looks_like_generation_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // object_store::Error::Precondition displays as "Request precondition
     // failure for path …"; HTTP 412 as "412 Precondition Failed". A bare
-    // "precondition" also matches planner/SQL errors and would retry them.
-    lower.contains("request precondition failure")
-        || lower.contains("412 precondition failed")
-        || lower.contains("if-match")
+    // "precondition" or "if-match" also matches planner/SQL errors and
+    // object keys like `listing/if-match/data.parquet`.
+    lower.contains("request precondition failure") || lower.contains("412 precondition failed")
 }
 
 fn looks_like_parquet_decode(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     // `snappy:` is the codec prefix on `snappy: corrupt input`. A bare
     // "snappy" also matches object keys like `snappy/archive/data.parquet`.
+    // Generic I/O (`unexpected eof`, `failed to fill whole buffer`, `eof:`)
+    // also appears on connector disconnects, so those need Parquet context.
     lower.contains("snappy:")
         || lower.contains("corrupt input")
         || lower.contains("corrupt footer")
         || lower.contains("invalid page header")
         || lower.contains("parquet argument error")
-        || lower.contains("failed to fill whole buffer")
         || lower.contains("range length must match")
         || lower.contains("does not match length")
-        || lower.contains("eof:")
-        || lower.contains("unexpected eof")
+        || (lower.contains("parquet")
+            && (lower.contains("failed to fill whole buffer")
+                || lower.contains("unexpected eof")
+                || lower.contains("eof:")))
 }
 
 fn error_chain_matches(error: &dyn std::error::Error, predicate: fn(&str) -> bool) -> bool {
@@ -3373,6 +3375,23 @@ mod tests {
             matches!(&classified, RetryError::Permanent(_)),
             "an execution precondition must stay permanent"
         );
+
+        let if_match_path = DataFusionError::External(Box::new(std::io::Error::other(
+            "Object at path listing/if-match/data.parquet: AccessDenied",
+        )));
+        assert!(
+            !is_object_generation_changed_error(&if_match_path),
+            "If-Match in the object key is not a generation change"
+        );
+        let classified = retry_from_df_error(if_match_path);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "AccessDenied must stay permanent even when the key contains if-match"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
     }
 
     #[test]
@@ -3435,6 +3454,15 @@ mod tests {
                 "Parquet error: Arrow: Parquet argument error: External: snappy: corrupt input \
                  (expected copy read of length 1; remaining src: 0)"
             ),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        let mysql_eof = "MySQL connection closed: unexpected eof during binlog stream";
+        assert_eq!(
+            refresh_error_reason_from_message(mysql_eof),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message("Parquet error: Arrow: failed to fill whole buffer"),
             metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
         );
     }
