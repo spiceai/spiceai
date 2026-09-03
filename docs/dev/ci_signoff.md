@@ -288,6 +288,12 @@ runner. It deliberately never SSHes into ad-hoc hosts — the LAN lab boxes
 double as benchmark machines, and a workspace build there mid-run silently
 corrupts the measurement.
 
+The remote job runs on the Linux self-hosted pool (`spiceai-dev-runners`), not
+on `spiceai-macos`, which `pr.yml`'s merge-queue jobs occupy. That makes the
+platform under test Linux, so a remote sign-off and a local `make signoff` on a
+Mac clear the same branch on different targets: a lint or build failure that
+only appears under one `cfg(target_os)` is caught by only one of them.
+
 The Actions workflow:
 
 0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
