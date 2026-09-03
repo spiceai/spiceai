@@ -304,49 +304,6 @@ pub(crate) fn rand_to_random(
     Ok(Some(ast_fn))
 }
 
-/// Converts `btrim` into `DuckDB`'s `trim`.
-///
-/// `trim(x)` in SQL resolves to the `btrim` UDF in `DataFusion` — `trim` is one
-/// of its aliases — and the unparser emits a scalar function under its
-/// canonical name, so a pushed-down `trim` arrives at `DuckDB` as
-/// `btrim(...)`. `DuckDB` has no function of that name and fails the whole
-/// query with `Catalog Error: Scalar Function with name btrim does not exist!`
-/// (issue #13794).
-///
-/// `DuckDB`'s two-argument `trim` is the same function: the second argument is
-/// the *set* of characters to strip from both ends, which is what `btrim`'s
-/// `TrimBoth` kernel does.
-///
-/// **The one-argument form is rendered as `trim(arg, ' ')`, not `trim(arg)`.**
-/// The bare unary calls are *not* the same function: `DataFusion` strips the
-/// ASCII space and nothing else (`general_trim` dispatches to
-/// `trim_ascii_char(s, b' ')`), while `DuckDB`'s unary `trim` strips every
-/// Unicode space separator. On `DuckDB` 1.4.4, `length(trim(x))` over values
-/// padded with U+00A0, U+2003 and U+3000 answers 1 where the kernel answers 3 —
-/// so the bare rename would have replaced issue #13794's loud error with
-/// silently different rows depending on whether the call federated, which is
-/// worse than the error. Naming the character set explicitly pins `DuckDB` to
-/// the one character the kernel removes. (A tab agrees either way: `DuckDB`
-/// trims the Zs category, not all whitespace.)
-///
-/// `btrim` admits no arity other than one or two, so anything else is left to
-/// evaluate locally rather than rendered.
-pub(crate) fn btrim_to_trim(
-    unparser: &datafusion::sql::unparser::Unparser,
-    args: &[Expr],
-) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    let call = match args {
-        [arg] => unparser.scalar_function_to_sql(
-            "trim",
-            &[arg.clone(), Expr::Literal(ScalarValue::from(" "), None)],
-        )?,
-        [_, _] => unparser.scalar_function_to_sql("trim", args)?,
-        _ => return Ok(None),
-    };
-
-    Ok(Some(call))
-}
-
 pub(super) enum DuckDBRegexpFunction {
     Match,
     Like,
@@ -775,70 +732,6 @@ mod tests {
             .expr_to_sql(&call)
             .expect("btrim unparses for DuckDB");
         assert_eq!(rendered.to_string(), "trim('  hi  ', ' ')");
-    }
-
-    #[test]
-    fn btrim_unparses_as_duckdb_trim() {
-        // `trim(col)` resolves to the `btrim` UDF and the unparser emits scalar
-        // functions under their canonical name, so without this rewrite a
-        // pushed-down `trim` reaches DuckDB as `btrim(...)` — a function it does
-        // not have — and fails the whole query (issue #13794). Driven through
-        // `Dialect::scalar_function_to_sql_overrides` rather than the handler
-        // directly, because registering the handler in `duckdb_scalar_overrides`
-        // is the half that was missing.
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let col = Expr::Column(Column {
-            relation: Some(TableReference::from("t")),
-            name: "name".to_string(),
-            spans: Spans::new(),
-        });
-
-        // The one-argument form must name the character set. A bare
-        // `trim("t"."name")` would let DuckDB strip every Unicode space
-        // separator where the kernel strips only the ASCII space, so it would
-        // answer differently for a value padded with U+00A0, U+2003 or U+3000
-        // depending on whether the call federated.
-        let one_arg = dialect
-            .scalar_function_to_sql_overrides(
-                &unparser,
-                crate::dialect::BTRIM_NAME,
-                std::slice::from_ref(&col),
-            )
-            .expect("btrim renders")
-            .expect("the dialect has a handler registered for btrim");
-        assert_eq!(one_arg.to_string(), r#"trim("t"."name", ' ')"#);
-
-        // Two arguments: DuckDB's `trim` takes the same character *set* second
-        // argument that `btrim`'s TrimBoth kernel strips, so it passes straight
-        // through.
-        let two_args = dialect
-            .scalar_function_to_sql_overrides(
-                &unparser,
-                crate::dialect::BTRIM_NAME,
-                &[col, lit("x")],
-            )
-            .expect("btrim renders")
-            .expect("the dialect has a handler registered for btrim");
-        assert_eq!(two_args.to_string(), r#"trim("t"."name", 'x')"#);
-    }
-
-    #[test]
-    fn btrim_with_an_unrenderable_arity_stays_local() {
-        // `btrim`'s signature admits only one or two arguments. Anything else is
-        // not a call this can faithfully render, and returning `None` leaves it
-        // to evaluate locally rather than emitting SQL DuckDB would reject.
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        for args in [vec![], vec![lit("a"), lit("b"), lit("c")]] {
-            assert!(
-                btrim_to_trim(&unparser, &args)
-                    .expect("an unrenderable arity is not an error")
-                    .is_none(),
-                "btrim with {} arguments must not be rewritten",
-                args.len()
-            );
-        }
     }
 
     #[test]
