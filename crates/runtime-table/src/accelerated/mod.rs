@@ -66,6 +66,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
+pub mod caching_eviction;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_task;
@@ -424,6 +425,8 @@ pub struct Builder {
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
+    caching_max_size_bytes: Option<u64>,
+    caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
@@ -481,6 +484,8 @@ impl Builder {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
+            caching_max_size_bytes: None,
+            caching_max_items: None,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
@@ -735,6 +740,18 @@ impl Builder {
         self
     }
 
+    /// Set the byte budget (`caching_max_size`) for cache mode
+    pub fn caching_max_size_bytes(&mut self, max_size_bytes: Option<u64>) -> &mut Self {
+        self.caching_max_size_bytes = max_size_bytes;
+        self
+    }
+
+    /// Set the row budget (`caching_max_items`) for cache mode
+    pub fn caching_max_items(&mut self, max_items: Option<u64>) -> &mut Self {
+        self.caching_max_items = max_items;
+        self
+    }
+
     /// Set whether the dataset was bootstrapped from a snapshot.
     pub fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
         self.bootstrap_status = bootstrap_status;
@@ -928,7 +945,7 @@ impl Builder {
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
@@ -951,6 +968,7 @@ impl Builder {
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
+        refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
@@ -1047,7 +1065,30 @@ impl Builder {
             None
         };
 
-        if let Some(retention) = self.retention {
+        // A caching accelerator is bounded by `caching_eviction` as a computed
+        // retention policy rather than by a loop of its own, so the cache is
+        // swept by the same ticker, write lock and index-aware delete every
+        // other dataset uses. Attached before the retention task is spawned
+        // below.
+        let retention = if refresh_mode == RefreshMode::Caching {
+            Some(caching_eviction::retention(
+                caching_eviction::CacheLimits {
+                    max_size_bytes: self.caching_max_size_bytes,
+                    max_items: self.caching_max_items,
+                    ttl: self.caching_ttl,
+                    stale_while_revalidate: self.caching_stale_while_revalidate_ttl,
+                    stale_if_error: self.caching_stale_if_error,
+                },
+                self.retention,
+                &self.accelerator,
+                &self.dataset_name,
+                &self.io_runtime,
+            ))
+        } else {
+            self.retention
+        };
+
+        if let Some(retention) = retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
@@ -2229,6 +2270,41 @@ fn filters_for_accelerator_scan(
     Ok(accelerator_filters)
 }
 
+/// Resolves what a retention check should delete, computed fresh on every tick.
+///
+/// The two static filter kinds can only express a predicate fixed when the
+/// dataset was configured. This one is asked each tick, so a policy that has to
+/// *measure* the table before it can decide — a byte or row budget, which is
+/// knowable only by aggregating what is stored — can be a retention filter
+/// rather than a second eviction loop running beside this one.
+///
+/// It is given whatever the dataset's own retention filters resolved to and has
+/// the last word on the result. An implementation may widen that predicate,
+/// narrow it, or ignore it: a caching accelerator translates it from rows to
+/// whole cache entries, because deleting part of a multi-row cached response
+/// would leave the rest to be served as though it were complete.
+#[async_trait::async_trait]
+pub trait RetentionPredicate: Send + Sync + std::fmt::Debug {
+    /// The rows to delete this tick, or `None` when there is nothing to remove.
+    ///
+    /// `configured` is what this dataset's static retention filters resolved
+    /// to, or `None` when it has none. An implementation that ignores it drops
+    /// a `retention_period` or `retention_sql` the user wrote, silently — so it
+    /// must either fold `configured` into what it returns or be able to say why
+    /// that rule cannot apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusionError` if the accelerator cannot be queried for
+    /// whatever the decision needs. The tick is skipped and retried on the next
+    /// interval.
+    async fn delete_expr(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        configured: Option<Expr>,
+    ) -> datafusion::error::Result<Option<Expr>>;
+}
+
 #[derive(Debug)]
 pub enum DataRetentionFilter {
     Time {
@@ -2364,6 +2440,9 @@ impl RetentionBuilder {
         Some(Retention {
             filters,
             check_interval,
+            // The builder configures a dataset's own retention rules; a
+            // computed policy is attached by whatever owns it.
+            computed: None,
         })
     }
 }
@@ -2377,6 +2456,16 @@ impl Default for RetentionBuilder {
 pub struct Retention {
     pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
+    /// A policy decided per tick rather than at configuration time, which has
+    /// the last word on what `filters` resolved to: see [`RetentionPredicate`].
+    ///
+    /// A field rather than another `filters` variant, because it does not
+    /// compose the way they do. Every variant in that list is OR'd together;
+    /// this one is handed their combined result and may widen it, narrow it or
+    /// replace it. Putting it in the list would make "at most one, applied
+    /// last" a convention the loop has to enforce by hand, and a second one
+    /// would silently disable the first.
+    pub(crate) computed: Option<Arc<dyn RetentionPredicate>>,
 }
 
 impl Retention {
