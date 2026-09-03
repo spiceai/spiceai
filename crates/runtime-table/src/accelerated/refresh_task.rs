@@ -604,13 +604,25 @@ impl RefreshTask {
             .iter()
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
-        let result = retry(retry_strategy, || async { self.run_once(&refresh).await })
-            .instrument(span.clone())
-            .await;
+        let result = retry(retry_strategy, || async {
+            match self.run_once(&refresh).await {
+                Ok(()) => Ok(()),
+                Err(retry_err) => {
+                    if !self.runtime_status.is_shutdown()
+                        && let Some(error) = attempt_refresh_error(&retry_err)
+                    {
+                        self.record_refresh_error(error, &refresh.mode).await;
+                    }
+                    Err(retry_err)
+                }
+            }
+        })
+        .instrument(span.clone())
+        .await;
 
-        // Count once for the failure that ended the refresh. A 412 that retries
-        // successfully is not an error; an exhausted generation-change still
-        // carries `reason=object_generation_changed` so it can be filtered.
+        // Log any failure that ended the loop. Generation-change is counted
+        // here so a recovered 412 is silent; other errors were counted above
+        // on each attempt so unbounded retries stay visible.
         if let Some(e) = terminal_refresh_error(&result, self.runtime_status.is_shutdown()) {
             tracing::error!(
                 "Failed to refresh {} {}: {e}",
@@ -620,7 +632,9 @@ impl RefreshTask {
             for span in &spans {
                 tracing::error!(target: "task_history", parent: span, "{e}");
             }
-            self.record_refresh_error(e, &refresh.mode).await;
+            if let Some(error) = terminal_generation_change_refresh_error(&result, false) {
+                self.record_refresh_error(error, &refresh.mode).await;
+            }
         }
 
         result
@@ -3004,18 +3018,44 @@ pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
     })
 }
 
-/// The error that ended a refresh retry loop, if it should increment
-/// `dataset_acceleration_refresh_errors`.
+/// The error that ended a refresh retry loop, if the refresh itself failed.
 ///
-/// A recovered retry (`Ok`) and a shutdown abort are not refresh errors. The
-/// metric is incremented from this value only, so a transient 412 that later
-/// succeeds cannot emit a point and an exhausted failure emits exactly one.
+/// A recovered retry (`Ok`) and a shutdown abort are not refresh failures.
+/// Used for the user-facing error log. Metric increments use
+/// [`attempt_refresh_error`] and [`terminal_generation_change_refresh_error`].
 #[must_use]
 fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
     if shutdown {
         return None;
     }
     result.as_ref().err()
+}
+
+/// Failed attempts that are not a generation-change increment immediately so a
+/// persistent connector error stays visible while retries continue (`refresh_retry_max_attempts`
+/// defaults to unlimited). Generation-change waits for the terminal outcome.
+fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Error> {
+    let inner = inner_err_from_retry_ref(error);
+    if refresh_error_reason(inner) == metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+/// An exhausted generation-change after the retry loop. A recovered 412 is
+/// `Ok` and is not counted; a non-generation terminal was already counted
+/// per attempt.
+fn terminal_generation_change_refresh_error<'a>(
+    result: &'a super::Result<()>,
+    shutdown: bool,
+) -> Option<&'a super::Error> {
+    let error = terminal_refresh_error(result, shutdown)?;
+    if refresh_error_reason(error) == metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED {
+        Some(error)
+    } else {
+        None
+    }
 }
 
 /// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
@@ -3660,6 +3700,105 @@ mod tests {
         assert!(
             (exhausted_count - 1.0).abs() < f64::EPSILON,
             "an exhausted 412 must emit exactly one reason-labeled refresh error (got {exhausted_count})"
+        );
+    }
+
+    /// `attempt_refresh_error` classifies non-generation failures for immediate
+    /// per-attempt metric increments and suppresses generation-change so a
+    /// recovered 412 is counted once at the terminal outcome only.
+    #[test]
+    fn attempt_refresh_error_suppresses_generation_change_and_counts_other() {
+        // A generation-change transient must return None (counted at terminal).
+        let gen_change =
+            retry_from_df_error(DataFusionError::External(Box::new(std::io::Error::other(
+                "Request precondition failure for path listing/data.parquet: \
+                 412 Precondition Failed",
+            ))));
+        assert!(
+            attempt_refresh_error(&gen_change).is_none(),
+            "generation-change must be suppressed from per-attempt metric"
+        );
+
+        // A non-generation permanent failure must be returned immediately.
+        let io_err = RetryError::permanent(super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::External(Box::new(std::io::Error::other(
+                "Execution error: connection reset by peer",
+            ))),
+        });
+        assert!(
+            attempt_refresh_error(&io_err).is_some(),
+            "a non-generation failure must be returned for per-attempt increment"
+        );
+        assert_eq!(
+            refresh_error_reason(attempt_refresh_error(&io_err).expect("just asserted some")),
+            metrics::REFRESH_ERROR_REASON_OTHER,
+        );
+    }
+
+    /// A persistent non-generation failure with unlimited retries increments
+    /// the metric on every attempt, not only once at the end.
+    #[test]
+    fn non_generation_attempt_error_increments_on_each_retry() {
+        let registry = super::test_prometheus_registry().clone();
+
+        let dataset = "non_gen_attempt_test";
+        let reason = metrics::REFRESH_ERROR_REASON_OTHER;
+        let labels = vec![vec![
+            KeyValue::new("dataset", dataset),
+            KeyValue::new("mode", "full"),
+        ]];
+
+        let before = refresh_error_count(&registry, dataset, reason);
+
+        // Simulate three failed attempts, each calling emit_refresh_errors as
+        // attempt_refresh_error would trigger from run().
+        for _ in 0..3 {
+            let err = RetryError::permanent(super::super::Error::FailedToRefreshDataset {
+                source: DataFusionError::External(Box::new(std::io::Error::other(
+                    "connection reset by peer",
+                ))),
+            });
+            if let Some(e) = attempt_refresh_error(&err) {
+                emit_refresh_errors(labels.clone(), refresh_error_reason(e));
+            }
+        }
+
+        let after = refresh_error_count(&registry, dataset, reason);
+        assert!(
+            (after - before - 3.0).abs() < f64::EPSILON,
+            "three failed attempts must emit three refresh-error points (before={before} after={after})"
+        );
+    }
+
+    /// `terminal_generation_change_refresh_error` is `None` for non-generation errors
+    /// (they were already counted per-attempt) and `Some` for exhausted 412s.
+    #[test]
+    fn terminal_generation_change_refresh_error_selects_only_generation_errors() {
+        let gen_result: super::super::Result<()> =
+            Err(super::super::Error::FailedToRefreshDataset {
+                source: DataFusionError::External(Box::new(std::io::Error::other(
+                    "Request precondition failure for path listing/data.parquet: \
+                     412 Precondition Failed",
+                ))),
+            });
+        assert!(
+            terminal_generation_change_refresh_error(&gen_result, false).is_some(),
+            "exhausted generation-change must be returned for terminal metric"
+        );
+        assert!(
+            terminal_generation_change_refresh_error(&gen_result, true).is_none(),
+            "shutdown must suppress even a generation-change terminal error"
+        );
+
+        let other_result: super::super::Result<()> =
+            Err(super::super::Error::FailedToRefreshDataset {
+                source: DataFusionError::External(Box::new(std::io::Error::other(
+                    "connection reset by peer",
+                ))),
+            });
+        assert!(
+            terminal_generation_change_refresh_error(&other_result, false).is_none(),
+            "a non-generation terminal error must not be counted again at terminal"
         );
     }
 
