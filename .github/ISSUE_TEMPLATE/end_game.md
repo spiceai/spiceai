@@ -249,7 +249,7 @@ Testing focus DRIs are responsible for:
 ## Release Publication Steps
 
 - [ ] Cherry-pick release notes onto the release branch.
-- [ ] Cherry-pick acknowledgements onte the release branch (generated earlier).
+- [ ] Cherry-pick acknowledgements onto the release branch (generated earlier).
 - [ ] Merge Spicepod JSON schema onto the release branch (generated earlier).
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
