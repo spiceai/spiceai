@@ -482,6 +482,26 @@ jobs:
           SIGNOFF_SKIP_TARGETED_LINT: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
           SIGNOFF_SKIP_TARGETED_TESTS: "${{ inputs.run_targeted_prechecks && '' || '1' }}"
 
+      # Ahead of the status handlers below, not after them, and bounded. Those
+      # handlers talk to the GitHub API and can take many minutes when it is
+      # slow, which is exactly when a run overruns its budget — and a job
+      # killed at its wall uploads no log at all, so a diagnostic queued behind
+      # them is lost in every case it was written to explain (runs 33706211503
+      # and 33731617339 both died with the cache stats still pending). Cache
+      # health is the first thing an overrun needs and the cheapest to get.
+      - name: Show sccache stats
+        if: always() && (env.SCCACHE_SETUP == 'true')
+        # Bounded because it sits in front of the status resolution now: this
+        # asks the local sccache server, which is normally instant, but a
+        # wedged one must not spend the cleanup window that the handlers need.
+        timeout-minutes: 2
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
       # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
       # non-zero under its `set +e`, falls into the failure branch, and posts
       # `signoff=failure` — "Sign-off checks failed after Ns" — about a branch nothing
@@ -536,12 +556,3 @@ jobs:
         run: |
           .trusted-ci/signoff clear-pending \
             "Remote sign-off ended without posting a verdict — sign off again"
-
-      - name: Show sccache stats
-        if: always() && (env.SCCACHE_SETUP == 'true')
-        # `always()`: this is the one step that reports cache health, and without it
-        # it is skipped on exactly the failures it would explain (#12420). The `||`
-        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
-        # gone `--show-stats` cannot answer either, and that is itself the finding.
-        run: |
-          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
