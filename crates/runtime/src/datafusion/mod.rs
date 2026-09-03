@@ -3190,7 +3190,7 @@ impl DataFusion {
             // several rows (a paginated one is fetched a page at a time), and a
             // row-level delete could take part of one and leave the rest to be
             // served as though it were the whole response.
-            // 
+            //
             // Nothing in the caching read path removes an entry, so the
             // accelerator is bounded by a retention policy or by nothing at all.
             match caching_retention::caching_retention(
