@@ -32,10 +32,10 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use datafusion::arrow::array::timezone::Tz;
-use datafusion::arrow::datatypes::TimeUnit;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     self, BinaryOperator, CaseWhen, Function, FunctionArg, FunctionArgExpr, ObjectName,
@@ -287,11 +287,44 @@ pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
 /// other two pieces — a handler, because the unparser otherwise emits the call
 /// verbatim into SQL `BigQuery` rejects, and a per-call check, because the
 /// handler can only render some call shapes and the rest must stay local.
-pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[ScalarOverride {
-    name: super::REGEXP_LIKE_NAME,
-    handler: regexp_like_to_sql,
-    can_translate: regexp_like_is_renderable,
-}];
+pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
+    ScalarOverride {
+        name: super::REGEXP_LIKE_NAME,
+        handler: regexp_like_to_sql,
+        can_translate: regexp_like_is_renderable,
+    },
+    ScalarOverride {
+        name: "array_element",
+        handler: array_element_to_sql,
+        can_translate: array_index_is_renderable,
+    },
+];
+
+/// `array_element` is 1-based and counts from the end for a negative index.
+/// `BigQuery` has no end-relative subscript, so the fork's dialect renders only
+/// a non-negative index and refuses the rest; this is the check that keeps the
+/// refusal off the pushdown path, leaving such a call to evaluate locally rather
+/// than failing the query.
+fn array_index_is_renderable(args: &[Expr]) -> bool {
+    let [_, Expr::Literal(index, _)] = args else {
+        return false;
+    };
+    index.data_type().is_integer()
+        && matches!(
+            index.cast_to(&DataType::Int64),
+            Ok(ScalarValue::Int64(Some(index))) if index >= 0
+        )
+}
+
+/// Defers to the fork's `BigQuery` rendering, which spells the subscript
+/// `SAFE_ORDINAL` so it agrees with `array_element`'s 1-based indexing.
+///
+/// Registered here only so [`can_translate`] can refuse the indexes that
+/// rendering will not take. Returning `Ok(None)` instead would fall through to
+/// the generic 0-based subscript, which reads the neighbouring element.
+fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    BigQueryDialect::new().scalar_function_to_sql_overrides(unparser, "array_element", args)
+}
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
 /// and hands both to `render` as `BigQuery` SQL.
@@ -1364,6 +1397,40 @@ mod tests {
     #[test]
     fn a_call_with_no_path_has_no_translation() {
         assert_eq!(json_path(&[col("doc")]), None);
+    }
+
+    /// `array_element` renders only a non-negative index, so the gate has to
+    /// refuse the rest — otherwise the call is pushed down and the rendering
+    /// then fails the whole query instead of evaluating locally.
+    #[test]
+    fn array_element_federates_only_for_a_non_negative_integer_index() {
+        assert!(can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(1i64)]
+        )));
+        assert!(can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(0i64)]
+        )));
+        // Counts from the end, which BigQuery cannot express.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(-1i64)]
+        )));
+        // Sign unknown until it runs.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), col("i")]
+        )));
+        // Not an ordinal BigQuery would take.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit("1")]
+        )));
+
+        // And what does federate keeps the 1-based spelling.
+        let sql = render("array_element", vec![col("arr"), lit(1i64)]);
+        assert!(sql.contains("SAFE_ORDINAL(1)"), "not 1-based: {sql}");
     }
 
     #[test]
