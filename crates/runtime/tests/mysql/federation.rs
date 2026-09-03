@@ -297,11 +297,13 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 /// strips any character in it, so a rewrite would trade a failed query for
 /// wrong rows. `btrim` is deny-listed instead and evaluates locally.
 ///
-/// Covers **both** registration paths in one container, because they install
-/// the deny-list at two separate call sites and the catalog one was missed
-/// first time round: `MySQLTableFactory` in the dataset connector, and again in
-/// `catalogconnector::mysql`. The deny-list unit tests exercise the builder, so
-/// they pass with either call site's `with_function_support` removed.
+/// Covers **both** registration paths in one container because the deny-list is
+/// installed at two independent call sites — `MySQLTableFactory` in the dataset
+/// connector, and again in `catalogconnector::mysql` — and nothing ties them
+/// together: `with_function_support` is an optional builder step, so omitting it
+/// at either site compiles and degrades only against a live MySQL. The deny-list
+/// unit tests exercise the builder rather than the wiring, so they pass with
+/// either call site's install removed; only this test fails.
 #[tokio::test]
 async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));

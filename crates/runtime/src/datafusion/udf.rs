@@ -1101,11 +1101,11 @@ mod tests {
 
     #[test]
     fn sqlite_and_mysql_deny_lists_still_deny_every_spice_function() {
-        // Carving `btrim` into these two lists must not have cost them the Spice
-        // deny-list they were built for: `SqliteTableProviderFactory` and
-        // `MySQLTableFactory` previously took the backend-agnostic default, and
-        // a Spice-only function reaching either backend is the unknown-function
-        // failure of issue #10703.
+        // The invariant: a backend-specific list is the generic Spice deny-list
+        // *plus* that backend's extras, never a replacement for it. A Spice-only
+        // function reaching either backend is the unknown-function failure of
+        // issue #10703, so `btrim` must be additive to that set rather than the
+        // whole of it.
         let json_name = json_get_str_udf().name().to_string();
         for (backend, support) in [
             ("sqlite", deny_spice_functions_for_sqlite_table_providers()),
