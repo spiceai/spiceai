@@ -570,6 +570,16 @@
         "task_history": {
           "$ref": "#/$defs/TaskHistory"
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeDrasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "auth": {
           "anyOf": [
             {
@@ -1183,6 +1193,128 @@
         "full"
       ]
     },
+    "RuntimeDrasi": {
+      "description": "Runtime-level Drasi forwarding for the tables Spice generates itself.\n\n**Alpha** — in preview, and should not be used in production.\n\nPublishes writes to the runtime's own tables — `task_history`, `metrics` —\nso Drasi continuous queries can react to Spice's operational events: a query\nthat ran too long, a dataset refresh that failed. These tables are not\nchange-data-captured from an external source, so this is configured\nseparately from a dataset's `drasi:` block.\n\nIt deliberately has no `on_delivery_error`. That setting trades a CDC stall\nfor zero loss, which works because an unacknowledged replication position\nreplays. There is no such position here: these rows are the runtime's own\ntelemetry, so delivery is queued per table, and an unreachable Drasi is\ncounted and dropped rather than allowed to stall the writer.\n\n# Example\n\n```yaml\nruntime:\n  drasi:\n    source_id: spice-runtime\n    params:\n      drasi_http_endpoint: http://localhost:9000\n    tables:\n      - name: task_history\n```",
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "description": "The id of the Drasi source to publish into.",
+          "type": "string"
+        },
+        "forwarding": {
+          "description": "Whether this block forwards. Defaults to `enabled`; set `disabled` to\nkeep the configuration in place without publishing anything.",
+          "$ref": "#/$defs/DrasiForwarding"
+        },
+        "tables": {
+          "description": "The runtime tables to forward. Nothing is forwarded until a table is\nlisted, so enabling this never publishes a table the operator did not\nname.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeDrasiTable"
+          }
+        },
+        "transport": {
+          "description": "How change events reach Drasi. Defaults to `http`.",
+          "$ref": "#/$defs/DrasiTransport"
+        },
+        "params": {
+          "description": "Transport connection parameters — the same keys a dataset's `drasi:`\nblock accepts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_id"
+      ]
+    },
+    "DrasiForwarding": {
+      "description": "Whether a `drasi:` block actually forwards.\n\nLets a complete, valid configuration stay in the Spicepod while forwarding is\nturned off — so switching it back on is a one-word edit rather than\nreconstructing the endpoint, labels and key columns from memory.",
+      "oneOf": [
+        {
+          "description": "Changes are published to the configured Drasi source.",
+          "type": "string",
+          "const": "enabled"
+        },
+        {
+          "description": "Nothing is published, and the rest of the block is left unvalidated —\nincluding the `acceleration.refresh_mode: changes` requirement — so a\ndataset can be parked without its Drasi settings being removed.",
+          "type": "string",
+          "const": "disabled"
+        }
+      ]
+    },
+    "RuntimeDrasiTable": {
+      "description": "One runtime table to forward.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Table name within the `runtime` schema, e.g. `task_history`.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Columns that identify a row, used to derive the Drasi element id.\n\nDefaults to the table's declared primary key. A table with neither — the\nruntime's `metrics` table declares none — is refused rather than\nforwarded under a synthesized id, which would publish a duplicate node\nevery time a delivery is retried.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "labels": {
+          "description": "Node labels. Defaults to the qualified table name, e.g.\n`runtime.task_history`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "DrasiTransport": {
+      "description": "The transport a [`Drasi`] forwarder publishes over.\n\nThe two reach different Drasi deployments and speak different wire formats;\nthey are not interchangeable against one server.",
+      "oneOf": [
+        {
+          "description": "POST batches to a Drasi Server HTTP source's ingestion route.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "`XADD` `CloudEvents` envelopes onto the Redis stream a Drasi platform\nsource consumes. Reaches a Kubernetes-deployed Drasi without building\ncustom source containers.",
+          "type": "string",
+          "const": "redis"
+        }
+      ]
+    },
+    "Params": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "ParamValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
     "Auth": {
       "type": "object",
       "properties": {
@@ -1492,7 +1624,7 @@
       "type": "object",
       "properties": {
         "cores": {
-          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it. Applied at startup only — the thread\npools it sizes cannot be resized on a spicepod reload.",
+          "description": "The CPU entitlement, as a Kubernetes CPU quantity: `4`, `3.5`, `3500m`.\n`auto` (the default) detects it, which on a pod that declares a CPU\nrequest means a bounded multiple of that request. `all` means every\navailable core regardless of the request — a CPU limit, if one is set, is\nstill respected, and a value set here still narrows an `all` coming from\n`SPICE_CPU_CORES` or `--cpu-cores`. Applied at startup only — the thread pools it sizes\ncannot be resized on a spicepod reload.",
           "anyOf": [
             {
               "$ref": "#/$defs/CpuQuantity"
@@ -1506,7 +1638,7 @@
       "additionalProperties": false
     },
     "CpuQuantity": {
-      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`); it always serializes as a string, so\n`--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
+      "description": "A CPU quantity, held verbatim so it can be echoed back in an error message.\n\nAccepts a YAML number (`cores: 4`, `cores: 3.5`) or a string\n(`cores: 3500m`, `cores: auto`, `cores: all`); it always serializes as a\nstring, so\n`--set-runtime cpu.cores=…` round-trips through YAML unchanged. Validation\nlives in `cpu_budget`, which is where the value is used.",
       "type": "string"
     },
     "Metrics": {
@@ -1584,30 +1716,6 @@
       "additionalProperties": false,
       "required": [
         "state_location"
-      ]
-    },
-    "Params": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/$defs/ParamValue"
-      }
-    },
-    "ParamValue": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "integer",
-          "format": "int64"
-        },
-        {
-          "type": "number",
-          "format": "double"
-        },
-        {
-          "type": "boolean"
-        }
       ]
     },
     "SourceRateControl": {
@@ -1994,7 +2102,7 @@
           "const": "file"
         },
         {
-          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.",
+          "description": "Always create a new file, truncating/overwriting any existing file on startup.\nUse this when you want a fresh acceleration on each startup.\nWith `snapshots: enabled` the outgoing file is still snapshotted, but no\nsnapshot is bootstrapped back in — the next refresh rebuilds from the\nsource. Datasets whose refresh never reads a source still bootstrap,\nbecause there the snapshot is the only copy of the data: `refresh_mode:\nsnapshot`, whose source is the snapshot store, and `sink:` datasets,\nwhich never refresh at all.",
           "type": "string",
           "const": "file_create"
         },
@@ -2186,6 +2294,16 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/FtsStore"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "drasi": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Drasi"
                 },
                 {
                   "type": "null"
@@ -3784,6 +3902,88 @@
           ]
         }
       }
+    },
+    "Drasi": {
+      "description": "Dataset-level [Drasi](https://drasi.io) change-forwarding configuration.\n\n**Alpha** — in preview, and should not be used in production.\n\nPublishes the dataset's change-data-capture stream to a Drasi source, so Drasi\ncontinuous queries observe the same changes the runtime applies to the local\naccelerator. Each changed row becomes one Drasi graph node: the row's primary\nkey derives the element id, the source table name becomes the node label, and\nthe row's columns become node properties.\n\nRequires `acceleration.refresh_mode: changes` on the same dataset — the\nforwarder taps the CDC stream, so a dataset without one has nothing to forward.\n\n# Example\n\n```yaml\ndatasets:\n  - from: postgres:public.orders\n    name: orders\n    acceleration:\n      enabled: true\n      engine: cayenne\n      refresh_mode: changes\n    drasi:\n      source_id: spice-cdc\n      forwarding: enabled   # or `disabled`, to park the config\n      labels: [public.orders]\n      params:\n        drasi_http_endpoint: http://localhost:9000\n```",
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "description": "The id of the Drasi source to publish into.\n\nMust string-equal the `id` of a source already declared on the Drasi side;\nDrasi never auto-creates one, and a mismatch is rejected by the server.",
+          "type": "string"
+        },
+        "forwarding": {
+          "description": "Whether this block forwards. Defaults to `enabled`; set `disabled` to\nkeep the configuration in place without publishing anything.",
+          "$ref": "#/$defs/DrasiForwarding"
+        },
+        "labels": {
+          "description": "Node labels applied to every element from this dataset. Drasi continuous\nqueries match on these (`MATCH (o:public.orders)`).\n\nDefaults to the dataset's source table name, matching the convention used\nby Drasi's own relational sources (schema-qualified when the source\nqualifies it, e.g. `public.orders`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transport": {
+          "description": "How change events reach Drasi. Defaults to `http`.",
+          "$ref": "#/$defs/DrasiTransport"
+        },
+        "delivery": {
+          "description": "When a change counts as handed off. Defaults to `acknowledged`, which\nnever loses a change but paces replication at Drasi's speed. Use\n`queued` to decouple them.",
+          "$ref": "#/$defs/DrasiDelivery"
+        },
+        "on_delivery_error": {
+          "description": "What the CDC stream does when Drasi cannot accept a change event.\nDefaults to `block`. Applies only to `delivery: acknowledged`.",
+          "$ref": "#/$defs/OnDeliveryError"
+        },
+        "params": {
+          "description": "Transport connection parameters.\n\nFor `transport: http`:\n- `drasi_http_endpoint` (required) — the Drasi HTTP source's own listener,\n  e.g. `http://localhost:9000`. This is the port the source binds, not the\n  Drasi Server management API port.\n- `drasi_request_timeout` (optional) — per-request timeout, e.g. `30s`.\n\nFor `transport: redis`:\n- `drasi_redis_url` (required) — e.g. `redis://localhost:6379`, or\n  `rediss://` for TLS.\n- `drasi_stream_key` (required) — the Redis stream the Drasi platform\n  source reads, e.g. `drasi-events`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "source_id"
+      ]
+    },
+    "DrasiDelivery": {
+      "description": "When a change is considered handed off to Drasi.\n\nThis is the throughput/durability trade for the CDC path. It exists because\nthe strict choice makes a reaction engine's availability a ceiling on\nreplication throughput, which is rarely what an operator wants from a\ndownstream consumer.",
+      "oneOf": [
+        {
+          "description": "A change reaches Drasi before its replication position is acknowledged.\n\nNothing is lost — a stall or a crash replays from the unacknowledged\nposition — but replication only advances as fast as Drasi accepts, so a\nslow or unreachable Drasi slows or stops it, and the source's replication\nlog grows behind it. See `on_delivery_error` for what a failure does.",
+          "type": "string",
+          "const": "acknowledged"
+        },
+        {
+          "description": "A change is queued locally and its replication position acknowledged\nimmediately; delivery is retried in the background.\n\nReplication never waits for Drasi. A change Drasi will not accept is\nwritten to a durable dead-letter store under `.spice/data/drasi` and\nretried until it lands, surviving a restart — so the replication log is\nno longer what replays a failure, this is.\n\nBecause an insert or update is a full-state replace keyed by element id,\nredelivery must not be overtaken: once anything is pending, later changes\nfor that component queue behind it and delivery resumes only once the\nstore drains. Drasi's view therefore advances in order or not at all.\n\nA change Drasi will *never* accept — a rejected payload, or an operation\nwith no Drasi equivalent — is counted and discarded rather than retained,\nsince retaining it would block every later change behind something that\ncannot succeed.\n\n`on_delivery_error` does not apply and is ignored here: there is no\nreplication position left to hold, and the queue is what decides a\nfailure's fate.",
+          "type": "string",
+          "const": "queued"
+        }
+      ]
+    },
+    "OnDeliveryError": {
+      "description": "What the change stream does when a change event cannot be delivered to Drasi.\n\nDelivery is attempted *before* the change envelope acknowledges the source's\nreplication position, so `block` — the default — cannot lose an event.",
+      "oneOf": [
+        {
+          "description": "Retry with backoff until delivery succeeds. No event is ever lost, but\nacceleration stalls for as long as Drasi is unreachable, and the source's\nreplication log grows behind the unacknowledged position.",
+          "type": "string",
+          "const": "block"
+        },
+        {
+          "description": "Retry with backoff up to a bounded attempt budget, then log the failure,\ncount it, and let the change through. Acceleration is never held up by a\ndownstream outage, at the cost of Drasi missing those changes.",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Retry with backoff up to a bounded attempt budget, then fail the change\nstream. The dataset is marked in error and stops applying changes.",
+          "type": "string",
+          "const": "fail"
+        }
+      ]
     },
     "CheckAvailability": {
       "description": "Controls whether the federated table periodically has its availability checked.",
@@ -6768,6 +6968,14 @@
           "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
           "type": "string"
         },
+        "response_cache_max_size_bytes": {
+          "description": "Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache.",
+          "type": "string"
+        },
+        "response_cache_fallback_ttl": {
+          "description": "How long to keep a response whose origin sent no 'Cache-Control' header at all, for example '5m' or '30s'. An origin that did send 'Cache-Control' is always honoured instead, including its refusals. Unset by default, which keeps such responses uncached.",
+          "type": "string"
+        },
         "health_probe": {
           "description": "Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted.",
           "type": "string"
@@ -7128,6 +7336,14 @@
         },
         "max_request_partitions": {
           "description": "Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped.",
+          "type": "string"
+        },
+        "response_cache_max_size_bytes": {
+          "description": "Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache.",
+          "type": "string"
+        },
+        "response_cache_fallback_ttl": {
+          "description": "How long to keep a response whose origin sent no 'Cache-Control' header at all, for example '5m' or '30s'. An origin that did send 'Cache-Control' is always honoured instead, including its refusals. Unset by default, which keeps such responses uncached.",
           "type": "string"
         },
         "health_probe": {
@@ -7786,7 +8002,7 @@
           "type": "string"
         },
         "mysql_replication_initial_snapshot": {
-          "description": "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) snapshots when no resumable binlog position exists and resumes without a snapshot when one does; 'disabled' streams changes only; 'always' re-snapshots on every start, discarding any persisted position. Default: auto.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "description": "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) snapshots when no resumable binlog position exists and resumes without a snapshot when one does; 'disabled' streams changes only; 'always' re-snapshots on every start, discarding any persisted position. 'disabled' governs the first load only: an acceleration that already holds rows is still re-read when its recorded position can no longer be resumed from and `mysql_replication_invalid_checkpoint_behavior` is 'restart', which would otherwise leave it serving rows the source deleted. Default: auto.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "auto",
           "enum": [
@@ -7806,7 +8022,7 @@
           "default": "8192"
         },
         "mysql_replication_invalid_checkpoint_behavior": {
-          "description": "What to do when the persisted binlog position was purged from the source: 'error' (default) surfaces an actionable error; 'restart' drops the saved position and re-snapshots the table. Default: error.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
+          "description": "What to do when the persisted binlog position was purged from the source: 'error' (default) surfaces an actionable error; 'restart' re-reads the table, whatever `mysql_replication_initial_snapshot` is set to. Default: error.\n\nSee: https://spiceai.org/docs/components/data-connectors/mysql",
           "type": "string",
           "default": "error",
           "enum": [
@@ -8968,7 +9184,11 @@
           ]
         },
         "cayenne_segment_cache_mb": {
-          "description": "Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.",
+          "description": "Ignored: the in-memory Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per table, so a per-table size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is reported at startup and otherwise has no effect.",
+          "type": "string"
+        },
+        "cayenne_scan_concurrency": {
+          "description": "How many splits a single Vortex file scan decodes concurrently. 'auto' (default) derives it from the query fan-out and the number of files a scan plans, so a table held in few files still decodes in parallel. 'off' decodes each file serially. An explicit count pins it. Each concurrent split holds a decoded batch, and all of them are charged to 'runtime.query.memory_limit', so lowering this cuts a scan's resident decode memory without shrinking query parallelism everywhere the way 'runtime.query.target_partitions' does.",
           "type": "string",
           "default": "auto"
         },
@@ -9156,7 +9376,7 @@
           "default": "32"
         },
         "cayenne_compaction_background_interval_ms": {
-          "description": "Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 30000 otherwise.",
+          "description": "Background compaction interval in milliseconds. The accelerator runs a per-table background task at this interval. Set to 0 to disable the background task — inline compaction on writes still runs. Default: 10000 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 0 (disabled) for refresh_mode: full, whose whole-table replace leaves nothing to consolidate; 30000 otherwise.",
           "type": "string"
         },
         "cayenne_inline_max_rows": {
@@ -9213,23 +9433,24 @@
           "type": "string"
         },
         "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
+          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
           "type": "string",
+          "default": "auto",
           "enum": [
             "auto",
             "adaptive"
           ]
         },
         "cayenne_goal_replication_lag": {
-          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps.",
+          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps.",
           "type": "string"
         },
         "cayenne_goal_freshness": {
-          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset.",
+          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
           "type": "string"
         },
         "cayenne_goal_query_latency": {
-          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset.",
+          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
           "type": "string"
         },
         "cayenne_goal_convergence_window": {
@@ -9798,47 +10019,35 @@
       "type": "object",
       "properties": {
         "endpoint": {
-          "description": "The OpenAI API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).",
+          "description": "The `OpenAI` API base endpoint. Can be overridden to use a compatible provider (i.e. Nvidia NIM).",
           "type": "string",
           "default": "https://api.openai.com/v1"
         },
         "openai_api_key": {
-          "description": "The OpenAI API key.",
+          "description": "The `OpenAI` API key.",
           "type": "string",
           "x-secret": true
         },
         "openai_org_id": {
-          "description": "The OpenAI organization ID.",
+          "description": "The `OpenAI` organization ID.",
           "type": "string"
         },
         "openai_project_id": {
-          "description": "The OpenAI project ID.",
+          "description": "The `OpenAI` project ID.",
           "type": "string"
         },
         "openai_usage_tier": {
-          "description": "The current usage tier for the OpenAI account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.",
+          "description": "The current usage tier for the `OpenAI` account associated with the API key: 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'.",
           "type": "string",
-          "default": "tier1",
-          "enum": [
-            "free",
-            "tier1",
-            "tier2",
-            "tier3",
-            "tier4",
-            "tier5"
-          ]
+          "default": "tier1"
         },
         "responses_api": {
           "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
+          "default": "disabled"
         },
         "openai_responses_tools": {
-          "description": "The OpenAI Responses tools to use when calling the model from the Responses API",
+          "description": "The `OpenAI` Responses tools to use when calling the model from the Responses API.",
           "type": "string",
           "default": ""
         },
@@ -9931,6 +10140,11 @@
         "user": {
           "type": "string"
         },
+        "openai_tools": {
+          "description": "**DEPRECATED**: Use 'tools' without prefix",
+          "type": "string",
+          "deprecated": true
+        },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: Use 'frequency_penalty' without prefix",
           "type": "string",
@@ -10016,11 +10230,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: Use 'tools' without prefix",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: Use 'tool_choice' without prefix",
           "type": "string",
@@ -10054,11 +10263,11 @@
       "type": "object",
       "properties": {
         "endpoint": {
-          "description": "The Azure OpenAI resource endpoint, e.g., https://resource-name.openai.azure.com.",
+          "description": "The Azure `OpenAI` resource endpoint, e.g., <https://resource-name.openai.azure.com>.",
           "type": "string"
         },
         "azure_api_version": {
-          "description": "The API version used for the Azure OpenAI service.",
+          "description": "The API version used for the Azure `OpenAI` service.",
           "type": "string"
         },
         "azure_deployment_name": {
@@ -10066,26 +10275,22 @@
           "type": "string"
         },
         "azure_api_key": {
-          "description": "The Azure OpenAI API key from the models deployment page.",
+          "description": "The Azure `OpenAI` API key from the models deployment page.",
           "type": "string"
         },
         "azure_entra_token": {
           "description": "The Azure Entra token for authentication.",
           "type": "string"
         },
-        "azure_openai_responses_tools": {
-          "description": "Comma-separated list of OpenAI-hosted tools exposed via the Responses API for this model.",
+        "openai_responses_tools": {
+          "description": "Comma-separated list of `OpenAI`-hosted tools exposed via the Responses API for this model.",
           "type": "string",
           "default": ""
         },
         "responses_api": {
           "description": "Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.",
           "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
+          "default": "disabled"
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -10108,6 +10313,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "azure_tools": {
           "type": "string"
         },
         "azure_frequency_penalty": {
@@ -10161,9 +10369,6 @@
         "azure_top_p": {
           "type": "string"
         },
-        "azure_tools": {
-          "type": "string"
-        },
         "azure_tool_choice": {
           "type": "string"
         },
@@ -10178,6 +10383,11 @@
         },
         "azure_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -10264,11 +10474,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -10302,32 +10507,25 @@
       "type": "object",
       "properties": {
         "chat_template": {
-          "description": "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
+          "description": "Customizes the transformation of `OpenAI` chat messages into a character stream for the model.",
           "type": "string"
         },
         "trust_pickle": {
           "description": "Allow loading pickle-based weight files (.pt / .pth / .ckpt / .bin). These formats execute arbitrary code on load and are disabled by default. Set to 'true' only when the model weights come from a fully trusted source.",
           "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
+          "default": "false"
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
           "type": "string",
-          "default": "none",
-          "enum": [
-            "none",
-            "ring"
-          ]
+          "default": "none"
         },
         "node_rank": {
           "description": "This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.",
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
           "type": "string"
         },
         "context_length": {
@@ -10335,13 +10533,9 @@
           "type": "string"
         },
         "paged_attention": {
-          "description": "Attention implementation for a locally served model. 'auto' (the default) uses PagedAttention wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.",
+          "description": "Attention implementation for a locally served model. 'auto' (the default) uses `PagedAttention` wherever the build supports it, and the engine falls back to dense attention for architectures with no paged kernel, such as the Multi-head Latent Attention GGUFs. 'disabled' forces dense attention with a contiguous KV cache.",
           "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "disabled"
-          ]
+          "default": "auto"
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -10364,6 +10558,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "file_tools": {
           "type": "string"
         },
         "file_frequency_penalty": {
@@ -10417,9 +10614,6 @@
         "file_top_p": {
           "type": "string"
         },
-        "file_tools": {
-          "type": "string"
-        },
         "file_tool_choice": {
           "type": "string"
         },
@@ -10434,6 +10628,11 @@
         },
         "file_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -10520,11 +10719,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -10566,11 +10760,11 @@
           "type": "string"
         },
         "databricks_client_id": {
-          "description": "The Databricks Service Principal Client ID. Can't be used with databricks_token.",
+          "description": "The Databricks Service Principal Client ID. Can't be used with `databricks_token`.",
           "type": "string"
         },
         "databricks_client_secret": {
-          "description": "The Databricks Service Principal Client Secret. Can't be used with databricks_token.",
+          "description": "The Databricks Service Principal Client Secret. Can't be used with `databricks_token`.",
           "type": "string"
         },
         "tools": {
@@ -10594,6 +10788,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "databricks_tools": {
           "type": "string"
         },
         "databricks_frequency_penalty": {
@@ -10647,9 +10844,6 @@
         "databricks_top_p": {
           "type": "string"
         },
-        "databricks_tools": {
-          "type": "string"
-        },
         "databricks_tool_choice": {
           "type": "string"
         },
@@ -10664,6 +10858,11 @@
         },
         "databricks_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -10750,11 +10949,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -10792,7 +10986,7 @@
           "type": "string"
         },
         "chat_template": {
-          "description": "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
+          "description": "Customizes the transformation of `OpenAI` chat messages into a character stream for the model.",
           "type": "string"
         },
         "huggingface_token": {
@@ -10800,20 +10994,16 @@
           "type": "string"
         },
         "distributed_backend": {
-          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list; omit or 'none' for single-node.",
+          "description": "Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.",
           "type": "string",
-          "default": "none",
-          "enum": [
-            "none",
-            "ring"
-          ]
+          "default": "none"
         },
         "node_rank": {
           "description": "This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.",
           "type": "string"
         },
         "nodes": {
-          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2,10.0.0.3'). Identical on every node; only `node_rank` differs. Two or more nodes. Whether a given model can be split across that many nodes depends on the model and is reported when it loads.",
+          "description": "Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.",
           "type": "string"
         },
         "tools": {
@@ -10837,6 +11027,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "huggingface_tools": {
           "type": "string"
         },
         "huggingface_frequency_penalty": {
@@ -10890,9 +11083,6 @@
         "huggingface_top_p": {
           "type": "string"
         },
-        "huggingface_tools": {
-          "type": "string"
-        },
         "huggingface_tool_choice": {
           "type": "string"
         },
@@ -10907,6 +11097,11 @@
         },
         "huggingface_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -10989,11 +11184,6 @@
           "deprecated": true
         },
         "openai_top_p": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
-        "openai_tools": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -11069,6 +11259,9 @@
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
           "type": "string"
         },
+        "anthropic_tools": {
+          "type": "string"
+        },
         "anthropic_frequency_penalty": {
           "type": "string"
         },
@@ -11120,9 +11313,6 @@
         "anthropic_top_p": {
           "type": "string"
         },
-        "anthropic_tools": {
-          "type": "string"
-        },
         "anthropic_tool_choice": {
           "type": "string"
         },
@@ -11137,6 +11327,11 @@
         },
         "anthropic_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -11223,11 +11418,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -11261,11 +11451,11 @@
       "type": "object",
       "properties": {
         "xai_api_key": {
-          "description": "The xAI API key.",
+          "description": "The `xAI` API key.",
           "type": "string"
         },
         "xai_usage_tier": {
-          "description": "xAI usage tier (0-4). Used for rate limit defaults.",
+          "description": "`xAI` usage tier (0-4). Used for rate limit defaults.",
           "type": "string"
         },
         "tools": {
@@ -11289,6 +11479,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "xai_tools": {
           "type": "string"
         },
         "xai_frequency_penalty": {
@@ -11342,9 +11535,6 @@
         "xai_top_p": {
           "type": "string"
         },
-        "xai_tools": {
-          "type": "string"
-        },
         "xai_tool_choice": {
           "type": "string"
         },
@@ -11359,6 +11549,11 @@
         },
         "xai_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -11445,11 +11640,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -11483,12 +11673,12 @@
       "type": "object",
       "properties": {
         "aws_access_key_id": {
-          "description": "The AWS access key ID to use for Bedrock models",
+          "description": "The AWS access key ID to use for Bedrock models.",
           "type": "string",
           "x-secret": true
         },
         "aws_secret_access_key": {
-          "description": "The AWS secret access key to use for Bedrock models",
+          "description": "The AWS secret access key to use for Bedrock models.",
           "type": "string",
           "x-secret": true
         },
@@ -11503,29 +11693,19 @@
         },
         "aws_iam_role_source": {
           "description": "IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
+          "type": "string"
         },
         "bedrock_guardrail_identifier": {
-          "description": "Identifier for the guardrail. Pattern: `(([a-z0-9]+) | (arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))`. Length: 0-2048.",
+          "description": "Identifier for the guardrail.",
           "type": "string"
         },
         "bedrock_guardrail_version": {
-          "description": "Guardrail version. Pattern: `(([1-9][0-9]{0,7})|(DRAFT))`",
+          "description": "Guardrail version.",
           "type": "string"
         },
         "bedrock_trace": {
-          "description": "Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`",
-          "type": "string",
-          "enum": [
-            "enabled",
-            "disabled",
-            "enabled_full"
-          ]
+          "description": "Trace behavior for the guardrail. Valid values: `enabled`, `disabled`, `enabled_full`.",
+          "type": "string"
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -11548,6 +11728,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "bedrock_tools": {
           "type": "string"
         },
         "bedrock_frequency_penalty": {
@@ -11601,9 +11784,6 @@
         "bedrock_top_p": {
           "type": "string"
         },
-        "bedrock_tools": {
-          "type": "string"
-        },
         "bedrock_tool_choice": {
           "type": "string"
         },
@@ -11618,6 +11798,11 @@
         },
         "bedrock_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -11700,11 +11885,6 @@
           "deprecated": true
         },
         "openai_top_p": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
-        "openai_tools": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -11768,6 +11948,9 @@
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
           "type": "string"
         },
+        "google_tools": {
+          "type": "string"
+        },
         "google_frequency_penalty": {
           "type": "string"
         },
@@ -11819,9 +12002,6 @@
         "google_top_p": {
           "type": "string"
         },
-        "google_tools": {
-          "type": "string"
-        },
         "google_tool_choice": {
           "type": "string"
         },
@@ -11836,6 +12016,11 @@
         },
         "google_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -11922,11 +12107,6 @@
           "type": "string",
           "deprecated": true
         },
-        "openai_tools": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
         "openai_tool_choice": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
@@ -11960,18 +12140,14 @@
       "type": "object",
       "properties": {
         "spiceai_api_key": {
-          "description": "The API key for the Spice.ai Cloud Platform, or for the Spice runtime serving the model. Required for the Spice.ai Cloud Platform.",
+          "description": "The API key for the `Spice.ai` Cloud Platform, or for the Spice runtime serving the model. Required for the `Spice.ai` Cloud Platform.",
           "type": "string",
           "x-secret": true
         },
         "spiceai_endpoint": {
-          "description": "The endpoint serving the model: the Spice.ai Cloud Platform, or another Spice runtime.",
+          "description": "The endpoint serving the model: the `Spice.ai` Cloud Platform, or another Spice runtime.",
           "type": "string",
-          "default": "https://data.spiceai.io",
-          "examples": [
-            "https://data.spiceai.io",
-            "http://localhost:8090"
-          ]
+          "default": "https://data.spiceai.io"
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
@@ -11994,6 +12170,9 @@
         },
         "requests_per_minute_limit": {
           "description": "Maximum requests per minute for this model. Overrides provider defaults.",
+          "type": "string"
+        },
+        "spiceai_tools": {
           "type": "string"
         },
         "spiceai_frequency_penalty": {
@@ -12047,9 +12226,6 @@
         "spiceai_top_p": {
           "type": "string"
         },
-        "spiceai_tools": {
-          "type": "string"
-        },
         "spiceai_tool_choice": {
           "type": "string"
         },
@@ -12064,6 +12240,11 @@
         },
         "spiceai_user": {
           "type": "string"
+        },
+        "openai_tools": {
+          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
+          "type": "string",
+          "deprecated": true
         },
         "openai_frequency_penalty": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
@@ -12146,11 +12327,6 @@
           "deprecated": true
         },
         "openai_top_p": {
-          "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
-          "type": "string",
-          "deprecated": true
-        },
-        "openai_tools": {
           "description": "**DEPRECATED**: The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.",
           "type": "string",
           "deprecated": true
@@ -12351,6 +12527,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -12532,6 +12718,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -12725,6 +12921,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -12906,6 +13112,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -13099,6 +13315,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -13280,6 +13506,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -13473,6 +13709,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -13654,6 +13900,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -13847,6 +14103,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -14028,6 +14294,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -14221,6 +14497,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -14402,6 +14688,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -14595,6 +14891,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -14776,6 +15082,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -14969,6 +15285,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -15150,6 +15476,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -15343,6 +15679,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -15524,6 +15870,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -15717,6 +16073,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -15898,6 +16264,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -16091,6 +16467,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -16272,6 +16658,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -16465,6 +16861,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -16646,6 +17052,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -16839,6 +17255,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -17020,6 +17446,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -17213,6 +17649,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -17394,6 +17840,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -17587,6 +18043,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -17768,6 +18234,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -17961,6 +18437,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -18142,6 +18628,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -18335,6 +18831,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -18516,6 +19022,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -18709,6 +19225,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -18890,6 +19416,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -19083,6 +19619,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -19264,6 +19810,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -19457,6 +20013,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -19638,6 +20204,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -19840,6 +20416,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -20030,6 +20616,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -20232,6 +20828,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -20422,6 +21028,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -20624,6 +21240,16 @@
             }
           ]
         },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "check_availability": {
           "$ref": "#/$defs/CheckAvailability"
         },
@@ -20814,6 +21440,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
@@ -22046,6 +22682,16 @@
           "anyOf": [
             {
               "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
             },
             {
               "type": "null"
