@@ -26,6 +26,7 @@ serde = { workspace = true, features = ["derive"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
+util = { path = "../util" }
 
 [lints]
 workspace = true

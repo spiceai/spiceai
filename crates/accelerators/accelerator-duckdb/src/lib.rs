@@ -55,7 +55,7 @@ use datafusion_table_providers::{
         self as db_connection_pool,
         duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     },
-    util::{column_reference::ColumnReference, indexes::IndexType},
+    util::indexes::IndexType,
 };
 use duckdb::AccessMode;
 use futures::StreamExt;
@@ -1763,9 +1763,7 @@ fn duckdb_unique_index_columns(cmd: &CreateExternalTable) -> Vec<Vec<String>> {
             if index_type != IndexType::Unique {
                 return None;
             }
-            ColumnReference::try_from(columns.as_str())
-                .ok()
-                .map(|columns| columns.iter().map(str::to_string).collect())
+            util::column_reference::parse(&columns).ok()
         })
         .collect()
 }

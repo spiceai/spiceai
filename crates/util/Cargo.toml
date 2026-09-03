@@ -19,6 +19,7 @@ humantime.workspace = true
 pin-project = { workspace = true, optional = true }
 rand.workspace = true
 serde_json.workspace = true
+snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true }

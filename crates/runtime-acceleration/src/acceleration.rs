@@ -34,10 +34,10 @@ use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 /// Errors that can occur when parsing acceleration configuration.
 #[derive(Debug, Snafu)]
 pub enum ParseError {
-    #[snafu(display("Unable to parse column reference {column_ref}: {source}"))]
+    #[snafu(display("Failed to parse the column reference '{column_ref}': {source}"))]
     UnableToParseColumnReference {
         column_ref: String,
-        source: datafusion_table_providers::util::column_reference::Error,
+        source: util::column_reference::Error,
     },
 
     #[snafu(display("Error parsing {field} as duration: {source}"))]
@@ -750,12 +750,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
         let try_parse_column_reference = |column: &str| {
-            ColumnReference::try_from(column).map_err(|e| {
-                ParseError::UnableToParseColumnReference {
+            util::column_reference::parse(column)
+                .map(ColumnReference::new)
+                .map_err(|e| ParseError::UnableToParseColumnReference {
                     column_ref: column.to_string(),
                     source: e,
-                }
-            })
+                })
         };
 
         let try_parse_duration = |field: &str, duration: Option<String>| {
@@ -1279,6 +1279,67 @@ mod tests {
         acceleration
             .validate_primary_key(&schema_with(&["marker_id", "value"]))
             .expect("primary key column present, so validation passes");
+    }
+
+    /// A column whose name contains dots is referenced the way it would be written in
+    /// SQL, so the quotes are not part of the name.
+    #[test]
+    fn quoted_primary_key_column_resolves_to_the_schema_column() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            primary_key: Some(r#"(time_unix_nano, "service.instance.id")"#.to_string()),
+            ..Default::default()
+        };
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+
+        let schema = schema_with(&["time_unix_nano", "service.instance.id", "value"]);
+        parsed
+            .validate_primary_key(&schema)
+            .expect("quoted primary key column present, so validation passes");
+
+        let constraints = parsed
+            .table_constraints(Arc::clone(&schema))
+            .expect("constraints should build")
+            .expect("a primary key was configured");
+        assert_eq!(
+            constraints,
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1, 0])]),
+            "the primary key must point at both configured columns"
+        );
+    }
+
+    #[test]
+    fn quoted_index_column_resolves_to_the_schema_column() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            indexes: HashMap::from([(
+                r#""service.instance.id""#.to_string(),
+                spicepod_acceleration::IndexType::Enabled,
+            )]),
+            ..Default::default()
+        };
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+
+        parsed
+            .validate_indexes(&schema_with(&["service.instance.id", "value"]))
+            .expect("quoted index column present, so validation passes");
+    }
+
+    #[test]
+    fn malformed_primary_key_reference_names_the_reference() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            primary_key: Some(r#"(time_unix_nano, "service.instance.id"#.to_string()),
+            ..Default::default()
+        };
+        let err = Acceleration::try_from(acceleration).expect_err("unterminated quote must fail");
+
+        assert!(
+            matches!(err, ParseError::UnableToParseColumnReference { .. }),
+            "expected UnableToParseColumnReference, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"(time_unix_nano, "service.instance.id"#) && msg.contains("closing"),
+            "message should name the reference and what is missing: {msg}"
+        );
     }
 
     /// The exact configuration that turns durable federated write-back on.

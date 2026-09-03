@@ -109,17 +109,9 @@ fn parse_indexes_option(
             continue;
         }
 
-        // Parse column reference - may be compound like "(col1, col2)" or just "col1"
-        let columns: Vec<String> = if col_part.starts_with('(') && col_part.ends_with(')') {
-            // Compound key: "(col1, col2)"
-            col_part[1..col_part.len() - 1]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            vec![col_part.to_string()]
-        };
+        // May be compound like "(col1, col2)" or just "col1", with quoted names.
+        let columns = util::column_reference::parse(col_part)
+            .map_err(|e| DataFusionError::Configuration(e.to_string()))?;
 
         // Validate all columns exist in schema
         for col in &columns {
@@ -529,6 +521,23 @@ mod tests {
 
         assert_eq!(result[2].0, vec!["col2".to_string(), "col3".to_string()]);
         assert_eq!(result[2].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_quoted_column_name() {
+        let schema = create_schema_with_columns(&[
+            ("service.instance.id", arrow::datatypes::DataType::Utf8),
+            ("col1", arrow::datatypes::DataType::Int64),
+        ]);
+
+        let result = parse_indexes_option(r#"("service.instance.id",col1):unique"#, &schema)
+            .expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].0,
+            vec!["service.instance.id".to_string(), "col1".to_string()]
+        );
+        assert_eq!(result[0].1, IndexType::Unique);
     }
 
     #[test]

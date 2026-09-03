@@ -112,6 +112,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -17793,6 +17794,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tracing",
+ "util",
 ]
 
 [[package]]
@@ -23118,6 +23120,7 @@ dependencies = [
  "pin-project",
  "rand 0.10.1",
  "serde_json",
+ "snafu",
  "tokio",
  "tokio-util",
  "tracing",
