@@ -34,7 +34,7 @@ use chrono::DateTime;
 use datafusion::arrow::array::timezone::Tz;
 use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
@@ -1016,6 +1016,13 @@ impl SpiceBigQueryDialect {
     }
 }
 
+/// Every `Dialect` method is forwarded explicitly, and the lint keeps it that way.
+///
+/// An unlisted method falls back to the *trait default*, which is the generic
+/// rendering rather than `BigQuery`'s — so a method added upstream would silently
+/// revert `BigQuery` to generic SQL, with no error anywhere. Denying
+/// `missing_trait_methods` turns that into a compile failure instead.
+#[deny(clippy::missing_trait_methods)]
 impl Dialect for SpiceBigQueryDialect {
     fn with_custom_scalar_overrides(mut self, handlers: Vec<(&str, ScalarFnToSqlHandler)>) -> Self {
         for (name, handler) in handlers {
@@ -1036,6 +1043,20 @@ impl Dialect for SpiceBigQueryDialect {
         }
         self.inner
             .scalar_function_to_sql_overrides(unparser, func_name, args)
+    }
+
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        order_by: &[SortExpr],
+    ) -> Result<Option<ast::Expr>> {
+        self.inner.aggregate_function_to_sql_overrides(
+            unparser, func_name, args, distinct, filter, order_by,
+        )
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
@@ -1092,6 +1113,30 @@ impl Dialect for SpiceBigQueryDialect {
 
     fn timestamp_cast_dtype(&self, time_unit: &TimeUnit, tz: &Option<Arc<str>>) -> ast::DataType {
         self.inner.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    fn timestamp_literal_cast_dtype(
+        &self,
+        time_unit: &TimeUnit,
+        tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        self.inner.timestamp_literal_cast_dtype(time_unit, tz)
+    }
+
+    fn date_difference_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_difference_to_sql(lhs, rhs)
+    }
+
+    fn date_to_integer_to_sql(&self, date: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_to_integer_to_sql(date)
+    }
+
+    fn requires_explicit_comparison_coercion(&self) -> bool {
+        self.inner.requires_explicit_comparison_coercion()
+    }
+
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        self.inner.timestamp_literal_max_subsecond_digits()
     }
 
     fn timestamp_at_time_zone_to_sql(&self, input: ast::Expr, tz: &str) -> Option<ast::Expr> {
