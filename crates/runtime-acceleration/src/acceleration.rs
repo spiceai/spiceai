@@ -1337,7 +1337,8 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains(r#"(time_unix_nano, "service.instance.id"#) && msg.contains("closing"),
+            msg.contains(r#"(time_unix_nano, "service.instance.id"#)
+                && msg.contains("must end with ')'"),
             "message should name the reference and what is missing: {msg}"
         );
     }

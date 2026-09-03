@@ -16,11 +16,14 @@ limitations under the License.
 
 //! Parsing of the column reference strings used by `acceleration.primary_key`,
 //! `acceleration.indexes` and `acceleration.on_conflict`: a single column, or a
-//! compound `(column_a, column_b)` list.
+//! comma-separated list optionally wrapped in parentheses.
 //!
-//! A name may be double-quoted, the way it would be written in SQL, which is how a
-//! column whose name contains dots (`"service.instance.id"`) is referenced. The
-//! parsed names are always the unquoted names as they appear in the schema.
+//! The names are literal Arrow field names, NOT SQL identifiers, so a SQL identifier
+//! parser is the wrong tool: `sqlparser` reads `service.instance.id` as three
+//! qualifiers and rejects the `sentry-environment` and `2xx_count` field names an `OTel`
+//! schema is full of. A name may still be double-quoted the way SQL writes it, which is
+//! how a name containing dots is told apart from those qualifiers; the parsed names are
+//! always the unquoted names as they appear in the schema.
 
 use snafu::prelude::*;
 
@@ -32,14 +35,9 @@ pub enum Error {
     EmptyColumnReference { column_ref: String },
 
     #[snafu(display(
-        "The compound column reference '{column_ref}' is missing its closing ')'. Write a compound key as '(column_a, column_b)' and try again."
+        "The compound column reference '{column_ref}' must end with ')'. Write a compound key as '(column_a, column_b)' and try again."
     ))]
-    MissingClosingParenthesis { column_ref: String },
-
-    #[snafu(display(
-        "The column reference '{column_ref}' has unexpected text after its closing ')'. Write a compound key as '(column_a, column_b)' and try again."
-    ))]
-    TrailingText { column_ref: String },
+    UnclosedParenthesis { column_ref: String },
 
     #[snafu(display(
         "The column reference '{column_ref}' contains an empty column name. Remove the extra ',' and try again."
@@ -50,11 +48,6 @@ pub enum Error {
         "The quoted column name in the column reference '{column_ref}' is missing its closing '\"'. Quote a column name as '\"column.name\"' and try again."
     ))]
     UnterminatedQuotedName { column_ref: String },
-
-    #[snafu(display(
-        "The column reference '{column_ref}' has a '\"' in the middle of a column name. Quote a whole column name as '\"column.name\"', doubling any '\"' it contains, and try again."
-    ))]
-    MisplacedQuote { column_ref: String },
 
     #[snafu(display(
         "The column name '{column}' in the column reference '{column_ref}' contains an unsupported character '{character}'. Reference a column whose name does not contain ',', ';', ':', '(', ')' or '\"' and try again."
@@ -95,108 +88,28 @@ pub fn parse(column_ref: &str) -> Result<Vec<String>, Error> {
     );
 
     let inner = match trimmed.strip_prefix('(') {
-        Some(rest) => {
-            let end =
-                closing_parenthesis(rest).context(MissingClosingParenthesisSnafu { column_ref })?;
-            ensure!(
-                rest[end + 1..].trim().is_empty(),
-                TrailingTextSnafu { column_ref }
-            );
-            &rest[..end]
-        }
+        Some(rest) => rest
+            .strip_suffix(')')
+            .context(UnclosedParenthesisSnafu { column_ref })?,
         None => trimmed,
     };
 
-    split_names(inner, column_ref)
+    inner
+        .split(',')
+        .map(|name| parse_name(name.trim(), column_ref))
+        .collect()
 }
 
-/// The byte offset of the `)` closing the reference opened by the `(` that precedes
-/// `rest`, ignoring any `)` inside a quoted name.
-fn closing_parenthesis(rest: &str) -> Option<usize> {
-    let mut in_quotes = false;
-    for (offset, c) in rest.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ')' if !in_quotes => return Some(offset),
-            _ => {}
-        }
-    }
-    None
-}
+/// One name of a reference: the schema name, with the quotes an optionally quoted name
+/// is written with removed.
+fn parse_name(name: &str, column_ref: &str) -> Result<String, Error> {
+    let name = match name.strip_prefix('"') {
+        Some(rest) => rest
+            .strip_suffix('"')
+            .context(UnterminatedQuotedNameSnafu { column_ref })?,
+        None => name,
+    };
 
-/// Where the scan is within the name it is reading.
-enum State {
-    /// Before the first character of a name.
-    Start,
-    /// Reading an unquoted name.
-    Bare,
-    /// Inside `"`.
-    Quoted,
-    /// After the `"` that closed a name.
-    AfterQuote,
-}
-
-fn split_names(inner: &str, column_ref: &str) -> Result<Vec<String>, Error> {
-    let mut names: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut state = State::Start;
-    let mut chars = inner.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match state {
-            State::Start => match c {
-                ',' => return EmptyColumnNameSnafu { column_ref }.fail(),
-                '"' => state = State::Quoted,
-                c if c.is_whitespace() => {}
-                c => {
-                    current.push(c);
-                    state = State::Bare;
-                }
-            },
-            State::Bare => match c {
-                ',' => {
-                    push_name(&mut names, current.trim().to_string(), column_ref)?;
-                    current.clear();
-                    state = State::Start;
-                }
-                // A quoted name has to be the whole name: `a"b"` is ambiguous.
-                '"' => return MisplacedQuoteSnafu { column_ref }.fail(),
-                c => current.push(c),
-            },
-            State::Quoted => match c {
-                // `""` is an escaped quote within the name.
-                '"' if chars.peek() == Some(&'"') => {
-                    chars.next();
-                    current.push('"');
-                }
-                '"' => state = State::AfterQuote,
-                c => current.push(c),
-            },
-            State::AfterQuote => match c {
-                ',' => {
-                    push_name(&mut names, std::mem::take(&mut current), column_ref)?;
-                    state = State::Start;
-                }
-                c if c.is_whitespace() => {}
-                _ => return MisplacedQuoteSnafu { column_ref }.fail(),
-            },
-        }
-    }
-
-    match state {
-        State::Start if names.is_empty() => {
-            return EmptyColumnReferenceSnafu { column_ref }.fail();
-        }
-        State::Start => return EmptyColumnNameSnafu { column_ref }.fail(),
-        State::Bare => push_name(&mut names, current.trim().to_string(), column_ref)?,
-        State::Quoted => return UnterminatedQuotedNameSnafu { column_ref }.fail(),
-        State::AfterQuote => push_name(&mut names, current, column_ref)?,
-    }
-
-    Ok(names)
-}
-
-fn push_name(names: &mut Vec<String>, name: String, column_ref: &str) -> Result<(), Error> {
     ensure!(!name.is_empty(), EmptyColumnNameSnafu { column_ref });
     if let Some(character) = name.chars().find(|c| UNSUPPORTED_CHARACTERS.contains(c)) {
         return UnsupportedCharacterInNameSnafu {
@@ -206,8 +119,8 @@ fn push_name(names: &mut Vec<String>, name: String, column_ref: &str) -> Result<
         }
         .fail();
     }
-    names.push(name);
-    Ok(())
+
+    Ok(name.to_string())
 }
 
 #[cfg(test)]
@@ -227,6 +140,19 @@ mod tests {
         assert_eq!(names(" ( foo , bar ) "), vec!["foo", "bar"]);
         // The parentheses are optional: a comma-separated list is a compound key too.
         assert_eq!(names("foo, bar"), vec!["foo", "bar"]);
+    }
+
+    /// The names are literal field names, so what a SQL identifier parser would read as
+    /// a qualifier chain or reject outright is a single column here.
+    #[test]
+    fn parses_names_that_are_not_sql_identifiers() {
+        assert_eq!(names("service.instance.id"), vec!["service.instance.id"]);
+        assert_eq!(names("sentry-environment"), vec!["sentry-environment"]);
+        assert_eq!(names("2xx_count"), vec!["2xx_count"]);
+        assert_eq!(
+            names("(time_unix_nano, sd-routing-key)"),
+            vec!["time_unix_nano", "sd-routing-key"]
+        );
     }
 
     #[test]
@@ -254,59 +180,39 @@ mod tests {
             "The column reference '' is empty. Name the column to use, or a compound key as '(column_a, column_b)', and try again."
         );
         assert_eq!(
-            parse("()").expect_err("no columns"),
-            Error::EmptyColumnReference {
-                column_ref: "()".to_string()
-            }
-        );
-        assert_eq!(
             parse("(foo,bar").expect_err("unclosed paren"),
-            Error::MissingClosingParenthesis {
+            Error::UnclosedParenthesis {
                 column_ref: "(foo,bar".to_string()
             }
         );
         assert_eq!(
             parse("(foo, bar) baz").expect_err("trailing text"),
-            Error::TrailingText {
+            Error::UnclosedParenthesis {
                 column_ref: "(foo, bar) baz".to_string()
             }
         );
         assert_eq!(
-            parse("(foo,,bar)").expect_err("empty name"),
+            parse("()").expect_err("no columns"),
             Error::EmptyColumnName {
-                column_ref: "(foo,,bar)".to_string()
+                column_ref: "()".to_string()
             }
         );
-        assert_eq!(
-            parse("(foo,)").expect_err("trailing comma"),
-            Error::EmptyColumnName {
-                column_ref: "(foo,)".to_string()
-            }
-        );
-        assert_eq!(
-            parse("(,foo)").expect_err("leading comma"),
-            Error::EmptyColumnName {
-                column_ref: "(,foo)".to_string()
-            }
-        );
-        assert_eq!(
-            parse(r#""service.instance.id"#).expect_err("unterminated quote"),
-            Error::UnterminatedQuotedName {
-                column_ref: r#""service.instance.id"#.to_string()
-            }
-        );
-        assert_eq!(
-            parse(r#"(a"b")"#).expect_err("misplaced quote"),
-            Error::MisplacedQuote {
-                column_ref: r#"(a"b")"#.to_string()
-            }
-        );
-        assert_eq!(
-            parse(r#"("a"b)"#).expect_err("misplaced quote"),
-            Error::MisplacedQuote {
-                column_ref: r#"("a"b)"#.to_string()
-            }
-        );
+        for column_ref in ["(foo,,bar)", "(foo,)", "(,foo)"] {
+            assert_eq!(
+                parse(column_ref).expect_err("empty column name"),
+                Error::EmptyColumnName {
+                    column_ref: column_ref.to_string()
+                }
+            );
+        }
+        for column_ref in [r#""service.instance.id"#, r#"("a"b)"#] {
+            assert_eq!(
+                parse(column_ref).expect_err("unterminated quoted name"),
+                Error::UnterminatedQuotedName {
+                    column_ref: column_ref.to_string()
+                }
+            );
+        }
     }
 
     #[test]
@@ -314,41 +220,26 @@ mod tests {
         // A name holding one of the separators the reference is carried in cannot be
         // read back, so it is refused rather than silently split.
         assert_eq!(
-            parse(r#"("a,b")"#).expect_err("comma in name"),
+            parse(r#"(a"b)"#).expect_err("quote in name"),
             Error::UnsupportedCharacterInName {
-                column_ref: r#"("a,b")"#.to_string(),
-                column: "a,b".to_string(),
-                character: ',',
-            }
-        );
-        assert_eq!(
-            parse(r#""a""b""#).expect_err("quote in name"),
-            Error::UnsupportedCharacterInName {
-                column_ref: r#""a""b""#.to_string(),
+                column_ref: r#"(a"b)"#.to_string(),
                 column: r#"a"b"#.to_string(),
                 character: '"',
             }
         );
-        for character in [';', ':', '(', ')'] {
-            let column_ref = format!("a{character}b");
+        assert_eq!(
+            parse(r#"("a.b(c)")"#).expect_err("parenthesis in name"),
+            Error::UnsupportedCharacterInName {
+                column_ref: r#"("a.b(c)")"#.to_string(),
+                column: "a.b(c)".to_string(),
+                character: '(',
+            }
+        );
+        for column_ref in ["a;b", "a:b", r#"("a,b")"#] {
             assert!(
-                parse(&column_ref).is_err(),
+                parse(column_ref).is_err(),
                 "'{column_ref}' should be refused"
             );
         }
-    }
-
-    #[test]
-    fn quoted_names_may_contain_parentheses_and_dots() {
-        // `)` inside quotes does not close the compound reference.
-        assert_eq!(names(r#"("a.b", c)"#), vec!["a.b", "c"]);
-        assert_eq!(
-            parse(r#"("a)b", c)"#).expect_err("parenthesis in name"),
-            Error::UnsupportedCharacterInName {
-                column_ref: r#"("a)b", c)"#.to_string(),
-                column: "a)b".to_string(),
-                character: ')',
-            }
-        );
     }
 }
