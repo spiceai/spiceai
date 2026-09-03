@@ -306,11 +306,16 @@ The Actions workflow:
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
 
-The checks run under a 353-minute budget, inside a 358-minute job budget, so a
+The checks run under a 345-minute budget, inside a 358-minute job budget, so a
 run that overruns fails as a failed step rather than being terminated at the
 runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
-step and no chance to clean up). A run that ends without a verdict leaves the
-commit at `pending` either way, and never at a failure. Where the two endings
+step and no chance to clean up). The ~13-minute gap is sized for the handlers
+below, not for the seconds a status post looks like it should take: a run whose
+step used its whole budget has been seen spending over 11 minutes in
+`clear-pending`, and a job killed at the wall uploads no log at all, so too
+narrow a gap costs the run both its status resolution and its diagnostics. A
+run that ends without a verdict leaves the commit at `pending` either way, and
+never at a failure. Where the two endings
 differ is only which status the handler finds:
 
 | Ending | Handler | Effect |

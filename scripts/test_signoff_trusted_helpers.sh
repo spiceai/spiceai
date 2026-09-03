@@ -124,20 +124,25 @@ build_fixture() {
     git_quiet init -b trunk
     git_quiet config user.email test@example.com
     git_quiet config user.name "Test"
-    mkdir -p scripts .github/actions/setup-rust
+    mkdir -p scripts .github/actions/setup-rust .github/actions/configure-apt
 
     # The OLD helper: no `correct-cancelled`, exactly the shape that produced
     # #12657.
     printf '#!/usr/bin/env bash\necho OLD-SIGNOFF\n' >scripts/signoff
     chmod +x scripts/signoff
     printf 'name: setup-rust\n# OLD-ACTION\n' >.github/actions/setup-rust/action.yml
+    printf 'name: configure-apt\n# OLD-NESTED\n' >.github/actions/configure-apt/action.yml
     git_quiet add -A
     git_quiet commit -m "old"
     git_quiet branch branch-under-test
 
-    # The NEW helper, on trunk: this is what github.sha points at.
+    # The NEW helper, on trunk: this is what github.sha points at. Its action
+    # nests another action the way setup-cc/setup-make/setup-sccache nest
+    # configure-apt — the shape whose `uses: ./…` resolves from the workspace
+    # root rather than the action's own directory.
     printf '#!/usr/bin/env bash\ncase "${1:-}" in correct-cancelled) echo NEW-SIGNOFF;; esac\n' >scripts/signoff
-    printf 'name: setup-rust\n# NEW-ACTION\n' >.github/actions/setup-rust/action.yml
+    printf 'name: setup-rust\n# NEW-ACTION\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/configure-apt\n' >.github/actions/setup-rust/action.yml
+    printf 'name: configure-apt\n# NEW-NESTED\n' >.github/actions/configure-apt/action.yml
     git_quiet add -A
     git_quiet commit -m "new"
   ) || return 1
@@ -205,6 +210,37 @@ echo "the trusted composite actions come from the same commit"
 assert_contains "trusted action" "NEW-ACTION" "$clone/.trusted-ci/actions/setup-rust/action.yml"
 assert_absent "the branch's action must not be what runs" "OLD-ACTION" \
   "$clone/.trusted-ci/actions/setup-rust/action.yml"
+
+# A composite action's nested `uses: ./…` resolves from the *workspace root*,
+# not from the action's own directory. So a trusted copy that still names
+# `./.github/actions/x` runs the checked-out x — fork-authored, for a fork
+# dispatch — with this job's GH_TOKEN and cache credentials in scope, which is
+# the boundary `.trusted-ci/` exists to draw. The step repoints those
+# references, and the copies must show it.
+echo "nested action references are repointed at the trusted tree"
+assert_contains "nested reference repointed" \
+  "uses: ./.trusted-ci/actions/configure-apt" \
+  "$clone/.trusted-ci/actions/setup-rust/action.yml"
+assert_absent "no trusted copy may reach back into the checked-out tree" \
+  "uses: ./.github/actions/" \
+  "$clone/.trusted-ci/actions/setup-rust/action.yml"
+
+# The rewrite is only useful if what it points at was itself materialised from
+# the trusted commit.
+assert_contains "the nested action is itself trusted" "NEW-NESTED" \
+  "$clone/.trusted-ci/actions/configure-apt/action.yml"
+assert_absent "the branch's nested action must not be what runs" "OLD-NESTED" \
+  "$clone/.trusted-ci/actions/configure-apt/action.yml"
+
+# The guard is deliberately wider than the rewrite, so a spelling the rewrite
+# does not handle stops the run instead of silently escaping. Plant one and
+# require a non-zero exit: a guard that has only ever passed proves nothing.
+echo "an unrewritten reference fails the step rather than escaping"
+printf 'name: sneaky\nruns:\n  using: composite\n  steps:\n    - uses: "\056/.github/actions/configure-apt"\n' \
+  >"$clone/.trusted-ci/actions/setup-rust/action.yml"
+tests_run=$((tests_run + 1))
+guard_out=$(cd "$clone" && grep -rnE 'uses:[[:space:]]*"?'"'"'?\.?/?\.github/actions/' .trusted-ci/actions 2>&1)
+[[ -n "$guard_out" ]] || fail_test "the guard did not match a quoted nested reference: it would have escaped"
 
 # Later steps invoke `.trusted-ci/signoff` directly, so the bit has to survive
 # the extraction — `git show` writes a plain file, unlike the `cp` this replaced.

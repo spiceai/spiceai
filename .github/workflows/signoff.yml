@@ -388,6 +388,48 @@ jobs:
           git archive "$TRUSTED_SHA" .github/actions | tar -x -C .trusted-ci --strip-components=1
           git show "${TRUSTED_SHA}:scripts/signoff" > .trusted-ci/signoff
           chmod +x .trusted-ci/signoff
+
+          # A composite action's nested `uses: ./…` resolves from the workspace
+          # root, not from the action's own directory — so a trusted copy that
+          # names `./.github/actions/x` runs the *checked-out* x, which for a
+          # fork dispatch is fork-authored. `setup-cc`, `setup-make` and
+          # `setup-sccache` each nest `configure-apt` that way, behind an
+          # `if: runner.os == 'Linux'` that this Linux pool satisfies, and they
+          # run with this job's GH_TOKEN and (after cache setup) the MinIO
+          # credentials in scope. Repoint every nested reference at the trusted
+          # tree so the boundary holds transitively rather than only one level
+          # deep. Anchored on `./.github/actions/` so a `uses:` naming another
+          # repository is untouched.
+          nested=$(grep -rlF 'uses: ./.github/actions/' .trusted-ci/actions || true)
+          if [ -n "$nested" ]; then
+            printf '%s\n' "$nested" | while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              # Not `sed -i`: BSD sed requires an argument to it, and
+              # scripts/test_signoff_trusted_helpers.sh runs this very block on
+              # whatever machine a developer runs it from.
+              sed 's|uses: \./\.github/actions/|uses: ./.trusted-ci/actions/|g' "$f" >"$f.tmp" \
+                && mv "$f.tmp" "$f"
+            done
+            echo "Repointed nested action references at .trusted-ci in:"
+            printf '  %s\n' $nested
+          fi
+          # Assert it, rather than trusting the rewrite: a nested reference that
+          # survives here is a hole in exactly the boundary this step exists to
+          # establish, and it must stop the run rather than be discovered later.
+          #
+          # Deliberately a wider net than the rewrite above. The rewrite matches
+          # the one spelling every action in this repo actually uses; this
+          # matches any `uses:` line naming that tree at all — quoted, or
+          # without the leading `./`. A guard sharing the rewrite's pattern
+          # could only ever confirm the rewrite ran, never catch a spelling it
+          # does not handle, which is the failure worth catching. Restricted to
+          # `uses:` lines so a comment mentioning the path is not a false
+          # positive.
+          if grep -rnE 'uses:[[:space:]]*"?'"'"'?\.?/?\.github/actions/' .trusted-ci/actions; then
+            echo "::error::A trusted CI helper still references the checked-out .github/actions tree (listed above). For a fork dispatch that runs fork-authored code with this job's secrets, so the sign-off cannot proceed. If the reference above uses an unusual spelling, teach the rewrite in this step to handle it."
+            exit 1
+          fi
+
           echo "Saved trusted CI helpers from ${TRUSTED_SHA} (this workflow file's own commit) to .trusted-ci/"
 
       - name: Fetch and check out fork head commit
@@ -540,9 +582,10 @@ jobs:
       # setup (~25s), well after this step has run.
       #
       # `!cancelled()` partitions this against the cancellation handler above, along the
-      # grain of #12343's own design: `timeout-minutes: 353` makes budget expiry land here
-      # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
-      # cases and the handler above the externally-cancelled ones.
+      # grain of #12343's own design: the sign-off step's own `timeout-minutes` makes
+      # budget expiry land here as a *failed step* rather than a cancellation, leaving
+      # this step the incomplete-run cases and the handler above the
+      # externally-cancelled ones.
       #
       # Neither handler writes a verdict, so the two agree on the end state rather than
       # racing to opposite ones: budget expiry and external cancellation are the same
