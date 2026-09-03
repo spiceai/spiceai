@@ -36,7 +36,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use snafu::Snafu;
 
-/// Errors returned by [`SwappableTableProvider::swap`].
+/// Errors returned by [`SwappableTableProvider::swap`] and [`SwappableTableProvider::replace`].
 #[derive(Debug, Snafu)]
 pub enum SwapError {
     #[snafu(display(
@@ -162,21 +162,23 @@ impl SwappableTableProvider {
         )
     }
 
-    /// Replace the inner provider. Validates that the new provider's schema
-    /// is compatible with the cached schema (see [`schemas_compatible`]) and
-    /// returns [`SwapError::SchemaMismatch`] otherwise without mutating
-    /// state. Production callers should pre-validate too so they can surface
-    /// dataset-aware error context, but this guard ensures incompatible
-    /// providers cannot be installed even in release builds.
+    /// Install `new_inner` and return the provider it replaced. Validates that the new
+    /// provider's schema is compatible with the cached schema (see [`schemas_compatible`]) and
+    /// returns [`SwapError::SchemaMismatch`] otherwise without mutating state. Production callers
+    /// should pre-validate too so they can surface dataset-aware error context, but this guard
+    /// ensures incompatible providers cannot be installed even in release builds.
     ///
     /// Lock poisoning is recovered transparently via
     /// [`std::sync::PoisonError::into_inner`].
     ///
     /// # Errors
     ///
-    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible
-    /// with the cached schema.
-    pub fn swap(&self, new_inner: Arc<dyn TableProvider>) -> Result<(), SwapError> {
+    /// Returns [`SwapError::SchemaMismatch`] if the new provider's schema is incompatible with
+    /// the cached schema; the inner provider is left unchanged.
+    pub fn swap(
+        &self,
+        new_inner: Arc<dyn TableProvider>,
+    ) -> Result<Arc<dyn TableProvider>, SwapError> {
         if !schemas_compatible(new_inner.schema().as_ref(), self.cached_schema.as_ref()) {
             return Err(SwapError::SchemaMismatch);
         }
@@ -184,8 +186,7 @@ impl SwappableTableProvider {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = new_inner;
-        Ok(())
+        Ok(std::mem::replace(&mut *guard, new_inner))
     }
 }
 

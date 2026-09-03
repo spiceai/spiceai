@@ -44,10 +44,18 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
+use async_trait::async_trait;
+use data_accelerator_api::swappable::{SwapError, SwappableTableProvider};
+use data_accelerator_api::{DataAccelerator, ReloadProviderFactory};
+use datafusion::catalog::Session;
+use datafusion::logical_expr::TableType;
+use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_request_context::CacheNamespace;
 use runtime_status::{ComponentStatus, RuntimeStatus};
+use snafu::{ResultExt, Snafu};
 use util::expr::combine_exprs_balanced;
 
 /// Type alias for tracking in-flight revalidation requests.
@@ -223,6 +231,204 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 /// them is a configuration the accelerator cannot write to.
 const CACHE_WRITE_FAILURES_BEFORE_UNHEALTHY: u32 = 3;
 
+/// Everything the cache-write task needs to reopen a caching accelerator that has entered a
+/// fatal, self-invalidating state — e.g. a file-mode DuckDB instance that reached
+/// `duckdb_memory_limit`, failed a transaction, then failed the rollback and invalidated the
+/// database (spiceai/spiceai#13513).
+///
+/// Recovery drops the broken provider and rebuilds a fresh one over the same on-disk file via
+/// [`DataAccelerator::rebuild_provider`], then swaps it into `swappable`. Because the live table
+/// provider *is* `swappable`, both reads and the cache-write path follow the swap with no
+/// further wiring: the dataset resumes serving the rows already on disk instead of failing every
+/// query until the process restarts. Only engines that declare
+/// [`DataAccelerator::supports_caching_recovery`] (today just DuckDB) get a `CachingRecovery`.
+#[derive(Clone)]
+pub struct CachingRecovery {
+    /// The live provider. Recovery installs a placeholder here to release the broken provider's
+    /// file lock, then installs the rebuilt provider. It is also the dataset's table provider,
+    /// so reads and writes follow the swap automatically.
+    pub swappable: Arc<SwappableTableProvider>,
+    /// The engine, which both recognises its fatal errors and rebuilds the provider.
+    pub accelerator: Arc<dyn DataAccelerator>,
+    /// The dataset, passed back to the engine so it can resolve its on-disk file.
+    pub source: Arc<dyn AccelerationSource>,
+    /// Re-runs `create_accelerator_table` to build a fresh provider over that file.
+    pub provider_factory: ReloadProviderFactory,
+}
+
+impl fmt::Debug for CachingRecovery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachingRecovery")
+            .field("engine", &self.accelerator.name())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`CachingRecovery::recover`] did not restore the dataset. The caller decides what to log
+/// and whether to retry (a caching-mode write retries naturally on its next flush).
+#[derive(Debug, Snafu)]
+pub enum RecoverError {
+    #[snafu(display("failed to rebuild the provider: {source}"))]
+    RebuildFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[snafu(display("the rebuilt provider was rejected by the swap: {source}"))]
+    SwapRejected { source: SwapError },
+}
+
+impl CachingRecovery {
+    /// Whether `err` is a recoverable fatal state for this engine — i.e. [`Self::recover`] is
+    /// worth calling.
+    #[must_use]
+    pub fn is_fatal_error(&self, err: &DataFusionError) -> bool {
+        match Engine::try_from(self.accelerator.name()) {
+            Ok(engine) => is_recoverable_fatal_error(engine, err),
+            Err(_) => false,
+        }
+    }
+
+    /// Reopen the wrapped engine over the file it already has and swap the fresh provider in.
+    ///
+    /// It first installs a schema-matching placeholder in place of the broken provider and
+    /// drops the latter, releasing the only long-lived strong reference to the invalidated
+    /// engine so its connection pool — and the file lock it still holds — can drop. Only then
+    /// can the rebuild reopen the same file. A single attempt; the caller retries naturally on
+    /// its next failed flush.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoverError::RebuildFailed`] if reopening the engine failed, or
+    /// [`RecoverError::SwapRejected`] if the rebuilt provider did not match the cached schema.
+    pub async fn recover(&self) -> Result<(), RecoverError> {
+        let placeholder: Arc<dyn TableProvider> =
+            Arc::new(RecoveringTableProvider::new(self.swappable.schema()));
+        // A schema mismatch is impossible here (the placeholder carries the cached schema), so
+        // surface it as a swap rejection rather than inventing a variant for the unreachable.
+        let previous = self
+            .swappable
+            .swap(Arc::clone(&placeholder))
+            .context(SwapRejectedSnafu)?;
+        drop(previous);
+
+        let new_provider = self
+            .accelerator
+            .rebuild_provider(
+                self.source.as_ref(),
+                placeholder,
+                self.provider_factory.clone(),
+            )
+            .await
+            .context(RebuildFailedSnafu)?;
+
+        self.swappable
+            .swap(new_provider)
+            .map(|_| ())
+            .context(SwapRejectedSnafu)
+    }
+}
+
+/// Whether `err` from acceleration engine `engine` (a [`DataAccelerator::name`]) is a fatal
+/// state a provider rebuild can recover from (spiceai/spiceai#13513).
+///
+/// The markers are engine-specific, so this matches on the engine rather than the error text
+/// alone. DuckDB invalidates its whole database when an out-of-memory rollback fails — the
+/// commit reports `Cannot continue operation` and every later query reports `database has been
+/// invalidated` until the instance is reopened. It is deliberately narrow: an ordinary
+/// out-of-memory error that rolled back cleanly leaves the database usable and must not match.
+fn is_recoverable_fatal_error(engine: Engine, err: &DataFusionError) -> bool {
+    match engine {
+        Engine::DuckDB => {
+            let message = err.to_string();
+            message.contains("has been invalidated")
+                || message.contains("Cannot continue operation")
+        }
+        _ => false,
+    }
+}
+
+/// Attempt a reopen and log the outcome, returning `true` if the accelerator is serving queries
+/// again. The caller must hold the accelerator write mutex (recovery serializes with writes,
+/// per the invariant [`DataAccelerator::rebuild_provider`] documents).
+///
+/// A `false` return leaves the recovering placeholder installed — every query and write then
+/// fails, so a later flush can never re-trigger recovery. The caller must remember to retry
+/// (the cache-write task does, on its flush ticker) until this succeeds.
+async fn recover_and_log(recovery: &CachingRecovery, dataset_name: &str) -> bool {
+    match recovery.recover().await {
+        Ok(()) => {
+            tracing::info!(
+                "Dataset '{dataset_name}' accelerator reopened after a fatal error; it is \
+                 serving queries again."
+            );
+            true
+        }
+        Err(recover_err) => {
+            tracing::error!(
+                "Dataset '{dataset_name}' accelerator reopen did not complete; retrying until it \
+                 succeeds or the process restarts. Cause: {recover_err}."
+            );
+            false
+        }
+    }
+}
+
+/// A schema-preserving stand-in installed into the [`SwappableTableProvider`] for the brief
+/// window while a broken engine provider is being rebuilt (see [`CachingRecovery::recover`]).
+///
+/// Its only job is to hold the correct schema (so the swap validates) while returning a clear
+/// error from every scan and write. It must never return an empty result: a caching-mode scan
+/// treats zero rows as a cache miss, so serving empty here would turn a transient recovery
+/// window into silently-wrong query results. An error is correct; the query already failed
+/// against the invalidated instance, and a later query succeeds once the rebuilt provider is in.
+#[derive(Debug)]
+struct RecoveringTableProvider {
+    schema: SchemaRef,
+}
+
+impl RecoveringTableProvider {
+    fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
+
+    fn recovering_error() -> DataFusionError {
+        DataFusionError::Execution(
+            "accelerator is recovering from a fatal error and is briefly unavailable; retry the \
+             query"
+                .to_string(),
+        )
+    }
+}
+
+#[async_trait]
+impl TableProvider for RecoveringTableProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Err(Self::recovering_error())
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Err(Self::recovering_error())
+    }
+}
+
 /// The `error!` and dataset status a caching accelerator gets when it can accept writes but
 /// cannot store any of them.
 ///
@@ -344,6 +550,7 @@ impl CacheWriteHealth {
 ///
 /// Removes cache keys from `in_flight_revalidations` after writes complete.
 /// Updates `last_updated_at` after successful writes to support `snapshots_creation_policy: on_change`.
+#[expect(clippy::too_many_arguments)]
 pub fn spawn_batched_cache_write_task(
     mut rx: CacheWriteReceiver,
     accelerator: Arc<dyn TableProvider>,
@@ -352,11 +559,15 @@ pub fn spawn_batched_cache_write_task(
     in_flight_revalidations: InFlightRevalidations,
     last_updated_at: Arc<AtomicI64>,
     runtime_status: Arc<RuntimeStatus>,
+    recovery: Option<CachingRecovery>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let dataset_name = dataset.to_string();
         let mut health = CacheWriteHealth::new(runtime_status, dataset);
         let mut batch_buffer: Vec<CacheWriteRequest> = Vec::new();
+
+        // On an error we are attempting to recover from, state might be pending between loops.
+        let mut recovery_pending = false;
         let mut flush_ticker =
             tokio::time::interval(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS));
         // First tick completes immediately, skip it
@@ -388,6 +599,8 @@ pub fn spawn_batched_cache_write_task(
                                 &in_flight_revalidations,
                                 &last_updated_at,
                                 &mut health,
+                                recovery.as_ref(),
+                                &mut recovery_pending,
                             ).await;
                         }
                         break;
@@ -405,7 +618,17 @@ pub fn spawn_batched_cache_write_task(
                             &in_flight_revalidations,
                             &last_updated_at,
                             &mut health,
+                            recovery.as_ref(),
+                            &mut recovery_pending,
                         ).await;
+                    } else if recovery_pending
+                        && let Some(rec) = recovery.as_ref()
+                    {
+                        // A previous reopen left the accelerator on the recovering placeholder.
+                        // Retry it here, driven by the ticker rather than by new writes: the
+                        // placeholder rejects writes, so no flush would ever re-trigger this.
+                        let _guard = accelerator_write_mutex.lock().await;
+                        recovery_pending = !recover_and_log(rec, &dataset_name).await;
                     }
                 }
             }
@@ -416,6 +639,7 @@ pub fn spawn_batched_cache_write_task(
 }
 
 /// Flushes accumulated cache write requests as a single batched operation.
+#[expect(clippy::too_many_arguments)]
 async fn flush_cache_writes(
     buffer: &mut Vec<CacheWriteRequest>,
     accelerator: &Arc<dyn TableProvider>,
@@ -424,6 +648,8 @@ async fn flush_cache_writes(
     in_flight_revalidations: &InFlightRevalidations,
     last_updated_at: &Arc<AtomicI64>,
     health: &mut CacheWriteHealth,
+    recovery: Option<&CachingRecovery>,
+    recovery_pending: &mut bool,
 ) {
     if buffer.is_empty() {
         return;
@@ -535,6 +761,25 @@ async fn flush_cache_writes(
     if let Err(e) = result {
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
         health.record_failure(&e);
+
+        // If possible, recover the accelerator state.
+        if let Some(rec) = recovery
+            && rec.is_fatal_error(&e)
+        {
+            tracing::warn!(
+                "Dataset '{dataset_name}' accelerator entered a fatal state; reopening it. \
+                 {request_count} buffered cache writes were dropped and will be re-fetched on \
+                 next access."
+            );
+            // Hold the accelerator write mutex across the reopen so it is serialized with
+            // concurrent writes, matching the invariant `DataAccelerator::rebuild_provider`
+            // documents.
+            let _guard = accelerator_write_mutex.lock().await;
+            // If the reopen fails it leaves the recovering placeholder installed, which rejects
+            // every query and write — so no later flush could re-trigger recovery. Record that
+            // it is pending; the task's ticker retries it until it succeeds.
+            *recovery_pending = !recover_and_log(rec, dataset_name).await;
+        }
     } else if insert_rows > 0 || upsert_rows > 0 {
         health.record_success();
 
@@ -2567,6 +2812,7 @@ mod tests {
             Arc::clone(in_flight_revalidations),
             last_updated_at,
             RuntimeStatus::new(),
+            None,
         );
         (tx, handle)
     }

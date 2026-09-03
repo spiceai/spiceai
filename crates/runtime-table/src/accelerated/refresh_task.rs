@@ -1223,7 +1223,7 @@ impl RefreshTask {
     /// Drives `RefreshMode::Snapshot`: poll the snapshot store for a snapshot
     /// strictly newer than what is currently loaded; if found, download it
     /// (which writes to the accelerator's primary path) and call into the
-    /// accelerator's `reload_from_snapshot` to swap in a fresh `TableProvider`.
+    /// accelerator's `rebuild_provider` to swap in a fresh `TableProvider`.
     ///
     /// The federated source is never queried by this code path. When no newer
     /// snapshot is available the call is a no-op (Ready, no swap).
@@ -1400,7 +1400,7 @@ impl RefreshTask {
         // against the (rare) case where the metadata's recorded schema
         // differed from the schema actually embedded in the downloaded
         // file. The downloaded file may have replaced the primary path
-        // here, but `reload_from_snapshot` is gated below — and a
+        // here, but `rebuild_provider` is gated below — and a
         // schema-mismatch returned here is treated as permanent.
         if !schemas_compatible(info.schema.as_ref(), live_schema.as_ref()) {
             let (kind, detail) =
@@ -1440,7 +1440,7 @@ impl RefreshTask {
         // accelerator writes.
         let new_provider = match state
             .accelerator
-            .reload_from_snapshot(
+            .rebuild_provider(
                 state.source.as_ref(),
                 state.swappable_provider.current(),
                 Arc::clone(&state.provider_factory),
