@@ -268,9 +268,15 @@ jobs:
     # legible failure.
     #
     # The budget that has to hold is `setup + sign-off step + cleanup < 358`,
-    # not just `353 < 358`: the job clock starts before the setup steps, the
-    # step clock only when the step does. Setup is toolchain probes and package
-    # installs and cleanup is a few API calls, so the 5-minute gap is ample.
+    # not just `345 < 358`: the job clock starts before the setup steps, the
+    # step clock only when the step does. Setup measures ~80s here, so the gap
+    # leaves ~11 minutes of cleanup — sized for the handlers below rather than
+    # for the seconds a status post looks like it should take. Run
+    # 33706211503 is why: its sign-off step used its whole budget, which left
+    # the 5-minute gap then in force with 3.7 minutes, and `clear-pending` was
+    # still running when the job wall arrived. The run lost both its status
+    # resolution and its `Show sccache stats` diagnostics — exactly when a
+    # budget overrun most needs explaining.
     timeout-minutes: 358
     permissions:
       contents: read
@@ -463,12 +469,12 @@ jobs:
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
         run: .trusted-ci/signoff -f
-        # Five minutes under the job budget above, so an overrun gives up as a
-        # failed step — which the run after it can read — rather than being
-        # terminated at the job wall as `cancelled` with nothing to show. The
-        # gate's peak duration on this pool is not yet measured; if sign-offs
-        # start expiring here, re-check this budget before suspecting a branch.
-        timeout-minutes: 353
+        # Thirteen minutes under the job budget above, so an overrun gives up
+        # as a failed step — which the run after it can read — and still
+        # leaves the handlers and `Show sccache stats` room to run. The gate's
+        # peak duration on this pool is not yet measured; if sign-offs start
+        # expiring here, re-check this budget before suspecting a branch.
+        timeout-minutes: 345
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
