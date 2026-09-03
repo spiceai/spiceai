@@ -123,6 +123,8 @@ jobs:
         run: cargo check --no-default-features --features runtime/openapi --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       # `mcp` is excluded from the powerset above, so nothing else compiles
       # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
