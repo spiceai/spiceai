@@ -51,11 +51,11 @@ limitations under the License.
 //!   as SQL requires.
 //!
 //!   Leaving a pair unjudged would still hide an inversion straddling a `NULL`
-//!   (`[2, NULL, 1]` is illegal under either convention), so the *leading* key
-//!   column's non-`NULL` values are additionally checked as a subsequence. Only
-//!   the leading column: a later one orders rows within a tie of the columns
-//!   before it, so `ORDER BY cnt, state` may legally step `state` backwards the
-//!   moment `cnt` changes.
+//!   (`[2, NULL, 1]` is illegal under either convention), so each key column's
+//!   non-`NULL` values are additionally checked as a subsequence — within the run
+//!   of rows tied on the columns before it, which is the only span that column
+//!   orders. `ORDER BY cnt, state` may therefore still step `state` backwards the
+//!   moment `cnt` changes, while an inversion inside one `cnt` group is caught.
 //! - **Terms that do not map onto an output column.** `ORDER BY` over an
 //!   expression absent from the projection cannot be located in the result. The
 //!   mappable leading terms are still checked and the rest is named — dropping a

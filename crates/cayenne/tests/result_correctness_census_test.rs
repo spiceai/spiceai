@@ -80,14 +80,15 @@ const ENGINES: [&str; 3] = ["duckdb", "sqlite", "chdb"];
 
 /// Load modes each suite exercises today.
 ///
-/// `SKILL.md` defines a comparison cell as (query, engine, load mode), but the
-/// inventory models only the first two — so a query x engine count cannot move
-/// when a suite gains a load mode, and on its own it cannot measure expansion
-/// axis 2. This table supplies the third dimension.
+/// A comparison cell is (query, engine, load mode) — a query only tests something
+/// when it is executed on two engines and the results compared, and the same
+/// query compared after a different load exercises a different write path. The
+/// inventory models only the first two, so a query x engine count cannot move
+/// when a suite gains a load mode. This table supplies the third dimension.
 ///
 /// **Maintained by hand against the test binaries** (`InsertOp::Overwrite`,
 /// repeated `InsertOp::Append`, `write_cdc_append_stream` + `finish()`). Update it
-/// when a suite gains a mode, or the axis-2 delta it reports goes stale. Today
+/// when a suite gains a mode, or the load-mode delta it reports goes stale. Today
 /// only CH-benCHmark runs the matrix.
 const SUITE_LOAD_MODES: &[(&str, &[&str])] = &[("chbench", &["full", "append", "changes"])];
 
@@ -224,7 +225,7 @@ fn print_comparison_cell_census() {
 
     // Axis 2 lives in a dimension the inventory does not model, so it gets its own
     // report — the query x engine total above is fixed under a load-mode change.
-    println!("\n### Load-mode cells (axis 2)\n");
+    println!("\n### Load-mode cells\n");
     println!("| suite | modes | query x engine | query x engine x mode |");
     println!("|---|---|---|---|");
     let mut mode_cells_total = 0usize;
@@ -287,7 +288,7 @@ fn print_comparison_cell_census() {
         "\n> Counted per query, not per cell: the sort check is a self-check on one\n> engine's output, so it runs on every engine lane the query reaches.\n"
     );
 
-    // The ranking that picks the expansion axis: one reason blocking many cells is
+    // The ranking that picks where to expand next: one reason blocking many cells is
     // one dialect shim away from becoming that many cells of real coverage.
     println!("\n### Static exclusion reasons by cells blocked\n");
     let mut ranked: Vec<_> = reasons.into_iter().collect();
