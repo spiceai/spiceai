@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `18a40370d014a0f8eed12ee0d5a914e8cb2070d8` | `lukim/spiceai-58.3.0` |
+| [arrow-rs](#arrow-rs) | `ccb268d61bd49a0a42ba229a2af397d78bce7beb` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `00f6865c0e1c8a6987a1cd7691b985b3a37554b2` | `spiceai-54` |
+| [datafusion](#datafusion) | `f9a635e6b580d5fe6ed0a70975e36014ea86c476` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a6c88abe381fa50d0b3bb1fbe20964eb5830f9bd` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -196,20 +196,24 @@ catch.
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
+| BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
 | Pluggable `CollectLeftAccumulator` seam on `HashJoinExec` | Cayenne's custom left-side accumulator cannot be installed | build | compile-guarded by `crates/cayenne` |
 
 ## arrow-rs
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
-`lukim/spiceai-58.3.0`. The whole patch is one file,
-`parquet/src/arrow/async_reader/store.rs`.
+`spiceai-58`. The pin lives in the object-store Parquet reader
+(`parquet/src/arrow/async_reader/store.rs`) and in the push-decoder short-read
+path (`parquet/src/util/push_buffers.rs` and its callers).
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
+
+| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
 
 ## datafusion-ballista
 
@@ -496,7 +500,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**36 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -525,35 +529,41 @@ They are not equal in consequence; this is the order to close them in.
 11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
+
 **Hangs, crashes and failures.** These take a query or the process down:
 
-12. `vortex` session lock re-entry in writer init (fork PR #29).
-13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+12. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+    on a short read — a footer prefetch racing an in-place shrink panics the
+    reader thread rather than surfacing a retriable decode error. The
+    listing/overwrite harness 412s before a short body reaches it; runtime
+    #13847 carries the scan-path guards for the rest of this revision.
+13. `vortex` session lock re-entry in writer init (fork PR #29).
+14. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-14. `async-openai` null-suppression in requests.
-15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-16. `model2vec-rs` optional `config.json`.
-17. `snowflake-rs` async query response support — long-running queries time out.
+15. `async-openai` null-suppression in requests.
+16. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+17. `model2vec-rs` optional `config.json`.
+18. `snowflake-rs` async query response support — long-running queries time out.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-18. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-19. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-20. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-21. `model2vec-rs` HF cache directory read from the environment — models are
+22. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-22. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-23. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-24. `graph-rs-sdk` tower middleware application.
+24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+25. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -561,7 +571,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-25. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a

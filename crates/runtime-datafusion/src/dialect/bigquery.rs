@@ -32,10 +32,10 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use datafusion::arrow::array::timezone::Tz;
-use datafusion::arrow::datatypes::TimeUnit;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     self, BinaryOperator, CaseWhen, Function, FunctionArg, FunctionArgExpr, ObjectName,
@@ -287,11 +287,44 @@ pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
 /// other two pieces — a handler, because the unparser otherwise emits the call
 /// verbatim into SQL `BigQuery` rejects, and a per-call check, because the
 /// handler can only render some call shapes and the rest must stay local.
-pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[ScalarOverride {
-    name: super::REGEXP_LIKE_NAME,
-    handler: regexp_like_to_sql,
-    can_translate: regexp_like_is_renderable,
-}];
+pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
+    ScalarOverride {
+        name: super::REGEXP_LIKE_NAME,
+        handler: regexp_like_to_sql,
+        can_translate: regexp_like_is_renderable,
+    },
+    ScalarOverride {
+        name: "array_element",
+        handler: array_element_to_sql,
+        can_translate: array_index_is_renderable,
+    },
+];
+
+/// `array_element` is 1-based and counts from the end for a negative index.
+/// `BigQuery` has no end-relative subscript, so the fork's dialect renders only
+/// a non-negative index and refuses the rest; this is the check that keeps the
+/// refusal off the pushdown path, leaving such a call to evaluate locally rather
+/// than failing the query.
+fn array_index_is_renderable(args: &[Expr]) -> bool {
+    let [_, Expr::Literal(index, _)] = args else {
+        return false;
+    };
+    index.data_type().is_integer()
+        && matches!(
+            index.cast_to(&DataType::Int64),
+            Ok(ScalarValue::Int64(Some(index))) if index >= 0
+        )
+}
+
+/// Defers to the fork's `BigQuery` rendering, which spells the subscript
+/// `SAFE_ORDINAL` so it agrees with `array_element`'s 1-based indexing.
+///
+/// Registered here only so [`can_translate`] can refuse the indexes that
+/// rendering will not take. Returning `Ok(None)` instead would fall through to
+/// the generic 0-based subscript, which reads the neighbouring element.
+fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    BigQueryDialect::new().scalar_function_to_sql_overrides(unparser, "array_element", args)
+}
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
 /// and hands both to `render` as `BigQuery` SQL.
@@ -1016,6 +1049,13 @@ impl SpiceBigQueryDialect {
     }
 }
 
+/// Every `Dialect` method is forwarded explicitly, and the lint keeps it that way.
+///
+/// An unlisted method falls back to the *trait default*, which is the generic
+/// rendering rather than `BigQuery`'s — so a method added upstream would silently
+/// revert `BigQuery` to generic SQL, with no error anywhere. Denying
+/// `missing_trait_methods` turns that into a compile failure instead.
+#[deny(clippy::missing_trait_methods)]
 impl Dialect for SpiceBigQueryDialect {
     fn with_custom_scalar_overrides(mut self, handlers: Vec<(&str, ScalarFnToSqlHandler)>) -> Self {
         for (name, handler) in handlers {
@@ -1036,6 +1076,20 @@ impl Dialect for SpiceBigQueryDialect {
         }
         self.inner
             .scalar_function_to_sql_overrides(unparser, func_name, args)
+    }
+
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        order_by: &[SortExpr],
+    ) -> Result<Option<ast::Expr>> {
+        self.inner.aggregate_function_to_sql_overrides(
+            unparser, func_name, args, distinct, filter, order_by,
+        )
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
@@ -1092,6 +1146,30 @@ impl Dialect for SpiceBigQueryDialect {
 
     fn timestamp_cast_dtype(&self, time_unit: &TimeUnit, tz: &Option<Arc<str>>) -> ast::DataType {
         self.inner.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    fn timestamp_literal_cast_dtype(
+        &self,
+        time_unit: &TimeUnit,
+        tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        self.inner.timestamp_literal_cast_dtype(time_unit, tz)
+    }
+
+    fn date_difference_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_difference_to_sql(lhs, rhs)
+    }
+
+    fn date_to_integer_to_sql(&self, date: ast::Expr) -> Option<ast::Expr> {
+        self.inner.date_to_integer_to_sql(date)
+    }
+
+    fn requires_explicit_comparison_coercion(&self) -> bool {
+        self.inner.requires_explicit_comparison_coercion()
+    }
+
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        self.inner.timestamp_literal_max_subsecond_digits()
     }
 
     fn timestamp_at_time_zone_to_sql(&self, input: ast::Expr, tz: &str) -> Option<ast::Expr> {
@@ -1319,6 +1397,40 @@ mod tests {
     #[test]
     fn a_call_with_no_path_has_no_translation() {
         assert_eq!(json_path(&[col("doc")]), None);
+    }
+
+    /// `array_element` renders only a non-negative index, so the gate has to
+    /// refuse the rest — otherwise the call is pushed down and the rendering
+    /// then fails the whole query instead of evaluating locally.
+    #[test]
+    fn array_element_federates_only_for_a_non_negative_integer_index() {
+        assert!(can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(1i64)]
+        )));
+        assert!(can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(0i64)]
+        )));
+        // Counts from the end, which BigQuery cannot express.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit(-1i64)]
+        )));
+        // Sign unknown until it runs.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), col("i")]
+        )));
+        // Not an ordinal BigQuery would take.
+        assert!(!can_translate(&call(
+            "array_element",
+            vec![col("arr"), lit("1")]
+        )));
+
+        // And what does federate keeps the 1-based spelling.
+        let sql = render("array_element", vec![col("arr"), lit(1i64)]);
+        assert!(sql.contains("SAFE_ORDINAL(1)"), "not 1-based: {sql}");
     }
 
     #[test]
@@ -1732,7 +1844,14 @@ mod tests {
         let dialect = new_bigquery_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         for entry in super::BUILTIN_SCALAR_OVERRIDES {
-            let args = [col("code"), lit("^R[0-9]{2}")];
+            // One call per entry, because an entry's `can_translate` accepts the
+            // shapes its own handler renders and those differ: `array_element`
+            // takes an array and a non-negative integer index where the regex
+            // entries take a column and a pattern.
+            let args: [Expr; 2] = match entry.name {
+                "array_element" => [col("arr"), lit(1_i64)],
+                _ => [col("code"), lit("^R[0-9]{2}")],
+            };
             assert!(
                 (entry.can_translate)(&args),
                 "`{name}`'s representative call must be translatable",
@@ -2156,6 +2275,24 @@ mod tests {
         datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
     }
 
+    /// A scan of one `DATE` column and one naive timestamp column, for the
+    /// renderings that depend on an operand being a date or a civil timestamp.
+    fn date_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("d", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new("e", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new(
+                "naive",
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("d", source, None).expect("scan d")
+    }
+
     /// The SQL `dialect` renders for `plan`.
     fn unparse_plan(
         dialect: &dyn datafusion::sql::unparser::dialect::Dialect,
@@ -2247,6 +2384,43 @@ mod tests {
         .expect("outer projection")
         .build()
         .expect("build");
+
+        // #212's renderings. Each is a BigQuery type or name fact the fork
+        // carries; a re-cut that drops one leaves the wrapper forwarding to a
+        // dialect that renders generic SQL, which the `missing_trait_methods`
+        // deny cannot see.
+        let date_difference = date_scan()
+            .project(vec![col("d.d") - col("d.e")])
+            .expect("date difference projection")
+            .build()
+            .expect("build");
+
+        let date_to_integer = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.d"),
+                DataType::Int64,
+            )])
+            .expect("date to integer projection")
+            .build()
+            .expect("build");
+
+        let naive_timestamp_cast = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.naive"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+            )])
+            .expect("naive timestamp cast projection")
+            .build()
+            .expect("build");
+
+        let constant_group_by = date_scan()
+            .aggregate(
+                vec![lit("POOLED")],
+                vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+            )
+            .expect("aggregate on a constant key")
+            .build()
+            .expect("build");
 
         let truncated = timestamp_scan()
             .project(vec![datafusion::functions::expr_fn::date_trunc(
@@ -2373,6 +2547,38 @@ mod tests {
                 &range_window,
                 "IS NULL ASC",
                 "NULLS LAST",
+            ),
+            (
+                // DATE - DATE is an INTERVAL in BigQuery and an Int64 day count
+                // in the plan, so a bare `-` hands the next operator a duration.
+                "date difference becomes DATE_DIFF (fork PR #212)",
+                &date_difference,
+                "DATE_DIFF(",
+                "`d`.`d` - `d`.`e`",
+            ),
+            (
+                // BigQuery has no cast from DATE to INT64.
+                "date to integer becomes UNIX_DATE (fork PR #212)",
+                &date_to_integer,
+                "UNIX_DATE(",
+                "AS INT64)",
+            ),
+            (
+                // BigQuery puts no timezone qualifier on a timestamp type:
+                // TIMESTAMP is the instant, DATETIME the civil value, so a naive
+                // operand typed TIMESTAMP has no supertype with a DATETIME column.
+                "a tz-naive timestamp cast is DATETIME (fork PR #212)",
+                &naive_timestamp_cast,
+                "DATETIME",
+                "AS TIMESTAMP)",
+            ),
+            (
+                // BigQuery refuses a literal grouping key outright, and an engine
+                // reading a bare integer there takes it as a select-list ordinal.
+                "a constant GROUP BY key is cast (fork PR #212)",
+                &constant_group_by,
+                "GROUP BY CAST('POOLED' AS STRING)",
+                "GROUP BY 'POOLED'",
             ),
         ] {
             let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
