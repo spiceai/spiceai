@@ -3013,15 +3013,19 @@ fn is_object_generation_changed_error(error: &DataFusionError) -> bool {
 
 fn looks_like_generation_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    // Match the store's precondition failure, not a bare "412" that can
-    // appear in an object key (`…/archive/412/data.parquet`).
-    lower.contains("precondition") || lower.contains("if-match")
+    // object_store::Error::Precondition displays as "Request precondition
+    // failure for path …"; HTTP 412 as "412 Precondition Failed". A bare
+    // "precondition" also matches planner/SQL errors and would retry them.
+    lower.contains("request precondition failure")
+        || lower.contains("412 precondition failed")
+        || lower.contains("if-match")
 }
 
 fn looks_like_parquet_decode(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("snappy")
         || lower.contains("corrupt input")
+        || lower.contains("corrupt footer")
         || lower.contains("invalid page header")
         || lower.contains("parquet argument error")
         || lower.contains("failed to fill whole buffer")
@@ -3327,6 +3331,32 @@ mod tests {
             refresh_error_reason(inner_err_from_retry_ref(&classified)),
             metrics::REFRESH_ERROR_REASON_OTHER
         );
+
+        let connector_precondition = DataFusionError::Plan(
+            "connector precondition is not satisfied: primary key is missing".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&connector_precondition),
+            "a planner 'precondition' is not an object replacement"
+        );
+        let classified = retry_from_df_error(connector_precondition);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "a planner precondition must stay permanent"
+        );
+
+        let sql_precondition = DataFusionError::Execution(
+            "SQL precondition failed before scanning any object".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&sql_precondition),
+            "an execution 'precondition' is not an object replacement"
+        );
+        let classified = retry_from_df_error(sql_precondition);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "an execution precondition must stay permanent"
+        );
     }
 
     #[test]
@@ -3355,6 +3385,16 @@ mod tests {
         );
         assert_ne!(
             refresh_error_reason_from_message(&page_header.to_string()),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let footer = "Parquet error: Invalid Parquet file. Corrupt footer";
+        assert_eq!(
+            refresh_error_reason_from_message(footer),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        assert_ne!(
+            refresh_error_reason_from_message(footer),
             metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
         );
     }
