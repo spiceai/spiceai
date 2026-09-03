@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `18a40370d014a0f8eed12ee0d5a914e8cb2070d8` | `lukim/spiceai-58.3.0` |
+| [arrow-rs](#arrow-rs) | `ccb268d61bd49a0a42ba229a2af397d78bce7beb` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `00f6865c0e1c8a6987a1cd7691b985b3a37554b2` | `spiceai-54` |
+| [datafusion](#datafusion) | `dfdde149631286c920851a09faeaa70007bea460` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a6c88abe381fa50d0b3bb1fbe20964eb5830f9bd` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -194,7 +194,7 @@ catch.
 | Unparser: `Dialect::group_by_matches_select_subexpressions`, and the aggregate scope a dialect that answers `false` needs | A `Projection` over an `Aggregate` is flattened into one `SELECT`, leaving the grouping expression bare in `GROUP BY` and wrapped inside a select item. BigQuery matches a whole select item and a column reference and nothing in between, so it refuses the statement outright. The two cheaper renderings are worse than the failure: `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the value the projection computes, so a projection that is not injective over the grouping expression collapses distinct groups and sums their aggregates, with no error | build (flag), then silent (query failure) | `crates/data_components/src/federation.rs::a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped`, which reads the flag, so losing the patch fails `cargo check` before it can fail the assertion; real-engine guard: `test/scripts/bigquery-pushdown.sh::group-by-expr-nested-in-select` |
 | `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
-| Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
+| Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader`; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag; bloom-filter replacement readers reuse that discovered version | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation. Losing the bloom-filter share does the same on a predicate scan: page reads fall back to a stale `If-Match` | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
 | Pluggable `CollectLeftAccumulator` seam on `HashJoinExec` | Cayenne's custom left-side accumulator cannot be installed | build | compile-guarded by `crates/cayenne` |
@@ -202,14 +202,15 @@ catch.
 ## arrow-rs
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
-`lukim/spiceai-58.3.0`. The whole patch is one file,
+`spiceai-58`. The whole patch is one file,
 `parquet/src/arrow/async_reader/store.rs`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
-| `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
+| `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
+| `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` |
 
 ## datafusion-ballista
 

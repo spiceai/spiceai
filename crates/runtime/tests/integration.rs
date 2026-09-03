@@ -169,6 +169,7 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
+mod s3_parquet_overwrite;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",

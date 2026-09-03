@@ -604,36 +604,28 @@ impl RefreshTask {
             .iter()
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
-        retry(retry_strategy, || async {
-            match self.run_once(&refresh).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    for label_set in self.get_dataset_label_sets(&refresh.mode).await {
-                        metrics::REFRESH_ERRORS.add(1, &label_set);
-                    }
-                    Err(e)
-                }
+        let result = retry(retry_strategy, || async { self.run_once(&refresh).await })
+            .instrument(span.clone())
+            .await;
+
+        // Count once for the failure that ended the refresh. A 412 that retries
+        // successfully is not an error; an exhausted generation-change still
+        // carries `reason=object_generation_changed` so it can be filtered.
+        if let Err(e) = &result
+            && !self.runtime_status.is_shutdown()
+        {
+            tracing::error!(
+                "Failed to refresh {} {}: {e}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
+            );
+            for span in &spans {
+                tracing::error!(target: "task_history", parent: span, "{e}");
             }
-        })
-        .instrument(span.clone())
-        .await
-        .inspect_err(|e| {
-            // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
-            // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::error!(
-                    "Failed to refresh {} {}: {e}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    )
-                );
-                for span in &spans {
-                    tracing::error!(target: "task_history", parent: span, "{e}");
-                }
-            }
-        })
+            self.record_refresh_error(e, &refresh.mode).await;
+        }
+
+        result
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
@@ -2331,8 +2323,15 @@ impl RefreshTask {
             .collect()
     }
 
+    async fn record_refresh_error(&self, error: &super::Error, mode: &RefreshMode) {
+        let reason = refresh_error_reason(error);
+        for mut label_set in self.get_dataset_label_sets(mode).await {
+            label_set.push(KeyValue::new(metrics::REFRESH_ERROR_REASON, reason));
+            metrics::REFRESH_ERRORS.add(1, &label_set);
+        }
+    }
+
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
-        let is_error = status.is_error();
         let is_ready = status == status::ComponentStatus::Ready;
 
         // Mark initial load complete BEFORE updating the runtime status to Ready.
@@ -2347,11 +2346,6 @@ impl RefreshTask {
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
-            if is_error {
-                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
-                metrics::REFRESH_ERRORS.add(1, &labels);
-            }
-
             if is_ready {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -2969,7 +2963,7 @@ fn dedup_predicates(
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
-    if is_retriable_error(&error) {
+    if is_retriable_error(&error) || is_object_generation_changed_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector {
             source: find_datafusion_root(error),
         });
@@ -2977,6 +2971,73 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     RetryError::permanent(super::Error::FailedToRefreshDataset {
         source: find_datafusion_root(error),
     })
+}
+
+/// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
+///
+/// Generation-change is checked first so a 412 wrapped in a Parquet fetch
+/// error is still filterable, not classified as decoder corruption.
+#[must_use]
+pub fn refresh_error_reason(error: &super::Error) -> &'static str {
+    if error_chain_matches(error, looks_like_generation_change) {
+        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+    } else if error_chain_matches(error, looks_like_parquet_decode) {
+        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+    } else {
+        metrics::REFRESH_ERROR_REASON_OTHER
+    }
+}
+
+/// Classify a refresh/scan error message the same way the metric does.
+///
+/// Used by the listing-table overwrite integration test to assert the
+/// filterable label against the real error text.
+#[must_use]
+pub fn refresh_error_reason_from_message(message: &str) -> &'static str {
+    if looks_like_generation_change(message) {
+        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+    } else if looks_like_parquet_decode(message) {
+        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+    } else {
+        metrics::REFRESH_ERROR_REASON_OTHER
+    }
+}
+
+/// A listed object was replaced while the scan still held the old generation.
+///
+/// Pinning turns that into a store precondition failure (`412` / `If-Match`)
+/// rather than a decoder error. Relisting and re-planning is the recovery.
+fn is_object_generation_changed_error(error: &DataFusionError) -> bool {
+    error_chain_matches(error, looks_like_generation_change)
+}
+
+fn looks_like_generation_change(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("precondition") || lower.contains("if-match") || lower.contains("412")
+}
+
+fn looks_like_parquet_decode(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("snappy")
+        || lower.contains("corrupt input")
+        || lower.contains("invalid page header")
+        || lower.contains("parquet argument error")
+        || lower.contains("failed to fill whole buffer")
+        || lower.contains("range length must match")
+        || lower.contains("does not match length")
+        || lower.contains("eof:")
+        || lower.contains("unexpected eof")
+}
+
+fn error_chain_matches(error: &dyn std::error::Error, predicate: fn(&str) -> bool) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(error);
+    while let Some(err) = current {
+        if predicate(&err.to_string()) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
@@ -3042,9 +3103,11 @@ mod tests {
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+    use runtime_metrics::acceleration as metrics;
     use spice_table::IndexLayer;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use util::RetryError;
 
     #[derive(Debug)]
     struct TestRefreshIndex;
@@ -3220,6 +3283,65 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn object_generation_change_is_a_transient_refresh_error() {
+        let precondition = DataFusionError::External(Box::new(std::io::Error::other(
+            "Request precondition failure for path listing/data.parquet: 412 Precondition Failed",
+        )));
+        assert!(is_object_generation_changed_error(&precondition));
+        let classified = retry_from_df_error(precondition);
+        assert!(
+            matches!(&classified, RetryError::Transient { .. }),
+            "a replaced object must re-list, not fail the refresh"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let plan = DataFusionError::Plan("column not found".to_string());
+        assert!(!is_object_generation_changed_error(&plan));
+        let classified = retry_from_df_error(plan);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "a planning error stays permanent"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+    }
+
+    #[test]
+    fn parquet_decode_is_not_a_generation_change() {
+        let snappy = DataFusionError::External(Box::new(std::io::Error::other(
+            "Parquet error: Arrow: Parquet argument error: External: snappy: corrupt input \
+             (expected copy read of length 1; remaining src: 0)",
+        )));
+        assert!(!is_object_generation_changed_error(&snappy));
+        let classified = retry_from_df_error(snappy);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "genuine Parquet corruption must not retry as a generation change"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+
+        let page_header = DataFusionError::External(Box::new(std::io::Error::other(
+            "Parquet error: Arrow: Parquet argument error: EOF: Invalid page header",
+        )));
+        assert_eq!(
+            refresh_error_reason_from_message(&page_header.to_string()),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        assert_ne!(
+            refresh_error_reason_from_message(&page_header.to_string()),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
     }
 
     #[test]
