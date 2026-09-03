@@ -81,8 +81,8 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::bigquery_native_function_names())
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
+        .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .build()
-        .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot
