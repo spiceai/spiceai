@@ -177,7 +177,7 @@ retries = 0
 # ceiling. See `.github/scripts/check_nextest_config.py`, which holds this
 # binary's baseline and fails if the ceiling stops clearing it.
 [[profile.default.overrides]]
-filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test) | binary(=result_correctness)'
+filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test)'
 test-group = "result-correctness"
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 10 }

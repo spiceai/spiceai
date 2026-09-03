@@ -112,6 +112,29 @@ cargo test -p cayenne --test result_correctness_vs_sqlite_test
 cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --nocapture
 ```
 
+## What the gate runs
+
+`make nextest` builds with `--features cayenne/result-correctness-duckdb`, which
+is what makes the DuckDB and oracle-baseline binaries exist at all: cargo skips a
+test target whose `required-features` are unmet without reporting it, so before
+that flag the filterset selected them and they silently never ran.
+
+| Binary | In `make nextest` |
+|--------|-------------------|
+| `result_correctness_inventory_test` | yes |
+| `result_correctness_census_test` | yes |
+| `result_correctness_vs_sqlite_test` | yes |
+| `result_correctness_standalone_engines_test` | yes |
+| `result_correctness_vs_duckdb_test` | yes |
+| `result_correctness_vs_chdb_test` | no — chDB cannot co-link with DuckDB, so it needs its own job |
+| runtime `result_correctness` | no — see below |
+
+The runtime accelerator lane stays out of the fast gate on purpose.
+`runtime/duckdb,runtime/sqlite` flow through the whole `--all --tests` build, so
+every runtime integration test binary relinks with them at hundreds of megabytes
+each — a permanent cost on every sign-off for two micro-shape comparisons. It
+belongs in the integration workflow, which already builds with `duckdb,sqlite`.
+
 Optional env: `CAYENNE_PARITY_SCRATCH`, `CAYENNE_PARITY_*_SF`,
 `CAYENNE_PARITY_SSB_SCALE`, `CLICKBENCH_HITS_PARQUET`, `SQLLANCER_EXTRA_SQL`.
 
