@@ -44,6 +44,8 @@ mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(feature = "duckdb")]
+mod duckdb_builtin_pushdown;
+#[cfg(feature = "duckdb")]
 mod file_create_duckdb;
 #[cfg(feature = "duckdb")]
 mod file_swap_duckdb;

@@ -481,6 +481,37 @@ pub struct Acceleration {
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
+/// What durable write-back has to deliver on, given a primary key's columns.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DurableWriteBackKey<'a> {
+    /// Exactly one column: the shape the delivery worker can build its filter from.
+    Single(&'a str),
+    /// No primary key at all.
+    Undeclared,
+    /// More than one column.
+    Composite(&'a [String]),
+}
+
+/// Classify a primary key's columns for durable write-back.
+///
+/// The delivery worker turns each batch of claimed markers into a `pk IN (...)`
+/// filter over ONE column, so anything but exactly one column leaves it with
+/// nothing to deliver with — and a dataset in that state accepts writes, marks
+/// them, and never delivers any of them.
+///
+/// Both sides of that rule classify through here: the registration preflight over
+/// the key the Spicepod declares, and the delivery worker over the key the
+/// accelerator resolved. Sharing the classifier is what stops the rule holding in
+/// one and not the other.
+#[must_use]
+pub fn classify_durable_write_back_key(columns: &[String]) -> DurableWriteBackKey<'_> {
+    match columns {
+        [single] => DurableWriteBackKey::Single(single.as_str()),
+        [] => DurableWriteBackKey::Undeclared,
+        composite => DurableWriteBackKey::Composite(composite),
+    }
+}
+
 impl Acceleration {
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
@@ -513,10 +544,61 @@ impl Acceleration {
     /// call it, so the check and the behavior cannot drift apart.
     #[must_use]
     pub fn resolves_to_durable_write_back(&self) -> bool {
-        self.engine == Engine::Cayenne
-            && self.write_mode == spicepod_acceleration::WriteMode::WriteBack
-            && !self.on_conflict.is_empty()
-            && self.refresh_mode == Some(RefreshMode::Changes)
+        self.write_mode == spicepod_acceleration::WriteMode::WriteBack
+            && self.durable_write_back_gaps().iter().all(Option::is_none)
+    }
+
+    /// Each durable-write-back prerequisite this acceleration fails, named as the
+    /// setting that would satisfy it.
+    ///
+    /// One list serves both the predicate and the refusal message, so "durable"
+    /// cannot come to mean one thing to the check and another to what the user is
+    /// told to add. Naming the settings only — the sentence around them belongs to
+    /// the error that renders it.
+    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 3] {
+        [
+            (self.engine != Engine::Cayenne).then_some("acceleration.engine: cayenne"),
+            self.on_conflict
+                .is_empty()
+                .then_some("an 'acceleration.on_conflict' upsert on the primary key"),
+            (self.refresh_mode != Some(RefreshMode::Changes))
+                .then_some("acceleration.refresh_mode: changes"),
+        ]
+    }
+
+    /// The durable-write-back prerequisites this acceleration does not meet, named
+    /// as the settings a user would add, or `None` when it asks for no write-back
+    /// or already meets them.
+    ///
+    /// `write_back` selects the write-back write mode on its own, but only a
+    /// configuration meeting these records markers and runs a delivery worker. One
+    /// that asks for write-back without them has no path to the source at all, so
+    /// it must be refused rather than loaded and then refuse every write.
+    #[must_use]
+    pub fn unmet_durable_write_back_prerequisites(&self) -> Option<Vec<&'static str>> {
+        if self.write_mode != spicepod_acceleration::WriteMode::WriteBack {
+            return None;
+        }
+        let missing: Vec<&'static str> = self
+            .durable_write_back_gaps()
+            .into_iter()
+            .flatten()
+            .collect();
+        (!missing.is_empty()).then_some(missing)
+    }
+
+    /// The primary key durable write-back can deliver this acceleration on.
+    ///
+    /// Classifies the key the Spicepod *declares*. Inference cannot stand in for a
+    /// declaration here: it runs after the dataset has been accepted, so a key it
+    /// supplies — or fails to — cannot decide whether the dataset may be accepted
+    /// at all, and a composite key it adds would arrive behind the refusal.
+    #[must_use]
+    pub fn durable_write_back_primary_key(&self) -> DurableWriteBackKey<'_> {
+        match &self.primary_key {
+            Some(primary_key) => classify_durable_write_back_key(&primary_key.columns),
+            None => DurableWriteBackKey::Undeclared,
+        }
     }
 
     /// Returns whether Arrow `hash_index` is enabled for primary key upserts or indexes.
@@ -1295,6 +1377,27 @@ mod tests {
             refresh_mode: Some(RefreshMode::Changes),
             ..Acceleration::default()
         }
+    }
+
+    /// The rule both the registration preflight and the delivery worker classify
+    /// through: exactly one column, or there is nothing to key a delivery on.
+    #[test]
+    fn only_a_single_column_key_can_be_delivered_on() {
+        assert_eq!(
+            classify_durable_write_back_key(&["id".to_string()]),
+            DurableWriteBackKey::Single("id")
+        );
+        assert_eq!(
+            classify_durable_write_back_key(&[]),
+            DurableWriteBackKey::Undeclared
+        );
+
+        let composite = ["id".to_string(), "region".to_string()];
+        assert_eq!(
+            classify_durable_write_back_key(&composite),
+            DurableWriteBackKey::Composite(&composite),
+            "the columns come back so the refusal can name them"
+        );
     }
 
     #[test]

@@ -60,6 +60,140 @@ impl EvictionReason {
     }
 }
 
+/// What an invalidation did to the entries that read the table, reported as the
+/// `mode` attribute on `*_cache_table_invalidations`.
+///
+/// Without this attribute the mode switch is invisible: a cache configured with
+/// `stale_while_revalidate_ttl` stops reporting
+/// [`EvictionReason::Invalidated`] entirely, because there is no longer an
+/// eviction to report, and nothing else records that a refresh happened at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationMode {
+    /// The entries that read the table were dropped from the cache.
+    Evict,
+    /// The entries were left resident and marked stale as of this instant, to
+    /// be served once more inside `stale_while_revalidate_ttl` while a
+    /// background revalidation replaces each of them.
+    MarkStale,
+}
+
+impl InvalidationMode {
+    /// Every variant, so a caller publishing the series up front cannot omit one.
+    pub const ALL: [Self; 2] = [Self::Evict, Self::MarkStale];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Evict => "evict",
+            Self::MarkStale => "mark_stale",
+        }
+    }
+
+    fn key_value(self) -> KeyValue {
+        KeyValue::new("mode", self.as_str())
+    }
+}
+
+/// Why a lookup found an entry but would not serve it, reported as the `reason`
+/// attribute on `*_cache_stale_rejections`.
+///
+/// The three are operationally distinct, and an unlabelled total cannot be
+/// acted on: only [`StaleRejectionReason::WindowExpired`] says the configured
+/// `stale_while_revalidate_ttl` is too short for the rate queries arrive at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleRejectionReason {
+    /// No `stale_while_revalidate_ttl` is configured, so an invalidation is a
+    /// hard one and the entry stopped being servable the moment it was marked.
+    NoStaleWindow,
+    /// A window is configured but the query arrived after it closed, so the
+    /// entry expired unserved instead of absorbing the refresh it was kept for.
+    WindowExpired,
+    /// The entry is inside the window, but this lookup serves only fresh
+    /// results and so declined it — a miss the stale-while-revalidate path
+    /// would have absorbed.
+    FreshRequired,
+}
+
+impl StaleRejectionReason {
+    /// Every variant, so a caller publishing the series up front cannot omit one.
+    pub const ALL: [Self; 3] = [
+        Self::NoStaleWindow,
+        Self::WindowExpired,
+        Self::FreshRequired,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoStaleWindow => "no_window",
+            Self::WindowExpired => "window_expired",
+            Self::FreshRequired => "fresh_required",
+        }
+    }
+
+    fn key_value(self) -> KeyValue {
+        KeyValue::new("reason", self.as_str())
+    }
+}
+
+/// How a background stale-while-revalidate revalidation ended, reported as the
+/// `outcome` attribute on `*_cache_swr_revalidations`.
+///
+/// Every non-[`RevalidationOutcome::Stored`] outcome leaves the entry it was
+/// meant to replace in place, to be served stale until it expires. That is the
+/// failure mode with no other symptom — the queries keep succeeding — so it is
+/// only visible if it is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevalidationOutcome {
+    /// The fresh result replaced the entry.
+    Stored,
+    /// The revalidation query itself failed to execute.
+    QueryFailed,
+    /// The query ran but its result stream failed part-way through.
+    CollectFailed,
+    /// A table the revalidation read was invalidated while it ran, so its
+    /// result may predate that invalidation and was discarded.
+    InvalidatedMidFlight,
+    /// The result carried transient HTTP error responses (5xx/429), so the
+    /// previous entry was preserved rather than overwritten with them.
+    TransientErrors,
+    /// The result could not be encoded for storage.
+    EncodeFailed,
+    /// The cache write itself failed.
+    PutFailed,
+}
+
+impl RevalidationOutcome {
+    /// Every variant, so a caller publishing the series up front cannot omit one.
+    pub const ALL: [Self; 7] = [
+        Self::Stored,
+        Self::QueryFailed,
+        Self::CollectFailed,
+        Self::InvalidatedMidFlight,
+        Self::TransientErrors,
+        Self::EncodeFailed,
+        Self::PutFailed,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::QueryFailed => "query_failed",
+            Self::CollectFailed => "collect_failed",
+            Self::InvalidatedMidFlight => "invalidated_mid_flight",
+            Self::TransientErrors => "transient_errors",
+            Self::EncodeFailed => "encode_failed",
+            Self::PutFailed => "put_failed",
+        }
+    }
+
+    /// The `outcome` attribute for this variant. Public because the
+    /// revalidation it describes runs in `runtime`, which reaches the counter
+    /// directly — as the sibling stale-while-revalidate counters already do.
+    #[must_use]
+    pub fn key_value(self) -> KeyValue {
+        KeyValue::new("outcome", self.as_str())
+    }
+}
+
 macro_rules! generate_cache_metrics {
     ($prefix:literal, $name:ident) => {
         pub mod $name {
@@ -132,7 +266,34 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_stale_rejections"))
                     .with_description(
-                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. These are also counted as misses.",
+                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. Split by `reason` into whether no stale-while-revalidate window is configured, the window had closed, or the caller serves only fresh results. These are also counted as misses.",
+                    )
+                    .build()
+            });
+
+            pub static TABLE_INVALIDATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_table_invalidations"))
+                    .with_description(
+                        "Number of table invalidations applied to this cache, split by `mode` into whether the dependent entries were evicted or left resident and marked stale. Counts invalidations, not the entries each one affected.",
+                    )
+                    .build()
+            });
+
+            pub static SWR_REVALIDATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_swr_revalidations"))
+                    .with_description(
+                        "Number of completed background stale-while-revalidate revalidations, split by `outcome`. Any outcome other than `stored` leaves the previous entry in place to be served stale until it expires.",
+                    )
+                    .build()
+            });
+
+            pub static INVALIDATION_STALE_HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_invalidation_stale_hits"))
+                    .with_description(
+                        "Number of results served from an entry a table invalidation had marked stale, within the configured stale-while-revalidate window. Counted where the result is handed back, so a request whose own `max-stale` is shorter than the window, or whose entry fails to decode, is not counted here even though the entry was found.",
                     )
                     .build()
             });
@@ -178,11 +339,20 @@ macro_rules! generate_cache_metrics {
                 REQUESTS.add(0, &[]);
                 HITS.add(0, &[]);
                 MISSES.add(0, &[]);
-                STALE_REJECTIONS.add(0, &[]);
+                INVALIDATION_STALE_HITS.add(0, &[]);
                 STALE_WHILE_REVALIDATE_SKIPPED.add(0, &[]);
                 STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(0, &[]);
                 for reason in EvictionReason::ALL {
                     EVICTIONS.add(0, &[reason.key_value()]);
+                }
+                for reason in StaleRejectionReason::ALL {
+                    STALE_REJECTIONS.add(0, &[reason.key_value()]);
+                }
+                for mode in InvalidationMode::ALL {
+                    TABLE_INVALIDATIONS.add(0, &[mode.key_value()]);
+                }
+                for outcome in RevalidationOutcome::ALL {
+                    SWR_REVALIDATIONS.add(0, &[outcome.key_value()]);
                 }
             }
         }
@@ -228,7 +398,15 @@ pub trait CacheMetrics: Send + Sync {
         Self: Sized;
     /// Records a lookup that found an entry but could not serve it because a
     /// table it read had since been invalidated.
-    fn record_stale_rejection()
+    fn record_stale_rejection(reason: StaleRejectionReason)
+    where
+        Self: Sized;
+    /// Records a table invalidation applied to this cache, and what it did to
+    /// the dependent entries. Counts invalidations, not the entries each one
+    /// affected — the per-entry count is [`Self::record_eviction`] under
+    /// [`EvictionReason::Invalidated`], which reports nothing at all when the
+    /// invalidation marks entries stale instead of removing them.
+    fn record_table_invalidation(mode: InvalidationMode)
     where
         Self: Sized;
     fn update_hit_ratio(hits: u64, total: u64)
@@ -281,8 +459,12 @@ impl CacheMetrics for CachedSearchResult {
         search_results::EVICTIONS.add(1, &[reason.key_value()]);
     }
 
-    fn record_stale_rejection() {
-        search_results::STALE_REJECTIONS.add(1, &[]);
+    fn record_stale_rejection(reason: StaleRejectionReason) {
+        search_results::STALE_REJECTIONS.add(1, &[reason.key_value()]);
+    }
+
+    fn record_table_invalidation(mode: InvalidationMode) {
+        search_results::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {
@@ -324,8 +506,12 @@ impl CacheMetrics for CachedQueryResult {
         sql_results::EVICTIONS.add(1, &[reason.key_value()]);
     }
 
-    fn record_stale_rejection() {
-        sql_results::STALE_REJECTIONS.add(1, &[]);
+    fn record_stale_rejection(reason: StaleRejectionReason) {
+        sql_results::STALE_REJECTIONS.add(1, &[reason.key_value()]);
+    }
+
+    fn record_table_invalidation(mode: InvalidationMode) {
+        sql_results::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {
@@ -367,8 +553,12 @@ impl CacheMetrics for CachedEmbeddingResult {
         embeddings::EVICTIONS.add(1, &[reason.key_value()]);
     }
 
-    fn record_stale_rejection() {
-        embeddings::STALE_REJECTIONS.add(1, &[]);
+    fn record_stale_rejection(reason: StaleRejectionReason) {
+        embeddings::STALE_REJECTIONS.add(1, &[reason.key_value()]);
+    }
+
+    fn record_table_invalidation(mode: InvalidationMode) {
+        embeddings::TABLE_INVALIDATIONS.add(1, &[mode.key_value()]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {

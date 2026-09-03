@@ -60,12 +60,12 @@ pub struct CachedQueryResult {
     cached_at: Instant,
     /// When the query that produced this result began reading.
     ///
-    /// Serving this entry is only sound while none of [`Self::input_tables`]
-    /// has been invalidated since this instant, which is what
-    /// [`crate::QueryResultsCacheProvider::get_raw_key`] checks on every hit.
-    /// It is deliberately *not* [`Self::cached_at`]: an invalidation landing
-    /// between the read and the store must also disqualify the entry, and
-    /// `cached_at` is after both.
+    /// Serving this entry *as fresh* is only sound while none of
+    /// [`Self::input_tables`] has been invalidated since this instant, which is
+    /// what [`crate::QueryResultsCacheProvider::entry_validity`] rules on for
+    /// every hit. It is deliberately *not* [`Self::cached_at`]: an invalidation
+    /// landing between the read and the store must also disqualify the entry,
+    /// and `cached_at` is after both.
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
