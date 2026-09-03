@@ -301,7 +301,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 /// installed at two independent call sites — `MySQLTableFactory` in the dataset
 /// connector, and again in `catalogconnector::mysql` — and nothing ties them
 /// together: `with_function_support` is an optional builder step, so omitting it
-/// at either site compiles and degrades only against a live MySQL. The deny-list
+/// at either site compiles and degrades only against a live `MySQL`. The deny-list
 /// unit tests exercise the builder rather than the wiring, so they pass with
 /// either call site's install removed; only this test fails.
 #[tokio::test]
