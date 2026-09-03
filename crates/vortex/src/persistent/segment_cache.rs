@@ -395,34 +395,54 @@ impl SharedSegmentCache {
     /// A per-file view. `store` identifies the object store `path` is relative
     /// to; see [`StoreKey`].
     pub(crate) fn for_path(self: &Arc<Self>, store: StoreKey, path: Path) -> Arc<dyn SegmentCache> {
-        let state = self.path_states.as_ref().map(|path_states| {
-            // `entry` holds this shard's lock across the upgrade-or-insert, so a
-            // concurrent drop for the same path cannot unregister a state between
-            // the lookup and the insert.
-            match path_states.entry(path.clone()) {
-                Entry::Occupied(mut occupied) => {
-                    if let Some(live) = occupied.get().upgrade() {
-                        live
-                    } else {
-                        // Registered but every opener has dropped: replace the
-                        // expired weak rather than leaving a dead entry behind.
-                        let state = Arc::new(PathCacheState::default());
-                        occupied.insert(Arc::downgrade(&state));
-                        state
-                    }
-                }
-                Entry::Vacant(vacant) => {
-                    let state = Arc::new(PathCacheState::default());
-                    vacant.insert(Arc::downgrade(&state));
-                    state
-                }
-            }
-        });
+        let state = self.registered_state(&path);
         Arc::new(PathSegmentCache {
             shared: Arc::clone(self),
             store,
             path: Arc::new(path),
             state,
+        })
+    }
+
+    /// The insertion state registered for `path`, registering one if the path
+    /// has no live entry. `None` when this cache does not track retirement.
+    ///
+    /// Openers and retirement share this one path into the registry, so
+    /// whichever arrives second for a path finds the state the first registered
+    /// rather than minting a second one beside it.
+    fn registered_state(&self, path: &Path) -> Option<Arc<PathCacheState>> {
+        let path_states = self.path_states.as_ref()?;
+        // Registered and live is the overwhelmingly common case on the open
+        // path, and a read guard serves it without the key clone an `entry`
+        // needs. It is not a weaker check: `PathSegmentCache::drop` unregisters
+        // under this shard's *write* lock, so it cannot interleave here, and
+        // once this upgrade succeeds its `strong_count == 1` predicate can no
+        // longer pass. Release the guard before the fallback — taking `entry`
+        // on a shard this thread already holds would deadlock.
+        if let Some(live) = path_states.get(path).and_then(|state| state.upgrade()) {
+            return Some(live);
+        }
+        // `entry` holds the shard lock across the upgrade-or-insert, so a
+        // concurrent drop cannot unregister a state between the lookup and the
+        // insert, and the upgrade is retried under it because a registration
+        // can have landed since the read above.
+        Some(match path_states.entry(path.clone()) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(live) = occupied.get().upgrade() {
+                    live
+                } else {
+                    // Registered but every opener has dropped: replace the
+                    // expired weak rather than leaving a dead entry behind.
+                    let state = Arc::new(PathCacheState::default());
+                    occupied.insert(Arc::downgrade(&state));
+                    state
+                }
+            }
+            Entry::Vacant(vacant) => {
+                let state = Arc::new(PathCacheState::default());
+                vacant.insert(Arc::downgrade(&state));
+                state
+            }
         })
     }
 
@@ -447,36 +467,48 @@ impl SharedSegmentCache {
             return;
         }
 
-        // Mark every path that is *currently registered* retired before
-        // enumerating keys. A put that started before this mark incremented
-        // `active_puts`, so draining to zero makes its insert visible to the
-        // enumeration; a later put through one of these states observes `retired`
-        // and skips insertion. The drain is bounded — see
+        // Register a state for every retiring path — including paths nothing has
+        // open — and hold it for the rest of this call, then mark them all
+        // retired before enumerating keys. A put that started before the mark
+        // incremented `active_puts`, so waiting for zero proves its insert is
+        // visible to the enumeration; a put that starts after it observes
+        // `retired` and skips insertion. The drain is bounded — see
         // [`ACTIVE_PUT_DRAIN_TIMEOUT`] for what a timeout costs and why waiting
-        // forever costs more.
+        // forever costs more. An opener that lands between the two loops takes
+        // the registered state while it is still unretired, and it is that same
+        // mark-then-drain protocol that covers its put.
         //
-        // That covers openers this snapshot can see, and no more. A path whose
-        // registry entry is absent or whose weak has expired can be opened again
-        // after the snapshot: `for_path` mints a fresh state with
-        // `retired == false`, and a put through it can land after the key scan,
-        // leaving the retired path repopulated. Closing that needs a retirement
-        // marker installed under the same shard lock and kept until no stale
-        // opener can appear — tracked in spiceai/spiceai#12963, since it changes
-        // the no-permanent-tombstones property this design was built around.
+        // Registering rather than snapshotting is what puts such an opener on a
+        // state this call is tracking at all. A path with no live registry entry
+        // — the ordinary case for a file no scan holds open, which is what
+        // compaction retires — otherwise left `for_path` free to mint a fresh
+        // unretired state and repopulate a path this call had already cleared
+        // (#12963).
+        //
+        // A [`RetirementGuard`] owns the registrations, so a retirement tracks a
+        // path only while it is retiring it however this call ends. Every
+        // `await` below is a cancellation point, and the entry a drop at one of
+        // them would otherwise strand is permanent in practice: the path was
+        // just retired and unlinked, so nothing reopens it to replace the
+        // expired weak. Making cache residency follow logical reachability
+        // instead is spiceai/spiceai#12962.
         let mut retiring: Vec<&Path> = Vec::new();
         let mut states: Vec<Arc<PathCacheState>> = Vec::new();
-        if let Some(path_states) = self.path_states.as_ref() {
-            for path in &paths {
-                if let Some(state) = path_states.get(path).and_then(|state| state.upgrade()) {
-                    retiring.push(path);
-                    states.push(state);
-                }
+        for path in &paths {
+            if let Some(state) = self.registered_state(path) {
+                retiring.push(path);
+                states.push(state);
             }
         }
-        for state in &states {
+        let registrations = RetirementGuard {
+            cache: self,
+            states,
+            paths: &paths,
+        };
+        for state in &registrations.states {
             state.retired.store(true, Ordering::SeqCst);
         }
-        if !drain_active_puts(&states, ACTIVE_PUT_DRAIN_TIMEOUT).await {
+        if !drain_active_puts(&registrations.states, ACTIVE_PUT_DRAIN_TIMEOUT).await {
             // Proceeding is the lesser harm, and what it costs is bounded: a put
             // that inserts into a retired path removes its own entry once the
             // insert lands (see `put`), so a straggler leaves nothing behind
@@ -484,7 +516,7 @@ impl SharedSegmentCache {
             // unaffected either way — every caller has already deleted the file.
             let stalled: Vec<&Path> = retiring
                 .iter()
-                .zip(&states)
+                .zip(&registrations.states)
                 .filter(|(_, state)| state.active_puts.load(Ordering::SeqCst) > 0)
                 .map(|(path, _)| *path)
                 .collect();
@@ -568,12 +600,13 @@ impl SharedSegmentCache {
             }
         };
         // Both give-up arms above fall through here with nothing to invalidate
-        // rather than returning: the registry cleanup below has to run whichever
-        // way this ends. An opener that dropped while this call held its state
-        // could not unregister it — `PathSegmentCache::drop` saw the extra
-        // strong reference — so returning early would strand an expired entry
-        // that nothing will ever revisit, the paths here being unique per
-        // snapshot.
+        // rather than returning. Returning early would be correct now that
+        // `registrations` cleans up on the way out, but falling through keeps
+        // the two arms on the one exit the success path takes. An opener that
+        // dropped while this call held its state could not unregister it —
+        // `PathSegmentCache::drop` saw the extra strong reference — so the
+        // cleanup has to run whichever way this ends, the paths here being
+        // unique per snapshot and so never revisited.
         if !keys.is_empty() {
             for key in &keys {
                 self.cache.invalidate(key).await;
@@ -585,14 +618,27 @@ impl SharedSegmentCache {
             // removals.
             self.run_pending_tasks().await;
         }
+    }
 
+    /// Release this retirement's registrations and drop the registry entries for
+    /// `paths` that nothing else holds.
+    ///
+    /// Taking `states` by value is what orders the two: the entries cannot be
+    /// judged unheld while this call's own `Arc`s are still counted. Only the
+    /// paths just retired, not a sweep of the whole registry. A surviving entry
+    /// is one something still holds — a file some scan has open, one opened
+    /// mid-retirement, or a path a concurrent retirement is also retiring — and
+    /// each of those needs the state left in place.
+    ///
+    /// Called only from [`RetirementGuard::drop`], which is what puts completion
+    /// and cancellation on the one exit.
+    fn unregister_unheld(&self, states: Vec<Arc<PathCacheState>>, paths: &HashSet<Path>) {
         drop(states);
-        if let Some(path_states) = self.path_states.as_ref() {
-            // Only the paths just retired, not a sweep of the whole registry:
-            // every other entry belongs to a file some other scan still has open.
-            for path in &paths {
-                path_states.remove_if(path, |_, state| state.strong_count() == 0);
-            }
+        let Some(path_states) = self.path_states.as_ref() else {
+            return;
+        };
+        for path in paths {
+            path_states.remove_if(path, |_, state| state.strong_count() == 0);
         }
     }
 
@@ -689,6 +735,27 @@ struct ActivePutGuard<'a>(&'a PathCacheState);
 impl Drop for ActivePutGuard<'_> {
     fn drop(&mut self) {
         self.0.active_puts.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The registrations one [`SharedSegmentCache::invalidate_paths`] call holds for
+/// the batch it is retiring, released when that call ends — by returning or by
+/// being dropped at any of the `await`s between registering and finishing.
+///
+/// The states have to be dropped before the registry entries are judged unheld,
+/// which is why [`SharedSegmentCache::unregister_unheld`] takes them by value:
+/// its `strong_count() == 0` predicate counts this retirement's own `Arc`s until
+/// they go.
+struct RetirementGuard<'a> {
+    cache: &'a SharedSegmentCache,
+    states: Vec<Arc<PathCacheState>>,
+    paths: &'a HashSet<Path>,
+}
+
+impl Drop for RetirementGuard<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .unregister_unheld(std::mem::take(&mut self.states), self.paths);
     }
 }
 
@@ -838,6 +905,13 @@ impl Drop for PathSegmentCache {
 }
 #[cfg(test)]
 mod tests {
+    //! Every cache built here takes a `name` unique to its test. `new`
+    //! registers globally and `name` is the only label on the resulting series,
+    //! so two concurrent tests sharing one feed a single series from
+    //! independent counters — observed to make a delta reader read a stale
+    //! value, and to panic inside the SDK subtracting a larger previous sample
+    //! from a smaller current one.
+
     use std::collections::HashMap;
     use std::sync::Weak;
     use std::time::Duration;
@@ -1174,7 +1248,7 @@ mod tests {
     /// data, not just a wrong hit rate.
     #[tokio::test]
     async fn identical_paths_in_different_stores_do_not_collide() {
-        let shared = SharedSegmentCache::new(1 << 20, false, "test");
+        let shared = SharedSegmentCache::new(1 << 20, false, "stores");
         let path = Path::from("narrow/019ff413/019ff41a/data.vortex");
         let id = SegmentId::from(1);
 
@@ -1232,7 +1306,7 @@ mod tests {
         let segment = block.slice(0..SEGMENT_BYTES);
         let segment_ptr = segment.as_slice().as_ptr();
 
-        let shared = SharedSegmentCache::new(8 * 1024 * 1024, false, "test");
+        let shared = SharedSegmentCache::new(8 * 1024 * 1024, false, "trim");
         let cache = shared.for_path(test_store(), Path::from("coalesced.vortex"));
         let id = SegmentId::from(1);
         cache
@@ -1271,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_put_roundtrip_and_path_isolation() {
-        let shared = SharedSegmentCache::new(1 << 20, false, "test");
+        let shared = SharedSegmentCache::new(1 << 20, false, "roundtrip");
         let cache_a = shared.for_path(test_store(), Path::from("a.vortex"));
         let cache_b = shared.for_path(test_store(), Path::from("b.vortex"));
         let id = SegmentId::from(1);
@@ -1352,7 +1426,7 @@ mod tests {
 
     #[test]
     fn counter_callbacks_cannot_publish_hits_ahead_of_accesses() {
-        let counters = SharedSegmentCache::new(1_024, false, "test");
+        let counters = SharedSegmentCache::new(1_024, false, "counters");
         counters.accesses.store(1, Ordering::Relaxed);
         counters.hits.store(1, Ordering::Relaxed);
 
@@ -1570,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidates_exact_paths_only() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "exact-paths");
         let path_a = Path::from("snapshot-a/a.vortex");
         let path_b = Path::from("snapshot-b/b.vortex");
         let cache_a = shared.for_path(test_store(), path_a.clone());
@@ -1622,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidation_physically_evicts_entries_without_later_cache_activity() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "physical-eviction");
         let retired_path = Path::from("snapshot-a/retired.vortex");
         let live_path = Path::from("snapshot-b/live.vortex");
         let retired = shared.for_path(test_store(), retired_path.clone());
@@ -1667,7 +1741,7 @@ mod tests {
     /// inline. Regression test for spiceai/spiceai#12964.
     #[tokio::test(start_paused = true)]
     async fn a_stuck_put_bounds_the_retirement_drain_instead_of_holding_it() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "drain-bound");
         let path = Path::from("snapshot-a/stuck.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
@@ -1722,7 +1796,7 @@ mod tests {
             .expect("build a runtime with a one-thread blocking pool");
 
         runtime.block_on(async {
-            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let shared = SharedSegmentCache::new(1 << 20, true, "saturated-pool");
             let path = Path::from("snapshot-a/saturated.vortex");
             let file = shared.for_path(test_store(), path.clone());
             let id = SegmentId::from(1);
@@ -1778,7 +1852,7 @@ mod tests {
             .expect("build a runtime with a one-thread blocking pool");
 
         runtime.block_on(async {
-            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let shared = SharedSegmentCache::new(1 << 20, true, "scan-give-up");
             let path = Path::from("snapshot-a/stranded.vortex");
             let file = shared.for_path(test_store(), path.clone());
             file.put(SegmentId::from(1), ByteBuffer::from(vec![1u8, 2, 3, 4]))
@@ -1854,7 +1928,7 @@ mod tests {
     async fn stuck_puts_on_many_paths_share_one_drain_deadline() {
         const STUCK_PATHS: u32 = 8;
 
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "shared-deadline");
         let mut files = Vec::new();
         let mut paths = HashSet::new();
         for index in 0..STUCK_PATHS {
@@ -1905,7 +1979,7 @@ mod tests {
         // get inserted stays resident: sized under it, Moka would evict the
         // entry on weight alone and the assertion would hold with or without the
         // code it exists to check.
-        let shared = SharedSegmentCache::new(64 << 20, true, "test");
+        let shared = SharedSegmentCache::new(64 << 20, true, "coalesced-trim");
         let path = Path::from("snapshot-a/trimming.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
@@ -1953,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn path_state_stays_registered_until_the_last_open_file_drops() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        let shared = SharedSegmentCache::new(1 << 20, true, "registration");
         let path = Path::from("snapshot/shared.vortex");
         let first = shared.for_path(test_store(), path.clone());
         let second = shared.for_path(test_store(), path.clone());
@@ -1992,6 +2066,192 @@ mod tests {
         assert!(
             !states.contains_key(&path),
             "the registry entry is removed when the last opener drops"
+        );
+    }
+
+    /// A file opened while a retirement is in flight must not repopulate the
+    /// path that retirement is clearing (#12963).
+    ///
+    /// The retirement is held mid-flight by an in-flight put on a second
+    /// retiring path, which parks its drain loop on a `sleep` and makes a single
+    /// poll land there deterministically. What the assertions rely on is only
+    /// that no key has been invalidated yet, which the resident-segment check
+    /// below establishes directly.
+    ///
+    /// The property asserted is the strong one: a put through a handle opened
+    /// mid-retirement never lands. That is what makes the test independent of
+    /// where in the retirement the put arrives — including the production window
+    /// after the key scan, where nothing would remove it afterwards — and it is
+    /// asserted *before* the retirement resumes so that the scan cannot be what
+    /// makes it pass.
+    #[tokio::test]
+    async fn a_file_opened_during_retirement_cannot_repopulate_it() {
+        let shared = SharedSegmentCache::new(1 << 20, true, "retirement");
+        let retiring = Path::from("snapshot-a/retiring.vortex");
+        let keeper = Path::from("snapshot-a/keeper.vortex");
+        // Retired without ever being opened, before or during. Nothing else can
+        // drop the state this retirement registers for it — the last-opener path
+        // needs an opener — so it is the one that proves the registration is
+        // temporary rather than a tombstone.
+        let never_opened = Path::from("snapshot-a/never-opened.vortex");
+        let states = shared
+            .path_states
+            .as_ref()
+            .expect("retirement tracking enabled");
+        let resident = SegmentId::from(1);
+        let late = SegmentId::from(2);
+
+        // Cache a segment under the retiring path, then drop the opener: the
+        // registry keeps only a `Weak`, so nothing is left for the retirement to
+        // find. This is the shape a compaction sees for any file no scan holds
+        // open at the moment its snapshot is retired.
+        {
+            let opener = shared.for_path(test_store(), retiring.clone());
+            opener
+                .put(resident, ByteBuffer::from(vec![1u8, 2, 3, 4]))
+                .await
+                .expect("put for the retiring path should not error");
+        }
+        assert!(
+            !states.contains_key(&retiring),
+            "the dropped opener must leave no registered state for the retirement to snapshot"
+        );
+
+        // A second retiring path, held open with one put registered, parks the
+        // retirement in its drain loop: it stands in for a put that started
+        // before the mark, which is what that loop exists to wait for.
+        let keeper_cache = shared.for_path(test_store(), keeper.clone());
+        let keeper_state = states
+            .get(&keeper)
+            .and_then(|state| state.upgrade())
+            .expect("the open keeper file registers a state");
+        keeper_state.active_puts.fetch_add(1, Ordering::SeqCst);
+
+        let mut retirement = std::pin::pin!(shared.invalidate_paths(HashSet::from([
+            retiring.clone(),
+            keeper.clone(),
+            never_opened.clone(),
+        ])));
+        assert!(
+            futures::poll!(retirement.as_mut()).is_pending(),
+            "the in-flight put must park the retirement, leaving it mid-flight with every path marked"
+        );
+
+        // Exactly the opener the retirement snapshot could not have seen.
+        let opened_mid_retirement = shared.for_path(test_store(), retiring.clone());
+        assert!(
+            opened_mid_retirement
+                .get(resident)
+                .await
+                .expect("get for the resident segment should not error")
+                .is_some(),
+            "the retirement must still be short of invalidating any key, or it is not mid-flight at all"
+        );
+        opened_mid_retirement
+            .put(late, ByteBuffer::from(vec![5u8, 6, 7, 8]))
+            .await
+            .expect("a put for a retiring path is ignored, not an error");
+        assert!(
+            opened_mid_retirement
+                .get(late)
+                .await
+                .expect("get for the retiring path should not error")
+                .is_none(),
+            "a file opened mid-retirement must observe the retirement, not cache through it"
+        );
+
+        keeper_state.active_puts.fetch_sub(1, Ordering::SeqCst);
+        // Last-opener removal counts strong references, so this test's own
+        // upgrade has to go before the registry can be asserted on below.
+        drop(keeper_state);
+        retirement.await;
+
+        assert_eq!(
+            shared.entry_count().await,
+            0,
+            "neither the segment resident before the retirement nor the one a mid-retirement opener tried to add may survive it"
+        );
+
+        assert!(
+            !states.contains_key(&never_opened),
+            "a retirement that registers a state for a path nothing opens must not leave it behind"
+        );
+
+        drop(keeper_cache);
+        drop(opened_mid_retirement);
+        assert!(
+            !states.contains_key(&retiring),
+            "the state a mid-retirement opener took over must still go when that opener drops"
+        );
+    }
+
+    /// A retirement dropped mid-flight must release the registrations it made,
+    /// not leave them behind as tombstones (#13427).
+    ///
+    /// Every `await` between registering the states and releasing them is a
+    /// cancellation point, and the entry a drop strands is permanent in
+    /// practice: the path has just been unlinked, so nothing reopens it to
+    /// replace the expired weak, and compaction retires in batches.
+    ///
+    /// The subject is a path nothing has ever opened. Its only registration is
+    /// the one this retirement makes, so its removal cannot be attributed to an
+    /// opener dropping — the way the other registry assertions in this module
+    /// can be. The drain is parked exactly as in
+    /// `a_file_opened_during_retirement_cannot_repopulate_it`, which puts a
+    /// single poll deterministically at the first await after registration.
+    #[tokio::test]
+    async fn a_retirement_dropped_mid_flight_releases_its_registrations() {
+        let shared = SharedSegmentCache::new(1 << 20, true, "retirement");
+        let keeper = Path::from("snapshot-a/keeper.vortex");
+        let never_opened = Path::from("snapshot-a/never-opened.vortex");
+        let states = shared
+            .path_states
+            .as_ref()
+            .expect("retirement tracking enabled");
+
+        let keeper_cache = shared.for_path(test_store(), keeper.clone());
+        let keeper_state = states
+            .get(&keeper)
+            .and_then(|state| state.upgrade())
+            .expect("the open keeper file registers a state");
+        keeper_state.active_puts.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let mut retirement = std::pin::pin!(
+                shared.invalidate_paths(HashSet::from([keeper.clone(), never_opened.clone()]))
+            );
+            assert!(
+                futures::poll!(retirement.as_mut()).is_pending(),
+                "the in-flight put must park the retirement, leaving it mid-flight"
+            );
+            // Without this the test is vacuous: a registration that was never
+            // made cannot be stranded, and nothing else in this test would
+            // notice a poll that stopped short of `registered_state`.
+            assert!(
+                states.contains_key(&never_opened),
+                "the parked retirement must already have registered the path it is retiring"
+            );
+        }
+
+        // Only the retirement ever registered `never_opened`, so its own drop
+        // is the whole reason the entry can go.
+        assert!(
+            !states.contains_key(&never_opened),
+            "a retirement dropped mid-flight must not strand the registration it made"
+        );
+        // The same drop must not evict a path something still holds: the keeper
+        // is open, and its state has to outlive any one retirement of it.
+        assert!(
+            states.contains_key(&keeper),
+            "a dropped retirement must leave the registration of a path an opener still holds"
+        );
+
+        keeper_state.active_puts.fetch_sub(1, Ordering::SeqCst);
+        drop(keeper_state);
+        drop(keeper_cache);
+        assert!(
+            !states.contains_key(&keeper),
+            "the keeper's registration must still go when its last opener drops"
         );
     }
 }
