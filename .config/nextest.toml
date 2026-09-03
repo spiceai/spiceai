@@ -169,7 +169,7 @@ retries = 0
 # to rescue.
 #
 # `slow-timeout` raises the wall-clock ceiling from the global 360s (120s x 3) to
-# 1200s (120s x 10). The slowest test is the SF1 TPC-DS + ClickBench comparison,
+# 1440s (120s x 12), matching the convergence binaries above. The slowest test is the SF1 TPC-DS + ClickBench comparison,
 # measured at 127.7s locally with fixtures already generated; CI pays `dsdgen` on
 # every fresh runner on top of that, and contention on the shared pool has been
 # measured multiplying runtimes 4.6x. With `retries = 0` a wall-clock kill is an
@@ -180,4 +180,4 @@ retries = 0
 filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test)'
 test-group = "result-correctness"
 retries = 0
-slow-timeout = { period = "120s", terminate-after = 10 }
+slow-timeout = { period = "120s", terminate-after = 12 }
