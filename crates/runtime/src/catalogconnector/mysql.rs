@@ -89,12 +89,15 @@ impl CatalogConnector for MySQLCatalog {
             })?;
 
         let pool = Arc::new(pool);
-        // The same deny-list the `mysql` *dataset* connector installs. Without
-        // it every function MySQL cannot evaluate is unparsed into the pushed-down
-        // SQL verbatim and fails the query remotely: `btrim`, which a plain
-        // `trim(col)` becomes (issue #13794), and the whole Spice-only set that
-        // issue #10703 exists to keep local — `json_get_str` reaches MySQL as
-        // `FUNCTION <db>.json_get_str does not exist`.
+        // Install the Spice function deny-list so federation evaluates locally
+        // anything MySQL cannot run, instead of unparsing it into the SQL sent to
+        // MySQL where it fails as an unknown function. That covers the Spice-only
+        // UDFs `json_get_str`, the embedding/distance functions and the rest
+        // (issues #10703 and #13664), and `btrim` — which a plain `trim(col)`
+        // becomes, since `trim` is one of that UDF's aliases and the unparser
+        // emits the canonical name (issue #13794). The dataset connector installs
+        // the same list; `mysql_btrim_evaluates_locally_on_both_registration_paths`
+        // covers both call sites.
         let table_factory = Arc::new(
             MySQLTableFactory::new(Arc::clone(&pool))
                 .with_function_support(deny_spice_functions_for_mysql_table_providers()),

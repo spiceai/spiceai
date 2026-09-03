@@ -447,9 +447,10 @@ fn mysql_connection_params(port: u16) -> std::collections::HashMap<String, Strin
     ])
 }
 
-/// A three-row table whose values make `trim` observable: padded with spaces,
+/// A six-row table whose values make `trim` observable: padded with spaces,
 /// padded with `x` so the two-argument character-set form has something to
-/// strip, and padded on one side only.
+/// strip, padded on one side only, and three padded with Unicode space
+/// separators. Every assertion that counts rows expects all six.
 #[instrument]
 async fn init_trim_table(port: u16) -> Result<(), anyhow::Error> {
     let pool = get_mysql_conn(port)?;

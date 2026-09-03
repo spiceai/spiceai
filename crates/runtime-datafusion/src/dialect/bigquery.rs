@@ -1169,6 +1169,14 @@ impl Dialect for SpiceBigQueryDialect {
     fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
         self.inner.string_literal_to_sql(s)
     }
+
+    fn group_by_matches_select_subexpressions(&self) -> bool {
+        self.inner.group_by_matches_select_subexpressions()
+    }
+
+    fn range_window_default_nulls_first(&self, asc: bool) -> Option<bool> {
+        self.inner.range_window_default_nulls_first(asc)
+    }
 }
 
 #[cfg(test)]
@@ -2110,6 +2118,25 @@ mod tests {
         );
     }
 
+    /// [`timestamp_scan`] plus a value column, for a window function to aggregate.
+    fn windowed_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "ts",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+            datafusion::arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let source = Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+            schema,
+        )) as Arc<dyn datafusion::logical_expr::TableSource>;
+        datafusion::logical_expr::LogicalPlanBuilder::scan("t", source, None).expect("scan t")
+    }
+
     /// A scan of `t(ts)` carrying a UTC nanosecond timestamp, which most arms of
     /// [`the_wrapper_forwards_every_bigquery_specific_rendering`] filter or project over.
     fn timestamp_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
@@ -2230,6 +2257,71 @@ mod tests {
             .build()
             .expect("build");
 
+        // A grouped timestamp projected through a wrapper. Nothing else in this
+        // test reaches `group_by_matches_select_subexpressions`, and a wrapper
+        // that inherits its permissive default renders one flat SELECT that
+        // BigQuery refuses with "neither grouped nor aggregated".
+        let wrapped_grouping = {
+            let grouped = timestamp_scan()
+                .aggregate(
+                    vec![datafusion::functions::expr_fn::date_trunc(
+                        lit("week"),
+                        col("t.ts"),
+                    )],
+                    vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64))],
+                )
+                .expect("aggregate")
+                .build()
+                .expect("build aggregate");
+            let mut outputs = grouped.schema().columns().into_iter();
+            let group_output = outputs.next().expect("the grouping expression's output");
+            let count_output = outputs.next().expect("the aggregate's output");
+            datafusion::logical_expr::LogicalPlanBuilder::from(grouped)
+                .project(vec![
+                    datafusion::logical_expr::cast(
+                        datafusion::logical_expr::Expr::Column(group_output),
+                        DataType::Date32,
+                    )
+                    .alias("week_start"),
+                    datafusion::logical_expr::Expr::Column(count_output).alias("n"),
+                ])
+                .expect("projection over the aggregate")
+                .build()
+                .expect("build")
+        };
+
+        // `SUM(v) OVER (ORDER BY ts)`, whose frame a plan normalizes to RANGE and
+        // whose placement it normalizes to ASC NULLS LAST — the combination
+        // BigQuery refuses. A wrapper inheriting the permissive default renders
+        // the NULLS clause and the statement fails.
+        let range_window = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                        datafusion::functions_aggregate::sum::sum_udaf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new(Some(false)),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
         for (property, plan, must_contain, must_not_contain) in [
             (
                 "timestamp literal offset (fork PR #144)",
@@ -2260,6 +2352,27 @@ mod tests {
                 &truncated,
                 "TIMESTAMP_TRUNC(`t`.`ts`, MONTH)",
                 "date_trunc",
+            ),
+            (
+                // BigQuery matches a GROUP BY entry against a whole select item
+                // and a column reference and nothing in between, so the aggregate
+                // has to reach it in a scope of its own. `FROM (SELECT` is that
+                // scope; a flat rendering puts the grouping expression in the
+                // outer select list, where the statement is refused.
+                "grouping expression a select item wraps",
+                &wrapped_grouping,
+                "FROM (SELECT",
+                "CAST(TIMESTAMP_TRUNC",
+            ),
+            (
+                // BigQuery accepts no NULL placement but its own inside a RANGE
+                // clause, and an ORDER BY with no explicit frame implies RANGE for
+                // an aggregate. The placement has to be spelled as a leading key;
+                // a surviving NULLS clause is the rendering BigQuery refuses.
+                "RANGE window NULL placement",
+                &range_window,
+                "IS NULL ASC",
+                "NULLS LAST",
             ),
         ] {
             let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);

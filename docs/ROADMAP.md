@@ -15,10 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### [v2.2.1](https://github.com/spiceai/spiceai/milestone/111) (August 2026)
-
-**Focus:** Patch release — write-back durability, Cayenne, and accelerator stability fixes.
-
 ### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (September 2026)
 
 **Focus:** Schema Registry & Write-Back Acceleration.
