@@ -3631,14 +3631,14 @@ mod tests {
         if let Some(error) = terminal_refresh_error(&recovered, false) {
             emit_refresh_errors(generation_change_labels(), refresh_error_reason(error));
         }
-        assert_eq!(
-            refresh_error_count(
-                &registry,
-                "generation_change_metric_test",
-                metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
-            ),
-            0.0,
-            "a recovered 412 must emit zero dataset_acceleration_refresh_errors points"
+        let recovered_count = refresh_error_count(
+            &registry,
+            "generation_change_metric_test",
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            recovered_count.abs() < f64::EPSILON,
+            "a recovered 412 must emit zero dataset_acceleration_refresh_errors points (got {recovered_count})"
         );
 
         let exhausted_strategy = FibonacciBackoffBuilder::new()
@@ -3652,14 +3652,14 @@ mod tests {
         let recorded = terminal_refresh_error(&exhausted, false)
             .expect("an exhausted generation-change is a refresh error");
         emit_refresh_errors(generation_change_labels(), refresh_error_reason(recorded));
-        assert_eq!(
-            refresh_error_count(
-                &registry,
-                "generation_change_metric_test",
-                metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
-            ),
-            1.0,
-            "an exhausted 412 must emit exactly one reason-labeled refresh error"
+        let exhausted_count = refresh_error_count(
+            &registry,
+            "generation_change_metric_test",
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            (exhausted_count - 1.0).abs() < f64::EPSILON,
+            "an exhausted 412 must emit exactly one reason-labeled refresh error (got {exhausted_count})"
         );
     }
 
