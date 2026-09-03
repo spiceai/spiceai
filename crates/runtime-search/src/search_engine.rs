@@ -480,6 +480,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
+            // Captured before the search reads anything: the stored entry
+            // carries this stamp so `get_raw_key_if_fresh` can reject it once
+            // any table it read is invalidated — including an invalidation
+            // that lands while this search is still streaming its results.
+            let read_started_at = std::time::Instant::now();
             let search_key = SearchKey::from(req);
             let cache_control = request_context.cache_control();
 
@@ -502,13 +507,20 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
             match (
                 cache_control,
-                cache_provider.get_raw_key(&raw_cache_key.as_u64()).await,
+                cache_provider
+                    .get_raw_key_if_fresh(&raw_cache_key.as_u64())
+                    .await,
             ) {
                 (CacheControl::NoCache, _) => {
                     tracing::trace!("Search cache bypass");
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheBypass,
                     )
                 }
@@ -522,7 +534,12 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                     tracing::trace!("Search cache miss");
                     let results = self.search(req).await?;
                     (
-                        wrap_cache_to_result(raw_cache_key, results, Arc::clone(&cache_provider)),
+                        wrap_cache_to_result(
+                            raw_cache_key,
+                            results,
+                            Arc::clone(&cache_provider),
+                            read_started_at,
+                        ),
                         CacheStatus::CacheMiss,
                     )
                 }
@@ -749,10 +766,15 @@ fn is_field_not_found_on_unrelated_table(tbl: &TableReference, e: &DataFusionErr
     })
 }
 
+/// `read_started_at` is when the search began reading its tables; the stored
+/// entry carries it so a later lookup can reject the entry if any of those
+/// tables is invalidated at or after that instant — see
+/// [`TabledCacheProvider::get_raw_key_if_fresh`].
 fn wrap_cache_to_result(
     key: RawCacheKey,
     aggregation_result: HashMap<TableReference, AggregationResult>,
     cache_provider: Arc<dyn TabledCacheProvider<CachedSearchResult> + Send + Sync>,
+    read_started_at: std::time::Instant,
 ) -> HashMap<TableReference, AggregationResult> {
     // each hashmap entry is an aggregation result which contains a sendable record batch stream
     // for each table reference, we need to wrap the batch stream in another stream to pull out the record batches
@@ -860,6 +882,7 @@ fn wrap_cache_to_result(
         let result = CachedSearchResult {
             results: Arc::new(results),
             input_tables: Arc::new(expected_keys),
+            read_started_at,
         };
 
         if result.get_memory_size() > cache_provider.max_size() {

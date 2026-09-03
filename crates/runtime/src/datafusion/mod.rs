@@ -85,7 +85,9 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
-use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use cache::{
+    CacheProvider, CachedLogicalPlan, Caching, QueryResultsCacheProvider, key::RawCacheKey,
+};
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
@@ -4155,7 +4157,7 @@ impl DataFusion {
 
     pub fn plans_cache_provider(
         &self,
-    ) -> Option<Arc<dyn TabledCacheProvider<LogicalPlan> + Send + Sync>> {
+    ) -> Option<Arc<dyn TabledCacheProvider<CachedLogicalPlan> + Send + Sync>> {
         self.caching.plans.clone()
     }
 
@@ -4953,14 +4955,26 @@ impl DataFusion {
         cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
+        // Captured before planning reads any catalog state: the stored plan
+        // carries this stamp so `get_raw_key_if_fresh` can reject it once any
+        // table it scans is invalidated — including an invalidation that lands
+        // while this very planning pass is still running.
+        // `create_logical_plan` can block on pending dataset initializations,
+        // so that window is not negligible; without the stamp, the store below
+        // resurrects a plan the invalidation could never see (`moka`
+        // predicates match only entries that exist when they register), and
+        // the plan pins pre-invalidation table state through the
+        // `Arc<dyn TableSource>` in its scans.
+        let planned_at = std::time::Instant::now();
+
         let plans_cache = if let Some(cache_key) = cache_key_opt {
             let plans_cache = self.plans_cache_provider();
 
             if let Some(cache) = plans_cache.as_ref()
-                && let Some(plan) = cache.get_raw_key(&cache_key.as_u64()).await
+                && let Some(cached) = cache.get_raw_key_if_fresh(&cache_key.as_u64()).await
             {
                 tracing::trace!("using cached plan for {sql}");
-                return Ok(plan);
+                return Ok(cached.plan);
             }
             plans_cache
         } else {
@@ -4973,7 +4987,12 @@ impl DataFusion {
             && let Some(cache_key) = cache_key_opt
         {
             tracing::trace!("caching plan for {sql}");
-            cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
+            cache
+                .put_raw_key(
+                    &cache_key.as_u64(),
+                    CachedLogicalPlan::new(plan.clone(), planned_at),
+                )
+                .await;
         }
 
         Ok(plan)
@@ -6109,6 +6128,96 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    /// A plan whose planning straddled an invalidation of its table must not
+    /// be served from the plans cache.
+    ///
+    /// The racing store is simulated directly: the plan is stamped as planned
+    /// *before* the invalidation but stored *after* it, which is exactly what
+    /// a planning pass that outlives a concurrent refresh, DML write, or
+    /// schema change produces — and what the invalidation's own entry removal
+    /// can never reach, since the entry does not exist when it runs. The
+    /// wiring under test is `get_or_create_logical_plan` using the
+    /// freshness-checked lookup: served stale, it would keep the poisoned
+    /// entry; replanning, it overwrites it with a fresh one.
+    #[tokio::test]
+    async fn test_get_or_create_logical_plan_rejects_plan_from_before_invalidation() {
+        static SQL: &str = "SELECT id FROM plans_tbl";
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let table = MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![arrow::array::RecordBatch::new_empty(schema)]],
+        )
+        .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare("plans_tbl"), Arc::new(table))
+            .expect("should register table");
+
+        let session = df.ctx.state();
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        let cache_provider = df
+            .plans_cache_provider()
+            .expect("plans cache should be configured");
+
+        // The racing planner began before the invalidation...
+        let stale_planned_at = std::time::Instant::now();
+        df.caching()
+            .invalidate_for_table(TableReference::bare("plans_tbl"))
+            .await
+            .expect("invalidation should succeed");
+
+        // ...and stores its plan afterwards, where the invalidation's entry
+        // removal can no longer reach it.
+        let stale_plan = df
+            .create_logical_plan(&session, SQL)
+            .await
+            .expect("should plan directly");
+        cache_provider
+            .put_raw_key(
+                &raw_cache_key.as_u64(),
+                CachedLogicalPlan::new(stale_plan, stale_planned_at),
+            )
+            .await;
+
+        // The lookup must reject the stale entry and replan.
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+            .await
+            .expect("logical plan");
+
+        // Served stale, the poisoned entry would remain and still fail the
+        // freshness check; replanned, the store overwrote it with a fresh one.
+        assert!(
+            cache_provider
+                .get_raw_key_if_fresh(&raw_cache_key.as_u64())
+                .await
+                .is_some(),
+            "the stale plan must be replaced by a freshly planned, servable entry"
+        );
     }
 
     #[cfg(all(feature = "duckdb", feature = "snapshots",))]

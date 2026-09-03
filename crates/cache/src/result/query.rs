@@ -235,6 +235,12 @@ impl AsTableRefs for CachedQueryResult {
     }
 }
 
+impl crate::ReadStartedAt for CachedQueryResult {
+    fn read_started_at(&self) -> Instant {
+        self.read_started_at
+    }
+}
+
 pub struct CachedStream {
     /// Vector of record batches
     data: Arc<Vec<RecordBatch>>,

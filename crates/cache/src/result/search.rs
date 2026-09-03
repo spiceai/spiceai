@@ -85,11 +85,22 @@ impl CachedAggregationResult {
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
     pub input_tables: Arc<HashSet<TableReference>>,
+    /// When the search that produced this result began reading its tables.
+    /// Consulted by [`crate::TabledCacheProvider::get_raw_key_if_fresh`]: a
+    /// result whose tables were invalidated at or after this instant may hold
+    /// pre-invalidation rows and is treated as a miss.
+    pub read_started_at: std::time::Instant,
 }
 
 impl AsTableRefs for CachedSearchResult {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
         Arc::clone(&self.input_tables)
+    }
+}
+
+impl crate::ReadStartedAt for CachedSearchResult {
+    fn read_started_at(&self) -> std::time::Instant {
+        self.read_started_at
     }
 }
 
@@ -163,6 +174,7 @@ mod tests {
                 result.clone(),
             )])),
             input_tables: Arc::new(HashSet::new()),
+            read_started_at: std::time::Instant::now(),
         };
         assert!(
             cached.get_memory_size() * 100 < scan_batch.get_array_memory_size(),
@@ -197,6 +209,7 @@ mod tests {
                 ),
             )])),
             input_tables: Arc::new(HashSet::from([TableReference::bare("docs")])),
+            read_started_at: std::time::Instant::now(),
         }
     }
 
