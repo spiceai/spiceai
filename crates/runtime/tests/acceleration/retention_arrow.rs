@@ -153,7 +153,7 @@ async fn test_partitioned_arrow_retention_sql_applies_on_refresh_without_retenti
 
 /// The retention period for the tests below. Rows older than this are what a retention
 /// pass is supposed to delete.
-const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_mins(60);
+const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Rows this many minutes old, so they sit well outside [`RETENTION_PERIOD`] but well
 /// inside the refresh window the dataset declares.
@@ -174,11 +174,12 @@ fn write_straddling_source(path: &std::path::Path) -> Result<(), anyhow::Error> 
     let now = chrono::Utc::now();
     let mut csv = String::from("id,ts\n");
     for i in 0..STALE_ROWS {
-        let ts = now - chrono::Duration::minutes(STALE_AGE_MINUTES + i as i64);
+        let offset = i64::try_from(i)?;
+        let ts = now - chrono::Duration::minutes(STALE_AGE_MINUTES + offset);
         writeln!(csv, "{},{}", i, ts.format("%Y-%m-%dT%H:%M:%S%.6fZ"))?;
     }
     for i in 0..FRESH_ROWS {
-        let ts = now - chrono::Duration::seconds(i as i64);
+        let ts = now - chrono::Duration::seconds(i64::try_from(i)?);
         writeln!(
             csv,
             "{},{}",
@@ -274,7 +275,7 @@ async fn test_arrow_time_retention_with_a_check_interval_evicts_the_stale_rows()
                     .await?;
 
             let fresh = i64::try_from(FRESH_ROWS)?;
-            let evicted = wait_until_true(std::time::Duration::from_secs(60), || async {
+            let evicted = wait_until_true(std::time::Duration::from_mins(1), || async {
                 crate::acceleration::row_count(&rt, name)
                     .await
                     .is_ok_and(|c| c == fresh)

@@ -2446,7 +2446,7 @@ impl RetentionBuilder {
         // Add time-based filter if period and time_column are provided
         if let Some(period) = self.time_period {
             let Some(time_column) = self.time_column else {
-                return Err(RetentionRefusal::NoTimeColumn);
+                return Err(RetentionRefusal::TimeColumnUnset);
             };
 
             filters.push(DataRetentionFilter::Time {
@@ -2466,16 +2466,14 @@ impl RetentionBuilder {
         }
 
         if filters.is_empty() {
-            return Err(RetentionRefusal::NoFilter);
+            return Err(RetentionRefusal::NothingToDelete);
         }
 
         // Checked after the filters so that a configuration missing both is still
         // reported by the filter arm, as it was before the interval had an arm at
         // all: `retention_check_interval` has no default, so this is the arm a
         // dataset reaches when it configures everything else a policy needs.
-        let check_interval = self
-            .check_interval
-            .ok_or(RetentionRefusal::NoCheckInterval)?;
+        let check_interval = self.check_interval.ok_or(RetentionRefusal::Unscheduled)?;
 
         Ok(Retention {
             filters,
@@ -2496,11 +2494,11 @@ const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accel
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetentionRefusal {
     /// Neither `retention_period` nor `retention_sql` says what to delete.
-    NoFilter,
+    NothingToDelete,
     /// `retention_period` is set but `time_column` does not say what to compare.
-    NoTimeColumn,
+    TimeColumnUnset,
     /// Nothing says how often to delete, and `retention_check_interval` has no default.
-    NoCheckInterval,
+    Unscheduled,
 }
 
 impl RetentionRefusal {
@@ -2511,13 +2509,13 @@ impl RetentionRefusal {
         // otherwise break this line in two and forge a second one.
         let dataset_name = dataset_name.escape_debug();
         let cause_and_fix = match self {
-            Self::NoFilter => {
+            Self::NothingToDelete => {
                 "Cause: neither `retention_period` nor `retention_sql` is set, so nothing says which rows to delete. Set one of them."
             }
-            Self::NoTimeColumn => {
+            Self::TimeColumnUnset => {
                 "Cause: time-based retention compares `time_column` against the cutoff, and it is not set. Set `time_column` on the dataset, or delete by expression with `retention_sql` instead."
             }
-            Self::NoCheckInterval => {
+            Self::Unscheduled => {
                 "Cause: `retention_check_interval` is missing or is not a valid duration, and it has no default. Set it, for example `retention_check_interval: 1h`."
             }
         };
@@ -2832,7 +2830,7 @@ mod tests {
     fn test_a_retention_policy_without_a_check_interval_is_refused_and_named() {
         assert_eq!(
             interval_less_builder().assemble().err(),
-            Some(RetentionRefusal::NoCheckInterval),
+            Some(RetentionRefusal::Unscheduled),
             "a policy whose only missing setting is `retention_check_interval` must refuse with that reason, not silently"
         );
         assert!(
@@ -2871,7 +2869,7 @@ mod tests {
                 .enabled(true)
                 .assemble()
                 .err(),
-            Some(RetentionRefusal::NoTimeColumn)
+            Some(RetentionRefusal::TimeColumnUnset)
         );
     }
 
@@ -2887,7 +2885,7 @@ mod tests {
                     .enabled(true)
                     .assemble()
                     .err(),
-                Some(RetentionRefusal::NoFilter),
+                Some(RetentionRefusal::NothingToDelete),
                 "check_interval={check_interval:?}"
             );
         }
@@ -2896,9 +2894,9 @@ mod tests {
     #[test]
     fn test_every_retention_refusal_names_the_dataset_the_impact_and_the_fix() {
         for refusal in [
-            RetentionRefusal::NoFilter,
-            RetentionRefusal::NoTimeColumn,
-            RetentionRefusal::NoCheckInterval,
+            RetentionRefusal::NothingToDelete,
+            RetentionRefusal::TimeColumnUnset,
+            RetentionRefusal::Unscheduled,
         ] {
             let message = refusal.message("events");
             assert!(
@@ -2923,7 +2921,7 @@ mod tests {
     #[test]
     fn test_a_refusal_cannot_forge_a_second_log_line_through_the_dataset_name() {
         // A quoted Spicepod identifier may legally contain a newline.
-        let message = RetentionRefusal::NoCheckInterval
+        let message = RetentionRefusal::Unscheduled
             .message("events\n2026-01-01T00:00:00Z ERROR forged: line");
         assert!(
             !message.contains('\n'),
@@ -2958,7 +2956,7 @@ mod tests {
 
     #[test]
     fn test_the_missing_check_interval_refusal_names_the_setting_that_has_no_default() {
-        let message = RetentionRefusal::NoCheckInterval.message("events");
+        let message = RetentionRefusal::Unscheduled.message("events");
         assert!(
             message.contains("`retention_check_interval`") && message.contains("no default"),
             "the refusal must name the unset setting and say it has no default: {message}"
