@@ -539,12 +539,23 @@ fn check_non_null_subsequences(rows: usize, comparators: &[KeyComparator]) -> Op
     None
 }
 
-/// Whether two adjacent rows are *known* equal on every one of `keys`. A pair a
-/// `NULL` leaves unjudged is not known-equal, so it ends the tie group rather
-/// than silently extending it.
+/// Whether two adjacent rows are *known* equal on every one of `keys`.
+///
+/// Treating two `NULL`s as unequal here would reset the group on every row of a
+/// `NULL` run and hide inversions inside it: `ORDER BY k1, k2` over
+/// `[(NULL, 2), (NULL, NULL), (NULL, 1)]` is illegal under `NULLS FIRST` and
+/// `NULLS LAST` alike, and every one of its pairs ties on `k1`.
 fn tied_on(keys: &[KeyComparator], a: usize, b: usize) -> bool {
     keys.iter().all(|KeyComparator { array, compare, .. }| {
-        !array.is_null(a) && !array.is_null(b) && compare(a, b) == Ordering::Equal
+        match (array.is_null(a), array.is_null(b)) {
+            // Equal under every placement convention — the same reasoning the
+            // adjacent walk uses to keep checking later columns.
+            (true, true) => true,
+            (false, false) => compare(a, b) == Ordering::Equal,
+            // Exactly one NULL: placement decides this pair, which is not a
+            // known tie, so the group ends here.
+            _ => false,
+        }
     })
 }
 

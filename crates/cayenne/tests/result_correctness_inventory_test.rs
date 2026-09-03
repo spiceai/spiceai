@@ -868,3 +868,43 @@ fn a_qualified_name_resolves_through_the_projection() {
         }
     );
 }
+
+/// Two `NULL`s in a preceding key are a tie under every placement convention, so
+/// they hold the tie group together. Resetting on them would hide an inversion
+/// inside a run of `NULL`s: this is illegal under `NULLS FIRST` and `NULLS LAST`
+/// alike, and every pair ties on `k1`.
+#[test]
+fn sort_check_keeps_a_tie_group_across_null_values_in_a_preceding_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let inverted_inside_a_null_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![None, None, None])),
+            Arc::new(Int64Array::from(vec![Some(2), None, Some(1)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "null_group_inversion",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[inverted_inside_a_null_group.clone()],
+        &[inverted_inside_a_null_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2 goes 2 then 1 inside a k1 tie of NULLs: {result:?}"
+    );
+}
