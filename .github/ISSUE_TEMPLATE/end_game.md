@@ -1,7 +1,7 @@
 ---
 name: Milestone Endgame
 about: Ship a milestone release for Spice.ai Open Source!
-title: 'v1.x.x Endgame'
+title: 'v2.x.x Endgame'
 labels: 'kind/endgame'
 assignees: ''
 ---
@@ -238,7 +238,7 @@ Testing focus DRIs are responsible for:
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
 
-- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
+- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and update the PR to apply to the release branch.
 
 - [ ] Run [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) **on the release branch** to update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md).
 
@@ -249,6 +249,8 @@ Testing focus DRIs are responsible for:
 ## Release Publication Steps
 
 - [ ] Cherry-pick release notes onto the release branch.
+- [ ] Cherry-pick acknowledgements onte the release branch (generated earlier).
+- [ ] Merge Spicepod JSON schema onto the release branch (generated earlier).
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
   - [ ] (Docs DRI) Create and merge PR from `release/X.Y.Z` into `trunk`.
