@@ -45,8 +45,11 @@ use runtime_metrics::acceleration::{
     REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED, REFRESH_ERROR_REASON_PARQUET_DECODE,
 };
 use spicepod::{
-    acceleration::Acceleration,
-    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
+    acceleration::{Acceleration, RefreshMode},
+    component::{
+        caching::SQLResultsCacheConfig,
+        dataset::{Dataset, TimeFormat},
+    },
     param::Params,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +70,9 @@ const BUCKET: &str = "overwrite-race";
 const OBJECT_KEY: &str = "listing/data.parquet";
 const ROWS: i64 = 20_000;
 const ROW_GROUP_SIZE: usize = 2_000;
+/// Unix seconds for row `id=0`. Later rows are `EVENT_TIME_EPOCH + id` so
+/// `refresh_mode: append` has a strictly increasing `time_column`.
+const EVENT_TIME_EPOCH: i64 = 1_700_000_000;
 
 fn listing_dataset(endpoint: &str, bucket: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("s3://{bucket}/listing/"), "overwrite_race");
@@ -126,6 +132,26 @@ fn generation_table(seed: i64) -> RecordBatch {
         ],
     )
     .expect("generation batch")
+}
+
+fn generation_table_with_event_time(seed: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("event_time", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (0..ROWS).collect();
+    let event_times: Vec<i64> = (0..ROWS).map(|i| EVENT_TIME_EPOCH + i).collect();
+    let payload: Vec<String> = (0..ROWS).map(|i| generation_payload(seed, i)).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Int64Array::from(event_times)),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .expect("append generation batch")
 }
 
 fn write_snappy_parquet(batch: &RecordBatch) -> Vec<u8> {
@@ -566,10 +592,10 @@ async fn read_http_message(
     Ok(Some((headers, body)))
 }
 
-async fn scan_payload_char_len(rt: &Runtime) -> Result<i64, String> {
+async fn scan_i64_query(rt: &Runtime, sql: &str) -> Result<i64, String> {
     let result = rt
         .datafusion()
-        .query_builder("SELECT SUM(char_length(payload)) AS total FROM overwrite_race")
+        .query_builder(sql)
         .build()
         .run()
         .await
@@ -580,6 +606,14 @@ async fn scan_payload_char_len(rt: &Runtime) -> Result<i64, String> {
         total += sum_i64_column(batch.column(0))?;
     }
     Ok(total)
+}
+
+async fn scan_payload_char_len(rt: &Runtime) -> Result<i64, String> {
+    scan_i64_query(
+        rt,
+        "SELECT SUM(char_length(payload)) AS total FROM overwrite_race",
+    )
+    .await
 }
 
 fn sum_i64_column(column: &arrow::array::ArrayRef) -> Result<i64, String> {
@@ -727,6 +761,34 @@ fn accelerated_listing_dataset(endpoint: &str, bucket: &str) -> Dataset {
     dataset
 }
 
+/// Production shape from [#13793](https://github.com/spiceai/spiceai/issues/13793):
+/// accelerated listing table, `refresh_mode: append`, and a valid `time_column`.
+fn accelerated_append_listing_dataset(endpoint: &str, bucket: &str) -> Dataset {
+    let mut dataset = listing_dataset(endpoint, bucket);
+    dataset.time_column = Some("event_time".to_string());
+    dataset.time_format = Some(TimeFormat::UnixSeconds);
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_mode: Some(RefreshMode::Append),
+        refresh_retry_enabled: true,
+        refresh_retry_max_attempts: Some(8),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+#[test]
+fn accelerated_append_fixture_sets_append_and_a_time_column() {
+    let dataset = accelerated_append_listing_dataset("http://127.0.0.1:1", "bucket");
+    assert_eq!(dataset.time_column.as_deref(), Some("event_time"));
+    assert_eq!(dataset.time_format, Some(TimeFormat::UnixSeconds));
+    let acceleration = dataset
+        .acceleration
+        .as_ref()
+        .expect("append fixture enables acceleration");
+    assert_eq!(acceleration.refresh_mode, Some(RefreshMode::Append));
+}
+
 async fn corrupt_parquet_is_not_classified_as_generation_change(
     endpoint: &str,
     minio: &str,
@@ -825,6 +887,67 @@ async fn accelerated_refresh_retries_a_replaced_object(
     Ok(())
 }
 
+/// Same overwrite race as the full-refresh arm, on the production append path
+/// (`RefreshTask::run` → `get_incremental_append_update`). A 412 mid-stream
+/// plus retry must not leave a partial write or a second copy of the same ids.
+async fn accelerated_append_refresh_retries_without_partial_or_duplicate_rows(
+    mix: &MixProxy,
+    proxy: &str,
+    minio: &str,
+    bucket: &str,
+    generations: &GenerationPair,
+) -> Result<(), anyhow::Error> {
+    ensure_bucket_and_object(minio, bucket, generations.bytes_a.clone(), false).await?;
+    mix.reset();
+    let load = tokio::spawn({
+        let proxy = proxy.to_string();
+        let bucket = bucket.to_string();
+        async move {
+            run_runtime_with_dataset(accelerated_append_listing_dataset(&proxy, &bucket)).await
+        }
+    });
+    mix.wait_for_first_pinned_object_get().await?;
+    ensure!(
+        mix.unpinned_object_gets() >= 1,
+        "schema inference must GET '{OBJECT_KEY}' without If-Match/versionId before the append refresh scan pins it; \
+         otherwise waiting for any object GET would overwrite during inference"
+    );
+    overwrite_object(minio, bucket, generations.bytes_b.clone()).await?;
+    let rt = load
+        .await
+        .map_err(|e| anyhow::anyhow!("append load join: {e}"))?
+        .map_err(|e| anyhow::anyhow!("append refresh did not recover after overwrite: {e}"))?;
+    ensure!(
+        mix.precondition_failures() >= 1,
+        "append refresh must observe a 412 from the replaced object before succeeding, saw {}",
+        mix.precondition_failures()
+    );
+    let count = scan_i64_query(rt.as_ref(), "SELECT COUNT(*) FROM overwrite_race")
+        .await
+        .map_err(|e| anyhow::anyhow!("append row count after overwrite retry: {e}"))?;
+    let distinct = scan_i64_query(rt.as_ref(), "SELECT COUNT(DISTINCT id) FROM overwrite_race")
+        .await
+        .map_err(|e| anyhow::anyhow!("append distinct id count after overwrite retry: {e}"))?;
+    let total = scan_payload_char_len(rt.as_ref())
+        .await
+        .map_err(|e| anyhow::anyhow!("append payload sum after overwrite retry: {e}"))?;
+    ensure!(
+        count == ROWS,
+        "append 412 retry must not leave a partial or extra write: expected {ROWS} rows, got {count}"
+    );
+    ensure!(
+        distinct == ROWS,
+        "append 412 retry must not duplicate ids: COUNT(*)={count} COUNT(DISTINCT id)={distinct}"
+    );
+    ensure!(
+        total == generations.sum_a || total == generations.sum_b,
+        "append 412 retry must return one generation ({} or {}), got payload sum {total}",
+        generations.sum_a,
+        generations.sum_b
+    );
+    Ok(())
+}
+
 /// Control: a listing-table scan of one unchanged `Snappy` object returns that
 /// generation's payload length. Mutation: replacing the object after the
 /// footer is read must not surface as Parquet corruption, a worker panic, or
@@ -848,6 +971,12 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                 bytes_b: write_snappy_parquet(&gen_b),
                 sum_a: expected_payload_char_len(1),
                 sum_b: expected_payload_char_len(2),
+            };
+            let append_generations = GenerationPair {
+                bytes_a: write_snappy_parquet(&generation_table_with_event_time(1)),
+                bytes_b: write_snappy_parquet(&generation_table_with_event_time(2)),
+                sum_a: generations.sum_a,
+                sum_b: generations.sum_b,
             };
             ensure!(
                 !generations.bytes_a.is_empty(),
@@ -882,6 +1011,14 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
                     &minio,
                     "overwrite-race-accel",
                     &generations,
+                )
+                .await?;
+                accelerated_append_refresh_retries_without_partial_or_duplicate_rows(
+                    &mix,
+                    &proxy,
+                    &minio,
+                    "overwrite-race-accel-append",
+                    &append_generations,
                 )
                 .await?;
                 Ok::<(), anyhow::Error>(())
