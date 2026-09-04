@@ -22,7 +22,6 @@ use std::{sync::Arc, time::Duration};
 use app::AppBuilder;
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::execution::RecordBatchStream;
 use futures::TryStreamExt;
 
 use crate::{
