@@ -208,6 +208,16 @@ mod tests {
         Arc::new(RequestContext::builder(Protocol::Internal).build())
     }
 
+    fn test_batch(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(values))];
+        RecordBatch::try_new(schema, columns).expect("create record batch")
+    }
+
     fn test_runtime() -> tokio::runtime::Runtime {
         Builder::new_multi_thread()
             .worker_threads(1)
@@ -361,14 +371,10 @@ mod tests {
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
 
         let driver_handle = runtime.spawn(async move {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )]));
-            let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1, 2, 3]))];
-            let batch = RecordBatch::try_new(schema, columns).expect("create record batch");
-            batch_tx.send(Ok(batch)).await.expect("send batch");
+            batch_tx
+                .send(Ok(test_batch(vec![1, 2, 3])))
+                .await
+                .expect("send batch");
             drop(batch_tx);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             panic!("driver task panic after one batch");
@@ -425,14 +431,10 @@ mod tests {
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
 
         let driver_handle = runtime.spawn(async move {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )]));
-            let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![7]))];
-            let batch = RecordBatch::try_new(schema, columns).expect("create record batch");
-            batch_tx.send(Ok(batch)).await.expect("send batch");
+            batch_tx
+                .send(Ok(test_batch(vec![7])))
+                .await
+                .expect("send batch");
         });
 
         let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle)
