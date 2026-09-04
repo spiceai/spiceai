@@ -1582,7 +1582,6 @@ mod test {
     }
 
     /// A batch that retains nothing extra is shared, not copied.
-    #[test]
     /// Guard for the `Buffer::has_custom_allocation` patch on our arrow-rs fork
     /// (spiceai/arrow-rs#25, branch `spiceai-58`). See `docs/dev/fork_patches.md`.
     ///
@@ -1593,7 +1592,6 @@ mod test {
     /// drops the predicate this stops holding, so the assertion is on the
     /// outcome (the copy is decoupled) rather than on the predicate itself.
     #[test]
-    #[expect(clippy::expect_used, reason = "a test asserts by panicking with a message")]
     fn a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim() {
         // Exactly sized, so nothing looks reclaimable — the shape a driver
         // import or a Flight message body presents.
@@ -1643,6 +1641,7 @@ mod test {
         );
     }
 
+    #[test]
     fn compact_retained_buffers_leaves_a_compact_batch_untouched() {
         let batch = wide_string_batch(4, 16);
 
