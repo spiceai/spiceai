@@ -435,8 +435,19 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionContext, col, lit};
+    use datafusion::sql::TableReference;
+    use datafusion_table_providers::duckdb::sql_table::DuckDBTable;
+    use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDBParameter;
+    use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::indexes::IndexType;
+    use duckdb::DuckdbConnectionManager;
+    use r2d2::PooledConnection;
 
     fn parse_statement(sql: &str) -> Statement {
         Parser::parse_sql(&PARSER_DIALECT, sql)
@@ -625,6 +636,66 @@ mod tests {
                     "Query {i} must be rewritten correctly"
                 );
             },
+        );
+    }
+    /// The rule reads its index list off the `DuckSqlExec` the table builds, and
+    /// does nothing at all when that list is empty. A `DuckDBTable` that stops
+    /// carrying its indexes onto the exec node therefore disables the rewrite with
+    /// no error and no plan difference beyond the missing CTE — every query on an
+    /// indexed accelerator goes back to scanning the whole table. This drives the
+    /// real table -> exec -> rule path, which `test_rewrite_statement` cannot: it
+    /// hands `rewrite_statement` its indexes directly and so passes either way.
+    #[tokio::test]
+    async fn a_tables_indexes_reach_the_rule_through_the_exec_node() {
+        let pool: Arc<
+            dyn DbConnectionPool<PooledConnection<DuckdbConnectionManager>, DuckDBParameter>
+                + Send
+                + Sync,
+        > = Arc::new(DuckDbConnectionPool::new_memory().expect("in-memory DuckDB pool"));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let table = DuckDBTable::new_with_schema(
+            &pool,
+            Arc::clone(&schema),
+            TableReference::bare("t"),
+            None,
+            None,
+            None,
+            None,
+            vec![make_index(&["a"])],
+        );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let plan = table
+            .scan(
+                &state,
+                None,
+                &[col("a").eq(lit(1)), col("b").eq(lit(2))],
+                None,
+            )
+            .await
+            .expect("the table plans a filtered scan");
+
+        let unoptimized = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !unoptimized.contains(CTE_NAME),
+            "the scan must not already carry the CTE; plan was:\n{unoptimized}"
+        );
+
+        let optimized = DuckDBIntermediateIndexMaterializationOptimizer::new()
+            .optimize(plan, state.config_options())
+            .expect("the rule runs");
+        let optimized = displayable(optimized.as_ref()).indent(true).to_string();
+
+        assert!(
+            optimized.contains(CTE_NAME),
+            "the filter on the indexed column must be materialized into a CTE, \
+             which only happens if the table's indexes reached the exec node; plan was:\n{optimized}"
         );
     }
 }
