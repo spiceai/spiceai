@@ -670,6 +670,51 @@ fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
 
 /// How many bytes compacting `column` would reclaim, or `None` when the copy
 /// would not pay for itself.
+/// Whether [`compact_column`] can produce a copy of `column` that shares nothing
+/// with the original.
+///
+/// The mirror of the structural declines in [`reclaimable_bytes`], kept beside
+/// them so the two cannot drift: a top-level view column is rebuilt through
+/// arrow's `gc`, and everything else goes through `MutableArrayData`, which
+/// shares a dictionary's values and a nested view's data buffers wholesale
+/// rather than narrowing them — and panics outright building an extend for a
+/// dictionary whose value count does not fit its key type.
+fn can_be_copied_whole(column: &ArrayRef) -> bool {
+    match column.data_type() {
+        DataType::Utf8View | DataType::BinaryView => true,
+        data_type if contains_view_type(data_type) || contains_dictionary(data_type) => false,
+        _ => true,
+    }
+}
+
+/// Whether any buffer under `column` is a custom allocation — memory freed by
+/// its own owner rather than by the buffer, which
+/// [`arrow::buffer::Buffer::has_custom_allocation`] reports.
+///
+/// Such a buffer's `capacity` is the size recorded when it was built, and the
+/// allocation actually kept alive may be larger, so the comparison
+/// [`reclaimable_bytes`] makes cannot see what the column really pins. Three
+/// paths produce them and in each the buffer is a window onto something bigger:
+/// a result imported over the Arrow C data interface points into the producer's
+/// chunk; `arrow-flight` builds every array buffer of a batch as a slice of the
+/// one IPC message body; and `parquet`'s byte-view readers hand a view column
+/// the page itself as its data block.
+///
+/// Walks children and the null buffer as well as the column's own buffers,
+/// because a struct or list column is only as decoupled as its least decoupled
+/// part.
+fn rests_on_foreign_memory(column: &ArrayRef) -> bool {
+    fn walk(data: &arrow::array::ArrayData) -> bool {
+        data.buffers().iter().any(Buffer::has_custom_allocation)
+            || data
+                .nulls()
+                .is_some_and(|nulls| nulls.buffer().has_custom_allocation())
+            || data.child_data().iter().any(walk)
+    }
+
+    walk(&column.to_data())
+}
+
 fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
     match column.data_type() {
         DataType::Utf8View => return view_reclaimable_bytes::<StringViewType>(column),
@@ -744,14 +789,16 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
 #[must_use]
 pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
     let (plan, total_reclaimable) = compaction_plan(batch);
+    let decouple = columns_to_decouple(batch);
 
-    if total_reclaimable == 0 {
+    if total_reclaimable == 0 && !decouple.iter().any(|d| *d) {
         return batch.clone();
     }
 
     tracing::trace!(
         rows = batch.num_rows(),
         reclaimable_bytes = total_reclaimable,
+        decoupled_columns = decouple.iter().filter(|d| **d).count(),
         "Compacting record batch"
     );
 
@@ -759,8 +806,11 @@ pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
         .columns()
         .iter()
         .zip(&plan)
-        .map(|(column, reclaim)| {
-            if reclaim.is_some() {
+        .zip(&decouple)
+        .map(|((column, reclaim), decouple)| {
+            // `reclaim` is a saving worth making; `decouple` is memory this
+            // batch cannot bound while it shares it. Either is reason to copy.
+            if (reclaim.is_some() && total_reclaimable > 0) || *decouple {
                 compact_column(column)
             } else {
                 Arc::clone(column)
@@ -817,6 +867,29 @@ fn compaction_plan(batch: &RecordBatch) -> (Vec<Option<usize>>, usize) {
     } else {
         (plan, total)
     }
+}
+
+/// Which columns must be copied to decouple them from memory someone else owns,
+/// regardless of what [`compaction_plan`] estimates.
+///
+/// The estimate is exactly what cannot be trusted here: a foreign buffer reports
+/// the size it was built with, so a column pinning a whole page or message body
+/// looks perfectly compact and both the retention ratio and the batch-wide floor
+/// decline to copy it. Those two tests ask whether a copy reclaims enough bytes
+/// to be worth making; for these columns the question is instead whether the
+/// entry can bound what it holds at all, and it cannot while it shares the
+/// producer's memory.
+///
+/// A column [`reclaimable_bytes`] declined for a *structural* reason is left
+/// alone even so, because copying it would not decouple it: `MutableArrayData`
+/// shares a dictionary's values and a nested view's data buffers wholesale, so
+/// the copy would pay for itself and still pin the original.
+fn columns_to_decouple(batch: &RecordBatch) -> Vec<bool> {
+    batch
+        .columns()
+        .iter()
+        .map(|column| can_be_copied_whole(column) && rests_on_foreign_memory(column))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1510,6 +1583,66 @@ mod test {
 
     /// A batch that retains nothing extra is shared, not copied.
     #[test]
+    /// Guard for the `Buffer::has_custom_allocation` patch on our arrow-rs fork
+    /// (spiceai/arrow-rs#25, branch `spiceai-58`). See `docs/dev/fork_patches.md`.
+    ///
+    /// A batch whose buffers are owned by someone else must be copied on the way
+    /// into anything that retains it, even though the reclaim estimate says
+    /// there is nothing to reclaim — because for such a buffer that estimate is
+    /// the size the producer declared, not what it keeps alive. If a fork re-cut
+    /// drops the predicate this stops holding, so the assertion is on the
+    /// outcome (the copy is decoupled) rather than on the predicate itself.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test asserts by panicking with a message")]
+    fn a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim() {
+        // Exactly sized, so nothing looks reclaimable — the shape a driver
+        // import or a Flight message body presents.
+        use arrow::array::{ArrayData, Int64Array};
+
+        let backing: Arc<Vec<u8>> = Arc::new(1_i64.to_le_bytes().repeat(4));
+        let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+        let foreign = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+            )
+        };
+        assert!(
+            foreign.has_custom_allocation(),
+            "the fixture must actually be foreign owned, or this proves nothing"
+        );
+
+        let data = ArrayData::builder(DataType::Int64)
+            .len(4)
+            .add_buffer(foreign)
+            .build()
+            .expect("a valid Int64 array");
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int64Array::from(data)) as ArrayRef,
+        )])
+        .expect("a one-column batch");
+
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            !compacted.column(0).to_data().buffers()[0].has_custom_allocation(),
+            "compaction must copy a column off memory it does not own, so what the \
+             entry holds is bounded by what it was billed"
+        );
+        assert_eq!(
+            compacted
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("still an Int64Array")
+                .values(),
+            &[1_i64; 4],
+            "decoupling must not change the rows"
+        );
+    }
+
     fn compact_retained_buffers_leaves_a_compact_batch_untouched() {
         let batch = wide_string_batch(4, 16);
 
