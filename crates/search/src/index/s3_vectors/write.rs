@@ -311,10 +311,6 @@ pub fn extract_and_format_metadata(
 /// A row whose key is evicted is dropped from the write as well, even when its own vector
 /// is fine: the delete runs before the put, so storing it would restore under that key a
 /// row a later row of the same batch replaced with one this write cannot embed.
-///
-/// The decision is per call, so a key repeated across two calls — `write` splits a batch
-/// larger than `batch_write_rows` into chunks processed independently — is decided within
-/// each chunk rather than across them.
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -327,46 +323,53 @@ fn filter_zero_vectors(
     HashMap<String, Vec<Option<Value>>>,
     Vec<String>,
 ) {
-    // What this write would do with each row that names a key, in row order — which is
+    // Per row: the key this row would be stored under, or `None` for a row that addresses
+    // no stored vector, and what this write would do with it. In row order, because that is
     // what decides a key the batch carries more than once.
-    let mut outcomes: Vec<(&str, write_util::RowOutcome)> = Vec::with_capacity(embeddings.len());
-    for (embedding, key) in embeddings.iter().zip(primary_keys.iter()) {
-        let outcome = match embedding {
-            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-            Some(embedding) if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) => {
-                let key_str = key.as_deref().unwrap_or("unknown");
-                tracing::warn!(
-                    "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
-                );
-                write_util::RowOutcome::Rejected
-            }
-            Some(_) => write_util::RowOutcome::Indexed,
-            // `write_data` skips a row whose embedding is `None` (a NULL or empty search
-            // text), so those keys keep whatever vector an earlier text stored.
-            None => write_util::RowOutcome::Rejected,
-        };
-        // A NULL key addresses no stored vector, so there is nothing to remove.
-        if let Some(key) = key {
-            outcomes.push((key.as_str(), outcome));
-        }
-    }
-
-    let evicted = write_util::keys_to_evict(outcomes.iter().copied());
-    let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
-
-    let drop_row: Vec<bool> = embeddings
+    let rows: Vec<(Option<&str>, write_util::RowOutcome)> = embeddings
         .iter()
         .zip(primary_keys.iter())
         .map(|(embedding, key)| {
-            let invalid_vector = embedding
-                .as_ref()
-                .is_some_and(|e| e.iter().all(|&x| x == 0.0 || x.is_nan()));
-            // Only a row this write would otherwise store needs dropping. A row with no
-            // embedding is skipped by `write_data` either way, so leaving it in place keeps
-            // the arrays exactly as they were before eviction was considered.
-            let superseded =
-                embedding.is_some() && key.as_deref().is_some_and(|key| evicted_keys.contains(key));
-            invalid_vector || superseded
+            let outcome = match embedding {
+                // Single pass: check if all values are zero or NaN (both are invalid embeddings)
+                Some(embedding) if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) => {
+                    let key_str = key.as_deref().unwrap_or("unknown");
+                    tracing::warn!(
+                        "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
+                    );
+                    write_util::RowOutcome::Rejected
+                }
+                Some(_) => write_util::RowOutcome::Indexed,
+                // `write_data` skips a row whose embedding is `None` (a NULL or empty search
+                // text), so those keys keep whatever vector an earlier text stored.
+                None => write_util::RowOutcome::Rejected,
+            };
+            // A NULL key addresses no stored vector, so there is nothing to remove.
+            (key.as_deref(), outcome)
+        })
+        .collect();
+
+    let evicted = write_util::keys_to_evict(
+        rows.iter()
+            .filter_map(|(key, outcome)| key.map(|key| (key, *outcome))),
+    );
+    let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+
+    // A row this write will not store: its own vector is invalid, or a later row of the
+    // batch decided its key against it and the delete below would otherwise be undone by
+    // the put. A row with no embedding at all is left in place either way — `write_data`
+    // skips it, so removing it would only change the arrays for no effect.
+    let drop_row: Vec<bool> = rows
+        .iter()
+        .zip(embeddings.iter())
+        .map(|((key, outcome), embedding)| {
+            embedding.is_some()
+                && match outcome {
+                    write_util::RowOutcome::Rejected => true,
+                    write_util::RowOutcome::Indexed => {
+                        key.is_some_and(|key| evicted_keys.contains(key))
+                    }
+                }
         })
         .collect();
 
