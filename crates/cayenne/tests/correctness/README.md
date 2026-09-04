@@ -182,9 +182,14 @@ It stays deliberately narrow where engines legitimately differ:
   values as a subsequence; and an interleaved `NULL` block (`[1, NULL, 2]`, which
   is neither `NULLS FIRST`'s `[NULL, 1, 2]` nor `NULLS LAST`'s `[1, 2, NULL]`), by
   rejecting a run that crosses between `NULL` and non-`NULL` more than once. So
-  `ORDER BY cnt, state` may still step `state` backwards — and place its `NULL`s
-  afresh — when `cnt` changes, while either shape inside one `cnt` group is
-  caught.
+  `ORDER BY cnt, state` may still step `state` backwards when `cnt` changes,
+  while either shape inside one `cnt` group is caught.
+
+  The value scan and the `NULL` block restart per group; the boundary the
+  `NULL`s sit against does not. Placement belongs to the term, which the engine
+  sorts the whole result by, so `state` trailing its `NULL`s in one `cnt` group
+  and leading with them in the next is an order no placement produces — caught
+  even though each group on its own looks fine.
 - **A term that maps to no output column does not sink the whole key.** The
   mappable leading terms are still verified and the rest is named, so an
   `ORDER BY a, CASE …, b` still enforces `a`.

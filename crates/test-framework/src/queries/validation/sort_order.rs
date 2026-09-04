@@ -645,7 +645,12 @@ fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<Sor
 /// `ORDER BY k1, k2` over `[(1, 2), (1, NULL), (1, 1)]` is illegal, and both of
 /// its adjacent pairs are unjudged. So each column is checked inside its own tie
 /// group, which is what keeps `ORDER BY cnt, state` free to step `state`
-/// backwards — and free to place its `NULL`s afresh — the moment `cnt` changes.
+/// backwards the moment `cnt` changes.
+///
+/// What restarts per group is the value scan and the `NULL` block; the boundary
+/// those `NULL`s sit against does not. That belongs to the `ORDER BY` term, which
+/// the engine sorts the whole result by, so the first group to reveal it fixes it
+/// for the rest.
 fn check_within_tie_groups(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
     for (depth, key) in comparators.iter().enumerate() {
         let KeyComparator {
