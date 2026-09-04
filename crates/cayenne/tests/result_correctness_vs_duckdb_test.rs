@@ -475,14 +475,21 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
     let gen_db = out_dir.join("gen.duckdb");
     let conn = Connection::open(&gen_db).expect("duckdb open for tpcds gen");
-    if let Err(e) = conn.execute_batch(&format!(
-        "INSTALL tpcds;
-         LOAD tpcds;
-         CALL dsdgen(sf={sf});"
-    )) {
+    // Only `INSTALL` reaches DuckDB's extension repository, so only it can fail
+    // for want of a network and be reported as an environment that cannot supply
+    // the fixture. Everything after it is local: a `LOAD` that fails means the
+    // installed extension is unusable, and a `dsdgen` that fails means the
+    // generator is broken. Running the three as one batch made either of those
+    // indistinguishable from having no network, which turns a regression in the
+    // fixture into a passing exclusion.
+    if let Err(e) = conn.execute_batch("INSTALL tpcds;") {
         eprintln!("TPC-DS fixture unavailable: {e}");
         return None;
     }
+    conn.execute_batch("LOAD tpcds;")
+        .expect("load DuckDB's tpcds extension, which installed successfully");
+    conn.execute_batch(&format!("CALL dsdgen(sf={sf});"))
+        .expect("generate the TPC-DS fixture with dsdgen");
 
     // Export every base table that exists after dsdgen.
     let mut stmt = conn
@@ -498,12 +505,14 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
         .collect();
     for table in names {
         let path = out_dir.join(format!("{table}.parquet"));
-        if let Err(e) = conn.execute_batch(&format!(
+        // Skipping a failed export would leave a partial fixture behind, which
+        // the next run reads as a complete one because the directory is not
+        // empty. Every name here came from `information_schema` a moment ago.
+        conn.execute_batch(&format!(
             "COPY {table} TO '{}' (FORMAT PARQUET);",
             path.display()
-        )) {
-            eprintln!("skip copy {table}: {e}");
-        }
+        ))
+        .unwrap_or_else(|e| panic!("export TPC-DS table {table}: {e}"));
     }
     Some(out_dir.to_path_buf())
 }
@@ -536,18 +545,26 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         .unwrap_or_default();
     let table_refs: Vec<&str> = exported.iter().map(String::as_str).collect();
 
-    if tpcds_fixture_missing || table_refs.is_empty() {
+    if tpcds_fixture_missing {
         results.push(RunResult {
             suite: "tpcds".into(),
             name: "*".into(),
             engine_pair: "cayenne-duckdb",
             outcome: ParityOutcome::Excluded {
                 reason: "TPC-DS fixture unavailable: DuckDB's tpcds extension could not be \
-                         installed in this environment (needs network), or dsdgen produced no tables"
+                         installed in this environment (needs network)"
                     .into(),
             },
         });
     } else {
+        // Generation succeeded, so tables must exist. Treating their absence as
+        // another environmental exclusion would let a silent generator failure
+        // count as a pass.
+        assert!(
+            !table_refs.is_empty(),
+            "TPC-DS generation reported success but exported no tables into {}",
+            tpcds_dir.display()
+        );
         let cayenne = load_cayenne_from_parquet(&tpcds_dir, &table_refs).await;
         let (duck_temp, duck) = load_duckdb_from_parquet(&tpcds_dir, &table_refs);
         let _keep = duck_temp;
