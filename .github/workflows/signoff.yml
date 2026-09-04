@@ -17,9 +17,9 @@
 #   4. Unit tests + CLI verification (make nextest verify-cli)
 #   5. Post signoff status + re-run Attestation if needed
 #
-# The checks run under an explicit budget below the pool's ~360-minute job wall,
-# so a run that overruns fails legibly and clears the pending status it posted
-# rather than being terminated as `cancelled` with nothing to show for it.
+# The checks run under an explicit budget, so a run that overruns fails legibly
+# and clears the pending status it posted rather than running unbounded or being
+# terminated as `cancelled` with nothing to show for it.
 #
 # This workflow is the only remote sign-off path (never SSH to ad-hoc hosts —
 # the LAN lab boxes double as benchmark machines):
@@ -261,23 +261,30 @@ jobs:
     # The Linux self-hosted pool, deliberately not `spiceai-macos`: pr.yml's
     # merge-queue jobs run there, and a sign-off can hold a slot for hours.
     runs-on: spiceai-dev-runners
-    # GitHub terminates a self-hosted job at its ~360-minute default wall, and
-    # that arrives as `cancelled` with no failed step — the same shape as the
-    # cancel-in-progress eviction above, and with no chance for the steps below
-    # to run. Stop just short of the wall so an overrun is this workflow's own,
-    # legible failure.
+    # A job terminated at a wall arrives as `cancelled` with no failed step —
+    # the same shape as the cancel-in-progress eviction above, and with no
+    # chance for the steps below to run. This budget is set to expire first so
+    # that an overrun is instead this workflow's own, legible failure.
     #
-    # The budget that has to hold is `setup + sign-off step + cleanup < 358`,
-    # not just `345 < 358`: the job clock starts before the setup steps, the
-    # step clock only when the step does. Setup measures ~80s here, so the gap
-    # leaves ~11 minutes of cleanup — sized for the handlers below rather than
-    # for the seconds a status post looks like it should take. Run
-    # 33706211503 is why: its sign-off step used its whole budget, which left
-    # the 5-minute gap then in force with 3.7 minutes, and `clear-pending` was
-    # still running when the job wall arrived. The run lost both its status
-    # resolution and its `Show sccache stats` diagnostics — exactly when a
-    # budget overrun most needs explaining.
-    timeout-minutes: 358
+    # It is not sized against an external wall. GitHub bounds a *self-hosted*
+    # job at 5 days, not the 6 hours it allows a GitHub-hosted one, and this
+    # repo already runs `testoperator_dispatch.yml` on this same pool at 720.
+    # So the number answers to the work: two full-length runs of the gate here
+    # (33706211503, 33731617339) were still going at 353 and 345 minutes, which
+    # bounds its peak from below but does not measure it. The budget leaves
+    # room for that rather than inheriting a figure calibrated against a pool
+    # with a warm `target/`.
+    #
+    # What has to hold is `setup + sign-off step + cleanup < 720`, not just
+    # `690 < 720`: the job clock starts before the setup steps, the step clock
+    # only when the step does. Setup measures ~80s here, so the gap leaves ~28
+    # minutes of cleanup. Size it for the handlers below rather than for the
+    # seconds a status post looks like it should take — run 33706211503 left
+    # the 5-minute gap then in force with 3.7 minutes and `clear-pending` was
+    # cancelled mid-flight, and 33731617339 showed that handler needing 11m42s
+    # on its own. A run that loses its status resolution and its `Show sccache
+    # stats` output loses them exactly when an overrun most needs explaining.
+    timeout-minutes: 720
     permissions:
       contents: read
       statuses: write
@@ -511,12 +518,15 @@ jobs:
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
         run: .trusted-ci/signoff -f
-        # Thirteen minutes under the job budget above, so an overrun gives up
-        # as a failed step — which the run after it can read — and still
-        # leaves the handlers and `Show sccache stats` room to run. The gate's
-        # peak duration on this pool is not yet measured; if sign-offs start
-        # expiring here, re-check this budget before suspecting a branch.
-        timeout-minutes: 345
+        # Thirty minutes under the job budget above, so an overrun gives up as
+        # a failed step — which the run after it can read — and still leaves
+        # the handlers and `Show sccache stats` room to run; `clear-pending`
+        # alone has been seen taking 11m42s. The gate's peak duration on this
+        # pool is not measured, only bounded below by two runs still going at
+        # 345 and 353 minutes, so this is headroom rather than a fit. If
+        # sign-offs start expiring here, re-check this budget before suspecting
+        # a branch.
+        timeout-minutes: 690
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
