@@ -309,6 +309,39 @@ fn an_order_by_limit_violation_is_named_as_one_not_as_a_content_mismatch() {
     );
 }
 
+/// A `COLLATE` asks for an ordering the comparison cannot reproduce: it runs on
+/// Arrow's native ordering, which for strings is byte order. SQLite returns
+/// `['a', 'B']` for `ORDER BY v COLLATE NOCASE`, and byte order calls that an
+/// inversion because `B` is 0x42 and `a` is 0x61. Checking it anyway would fail
+/// correct output, so the term is reported as unchecked instead.
+#[test]
+fn a_collated_term_is_reported_unchecked_not_judged_by_byte_order() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let collated = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec!["a", "B"]))],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "collated",
+        "SELECT v COLLATE NOCASE AS v FROM t ORDER BY v COLLATE NOCASE",
+        &[collated.clone()],
+        &[collated],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert_eq!(
+        comparison.result,
+        QueryValidationResult::Pass,
+        "NOCASE makes ['a', 'B'] correctly ordered; byte order must not overrule it"
+    );
+    assert!(
+        !comparison.unchecked.is_empty(),
+        "and the collation must be reported as a hole rather than a silent pass"
+    );
+}
+
 /// Prove the harness routes through the shipped `compare_query_result_batches`.
 #[test]
 fn harness_compare_actual_results_drives_shipped_path() {

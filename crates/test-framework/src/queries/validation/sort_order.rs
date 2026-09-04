@@ -211,6 +211,26 @@ fn resolve_order_by(order_by: &OrderBy, query: &SqlQuery, schema: &SchemaRef) ->
     let mut key: Vec<SortKeyColumn> = Vec::with_capacity(terms.len());
     let mut unresolved_suffix: Option<String> = None;
     for term in terms {
+        // A collation asks for an ordering this check cannot reproduce, so the
+        // term is reported rather than judged. Comparison runs on Arrow's native
+        // ordering — byte order for strings — while a collation may be case- or
+        // locale-insensitive: SQLite answers `ORDER BY v COLLATE NOCASE` over
+        // `('a'), ('B')` with `['a', 'B']`, which byte order calls an inversion.
+        // Honoring the request would mean reimplementing each engine's
+        // collations, and judging it without them fails correct output.
+        if requests_a_collation(&term.expr.to_string()) {
+            unresolved_suffix = Some(match key.last() {
+                Some(last) => format!(
+                    "verified through '{}'; ORDER BY term '{}' requests a collation, whose ordering is not reproduced here, so it and any term after it are unchecked",
+                    last.name, term.expr
+                ),
+                None => format!(
+                    "nothing about the row order was verified: the first ORDER BY term '{}' requests a collation, whose ordering is not reproduced here",
+                    term.expr
+                ),
+            });
+            break;
+        }
         // Stop at the first term that cannot be located, keeping the prefix: a
         // violation on the prefix is a real violation, and the terms after it are
         // only ever consulted once the prefix ties.
@@ -384,6 +404,46 @@ fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
         };
         fold_unquoted_case(&projected.to_string()) == wanted
     })
+}
+
+/// Whether a rendered `ORDER BY` term asks for a SQL collation.
+///
+/// Scanned over the rendering rather than matched against the AST, so a
+/// `COLLATE` nested anywhere inside the term counts: what matters is that some
+/// part of the ordering was requested under a collation, not where it sits. An
+/// AST match would have to enumerate the expression variants that can contain
+/// one, and the variant it forgets fails the wrong way — judging a collated
+/// order by byte order and reporting correct output as a violation. Missing the
+/// other way costs only an unnecessary coverage note.
+///
+/// Quoted runs are skipped, so a string literal or a quoted identifier that
+/// happens to contain the word does not count.
+fn requests_a_collation(rendered: &str) -> bool {
+    let mut inside: Option<char> = None;
+    let mut word = String::new();
+    for character in rendered.chars() {
+        match inside {
+            Some(delimiter) => {
+                if character == delimiter {
+                    inside = None;
+                }
+            }
+            None if character == '\'' || character == '"' => {
+                inside = Some(character);
+                word.clear();
+            }
+            None if character.is_ascii_alphanumeric() || character == '_' => {
+                word.push(character.to_ascii_lowercase());
+            }
+            None => {
+                if word == "collate" {
+                    return true;
+                }
+                word.clear();
+            }
+        }
+    }
+    word == "collate"
 }
 
 /// A rendered expression with its unquoted text lowercased, so two renderings
