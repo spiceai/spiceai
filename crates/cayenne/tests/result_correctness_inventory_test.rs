@@ -973,6 +973,19 @@ fn an_ambiguous_column_name_is_not_guessed() {
     );
 }
 
+/// A qualifier that names a column the query never projected identifies no
+/// result column, so the term is unresolved. Matching on the trailing name alone
+/// would check an unrelated column and report its order as this term's.
+#[test]
+fn a_qualified_name_does_not_match_an_unrelated_column() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+    let resolution = resolve_sort_key("SELECT a.x FROM a CROSS JOIN b ORDER BY b.x", &schema);
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "b.x is not projected; the only result column is a.x: {resolution:?}"
+    );
+}
+
 /// A qualified term still resolves when the projection names it exactly, even
 /// though the bare name is ambiguous across the result columns.
 #[test]

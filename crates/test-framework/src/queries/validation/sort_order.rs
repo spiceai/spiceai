@@ -296,12 +296,12 @@ fn resolve_term(
         return Some(ordinal - 1);
     }
 
-    // `ORDER BY revenue` / `ORDER BY o.o_orderdate` — a name that survives into
-    // the result schema, or a projection alias. Only when the name picks out one
-    // column: a join can project two columns sharing a name, and taking the first
-    // would silently check the wrong one. An ambiguous name falls through to the
-    // projection, where `o.o_orderdate` still matches its own item exactly.
-    if let Some(name) = simple_name(expr) {
+    // `ORDER BY revenue` — a bare name that survives into the result schema, or a
+    // projection alias. Only when the name picks out one column: a join can
+    // project two columns sharing a name, and taking the first would silently
+    // check the wrong one. An ambiguous name falls through to the projection.
+    if let Expr::Identifier(ident) = expr {
+        let name = ident.value.as_str();
         if let [only] = field_indices(schema, name).as_slice() {
             return Some(*only);
         }
@@ -310,17 +310,43 @@ fn resolve_term(
         }
     }
 
+    // `ORDER BY o.o_orderdate` — the qualifier names the term's table, which the
+    // result schema does not carry, so only the projection can say which column is
+    // meant. Matching on the trailing name would resolve `ORDER BY b.x` onto a
+    // projected `a.x` and report that column's order as this term's, so a
+    // qualifier the projection does not confirm leaves the term unresolved.
+    if let Expr::CompoundIdentifier(parts) = expr {
+        if let Some(index) = projection.and_then(|items| expression_index(items, expr)) {
+            return Some(index);
+        }
+        // `SELECT o_orderdate … ORDER BY o.o_orderdate`: a bare projection of the
+        // same name is the same column, because SQL requires that bare name to be
+        // unambiguous across the query's tables.
+        let name = parts.last()?.value.as_str();
+        return projection.and_then(|items| bare_column_index(items, name));
+    }
+
     // `ORDER BY sum(l_quantity)` — an expression repeated from the projection.
     projection.and_then(|items| expression_index(items, expr))
 }
 
-/// Trailing identifier of a bare or qualified column reference.
-fn simple_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.as_str()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
-        _ => None,
+/// The projection item that is exactly the unqualified column `name`, when only
+/// one is. Two would leave the name ambiguous, which is the caller's cue to stop
+/// rather than guess.
+fn bare_column_index(items: &[SelectItem], name: &str) -> Option<usize> {
+    let mut found = None;
+    for (index, item) in items.iter().enumerate() {
+        let SelectItem::UnnamedExpr(Expr::Identifier(ident)) = item else {
+            continue;
+        };
+        if ident.value.eq_ignore_ascii_case(name) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
     }
+    found
 }
 
 /// Every result column carrying `name`. More than one means the name alone does
