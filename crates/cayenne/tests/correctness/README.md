@@ -166,12 +166,16 @@ It stays deliberately narrow where engines legitimately differ:
 
   Two rows that are **both** `NULL` in a key column are tied under every
   convention, so the check continues to the next key column for them, as SQL
-  requires — and two `NULL`s likewise hold a tie group together. Because leaving
-  a pair unjudged would hide an inversion that straddles a `NULL` — `[2, NULL, 1]`
-  is illegal either way — each key column's non-`NULL` values are also checked as
-  a subsequence, within the run of rows tied on the columns before it. So
-  `ORDER BY cnt, state` may still step `state` backwards when `cnt` changes,
-  while an inversion inside one `cnt` group is caught.
+  requires — and two `NULL`s likewise hold a tie group together. Leaving pairs
+  unjudged would hide two shapes that no convention produces, so both are caught
+  within the run of rows tied on the columns before the key: an inversion
+  straddling a `NULL` (`[2, NULL, 1]`), by checking the key column's non-`NULL`
+  values as a subsequence; and an interleaved `NULL` block (`[1, NULL, 2]`, which
+  is neither `NULLS FIRST`'s `[NULL, 1, 2]` nor `NULLS LAST`'s `[1, 2, NULL]`), by
+  rejecting a run that crosses between `NULL` and non-`NULL` more than once. So
+  `ORDER BY cnt, state` may still step `state` backwards — and place its `NULL`s
+  afresh — when `cnt` changes, while either shape inside one `cnt` group is
+  caught.
 - **A term that maps to no output column does not sink the whole key.** The
   mappable leading terms are still verified and the rest is named, so an
   `ORDER BY a, CASE …, b` still enforces `a`.

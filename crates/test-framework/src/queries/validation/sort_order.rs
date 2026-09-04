@@ -50,12 +50,19 @@ limitations under the License.
 //!   convention, so the check continues to the next key column for them, exactly
 //!   as SQL requires.
 //!
-//!   Leaving a pair unjudged would still hide an inversion straddling a `NULL`
-//!   (`[2, NULL, 1]` is illegal under either convention), so each key column's
-//!   non-`NULL` values are additionally checked as a subsequence — within the run
-//!   of rows tied on the columns before it, which is the only span that column
-//!   orders. `ORDER BY cnt, state` may therefore still step `state` backwards the
-//!   moment `cnt` changes, while an inversion inside one `cnt` group is caught.
+//!   Leaving pairs unjudged would still hide two shapes that no placement
+//!   convention produces, so both are checked within the run of rows tied on the
+//!   columns before the key — the only span that key orders. `ORDER BY cnt,
+//!   state` may therefore still step `state` backwards the moment `cnt` changes,
+//!   while either shape inside one `cnt` group is caught.
+//!
+//!   - An inversion straddling a `NULL`: `[2, NULL, 1]` skips both of its pairs,
+//!     so the key column's non-`NULL` values are checked as a subsequence.
+//!   - An interleaved `NULL` block: `[1, NULL, 2]` is neither the `[NULL, 1, 2]`
+//!     that `NULLS FIRST` gives nor the `[1, 2, NULL]` that `NULLS LAST` gives.
+//!     Whichever end an engine picks, the `NULL`s land in one block against a
+//!     boundary, so a run that crosses between `NULL` and non-`NULL` more than
+//!     once is a violation.
 //! - **Terms that do not map onto an output column.** `ORDER BY` over an
 //!   expression absent from the projection cannot be located in the result. The
 //!   mappable leading terms are still checked and the rest is named — dropping a
@@ -111,7 +118,7 @@ pub enum SortKeyResolution {
 pub struct SortOrderViolation {
     /// Result column whose values are out of order.
     pub column: String,
-    /// 1-based position of the row that sorts before its predecessor.
+    /// 1-based position of the row that breaks the order.
     pub row_number: usize,
     /// Key value on the preceding row.
     pub previous: String,
@@ -455,7 +462,7 @@ pub fn verify_sorted_batch(batch: &RecordBatch, key: &[SortKeyColumn]) -> Result
     if let Some(found) = check_adjacent_rows(batch.num_rows(), &comparators) {
         return Ok(found);
     }
-    if let Some(found) = check_non_null_subsequences(batch.num_rows(), &comparators) {
+    if let Some(found) = check_within_tie_groups(batch.num_rows(), &comparators) {
         return Ok(found);
     }
     Ok(SortCheck::Ordered)
@@ -494,19 +501,25 @@ fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<Sor
     None
 }
 
-/// Adjacent pairs alone cannot see an inversion that straddles an unjudged
-/// `NULL`: `[2, NULL, 1]` skips both pairs while being illegal under either
-/// placement convention. Comparing a key column's non-`NULL` values against the
-/// previous non-`NULL` value catches that without taking a position on where
-/// `NULL`s belong.
+/// Two illegal shapes survive the adjacent walk once a `NULL` leaves pairs
+/// unjudged, and neither takes a position on where `NULL`s belong:
 ///
-/// Every key column needs this, not just the leading one, because a later column
+/// - `[2, NULL, 1]` inverts across the `NULL` while skipping both of its pairs.
+///   Comparing each non-`NULL` value against the previous non-`NULL` one catches
+///   it.
+/// - `[1, NULL, 2]` interleaves the `NULL`s: `NULLS FIRST` orders these rows
+///   `[NULL, 1, 2]` and `NULLS LAST` orders them `[1, 2, NULL]`, so under either
+///   convention the `NULL`s form one block against a boundary. A run that crosses
+///   between `NULL` and non-`NULL` twice has non-`NULL` values on both sides of a
+///   `NULL` block and matches neither.
+///
+/// Every key column needs both, not just the leading one, because a later column
 /// is still constrained *within* a run of rows tied on the columns before it:
 /// `ORDER BY k1, k2` over `[(1, 2), (1, NULL), (1, 1)]` is illegal, and both of
 /// its adjacent pairs are unjudged. So each column is checked inside its own tie
 /// group, which is what keeps `ORDER BY cnt, state` free to step `state`
-/// backwards the moment `cnt` changes.
-fn check_non_null_subsequences(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
+/// backwards — and free to place its `NULL`s afresh — the moment `cnt` changes.
+fn check_within_tie_groups(rows: usize, comparators: &[KeyComparator]) -> Option<SortCheck> {
     for (depth, key) in comparators.iter().enumerate() {
         let KeyComparator {
             column,
@@ -519,11 +532,22 @@ fn check_non_null_subsequences(rows: usize, comparators: &[KeyComparator]) -> Op
         }
         let preceding = &comparators[..depth];
         let mut previous: Option<usize> = None;
+        let mut crossings = 0usize;
         for row in 0..rows {
-            if row > 0 && !tied_on(preceding, row - 1, row) {
-                // An earlier key separated these rows (or left them unjudged), so
-                // this column's ordering starts over.
-                previous = None;
+            if row > 0 {
+                if tied_on(preceding, row - 1, row) {
+                    if array.is_null(row - 1) != array.is_null(row) {
+                        crossings += 1;
+                        if crossings > 1 {
+                            return Some(violation(column, array.as_ref(), row - 1, row));
+                        }
+                    }
+                } else {
+                    // An earlier key separated these rows (or left them unjudged),
+                    // so this column's ordering — and its NULL block — starts over.
+                    previous = None;
+                    crossings = 0;
+                }
             }
             if array.is_null(row) {
                 continue;

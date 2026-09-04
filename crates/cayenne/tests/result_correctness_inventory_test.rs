@@ -832,6 +832,132 @@ fn sort_check_allows_a_later_key_to_restart_when_an_earlier_one_changes() {
     );
 }
 
+/// A `NULL` block that is neither first nor last is illegal under every
+/// placement convention, even though its non-`NULL` values ascend and every
+/// adjacent pair touching the `NULL` goes unjudged.
+#[test]
+fn sort_check_rejects_a_null_block_that_is_neither_first_nor_last() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let interleaved = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "interleaved_null",
+        "SELECT v FROM t ORDER BY v",
+        &[interleaved.clone()],
+        &[interleaved],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "v"
+        ),
+        "NULLS FIRST orders this [NULL, 1, 2] and NULLS LAST [1, 2, NULL]; neither is [1, NULL, 2]: {result:?}"
+    );
+}
+
+/// The same rule holds for a later key inside a tie group, which is the only
+/// span that key orders.
+#[test]
+fn sort_check_rejects_an_interleaved_null_block_in_a_later_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let interleaved_within_a_tie = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1])),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(2)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "later_key_interleaved_null",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[interleaved_within_a_tie.clone()],
+        &[interleaved_within_a_tie],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2's NULL sits between two non-NULLs inside one k1 tie: {result:?}"
+    );
+}
+
+/// Both boundary placements must stay legal, and a later key's `NULL` run is
+/// judged per tie group — so a group ending in `NULL`s followed by one starting
+/// with them is two legal blocks, not one interleaved.
+#[test]
+fn sort_check_allows_either_null_boundary_and_judges_it_per_tie_group() {
+    let one_column = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    for (name, values) in [
+        ("nulls_first", vec![None, Some(1), Some(2)]),
+        ("nulls_last", vec![Some(1), Some(2), None]),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&one_column),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .expect("batch");
+        let comparison = compare_query_result_batches_with_sort_check(
+            name,
+            "SELECT v FROM t ORDER BY v",
+            &[batch.clone()],
+            &[batch],
+            RowOrder::Multiset,
+        )
+        .expect("compare");
+        assert!(
+            comparison.is_fully_verified_pass(),
+            "{name} places every NULL at one boundary: {comparison:?}"
+        );
+    }
+
+    let two_columns = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let nulls_last_then_first = RecordBatch::try_new(
+        Arc::clone(&two_columns),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(5), None, None, Some(3)])),
+        ],
+    )
+    .expect("batch");
+    let comparison = compare_query_result_batches_with_sort_check(
+        "per_group_null_boundary",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[nulls_last_then_first.clone()],
+        &[nulls_last_then_first],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        comparison.is_fully_verified_pass(),
+        "each k1 group puts its NULLs at one end of that group: {comparison:?}"
+    );
+}
+
 /// A bare name matching two output columns identifies neither. Guessing the
 /// first would check the wrong column; the hole is reported instead.
 #[test]
