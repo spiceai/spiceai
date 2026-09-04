@@ -273,12 +273,17 @@ jobs:
     # (33706211503, 33731617339) were still going at 353 and 345 minutes, which
     # bounds its peak from below but does not measure it.
     #
-    # Why it needs that much room is not established, and it is not a cold
-    # `target/`: both checkouts below leave actions/checkout's `clean` at its
-    # default, so `git clean -ffdx` removes `target/` on either pool, and a
-    # macOS sign-off starting equally cold (run 33805411465) completed the same
-    # gate in 100 minutes. Whatever accounts for the gap, this budget has to
-    # cover it rather than inherit a figure calibrated on the other pool.
+    # It is not a cold `target/`: both checkouts below leave actions/checkout's
+    # `clean` at its default, so `git clean -ffdx` removes `target/` before
+    # every run on either pool.
+    #
+    # What the old figure really missed is how much this gate's cost varies.
+    # Seventeen successful sign-offs on the macOS pool over one week ran 78 to
+    # 319 minutes, median 100 — so the two Linux runs above sit around a tenth
+    # past the macOS *worst* case rather than multiples past its typical one,
+    # and 345 was already marginal on the pool it was calibrated for: one
+    # success finished within 26 minutes of it. Covering that tail is the
+    # point; a budget set near the median is one slow run from expiring.
     #
     # What has to hold is `setup + sign-off step + cleanup < 720`, not just
     # `690 < 720`: the job clock starts before the setup steps, the step clock
