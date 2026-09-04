@@ -10,7 +10,7 @@ uploads it as an artifact).
 |------|--------|
 | IBM tag | `v0.1.1` |
 | `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion rev | `f9a635e6b580d5fe6ed0a70975e36014ea86c476` (`spiceai-54`) |
+| spiceai/datafusion rev | `2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c` (`lukekim/substrait-varchar-literal` / spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
 
@@ -74,6 +74,23 @@ cargo run -p spice-substrait-compliance -- \
 | String padding | 2 | q10, q15 | Isthmus `CHAR` padding vs trimmed DuckDB goldens |
 | Output alias | 1 | q18 | Plan alias `TOTAL_QTY` vs DuckDB `sum(l_quantity)` |
 | Pass | 1 | q14 | Values and types match IBM goldens |
+
+## Expected after DF #215 (VarChar) — not yet re-run on this box
+
+DF consumer now lowers `LiteralType::VarChar` → `Utf8`. The **13** Isthmus VarChar
+rows below should leave **ERROR** (become **PASS** or **FAIL** once the plan executes).
+q09 stays **ERROR** (non-value function argument). Baseline table above is pre-fix.
+
+| Query | Was | Expected after #215 |
+|-------|-----|---------------------|
+| q02, q03, q05, q07, q08, q11, q12, q16, q17, q19, q20, q21, q22 | ERROR (VarChar) | PASS or FAIL (not ERROR) |
+| q09 | ERROR (non-value fn arg) | ERROR (unchanged) |
+| q01, q04, q06, q10, q13, q15, q18 | FAIL | FAIL (unchanged taxonomy) |
+| q14 | PASS | PASS |
+
+Headline expectation if only VarChar moves: **ERROR 14 → 1**; PASS+FAIL redistribute among the 13 former VarChar ERRORs. Re-run Mode A after `cargo update` resolves the new DF rev and IBM suite is present; then replace this section with measured PASS|FAIL|SKIP|ERROR.
+
+**Mode A re-run blocker on executor box:** full workspace compile + IBM `test-suites/tpch` + DuckDB goldens not exercised here. Pin bumped to DF #215 head for CI/local re-run on #13879.
 
 Do not treat 4.5% as a merge gate. Nightly CI is report-only until a
 threshold is set from this baseline (and preferably from Mode B).
