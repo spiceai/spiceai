@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn the_constructed_duckdb_dialect_renders_no_denied_builtin() {
+    fn the_constructed_duckdb_dialect_renders_no_denied_builtin_except_regexp_count() {
         // Asserted against the dialect `new_duckdb_dialect` actually builds, not
         // against `duckdb_scalar_overrides` alone: the constructor chains
         // `duckdb_builtin_scalar_overrides` too, so checking one list would leave

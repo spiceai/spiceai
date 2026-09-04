@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_denies_regexp_match_but_not_its_siblings() {
+    fn duckdb_denies_three_regexp_builtins_and_federates_the_other_two() {
         // Three of the five DataFusion regexp built-ins have no value-preserving
         // DuckDB rendering: `regexp_extract` returns the whole match rather than
         // the capture groups and the empty string rather than NULL for a

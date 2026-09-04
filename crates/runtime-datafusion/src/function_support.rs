@@ -31,8 +31,8 @@ use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names}
 /// `cosine_distance` → `array_cosine_distance`, `rand` → `random()`), derived
 /// from the dialect so it tracks it automatically.
 ///
-/// On top of that carve-out, `regexp_match` is denied outright — see
-/// [`DUCKDB_DENIED_BUILTINS`] for why.
+/// On top of that carve-out, the built-ins in [`DUCKDB_DENIED_BUILTINS`] are
+/// denied outright — see there for which, and why.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
     Arc::new(duckdb_function_support())
@@ -45,8 +45,10 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
     duckdb_function_support()
 }
 
-/// The `DataFusion` built-ins `DuckDB` must not be handed, despite having a
-/// function that looks like the one asked for.
+/// The `DataFusion` built-ins `DuckDB` must not be handed, because `DuckDB`
+/// cannot evaluate them faithfully: two have a function that looks like the one
+/// asked for but answers a different question, and one has no such function at
+/// all.
 ///
 /// `regexp_match` returns the first match's *capture groups* as a list, and
 /// NULL when nothing matches. `DuckDB` has no function with those semantics:
