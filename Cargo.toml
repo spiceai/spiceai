@@ -272,7 +272,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ea4fff58fa756f13a00f4aeae189d63ce97a649e" } # branch: spiceai-54 (merged PR #70; DuckDB 1.4.4; this crate pins duckdb by git rev, so patch.crates-io alone cannot move it)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ea4fff58fa756f13a00f4aeae189d63ce97a649e" } # branch: spiceai-54 (spiceai/datafusion-table-providers#70: per-call aggregate/window support; descends from #69)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
