@@ -149,8 +149,15 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
+#
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
+# name for the same reason: each stands a local one-shot HTTP server up on an
+# ephemeral port and drives a provider adapter against it, so they exercise the
+# real client's error mapping with no credentials and no external service.
+# `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
+# provider APIs and needs a `.env`, so it stays in the nightly gate.
 NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
