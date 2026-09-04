@@ -295,13 +295,13 @@ fn build_documents(
     // already stored under a rejected `_id` holds a vector from an earlier value of the
     // row's text, which a search would go on returning — see
     // [`write_util::keys_to_evict`], which also decides a repeated `_id` by its last row.
-    let mut outcomes: Vec<(String, write_util::RowOutcome)> = Vec::with_capacity(record.num_rows());
+    let mut outcomes: Vec<(&str, write_util::RowOutcome)> = Vec::with_capacity(record.num_rows());
 
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
             if let Some(id) = primary_keys[row].as_ref() {
-                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
+                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         };
@@ -334,7 +334,7 @@ fn build_documents(
                 zero_or_nan_samples.push(row);
             }
             if let Some(id) = primary_keys[row].as_ref() {
-                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
+                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -345,7 +345,7 @@ fn build_documents(
                 non_finite_samples.push(row);
             }
             if let Some(id) = primary_keys[row].as_ref() {
-                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
+                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -379,7 +379,7 @@ fn build_documents(
         doc.insert(index.vector_field.clone(), vec_json);
 
         if let Some(id) = primary_keys[row].as_ref() {
-            outcomes.push((id.clone(), write_util::RowOutcome::Indexed));
+            outcomes.push((id.as_str(), write_util::RowOutcome::Indexed));
         }
         docs.push((primary_keys[row].clone(), Value::Object(doc)));
     }
@@ -405,7 +405,7 @@ fn build_documents(
         );
     }
 
-    let evicted = write_util::keys_to_evict(outcomes.iter().map(|(id, o)| (id.as_str(), *o)));
+    let evicted = write_util::keys_to_evict(outcomes);
 
     // A document whose `_id` is evicted must not be indexed by this same request: the
     // delete runs first, so leaving it in `docs` would restore under that `_id` a row a

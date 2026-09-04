@@ -244,14 +244,14 @@ impl MemoryVectorIndex {
         let mask: BooleanArray = rows
             .iter()
             .map(|row| {
-                let keep = matches!(
-                    row,
-                    Some((key, write_util::RowOutcome::Indexed)) if !evicted_keys.contains(key)
-                );
-                if keep && let Some((key, _)) = row {
-                    keys.push((*key).to_string());
+                let Some((key, write_util::RowOutcome::Indexed)) = row else {
+                    return Some(false);
+                };
+                if evicted_keys.contains(key) {
+                    return Some(false);
                 }
-                Some(keep)
+                keys.push((*key).to_string());
+                Some(true)
             })
             .collect();
 
