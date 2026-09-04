@@ -542,17 +542,42 @@ jobs:
       # and 33731617339 both died with the cache stats still pending). Cache
       # health is the first thing an overrun needs and the cheapest to get.
       - name: Show sccache stats
-        if: always() && (env.SCCACHE_SETUP == 'true')
+        if: always()
         # Bounded because it sits in front of the status resolution now: this
         # asks the local sccache server, which is normally instant, but a
         # wedged one must not spend the cleanup window that the handlers need.
         timeout-minutes: 2
         # `always()`: this is the one step that reports cache health, and without it
-        # it is skipped on exactly the failures it would explain (#12420). The `||`
-        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
-        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        # it is skipped on exactly the failures it would explain (#12420).
+        #
+        # The condition is `always()` alone, not `always() && SCCACHE_SETUP ==
+        # 'true'`, because a run that lost the cache is the one whose duration
+        # most needs explaining and the one that would otherwise say nothing
+        # here. `setup-sccache`'s pre-flight degrades rather than fails — an
+        # unreachable backend is an infrastructure condition, not a fault in the
+        # code under test — so it clears `RUSTC_WRAPPER`, sets
+        # `SCCACHE_SETUP=false` and lets the gate compile uncached behind a
+        # single `::warning::` posted minutes into a run that lasts hours. The
+        # step budget is calibrated against a cached run, so that run overruns
+        # for a reason that has nothing to do with the branch or the budget, and
+        # the reader has to find one annotation to know it. Report it where they
+        # are already looking.
+        #
+        # The `||` keeps a diagnostic from ever deciding a verdict — when the
+        # cache backend is gone `--show-stats` cannot answer either, and that is
+        # itself the finding.
         run: |
-          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+          case "${SCCACHE_SETUP:-unset}" in
+            true)
+              sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+              ;;
+            false)
+              echo "::warning::This sign-off compiled without the compiler cache: the pre-flight found the backend unreachable and cleared RUSTC_WRAPPER. The step budget is calibrated against a cached run, so read this run's duration, and any budget expiry, as a cache-backend outage rather than as the branch or the budget."
+              ;;
+            *)
+              echo "The compiler cache was never configured in this run, so there are no stats to report."
+              ;;
+          esac
 
       # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
       # non-zero under its `set +e`, falls into the failure branch, and posts
