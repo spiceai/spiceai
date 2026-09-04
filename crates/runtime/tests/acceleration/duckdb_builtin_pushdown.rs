@@ -392,9 +392,10 @@ async fn duckdb_accelerated_to_hex_agrees_with_local() -> Result<(), anyhow::Err
 /// content, with no error and no warning (regression test for #13850).
 ///
 /// The empty string and NULL are here because they are where a decode-based
-/// rewrite could go wrong in the other direction: `unhex('')` must stay the
-/// empty-input digest and `unhex(NULL)` must stay NULL, rather than either
-/// collapsing into the other.
+/// rewrite could go wrong in the other direction. The pushed-down expression
+/// is `unhex(sha256(..))`, so those two cases are `unhex(sha256(''))`, which
+/// must stay the empty-input digest, and `unhex(sha256(NULL))`, which must
+/// stay NULL — rather than either collapsing into the other.
 #[tokio::test]
 async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -457,10 +458,11 @@ async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Err
                 "DuckDB-accelerated sha256 must agree with local evaluation"
             );
 
-            // The empty string, reached over the NULL row. `unhex('')` is the
-            // empty BLOB, so a rewrite that confused "no bytes" with "no value"
-            // would answer NULL here while the kernel answers the empty-input
-            // digest.
+            // The empty string, reached over the NULL row. DuckDB's
+            // sha256('') is the empty-input digest's hex text, so the pushed
+            // unhex(sha256('')) decodes back to that digest; a rewrite that
+            // confused "no bytes" with "no value" would answer NULL here while
+            // the kernel answers the digest.
             let empty = "SELECT id, sha256(coalesce(name, '')) AS d FROM {table} WHERE id = 4";
             let accelerated = run_query(&rt, &empty.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &empty.replace("{table}", "local")).await?;
