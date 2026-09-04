@@ -32,7 +32,7 @@ const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argum
 const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
-const BTRIM_NAME: &str = "btrim";
+pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
