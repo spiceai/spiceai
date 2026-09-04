@@ -112,20 +112,34 @@ jobs:
       # `chdb-rust`'s build script fetches libchdb into OUT_DIR and pins the
       # version it expects, so installing a copy here would be a second place to
       # keep that version right — and the stale one would win, because the build
-      # script prefers an existing library over downloading. The fetch is the
-      # only network step, hence the retry.
+      # script prefers an existing library over downloading. That fetch is the
+      # only network step in this lane, so the build is retried and the run is
+      # not: the lane compares two engines' answers to the same SQL over the same
+      # data, where a mismatch is deterministic and a retry can only hide one.
+      # Same reasoning as `retries = 0` in `.config/nextest.toml`.
+      - name: Build the chDB result-correctness lane
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo test -p cayenne --features result-correctness-chdb \
+                 --test result_correctness_vs_chdb_test --no-run; then
+              built=yes
+              break
+            fi
+            echo "build attempt ${attempt} failed (libchdb fetch); retrying" >&2
+            sleep 30
+          done
+          test "${built:-no}" = yes
+
       - name: Run the chDB result-correctness lane
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_INCREMENTAL: 0
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: |
-          for attempt in 1 2 3; do
-            if cargo test -p cayenne --features result-correctness-chdb \
-                 --test result_correctness_vs_chdb_test -- --nocapture; then
-              exit 0
-            fi
-            echo "attempt ${attempt} failed; retrying" >&2
-            sleep 30
-          done
-          exit 1
+          cargo test -p cayenne --features result-correctness-chdb \
+            --test result_correctness_vs_chdb_test -- --nocapture
