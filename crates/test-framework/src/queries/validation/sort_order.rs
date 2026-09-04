@@ -62,7 +62,9 @@ limitations under the License.
 //!     that `NULLS FIRST` gives nor the `[1, 2, NULL]` that `NULLS LAST` gives.
 //!     Whichever end an engine picks, the `NULL`s land in one block against a
 //!     boundary, so a run that crosses between `NULL` and non-`NULL` more than
-//!     once is a violation.
+//!     once is a violation — and the end it picks holds for the whole result,
+//!     so a term whose `NULL`s lead in one tie group and trail in another
+//!     matches no placement either.
 //! - **Terms that do not map onto an output column.** `ORDER BY` over an
 //!   expression absent from the projection cannot be located in the result. The
 //!   mappable leading terms are still checked and the rest is named — dropping a
@@ -631,6 +633,13 @@ fn check_adjacent_rows(rows: usize, comparators: &[KeyComparator]) -> Option<Sor
 ///   between `NULL` and non-`NULL` twice has non-`NULL` values on both sides of a
 ///   `NULL` block and matches neither.
 ///
+/// Which boundary is never judged, but it must be the *same* boundary
+/// throughout: the engine picks one placement for the term and sorts the whole
+/// result with it. `ORDER BY k1, k2` over `[(1, 1), (1, NULL), (2, NULL), (2, 2)]`
+/// puts `k2`'s `NULL` last in one `k1` group and first in the next, which
+/// `NULLS FIRST` (`[(1, NULL), (1, 1), (2, NULL), (2, 2)]`) and `NULLS LAST`
+/// (`[(1, 1), (1, NULL), (2, 2), (2, NULL)]`) both refuse.
+///
 /// Every key column needs both, not just the leading one, because a later column
 /// is still constrained *within* a run of rows tied on the columns before it:
 /// `ORDER BY k1, k2` over `[(1, 2), (1, NULL), (1, 1)]` is illegal, and both of
@@ -651,6 +660,11 @@ fn check_within_tie_groups(rows: usize, comparators: &[KeyComparator]) -> Option
         let preceding = &comparators[..depth];
         let mut previous: Option<usize> = None;
         let mut crossings = 0usize;
+        // Which end this column's NULLs were seen at, once any group has shown
+        // it. The engine picks one placement for the term and sorts the whole
+        // result with it, so this is carried *across* groups even though the
+        // crossing count restarts within each.
+        let mut nulls_first: Option<bool> = None;
         for row in 0..rows {
             if row > 0 {
                 if tied_on(preceding, row - 1, row) {
@@ -659,10 +673,21 @@ fn check_within_tie_groups(rows: usize, comparators: &[KeyComparator]) -> Option
                         if crossings > 1 {
                             return Some(violation(column, array.as_ref(), row - 1, row));
                         }
+                        // Crossing into a NULL puts them after the values, out of
+                        // one means they came before.
+                        let places_nulls_first = !array.is_null(row);
+                        match nulls_first {
+                            Some(established) if established != places_nulls_first => {
+                                return Some(violation(column, array.as_ref(), row - 1, row));
+                            }
+                            _ => nulls_first = Some(places_nulls_first),
+                        }
                     }
                 } else {
                     // An earlier key separated these rows (or left them unjudged),
                     // so this column's ordering — and its NULL block — starts over.
+                    // Its placement does not: that belongs to the term, not the
+                    // group.
                     previous = None;
                     crossings = 0;
                 }

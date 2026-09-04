@@ -1103,11 +1103,10 @@ fn sort_check_rejects_an_interleaved_null_block_in_a_later_key() {
     );
 }
 
-/// Both boundary placements must stay legal, and a later key's `NULL` run is
-/// judged per tie group — so a group ending in `NULL`s followed by one starting
-/// with them is two legal blocks, not one interleaved.
+/// Both boundary placements are legal — the check never says which end `NULL`s
+/// belong at — but the end an engine picks holds for the whole result.
 #[test]
-fn sort_check_allows_either_null_boundary_and_judges_it_per_tie_group() {
+fn sort_check_allows_either_null_boundary() {
     let one_column = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
     for (name, values) in [
         ("nulls_first", vec![None, Some(1), Some(2)]),
@@ -1131,30 +1130,77 @@ fn sort_check_allows_either_null_boundary_and_judges_it_per_tie_group() {
             "{name} places every NULL at one boundary: {comparison:?}"
         );
     }
+}
 
-    let two_columns = Arc::new(Schema::new(vec![
+/// A secondary key's `NULL`s must land at the same end in every tie group. The
+/// placement belongs to the `ORDER BY` term, which the engine sorts the whole
+/// result by — so trailing in one group and leading in the next is an order no
+/// placement produces, even though each group on its own looks fine.
+#[test]
+fn sort_check_rejects_null_placement_that_changes_between_tie_groups() {
+    let schema = Arc::new(Schema::new(vec![
         Field::new("k1", DataType::Int64, false),
         Field::new("k2", DataType::Int64, true),
     ]));
-    let nulls_last_then_first = RecordBatch::try_new(
-        Arc::clone(&two_columns),
+    let placement_flips = RecordBatch::try_new(
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
-            Arc::new(Int64Array::from(vec![Some(5), None, None, Some(3)])),
+            Arc::new(Int64Array::from(vec![Some(1), None, None, Some(2)])),
         ],
     )
     .expect("batch");
-    let comparison = compare_query_result_batches_with_sort_check(
-        "per_group_null_boundary",
+
+    let result = compare_query_result_batches_with_sort_check(
+        "placement_flips",
         "SELECT k1, k2 FROM t ORDER BY k1, k2",
-        &[nulls_last_then_first.clone()],
-        &[nulls_last_then_first],
+        &[placement_flips.clone()],
+        &[placement_flips],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "NULLS FIRST gives [(1,NULL),(1,1),(2,NULL),(2,2)] and NULLS LAST gives \
+         [(1,1),(1,NULL),(2,2),(2,NULL)]; this is neither: {result:?}"
+    );
+}
+
+/// The same shape with one consistent placement is legal, and must stay so:
+/// every group trails its `NULL`s.
+#[test]
+fn sort_check_allows_one_null_placement_across_every_tie_group() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let nulls_last_throughout = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(5), None, Some(3), None])),
+        ],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "one_placement",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[nulls_last_throughout.clone()],
+        &[nulls_last_throughout],
         RowOrder::Multiset,
     )
     .expect("compare");
     assert!(
         comparison.is_fully_verified_pass(),
-        "each k1 group puts its NULLs at one end of that group: {comparison:?}"
+        "both k1 groups trail their NULLs, and k2 may restart at 3 when k1 changes: {comparison:?}"
     );
 }
 
