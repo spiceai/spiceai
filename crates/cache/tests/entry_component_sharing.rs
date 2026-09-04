@@ -191,7 +191,7 @@ fn assert_all_share<T>(items: &[Arc<T>], what: &str) {
 #[tokio::test]
 async fn entries_of_one_shape_share_a_single_schema() {
     let entries = store_entries(8, WIDE_NAME_LEN, "orders").await;
-    let schemas: Vec<SchemaRef> = entries.iter().map(|e| Arc::clone(&e.schema)).collect();
+    let schemas: Vec<SchemaRef> = entries.iter().map(|e| e.schema.arc()).collect();
     assert_all_share(&schemas, "schema");
 }
 
@@ -201,7 +201,7 @@ async fn entries_of_one_shape_share_a_single_schema() {
 async fn entries_reading_one_table_share_a_single_input_table_set() {
     let entries = store_entries(4, 16, &"t".repeat(WIDE_NAME_LEN)).await;
     let tables: Vec<Arc<HashSet<TableReference>>> =
-        entries.iter().map(|e| Arc::clone(&e.input_tables)).collect();
+        entries.iter().map(|e| e.input_tables.arc()).collect();
     assert_all_share(&tables, "input-table set");
 }
 
@@ -210,9 +210,9 @@ async fn entries_reading_one_table_share_a_single_input_table_set() {
 #[tokio::test]
 async fn a_wide_shape_is_still_one_allocation() {
     let entries = store_entries(200, 64, &"wide_table".repeat(64)).await;
-    let schemas: Vec<SchemaRef> = entries.iter().map(|e| Arc::clone(&e.schema)).collect();
+    let schemas: Vec<SchemaRef> = entries.iter().map(|e| e.schema.arc()).collect();
     let tables: Vec<Arc<HashSet<TableReference>>> =
-        entries.iter().map(|e| Arc::clone(&e.input_tables)).collect();
+        entries.iter().map(|e| e.input_tables.arc()).collect();
     assert_all_share(&schemas, "schema");
     assert_all_share(&tables, "input-table set");
 }
@@ -236,9 +236,9 @@ async fn a_shared_shape_is_not_billed_to_every_entry() {
     // together, because the pair is the invariant: an entry that holds a
     // private copy and is not billed for it is the worst of both, and a test
     // that checked only the charge would call that state a pass.
-    let schemas: Vec<SchemaRef> = entries.iter().map(|e| Arc::clone(&e.schema)).collect();
+    let schemas: Vec<SchemaRef> = entries.iter().map(|e| e.schema.arc()).collect();
     let tables: Vec<Arc<HashSet<TableReference>>> =
-        entries.iter().map(|e| Arc::clone(&e.input_tables)).collect();
+        entries.iter().map(|e| e.input_tables.arc()).collect();
     assert_all_share(&schemas, "schema");
     assert_all_share(&tables, "input-table set");
 

@@ -258,14 +258,30 @@ async fn the_cache_holds_about_what_it_reports_holding() {
             // hold real memory that no entry is charged for. It is bounded — one
             // copy per distinct shape, not one per entry — so it shows up here
             // as a fixed addend, not as growth per entry.
-            let pooled = arrow_tools::schema_intern::global().stats().value_bytes as u64
-                + arrow_tools::table_set_intern::global().stats().value_bytes as u64;
+            let pooled = cache::intern::schema::global().stats().value_bytes as u64
+                + cache::intern::table_set::global().stats().value_bytes as u64;
 
             println!(
                 "entries {stored}: reported {reported_growth} B, actually held {actual_growth} B \
                  ({} B/entry reported, {} B/entry held), pooled and uncharged {pooled} B",
                 reported_growth / stored,
                 actual_growth / stored,
+            );
+
+            // The per-entry store allowance is one flat calibrated constant
+            // (`cache::sizing::ENTRY_OVERHEAD_BYTES`), and it is a cost of the
+            // store and the allocator — so it moves with platform, allocator
+            // and moka version. This is what catches a platform where it has
+            // gone badly wrong: on the shape below the allowance is most of
+            // what an entry is billed, so if the constant no longer describes
+            // this machine the two figures diverge here first.
+            let per_entry_reported = reported_growth / stored;
+            let per_entry_held = actual_growth / stored;
+            assert!(
+                per_entry_reported.abs_diff(per_entry_held) * 2 <= per_entry_held,
+                "an entry is billed {per_entry_reported} B but holds {per_entry_held} B, more \
+                 than 50% apart; the flat per-entry store allowance no longer describes this \
+                 platform's allocator or moka version and should be re-calibrated"
             );
 
             assert!(

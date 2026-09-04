@@ -39,7 +39,7 @@ pub(crate) fn prepare_for_storage(mut batches: Vec<RecordBatch>) -> Vec<RecordBa
     for batch in &mut batches {
         *batch = arrow_tools::record_batch::compact_retained_buffers(batch);
     }
-    arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
+    crate::intern::schema::intern_batch_schemas(&mut batches);
     batches
 }
 

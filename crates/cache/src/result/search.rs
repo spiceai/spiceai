@@ -18,10 +18,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::sql::TableReference;
 
-use arrow_tools::table_set_intern::table_reference_heap_size;
+use crate::intern::table_set::table_reference_heap_size;
+use crate::intern::Interned;
 use crate::sizing::{
     ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
 };
@@ -33,7 +34,10 @@ pub struct CachedAggregationResult {
     pub primary_keys: Vec<String>,
     pub data_columns: Vec<String>,
     pub matches: HashMap<String, Vec<String>>,
-    pub schema: SchemaRef,
+    /// [`Interned`] for the same reason as [`crate::CachedQueryResult::schema`]:
+    /// it can only have come from the pool, so it is shared and the weigher's
+    /// decision not to charge for it holds however this struct is built.
+    pub schema: Interned<Schema>,
 }
 
 impl CachedAggregationResult {
@@ -55,7 +59,7 @@ impl CachedAggregationResult {
             primary_keys,
             data_columns,
             matches,
-            schema: arrow_tools::schema_intern::intern(schema),
+            schema: crate::intern::schema::intern(schema),
         }
     }
 
@@ -94,12 +98,12 @@ pub struct CachedSearchResult {
     /// A public field would let a new call site store an un-shared copy, and
     /// nothing would fail — the entry would simply stop being billed for memory
     /// it privately holds.
-    input_tables: Arc<HashSet<TableReference>>,
+    input_tables: Interned<HashSet<TableReference>>,
 }
 
 impl CachedSearchResult {
     /// Builds an entry, interning the input-table set so entries over the same
-    /// tables share one allocation. See [`arrow_tools::table_set_intern`].
+    /// tables share one allocation. See [`crate::intern::table_set`].
     #[must_use]
     pub fn new(
         results: Arc<HashMap<TableReference, CachedAggregationResult>>,
@@ -107,14 +111,14 @@ impl CachedSearchResult {
     ) -> Self {
         Self {
             results,
-            input_tables: arrow_tools::table_set_intern::intern(input_tables),
+            input_tables: crate::intern::table_set::intern(input_tables),
         }
     }
 }
 
 impl AsTableRefs for CachedSearchResult {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
+        self.input_tables.arc()
     }
 }
 
@@ -267,14 +271,13 @@ mod tests {
         let second = empty_result_over(schema_of_width(200), Vec::new());
 
         let schema_of = |result: &CachedSearchResult| {
-            Arc::clone(
-                &result
-                    .results
-                    .values()
-                    .next()
-                    .expect("one aggregated result")
-                    .schema,
-            )
+            result
+                .results
+                .values()
+                .next()
+                .expect("one aggregated result")
+                .schema
+                .arc()
         };
 
         assert!(

@@ -16,6 +16,11 @@ limitations under the License.
 
 //! A content-keyed, weakly-held pool of shared allocations.
 //!
+//! Lives in this crate because the cache is what retains the values worth
+//! sharing: a schema is minted per plan and a table set per query, but only a
+//! cached entry keeps either past the query that made it. Interning anywhere
+//! higher would hash values that are about to be dropped.
+//!
 //! The problem it solves is the same wherever it appears: something builds a
 //! fresh allocation per operation whose *contents* are one of a handful of
 //! shapes, and something else retains one of those per item. N retained items
@@ -63,6 +68,48 @@ pub(crate) const SWEEP_INTERVAL: usize = 256;
 /// weakly-held pool promises not to do. Shrinking only past a slack factor
 /// keeps a steady-state workload from reallocating on every sweep.
 const CAPACITY_SLACK: usize = 4;
+
+/// A value that came out of an [`Interner`], and so is shared with every other
+/// holder of the same content.
+///
+/// The point is what it cannot be built from: there is no way to make one from
+/// an arbitrary `Arc<T>`, only by interning. A cache entry that stores its
+/// schema and table set as `Interned` therefore cannot hold a private copy, so
+/// the weigher's decision not to charge for them stays true no matter how many
+/// constructors the entry grows. Before this, that decision rested on every
+/// call site remembering to intern — the class of mistake CLAUDE.md's
+/// *Trait evolution & wrapper delegation* section is about, where the wiring
+/// compiles and silently no-ops.
+#[derive(Debug)]
+pub struct Interned<T>(Arc<T>);
+
+impl<T> Interned<T> {
+    /// The shared allocation, for a caller that needs the `Arc` itself.
+    #[must_use]
+    pub fn arc(&self) -> Arc<T> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl<T> Clone for Interned<T> {
+    // Derived `Clone` would demand `T: Clone`; sharing the `Arc` is the point.
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Interned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> AsRef<T> for Interned<T> {
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// A value the pool can share: comparable by content, and able to say how much
 /// memory it occupies.
@@ -274,34 +321,8 @@ impl<T, S: BuildHasher> Interner<T, S> {
         }
     }
 
-    /// Interns that collapsed a distinct allocation onto the shared one,
-    /// cumulative. See [`InternerStats::collapsed`].
-    ///
-    /// Read straight from the counter rather than through [`Self::stats`],
-    /// which walks every shard: a reporter sampling these should not pay for a
-    /// full traversal to read three atomics.
-    #[must_use]
-    pub fn collapsed(&self) -> u64 {
-        self.collapsed.load(Ordering::Relaxed)
-    }
 
-    /// Interns whose caller already held the shared allocation, cumulative.
-    /// See [`InternerStats::already_shared`].
-    #[must_use]
-    pub fn already_shared(&self) -> u64 {
-        self.already_shared.load(Ordering::Relaxed)
-    }
 
-    /// Interns that adopted a value the pool had not seen, cumulative.
-    ///
-    /// Read against [`Self::collapsed`], this is what says whether interning is
-    /// earning its place: misses without collapses means values are arriving
-    /// distinct and nothing is being shared — the case in which per-item
-    /// accounting has stopped charging for memory that is not in fact shared.
-    #[must_use]
-    pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
 
     /// A snapshot of what the pool holds, excluding rows whose holders are gone.
     ///
@@ -344,7 +365,15 @@ impl<T: Internable, S: BuildHasher> Interner<T, S> {
     /// Takes the value by value because that is how it is meant to be used —
     /// hand over the copy you were about to store, keep the canonical one.
     #[must_use]
-    pub fn intern(&self, value: Arc<T>) -> Arc<T> {
+    pub fn intern(&self, value: Arc<T>) -> Interned<T> {
+        Interned(self.intern_arc(value))
+    }
+
+    /// The shared allocation itself, for the few callers that need an `Arc`
+    /// rather than the proof-carrying [`Interned`] — rewriting a batch's schema
+    /// in place, for one.
+    #[must_use]
+    pub fn intern_arc(&self, value: Arc<T>) -> Arc<T> {
         let hash = self.hash_of(&value);
         // The remainder is below SHARDS and so always fits; the fallback keeps
         // this total rather than resting on that reasoning.
@@ -359,18 +388,24 @@ impl<T: Internable, S: BuildHasher> Interner<T, S> {
         if let Some(candidates) = shard.buckets.get(&hash) {
             for row in candidates {
                 if let Some(existing) = row.value.upgrade() {
+                    // Pointer equality first. It answers the same question as
+                    // the deep compare whenever it is true, and it is true on a
+                    // hot path: a caller that interns a value it already got
+                    // from this pool — which every re-store of an unchanged
+                    // shape does — would otherwise pay a full content walk,
+                    // holding the shard lock, to learn what one pointer compare
+                    // settles. It also separates "a duplicate was collapsed"
+                    // from "the caller already had the shared copy"; only the
+                    // former is a saving, and counting both as one number would
+                    // make a pool that dedupes nothing look effective.
+                    if Arc::ptr_eq(&existing, &value) {
+                        self.already_shared.fetch_add(1, Ordering::Relaxed);
+                        return existing;
+                    }
                     // Content equality, not merely a matching hash: two distinct
                     // values that collide must never be conflated.
                     if existing.as_ref() == value.as_ref() {
-                        // Pointer equality separates "a duplicate was collapsed"
-                        // from "the caller already had the shared copy". Only
-                        // the former is a saving; counting both as one number
-                        // would make a pool that dedupes nothing look effective.
-                        if Arc::ptr_eq(&existing, &value) {
-                            self.already_shared.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            self.collapsed.fetch_add(1, Ordering::Relaxed);
-                        }
+                        self.collapsed.fetch_add(1, Ordering::Relaxed);
                         return existing;
                     }
                 }
@@ -392,4 +427,17 @@ impl<T: Internable, S: BuildHasher> Interner<T, S> {
         value.content_hash(&mut hasher);
         hasher.finish()
     }
+}
+
+pub mod schema;
+pub mod table_set;
+
+/// Reclaims tombstones across every process-wide pool this crate owns.
+///
+/// Driven by [`crate::Caching::run_pending_maintenance`]: a pool only reclaims
+/// a shard that interning happens to touch, so a shard that goes quiet after a
+/// burst would otherwise hold its dead rows for the process lifetime.
+pub fn sweep_all() {
+    schema::sweep();
+    table_set::sweep();
 }

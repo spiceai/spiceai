@@ -27,7 +27,7 @@ limitations under the License.
 //! a 4,000-char name cost **+4,063 bytes per entry**, which is the whole name
 //! copied per entry.
 //!
-//! This lives beside [`crate::intern`] rather than beside its user in the cache
+//! This lives beside [`super`] rather than beside its user in the cache
 //! crate because [`Internable`] is local here: the orphan rule allows a local
 //! trait on the foreign `HashSet<TableReference>`, but would not allow the
 //! cache crate to write the same impl.
@@ -40,7 +40,7 @@ use std::sync::{Arc, LazyLock};
 
 use datafusion::sql::TableReference;
 
-use crate::intern::{Internable, Interner};
+use super::{Internable, Interner};
 
 /// The set a cached result carries, as the cache stores it.
 pub type TableSet = HashSet<TableReference>;
@@ -131,7 +131,7 @@ pub fn sweep() {
 
 /// Interns `tables` in the process-wide pool. See [`Interner::intern`].
 #[must_use]
-pub fn intern(tables: Arc<TableSet>) -> Arc<TableSet> {
+pub fn intern(tables: Arc<TableSet>) -> super::Interned<TableSet> {
     GLOBAL.intern(tables)
 }
 
@@ -168,8 +168,8 @@ mod tests {
             "the two sets must start as distinct allocations for this to prove anything"
         );
 
-        let first = interner.intern(forwards);
-        let second = interner.intern(backwards);
+        let first = interner.intern(forwards).arc();
+        let second = interner.intern(backwards).arc();
         assert!(
             Arc::ptr_eq(&first, &second),
             "sets with the same members must collapse regardless of build order"
@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn sets_with_different_members_stay_separate() {
         let interner = TableSetInterner::new();
-        let orders = interner.intern(set(&["orders"]));
-        let customers = interner.intern(set(&["customers"]));
+        let orders = interner.intern(set(&["orders"])).arc();
+        let customers = interner.intern(set(&["customers"])).arc();
         assert!(!Arc::ptr_eq(&orders, &customers));
         assert_eq!(interner.stats().rows, 2);
     }
@@ -191,8 +191,8 @@ mod tests {
     #[test]
     fn a_subset_does_not_collapse_onto_its_superset() {
         let interner = TableSetInterner::new();
-        let one = interner.intern(set(&["orders"]));
-        let two = interner.intern(set(&["orders", "customers"]));
+        let one = interner.intern(set(&["orders"])).arc();
+        let two = interner.intern(set(&["orders", "customers"])).arc();
         assert!(!Arc::ptr_eq(&one, &two));
     }
 
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn the_pool_reports_the_bytes_it_shares() {
         let interner = TableSetInterner::new();
-        let held = interner.intern(set(&["a_table_with_a_reasonably_long_name"]));
+        let held = interner.intern(set(&["a_table_with_a_reasonably_long_name"])).arc();
         let stats = interner.stats();
         assert_eq!(stats.rows, 1);
         assert_eq!(stats.value_bytes, table_set_deep_size(&held));

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use parking_lot::Mutex;
 use std::sync::LazyLock;
 
 use opentelemetry::{
@@ -84,18 +85,57 @@ struct InternerMetrics {
 
 /// How a pool reports itself. One set per pool, so the instruments below are
 /// built once and read the right globals.
+///
+/// One accessor, not four: `stats()` already carries the counters, and taking
+/// them from the same snapshot is what makes a scrape internally consistent.
 struct InternerSource {
     /// Instrument-name prefix, e.g. `schema_interner`.
     prefix: &'static str,
     /// What the pool holds, for the descriptions: e.g. "Arrow schemas".
     noun: &'static str,
-    stats: fn() -> arrow_tools::intern::InternerStats,
-    collapsed: fn() -> u64,
-    already_shared: fn() -> u64,
-    misses: fn() -> u64,
+    stats: fn() -> crate::intern::InternerStats,
 }
 
-fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
+/// The last snapshot taken of a pool, and when.
+///
+/// `stats()` takes all 16 shard mutexes and walks every row and bucket — the
+/// same mutexes the cache write path contends for. Six instruments read from
+/// one pool, so a scrape that called it per instrument would do that six times
+/// over and could still report six mutually inconsistent numbers. Prometheus
+/// pulls, so the rate is whatever the scraper chooses. One snapshot per pool
+/// per scrape window serves every instrument from the same walk.
+struct StatsCache {
+    taken_at: std::time::Instant,
+    stats: crate::intern::InternerStats,
+}
+
+/// How long a snapshot serves. Shorter than any sane scrape interval, so a
+/// scrape still sees fresh numbers, but long enough that the six instruments of
+/// one scrape share a single walk.
+const STATS_FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl InternerSource {
+    /// The pool's stats, recomputed only when the last snapshot has aged out.
+    fn snapshot(&'static self, cell: &Mutex<Option<StatsCache>>) -> crate::intern::InternerStats {
+        let mut held = cell.lock();
+        if let Some(cached) = held.as_ref()
+            && cached.taken_at.elapsed() < STATS_FRESH_FOR
+        {
+            return cached.stats;
+        }
+        let stats = (self.stats)();
+        *held = Some(StatsCache {
+            taken_at: std::time::Instant::now(),
+            stats,
+        });
+        stats
+    }
+}
+
+fn build_interner_metrics(
+    source: &'static InternerSource,
+    snapshot: &'static Mutex<Option<StatsCache>>,
+) -> InternerMetrics {
     let meter = global::meter(source.prefix);
     let (noun, prefix) = (source.noun, source.prefix);
     InternerMetrics {
@@ -103,7 +143,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
             .u64_observable_gauge(format!("{prefix}_rows"))
             .with_description(format!("Distinct {noun} currently shared by the interner."))
             .with_callback(move |observer| {
-                observer.observe((source.stats)().rows as u64, &[]);
+                observer.observe(source.snapshot(snapshot).rows as u64, &[]);
             })
             .build(),
         _value_bytes: meter
@@ -113,7 +153,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
             ))
             .with_unit("By")
             .with_callback(move |observer| {
-                observer.observe((source.stats)().value_bytes as u64, &[]);
+                observer.observe(source.snapshot(snapshot).value_bytes as u64, &[]);
             })
             .build(),
         _self_bytes: meter
@@ -123,7 +163,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
             )
             .with_unit("By")
             .with_callback(move |observer| {
-                observer.observe((source.stats)().self_bytes as u64, &[]);
+                observer.observe(source.snapshot(snapshot).self_bytes as u64, &[]);
             })
             .build(),
         // Cumulative, so counters rather than gauges — and read through the
@@ -135,7 +175,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
                 "Distinct {noun} allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates."
             ))
             .with_callback(move |observer| {
-                observer.observe((source.collapsed)(), &[]);
+                observer.observe(source.snapshot(snapshot).collapsed, &[]);
             })
             .build(),
         _already_shared: meter
@@ -144,7 +184,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
                 "Interns whose caller already held the shared allocation. Counted apart from collapsed values because no duplicate was removed.",
             )
             .with_callback(move |observer| {
-                observer.observe((source.already_shared)(), &[]);
+                observer.observe(source.snapshot(snapshot).already_shared, &[]);
             })
             .build(),
         _misses: meter
@@ -153,7 +193,7 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
                 "Interns that adopted {noun} the pool had not seen. Misses without collapses means values are arriving distinct and nothing is being shared."
             ))
             .with_callback(move |observer| {
-                observer.observe((source.misses)(), &[]);
+                observer.observe(source.snapshot(snapshot).misses, &[]);
             })
             .build(),
     }
@@ -162,25 +202,21 @@ fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
 static SCHEMA_POOL: InternerSource = InternerSource {
     prefix: "schema_interner",
     noun: "Arrow schemas",
-    stats: || arrow_tools::schema_intern::global().stats(),
-    collapsed: || arrow_tools::schema_intern::global().collapsed(),
-    already_shared: || arrow_tools::schema_intern::global().already_shared(),
-    misses: || arrow_tools::schema_intern::global().misses(),
+    stats: || crate::intern::schema::global().stats(),
 };
+static SCHEMA_POOL_SNAPSHOT: Mutex<Option<StatsCache>> = Mutex::new(None);
 
 static TABLE_SET_POOL: InternerSource = InternerSource {
     prefix: "table_set_interner",
     noun: "input-table sets",
-    stats: || arrow_tools::table_set_intern::global().stats(),
-    collapsed: || arrow_tools::table_set_intern::global().collapsed(),
-    already_shared: || arrow_tools::table_set_intern::global().already_shared(),
-    misses: || arrow_tools::table_set_intern::global().misses(),
+    stats: || crate::intern::table_set::global().stats(),
 };
+static TABLE_SET_POOL_SNAPSHOT: Mutex<Option<StatsCache>> = Mutex::new(None);
 
 static INTERNER_METRICS: LazyLock<Vec<InternerMetrics>> = LazyLock::new(|| {
     vec![
-        build_interner_metrics(&SCHEMA_POOL),
-        build_interner_metrics(&TABLE_SET_POOL),
+        build_interner_metrics(&SCHEMA_POOL, &SCHEMA_POOL_SNAPSHOT),
+        build_interner_metrics(&TABLE_SET_POOL, &TABLE_SET_POOL_SNAPSHOT),
     ]
 });
 

@@ -33,6 +33,7 @@ use futures::task::{Context, Poll};
 use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
+use crate::intern::Interned;
 use crate::sizing::{ENTRY_OVERHEAD_BYTES, arc_heap_size};
 
 use super::CacheStatus;
@@ -50,10 +51,15 @@ pub enum CachedData {
 pub struct CachedQueryResult {
     /// Cached record batches (raw or encoded)
     data: CachedData,
-    /// Schema for the cached data
-    pub schema: Arc<Schema>,
-    /// Input tables referenced by the query
-    pub input_tables: Arc<HashSet<TableReference>>,
+    /// Schema for the cached data.
+    ///
+    /// [`Interned`] rather than `Arc`: it can only have come from the pool, so
+    /// it is shared with every other entry of this shape and the weigher's
+    /// decision not to charge for it holds however this struct is built.
+    pub schema: Interned<Schema>,
+    /// Input tables referenced by the query. [`Interned`] for the same reason
+    /// as [`Self::schema`].
+    pub input_tables: Interned<HashSet<TableReference>>,
     /// Timestamp when the result was cached.
     cached_at: Instant,
     /// When the query that produced this result began reading.
@@ -84,8 +90,8 @@ impl CachedQueryResult {
     ) -> Self {
         Self {
             data: CachedData::Raw(Arc::new(super::prepare_for_storage(batches))),
-            schema: arrow_tools::schema_intern::intern(schema),
-            input_tables: arrow_tools::table_set_intern::intern(input_tables),
+            schema: crate::intern::schema::intern(schema),
+            input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
             read_started_at,
             encoder: None,
@@ -104,8 +110,8 @@ impl CachedQueryResult {
     ) -> Self {
         Self {
             data: CachedData::Encoded(encoded_data),
-            schema: arrow_tools::schema_intern::intern(schema),
-            input_tables: arrow_tools::table_set_intern::intern(input_tables),
+            schema: crate::intern::schema::intern(schema),
+            input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
             read_started_at,
             encoder,
@@ -139,8 +145,8 @@ impl CachedQueryResult {
 
         Ok(Self {
             data,
-            schema: arrow_tools::schema_intern::intern(schema),
-            input_tables: arrow_tools::table_set_intern::intern(input_tables),
+            schema: crate::intern::schema::intern(schema),
+            input_tables: crate::intern::table_set::intern(input_tables),
             cached_at,
             read_started_at,
             encoder,
@@ -203,7 +209,7 @@ impl CachedQueryResult {
     /// wrong to begin with.
     ///
     /// What keeps that residual case from being silent is reporting rather than
-    /// admission: [`arrow_tools::schema_intern::SchemaInterner::stats`] counts
+    /// admission: [`crate::intern::schema::SchemaInterner::stats`] counts
     /// each distinct schema once and is published as
     /// `schema_interner_schema_bytes`, so a pool growing without bound is
     /// visible even though it does not trigger eviction.
@@ -250,7 +256,7 @@ impl Sizeable for CachedQueryResult {
 
 impl AsTableRefs for CachedQueryResult {
     fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
-        Arc::clone(&self.input_tables)
+        self.input_tables.arc()
     }
 }
 
@@ -497,7 +503,7 @@ mod tests {
         assert_eq!(batches.len(), 2);
         for (i, batch) in batches.iter().enumerate() {
             assert!(
-                Arc::ptr_eq(batch.schema_ref(), &result.schema),
+                Arc::ptr_eq(batch.schema_ref(), &result.schema.arc()),
                 "batch {i} must share the entry's interned schema"
             );
             assert_eq!(batch.num_rows(), 3, "interning must not disturb the rows");
@@ -514,7 +520,7 @@ mod tests {
         let second = empty_result_of_width(200);
 
         assert!(
-            Arc::ptr_eq(&first.schema, &second.schema),
+            Arc::ptr_eq(&first.schema.arc(), &second.schema.arc()),
             "entries of the same shape must share one schema allocation"
         );
         assert_eq!(
@@ -559,7 +565,7 @@ mod tests {
             "a 1 MiB budget must not admit the pre-fix 12,840 wide 0-row entries, it admits {admissible} at {entry_weight} bytes each"
         );
 
-        let schema_bytes = arrow_tools::schema_intern::schema_deep_size(&entry.schema) as u64;
+        let schema_bytes = crate::intern::schema::schema_deep_size(&entry.schema) as u64;
         let really_held = admissible * entry_weight + schema_bytes;
         assert!(
             really_held < 2 * budget,
@@ -693,7 +699,7 @@ mod tests {
             3,
             "Cached empty result must preserve the original 3-field schema"
         );
-        assert_eq!(cached_result.schema, schema);
+        assert_eq!(cached_result.schema.arc(), schema);
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/9481>
@@ -721,13 +727,13 @@ mod tests {
             3,
             "Cached empty result must preserve the original 3-field schema"
         );
-        assert_eq!(cached_result.schema, schema);
+        assert_eq!(cached_result.schema.arc(), schema);
 
         // Verify the CachedStream also reports the correct schema
         let records = cached_result.records().await.expect("should decode");
         assert!(records.is_empty(), "Should have no record batches");
 
-        let stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
+        let stream = CachedStream::new(records, cached_result.schema.arc());
         assert_eq!(
             stream.schema().fields().len(),
             3,

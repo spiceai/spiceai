@@ -953,7 +953,6 @@ dependencies = [
 name = "arrow_tools"
 version = "2.3.0-unstable"
 dependencies = [
- "ahash 0.8.12",
  "arrow",
  "arrow-cast",
  "arrow-json",
@@ -962,7 +961,6 @@ dependencies = [
  "criterion 0.7.0",
  "datafusion",
  "insta",
- "parking_lot",
  "serde_json",
  "snafu",
  "tracing",

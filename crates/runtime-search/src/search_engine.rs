@@ -540,7 +540,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                         let result = AggregationResult {
                             data: Box::pin(CachedStream::new(
                                 Arc::clone(&cached_aggregation_result.records),
-                                Arc::clone(&cached_aggregation_result.schema),
+                                cached_aggregation_result.schema.arc(),
                             )),
                             primary_key: cached_aggregation_result.primary_keys.clone(),
                             data_columns: cached_aggregation_result.data_columns.clone(),

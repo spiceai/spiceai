@@ -85,11 +85,11 @@ use std::mem::size_of;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef};
 
-use crate::intern::{Internable, Interner};
+use super::{Internable, Interner};
 #[cfg(test)]
-use crate::intern::{SHARDS, SWEEP_INTERVAL};
+use super::{SHARDS, SWEEP_INTERVAL};
 
 /// Number of independently-locked shards.
 ///
@@ -155,7 +155,7 @@ impl<S: BuildHasher> Interner<Schema, S> {
                 }
                 _ => {
                     let schema = Arc::clone(batch.schema_ref());
-                    let interned = self.intern(Arc::clone(&schema));
+                    let interned = self.intern_arc(Arc::clone(&schema));
                     last = Some((schema, Arc::clone(&interned)));
                     interned
                 }
@@ -195,7 +195,7 @@ pub fn sweep() {
 
 /// Interns `schema` in the process-wide pool. See [`Interner::intern`].
 #[must_use]
-pub fn intern(schema: SchemaRef) -> SchemaRef {
+pub fn intern(schema: SchemaRef) -> super::Interned<Schema> {
     GLOBAL.intern(schema)
 }
 
@@ -208,7 +208,7 @@ pub fn intern_batch_schemas(batches: &mut [RecordBatch]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field};
+    use arrow::datatypes::{DataType, Field};
     use std::collections::HashMap;
     use std::hash::Hasher;
 
@@ -227,8 +227,8 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&a, &b), "the two inputs start out distinct");
 
-        let ia = interner.intern(Arc::clone(&a));
-        let ib = interner.intern(Arc::clone(&b));
+        let ia = interner.intern(Arc::clone(&a)).arc();
+        let ib = interner.intern(Arc::clone(&b)).arc();
 
         assert!(
             Arc::ptr_eq(&ia, &ib),
@@ -247,7 +247,7 @@ mod tests {
             Field::new("a", DataType::Int64, true),
         ]));
 
-        let shared = interner.intern(Arc::clone(&schema));
+        let shared = interner.intern(Arc::clone(&schema)).arc();
 
         assert_eq!(shared.as_ref(), schema.as_ref());
         assert_eq!(shared.fields()[0].name(), "b", "order is preserved");
@@ -264,8 +264,8 @@ mod tests {
                 .with_metadata(HashMap::from([("k".to_string(), "v".to_string())])),
         );
 
-        let ia = interner.intern(Arc::clone(&bare));
-        let ib = interner.intern(Arc::clone(&annotated));
+        let ia = interner.intern(Arc::clone(&bare)).arc();
+        let ib = interner.intern(Arc::clone(&annotated)).arc();
 
         assert!(
             !Arc::ptr_eq(&ia, &ib),
@@ -288,8 +288,8 @@ mod tests {
 
         assert!(
             !Arc::ptr_eq(
-                &interner.intern(Arc::clone(&plain)),
-                &interner.intern(Arc::clone(&tagged))
+                &interner.intern(Arc::clone(&plain)).arc(),
+                &interner.intern(Arc::clone(&tagged)).arc()
             ),
             "field-level metadata distinguishes two schemas"
         );
@@ -302,8 +302,8 @@ mod tests {
         let required = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
 
         assert!(!Arc::ptr_eq(
-            &interner.intern(Arc::clone(&nullable)),
-            &interner.intern(Arc::clone(&required))
+            &interner.intern(Arc::clone(&nullable)).arc(),
+            &interner.intern(Arc::clone(&required)).arc()
         ));
     }
 
@@ -312,7 +312,7 @@ mod tests {
         let interner = SchemaInterner::new();
         {
             let schema = schema_of(4);
-            let shared = interner.intern(Arc::clone(&schema));
+            let shared = interner.intern(Arc::clone(&schema)).arc();
             assert_eq!(interner.stats().rows, 1);
             drop(shared);
             drop(schema);
@@ -331,7 +331,7 @@ mod tests {
         let interner = SchemaInterner::new();
         let weak = {
             let schema = schema_of(4);
-            let shared = interner.intern(Arc::clone(&schema));
+            let shared = interner.intern(Arc::clone(&schema)).arc();
             let weak = Arc::downgrade(&shared);
             drop(shared);
             drop(schema);
@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(interner.stats().rows, 0);
 
         let revived = schema_of(4);
-        let shared = interner.intern(Arc::clone(&revived));
+        let shared = interner.intern(Arc::clone(&revived)).arc();
 
         assert_eq!(shared.as_ref(), revived.as_ref());
         assert_eq!(interner.stats().rows, 1);
@@ -491,8 +491,8 @@ mod tests {
         let interner = SchemaInterner::new();
         let narrow = schema_of(4);
         let wide = schema_of(200);
-        let _narrow = interner.intern(Arc::clone(&narrow));
-        let _wide = interner.intern(Arc::clone(&wide));
+        let _narrow = interner.intern(Arc::clone(&narrow)).arc();
+        let _wide = interner.intern(Arc::clone(&wide)).arc();
 
         let stats = interner.stats();
         assert_eq!(stats.rows, 2);
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn repeated_interning_collapses_duplicates_into_one_row() {
         let interner = SchemaInterner::new();
-        let held: Vec<SchemaRef> = (0..64).map(|_| interner.intern(schema_of(8))).collect();
+        let held: Vec<SchemaRef> = (0..64).map(|_| interner.intern(schema_of(8)).arc()).collect();
 
         let stats = interner.stats();
         assert_eq!(stats.rows, 1, "64 equal schemas occupy one row");
@@ -533,11 +533,11 @@ mod tests {
     #[test]
     fn a_re_intern_of_the_shared_copy_is_not_counted_as_a_collapse() {
         let interner = SchemaInterner::new();
-        let shared = interner.intern(schema_of(8));
+        let shared = interner.intern(schema_of(8)).arc();
         assert_eq!(interner.stats().misses, 1);
 
         // Hand back the very allocation the pool returned.
-        let again = interner.intern(Arc::clone(&shared));
+        let again = interner.intern(Arc::clone(&shared)).arc();
         assert!(Arc::ptr_eq(&again, &shared));
 
         let stats = interner.stats();
@@ -593,9 +593,9 @@ mod tests {
                 .with_metadata(HashMap::from([("k".to_string(), "v".to_string())])),
         );
 
-        let i_narrow = interner.intern(Arc::clone(&narrow));
-        let i_wide = interner.intern(Arc::clone(&wide));
-        let i_annotated = interner.intern(Arc::clone(&annotated));
+        let i_narrow = interner.intern(Arc::clone(&narrow)).arc();
+        let i_wide = interner.intern(Arc::clone(&wide)).arc();
+        let i_annotated = interner.intern(Arc::clone(&annotated)).arc();
 
         assert_eq!(i_narrow.as_ref(), narrow.as_ref(), "content is preserved");
         assert_eq!(i_wide.as_ref(), wide.as_ref());
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(stats.misses, 3);
 
         // Re-interning still finds the right candidate within the bucket.
-        assert!(Arc::ptr_eq(&interner.intern(schema_of(9)), &i_wide));
+        assert!(Arc::ptr_eq(&interner.intern(schema_of(9)).arc(), &i_wide));
         assert_eq!(interner.stats().collapsed, 1);
     }
 
@@ -624,16 +624,16 @@ mod tests {
     fn concurrent_interning_converges_on_one_allocation() {
         let interner = Arc::new(SchemaInterner::new());
         let results: Vec<SchemaRef> = std::thread::scope(|scope| {
-            let handles = (0..8)
+            let handles: Vec<_> = (0..8)
                 .map(|_| {
                     let interner = Arc::clone(&interner);
                     scope.spawn(move || {
                         (0..64)
-                            .map(|_| interner.intern(schema_of(16)))
+                            .map(|_| interner.intern(schema_of(16)).arc())
                             .collect::<Vec<_>>()
                     })
                 })
-                .collect::<Vec<_>>();
+                .collect();
             handles
                 .into_iter()
                 .flat_map(|h| h.join().expect("thread"))

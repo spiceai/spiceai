@@ -36,12 +36,13 @@ limitations under the License.
 //!   merely points at it. A schema unique to a single entry is not charged
 //!   either — the same deliberate choice, accepting that such a workload can
 //!   exceed `max_size` by the size of its schemas.
-//!   [`arrow_tools::schema_intern`] counts those bytes once and publishes them,
+//!   [`crate::intern::schema`] counts those bytes once and publishes them,
 //!   so the residual is reported rather than enforced. See
 //!   [`crate::result::query::CachedQueryResult::memory_size`].
 //! * Collection slots are charged as `len`- or `capacity`-times-entry-size,
 //!   which omits a hash table's control bytes and a `Vec`'s spare capacity.
-//! * [`ENTRY_OVERHEAD_BYTES`] is a flat allowance, not a measurement.
+//! * [`ENTRY_OVERHEAD_BYTES`] is one flat per-entry allowance calibrated
+//!   against a measurement, not a model of any particular store.
 //!
 //! Exactness is not what `max_size` needs. What it needs — and what the
 //! pre-fix accounting did not give it — is a figure *proportional to what the
@@ -49,96 +50,36 @@ limitations under the License.
 //! entries fit under it.
 
 use std::mem::size_of;
-use std::sync::Arc;
 
-
-/// A model of the record a cache store keeps per entry.
-///
-/// Not a store's actual type — moka's `ValueEntry` and the Pingora engine's
-/// node are both private — but the fields any of them must keep: the key, a
-/// pointer to the value, and the two instants an expiring cache compares
-/// against. Sizing a model with `size_of` keeps the charge derived from
-/// something real and self-updating, rather than a number someone once
-/// measured and nobody can re-derive.
-struct StoreEntryRecord {
-    _key: u64,
-    _value: Arc<()>,
-    _inserted_at: std::time::Instant,
-    _last_accessed: std::time::Instant,
-}
-
-/// A model of one intrusive LRU list node. A store that evicts by both recency
-/// and age keeps the entry on two such lists.
-struct StoreDequeNode {
-    _prev: Option<std::ptr::NonNull<()>>,
-    _next: Option<std::ptr::NonNull<()>>,
-    _key_hash: u64,
-    _timestamp: std::time::Instant,
-}
-
-/// How many intrusive lists an entry sits on: access order and write order.
-const STORE_DEQUE_LISTS: usize = 2;
-
-/// The hash-table slot an entry occupies: its key and a pointer to its record.
-/// Charged at double, because an open-addressing table is grown well before it
-/// is full and the empty slots are as real as the occupied ones.
-const STORE_SLOT_BYTES: usize = 2 * (size_of::<u64>() + size_of::<usize>());
-
-/// What a small allocation actually consumes, over what it asks for.
-///
-/// Every item modelled above is its own allocation, and an allocator serves
-/// each from a size class rounded up from the request — snmalloc, the runtime's
-/// default, spaces its classes at 1/4 steps, so a request lands on average an
-/// eighth over and never more than a quarter. A numerator/denominator pair so
-/// the whole constant stays a `const` computation.
-const ALLOCATOR_ROUNDING_NUMERATOR: usize = 9;
-const ALLOCATOR_ROUNDING_DENOMINATOR: usize = 8;
-
-/// The bytes the models above do not name, per entry.
-///
-/// `size_of` can only be applied to structures that are written down, and a
-/// store's are private: moka threads an `EntryInfo` and a key handle through
-/// each of the three structures an entry sits in, and none of that is
-/// reachable from here. This covers the difference, and it is the only figure
-/// in this module taken from a measurement rather than derived.
-///
-/// Calibrated once, against a v2.2.1 runtime holding 100,000 cached 0-row
-/// point-lookup results, which held **1,225 B per entry** over an identical
-/// cache-disabled run. For that shape the named parts model 760 B — the entry
-/// struct (96), its schema (192), its input-table set (238) and the store model
-/// above (234) — leaving this remainder.
-///
-/// [`the_modelled_entry_matches_what_was_measured`] re-derives that comparison
-/// and fails if either side drifts, so a change to the models is checked
-/// against the measurement rather than silently absorbed by this number.
-const UNMODELLED_STORE_BYTES: usize = 465;
 
 /// Bytes charged to every cache entry for the store's own per-entry bookkeeping.
 ///
-/// A weigher is handed only the value, so none of what the store allocates
-/// *around* that value is reachable from it. It still has to be charged: without
-/// it a stream of individually tiny entries is free, and `max_size` cannot bound
-/// a high-cardinality workload of 0-row results at all, however accurately the
-/// rest of this module counts.
+/// A weigher is handed only the value, so nothing the store allocates *around*
+/// that value is reachable from it: moka's entry record, the two intrusive
+/// lists an entry sits on, its key handle, its hash-table slot, and the
+/// allocator's rounding on each of those. It still has to be charged, or a
+/// stream of individually tiny entries is free and `max_size` cannot bound a
+/// high-cardinality workload of 0-row results at all.
 ///
-/// Derived from the models above rather than guessed, and deliberately one
-/// figure for every store rather than a per-engine number with false precision —
-/// the engines differ by less than the allocator rounding does.
+/// **A flat allowance, calibrated once against a measurement.** An earlier
+/// version of this derived most of it with `size_of` over invented structs
+/// modelling moka's internals; that was worse than useless, because moka's
+/// types are private so the models could not track them, and the fitted
+/// remainder was two thirds of the total anyway. One honest number beats
+/// arithmetic that looks derived and is not.
 ///
-/// **Checked against a measurement, not taken from one.** On a v2.2.1 runtime
-/// holding 100,000 cached 0-row point-lookup results, the memory the process
-/// actually held per entry, over an identical cache-disabled run, was ~1,225 B;
-/// subtracting the schema and input-table set that are now shared leaves the
-/// residual this constant is for. `entry_overhead_is_close_to_what_a_store_holds`
-/// asserts the two stay within a factor of two of each other, which is the
-/// accuracy `max_size` needs: a bound proportional to what an entry holds, not
-/// an exact byte count.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize = (arc_heap_size::<StoreEntryRecord>()
-    + STORE_DEQUE_LISTS * arc_heap_size::<StoreDequeNode>()
-    + STORE_SLOT_BYTES)
-    * ALLOCATOR_ROUNDING_NUMERATOR
-    / ALLOCATOR_ROUNDING_DENOMINATOR
-    + UNMODELLED_STORE_BYTES;
+/// The measurement: a `spiced` holding 100,000 cached 0-row point-lookup
+/// results gave up ~1,225 B per entry over an identical cache-disabled run
+/// (`phys_footprint`, macOS/arm64, snmalloc). Of that, the entry struct and its
+/// batch vector account for ~136 B and the shared schema and input-table set
+/// for ~430 B across *all* entries, leaving this as what one more entry costs.
+///
+/// It is a per-entry cost of the store and the allocator, so it moves with
+/// platform, allocator and moka version. `results_cache_growth` in the runtime
+/// crate is what keeps it honest: it fills a real cache and asserts the
+/// reported total stays within a factor of the live heap, so a platform where
+/// this is badly wrong fails there rather than silently over- or under-billing.
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 700;
 
 /// Bytes an `Arc<T>` allocation costs beyond `T` itself: the strong and weak
 /// counts that sit in front of the value.
@@ -195,75 +136,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod derivation_tests {
-    use super::*;
-    use std::collections::HashSet;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::sql::TableReference;
-
-    /// What one entry of the measured shape was actually observed to hold.
-    ///
-    /// A v2.2.1 runtime, 100,000 distinct `SELECT 1 FROM t WHERE id = $v LIMIT 1`
-    /// queries each storing its own entry, `phys_footprint` growth per entry with
-    /// an identical cache-disabled run subtracted.
-    const MEASURED_BYTES_PER_ENTRY: usize = 1_225;
-
-    /// How far the model may sit from that measurement.
-    ///
-    /// `max_size` needs a charge proportional to what an entry holds, not an
-    /// exact byte count — an entry is billed before the allocator has been asked
-    /// for anything, so exactness is not available at any price. A quarter is
-    /// tight enough that a model which stopped describing the store would fail,
-    /// and loose enough to survive a different allocator or platform.
-    const TOLERANCE_NUMERATOR: usize = 1;
-    const TOLERANCE_DENOMINATOR: usize = 4;
-
-    /// The shape that was measured: one `Int64` output column, one input table.
-    fn measured_shape() -> (Schema, HashSet<TableReference>) {
-        (
-            Schema::new(vec![Field::new("Int64(1)", DataType::Int64, false)]),
-            HashSet::from([TableReference::bare("lookup")]),
-        )
-    }
-
-    /// The models, summed, must land near what such an entry was measured to
-    /// hold. This is what keeps [`UNMODELLED_STORE_BYTES`] honest: change a
-    /// model and the comparison moves, rather than the difference disappearing
-    /// into a constant nobody re-derives.
-    #[test]
-    fn the_modelled_entry_matches_what_was_measured() {
-        let (schema, tables) = measured_shape();
-        let modelled = size_of::<crate::result::query::CachedQueryResult>()
-            + arrow_tools::schema_intern::schema_deep_size(&schema)
-            + arrow_tools::table_set_intern::table_set_deep_size(&tables)
-            + ENTRY_OVERHEAD_BYTES;
-
-        let slack = MEASURED_BYTES_PER_ENTRY * TOLERANCE_NUMERATOR / TOLERANCE_DENOMINATOR;
-        assert!(
-            modelled.abs_diff(MEASURED_BYTES_PER_ENTRY) <= slack,
-            "the modelled cost of one entry is {modelled} B but such an entry was measured to \
-             hold {MEASURED_BYTES_PER_ENTRY} B, more than {slack} B apart; re-derive \
-             UNMODELLED_STORE_BYTES against a fresh measurement rather than widening this"
-        );
-    }
-
-    /// Once a shape is shared, the charge is what one *more* entry over that
-    /// shape costs — the schema and table set are already resident, so billing
-    /// them again would make `max_size` scale with entries times shape size.
-    #[test]
-    fn the_charge_is_the_marginal_cost_of_one_more_entry() {
-        let (schema, tables) = measured_shape();
-        let shared = arrow_tools::schema_intern::schema_deep_size(&schema)
-            + arrow_tools::table_set_intern::table_set_deep_size(&tables);
-        let marginal = MEASURED_BYTES_PER_ENTRY - shared;
-
-        let charged = size_of::<crate::result::query::CachedQueryResult>() + ENTRY_OVERHEAD_BYTES;
-        let slack = marginal * TOLERANCE_NUMERATOR / TOLERANCE_DENOMINATOR;
-        assert!(
-            charged.abs_diff(marginal) <= slack,
-            "an entry sharing its shape is billed {charged} B, but one more such entry costs \
-             about {marginal} B"
-        );
-    }
-}
