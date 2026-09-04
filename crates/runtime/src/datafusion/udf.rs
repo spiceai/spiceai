@@ -1111,23 +1111,24 @@ mod tests {
 
     #[test]
     fn duckdb_denies_regexp_match_but_not_its_siblings() {
-        // `regexp_match` has no DuckDB equivalent with the same semantics —
-        // `regexp_extract` returns the whole match rather than the capture
-        // groups, and the empty string rather than NULL for a non-match — and
-        // DuckDB has no `regexp_instr` at all. Both must stay local while the
-        // regexp functions DuckDB *can* answer keep federating (regression test
-        // for #13809).
+        // Three of the five DataFusion regexp built-ins have no value-preserving
+        // DuckDB rendering: `regexp_extract` returns the whole match rather than
+        // the capture groups and the empty string rather than NULL for a
+        // non-match (#13809); DuckDB has no `regexp_instr` at all; and
+        // `len(regexp_extract_all(NULL, p))` is NULL where `regexp_count`
+        // answers 0 (#13870). All three must stay local, while the two DuckDB
+        // does answer identically keep federating.
         for support in [
             deny_spice_functions_for_duckdb(),
             Arc::new(deny_spice_functions_for_duckdb_table_providers()),
         ] {
-            for name in ["regexp_match", "regexp_instr"] {
+            for name in ["regexp_match", "regexp_instr", "regexp_count"] {
                 assert!(
                     !support.supports(&make_named_expr(name)),
-                    "{name} has no faithful DuckDB rendering and must not be pushed down"
+                    "{name} has no value-preserving DuckDB rendering and must not be pushed down"
                 );
             }
-            for name in ["regexp_like", "regexp_replace", "regexp_count"] {
+            for name in ["regexp_like", "regexp_replace"] {
                 assert!(
                     support.supports(&make_named_expr(name)),
                     "{name} is rendered natively by the DuckDB dialect and must be pushed down"

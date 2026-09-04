@@ -802,6 +802,8 @@ mod tests {
 
     #[test]
     fn duckdb_native_function_names_advertises_denylisted_pushables() {
+        use std::collections::BTreeSet;
+
         // The federation deny-list relies on these names to let `cosine_distance`
         // and `rand` push down to DuckDB, so the dialect must advertise them.
         let names = crate::dialect::duckdb_native_function_names();
@@ -817,11 +819,23 @@ mod tests {
             names.contains(&"rand"),
             "duckdb_native_function_names() missing rand; got {names:?}"
         );
-        // Derived from the same override list, so they cannot drift.
+        // Still derived from the override list, so the two cannot drift — but the
+        // relation is "overrides minus the denied built-ins" rather than 1:1.
+        // `regexp_count` has a handler and is denied (#13870), so it is in one and
+        // not the other; asserting equal lengths would forbid that combination and
+        // force the handler to be deleted to express the deny.
+        let overrides: BTreeSet<&str> = crate::dialect::duckdb_scalar_overrides()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let denied: BTreeSet<&str> = crate::function_support::DUCKDB_DENIED_BUILTINS
+            .iter()
+            .copied()
+            .collect();
         assert_eq!(
-            names.len(),
-            crate::dialect::duckdb_scalar_overrides().len(),
-            "name list and scalar-override list must have the same length"
+            names.iter().copied().collect::<BTreeSet<&str>>(),
+            &overrides - &denied,
+            "the advertised names must be exactly the overrides that are not denied"
         );
     }
 }

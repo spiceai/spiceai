@@ -465,7 +465,7 @@ mod federation_tests {
         let unparser = Unparser::new(federation.dialect.as_ref());
         let args = [col("c0"), col("c1")];
 
-        for name in ["regexp_like", "regexp_replace", "regexp_count"] {
+        for name in ["regexp_like", "regexp_replace"] {
             let handled = !matches!(
                 federation
                     .dialect
@@ -481,8 +481,11 @@ mod federation_tests {
     }
 
     /// The converse, and the reason the list above is not all of them:
-    /// `regexp_match` and `regexp_instr` are **denied** rather than translated,
-    /// so the dialect must have no handler for them.
+    /// `regexp_match`, `regexp_instr` and `regexp_count` are **denied** rather
+    /// than pushed down. The first two have no handler at all; `regexp_count`
+    /// keeps its handler because the rewrite is right for non-NULL input and
+    /// #13870 is about making it NULL-preserving, so only the deny is asserted
+    /// for it.
     ///
     /// A deny-list does withhold a `DataFusion` built-in, contrary to what this
     /// module used to assert: this catalog hands its `FunctionSupport` to the
@@ -509,6 +512,11 @@ mod federation_tests {
                 "{name} is denied, so the dialect must not translate it -- a handler would \
                  render SQL DuckDB answers differently"
             );
+        }
+
+        // Every denied name must be withheld, whether or not the dialect still
+        // carries a handler for it: `regexp_count` keeps one on purpose (#13870).
+        for name in runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS {
             assert!(
                 !federation.function_support.supports(&stub_udf(name, 2)),
                 "{name} must be denied so the plan is left for DataFusion to evaluate locally"

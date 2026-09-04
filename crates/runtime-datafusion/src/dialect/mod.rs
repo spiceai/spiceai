@@ -38,7 +38,7 @@ pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
 pub(crate) const REGEXP_INSTR_NAME: &str = "regexp_instr";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
-const REGEXP_COUNT_NAME: &str = "regexp_count";
+pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_count";
 
 /// The scalar functions the `DuckDB` unparser dialect rewrites to native
 /// `DuckDB` SQL, paired with their handlers.
@@ -133,11 +133,18 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
 /// federation deny-list derives its `DuckDB` carve-out from this list (see
 /// [`crate::function_support::deny_spice_functions_for_duckdb`]), so the dialect
 /// and the deny-list stay in sync automatically.
+///
+/// A name in [`crate::function_support::DUCKDB_DENIED_BUILTINS`] is filtered out
+/// rather than trusted not to appear: a handler whose rendering is not
+/// value-preserving stays in the dialect so a later fix has it to work from
+/// (`regexp_count`, #13870), and "has a handler" must not be read as "may be
+/// pushed down" while that is true.
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {
     duckdb_scalar_overrides()
         .into_iter()
         .map(|(name, _)| name)
+        .filter(|name| !crate::function_support::DUCKDB_DENIED_BUILTINS.contains(name))
         .collect()
 }
 
@@ -216,9 +223,11 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGEXP_MATCH_NAME, bigquery, bigquery_native_function_names,
-        duckdb_builtin_scalar_overrides, duckdb_native_function_names, duckdb_scalar_overrides,
+        REGEXP_COUNT_NAME, bigquery, bigquery_native_function_names,
+        duckdb_builtin_scalar_overrides, duckdb_native_function_names, new_duckdb_dialect,
     };
+    use datafusion::prelude::col;
+    use datafusion::sql::unparser::Unparser;
 
     #[test]
     fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
@@ -233,26 +242,50 @@ mod tests {
     }
 
     #[test]
-    fn the_duckdb_dialect_has_no_regexp_match_handler() {
-        // The handler rendered `regexp_match` as `ARRAY[regexp_extract(s, p, 0)]
-        // AS item`, which answers a different question (whole match, not the
-        // capture groups; empty string, not NULL) and is not even valid SQL
-        // wherever the expression carries an alias. `regexp_match` is denied for
-        // DuckDB instead — see
-        // `crate::function_support::DUCKDB_DENIED_BUILTINS`. A handler
-        // reappearing here would silently re-enable the pushdown, because the
-        // deny-list carve-out is derived from this very list (#13809).
-        assert!(
-            !duckdb_scalar_overrides()
-                .iter()
-                .any(|(name, _)| *name == REGEXP_MATCH_NAME),
-            "`{REGEXP_MATCH_NAME}` must have no DuckDB handler; adding one back would carve it \
-             out of the deny-list and push down a call DuckDB answers differently"
-        );
-        assert!(
-            !duckdb_native_function_names().contains(&REGEXP_MATCH_NAME),
-            "`{REGEXP_MATCH_NAME}` must not be advertised as a native DuckDB function"
-        );
+    fn no_denied_builtin_is_advertised_as_a_native_duckdb_function() {
+        // `duckdb_native_function_names` is what the deny-list reads as its
+        // carve-out, so a denied name appearing there would un-deny it and push
+        // down a call DuckDB answers differently (#13809, #13870). Driven from
+        // the deny-list itself rather than a hardcoded name, so denying another
+        // built-in cannot skip this check.
+        for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
+            assert!(
+                !duckdb_native_function_names().contains(name),
+                "`{name}` is denied for DuckDB and must not be advertised as native"
+            );
+        }
+    }
+
+    #[test]
+    fn the_constructed_duckdb_dialect_renders_no_denied_builtin() {
+        // Asserted against the dialect `new_duckdb_dialect` actually builds, not
+        // against `duckdb_scalar_overrides` alone: the constructor chains
+        // `duckdb_builtin_scalar_overrides` too, so checking one list would leave
+        // this test green while a handler was restored in the other.
+        //
+        // `regexp_match` had one, rendering `ARRAY[regexp_extract(s, p, 0)] AS
+        // item` — the whole match rather than the capture groups, the empty
+        // string rather than NULL, and an `AS item` DuckDB's parser rejects
+        // wherever the expression is aliased (#13809).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = [col("c0"), col("c1")];
+
+        for name in crate::function_support::DUCKDB_DENIED_BUILTINS {
+            // `regexp_count` keeps its handler on purpose (#13870), so it is
+            // exempt from this one; the carve-out check above still covers it.
+            if *name == REGEXP_COUNT_NAME {
+                continue;
+            }
+            assert!(
+                matches!(
+                    dialect.scalar_function_to_sql_overrides(&unparser, name, &args),
+                    Ok(None)
+                ),
+                "the constructed DuckDB dialect must render no handler for the denied \
+                 `{name}`; one here would send DuckDB a call it answers differently"
+            );
+        }
     }
 
     #[test]

@@ -68,12 +68,27 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// of that name and the dialect renders none, so a federated call failed
 /// remotely with `Catalog Error: Scalar Function with name regexp_instr does not
 /// exist!` — the unknown-function failure the deny-list exists to prevent
-/// (issue #10703). It is the only other `DataFusion` regexp built-in the
-/// `DuckDB` dialect has no handler for; `regexp_like`, `regexp_replace` and
-/// `regexp_count` all have one and keep pushing down.
+/// (issue #10703).
+///
+/// `regexp_count` is here because its translation is not value-preserving
+/// either, on a narrower input: the dialect renders it
+/// `len(regexp_extract_all(x, p))`, and `regexp_extract_all(NULL, p)` is NULL in
+/// `DuckDB`, so `len(NULL)` is NULL where `DataFusion` counts zero matches and
+/// answers `0`. A count that is NULL rather than `0` propagates differently
+/// through `SUM`, through `= 0`, and through a `WHERE` built on it, so an
+/// accelerated dataset gained or lost rows against an unaccelerated one
+/// (issue #13870). The dialect keeps its handler — the rewrite is right for
+/// non-NULL input and #13870 is about making it NULL-preserving so the pushdown
+/// can come back — but a denied name is never advertised as native, which
+/// [`crate::dialect::duckdb_native_function_names`] enforces.
+///
+/// `regexp_like` and `regexp_replace` are the two `DataFusion` regexp built-ins
+/// left, and both agreed with local evaluation on every input measured,
+/// including a NULL one.
 pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::REGEXP_MATCH_NAME,
     crate::dialect::REGEXP_INSTR_NAME,
+    crate::dialect::REGEXP_COUNT_NAME,
 ];
 
 /// The deny-list for a consumer that installs the `DuckDB` dialect but wants
