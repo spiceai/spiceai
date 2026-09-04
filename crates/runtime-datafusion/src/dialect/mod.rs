@@ -33,6 +33,7 @@ const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags arg
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
 const BTRIM_NAME: &str = "btrim";
+const TO_HEX_NAME: &str = "to_hex";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
@@ -111,14 +112,25 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// [`duckdb_native_function_names`]: that list is the federation deny-list's
 /// carve-out, and a built-in federates unless it is denied, so carving one out
 /// would do nothing. What a built-in needs is the handler — without one the
-/// unparser emits the `DataFusion` name verbatim into SQL `DuckDB` rejects.
+/// unparser emits the `DataFusion` call verbatim, and `DuckDB` either rejects
+/// the name (`btrim`) or accepts it and answers differently (`to_hex`, whose
+/// digits come back upper-case). The second is the worse of the two: it is a
+/// silently different result rather than a query error.
 fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
-    vec![(
-        // DuckDB dialect: trim(string[, characters])
-        // DataFusion dialect: btrim(str[, trim_str]) — `trim` is only its alias
-        BTRIM_NAME,
-        Box::new(duckdb::btrim_to_trim) as ScalarFnToSqlHandler,
-    )]
+    vec![
+        (
+            // DuckDB dialect: trim(string[, characters])
+            // DataFusion dialect: btrim(str[, trim_str]) — `trim` is only its alias
+            BTRIM_NAME,
+            Box::new(duckdb::btrim_to_trim) as ScalarFnToSqlHandler,
+        ),
+        (
+            // DuckDB dialect: to_hex(int) — upper-case digits
+            // DataFusion dialect: to_hex(int) — lower-case digits
+            TO_HEX_NAME,
+            Box::new(duckdb::to_hex_to_lowercase_hex) as ScalarFnToSqlHandler,
+        ),
+    ]
 }
 
 /// Names of the Spice functions [`new_duckdb_dialect`] rewrites to native
