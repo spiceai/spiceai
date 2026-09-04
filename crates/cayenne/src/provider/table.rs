@@ -66,6 +66,7 @@ use super::pk_index::{
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
     pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
+use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -13155,7 +13156,7 @@ impl CayenneTableProvider {
             if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
-                    message: "Primary key values must be non-null".to_string(),
+                    message: null_primary_key_message(&batch, ctx.pk_indices),
                 });
             }
 
@@ -13558,7 +13559,7 @@ impl CayenneTableProvider {
                 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, pk_indices),
                     });
                 }
                 filtered_batches.push(batch);
@@ -14140,7 +14141,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices[..1]),
                     });
                 }
                 // Bulk values() iteration: the null gate proves the buffer
@@ -14176,7 +14177,7 @@ impl CayenneTableProvider {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(Error::DataValidation {
                             table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
+                            message: null_primary_key_message(&batch, pk_indices),
                         });
                     }
                     let should_delete = deleted_row_keys.contains(rows.row(row_index).as_ref());
@@ -26431,7 +26432,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, std::slice::from_ref(&pk_index)),
                     });
                 }
                 // Column sweep (see `DeletionIndex::get_batch`): bulk PK slice
@@ -26496,7 +26497,7 @@ impl CayenneTableProvider {
                 if pk_has_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices),
                     });
                 }
 
@@ -30612,8 +30613,9 @@ impl CayenneTableProvider {
                     })?;
                 if pk_array.null_count() > 0 {
                     return Err(datafusion_common::DataFusionError::Execution(format!(
-                        "Primary key values must be non-null for table {}",
-                        self.table_metadata.table_name
+                        "Data validation failed for table '{}': {}",
+                        self.table_metadata.table_name,
+                        null_primary_key_message(batch, std::slice::from_ref(&pk_index))
                     )));
                 }
                 // Bulk slice copy (~5x over the per-row is_null+value+push
@@ -30641,8 +30643,9 @@ impl CayenneTableProvider {
                 for row_index in 0..batch.num_rows() {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "Primary key values must be non-null for table {}",
-                            self.table_metadata.table_name
+                            "Data validation failed for table '{}': {}",
+                            self.table_metadata.table_name,
+                            null_primary_key_message(batch, &pk_indices)
                         )));
                     }
                     row_keys.push(bytes_key(rows.row(row_index).as_ref()));

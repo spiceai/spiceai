@@ -24,7 +24,18 @@ futures.workspace = true
 itertools.workspace = true
 globset.workspace = true
 http.workspace = true
-rmcp = { workspace = true, optional = true }
+# `client` gates `rmcp::service`, `serve_client`, `RoleClient` and `ServiceExt`, which
+# `mcp::catalog` names; `server` gates `RoleServer`, `ServerHandler` and
+# `service::RequestContext`, which `mcp::server` names; the two transports are the ones
+# `mcp::catalog` builds a client on. None are default features, so without them the crate's
+# own `mcp` feature cannot compile it -- it only ever built as part of a graph including
+# `runtime`, whose `rmcp` requests the same set for everything.
+rmcp = { workspace = true, optional = true, features = [
+    "client",
+    "server",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 runtime-auth = { path = "../runtime-auth" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
@@ -46,7 +57,9 @@ util = { path = "../util" }
 
 [features]
 default = []
-mcp = ["dep:rmcp"]
+# `tools/mcp` gates `tools::McpProxy` and `SpiceModelTool::as_mcp_proxy`, both of which
+# `mcp::tool` names, so the crate's MCP code needs it as much as it needs `rmcp` itself.
+mcp = ["dep:rmcp", "tools/mcp"]
 openapi = ["dep:utoipa"]
 
 [lints]
