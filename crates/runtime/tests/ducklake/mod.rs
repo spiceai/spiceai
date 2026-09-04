@@ -701,9 +701,10 @@ fn bootstrap_ducklake_names(metadata_path: &str, data_path: &str) {
 /// `Catalog Error: Scalar Function with name btrim does not exist!`.
 ///
 /// The dataset route in the same app is the control: it registers the same
-/// table through the connector, which has always attached the dialect, so the
-/// two routes disagreeing is the asymmetry this pins (regression test for
-/// #13825).
+/// table through the connector, which attaches the dialect at its own
+/// construction site (`connector-ducklake/src/lib.rs`). The two routes must
+/// therefore answer alike, and their disagreeing is the asymmetry this pins
+/// (regression test for #13825).
 ///
 /// The `base_sql` assertions are what make this a guard rather than a smoke
 /// test. They read the statement `DuckDB` is actually asked to run, so the test
@@ -804,10 +805,10 @@ async fn ducklake_catalog_route_installs_the_duckdb_dialect() -> Result<(), anyh
                 &from_catalog
             );
 
-            // The dataset route over the same table, which has always carried
-            // the dialect. Answering the same thing is the point: a rewrite
-            // that reached DuckDB but changed the answer would pass every
-            // assertion above and fail here.
+            // The dataset route over the same table, which carries the
+            // dialect from its own construction site. Answering the same thing
+            // is the point: a rewrite that reached DuckDB but changed the
+            // answer would pass every assertion above and fail here.
             let from_dataset: Vec<RecordBatch> = rt
                 .datafusion()
                 .query_builder(&query.replace("{table}", "names_ds"))
