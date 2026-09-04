@@ -2487,10 +2487,16 @@ const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accel
 
 /// Why [`RetentionBuilder::assemble`] could not assemble a retention policy.
 ///
-/// Every variant has the same user-visible outcome — no retention pass runs, so the
-/// accelerated table is unbounded — reached through a different missing setting, so
-/// [`Self::message`] states that impact once and each variant supplies its own cause
-/// and fix.
+/// Every variant has the same user-visible outcome — no *scheduled* retention pass runs —
+/// reached through a different missing setting, so [`Self::message`] states that impact
+/// once and each variant supplies its own cause and fix.
+///
+/// The impact stops at "nothing deletes on a schedule" deliberately. Two callers install
+/// something that still evicts: `create_accelerated_table` copies `retention_sql` into
+/// `refresh.write_retention_sql_delete_expr` for Arrow engines *before* building this, so
+/// refreshes go on deleting matching rows while `Unscheduled` or `TimeColumnUnset` refuses;
+/// and caching mode derives a policy after it (see [`RetentionBuilder::build_unreported`]).
+/// A claim about the table being unbounded is therefore not this builder's to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetentionRefusal {
     /// Neither `retention_period` nor `retention_sql` says what to delete.
@@ -2510,7 +2516,7 @@ impl RetentionRefusal {
         let dataset_name = dataset_name.escape_debug();
         let cause_and_fix = match self {
             Self::NothingToDelete => {
-                "Cause: neither `retention_period` nor `retention_sql` is set, so nothing says which rows to delete. Set one of them."
+                "Cause: neither `retention_period` nor `retention_sql` is set to a valid value, so nothing says which rows to delete. Set one of them."
             }
             Self::TimeColumnUnset => {
                 "Cause: time-based retention compares `time_column` against the cutoff, and it is not set. Set `time_column` on the dataset, or delete by expression with `retention_sql` instead."
@@ -2520,7 +2526,7 @@ impl RetentionRefusal {
             }
         };
         format!(
-            "[retention] Retention is enabled for dataset '{dataset_name}' but no retention pass runs, so no data is ever evicted and the accelerated table grows without limit. {cause_and_fix} See: {RETENTION_DOCS_URL}"
+            "[retention] Retention is enabled for dataset '{dataset_name}' but no scheduled retention pass runs, so nothing deletes rows on a schedule. {cause_and_fix} See: {RETENTION_DOCS_URL}"
         )
     }
 }
@@ -2904,7 +2910,7 @@ mod tests {
                 "{refusal:?} must name the dataset: {message}"
             );
             assert!(
-                message.contains("grows without limit"),
+                message.contains("no scheduled retention pass runs"),
                 "{refusal:?} must state what the operator will observe: {message}"
             );
             assert!(
@@ -2951,6 +2957,46 @@ mod tests {
                 .build_unreported()
                 .is_some(),
             "a complete policy must still build when the caller owns the reporting"
+        );
+    }
+
+    #[test]
+    fn test_no_refusal_claims_the_table_is_unbounded() {
+        // `create_accelerated_table` installs `retention_sql` on the Arrow refresh write
+        // path before building this, and caching mode derives a policy after it, so both
+        // `Unscheduled` and `TimeColumnUnset` are reachable while something still evicts.
+        // Measured on a running spiced: the refusal printed 64ms before
+        // "[retention] Evicted 7 records for events". See #13804.
+        for refusal in [
+            RetentionRefusal::NothingToDelete,
+            RetentionRefusal::TimeColumnUnset,
+            RetentionRefusal::Unscheduled,
+        ] {
+            let message = refusal.message("events");
+            for overclaim in [
+                "no data is ever evicted",
+                "grows without limit",
+                "never deleted",
+                "is unbounded",
+            ] {
+                assert!(
+                    !message.contains(overclaim),
+                    "{refusal:?} must not claim {overclaim:?} — the builder only knows that no scheduled pass runs: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_refusal_blames_the_value_not_the_key_where_a_bad_value_collapses_to_none() {
+        // `Dataset::retention_period` warns on an unparseable value and returns `None`, so
+        // this arm is reached with the key set. Saying it "is not set" told the operator to
+        // set a key they had already set. Measured: `retention_period: 7dd` logs
+        // "Unable to parse retention period" and then this refusal. See #13804.
+        let message = RetentionRefusal::NothingToDelete.message("events");
+        assert!(
+            message.contains("is set to a valid value"),
+            "the cause must fault the value, since an invalid one arrives here as absent: {message}"
         );
     }
 
