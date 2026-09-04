@@ -112,6 +112,11 @@ git_quiet() { git "$@" >/dev/null 2>&1; }
 # case, where github.sha is the ref already checked out).
 build_fixture() {
   local fetch_mode="$1"
+  # How the NEW (trusted) commit's setup-rust names its nested action. Defaults
+  # to the one spelling every action in this repo actually uses; the guard cases
+  # below pass spellings the step's rewrite does not handle, so that the guard
+  # is what has to stop the run.
+  local nested_ref="${2:-./.github/actions/configure-apt}"
   local root="$work_dir/fixture"
   rm -rf "$root"
   mkdir -p "$root"
@@ -141,7 +146,8 @@ build_fixture() {
     # configure-apt — the shape whose `uses: ./…` resolves from the workspace
     # root rather than the action's own directory.
     printf '#!/usr/bin/env bash\ncase "${1:-}" in correct-cancelled) echo NEW-SIGNOFF;; esac\n' >scripts/signoff
-    printf 'name: setup-rust\n# NEW-ACTION\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/configure-apt\n' >.github/actions/setup-rust/action.yml
+    printf 'name: setup-rust\n# NEW-ACTION\nruns:\n  using: composite\n  steps:\n    - uses: %s\n' \
+      "$nested_ref" >.github/actions/setup-rust/action.yml
     printf 'name: configure-apt\n# NEW-NESTED\n' >.github/actions/configure-apt/action.yml
     git_quiet add -A
     git_quiet commit -m "new"
@@ -232,16 +238,6 @@ assert_contains "the nested action is itself trusted" "NEW-NESTED" \
 assert_absent "the branch's nested action must not be what runs" "OLD-NESTED" \
   "$clone/.trusted-ci/actions/configure-apt/action.yml"
 
-# The guard is deliberately wider than the rewrite, so a spelling the rewrite
-# does not handle stops the run instead of silently escaping. Plant one and
-# require a non-zero exit: a guard that has only ever passed proves nothing.
-echo "an unrewritten reference fails the step rather than escaping"
-printf 'name: sneaky\nruns:\n  using: composite\n  steps:\n    - uses: "\056/.github/actions/configure-apt"\n' \
-  >"$clone/.trusted-ci/actions/setup-rust/action.yml"
-tests_run=$((tests_run + 1))
-guard_out=$(cd "$clone" && grep -rnE 'uses:[[:space:]]*"?'"'"'?\.?/?\.github/actions/' .trusted-ci/actions 2>&1)
-[[ -n "$guard_out" ]] || fail_test "the guard did not match a quoted nested reference: it would have escaped"
-
 # Later steps invoke `.trusted-ci/signoff` directly, so the bit has to survive
 # the extraction — `git show` writes a plain file, unlike the `cp` this replaced.
 echo "the trusted script is executable"
@@ -263,6 +259,32 @@ run_step "$new_sha"
 tests_run=$((tests_run + 1))
 [[ $rc -eq 0 ]] || fail_test "step exited $rc; output: $out"
 assert_contains "trusted signoff (no fetch needed)" "NEW-SIGNOFF" "$clone/.trusted-ci/signoff"
+
+# --- the guard is wider than the rewrite -------------------------------------
+# The rewrite matches the one spelling every action in this repo uses; the guard
+# matches any `uses:` line naming that tree at all, so a spelling the rewrite
+# does not handle stops the run instead of escaping into the checked-out tree
+# with this job's secrets in scope. These are the two the guard's comment claims
+# to cover.
+#
+# Each spelling goes into the *trusted* commit and the real step runs over it,
+# so what is asserted is the step's own exit status. Re-running a copy of the
+# guard's expression here instead would only confirm that the expression matches
+# the string this test wrote — it would still pass with the step's `exit 1`
+# removed, or with the guard deleted outright.
+echo "a reference the rewrite does not handle fails the step rather than escaping"
+for nested_ref in '"./.github/actions/configure-apt"' '.github/actions/configure-apt'; do
+  build_fixture shallow-refs "$nested_ref" || { echo "fixture setup failed"; exit 1; }
+  run_step "$new_sha"
+  tests_run=$((tests_run + 1))
+  [[ $rc -ne 0 ]] \
+    || fail_test "expected a non-zero exit for the reference $nested_ref; output: $out"
+  # And it has to fail *for that reason*: the guard names the copy it found, so
+  # an unrelated failure cannot stand in for the one under test.
+  tests_run=$((tests_run + 1))
+  grep -q '\.trusted-ci/actions/setup-rust/action\.yml' <<<"$out" \
+    || fail_test "the step failed for $nested_ref without naming the offending copy; output: $out"
+done
 
 # --- no silent fallback ------------------------------------------------------
 # An unresolvable trusted commit has to stop the run. Falling back to the
