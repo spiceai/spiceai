@@ -455,9 +455,11 @@ async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyho
                 "DuckDB-accelerated regexp_match must agree with local evaluation"
             );
 
-            // A non-match is NULL, not the empty list DuckDB's regexp_extract
-            // produced. `IS NULL` is where the two readings disagree about the
-            // truth of a row rather than only about its value.
+            // A non-match is NULL, not the `['']` DuckDB's regexp_extract
+            // answers — a one-element list holding the empty string, which
+            // pretty-prints as `[]` and so reads as an empty list. `IS NULL` is
+            // where the two readings disagree about the truth of a row rather
+            // than only about its value.
             let no_match = "SELECT id, regexp_match(s, 'zzz') IS NULL AS unmatched \
                             FROM {table} ORDER BY id";
             let accelerated = run_query(&rt, &no_match.replace("{table}", "accelerated")).await?;
