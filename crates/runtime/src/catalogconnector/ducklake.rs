@@ -36,7 +36,9 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use runtime_datafusion::dialect::new_duckdb_dialect;
-use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
+use runtime_datafusion::function_support::{
+    DUCKDB_DENIED_BUILTINS, deny_spice_functions_for_duckdb_dialect_without_carve_out,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -344,9 +346,18 @@ impl CatalogConnector for DuckLakeCatalog {
 ///
 /// The dialect is `DuckDB`'s, because `DuckLake` is `DuckDB`: without it the
 /// `DataFusion` `regexp_*` built-ins are unparsed with `DataFusion`'s flag
-/// argument in `DataFusion`'s position, which `DuckDB` reads differently. Those
-/// are built-ins rather than Spice functions, so no deny-list ever withholds
-/// them and only the dialect can make them right.
+/// argument in `DataFusion`'s position, which `DuckDB` reads differently. That
+/// is true of the two the dialect translates — `regexp_like` and
+/// `regexp_replace` — and only the dialect can make those right, since the
+/// deny-list's Spice carve-out has nothing to say about a built-in.
+///
+/// The other three take the opposite route and are **denied** rather than
+/// translated, which a deny-list can do to a built-in: `FunctionSupport` matches
+/// on the name alone, and `SQLExecutor::can_execute_plan` refuses to federate a
+/// whole plan containing an unsupported function — projections included, not just
+/// the filters `supports_filters_pushdown` screens — leaving the call for
+/// `DataFusion` to evaluate locally. See [`DUCKDB_DENIED_BUILTINS`] for why each
+/// of the three cannot be rendered faithfully.
 ///
 /// The deny-list is the plain one, **not** the `DuckDB`-flavored
 /// `deny_spice_functions_for_duckdb_table_providers`. That variant carves out the
@@ -358,10 +369,11 @@ impl CatalogConnector for DuckLakeCatalog {
 /// unknown-function error into a silently wrong number, so these are denied and
 /// evaluated locally instead. The divergence itself is #13728.
 ///
-/// It does take the `DuckDB` built-in denials, because the dialect it installs is
-/// the `DuckDB` one: `regexp_match` has no faithful `DuckDB` rendering and the
-/// dialect no longer emits one, so the call has to be denied here too rather than
-/// unparsed under its `DataFusion` name (issue #13809).
+/// It does take the `DuckDB` built-in denials, though, because the dialect it
+/// installs is the `DuckDB` one: without them `regexp_match` and `regexp_instr`
+/// would be unparsed under their `DataFusion` names and fail remotely as unknown
+/// functions, and `regexp_count` would be pushed down at a rendering that answers
+/// NULL where `DataFusion` answers `0` (issues #13809, #13870).
 fn ducklake_federation() -> DuckLakeFederation {
     DuckLakeFederation {
         dialect: new_duckdb_dialect(),
@@ -516,7 +528,7 @@ mod federation_tests {
 
         // Every denied name must be withheld, whether or not the dialect still
         // carries a handler for it: `regexp_count` keeps one on purpose (#13870).
-        for name in runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS {
+        for name in DUCKDB_DENIED_BUILTINS {
             assert!(
                 !federation.function_support.supports(&stub_udf(name, 2)),
                 "{name} must be denied so the plan is left for DataFusion to evaluate locally"
