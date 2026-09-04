@@ -110,17 +110,15 @@ impl GraphQLTableProviderBuilder {
             return Err(super::Error::NoJsonPointerFound {});
         }
 
-        // Health check on GraphQL resource existence
+        // Health check on GraphQL resource existence. The probe answers a
+        // different question than the table's rows do and is shaped nothing
+        // like them, so it is run for its error signal alone rather than
+        // parsed with the table's schema.
         if let Some(health_check_query) = self.health_check_query {
-            let _ = self
-                .client
-                .execute(
+            self.client
+                .execute_health_check(
                     &health_check_query,
-                    None,
-                    None,
-                    None,
                     self.context.clone().and_then(|o| o.error_checker()),
-                    None,
                 )
                 .await?;
         }
@@ -208,6 +206,15 @@ impl GraphQLTableProvider {
     pub fn client(&self) -> Arc<GraphQLClient> {
         Arc::clone(&self.client)
     }
+
+    /// Attaches a context to an already-built provider, for tests that build
+    /// without validation and then exercise a context-dependent scan decision.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<dyn GraphQLContext>) -> Self {
+        self.context = Some(context);
+        self
+    }
 }
 
 #[async_trait]
@@ -247,18 +254,27 @@ impl TableProvider for GraphQLTableProvider {
         let mut query = GraphQLQuery::try_from(Arc::clone(&self.base_query))
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-        let (error_checker, query_cost) = if let Some(context) = &self.context {
-            let parameters = filters
-                .iter()
-                .map(|f| context.filter_pushdown(f))
-                .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
+        let (error_checker, query_cost, supports_limit_pushdown) =
+            if let Some(context) = &self.context {
+                let parameters = filters
+                    .iter()
+                    .map(|f| context.filter_pushdown(f))
+                    .collect::<Result<Vec<_>, datafusion::error::DataFusionError>>()?;
 
-            context.inject_parameters(&parameters, &mut query)?;
+                context.inject_parameters(&parameters, &mut query)?;
 
-            (context.error_checker(), context.query_cost())
-        } else {
-            (None, None)
-        };
+                (
+                    context.error_checker(),
+                    context.query_cost(),
+                    context.supports_limit_pushdown(),
+                )
+            } else {
+                (None, None, true)
+            };
+
+        // A table whose rows do not map one-to-one onto the paginated connection
+        // cannot bound its scan by a row limit — see `supports_limit_pushdown`.
+        let limit = if supports_limit_pushdown { limit } else { None };
 
         apply_client_json_pointer(self.client.as_ref(), &mut query);
 
@@ -434,7 +450,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
 mod tests {
     use super::*;
     use crate::graphql::builder::GraphQLClientBuilder;
-    use crate::graphql::client::UnnestBehavior;
+    use crate::graphql::client::{UnnestBehavior, UnnestHandler};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
     use url::Url;
@@ -494,6 +510,87 @@ mod tests {
         assert_eq!(derived.field(0).data_type(), &DataType::Int64);
     }
 
+    /// The probe a health check sends back is not a row: it names the resource
+    /// and stops there. `repos` on the GitHub connector reads its `repo` column
+    /// out of the response and declares it non-null, so a probe run through the
+    /// table's schema reads back as an unmasked null and fails a dataset whose
+    /// rows are perfectly good — which is what happened to `spiceai/repos`.
+    #[tokio::test]
+    async fn a_health_check_probe_that_is_not_a_row_still_builds_the_table() {
+        use serde_json::{Map, Value, json};
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // The health check names the resource and nothing else.
+        Mock::given(method("POST"))
+            .and(body_string_contains("healthCheckProbe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"healthCheckProbe": {"id": "ORG_1", "login": "spiceai"}}}),
+            ))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("repositories"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"owner": {
+                    "repositories": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                        "nodes": [{"id": "REPO_1", "name": "spiceai"}],
+                    }
+                }}})),
+            )
+            .mount(&server)
+            .await;
+
+        // `repo` is read from the response, so only a row can supply it.
+        let stamp_repo: UnnestHandler = Box::new(|object: &Value| {
+            let mut row = match object {
+                Value::Object(row) => row.clone(),
+                _ => Map::new(),
+            };
+            let repo = row.remove("name").unwrap_or(Value::Null);
+            row.insert("repo".to_string(), repo);
+            Ok(vec![Value::Object(row)])
+        });
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("repo", DataType::Utf8, false),
+        ]));
+
+        let client = GraphQLClientBuilder::new(
+            Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+            UnnestBehavior::Custom(stamp_repo),
+        )
+        .with_schema(Some(schema))
+        .build(reqwest::Client::new())
+        .expect("client to build");
+
+        let health_check = GraphQLQuery::try_from(Arc::<str>::from(
+            r#"{ healthCheckProbe: repositoryOwner(login: "spiceai") { id login } }"#,
+        ))
+        .expect("query to parse")
+        .with_json_pointer(Arc::from("/data/healthCheckProbe"));
+
+        let provider = GraphQLTableProviderBuilder::new(client)
+            .with_health_check_query(health_check)
+            .build(
+                r#"{ owner: repositoryOwner(login: "spiceai") {
+                    repositories(first: 50) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id name }
+                    }
+                } }"#,
+            )
+            .await
+            .expect("a probe that is not a row is not a reason to fail the dataset");
+
+        assert_eq!(provider.schema().field(1).name(), "repo");
+    }
+
     #[test]
     fn build_without_validation_uses_configured_schema() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
@@ -533,6 +630,62 @@ mod tests {
         assert_eq!(
             TableProvider::schema(&provider).field(0).name(),
             "renamed_id"
+        );
+    }
+
+    /// A context that declines limit pushdown, for the scan test below.
+    #[derive(Debug)]
+    struct NoLimitPushdown;
+
+    impl GraphQLContext for NoLimitPushdown {
+        fn supports_limit_pushdown(&self) -> bool {
+            false
+        }
+    }
+
+    /// A table whose rows do not map one-to-one onto the paginated connection
+    /// must not have a SQL `LIMIT` pushed into it: pagination bounds the limit by
+    /// the connection's page size, so `LIMIT 20` would fetch 20 *parents* and stop
+    /// having emitted however many rows those carried — fewer than 20, silently.
+    #[tokio::test]
+    async fn scan_drops_the_limit_when_the_context_declines_pushdown() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        let build = || {
+            let client = GraphQLClientBuilder::new(
+                Url::parse("https://example.com/graphql").expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::clone(&schema)))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            GraphQLTableProviderBuilder::new(client)
+                .build_without_validation("query { view { nodes { id } } }")
+                .expect("provider to build without validation")
+        };
+
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        // Declining pushdown drops the limit …
+        let declining = build().with_context(Arc::new(NoLimitPushdown));
+        let plan = declining
+            .scan(&ctx.state(), None, &[], Some(20))
+            .await
+            .expect("scan to plan");
+        assert!(
+            !format!("{plan:?}").contains("limit="),
+            "a fan-out table must not bound its scan by a row limit, got: {plan:?}"
+        );
+
+        // … while the default keeps it, so no other connector changes behavior.
+        let plan = build()
+            .scan(&ctx.state(), None, &[], Some(20))
+            .await
+            .expect("scan to plan");
+        assert!(
+            format!("{plan:?}").contains("limit=[20]"),
+            "the default must still push the limit down, got: {plan:?}"
         );
     }
 

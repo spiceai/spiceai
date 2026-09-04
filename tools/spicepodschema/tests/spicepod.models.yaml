@@ -60,13 +60,14 @@ models:
 
   # ---------------------------------------------------------------------------
   # Google model
-  # Runtime params: google_api_key, endpoint
+  # Runtime params: google_project, google_location, google_service_account_path
   # ---------------------------------------------------------------------------
   - name: google_gemini
     from: google:gemini-1.5-pro
     params:
-      google_api_key: google-api-key
-      endpoint: https://generativelanguage.googleapis.com
+      google_project: my-gcp-project
+      google_location: us-central1
+      google_service_account_path: /etc/spice/gcp-service-account.json
 
   # ---------------------------------------------------------------------------
   # Huggingface model (if enabled)

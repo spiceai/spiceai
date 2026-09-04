@@ -561,6 +561,57 @@ failure", which blamed the branch for the volume.
 Set `SIGNOFF_MIN_FREE_GIB` to change the floor. Locally both checks only warn and
 the output is not watched — your own disk is yours to manage.
 
+
+### "Cargo.lock does not match the manifests"
+
+Sign-off asks cargo, before it compiles anything, whether `Cargo.lock` still
+describes the workspace manifests — `cargo metadata --locked`, which is cargo's own
+resolution with permission to write the lockfile withheld. If it would have to write
+one, the branch is not evaluated and the status says so.
+
+**Run `cargo update --workspace`, commit the regenerated `Cargo.lock`, and push.**
+Not "run any cargo command": `cargo fmt` and `cargo --version` resolve nothing, and
+anything run under `--locked` is refused for this very reason.
+
+`pr.yml`'s `Build and Test` runs the same check, as
+`scripts/signoff preflight-lockfile`, immediately after the toolchain setup — one
+implementation rather than two, for the reason two copies of a guard always drift.
+It answers there in about ten seconds, against the same question that job otherwise
+asks in its *last* step, after the whole suite has run. On 2026-08-26 that cost 13
+merge-queue branches the better part of an hour each, and the report was the single
+line `Update Cargo.lock`
+([#13598](https://github.com/spiceai/spiceai/issues/13598)).
+
+The queue is also where this shape of staleness is born: one PR changes a version in
+`[workspace.package]` while another adds or renames a member, git merges both
+cleanly because they touch different regions of the lockfile, and the combination is
+stale. Neither author can see it on their own PR, where `Attestation` is the only
+job that runs — so the sign-off gate is the first place anyone can be told.
+
+A missing lockfile reports the same way. That is cargo's own reading of `--locked`,
+and it matters here because `git diff` cannot see one: a branch that deletes
+`Cargo.lock` and lets the first cargo command recreate it has an *untracked* file,
+which a diff-based check passes.
+
+Two deliberate asymmetries:
+
+- **An unrecognised cargo failure is not a verdict.** An unreachable registry or a
+  manifest cargo cannot parse warns and passes; reporting it as a stale lockfile
+  would send you to regenerate a file that was never the problem. The full gate
+  reports the real cause minutes later with better context.
+- **Because of that, the lockfile is re-checked after the gate runs.** `lint-rust`
+  and `nextest` invoke cargo *without* `--locked`, so on a failure the preflight
+  could not read, cargo brings the lockfile up to date on its way past. Without the
+  second look, the run would post `signoff=success` for a HEAD whose committed
+  lockfile does not describe it. The comparison is against a snapshot taken before
+  the checks, so `scripts/signoff -f` on a tree already carrying lockfile edits is
+  judged on what *this run* changed.
+
+The guard's own wording is checked against the pinned toolchain rather than assumed:
+`scripts/test_signoff_disk_guard.sh` builds a one-crate fixture whose lockfile
+really is stale and asserts that cargo's refusal is still recognised, so a reworded
+diagnostic after a channel bump fails a test instead of silently retiring the check.
+
 ### "Compiler cache unreachable — checks did not complete"
 
 The pool's runners compile through `sccache` (`RUSTC_WRAPPER`, configured by

@@ -3,7 +3,7 @@ tests:
     spicepod_path: accelerated/postgres-duckdb[file].yaml
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 10
-    duration: 600
+    duration: 1800
     ready_wait: 300
     query_overrides: duckdb
     rate: 10000

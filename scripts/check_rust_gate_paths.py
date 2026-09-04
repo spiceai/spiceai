@@ -21,7 +21,7 @@
 # `scripts/check_crate_layers.py` all sat until #12111.
 #
 # The paths that must be gated are DERIVED, not listed: from what the `lint-rust`
-# recipe reads (`CLIPPY_CONF_DIR`, each `python3 scripts/…` guard), from the
+# recipe reads (`CLIPPY_CONF_DIR`, each `$(PYTHON) scripts/…` guard), from the
 # tracked files whose name marks them as lint/test config, and from every tracked
 # `.rs` file. So this catches "a config file the gate reads is in none of the
 # lists" and "a Rust source tree is in none of the lists" — the actual bugs — and
@@ -67,6 +67,12 @@ RUST_SOURCE_PATHS = (
     ".cargo/config.toml",
     # Holds every -Dclippy::… flag the gate enforces.
     "Makefile",
+    # `check_fork_patches.py` validates this file against `Cargo.lock`, so it is
+    # an input the gate reads. Gated by name rather than derived: nothing in the
+    # `lint-rust` recipe names it, only the guard it feeds. Left ungated, a
+    # ledger-only edit skips the very check that would have rejected it, and the
+    # mismatch surfaces on someone else's unrelated Rust PR.
+    "docs/dev/fork_patches.md",
 )
 
 # Paths that must NOT drag in the Rust gate — otherwise the fast-track is dead
@@ -147,7 +153,7 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
-    at, and every `python3 scripts/…` guard it runs) plus the tracked files whose
+    at, and every `$(PYTHON) scripts/…` guard it runs) plus the tracked files whose
     basename marks them as lint/test config.
     """
     paths: set[str] = set(RUST_SOURCE_PATHS)
@@ -161,7 +167,18 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
         )
     for conf_dir in re.findall(r'CLIPPY_CONF_DIR="([^"]+)"', recipe):
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
-    paths.update(re.findall(r"python3 (scripts/[\w./-]+\.py)", recipe))
+    # The recipe invokes the guards through $(PYTHON) — the Makefile variable
+    # that resolves a Python 3.11+ interpreter. Both make spellings and a literal
+    # `python3` are accepted, with any run of spaces between, so a recipe line
+    # written any of those ways still derives. The two directions are not
+    # symmetric: over-matching only adds a path to the "must be gated" set, which
+    # fails closed, while under-matching silently drops a guard from it and is the
+    # exact failure this script exists to catch. So the accepted spellings are
+    # deliberately broad, and only a spelling that would drop a guard — a
+    # different variable, or a bare `python` — is left unmatched.
+    paths.update(
+        re.findall(r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3) +(scripts/[\w./-]+\.py)", recipe)
+    )
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 

@@ -45,6 +45,9 @@ pub enum ListModelsError {
     #[snafu(display("Invalid credentials for {provider}"))]
     InvalidCredentials { provider: String },
 
+    #[snafu(display("Failed to authenticate with {provider}: {message}"))]
+    AuthenticationFailed { provider: String, message: String },
+
     #[snafu(display("Network error connecting to {provider}: {message}"))]
     NetworkError { provider: String, message: String },
 

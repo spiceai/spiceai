@@ -1196,16 +1196,32 @@ impl ChangeBatch {
         let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
-        let DataType::Struct(fields) = data_array.data_type() else {
-            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
-        };
-        let Ok(record_batch) = RecordBatch::try_new(
-            Arc::new(Schema::new(fields.clone())),
-            data_array.columns().to_vec(),
-        ) else {
+        let Ok(record_batch) =
+            RecordBatch::try_new(self.data_schema(), data_array.columns().to_vec())
+        else {
             unreachable!("The schema is validated to have a 'data' field which is a StructArray");
         };
         record_batch
+    }
+
+    /// The schema of the row data this batch carries, without building the batch.
+    ///
+    /// [`Self::data_batch`] allocates a `Schema`, a `Vec` of column `Arc`s and a
+    /// `RecordBatch` on every call. A caller that only reads the schema — the CDC
+    /// write path compares it against the acceleration's before applying a burst
+    /// — should use this instead, so a burst that is only being classified costs
+    /// no batch. The two can never disagree: [`Self::data_batch`] builds its
+    /// batch from this value.
+    #[must_use]
+    pub fn data_schema(&self) -> SchemaRef {
+        let data_col = self.record.column(self.data_idx);
+        let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = data_array.data_type() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        Arc::new(Schema::new(fields.clone()))
     }
 
     /// Whether this batch carries a before-image column
@@ -1556,6 +1572,61 @@ mod tests {
             before.schema().fields().len(),
             "before-image and data share the table schema"
         );
+    }
+
+    /// `data_schema` lets a caller that only reads the schema — the CDC write
+    /// path's per-burst schema-evolution preflight — skip building a
+    /// `RecordBatch` it never uses. That is only sound while it reports exactly
+    /// the fields the data column holds: a preflight that classified a burst
+    /// against invented or reordered fields would admit a widening the write then
+    /// applies under a different schema.
+    ///
+    /// Both accessors are checked against the `data` column read straight off the
+    /// record, not against each other — `data_batch` derives its schema from
+    /// `data_schema`, so comparing the two only ever compares a value with
+    /// itself. Pinned across both wrapper shapes, which place `data` at different
+    /// column indices.
+    #[test]
+    fn data_schema_reports_the_data_columns_own_fields() {
+        let table = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&table),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("data batch should match the table schema");
+
+        for (shape, batch) in [
+            ("changes_schema_with_before", before_image_batch()),
+            (
+                "changes_schema",
+                wrap_data_as_change_batch(&table, &rows).expect("to create change batch"),
+            ),
+        ] {
+            let data_col = batch
+                .record
+                .column_by_name("data")
+                .expect("the wrapper schema has a 'data' column");
+            let DataType::Struct(fields) = data_col.data_type() else {
+                panic!("{shape}: 'data' is validated to be a StructArray");
+            };
+
+            assert_eq!(
+                batch.data_schema().fields(),
+                fields,
+                "{shape}: data_schema must report the 'data' column's own fields"
+            );
+            assert_eq!(
+                batch.data_batch().schema().fields(),
+                fields,
+                "{shape}: data_batch must carry the 'data' column's own fields"
+            );
+        }
     }
 
     /// A null struct slot means "this row has no prior values", but Arrow lets the

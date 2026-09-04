@@ -26,7 +26,7 @@ use llms::{
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
-    google::Google,
+    google::{Google, auth},
     openai::new_openai_client,
     xai::Xai,
 };
@@ -126,15 +126,28 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
     .await
 }
 
-pub(crate) fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
-    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
-        .or_else(|_| std::env::var("GEMINI_API_KEY"))
-        .context("SPICE_GOOGLE_API_KEY or GEMINI_API_KEY not set")?;
+pub(crate) async fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let project = std::env::var("SPICE_GOOGLE_PROJECT").context("SPICE_GOOGLE_PROJECT not set")?;
+    let location =
+        std::env::var("SPICE_GOOGLE_LOCATION").context("SPICE_GOOGLE_LOCATION not set")?;
 
-    let google = Google::new(&SecretString::from(api_key), model_id)
-        .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
+    // Authenticate the way `from: google` does — as a GCP service account against Vertex AI —
+    // here through Application Default Credentials, so this needs
+    // `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key.
+    let client = auth::build_client(
+        auth::VertexAuthParams {
+            project: Some(&project),
+            location: Some(&location),
+            service_account_path: None,
+            service_account_key: None,
+            application_default_credentials: true,
+        },
+        "model.params",
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
 
-    Ok(Arc::new(google))
+    Ok(Arc::new(Google::from_client(client, model_id)))
 }
 
 pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {

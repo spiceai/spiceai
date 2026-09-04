@@ -144,6 +144,29 @@ impl Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A named scalar UDF expression, for asserting what a connector's federation
+/// deny-list does and does not allow. The deny-list matches on the function's
+/// name, so the body and the argument types are irrelevant -- only the name and
+/// the argument count are.
+#[cfg(test)]
+pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, create_udf};
+    use datafusion::prelude::col;
+
+    let udf = std::sync::Arc::new(create_udf(
+        name,
+        vec![DataType::Utf8; arity],
+        DataType::Utf8,
+        Volatility::Immutable,
+        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    ));
+    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        udf,
+        (0..arity).map(|i| col(format!("c{i}"))).collect(),
+    ))
+}
+
 #[cfg(feature = "adbc")]
 pub mod adbc;
 #[cfg(not(windows))]
@@ -153,6 +176,14 @@ pub mod databricks;
 pub mod deferred;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
+// Only the ADBC catalog connector reads the `query_federation` parameter today,
+// because only its dataset connector offers one. The MySQL, DuckLake and
+// Snowflake catalogs install their deny-list with no opt-out, matching theirs.
+// The PostgreSQL catalog installs none: `PostgresTableFactory`'s read path
+// carries no function-support seam at the pinned table-providers rev, so
+// closing it needs a change there. See #13664.
+#[cfg(feature = "adbc")]
+mod federation;
 pub mod glue;
 pub mod iceberg;
 #[cfg(feature = "mssql")]

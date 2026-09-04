@@ -344,6 +344,40 @@ pub fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// The primary keys a write must remove from its index because it could not index
+/// the rows they name.
+///
+/// A vector write drops a row it cannot embed — a NULL or empty search text, or a
+/// vector with no defined direction under any metric the index offers. Dropping it
+/// from the write is not the same as removing it from the index: whatever the index
+/// already holds under that key stays there, so a row rewritten from an indexable
+/// value to a rejected one goes on being returned at its previous vector while the
+/// write's own log line says the row was not indexed.
+///
+/// A stale vector is a wrong search result — the index asserts the row matches text
+/// it no longer contains. An absent one is a correct-by-omission result that agrees
+/// with what the write reported, and it costs nothing that is not recoverable: a
+/// vector index is derived from its source table, so the row itself is untouched and
+/// the next indexable write restores it. Removing the entry is therefore the one
+/// behaviour every backend can implement with the delete primitive it already has,
+/// and it is what these paths do.
+///
+/// `indexed` is what this same write is about to store. A key in both — the batch
+/// carries the key twice, once indexable and once not — is not evicted: the write
+/// that follows re-establishes it, so issuing a delete for it would only cost a round
+/// trip. Callers must still delete before they write, so the two orders agree.
+pub fn keys_to_evict<'a>(
+    rejected: impl IntoIterator<Item = String>,
+    indexed: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let indexed: std::collections::HashSet<&str> = indexed.into_iter().collect();
+    rejected
+        .into_iter()
+        .filter(|key| !indexed.contains(key.as_str()))
+        .unique()
+        .collect()
+}
+
 /// Reorder a [`RecordBatch`]'s columns alphabetically by field name.
 ///
 /// Because of limitations of `DFSchema::logically_equivalent_names_and_types` and its use in
@@ -635,6 +669,43 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
         assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    fn owned(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    #[test]
+    fn keys_to_evict_names_every_rejected_key_the_write_does_not_also_store() {
+        let evicted = keys_to_evict(owned(&["a", "b"]), ["c"]);
+        assert_eq!(
+            evicted,
+            owned(&["a", "b"]),
+            "a rejected key is what leaves a stale vector behind, so it must be evicted"
+        );
+    }
+
+    /// The batch carries one key twice — once indexable, once not. The write that follows
+    /// re-establishes it, so a delete for it would be undone by this same write.
+    #[test]
+    fn keys_to_evict_skips_a_key_the_same_write_also_indexes() {
+        let evicted = keys_to_evict(owned(&["a", "b"]), ["b"]);
+        assert_eq!(evicted, owned(&["a"]));
+    }
+
+    #[test]
+    fn keys_to_evict_deduplicates_a_key_rejected_more_than_once() {
+        let evicted = keys_to_evict(owned(&["a", "a", "b", "a"]), std::iter::empty());
+        assert_eq!(
+            evicted,
+            owned(&["a", "b"]),
+            "one delete per key is enough; repeating it only costs request size"
+        );
+    }
+
+    #[test]
+    fn keys_to_evict_is_empty_when_the_write_rejected_nothing() {
+        assert!(keys_to_evict(Vec::new(), ["a", "b"]).is_empty());
     }
 
     #[test]

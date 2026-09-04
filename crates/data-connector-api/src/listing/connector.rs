@@ -3182,4 +3182,206 @@ mod tests {
             "an invalid value falls back to the default"
         );
     }
+
+    /// An `InMemory` store that records the [`object_store::GetOptions`] of every
+    /// read, and reports a version for the object it holds so a reader has something
+    /// to pin to.
+    ///
+    /// `InMemory` itself reports no version, and a reader cannot pin what the store
+    /// does not give it — which would make the guard below pass whether or not the
+    /// pinning worked.
+    #[derive(Debug)]
+    struct VersionRecordingStore {
+        inner: object_store::memory::InMemory,
+        version: String,
+        reads: std::sync::Mutex<Vec<object_store::GetOptions>>,
+    }
+
+    impl VersionRecordingStore {
+        fn new(version: &str) -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                version: version.to_string(),
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<object_store::GetOptions> {
+            self.reads.lock().expect("reads lock").clone()
+        }
+
+        /// Forget what has been recorded, so a test can set itself up through the
+        /// same store it is about to assert on.
+        fn forget_reads(&self) {
+            self.reads.lock().expect("reads lock").clear();
+        }
+    }
+
+    impl std::fmt::Display for VersionRecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "VersionRecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VersionRecordingStore {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.reads.lock().expect("reads lock").push(options.clone());
+            let mut result = self.inner.get_opts(location, options).await?;
+            result.meta.version = Some(self.version.clone());
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Every read a versioned Parquet scan makes has to name the version it started
+    /// from, and none of them may be a suffix range.
+    ///
+    /// The connectors that set `object_versioning_type` — S3, ABFS, GCS, `SharePoint` —
+    /// do so because the object under a dataset can be replaced while a scan is in
+    /// flight. Pinning makes the reads a consistent view of one version; without it
+    /// the footer comes from the old object and the pages from the new one, and the
+    /// scan returns rows that were never in either.
+    ///
+    /// Both halves of that live on forks. `ListingOptions::with_object_versioning_type`
+    /// is a `spiceai/datafusion` patch, and the `if_match`/`version` it turns into on
+    /// every metadata, byte-range and suffix fetch is a `spiceai/arrow-rs` patch to
+    /// `ParquetObjectReader`. The `arrow-rs` half is the dangerous one: a re-cut that
+    /// keeps the constructor and drops the pinning still compiles, still scans, and
+    /// stops pinning.
+    ///
+    /// The suffix-range assertion guards the other reason `new_with_meta` exists:
+    /// Azure Blob Storage does not serve suffix ranges, so a reader that falls back to
+    /// one cannot read Parquet from ABFS at all.
+    #[tokio::test]
+    async fn a_versioned_parquet_read_pins_every_request_to_one_object_version() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::async_reader::{
+            ObjectVersionType, ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+        };
+        use futures::TryStreamExt;
+
+        const VERSION: &str = "the-version-the-scan-started-from";
+
+        // Two columns, so the data reads are plural and go through
+        // `get_byte_ranges` — the override that coalesces them — rather than a
+        // single `get_bytes`.
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("builds a batch");
+
+        let mut buffer = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None).expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let store = Arc::new(VersionRecordingStore::new(VERSION));
+        let location = Path::from("versioned.parquet");
+        store
+            .put(&location, buffer.into())
+            .await
+            .expect("stores the file");
+        let meta = store.head(&location).await.expect("heads the file");
+        // The write and the `head` are the test's own setup, and the `head` reaches
+        // `get_opts` too. Only what the reader asks for is under assertion.
+        store.forget_reads();
+        let store_handle = Arc::clone(&store);
+
+        let reader = ParquetObjectReader::new_with_meta(store as Arc<dyn ObjectStore>, meta)
+            .with_object_versioning_type(Some(ObjectVersionType::Version));
+        let rows: usize = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .expect("reads the Parquet metadata")
+            .build()
+            .expect("builds the record-batch stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("reads the data")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 3,
+            "the read has to reach the data, not just the footer"
+        );
+
+        let reads = store_handle.reads();
+        assert!(
+            !reads.is_empty(),
+            "the read issued no request at all, so this asserts nothing"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.version.as_deref(),
+                Some(VERSION),
+                "a read did not pin the object version, so a replacement mid-scan is read as a \
+                 mixture of both versions: {options:?}"
+            );
+            assert!(
+                !matches!(options.range, Some(object_store::GetRange::Suffix(_))),
+                "a read fell back to a suffix range, which Azure Blob Storage does not serve: \
+                 {options:?}"
+            );
+        }
+    }
 }

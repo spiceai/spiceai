@@ -140,32 +140,93 @@ pub async fn delete_by_keys(
             continue;
         };
 
-        let resp = match client.delete_by_query(es_index, &query).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Only a refused connection proves this chunk never reached the index, and so
-                // that no later chunk will either — stopping there costs nothing and spares a
-                // dead node one request per remaining chunk. Every other error leaves the
-                // delete's fate unknown: `JsonParse` is raised *after* a 2xx, so Elasticsearch
-                // ran that delete and only the body was unreadable, and a status error or a
-                // timeout can each land on a request the index already applied in part. Treating
-                // those as "never reached" and returning is what would leave the later chunks
-                // unissued — the same larger divergence a partial body is held open for above.
-                let never_reached = matches!(
-                    &e,
-                    elasticsearch::Error::HttpRequest { source } if source.is_connect()
-                );
-                failure.get_or_insert(DataFusionError::External(Box::new(e)));
-                if never_reached {
-                    break;
-                }
-                continue;
+        let outcome = issue_delete_chunk(client, es_index, &query).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
+        }
+    }
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// What issuing one `_delete_by_query` chunk produced: the failure to report, if any, and
+/// whether the rest of the batch has anything to reach.
+struct ChunkOutcome {
+    failure: Option<DataFusionError>,
+    never_reached: bool,
+}
+
+/// Issue one `_delete_by_query` and classify what came back.
+///
+/// Only a refused connection proves this chunk never reached the index, and so that no later
+/// chunk will either — stopping there costs nothing and spares a dead node one request per
+/// remaining chunk. Every other error leaves the delete's fate unknown: `JsonParse` is raised
+/// *after* a 2xx, so Elasticsearch ran that delete and only the body was unreadable, and a
+/// status error or a timeout can each land on a request the index already applied in part.
+/// Treating those as "never reached" is what would leave the later chunks unissued — a larger
+/// divergence than the one being reported.
+async fn issue_delete_chunk(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    query: &Value,
+) -> ChunkOutcome {
+    match client.delete_by_query(es_index, query).await {
+        Ok(resp) => ChunkOutcome {
+            // Report the first, which is the one whose surrounding state a reconcile starts
+            // from; later chunks fail the same way once the index has diverged.
+            failure: inspect_delete_response(&resp, es_index)
+                .err()
+                .map(|e| DataFusionError::External(Box::new(e))),
+            never_reached: false,
+        },
+        Err(e) => {
+            let never_reached = matches!(
+                &e,
+                elasticsearch::Error::HttpRequest { source } if source.is_connect()
+            );
+            ChunkOutcome {
+                failure: Some(DataFusionError::External(Box::new(e))),
+                never_reached,
             }
-        };
-        if let Err(e) = inspect_delete_response(&resp, es_index) {
-            // Report the first, which is the one whose surrounding state a reconcile starts from;
-            // later chunks fail the same way once the index has diverged.
-            failure.get_or_insert(DataFusionError::External(Box::new(e)));
+        }
+    }
+}
+
+/// Delete the documents stored under `ids`, addressing them by `_id`.
+///
+/// The write path derives each document's `_id` from its row's primary key and holds it while
+/// building the batch, so a write that could not index a row already has the identity of the
+/// document it has to remove — no re-derivation, and no dependence on the key's field mapping
+/// (see [`delete_by_keys`] for why filtering on a key column is not reliable).
+///
+/// Chunked and error-reported exactly as [`delete_by_keys`] is, via [`issue_delete_chunk`].
+pub async fn delete_by_ids(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    ids: &[String],
+) -> DataFusionResult<()> {
+    let mut failure: Option<DataFusionError> = None;
+
+    for chunk in ids.chunks(DELETE_CHUNK_ROWS) {
+        let values: Vec<Value> = chunk.iter().cloned().map(Value::String).collect();
+        if values.is_empty() {
+            continue;
+        }
+        let query = json!({ "ids": { "values": values } });
+
+        let outcome = issue_delete_chunk(client, es_index, &query).await;
+        if let Some(e) = outcome.failure {
+            failure.get_or_insert(e);
+        }
+        if outcome.never_reached {
+            break;
         }
     }
 
@@ -889,6 +950,96 @@ mod tests {
         .expect("delete should succeed");
 
         assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// End-to-end over the modeled store: the write path's eviction removes exactly the
+    /// documents whose rows it could not index, and leaves every other document alone.
+    #[tokio::test]
+    async fn delete_by_ids_removes_only_the_addressed_documents() {
+        let client = RecordingClient::with_ids(&["ORDER-1024", "ORDER-1025", "ORDER-1026"]);
+
+        delete_by_ids(&client, "idx", &ids(&["ORDER-1025"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
+    }
+
+    #[tokio::test]
+    async fn delete_by_ids_addresses_documents_by_id() {
+        let client = RecordingClient::default();
+
+        delete_by_ids(&client, "idx", &ids(&["7", "8"]))
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(
+            client.queries(),
+            vec![json!({"ids": {"values": ["7", "8"]}})]
+        );
+    }
+
+    /// A write that rejected nothing must not reach Elasticsearch at all — an `ids` query
+    /// with an empty list is not a no-op to send, it is a request that costs a round trip.
+    #[tokio::test]
+    async fn delete_by_ids_issues_no_request_for_an_empty_list() {
+        let client = RecordingClient::default();
+
+        delete_by_ids(&client, "idx", &[])
+            .await
+            .expect("delete should succeed");
+
+        assert!(client.queries().is_empty());
+    }
+
+    /// Chunked exactly as [`delete_by_keys`] is, so a large eviction cannot build an
+    /// unbounded id list in one request.
+    #[tokio::test]
+    async fn delete_by_ids_chunks_a_large_eviction() {
+        let client = RecordingClient::default();
+        let all: Vec<String> = (0..=DELETE_CHUNK_ROWS).map(|i| i.to_string()).collect();
+
+        delete_by_ids(&client, "idx", &all)
+            .await
+            .expect("delete should succeed");
+
+        let queries = client.queries();
+        assert_eq!(queries.len(), 2, "one request per {DELETE_CHUNK_ROWS} ids");
+        let first = queries[0]["ids"]["values"]
+            .as_array()
+            .expect("an ids query carries an array");
+        assert_eq!(first.len(), DELETE_CHUNK_ROWS);
+    }
+
+    /// The eviction reports a partially-applied delete the same way [`delete_by_keys`] does:
+    /// a document left in place is a stale vector still being served.
+    #[tokio::test]
+    async fn delete_by_ids_reports_a_partially_applied_delete() {
+        let client = RecordingClient::answering(json!({
+            "took": 1,
+            "timed_out": false,
+            "total": 2,
+            "deleted": 1,
+            "batches": 1,
+            "version_conflicts": 1,
+            "noops": 0,
+            "retries": {"bulk": 0, "search": 0},
+            "throttled_millis": 0,
+            "failures": [],
+        }));
+
+        let err = delete_by_ids(&client, "idx", &ids(&["7", "8"]))
+            .await
+            .expect_err("a delete that left a document behind must be reported");
+
+        assert!(
+            err.to_string().contains("only partially"),
+            "unexpected error: {err}"
+        );
     }
 
     /// An index with no primary key writes documents under generated `_id`s, so there is no id

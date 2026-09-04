@@ -18,11 +18,11 @@ limitations under the License.
 use std::{
     fmt,
     hash::DefaultHasher,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{Result, TokenProvider};
+use crate::{Result, TokenProvider, ensure_jwt_crypto_provider};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::{ExposeSecret, SecretString};
@@ -34,23 +34,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-// Ensure the aws-lc-rs crypto provider is installed for jsonwebtoken before the first JWT
-// operation. This is required because Cargo feature unification can activate both `aws_lc_rs`
-// and `rust_crypto` features simultaneously (e.g. via a transitive dep like octocrab), causing
-// jsonwebtoken's auto-detection to panic at runtime. Calling install_default() here makes it a
-// compile error if the `aws_lc_rs` feature is ever missing, and a safe no-op if already set.
-static JWT_CRYPTO_INIT: OnceLock<()> = OnceLock::new();
-
-fn ensure_jwt_crypto_provider() {
-    JWT_CRYPTO_INIT.get_or_init(|| {
-        // install_default() returns Err only if a provider is already installed by another caller
-        // (e.g. a test harness). That is not an error — any installed provider is acceptable here.
-        // The only real failure mode (aws_lc_rs feature missing) is a compile error: the symbol
-        // jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER would not exist.
-        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
-    });
-}
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {

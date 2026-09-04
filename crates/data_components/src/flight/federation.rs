@@ -67,7 +67,11 @@ impl SQLExecutor for FlightTable {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(self.client.clone(), query.to_string()),
+            query_to_stream(
+                self.client.clone(),
+                query.to_string(),
+                self.table_reference.to_quoted_string(),
+            ),
         )))
     }
 

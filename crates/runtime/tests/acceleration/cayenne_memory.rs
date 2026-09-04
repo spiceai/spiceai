@@ -57,7 +57,7 @@ async fn refresh(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("refresh_table failed: {e}"))?;
     notifier
         .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?
-        .notified()
+        .wait()
         .await;
     Ok(())
 }

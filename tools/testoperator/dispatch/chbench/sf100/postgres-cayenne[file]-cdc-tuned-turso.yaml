@@ -4,6 +4,6 @@ tests:
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 100
     terminals: 100
-    duration: 600
+    duration: 1800
     ready_wait: 600
     rate: 10000

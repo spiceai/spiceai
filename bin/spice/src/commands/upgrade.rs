@@ -62,11 +62,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
     tracing::info!("Current CLI version: v{current_cli_version}");
 
     // Get current runtime version if installed
-    let current_runtime_version = if ctx.is_runtime_installed() {
-        ctx.runtime_version().ok()
-    } else {
-        None
-    };
+    // The managed install specifically: `spice upgrade` replaces that one file,
+    // so a `spiced` beside the CLI, or one pinned by `SPICED_PATH`, must not
+    // decide whether it has work to do — see
+    // `RuntimeContext::managed_runtime_version`.
+    let current_runtime_version = ctx.managed_runtime_version().ok();
     if let Some(ref runtime_version) = current_runtime_version {
         tracing::info!("Current runtime version: {runtime_version}");
     } else {
@@ -111,6 +111,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         tracing::info!(
             "Already using version {target_version}. CLI and runtime upgrade not required."
         );
+        // The earliest of the no-op returns, and the one a user is most likely
+        // to hit while asking why an upgrade changed nothing. Being shadowed is
+        // the answer they need, and "already using version X" on its own reads
+        // as confirmation that the managed runtime is the one in use.
+        crate::context::warn_if_install_will_not_run(ctx);
         return Ok(());
     }
 
@@ -178,6 +183,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
     } else {
         tracing::info!("Runtime is already at {target_version}.");
     }
+    // Outside the branch: what the managed install is shadowed by does not
+    // depend on whether this run had anything to download, and the no-op run is
+    // where the warning matters most — a user checking why their upgrade made no
+    // difference is told the version is current and nothing else.
+    crate::context::warn_if_install_will_not_run(ctx);
 
     Ok(())
 }

@@ -220,7 +220,7 @@ async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), 
                     .expect("trigger parent refresh");
                 if let Some(notify) = notify {
                     tokio::select! {
-                        () = notify.notified() => {}
+                        _ = notify.wait() => {}
                         () = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }
@@ -365,7 +365,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
                     .expect("trigger parent refresh");
                 if let Some(notify) = notify {
                     tokio::select! {
-                        () = notify.notified() => {}
+                        _ = notify.wait() => {}
                         () = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }

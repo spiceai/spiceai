@@ -21,6 +21,7 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
 };
 use arrow_flight::error::FlightError;
+use arrow_tools::map_entries::{self, StreamNormalizer};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -72,6 +73,16 @@ pub enum Error {
     #[snafu(display("Query execution failed. {source} Verify the configuration and try again."))]
     ArrowFlight {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to read query results from Arrow Flight for table {table} ({source}), so the query cannot return rows. \
+        Cast the MAP column to a supported type in the query, or select it as a string with `to_json(<column>)`. \
+        See: https://spiceai.org/docs/components/data-connectors"
+    ))]
+    MapEntriesNotNormalizable {
+        table: String,
+        source: map_entries::Error,
     },
 }
 
@@ -216,6 +227,10 @@ impl FlightTable {
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
+        // A server is free to declare a MAP's `entries` field nullable, which the Arrow map
+        // layout forbids. Correcting it here keeps the schema this table reports to the planner
+        // in step with the batches `execute` hands back, which are normalized to the same shape.
+        let schema = map_entries::conforming_schema(schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =
@@ -242,6 +257,7 @@ impl FlightTable {
     ) -> Self {
         let table_reference = table_reference.into();
         tracing::debug!("table_reference={:?}", table_reference);
+        let schema = map_entries::conforming_schema(schema);
 
         let base_context = Self::get_base_context(&client);
         let join_push_down_context =
@@ -512,8 +528,14 @@ impl ExecutionPlan for FlightExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            query_to_stream(
+                self.client.clone(),
+                sql,
+                self.table_reference.to_quoted_string(),
+            ),
+        );
 
         Ok(Box::pin(stream_adapter))
     }
@@ -522,13 +544,19 @@ impl ExecutionPlan for FlightExec {
 fn query_to_stream(
     client: FlightClient,
     sql: String,
+    table: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
+        // The stream's schema is whatever its batches carry, so the normalizer is resolved from
+        // the first one and reused for the rest.
+        let mut normalizer = StreamNormalizer::new();
         match client.query(sql.as_str()).await {
             Ok(mut stream) => {
                 while let Some(batch) = stream.next().await {
                     match batch {
-                        Ok(batch) => yield Ok(batch),
+                        Ok(batch) => yield normalizer
+                            .normalize(batch)
+                            .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { table: table.clone(), source })),
                         Err(error) => {
                             yield Err(map_query_stream_error(error));
                         }
@@ -577,5 +605,302 @@ fn map_query_stream_error(error: FlightError) -> DataFusionError {
             }
             .to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlightTable;
+    use arrow::array::{
+        Array, ArrayData, ArrayRef, MapArray, RecordBatch, StringArray, StructArray,
+    };
+    use arrow::buffer::Buffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+    use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+    use arrow_flight::{
+        Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
+        FlightInfo, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    };
+    use bytes::Bytes;
+    use datafusion::catalog::TableProvider;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use datafusion::sql::TableReference;
+    use datafusion::sql::unparser::dialect::DefaultDialect;
+    use flight_client::{Credentials, FlightClient};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    use tokio_stream::Empty as EmptyStream;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, async_trait};
+
+    /// Builds a `MapArray` the way the Flight IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a server's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> RecordBatch {
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// A Flight server that declares — and serves — a `MAP` whose `entries` field is nullable.
+    #[derive(Clone)]
+    struct NullableMapEntriesService;
+
+    type EmptyResponseStream<T> = EmptyStream<Result<T, Status>>;
+
+    #[async_trait]
+    impl FlightService for NullableMapEntriesService {
+        type HandshakeStream = EmptyResponseStream<arrow_flight::HandshakeResponse>;
+        type ListFlightsStream = EmptyResponseStream<FlightInfo>;
+        type DoGetStream =
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
+        type DoPutStream = EmptyResponseStream<PutResult>;
+        type DoExchangeStream =
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send>>;
+        type DoActionStream = EmptyResponseStream<arrow_flight::Result>;
+        type ListActionsStream = EmptyResponseStream<ActionType>;
+
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("handshake"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("list_flights"))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            Ok(Response::new(FlightInfo {
+                schema: Bytes::new(),
+                flight_descriptor: None,
+                endpoint: vec![FlightEndpoint {
+                    ticket: Some(Ticket {
+                        ticket: Bytes::from_static(b"ticket"),
+                    }),
+                    location: vec![],
+                    expiration_time: None,
+                    app_metadata: Bytes::new(),
+                }],
+                total_records: -1,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Bytes::new(),
+            }))
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<PollInfo>, Status> {
+            Err(Status::unimplemented("poll_flight_info"))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            let schema = nullable_entries_map_batch().schema();
+            let options = arrow::ipc::writer::IpcWriteOptions::default();
+            let result = SchemaResult::try_from(SchemaAsIpc::new(schema.as_ref(), &options))
+                .map_err(|e| Status::internal(format!("encoding the schema: {e}")))?;
+            Ok(Response::new(result))
+        }
+
+        async fn do_get(
+            &self,
+            _request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            let batch = nullable_entries_map_batch();
+            let data =
+                arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch])
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+            Ok(Response::new(Box::pin(futures::stream::iter(
+                data.into_iter().map(Ok),
+            ))))
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("do_put"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            let batch = nullable_entries_map_batch();
+            let data =
+                arrow_flight::utils::batches_to_flight_data(batch.schema().as_ref(), vec![batch])
+                    .map_err(|e| Status::internal(format!("encoding the map batch: {e}")))?;
+            Ok(Response::new(Box::pin(futures::stream::iter(
+                data.into_iter().map(Ok),
+            ))))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("do_action"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("list_actions"))
+        }
+    }
+
+    pub(crate) struct TestServer {
+        pub(crate) addr: SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        handle: JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl TestServer {
+        pub(crate) async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let addr = listener.local_addr().expect("listener should have addr");
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(NullableMapEntriesService))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+            Self {
+                addr,
+                shutdown: Some(shutdown_tx),
+                handle,
+            }
+        }
+
+        pub(crate) async fn shutdown(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            self.handle
+                .await
+                .expect("server task should finish")
+                .expect("server should exit cleanly");
+        }
+    }
+
+    /// Regression test for #13495 over the whole connector read path: a Flight server declaring a
+    /// `MAP`'s `entries` field nullable — which the Arrow map layout forbids and the IPC reader
+    /// lets through — hands us a column no kernel can rebuild. Both halves are brought into line:
+    /// the schema this table reports to the planner, and the batches its scan yields.
+    #[tokio::test]
+    async fn a_servers_nullable_map_entries_declaration_is_corrected_on_read() {
+        let server = TestServer::start().await;
+        let client = FlightClient::try_new(
+            Arc::from(format!("http://{}", server.addr)),
+            Credentials::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("client should connect");
+
+        let table = FlightTable::create(
+            "flight",
+            client,
+            TableReference::bare("t"),
+            Arc::new(DefaultDialect {}),
+            None,
+        )
+        .await
+        .expect("table should be created");
+
+        let conforming = |schema: &SchemaRef| match schema.field(0).data_type() {
+            DataType::Map(entries, _) => !entries.is_nullable(),
+            other => panic!("expected a Map column, got {other:?}"),
+        };
+        assert!(
+            conforming(&TableProvider::schema(&table)),
+            "the schema reported to the planner still declares nullable entries"
+        );
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should plan");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        assert!(
+            conforming(&batch.schema()),
+            "the decoded batch still carries the server's non-conforming declaration"
+        );
+
+        // The property the declaration controls: every kernel that touches a map column rebuilds
+        // it through this constructor, and a nullable `entries` field is refused there outright.
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("a Map column");
+        let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
+        MapArray::try_new(field, offsets, entries, nulls, ordered)
+            .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
     }
 }
