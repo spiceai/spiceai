@@ -415,6 +415,12 @@ async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyho
                 .await?,
             )?
             .to_string();
+            // `can_execute_plan` refuses to federate a plan containing a denied
+            // function at all, so this plan may carry no `base_sql` whatsoever --
+            // which is the intended outcome, not a missing measurement. The
+            // `regexp_like` control at the end of this test is what keeps the
+            // negative assertions here from being vacuous: it proves a federated
+            // scan with a translated regexp call is still produced on this setup.
             let remote_sql = pushed_down_sql(&plan);
             assert!(
                 !remote_sql.contains("regexp_extract"),
@@ -473,6 +479,37 @@ async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyho
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "a non-matching regexp_match must be NULL accelerated and local alike"
+            );
+
+            // `regexp_instr` has no DuckDB function of that name and the dialect
+            // renders none, so before the deny this failed remotely with
+            // `Catalog Error: Scalar Function with name regexp_instr does not
+            // exist!` rather than answering.
+            let instr = "SELECT id, regexp_instr(s, 'b') AS i FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &instr.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &instr.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "regexp_instr must answer, and agree with local evaluation"
+            );
+
+            // Pinned separately over the non-NULL rows, so the values assert
+            // what the function returns without depending on whether the CSV
+            // reader gives the empty field NULL or an empty string.
+            let instr_rows = "SELECT id, regexp_instr(s, 'b') AS i FROM accelerated \
+                              WHERE id <= 3 ORDER BY id";
+            assert_batches_eq!(
+                [
+                    "+----+---+",
+                    "| id | i |",
+                    "+----+---+",
+                    "| 1  | 2 |",
+                    "| 2  | 0 |",
+                    "| 3  | 3 |",
+                    "+----+---+",
+                ],
+                &run_query(&rt, instr_rows).await?
             );
 
             // The sibling handlers the dialect still installs stay pushed down

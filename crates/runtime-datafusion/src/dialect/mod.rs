@@ -36,6 +36,7 @@ const TO_HEX_NAME: &str = "to_hex";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
+pub(crate) const REGEXP_INSTR_NAME: &str = "regexp_instr";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 const REGEXP_COUNT_NAME: &str = "regexp_count";
 

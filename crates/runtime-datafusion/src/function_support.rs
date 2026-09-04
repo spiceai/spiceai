@@ -63,7 +63,35 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
 /// [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], and `regexp_like`
 /// the `DuckDB` dialect does render natively (`regexp_matches`), so that shape
 /// keeps a boolean instead of a list either way.
-pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[crate::dialect::REGEXP_MATCH_NAME];
+///
+/// `regexp_instr` is here for the plainer reason that `DuckDB` has no function
+/// of that name and the dialect renders none, so a federated call failed
+/// remotely with `Catalog Error: Scalar Function with name regexp_instr does not
+/// exist!` — the unknown-function failure the deny-list exists to prevent
+/// (issue #10703). It is the only other `DataFusion` regexp built-in the
+/// `DuckDB` dialect has no handler for; `regexp_like`, `regexp_replace` and
+/// `regexp_count` all have one and keep pushing down.
+pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
+    crate::dialect::REGEXP_MATCH_NAME,
+    crate::dialect::REGEXP_INSTR_NAME,
+];
+
+/// The deny-list for a consumer that installs the `DuckDB` dialect but wants
+/// the **plain** Spice deny-list rather than the `DuckDB` carve-out — today the
+/// `DuckLake` catalog connector, which withholds the vector UDFs because the
+/// dialect's `cosine_distance` rewrite is not value-preserving (issue #13728).
+///
+/// It still needs [`DUCKDB_DENIED_BUILTINS`]. Those are `DataFusion` built-ins,
+/// so the plain deny-list does not withhold them, and the dialect is the
+/// `DuckDB` one — which no longer renders `regexp_match` at all, so without this
+/// the call would be unparsed under its `DataFusion` name and fail remotely as
+/// an unknown function.
+#[must_use]
+pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
+        .build()
+}
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
 /// the accelerator cannot be given different pushdown rules.
