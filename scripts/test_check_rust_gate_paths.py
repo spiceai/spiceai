@@ -240,12 +240,16 @@ def derived_from(recipe: str) -> list[str]:
 
 
 # The recipe invokes the guards through `$(PYTHON)`; a bare `python3` is still
-# accepted so a recipe line written the old way keeps deriving, and the spacing
-# between the interpreter and the script is not significant to make.
+# accepted so a recipe line written the old way keeps deriving. Every gap here is
+# one make hands the shell as a separator, confirmed by running each form through
+# make: the guard runs in all of them. So a guard written with any of them must
+# still derive, or it runs while silently leaving its own path ungated
+# (spiceai/spiceai#13783).
+GAPS = {"space": " ", "spaces": "   ", "tab": "\t", "space-tab": " \t", "continuation": " \\\n\t\t"}
 for spelling in ("$(PYTHON)", "${PYTHON}", "python3"):
-    for gap in (" ", "   "):
+    for name, gap in GAPS.items():
         check(
-            f"`{spelling}{gap}scripts/...` derives the guard it runs",
+            f"`{spelling}` + {name} + `scripts/...` derives the guard it runs",
             derived_from(f"\t{spelling}{gap}scripts/check_crate_layers.py"),
             ["scripts/check_crate_layers.py"],
         )
