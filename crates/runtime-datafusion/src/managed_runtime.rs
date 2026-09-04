@@ -330,28 +330,42 @@ mod tests {
 
     /// A driver that panics *after* the stream has started must surface an error.
     ///
-    /// The sender is dropped as the panicking task's future unwinds, which closes
-    /// the batch channel before the runtime publishes the task's outcome. Sleeping
-    /// between the two makes that window wide enough to hit on every run instead of
-    /// roughly a third of them: the stream is woken by the channel close while the
-    /// join handle is still pending, which is exactly the ordering that used to end
-    /// the stream as an empty success.
+    /// The sender is dropped as the panicking task's future unwinds, which closes the
+    /// batch channel before the runtime publishes the task's outcome. Two one-shot
+    /// barriers pin that ordering exactly rather than racing it: the driver closes the
+    /// channel and signals, and only after the stream has been polled once does it get
+    /// released to panic. So at the first poll the channel is provably closed and the
+    /// handle is provably pending — the ordering that used to end the stream as an empty
+    /// success, and the one a sleep only reaches by luck.
     ///
     /// Regression test for #13876.
     #[tokio::test]
     async fn driver_panic_after_stream_start_is_an_error_not_an_empty_success() {
         let runtime = test_runtime();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
+        let (closed_tx, closed_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
 
         let driver_handle = runtime.spawn(async move {
             drop(batch_tx);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = closed_tx.send(());
+            let _ = release_rx.await;
             panic!("driver task panic after stream start");
         });
 
-        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle)
-            .collect()
-            .await;
+        closed_rx.await.expect("driver signalled the channel close");
+
+        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle);
+        assert!(
+            matches!(futures::poll!(stream.next()), Poll::Pending),
+            "the stream ended while the driver's outcome was still unknown — \
+             a panicking query would be reported to the client as an empty success"
+        );
+
+        release_tx
+            .send(())
+            .expect("release the driver into its panic");
+        let results: Vec<_> = stream.collect().await;
 
         let [Err(err)] = results.as_slice() else {
             panic!("expected exactly one error item, got {results:?}");
@@ -370,24 +384,42 @@ mod tests {
         let runtime = test_runtime();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
 
+        let (closed_tx, closed_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
         let driver_handle = runtime.spawn(async move {
             batch_tx
                 .send(Ok(test_batch(vec![1, 2, 3])))
                 .await
                 .expect("send batch");
             drop(batch_tx);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = closed_tx.send(());
+            let _ = release_rx.await;
             panic!("driver task panic after one batch");
         });
 
-        let results: Vec<_> = RuntimeDriverStream::new(batch_rx, driver_handle)
-            .collect()
-            .await;
+        closed_rx.await.expect("driver signalled the channel close");
 
-        let [Ok(batch), Err(err)] = results.as_slice() else {
-            panic!("expected one batch then one error, got {results:?}");
+        let mut stream = RuntimeDriverStream::new(batch_rx, driver_handle);
+        let first = futures::poll!(stream.next());
+        assert!(
+            matches!(first, Poll::Ready(Some(Ok(_)))),
+            "the buffered batch should be drained before the driver's outcome is known, got {first:?}"
+        );
+        assert!(
+            matches!(futures::poll!(stream.next()), Poll::Pending),
+            "the stream ended after its last buffered batch while the driver's outcome was \
+             still unknown — a panicking query would be truncated into a short success"
+        );
+
+        release_tx
+            .send(())
+            .expect("release the driver into its panic");
+        let results: Vec<_> = stream.collect().await;
+
+        let [Err(err)] = results.as_slice() else {
+            panic!("expected exactly one error item after the batch, got {results:?}");
         };
-        assert_eq!(batch.num_rows(), 3);
         assert!(
             err.to_string().contains("Query driver task panicked"),
             "unexpected error: {err}"
