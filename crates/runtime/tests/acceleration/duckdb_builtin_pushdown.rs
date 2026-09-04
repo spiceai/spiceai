@@ -19,6 +19,7 @@ limitations under the License.
 //! local evaluation.
 
 use app::AppBuilder;
+use arrow::array::Array;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
@@ -448,6 +449,27 @@ async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Err
                 "+----+------------------------------------------------------------------+",
             ];
             assert_batches_eq!(expected, &accelerated);
+
+            // Row 4's blank cell above does not pin the NULL half of the
+            // contract on its own: `pretty_format_batches` renders a SQL NULL
+            // and a zero-length `Binary` value identically, so a rewrite that
+            // turned `unhex(sha256(NULL))` into the empty blob would print the
+            // same table. Only the null bitmap separates them. The query is
+            // `ORDER BY id` over four rows, so the last one is id=4.
+            let nulls: Vec<bool> = accelerated
+                .iter()
+                .flat_map(|batch| {
+                    let d = batch.column_by_name("d").expect("the digest column");
+                    (0..batch.num_rows())
+                        .map(|row| d.is_null(row))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                nulls,
+                vec![false, false, false, true],
+                "only the NULL name may produce a NULL digest, and the empty blob prints alike"
+            );
 
             // The accelerator's answer is only right if it is the answer
             // DataFusion gives; the hex-text rendering shows up here as a
