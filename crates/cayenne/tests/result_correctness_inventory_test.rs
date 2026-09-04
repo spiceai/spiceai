@@ -973,6 +973,56 @@ fn an_ambiguous_column_name_is_not_guessed() {
     );
 }
 
+/// Keyword and identifier case is not significant in SQL, but the case inside a
+/// string literal is: `'a'` and `'A'` select different rows. An expression that
+/// differs only there is a different expression, and matching it to the
+/// projection would check a column the query never asked to be ordered.
+#[test]
+fn an_expression_differing_inside_a_string_literal_is_not_the_projected_one() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "bucket",
+        DataType::Int64,
+        false,
+    )]));
+    let resolution = resolve_sort_key(
+        "SELECT CASE WHEN x = 'a' THEN 0 ELSE 1 END AS bucket FROM t \
+         ORDER BY CASE WHEN x = 'A' THEN 0 ELSE 1 END",
+        &schema,
+    );
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "'a' and 'A' match different rows, so this term is not the projected expression: {resolution:?}"
+    );
+}
+
+/// The case that is *not* significant must still match, or every corpus query
+/// spelling its aggregate differently from the projection goes unchecked.
+#[test]
+fn an_expression_matches_the_projection_across_keyword_case() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::Int64,
+        false,
+    )]));
+    let resolution = resolve_sort_key(
+        "SELECT SUM(l_quantity) AS total FROM t ORDER BY sum(l_quantity)",
+        &schema,
+    );
+    assert_eq!(
+        resolution,
+        SortKeyResolution::Resolved {
+            key: vec![SortKeyColumn {
+                index: 0,
+                name: "total".to_string(),
+                descending: false,
+                nulls_first: None,
+            }],
+            unresolved_suffix: None,
+        },
+        "SUM and sum are the same function"
+    );
+}
+
 /// A qualifier that names a column the query never projected identifies no
 /// result column, so the term is unresolved. Matching on the trailing name alone
 /// would check an unrelated column and report its order as this term's.

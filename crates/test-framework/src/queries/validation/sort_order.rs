@@ -373,7 +373,7 @@ fn alias_index(items: &[SelectItem], name: &str) -> Option<usize> {
 /// Rendering both through the parser's own `Display` normalizes the source
 /// text's whitespace and casing of keywords.
 fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
-    let wanted = expr.to_string();
+    let wanted = fold_unquoted_case(&expr.to_string());
     items.iter().position(|item| {
         let (SelectItem::UnnamedExpr(projected)
         | SelectItem::ExprWithAlias {
@@ -382,8 +382,40 @@ fn expression_index(items: &[SelectItem], expr: &Expr) -> Option<usize> {
         else {
             return false;
         };
-        projected.to_string().eq_ignore_ascii_case(&wanted)
+        fold_unquoted_case(&projected.to_string()) == wanted
     })
+}
+
+/// A rendered expression with its unquoted text lowercased, so two renderings
+/// that differ only in keyword or bare-identifier case compare equal.
+///
+/// Quoted runs keep the case they were written with, because SQL gives it
+/// meaning there: `x = 'a'` and `x = 'A'` match different rows, and `"Foo"` and
+/// `"foo"` are different columns. Folding the whole rendering would make those
+/// pairs equal and map an `ORDER BY` term onto a projected column the query
+/// never asked to be ordered.
+fn fold_unquoted_case(rendered: &str) -> String {
+    let mut folded = String::with_capacity(rendered.len());
+    let mut inside: Option<char> = None;
+    for character in rendered.chars() {
+        match inside {
+            // A doubled delimiter is SQL's escape for one literal delimiter. It
+            // reads here as a close followed by a reopen, which copies the run
+            // verbatim either way — the case inside is what matters.
+            Some(delimiter) => {
+                folded.push(character);
+                if character == delimiter {
+                    inside = None;
+                }
+            }
+            None if character == '\'' || character == '"' => {
+                inside = Some(character);
+                folded.push(character);
+            }
+            None => folded.push(character.to_ascii_lowercase()),
+        }
+    }
+    folded
 }
 
 /// Render one cell for a failure message. Only reached on a violation, so a
