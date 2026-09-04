@@ -36,9 +36,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbcon
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use runtime_datafusion::dialect::new_duckdb_dialect;
-use runtime_datafusion::function_support::{
-    DUCKDB_DENIED_BUILTINS, deny_spice_functions_for_duckdb_dialect_without_carve_out,
-};
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
 use snafu::prelude::*;
 use std::any::Any;
 use std::sync::Arc;
@@ -356,7 +354,8 @@ impl CatalogConnector for DuckLakeCatalog {
 /// on the name alone, and `SQLExecutor::can_execute_plan` refuses to federate a
 /// whole plan containing an unsupported function — projections included, not just
 /// the filters `supports_filters_pushdown` screens — leaving the call for
-/// `DataFusion` to evaluate locally. See [`DUCKDB_DENIED_BUILTINS`] for why each
+/// `DataFusion` to evaluate locally. See
+/// [`runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS`] for why each
 /// of the three cannot be rendered faithfully.
 ///
 /// The deny-list is the plain one, **not** the `DuckDB`-flavored
@@ -424,6 +423,7 @@ mod federation_tests {
     use crate::catalogconnector::stub_udf;
     use datafusion::prelude::col;
     use datafusion::sql::unparser::Unparser;
+    use runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS;
 
     /// A `DuckLake` catalog must deny the Spice-only UDFs `DuckDB` cannot run, so
     /// `DataFusion` evaluates them locally instead of unparsing them into the
