@@ -1997,6 +1997,8 @@ mod tests {
     use datafusion::logical_expr::Operator;
     use datafusion::optimizer::Analyzer;
     #[cfg(not(windows))]
+    use datafusion::execution::SessionStateBuilder;
+    #[cfg(not(windows))]
     use datafusion::prelude::SessionContext;
     #[cfg(not(windows))]
     use datafusion_expr::{Expr, LogicalPlan};
@@ -2018,6 +2020,136 @@ mod tests {
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// The JSON extraction semantics the BigQuery federation guidance rests on.
+    ///
+    /// Which of these forms pushes down to BigQuery is decided by the federation
+    /// deny-list, and the advice we give a customer follows from what each one
+    /// *means*:
+    ///
+    /// | node at `$.a`   | `json_as_text` | `json_get_str` | federates |
+    /// |-----------------|----------------|----------------|-----------|
+    /// | `"s"`           | `s`            | `s`            | typed only |
+    /// | `7`             | `7`            | NULL           | typed only |
+    /// | `true`          | `true`         | NULL           | typed only |
+    /// | `{"b":1}`       | `{"b":1}`      | NULL           | neither    |
+    /// | `null`          | NULL           | NULL           | typed only |
+    ///
+    /// `json_get_str` answers only for a JSON **string** node; `json_as_text`
+    /// returns the matched node's own bytes whatever it is. They therefore agree
+    /// on a string and a JSON `null` and disagree everywhere else — which is
+    /// exactly the condition on the advice "replace `json_as_text` with
+    /// `json_get_str` to gain pushdown": it is exact only where that path always
+    /// holds a string. If either function's null handling changed, that advice
+    /// would silently start returning NULL where it used to return digits, so it
+    /// is pinned here rather than left to the crate.
+    ///
+    /// `json_as_text` cannot be federated to BigQuery at all: no BigQuery
+    /// function returns a container node's *original* bytes — `JSON_QUERY`
+    /// re-renders it — so there is no faithful rendering to push down.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes() {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        datafusion_functions_json::register_all(&mut state)
+            .expect("register the JSON functions");
+        let ctx = SessionContext::new_with_state(state);
+
+        let one = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan the statement")
+                    .collect()
+                    .await
+                    .expect("run the statement");
+                let column = batches[0].column(0);
+                if column.is_null(0) {
+                    None
+                } else {
+                    Some(
+                        datafusion::common::ScalarValue::try_from_array(column, 0)
+                            .expect("read the value")
+                            .to_string(),
+                    )
+                }
+            }
+        };
+
+        for (doc, as_text, get_str) in [
+            (r#"{"a": "s"}"#, Some("s"), Some("s")),
+            (r#"{"a": 7}"#, Some("7"), None),
+            (r#"{"a": true}"#, Some("true"), None),
+            (r#"{"a": {"b": 1}}"#, Some(r#"{"b": 1}"#), None),
+            (r#"{"a": null}"#, None, None),
+        ] {
+            assert_eq!(
+                one(format!("SELECT json_as_text('{doc}', 'a')")).await.as_deref(),
+                as_text,
+                "json_as_text returns the node's own bytes: {doc}"
+            );
+            assert_eq!(
+                one(format!("SELECT json_get_str('{doc}', 'a')")).await.as_deref(),
+                get_str,
+                "json_get_str answers only for a JSON string node: {doc}"
+            );
+        }
+    }
+
+    /// `json_get(x, k)::string` federates, because `register_all` also installs
+    /// the rewrite that turns a cast of `json_get` into the typed accessor.
+    ///
+    /// That is why the guidance can offer the cast form as an alternative to
+    /// editing every call: `CAST(… AS VARCHAR)` becomes `json_get_str`,
+    /// `AS BIGINT` becomes `json_get_int`, `AS DOUBLE` becomes `json_get_float`
+    /// — and those are the names the BigQuery deny-list carves out, so the
+    /// statement pushes down. A bare `json_get` stays a JSON union with no SQL
+    /// type to unparse into, and stays local.
+    ///
+    /// Losing the rewrite would not fail a query; it would quietly stop the cast
+    /// form from federating, which is the whole point of recommending it.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_cast_of_json_get_becomes_the_typed_accessor_that_federates() {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        datafusion_functions_json::register_all(&mut state)
+            .expect("register the JSON functions");
+        let ctx = SessionContext::new_with_state(state);
+
+        // Over a *column*, not a literal: constant folding would evaluate a
+        // literal document at plan time and erase the call before the plan could
+        // be inspected, which says nothing about what federates.
+        let docs = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, true)]));
+        let table = MemTable::try_new(Arc::clone(&docs), vec![vec![]])
+            .expect("build the document table");
+        ctx.register_table("docs", Arc::new(table) as Arc<dyn TableProvider>)
+            .expect("register the document table");
+
+        for (cast_to, expected) in [
+            ("VARCHAR", "json_get_str"),
+            ("BIGINT", "json_get_int"),
+            ("DOUBLE", "json_get_float"),
+            ("BOOLEAN", "json_get_bool"),
+        ] {
+            let plan = ctx
+                .sql(&format!(
+                    "SELECT CAST(json_get(doc, 'a') AS {cast_to}) FROM docs"
+                ))
+                .await
+                .expect("plan the cast")
+                .into_optimized_plan()
+                .expect("optimize the plan")
+                .display_indent()
+                .to_string();
+            assert!(
+                plan.contains(expected),
+                "a cast to {cast_to} has to become {expected}, which the BigQuery \
+                 deny-list carves out: {plan}"
+            );
+        }
+    }
 
     /// An explicit `runtime.query.memory_limit` is honored verbatim regardless of
     /// whether Cayenne is active — the coordinated default only applies when unset.

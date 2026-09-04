@@ -2884,6 +2884,169 @@ mod function_support_tests {
         );
     }
 
+    /// `scan_project`'s aggregate twin: an aggregate belongs in an `Aggregate`
+    /// node, not a projection.
+    fn scan_aggregate(expr: Expr) -> LogicalPlan {
+        let source =
+            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+        LogicalPlanBuilder::scan("t", source, None)
+            .expect("scan the stub table")
+            .aggregate(Vec::<Expr>::new(), vec![expr])
+            .expect("aggregate the expression")
+            .build()
+            .expect("build the plan")
+    }
+
+    async fn federates_aggregate(driver_name: &str, expr: Expr) -> bool {
+        let provider = stub_table_provider(true, driver_name).await;
+        let adaptor = (provider.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .expect("a federation-enabled factory must produce a federated provider");
+        matches!(
+            adaptor
+                .source
+                .federation_provider()
+                .analyzer(&scan_aggregate(expr)),
+            Some(FederationAnalyzerForLogicalPlan::With(_))
+        )
+    }
+
+    /// BigQuery refuses exactly the filtered-aggregate shapes its dialect cannot
+    /// rewrite, and keeps the rest.
+    ///
+    /// This tests the **boundary** rather than a fixed list, because the two
+    /// sides live in different repositories and the set has moved more than
+    /// once. The dialect (fork PR #218) rewrites a `FILTER` into `COUNTIF` or
+    /// `CASE WHEN p THEN arg END`, which is exact only for an aggregate that
+    /// skips nulls and ignores input order — `count`, `sum`, `min`, `max`,
+    /// `avg` — and declines anything else. A declined rendering is a *failed
+    /// query* unless federation refuses the same shape, since a federated
+    /// statement has no local-execution fallback. So:
+    ///
+    /// * just inside the allowlist still federates — refusing it would cost the
+    ///   pushdown for nothing;
+    /// * just outside it does not — federating it would reach BigQuery as SQL it
+    ///   cannot parse.
+    ///
+    /// This is the repo-side guard for `with_aggregate_call_support`, the hook
+    /// the `datafusion-table-providers` fork carries. Lose the hook and the
+    /// deny-list stops consulting the shape, the outside-the-list cases start
+    /// federating, and the statement fails at the remote.
+    #[tokio::test]
+    async fn bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite() {
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        let keeps_rows = col("val").is_not_null();
+
+        // Just inside the allowlist: every one of these still federates.
+        for (label, aggregate) in [
+            (
+                "count(1)",
+                datafusion::functions_aggregate::expr_fn::count(lit(1_i64)),
+            ),
+            (
+                "count(NULL)",
+                datafusion::functions_aggregate::expr_fn::count(lit(
+                    datafusion::scalar::ScalarValue::Null,
+                )),
+            ),
+            (
+                "sum",
+                datafusion::functions_aggregate::expr_fn::sum(col("id")),
+            ),
+            (
+                "min",
+                datafusion::functions_aggregate::expr_fn::min(col("id")),
+            ),
+            (
+                "max",
+                datafusion::functions_aggregate::expr_fn::max(col("id")),
+            ),
+            (
+                "avg",
+                datafusion::functions_aggregate::expr_fn::avg(col("id")),
+            ),
+        ] {
+            let filtered = aggregate
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered aggregate");
+            assert!(
+                federates_aggregate("bigquery", filtered).await,
+                "{label} FILTER is rewritten exactly, so refusing it would only \
+                 cost the pushdown"
+            );
+        }
+
+        // An ordering does not change that: every aggregate on the list ignores
+        // input order, so the dialect still rewrites an ordered one.
+        let ordered_sum = datafusion::functions_aggregate::expr_fn::sum(col("id"))
+            .filter(keeps_rows.clone())
+            .order_by(vec![col("id").sort(true, false)])
+            .build()
+            .expect("ordered filtered sum");
+        assert!(
+            federates_aggregate("bigquery", ordered_sum).await,
+            "a sum ignores its ordering, so an ordered filtered sum still federates"
+        );
+
+        // Just outside the allowlist: the dialect declines, so federation must
+        // refuse, or the statement reaches BigQuery as SQL it cannot parse.
+        let array_agg = datafusion::functions_aggregate::expr_fn::array_agg(col("id"))
+            .filter(keeps_rows.clone())
+            .build()
+            .expect("filtered array_agg");
+        assert!(
+            !federates_aggregate("bigquery", array_agg).await,
+            "array_agg is off the allowlist — the CASE gives it a null element \
+             per rejected row, which BigQuery refuses to build"
+        );
+
+        // No filter at all is not this hook's business, whatever the aggregate.
+        let bare = datafusion::functions_aggregate::expr_fn::array_agg(col("id"));
+        assert!(
+            federates_aggregate("bigquery", bare).await,
+            "an unfiltered aggregate is unaffected"
+        );
+    }
+
+    /// A `FILTER` on a *window* call has no rewriting at all, so it has to be
+    /// refused too — otherwise the aggregate check above is trivially bypassed
+    /// by spelling the same thing `COUNT(x) FILTER (…) OVER (…)`.
+    ///
+    /// Measured against a real BigQuery project:
+    /// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federated
+    /// as written and came back `Syntax error: Expected ")" but got "("`. This
+    /// is the repo-side guard for `with_window_call_support`.
+    #[tokio::test]
+    async fn bigquery_refuses_a_filtered_window_call() {
+        let windowed = |filter: Option<Expr>| {
+            Expr::from(datafusion::logical_expr::expr::WindowFunction {
+                fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(
+                    datafusion::functions_aggregate::count::count_udaf(),
+                ),
+                params: datafusion::logical_expr::expr::WindowFunctionParams {
+                    args: vec![col("id")],
+                    partition_by: vec![col("val")],
+                    order_by: vec![],
+                    window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                    null_treatment: None,
+                    filter: filter.map(Box::new),
+                    distinct: false,
+                },
+            })
+        };
+
+        assert!(
+            !federates_aggregate("bigquery", windowed(Some(col("val").is_not_null()))).await,
+            "a filtered window call renders FILTER verbatim, which BigQuery \
+             refuses, so it must stay local"
+        );
+        assert!(
+            federates_aggregate("bigquery", windowed(None)).await,
+            "an unfiltered window call is unaffected"
+        );
+    }
+
     #[tokio::test]
     async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
         for name in [

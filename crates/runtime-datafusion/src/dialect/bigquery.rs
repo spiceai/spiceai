@@ -34,7 +34,7 @@ use chrono::DateTime;
 use datafusion::arrow::array::timezone::Tz;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
 use datafusion::logical_expr::{Expr, SortExpr};
 use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
@@ -197,6 +197,72 @@ fn key_is_renderable(key: &str) -> bool {
 fn json_path_is_renderable(args: &[Expr]) -> bool {
     json_path(args).is_some()
 }
+/// The aggregates whose `FILTER` the `BigQuery` dialect rewrites exactly.
+///
+/// Mirrors `filter_rewrite_is_exact` in the fork's unparser, and has to stay
+/// equal to it — the bitwise three are on it because BigQuery spells them under
+/// the same names, so they federate; `bool_and`/`bool_or` are not, because it
+/// spells those `LOGICAL_AND`/`LOGICAL_OR` and they never federate at all: the dialect declines what this list omits, and a declined
+/// rendering is a *failed query* unless federation also refuses it, since a
+/// federated statement has no local-execution fallback. The two directions of
+/// drift are `bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`
+/// in `connector-adbc`, which tests the boundary rather than a fixed set.
+const FILTER_REWRITE_IS_EXACT: &[&str] = &[
+    "count", "sum", "min", "max", "avg", "bit_and", "bit_or", "bit_xor",
+];
+
+/// Whether the `BigQuery` dialect can translate this particular *aggregate*
+/// call, given the `FILTER` it carries.
+///
+/// BigQuery has no `FILTER (WHERE …)` clause — measured, `COUNT(*) FILTER
+/// (WHERE x > 1)` is a syntax error — so the dialect moves the predicate inside
+/// the aggregate as `COUNTIF(p)` or `CASE WHEN p THEN arg END`. That is exact
+/// only for an aggregate that both skips null inputs and ignores input order,
+/// which is what [`FILTER_REWRITE_IS_EXACT`] lists; the dialect declines
+/// anything else, and this refuses the same set so it evaluates locally instead
+/// of reaching BigQuery as SQL it cannot parse.
+///
+/// `array_agg` is the one that matters in practice: the `CASE` gives it an
+/// element for every *rejected* row, and BigQuery will not build an array
+/// holding a null at all, so the rewrite fails for any filter that actually
+/// filters — where DataFusion answers `[2, 3]`.
+///
+/// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
+/// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
+/// verified on BigQuery — so refusing it would only cost the pushdown. Nor is an
+/// ordering refused on its own: every aggregate on the list ignores input order,
+/// so an ordered `SUM … FILTER` still rewrites.
+#[must_use]
+pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
+    if call.params.filter.is_none() {
+        return true;
+    }
+    let name = call.func.name();
+    if !FILTER_REWRITE_IS_EXACT
+        .iter()
+        .any(|exact| name.eq_ignore_ascii_case(exact))
+    {
+        return false;
+    }
+    // A multi-argument aggregate has no obvious argument for the predicate to
+    // guard, so the dialect declines it rather than guessing.
+    call.params.args.len() <= 1
+}
+
+/// Whether the `BigQuery` dialect can translate this particular *window* call.
+///
+/// A `FILTER` on a window call has no rewriting at all — the dialect's
+/// aggregate handling is not reached for one — so it renders verbatim and
+/// BigQuery refuses the statement. Measured through the runtime:
+/// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federates and
+/// comes back `Syntax error: Expected ")" but got "("`.
+///
+/// Refusing it here leaves the window for the local engine, which answers it.
+#[must_use]
+pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
+    call.params.filter.is_none()
+}
+
 
 /// Whether the `BigQuery` dialect can translate this call, for the pushdown
 /// policy to consult.
@@ -1176,6 +1242,7 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.string_to_timestamp_to_sql(value, tz)
     }
 
+
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
     }
@@ -1276,7 +1343,8 @@ mod tests {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionParams};
     use datafusion::logical_expr::{
-        ColumnarValue, ScalarUDF, Volatility, WindowFrame, WindowFunctionDefinition, create_udf,
+        ColumnarValue, ExprFunctionExt, ScalarUDF, Volatility, WindowFrame,
+        WindowFunctionDefinition, create_udf,
     };
     use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
@@ -2533,6 +2601,165 @@ mod tests {
                 .expect("build")
         };
 
+        // A decimal whose *integer* part overflows `NUMERIC`. `NUMERIC` is
+        // precision 38 scale 9, so it holds 29 integer digits; a thirtieth is
+        // refused outright ("Invalid NUMERIC value", measured), and the width
+        // arrives from arithmetic so no declared column type reveals it.
+        let integral_decimal = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(38, 0),
+            )])
+            .expect("integral decimal projection")
+            .build()
+            .expect("build");
+
+        // `LEAD` refuses a framing clause where the navigation functions that do
+        // take one keep theirs, so the frame has to be dropped from this and not
+        // from `FIRST_VALUE`.
+        let lead_with_frame = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(
+                        datafusion::functions_window::lead_lag::lead_udwf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new_bounds(
+                            datafusion::logical_expr::window_frame::WindowFrameUnits::Rows,
+                            datafusion::logical_expr::window_frame::WindowFrameBound::Preceding(
+                                ScalarValue::UInt64(None),
+                            ),
+                            datafusion::logical_expr::window_frame::WindowFrameBound::CurrentRow,
+                        ),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
+        // BigQuery has no `FILTER (WHERE ...)` — measured, it is a syntax error —
+        // so the predicate has to move inside the aggregate. Which rewriting is
+        // correct depends on the aggregate, so each of these is its own arm.
+        let filtered = |aggregate: datafusion::logical_expr::Expr| {
+            windowed_scan()
+                .aggregate(vec![col("t.ts")], vec![aggregate])
+                .expect("filtered aggregate")
+                .build()
+                .expect("build")
+        };
+        let keeps_rows = col("t.v").gt(lit(1_i64));
+        let filtered_count = filtered(
+            datafusion::functions_aggregate::expr_fn::count(lit(1_i64))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered count"),
+        );
+        let filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered sum"),
+        );
+        // `array_agg` keeps null inputs where the rewriting assumes they are
+        // skipped, and still takes the `CASE`: BigQuery refuses to build an array
+        // holding a null at all ("Array cannot have a null element"), so the
+        // rendering is correct whenever it runs and refused whenever it would not
+        // be. Declining would only lose the cases that work, since a federated
+        // statement has no local-execution fallback.
+        let filtered_array_agg = filtered(
+            datafusion::functions_aggregate::expr_fn::array_agg(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered array_agg"),
+        );
+        // `COUNT(1)` counts rows but `COUNT(NULL)` counts nothing: measured, 0
+        // where `COUNTIF` over the same rows is 2.
+        let filtered_count_null = filtered(
+            datafusion::functions_aggregate::expr_fn::count(lit(ScalarValue::Null))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered count of null"),
+        );
+        // The rewriting carries no ordering. For an order-sensitive aggregate
+        // that is a wrong answer, so it declines; for a sum the same rows give
+        // the same number in any order, so it still federates. Both directions
+        // are guarded, because declining everything ordered failed queries that
+        // were correct.
+        let ordered_filtered_array_agg = filtered(
+            datafusion::functions_aggregate::expr_fn::array_agg(col("t.v"))
+                .filter(keeps_rows.clone())
+                .order_by(vec![col("t.v").sort(true, false)])
+                .build()
+                .expect("ordered filtered array_agg"),
+        );
+        let filtered_bit_and = filtered(
+            datafusion::functions_aggregate::bit_and_or_xor::bit_and(col("t.v"))
+                .filter(keeps_rows.clone())
+                .build()
+                .expect("filtered bit_and"),
+        );
+        let ordered_filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(keeps_rows)
+                .order_by(vec![col("t.v").sort(true, false)])
+                .build()
+                .expect("ordered filtered sum"),
+        );
+
+
+
+        // A scale wider than BIGNUMERIC's thirty-eight is *rounded away
+        // silently* by BigQuery, unlike an integer overflow, which it refuses
+        // outright — so the widest type is still what gets emitted.
+        let wide_scale = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal256(76, 42),
+            )])
+            .expect("wide scale projection")
+            .build()
+            .expect("build");
+
+        // A tz-aware timestamp compared against a date. BigQuery has no common
+        // supertype for `TIMESTAMP` and `DATE` and refuses the pair, but a civil
+        // timestamp does compare with a date, so only the zoned side moves.
+        let instant_vs_date = timestamp_scan()
+            .filter(col("t.ts").gt_eq(lit(ScalarValue::Date32(Some(20_000)))))
+            .expect("instant vs date filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        // A comparison against `date_trunc(<unit>, <date>)`. The call reads its
+        // granularity from a literal, so its type is answerable only through
+        // `return_field_from_args`; a rendering that cannot read it pushes the
+        // comparison down uncoerced and BigQuery refuses "TIMESTAMP, DATETIME".
+        let truncated_date_comparison = timestamp_scan()
+            .filter(col("t.ts").gt_eq(datafusion::functions::expr_fn::date_trunc(
+                lit("month"),
+                datafusion::functions::expr_fn::current_date(),
+            )))
+            .expect("truncated date comparison filter")
+            .project(vec![col("t.ts")])
+            .expect("project")
+            .build()
+            .expect("build");
+
         for (property, plan, must_contain, must_not_contain) in [
             (
                 "timestamp literal offset (fork PR #144)",
@@ -2628,6 +2855,115 @@ mod tests {
                 &constant_group_by,
                 "GROUP BY CAST('POOLED' AS STRING)",
                 "GROUP BY 'POOLED'",
+            ),
+            (
+                // Losing this leaves the comparison at "TIMESTAMP, DATETIME",
+                // which BigQuery refuses with "No matching signature".
+                "an instant compared with a date is brought to DATETIME (fork PR #216)",
+                &instant_vs_date,
+                "DATETIME",
+                "CAST(`t`.`ts` AS TIMESTAMP) >=",
+            ),
+            (
+                // The whole `provable_data_type` chain #216 built stands behind
+                // this one rendering. Losing it leaves the call's type unreadable,
+                // so the comparison is pushed down uncoerced as
+                // `CAST(ts AS TIMESTAMP) >= TIMESTAMP_TRUNC(...)` — an instant
+                // against a civil timestamp, which BigQuery refuses with "No
+                // matching signature for operator >=". Which type the pair is
+                // brought to is the dialect's business; that it is brought to one
+                // at all is what this guards, so the assertion is that the
+                // truncation is cast rather than left bare.
+                "a comparison against a truncated date agrees on one type (fork PR #216)",
+                &truncated_date_comparison,
+                "CAST(TIMESTAMP_TRUNC(",
+                ">= TIMESTAMP_TRUNC(",
+            ),
+            (
+                "a frame on LEAD is dropped (fork PR #216)",
+                &lead_with_frame,
+                "OVER (ORDER BY",
+                "ROWS BETWEEN",
+            ),
+            (
+                "a filtered row count becomes COUNTIF (fork PR #216)",
+                &filtered_count,
+                "COUNTIF(",
+                "FILTER",
+            ),
+            (
+                "a filtered sum guards its argument (fork PR #216)",
+                &filtered_sum,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // Off the rewrite allowlist: the `CASE` would give it a null
+                // element for every rejected row, which BigQuery refuses to
+                // build. Declining leaves it for the local engine, which the
+                // federation deny-list is what actually arranges.
+                "a filtered array_agg is declined (fork PR #218)",
+                &filtered_array_agg,
+                "FILTER",
+                "CASE WHEN",
+            ),
+            (
+                // `COUNT(NULL)` is 0, where `COUNTIF` over the same rows is 2 —
+                // a different number with no error at all.
+                // Asserting only the absence of COUNTIF would also pass on a
+                // decline, which is not the behaviour: it still federates, as a
+                // COUNT over a CASE that is always NULL.
+                "a filtered COUNT(NULL) renders CASE, not COUNTIF (fork PR #218)",
+                &filtered_count_null,
+                "CASE WHEN",
+                "COUNTIF(",
+            ),
+            (
+                // Order-sensitive: the rewriting carries no ordering, so applying
+                // it here would answer differently rather than fail.
+                "an ordered filtered array_agg is declined (fork PR #218)",
+                &ordered_filtered_array_agg,
+                "FILTER",
+                "CASE WHEN",
+            ),
+            (
+                // Order-insensitive: the same rows give the same sum in any
+                // order, so this one must keep federating. Guards the narrowing
+                // of the decline, which otherwise failed correct queries.
+                "an ordered filtered sum still federates (fork PR #218)",
+                &ordered_filtered_sum,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // On the allowlist because BigQuery spells it under the same
+                // name; dropping it from the list silently cost this pushdown
+                // once already.
+                "a filtered bit_and guards its argument (fork PR #218)",
+                &filtered_bit_and,
+                "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // The two halves of a decimal's width get opposite treatment, and
+                // the measurements are why: an integer overflow is refused
+                // outright, so widening fixes a failure; a scale overflow is
+                // rounded away silently, and is accepted rather than declined —
+                // declining would fail the query over the thirty-ninth decimal
+                // place. `Decimal256(76, 42)` is what `bignumeric / numeric`
+                // types as, so this is the shape that actually arises.
+                "a decimal scale past BIGNUMERIC keeps the widest type (fork PR #218)",
+                &wide_scale,
+                "AS BIGNUMERIC)",
+                "DECIMAL(",
+            ),
+            (
+                // `NUMERIC` holds 29 integer digits; a value needing a thirtieth
+                // is refused. Selecting on scale alone renders `NUMERIC` here.
+                "a decimal whose integer part overflows NUMERIC (fork PR #218)",
+                &integral_decimal,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
             ),
         ] {
             let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), plan);
