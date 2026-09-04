@@ -3580,19 +3580,11 @@ mod test {
         )]);
         tracing::subscriber::with_default(subscriber, || {
             let resolved = resolve_cayenne_sort_merge_memory_pool_fraction(&params);
-            log_applied_cayenne_param(
-                CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
-                resolved,
-            );
+            log_applied_cayenne_param(CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM, resolved);
         });
 
-        let logged = String::from_utf8(
-            sink.0
-                .lock()
-                .expect("capture buffer poisoned")
-                .clone(),
-        )
-        .expect("captured log is not valid UTF-8");
+        let logged = String::from_utf8(sink.0.lock().expect("capture buffer poisoned").clone())
+            .expect("captured log is not valid UTF-8");
 
         assert!(
             logged.contains(
