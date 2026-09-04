@@ -126,6 +126,22 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      # `mcp` is excluded from the powerset above, so nothing else compiles
+      # `runtime-tools` under its own `mcp` feature: it is otherwise only ever built as
+      # part of a graph including `runtime`, which supplies the feature's real
+      # requirements and hides them from the declaration.
+      #
+      # `-p` is what makes this a guard rather than another workspace build. Without it
+      # Cargo selects the workspace `default-members` (`bin/spiced`) and checks that whole
+      # graph, which both costs far more and re-admits the feature unification the check
+      # exists to escape.
+      - name: Check runtime-tools/mcp feature
+        run: cargo check -p runtime-tools --features mcp --profile lint
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
       - name: Check snapshots feature
         run: cargo check --no-default-features --features snapshots --profile lint
         env:

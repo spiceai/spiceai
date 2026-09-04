@@ -63,6 +63,9 @@ pub struct RefreshTaskRunnerBuilder {
     is_s3_express_acceleration: bool,
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
+    /// Forwarded to the refresh task so the caching stale-row refresh claims
+    /// the keys it replaces.
+    in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -97,6 +100,7 @@ impl RefreshTaskRunnerBuilder {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
+            in_flight_revalidations: None,
         }
     }
 
@@ -170,6 +174,17 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Shares the caching accelerator's claim set with the refresh task, so
+    /// its periodic stale-row refresh claims the keys it replaces.
+    #[must_use]
+    pub fn with_in_flight_revalidations(
+        mut self,
+        in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
+    ) -> Self {
+        self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
@@ -206,6 +221,11 @@ impl RefreshTaskRunnerBuilder {
 
         if let Some(flag) = self.initial_load_completed {
             refresh_task_builder = refresh_task_builder.with_initial_load_completed(flag);
+        }
+
+        if let Some(in_flight_revalidations) = self.in_flight_revalidations {
+            refresh_task_builder =
+                refresh_task_builder.with_in_flight_revalidations(in_flight_revalidations);
         }
 
         let refresh_task = Arc::new(refresh_task_builder.build());

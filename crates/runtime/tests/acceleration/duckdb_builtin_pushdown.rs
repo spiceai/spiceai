@@ -69,6 +69,37 @@ fn write_unicode_space_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Integers whose hex rendering exercises the case divergence: a value with
+/// digits above 9 in both nibbles, a wide one, zero (whose single digit is the
+/// same in either case, which is why a spot check can miss this), the negative
+/// bound, and NULL.
+fn write_hex_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,h\n\
+         1,255\n\
+         2,3735928559\n\
+         3,0\n\
+         4,-1\n\
+         5,\n",
+    )?;
+    Ok(())
+}
+
+/// The SQL each federated scan in `plan` sends to `DuckDB`, one per line.
+///
+/// `base_sql` is the only part of an `EXPLAIN` that says what `DuckDB` is asked
+/// to evaluate — the logical plan above it names the `DataFusion` function
+/// whether or not the dialect rewrote the call — so every test here that claims
+/// a rewrite reached the remote engine reads it rather than the whole plan.
+fn pushed_down_sql(plan: &str) -> String {
+    plan.split("base_sql=")
+        .skip(1)
+        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn duckdb_accelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(Params::from_string_map(
@@ -136,12 +167,7 @@ async fn duckdb_accelerator_answers_btrim_and_agrees_with_local() -> Result<(), 
                 .await?,
             )?
             .to_string();
-            let remote_sql: String = plan
-                .split("base_sql=")
-                .skip(1)
-                .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let remote_sql = pushed_down_sql(&plan);
             assert!(
                 remote_sql.contains("trim("),
                 "the trims must be pushed down to DuckDB, not evaluated locally; plan was:\n{plan}"
@@ -236,6 +262,98 @@ async fn duckdb_accelerated_btrim_leaves_unicode_separators_alone() -> Result<()
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "a Zs-padded string must trim identically accelerated and local"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `to_hex` exists in both engines, so nothing denied the call and — before the
+/// dialect rewrote it — nothing changed it either: it was pushed into the
+/// accelerated store verbatim and came back with **upper-case** digits where
+/// the kernel produces lower-case ones. No error and no warning; the same query
+/// over the same rows just answered differently once the dataset was
+/// accelerated (regression test for #13818).
+///
+/// The predicate is the shape that makes this data loss rather than cosmetics:
+/// `WHERE to_hex(h) = 'deadbeef'` matched nothing accelerated and matched a row
+/// unaccelerated.
+#[tokio::test]
+async fn duckdb_accelerated_to_hex_agrees_with_local() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("hex.csv");
+            write_hex_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_to_hex")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // The call must reach DuckDB for this to be testing anything: an
+            // accelerated query that evaluated `to_hex` locally would agree
+            // with the control even with the rewrite removed.
+            let plan = to_pretty_display(
+                &run_query(&rt, "EXPLAIN SELECT to_hex(h) FROM accelerated").await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                remote_sql.contains("lower(to_hex("),
+                "the hex rendering must be pushed down to DuckDB inside a `lower(..)`; \
+                 plan was:\n{plan}"
+            );
+
+            let query = "SELECT id, to_hex(h) AS hx FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+
+            let expected = [
+                "+----+------------------+",
+                "| id | hx               |",
+                "+----+------------------+",
+                "| 1  | ff               |",
+                "| 2  | deadbeef         |",
+                "| 3  | 0                |",
+                "| 4  | ffffffffffffffff |",
+                "| 5  |                  |",
+                "+----+------------------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+
+            // The accelerator's answer is only right if it is the answer
+            // DataFusion gives; an upper-cased rendering shows up here as a
+            // divergence, not as a query error.
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated to_hex must agree with local evaluation"
+            );
+
+            // A predicate over the hex string: with the digits upper-cased
+            // remotely this returned no rows at all.
+            let predicate = "SELECT id FROM {table} WHERE to_hex(h) = 'deadbeef'";
+            let accelerated = run_query(&rt, &predicate.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &predicate.replace("{table}", "local")).await?;
+            assert_batches_eq!(
+                ["+----+", "| id |", "+----+", "| 2  |", "+----+",],
+                &accelerated
+            );
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "a predicate over to_hex must select the same rows accelerated and local"
             );
 
             rt.shutdown().await;

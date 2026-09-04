@@ -35,6 +35,14 @@ pub(crate) const TRIM_NAME: &str = "trim";
 /// [`btrim_to_trim`] for why it has to be passed to `DuckDB` explicitly.
 const ASCII_SPACE: &str = " ";
 
+/// The name both engines give the integer-to-hex function. They disagree only
+/// on the case of the digits — see [`to_hex_to_lowercase_hex`].
+const TO_HEX_NAME: &str = "to_hex";
+
+/// `DuckDB`'s lower-casing function, applied over [`TO_HEX_NAME`] to match
+/// `DataFusion`'s lower-case hex digits.
+const LOWER_NAME: &str = "lower";
+
 /// Renders `args` as a call to `duckdb_fn`, in the order given.
 ///
 /// The caller is responsible for having already put `args` into the shape
@@ -107,6 +115,58 @@ pub(crate) fn btrim_to_trim(
         // which would put `btrim` back into the DuckDB SQL.
         _ => Err(DataFusionError::Plan(format!(
             "btrim takes one or two arguments, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Renders `inner` as the sole argument of a call to `function_name`.
+fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
+    ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            function_name,
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// Lower-cases `DuckDB`'s `to_hex`, which upper-cases the digits `DataFusion`
+/// renders in lower case.
+///
+/// Both engines have a `to_hex`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim and came back
+/// with different characters. `to_hex(255)` is `ff` from the kernel and `FF`
+/// from `DuckDB`, so the same query over the same rows answered differently
+/// depending on whether the dataset happened to be accelerated, with no error
+/// and no warning (issue #13818). A predicate such as
+/// `WHERE to_hex(h) = 'deadbeef'` simply matched nothing.
+///
+/// Case is the *only* divergence: measured across `Int16`, `Int32` and `Int64`
+/// inputs, negative values, zero and NULL, both engines widen to 64 bits and
+/// produce the same digits in the same order, so wrapping the call in
+/// [`LOWER_NAME`] makes the two answers identical rather than merely closer.
+pub(crate) fn to_hex_to_lowercase_hex(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, TO_HEX_NAME)?
+            .map(|hex| wrap_in_call(hex, LOWER_NAME))),
+        // `to_hex` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the un-lowered `to_hex` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "to_hex takes one argument, got {}; cannot render it as DuckDB SQL.",
             args.len()
         ))),
     }
@@ -390,25 +450,6 @@ impl DuckDBRegexpFunction {
         Ok(())
     }
 
-    fn wrap_function(ast_fn: ast::Expr, function_name: &str) -> ast::Expr {
-        ast::Expr::Function(Function {
-            name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
-                function_name,
-            ))]),
-            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ast_fn))],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: ast::FunctionArguments::None,
-            uses_odbc_syntax: false,
-        })
-    }
-
     fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
         match self {
             DuckDBRegexpFunction::Match => {
@@ -424,7 +465,7 @@ impl DuckDBRegexpFunction {
             }
             DuckDBRegexpFunction::Count => {
                 // Wrap the extract array in a ``len()``
-                ast_fn = Self::wrap_function(ast_fn, "len");
+                ast_fn = wrap_in_call(ast_fn, "len");
             }
             _ => {}
         }
@@ -732,6 +773,59 @@ mod tests {
             .expr_to_sql(&call)
             .expect("btrim unparses for DuckDB");
         assert_eq!(rendered.to_string(), "trim('  hi  ', ' ')");
+    }
+
+    /// Both engines have a `to_hex`, so the call federated verbatim and came
+    /// back with upper-case digits where the kernel produces lower-case ones —
+    /// a silently different answer, not an error (regression test for #13818).
+    #[test]
+    fn to_hex_unparses_to_a_lowercased_duckdb_to_hex() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "h".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = to_hex_to_lowercase_hex(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"lower(to_hex("t"."h"))"#);
+    }
+
+    /// `to_hex` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the un-lowered
+    /// `to_hex` straight back to `DuckDB`.
+    #[test]
+    fn to_hex_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = to_hex_to_lowercase_hex(&unparser, &[lit(1_i64), lit(2_i64)])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("to_hex takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `to_hex` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_to_hex_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::to_hex(),
+            vec![lit(255_i64)],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("to_hex unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "lower(to_hex(255))");
     }
 
     #[test]
