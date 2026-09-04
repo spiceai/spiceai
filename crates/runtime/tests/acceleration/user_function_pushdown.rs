@@ -104,17 +104,17 @@ fn shadowing_unlikely() -> Function {
     function
 }
 
-fn csv_params() -> Option<Params> {
-    Some(Params::from_string_map(
+fn csv_params() -> Params {
+    Params::from_string_map(
         vec![("file_format".to_string(), "csv".to_string())]
             .into_iter()
             .collect(),
-    ))
+    )
 }
 
 fn sqlite_accelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
-    dataset.params = csv_params();
+    dataset.params = Some(csv_params());
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("sqlite".to_string()),
@@ -127,7 +127,7 @@ fn sqlite_accelerated(from: &str, name: &str) -> Dataset {
 
 fn unaccelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
-    dataset.params = csv_params();
+    dataset.params = Some(csv_params());
     dataset
 }
 
