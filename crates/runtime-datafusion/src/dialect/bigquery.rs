@@ -263,7 +263,6 @@ pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunctio
     call.params.filter.is_none()
 }
 
-
 /// Whether the `BigQuery` dialect can translate this call, for the pushdown
 /// policy to consult.
 ///
@@ -1241,7 +1240,6 @@ impl Dialect for SpiceBigQueryDialect {
     ) -> Option<ast::Expr> {
         self.inner.string_to_timestamp_to_sql(value, tz)
     }
-
 
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
@@ -2720,8 +2718,6 @@ mod tests {
                 .expect("ordered filtered sum"),
         );
 
-
-
         // A scale wider than BIGNUMERIC's thirty-eight is *rounded away
         // silently* by BigQuery, unlike an integer overflow, which it refuses
         // outright — so the widest type is still what gets emitted.
@@ -2750,10 +2746,12 @@ mod tests {
         // `return_field_from_args`; a rendering that cannot read it pushes the
         // comparison down uncoerced and BigQuery refuses "TIMESTAMP, DATETIME".
         let truncated_date_comparison = timestamp_scan()
-            .filter(col("t.ts").gt_eq(datafusion::functions::expr_fn::date_trunc(
-                lit("month"),
-                datafusion::functions::expr_fn::current_date(),
-            )))
+            .filter(
+                col("t.ts").gt_eq(datafusion::functions::expr_fn::date_trunc(
+                    lit("month"),
+                    datafusion::functions::expr_fn::current_date(),
+                )),
+            )
             .expect("truncated date comparison filter")
             .project(vec![col("t.ts")])
             .expect("project")

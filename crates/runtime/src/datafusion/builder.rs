@@ -1992,12 +1992,12 @@ mod tests {
     use datafusion::common::stats::Precision;
     #[cfg(not(windows))]
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    #[cfg(not(windows))]
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::object_store::ObjectStoreRegistry;
     #[cfg(not(windows))]
     use datafusion::logical_expr::Operator;
     use datafusion::optimizer::Analyzer;
-    #[cfg(not(windows))]
-    use datafusion::execution::SessionStateBuilder;
     #[cfg(not(windows))]
     use datafusion::prelude::SessionContext;
     #[cfg(not(windows))]
@@ -2051,8 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn json_extraction_keeps_the_semantics_the_pushdown_guidance_assumes() {
         let mut state = SessionStateBuilder::new().with_default_features().build();
-        datafusion_functions_json::register_all(&mut state)
-            .expect("register the JSON functions");
+        datafusion_functions_json::register_all(&mut state).expect("register the JSON functions");
         let ctx = SessionContext::new_with_state(state);
 
         let one = |sql: String| {
@@ -2086,12 +2085,16 @@ mod tests {
             (r#"{"a": null}"#, None, None),
         ] {
             assert_eq!(
-                one(format!("SELECT json_as_text('{doc}', 'a')")).await.as_deref(),
+                one(format!("SELECT json_as_text('{doc}', 'a')"))
+                    .await
+                    .as_deref(),
                 as_text,
                 "json_as_text returns the node's own bytes: {doc}"
             );
             assert_eq!(
-                one(format!("SELECT json_get_str('{doc}', 'a')")).await.as_deref(),
+                one(format!("SELECT json_get_str('{doc}', 'a')"))
+                    .await
+                    .as_deref(),
                 get_str,
                 "json_get_str answers only for a JSON string node: {doc}"
             );
@@ -2114,16 +2117,15 @@ mod tests {
     #[tokio::test]
     async fn a_cast_of_json_get_becomes_the_typed_accessor_that_federates() {
         let mut state = SessionStateBuilder::new().with_default_features().build();
-        datafusion_functions_json::register_all(&mut state)
-            .expect("register the JSON functions");
+        datafusion_functions_json::register_all(&mut state).expect("register the JSON functions");
         let ctx = SessionContext::new_with_state(state);
 
         // Over a *column*, not a literal: constant folding would evaluate a
         // literal document at plan time and erase the call before the plan could
         // be inspected, which says nothing about what federates.
         let docs = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, true)]));
-        let table = MemTable::try_new(Arc::clone(&docs), vec![vec![]])
-            .expect("build the document table");
+        let table =
+            MemTable::try_new(Arc::clone(&docs), vec![vec![]]).expect("build the document table");
         ctx.register_table("docs", Arc::new(table) as Arc<dyn TableProvider>)
             .expect("register the document table");
 

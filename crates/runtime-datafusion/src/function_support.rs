@@ -83,9 +83,7 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .build()
         .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
-        .with_aggregate_call_support(Arc::new(
-            crate::dialect::bigquery_can_translate_aggregate,
-        ))
+        .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
         .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
 }
 
