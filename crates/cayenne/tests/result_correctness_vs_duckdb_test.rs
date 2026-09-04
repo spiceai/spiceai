@@ -56,9 +56,8 @@ use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
     CayenneHarness, ParityOutcome, TPCH_TABLES, assert_all_pass_or_excluded,
-    assert_modes_agree_on_actual_results, compare_actual_results,
-    compare_actual_results_with_reason, execute_cayenne, make_dim_batch, make_fact_batch,
-    micro_bench_queries, write_parquet,
+    assert_modes_agree_on_actual_results, compare_actual_results, compare_actual_results_detailed,
+    execute_cayenne, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
 };
 use test_framework::queries::validation::QueryValidationFailReason;
 use test_framework::queries::{
@@ -166,7 +165,8 @@ async fn run_pair_with_df_baseline(
     match (cayenne_res, duck_res) {
         (Ok(c), Ok(d)) => {
             // --- Harness compares actual result batches ---
-            let (direct, direct_reason) = compare_actual_results_with_reason(query, &c, &d);
+            let compared = compare_actual_results_detailed(query, &c, &d);
+            let direct = compared.outcome;
             // `OrderUnchecked` means the rows matched and part of the ORDER BY
             // could not be verified — a coverage note to carry through, not a
             // mismatch to re-adjudicate against the DataFusion baseline.
@@ -182,7 +182,7 @@ async fn run_pair_with_df_baseline(
             // below would let DuckDB's violation return as `Excluded` — counted
             // as a pass — on the strength of Cayenne matching DataFusion.
             if matches!(
-                direct_reason,
+                compared.reason,
                 Some(QueryValidationFailReason::SortOrderViolation { .. })
             ) {
                 return direct;

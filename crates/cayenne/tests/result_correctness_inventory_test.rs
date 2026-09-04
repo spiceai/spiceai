@@ -38,7 +38,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
-use support::{compare_actual_results, compare_actual_results_with_reason};
+use support::{compare_actual_results, compare_actual_results_detailed, keep_unverified_order};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, RowOrder, SortKeyColumn, SortKeyResolution,
@@ -245,8 +245,8 @@ fn a_failure_carries_the_typed_reason_that_separates_a_sort_violation() {
 
     // Same rows, but the right side does not honor the query's own ORDER BY.
     let ordered = Query::new("ordered".into(), "SELECT v FROM t ORDER BY v".into(), false);
-    let (outcome, reason) =
-        compare_actual_results_with_reason(&ordered, &[sorted.clone()], &[reversed]);
+    let compared = compare_actual_results_detailed(&ordered, &[sorted.clone()], &[reversed]);
+    let (outcome, reason) = (compared.outcome, compared.reason);
     assert!(
         matches!(outcome, support::ParityOutcome::Fail { .. }),
         "a side that breaks its own ORDER BY is a failure: {outcome:?}"
@@ -260,7 +260,7 @@ fn a_failure_carries_the_typed_reason_that_separates_a_sort_violation() {
     );
 
     // Different rows: a content mismatch, which the baseline *may* adjudicate.
-    let (_, content) = compare_actual_results_with_reason(&ordered, &[sorted], &[other_rows]);
+    let content = compare_actual_results_detailed(&ordered, &[sorted], &[other_rows]).reason;
     assert!(
         content.is_some()
             && !matches!(
@@ -295,7 +295,8 @@ fn an_order_by_limit_violation_is_named_as_one_not_as_a_content_mismatch() {
         "SELECT v FROM t ORDER BY v LIMIT 10".into(),
         false,
     );
-    let (outcome, reason) = compare_actual_results_with_reason(&top_k, &[sorted], &[reversed]);
+    let compared = compare_actual_results_detailed(&top_k, &[sorted], &[reversed]);
+    let (outcome, reason) = (compared.outcome, compared.reason);
     assert!(
         matches!(outcome, support::ParityOutcome::Fail { .. }),
         "a mis-ordered top-K side is a failure: {outcome:?}"
@@ -339,6 +340,80 @@ fn a_collated_term_is_reported_unchecked_not_judged_by_byte_order() {
     assert!(
         !comparison.unchecked.is_empty(),
         "and the collation must be reported as a hole rather than a silent pass"
+    );
+}
+
+/// What the sort check could not cover must survive a failed content
+/// comparison. A caller that recovers from the failure — the chDB lane retries a
+/// schema mismatch as string rows — would otherwise turn an order that was never
+/// verified into a clean pass, which is the outcome this whole check exists to
+/// make impossible.
+#[test]
+fn an_unverified_order_survives_a_failed_content_comparison() {
+    let text = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let number = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let left = RecordBatch::try_new(
+        Arc::clone(&text),
+        vec![Arc::new(StringArray::from(vec!["a", "B"]))],
+    )
+    .expect("left");
+    let right = RecordBatch::try_new(
+        Arc::clone(&number),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("right");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "schema_mismatch_with_unchecked_order",
+        "SELECT v COLLATE NOCASE AS v FROM t ORDER BY v COLLATE NOCASE",
+        &[left],
+        &[right],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        matches!(comparison.result, QueryValidationResult::Fail(_)),
+        "the schemas differ, so the content comparison fails: {:?}",
+        comparison.result
+    );
+    assert!(
+        !comparison.unchecked.is_empty(),
+        "the collation left the order unverified, and a caller that recovers from \
+         the content failure must still be told that"
+    );
+}
+
+/// A lane that recovers from a failed comparison by re-comparing content — the
+/// chDB lane retries a schema mismatch as sorted string rows — establishes the
+/// rows and nothing about their order. Its pass must not overwrite a hole the
+/// sort check already reported.
+#[test]
+fn a_content_only_recovery_cannot_pass_an_unverified_order() {
+    let hole = vec!["left: ORDER BY term 'v COLLATE NOCASE' requests a collation".to_string()];
+
+    assert!(
+        matches!(
+            keep_unverified_order(support::ParityOutcome::Pass, hole.clone()),
+            support::ParityOutcome::OrderUnchecked { .. }
+        ),
+        "content matched, but nothing verified the order"
+    );
+    assert!(
+        matches!(
+            keep_unverified_order(support::ParityOutcome::Pass, Vec::new()),
+            support::ParityOutcome::Pass
+        ),
+        "with the order verified, the recovery stands as a pass"
+    );
+    let failed = support::ParityOutcome::Fail {
+        detail: "rows differ".to_string(),
+    };
+    assert!(
+        matches!(
+            keep_unverified_order(failed, hole),
+            support::ParityOutcome::Fail { .. }
+        ),
+        "a recovery that did not pass keeps its own verdict"
     );
 }
 

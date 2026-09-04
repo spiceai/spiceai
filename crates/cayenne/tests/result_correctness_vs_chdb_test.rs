@@ -43,9 +43,11 @@ use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
     CayenneHarness, ParityOutcome, assert_all_pass_or_excluded, compare_actual_results,
-    execute_cayenne, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
+    compare_actual_results_detailed, execute_cayenne, keep_unverified_order, make_dim_batch,
+    make_fact_batch, micro_bench_queries, write_parquet,
 };
 use test_framework::queries::Query;
+use test_framework::queries::validation::QueryValidationFailReason;
 
 fn scratch_dir() -> PathBuf {
     std::env::var_os("CAYENNE_PARITY_SCRATCH")
@@ -269,16 +271,28 @@ fn compare_results_lenient(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let direct = compare_actual_results(query, cayenne, reference);
-    if matches!(direct, ParityOutcome::Pass) {
-        return direct;
+    let compared = compare_actual_results_detailed(query, cayenne, reference);
+    if matches!(compared.outcome, ParityOutcome::Pass) {
+        return compared.outcome;
     }
-    if let ParityOutcome::Fail { detail } = &direct
+    if let ParityOutcome::Fail { detail } = &compared.outcome
+        // A side that broke its own ORDER BY is not a schema disagreement, and
+        // the fallback below cannot speak to it: comparing rows as sorted
+        // strings says nothing about the order either engine returned them in.
+        && !matches!(
+            compared.reason,
+            Some(QueryValidationFailReason::SortOrderViolation { .. })
+        )
         && (detail.contains("SchemaMismatch") || detail.contains("schema"))
     {
-        return compare_as_string_rows(query, cayenne, reference);
+        // The fallback sorts both sides before comparing, so a pass from it
+        // establishes content and nothing about order.
+        return keep_unverified_order(
+            compare_as_string_rows(query, cayenne, reference),
+            compared.unchecked,
+        );
     }
-    direct
+    compared.outcome
 }
 
 fn compare_as_string_rows(

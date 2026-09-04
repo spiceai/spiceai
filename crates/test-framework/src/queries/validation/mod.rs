@@ -1015,7 +1015,9 @@ pub fn compare_query_result_batches(
 /// check could not cover lands in [`SortCheckedComparison::unchecked`], because
 /// a hole that reads as a pass is the failure this check exists to remove. A
 /// caller that ignores that field is back to reporting unverified order as
-/// verified.
+/// verified. The field is populated even when the content comparison failed, for
+/// the caller that recovers from that failure and would otherwise pass an order
+/// nothing verified.
 ///
 /// `sql` must be the statement that produced *both* result sets. Where the two
 /// engines run textually different SQL, pass the form whose projection matches
@@ -1046,13 +1048,8 @@ pub fn compare_query_result_batches_with_sort_check(
         match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
             SortCheck::Ordered => {}
             SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
-                // A comparison that already failed carries its own finding, and
-                // what the sort check could not cover would only dilute it. The
-                // hole matters where the result would otherwise read as a pass.
-                if content_passed {
-                    println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
-                    unchecked.push(format!("{side}: {reason}"));
-                }
+                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                unchecked.push(format!("{side}: {reason}"));
             }
             SortCheck::Violation(v) => {
                 println!(
@@ -1073,9 +1070,13 @@ pub fn compare_query_result_batches_with_sort_check(
     }
 
     if !content_passed {
+        // The hole is carried even though the comparison failed, because not
+        // every caller treats that failure as final: one that recovers from it
+        // — the chDB lane retries a schema mismatch as string rows — would
+        // otherwise turn an order that was never verified into a clean pass.
         return Ok(SortCheckedComparison {
             result: content,
-            unchecked: Vec::new(),
+            unchecked,
         });
     }
 

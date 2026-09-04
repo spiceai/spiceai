@@ -24,7 +24,9 @@
 use arrow::array::RecordBatch;
 use test_framework::queries::Query;
 
-use super::{CayenneHarness, ParityOutcome, compare_results, compare_results_with_reason};
+use super::{
+    CayenneHarness, ComparedResults, ParityOutcome, compare_results, compare_results_detailed,
+};
 
 /// Execute `sql` on Cayenne and return the collected result batches.
 pub async fn execute_cayenne(
@@ -46,17 +48,15 @@ pub fn compare_actual_results(
     compare_results(query, left, right)
 }
 
-/// [`compare_actual_results`] plus the typed reason behind a `Fail`, so a caller
-/// can branch on the kind of failure without parsing its rendered detail.
-pub fn compare_actual_results_with_reason(
+/// [`compare_actual_results`] keeping the typed reason and the coverage holes,
+/// so a caller can branch on the kind of failure without parsing its rendered
+/// detail, and cannot lose an unverified order while recovering from one.
+pub fn compare_actual_results_detailed(
     query: &Query,
     left: &[RecordBatch],
     right: &[RecordBatch],
-) -> (
-    ParityOutcome,
-    Option<test_framework::queries::validation::QueryValidationFailReason>,
-) {
-    compare_results_with_reason(query, left, right)
+) -> ComparedResults {
+    compare_results_detailed(query, left, right)
 }
 
 /// Run `sql` on Cayenne and on a reference batch producer, then compare.

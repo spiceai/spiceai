@@ -52,7 +52,7 @@ pub mod tpch_data;
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{
     assert_all_pass_or_excluded, assert_modes_agree_on_actual_results, compare_actual_results,
-    compare_actual_results_with_reason, execute_and_compare_cayenne_to_batches, execute_cayenne,
+    compare_actual_results_detailed, execute_and_compare_cayenne_to_batches, execute_cayenne,
 };
 
 use std::collections::BTreeMap;
@@ -536,18 +536,47 @@ pub fn compare_results(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    compare_results_with_reason(query, cayenne, reference).0
+    compare_results_detailed(query, cayenne, reference).outcome
 }
 
-/// [`compare_results`] plus the typed reason behind a `Fail`, for a caller that
-/// must tell one kind of failure from another. `Fail::detail` renders the reason
-/// for a human to read; branching on that string instead would make control flow
-/// depend on a `Debug` format.
-pub fn compare_results_with_reason(
+/// A comparison together with what it could not establish.
+///
+/// Two callers need more than the outcome. `reason` tells one kind of failure
+/// from another — `Fail::detail` renders it for a human, and branching on that
+/// string would make control flow depend on a `Debug` format. `unchecked`
+/// carries the order the sort check could not verify, and is populated even when
+/// the content comparison failed: a caller that recovers from that failure would
+/// otherwise report an order nothing verified as a clean pass.
+pub struct ComparedResults {
+    pub outcome: ParityOutcome,
+    pub reason: Option<QueryValidationFailReason>,
+    pub unchecked: Vec<String>,
+}
+
+/// Downgrade a content-only recovery that passed, when the sort check had
+/// already declined to verify the order.
+///
+/// A lane that recovers from a failed comparison by comparing content another
+/// way — the chDB lane retries a schema mismatch as sorted string rows —
+/// establishes the rows and nothing about the order they came back in. Returning
+/// its `Pass` unqualified would report an unverified order as verified, which is
+/// the outcome the sort check exists to make impossible.
+#[must_use]
+pub fn keep_unverified_order(recovered: ParityOutcome, unchecked: Vec<String>) -> ParityOutcome {
+    match recovered {
+        ParityOutcome::Pass if !unchecked.is_empty() => {
+            ParityOutcome::OrderUnchecked { reasons: unchecked }
+        }
+        settled => settled,
+    }
+}
+
+/// [`compare_results`] with the reason and the coverage holes kept.
+pub fn compare_results_detailed(
     query: &Query,
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
-) -> (ParityOutcome, Option<QueryValidationFailReason>) {
+) -> ComparedResults {
     // Positional equality only where the row set itself depends on order. Elsewhere
     // multiset, so an `ORDER BY` on a non-unique key does not fail on the
     // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
@@ -569,31 +598,39 @@ pub fn compare_results_with_reason(
         reference,
         order,
     ) {
-        Ok(comparison) => match comparison.result {
-            QueryValidationResult::Pass if comparison.unchecked.is_empty() => {
-                (ParityOutcome::Pass, None)
+        Ok(comparison) => {
+            let unchecked = comparison.unchecked;
+            match comparison.result {
+                QueryValidationResult::Pass if unchecked.is_empty() => ComparedResults {
+                    outcome: ParityOutcome::Pass,
+                    reason: None,
+                    unchecked,
+                },
+                // Rows matched, but part of the ORDER BY went unverified. That is
+                // a coverage hole, reported as one rather than as a clean pass.
+                QueryValidationResult::Pass => ComparedResults {
+                    outcome: ParityOutcome::OrderUnchecked {
+                        reasons: unchecked.clone(),
+                    },
+                    reason: None,
+                    unchecked,
+                },
+                QueryValidationResult::Fail(reason) => ComparedResults {
+                    outcome: ParityOutcome::Fail {
+                        detail: format!("{reason:?}"),
+                    },
+                    reason: Some(reason),
+                    unchecked,
+                },
             }
-            // Rows matched, but part of the ORDER BY went unverified. That is a
-            // coverage hole, so it is reported as one rather than as a clean pass.
-            QueryValidationResult::Pass => (
-                ParityOutcome::OrderUnchecked {
-                    reasons: comparison.unchecked,
-                },
-                None,
-            ),
-            QueryValidationResult::Fail(reason) => (
-                ParityOutcome::Fail {
-                    detail: format!("{reason:?}"),
-                },
-                Some(reason),
-            ),
-        },
-        Err(e) => (
-            ParityOutcome::Fail {
+        }
+        Err(e) => ComparedResults {
+            outcome: ParityOutcome::Fail {
                 detail: format!("compare error: {e}"),
             },
-            None,
-        ),
+            reason: None,
+            unchecked: Vec::new(),
+        },
     }
 }
 
