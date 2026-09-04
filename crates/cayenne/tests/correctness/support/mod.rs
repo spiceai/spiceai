@@ -52,7 +52,7 @@ pub mod tpch_data;
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{
     assert_all_pass_or_excluded, assert_modes_agree_on_actual_results, compare_actual_results,
-    execute_and_compare_cayenne_to_batches, execute_cayenne,
+    compare_actual_results_with_reason, execute_and_compare_cayenne_to_batches, execute_cayenne,
 };
 
 use std::collections::BTreeMap;
@@ -69,8 +69,9 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches_with_sort_check,
-    has_top_level_limit, has_top_level_order_by, row_order_from_sql,
+    QueryValidationFailReason, QueryValidationResult, RowOrder,
+    compare_query_result_batches_with_sort_check, has_top_level_limit, has_top_level_order_by,
+    row_order_from_sql,
 };
 use test_framework::queries::{
     Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
@@ -535,6 +536,18 @@ pub fn compare_results(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
+    compare_results_with_reason(query, cayenne, reference).0
+}
+
+/// [`compare_results`] plus the typed reason behind a `Fail`, for a caller that
+/// must tell one kind of failure from another. `Fail::detail` renders the reason
+/// for a human to read; branching on that string instead would make control flow
+/// depend on a `Debug` format.
+pub fn compare_results_with_reason(
+    query: &Query,
+    cayenne: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> (ParityOutcome, Option<QueryValidationFailReason>) {
     // Positional equality only where the row set itself depends on order. Elsewhere
     // multiset, so an `ORDER BY` on a non-unique key does not fail on the
     // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
@@ -557,19 +570,30 @@ pub fn compare_results(
         order,
     ) {
         Ok(comparison) => match comparison.result {
-            QueryValidationResult::Pass if comparison.unchecked.is_empty() => ParityOutcome::Pass,
+            QueryValidationResult::Pass if comparison.unchecked.is_empty() => {
+                (ParityOutcome::Pass, None)
+            }
             // Rows matched, but part of the ORDER BY went unverified. That is a
             // coverage hole, so it is reported as one rather than as a clean pass.
-            QueryValidationResult::Pass => ParityOutcome::OrderUnchecked {
-                reasons: comparison.unchecked,
-            },
-            QueryValidationResult::Fail(reason) => ParityOutcome::Fail {
-                detail: format!("{reason:?}"),
-            },
+            QueryValidationResult::Pass => (
+                ParityOutcome::OrderUnchecked {
+                    reasons: comparison.unchecked,
+                },
+                None,
+            ),
+            QueryValidationResult::Fail(reason) => (
+                ParityOutcome::Fail {
+                    detail: format!("{reason:?}"),
+                },
+                Some(reason),
+            ),
         },
-        Err(e) => ParityOutcome::Fail {
-            detail: format!("compare error: {e}"),
-        },
+        Err(e) => (
+            ParityOutcome::Fail {
+                detail: format!("compare error: {e}"),
+            },
+            None,
+        ),
     }
 }
 

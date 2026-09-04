@@ -21,9 +21,13 @@ cayenne-property-tests = { max-threads = 2 }
 # shared scratch directory — `tpch_full_result_parity_vs_duckdb` and
 # `spicebench_sf1_tpch_scenario_parity_vs_duckdb` read the very same `tpch_sf1`
 # tree — so two of them running at once would race on `dbgen` output that neither
-# wrote atomically. Serializing the group also keeps one bundled DuckDB instance
-# per machine, which is how #12098 ran this lane when it hit allocator aborts
-# under parallelism.
+# wrote atomically. The SSB fixture is shared the same way and by one more binary:
+# `standalone_duckdb_vs_sqlite_ssb` and `ssb_full_result_parity_vs_sqlite` both
+# check for `ssb_scale{scale}/lineorder.parquet` and generate it when absent, so
+# whichever loses the race reads a file the winner is still writing. Every binary
+# that touches the scratch tree therefore belongs in this group. Serializing it
+# also keeps one bundled DuckDB instance per machine, which is how #12098 ran this
+# lane when it hit allocator aborts under parallelism.
 result-correctness = { max-threads = 1 }
 
 # Every GitHub test authenticates as the same account, and GitHub's secondary
@@ -177,7 +181,7 @@ retries = 0
 # ceiling. See `.github/scripts/check_nextest_config.py`, which holds this
 # binary's baseline and fails if the ceiling stops clearing it.
 [[profile.default.overrides]]
-filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test)'
+filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test) | binary(=result_correctness_vs_sqlite_test)'
 test-group = "result-correctness"
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }

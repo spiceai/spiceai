@@ -37,8 +37,8 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use support::compare_actual_results;
 use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
+use support::{compare_actual_results, compare_actual_results_with_reason};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, RowOrder, SortKeyColumn, SortKeyResolution,
@@ -214,6 +214,60 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     assert!(
         matches!(out, support::ParityOutcome::Fail { .. }),
         "ORDER BY+LIMIT must preserve order: {out:?}"
+    );
+}
+
+/// A `Fail` must carry its typed reason, not just a rendered one. The DuckDB
+/// lane re-adjudicates a Cayenne/DuckDB disagreement against a DataFusion
+/// baseline, and that baseline can speak to a content mismatch but says nothing
+/// about whether the *other* engine honored its own `ORDER BY`. Re-adjudicating
+/// a sort violation therefore returns it as `Excluded`, which counts as a pass.
+/// Telling the two apart on a `Debug` string would make that control flow depend
+/// on a format.
+#[test]
+fn a_failure_carries_the_typed_reason_that_separates_a_sort_violation() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let sorted = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("sorted");
+    let reversed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 1]))],
+    )
+    .expect("reversed");
+    let other_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![7, 8]))],
+    )
+    .expect("other rows");
+
+    // Same rows, but the right side does not honor the query's own ORDER BY.
+    let ordered = Query::new("ordered".into(), "SELECT v FROM t ORDER BY v".into(), false);
+    let (outcome, reason) =
+        compare_actual_results_with_reason(&ordered, &[sorted.clone()], &[reversed]);
+    assert!(
+        matches!(outcome, support::ParityOutcome::Fail { .. }),
+        "a side that breaks its own ORDER BY is a failure: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            reason,
+            Some(QueryValidationFailReason::SortOrderViolation { ref side, .. }) if side == "right"
+        ),
+        "the reason must name the violating side, not just render it: {reason:?}"
+    );
+
+    // Different rows: a content mismatch, which the baseline *may* adjudicate.
+    let (_, content) = compare_actual_results_with_reason(&ordered, &[sorted], &[other_rows]);
+    assert!(
+        content.is_some()
+            && !matches!(
+                content,
+                Some(QueryValidationFailReason::SortOrderViolation { .. })
+            ),
+        "a content mismatch must not read as a sort violation: {content:?}"
     );
 }
 

@@ -56,9 +56,11 @@ use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
     CayenneHarness, ParityOutcome, TPCH_TABLES, assert_all_pass_or_excluded,
-    assert_modes_agree_on_actual_results, compare_actual_results, execute_cayenne, make_dim_batch,
-    make_fact_batch, micro_bench_queries, write_parquet,
+    assert_modes_agree_on_actual_results, compare_actual_results,
+    compare_actual_results_with_reason, execute_cayenne, make_dim_batch, make_fact_batch,
+    micro_bench_queries, write_parquet,
 };
+use test_framework::queries::validation::QueryValidationFailReason;
 use test_framework::queries::{
     Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
 };
@@ -164,13 +166,24 @@ async fn run_pair_with_df_baseline(
     match (cayenne_res, duck_res) {
         (Ok(c), Ok(d)) => {
             // --- Harness compares actual result batches ---
-            let direct = compare_actual_results(query, &c, &d);
+            let (direct, direct_reason) = compare_actual_results_with_reason(query, &c, &d);
             // `OrderUnchecked` means the rows matched and part of the ORDER BY
             // could not be verified — a coverage note to carry through, not a
             // mismatch to re-adjudicate against the DataFusion baseline.
             if matches!(
                 direct,
                 ParityOutcome::Pass | ParityOutcome::OrderUnchecked { .. }
+            ) {
+                return direct;
+            }
+            // A sort violation is one engine disagreeing with its own ORDER BY,
+            // which the DataFusion baseline cannot adjudicate: it says nothing
+            // about the side that returned the rows out of order. Sending it
+            // below would let DuckDB's violation return as `Excluded` — counted
+            // as a pass — on the strength of Cayenne matching DataFusion.
+            if matches!(
+                direct_reason,
+                Some(QueryValidationFailReason::SortOrderViolation { .. })
             ) {
                 return direct;
             }
