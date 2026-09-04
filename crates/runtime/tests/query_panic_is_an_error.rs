@@ -81,6 +81,11 @@ impl ScalarUDFImpl for PanickingUdf {
     }
 }
 
+/// Several rows over several partitions, which is the shape the empty success was measured
+/// on: most partitions finish empty and only one carries the panicking row.
+const SQL: &str =
+    "SELECT spice_test_panic(x) AS z FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8)) t(x)";
+
 #[tokio::test]
 async fn a_panicking_query_is_an_error_not_an_empty_success() {
     let rt = Arc::new(Runtime::builder().build().await);
@@ -94,11 +99,6 @@ async fn a_panicking_query_is_an_error_not_an_empty_success() {
     rt.datafusion()
         .ctx
         .register_udf(ScalarUDF::from(PanickingUdf::new()));
-
-    // Several rows over several partitions, which is the shape the empty success was
-    // measured on: most partitions finish empty and only one carries the panicking row.
-    const SQL: &str =
-        "SELECT spice_test_panic(x) AS z FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8)) t(x)";
 
     // Repeated because the failure this guards is an ordering race: on the pre-fix code
     // roughly a third of runs returned the empty success and the rest returned the error,
