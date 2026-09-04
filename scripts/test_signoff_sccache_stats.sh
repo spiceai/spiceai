@@ -55,6 +55,20 @@ step = matches[0]
 if step.get("env"):
     sys.exit(f"step env keys appeared: {sorted(step['env'])} — this test does not model them")
 
+# The body below is only reachable in Actions because the step runs
+# unconditionally. Narrowing this back to `always() && env.SCCACHE_SETUP ==
+# 'true'` would skip the step on exactly the two states it exists to report,
+# and every assertion in this file would still pass — the body is identical
+# either way. So the condition is asserted, not just the body.
+condition = step.get("if")
+if condition != "always()":
+    sys.exit(
+        f"step `if:` is {condition!r}, expected 'always()'. The unset and false "
+        "branches are only reachable because this step runs unconditionally; a "
+        "narrower condition skips the step on the runs whose duration it explains, "
+        "which no assertion over the body alone can detect."
+    )
+
 body = step["run"]
 leftover = re.findall(r"\$\{\{.*?\}\}", body)
 if leftover:
