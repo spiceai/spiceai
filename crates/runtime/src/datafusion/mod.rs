@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
+use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
@@ -125,7 +126,7 @@ use spicepod::acceleration::SnapshotsTrigger;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
@@ -136,6 +137,7 @@ pub mod query;
 
 pub mod app_context_extension;
 pub mod builder;
+pub(crate) mod caching_retention;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
@@ -173,6 +175,11 @@ pub use runtime_datafusion::{
 const MAX_STREAMING_BROADCAST_BATCHES: usize = 128;
 const MAX_STREAMING_BROADCAST_ROWS: usize = 1_000_000;
 const MAX_STREAMING_BROADCAST_BYTES: usize = 128 * 1024 * 1024;
+
+/// Entry count at which `schema_evolve_locks` drops the locks nobody is holding. Well above
+/// the number of datasets a runtime serves, so real datasets keep their lock between writes
+/// and only a flood of unknown table names triggers a cleanup.
+const MAX_SCHEMA_EVOLVE_LOCKS: usize = 1024;
 
 #[derive(Default)]
 struct StreamingBroadcastBuffer {
@@ -751,6 +758,24 @@ struct PendingSinkRegistration {
     secrets: Arc<TokioRwLock<Secrets>>,
 }
 
+/// Removes `key` only while it still holds `claimed`.
+///
+/// Reloading a dataset replaces its map entry with a new one. A caller that finished working
+/// on the old entry must not delete the replacement, or the reloaded dataset loses whatever
+/// the entry was tracking for it.
+fn remove_if_same<V>(
+    map: &mut HashMap<TableReference, Arc<V>>,
+    key: &TableReference,
+    claimed: &Arc<V>,
+) {
+    if map
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, claimed))
+    {
+        map.remove(key);
+    }
+}
+
 struct DeferredTableRegistration {
     dataset: Arc<Dataset>,
     connector: Arc<dyn DataConnector>,
@@ -773,6 +798,66 @@ pub trait DatasetPlacement: std::fmt::Debug + Send + Sync {
     fn install(&self, name: &TableReference, provider: Arc<dyn TableProvider>) -> Result<()>;
 }
 
+/// The specific table instance registered under a name at the moment it was
+/// captured, for an action that is decided before an `.await` and applied after
+/// it.
+///
+/// Acking a partition set as loaded, or creating a refresh schedule, is about
+/// the table the action started for. A table removed — or removed and
+/// re-registered, as a rebuild or a schema-change recreate does — resolves to a
+/// different provider, and applying the action then reports a result for a table
+/// that never produced it.
+///
+/// Captured either by [`DataFusion::table_instance_as_registered`], from the
+/// provider a caller has just registered, or by
+/// [`DataFusion::capture_table_instance`], by resolving a name. Prefer the first
+/// where the registration is in reach: resolving by name can only see whatever
+/// is registered by then, so a replacement landing in between is captured as the
+/// thing the action was about. Either way
+/// [`DataFusion::await_refresh_completion`] re-resolves it after the wait.
+///
+/// The verdict is point-in-time and does not survive into the side effect the
+/// caller then commits; closing that remaining window needs the side effect
+/// itself to carry a generation (#13746).
+pub struct TableInstance {
+    table: TableReference,
+    /// Held weakly on purpose. A `Weak` keeps the allocation open, so a dropped
+    /// table's address cannot be reused by its replacement and read as the
+    /// *same* instance — and it does that without keeping the table alive, which
+    /// is what makes the identity safe to hold across the wait. An accelerated
+    /// table owns the refresher that owns the recorder, and a waiter reports
+    /// `Abandoned` only once every recorder has dropped; an instance holding the
+    /// table strongly would hold open, for the length of the `.await`, the very
+    /// signal that `.await` is waiting to see close.
+    ///
+    /// A captured provider that no longer upgrades is decisive on its own: the
+    /// table the action was about is gone, whatever the name resolves to now.
+    ///
+    /// `None` when nothing resolved under the name at capture time, which leaves
+    /// the instance with no identity to compare against.
+    provider: Option<Weak<dyn TableProvider>>,
+}
+
+/// What `register_view`'s task hands back: the waiter for an accelerated view's
+/// initial refresh, and the identity of the provider it registered.
+type ViewRegistration = (TableInstance, RefreshCompletionWaiter);
+
+/// What a deferred action gated on a refresh completion should do once that
+/// refresh has landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredRefreshOutcome {
+    /// A refresh landed and the table is still the one the action was started
+    /// for.
+    Apply,
+    /// Every recorder was dropped before a completion was recorded: no refresh
+    /// ran, and none can.
+    Abandoned,
+    /// A refresh landed, but the table has since been removed, or rebuilt as a
+    /// new instance, so the action is no longer about the table registered under
+    /// this name.
+    TableChanged,
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     pub(crate) runtime_status: Arc<status::RuntimeStatus>,
@@ -791,12 +876,21 @@ pub struct DataFusion {
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
-    /// Per-dataset locks serializing write-time schema evolution + rebind (the `OTel`
-    /// metric-dimension path). Keyed by table reference so concurrent exports for the
-    /// same metric can't race the `ALTER … ADD COLUMN` + re-registration; distinct
-    /// metrics evolve concurrently. Get-or-inserted lazily on first evolution.
-    schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::Mutex<()>>>>,
-    pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
+    /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
+    /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
+    /// write can complete through the provider being replaced, and its rows are then
+    /// invisible to the new one. Keyed by the bare table name so every way of naming a
+    /// dataset shares one lock (see `schema_evolve_lock`); created on first use and dropped
+    /// again once unused, so unknown table names cannot grow the map without bound.
+    schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
+    /// `sink` datasets waiting for their first write, which is when their schema becomes
+    /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
+    /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
+    /// registers while the others wait on the mutex, so no writer looks the table up before
+    /// it exists. The slot is emptied only once the provider is installed, so a registration
+    /// that is cancelled part-way leaves the entry for the next writer to retry.
+    pending_sink_tables:
+        TokioRwLock<HashMap<TableReference, Arc<Mutex<Option<PendingSinkRegistration>>>>>,
     deferred_tables: TokioRwLock<HashMap<String, DeferredTableRegistration>>,
     deferred_catalogs: TokioRwLock<HashMap<String, Arc<DeferredCatalogProvider>>>,
 
@@ -1138,6 +1232,101 @@ impl DataFusion {
         )
     }
 
+    /// Captures the identity of a provider at the moment it is registered.
+    ///
+    /// The guarantee is that this never consults the registry: it takes the very
+    /// `Arc` handed to `register_table`, so whether another worker replaces that
+    /// registration in the meantime does not change which table the identity is
+    /// about. Re-resolving the name instead can only see whatever is registered
+    /// by the time it looks, which is how a replacement gets captured as the
+    /// thing the action was started for — and then compares equal to itself. A
+    /// replacement is still reported, but by the comparison after the wait,
+    /// which is where it belongs.
+    #[must_use]
+    pub fn table_instance_as_registered(
+        table: TableReference,
+        provider: &Arc<dyn TableProvider>,
+    ) -> TableInstance {
+        TableInstance {
+            table,
+            provider: Some(Arc::downgrade(provider)),
+        }
+    }
+
+    /// Captures the table instance registered under `table_reference` right now,
+    /// so an action decided before an `.await` can tell, once it resumes,
+    /// whether it is still about the same table.
+    ///
+    /// Pair with [`DataFusion::await_refresh_completion`], which re-resolves it
+    /// once the refresh the action waits on has landed.
+    #[must_use]
+    pub async fn capture_table_instance(&self, table_reference: &TableReference) -> TableInstance {
+        TableInstance {
+            table: table_reference.clone(),
+            provider: self
+                .get_table(table_reference)
+                .await
+                .as_ref()
+                .map(Arc::downgrade),
+        }
+    }
+
+    /// Waits for `waiter`, then reports whether the action it gates may still be
+    /// applied to `instance`'s table.
+    ///
+    /// A deferred action has two questions to ask and this answers both, so a
+    /// caller cannot answer the first and forget the second. `Abandoned` alone is
+    /// not enough: it reports only a drop that happens *before* any completion
+    /// was recorded, while a completion recorded and *then* invalidated by a
+    /// removal or a rebuild still reads as answered.
+    ///
+    /// A `None` waiter is a caller with nothing to wait for; the table is still
+    /// re-resolved, since it may have gone in the meantime.
+    #[must_use]
+    pub async fn await_refresh_completion(
+        &self,
+        instance: TableInstance,
+        waiter: Option<RefreshCompletionWaiter>,
+    ) -> DeferredRefreshOutcome {
+        if let Some(waiter) = waiter
+            && waiter.wait().await.is_abandoned()
+        {
+            return DeferredRefreshOutcome::Abandoned;
+        }
+
+        if self.table_instance_is_current(&instance).await {
+            DeferredRefreshOutcome::Apply
+        } else {
+            DeferredRefreshOutcome::TableChanged
+        }
+    }
+
+    /// Whether `instance` still names the table registered under its name.
+    ///
+    /// `false` once that table has been removed, and equally once it has been
+    /// removed and re-registered: a rebuild resolves to a new provider, so an
+    /// action captured against the old one is about a table that is no longer
+    /// there.
+    #[must_use]
+    async fn table_instance_is_current(&self, instance: &TableInstance) -> bool {
+        let Some(captured) = instance.provider.as_ref() else {
+            // Nothing resolved under the name when the instance was captured, so
+            // there is no identity to compare against; the most the registry can
+            // still answer is whether the name is registered at all.
+            return self.table_exists(&instance.table);
+        };
+
+        let Some(captured) = captured.upgrade() else {
+            // The captured table has been dropped outright, so nothing
+            // registered under the name now can be it.
+            return false;
+        };
+
+        self.get_table(&instance.table)
+            .await
+            .is_some_and(|current| Arc::ptr_eq(&captured, &current))
+    }
+
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
@@ -1229,12 +1418,13 @@ impl DataFusion {
         Arc::new(ComposedCatalogProvider::new(external, internal_schemas))
     }
 
-    // Returns a Notify if the table supports notifying the runtime when the table is ready.
+    /// Returns a waiter for the dataset's initial load when the table has one to
+    /// report, so the caller can act on it however late it asks.
     pub async fn register_table(
         &self,
         dataset: Arc<Dataset>,
         table: Table,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_access_mode = dataset.access();
@@ -1253,7 +1443,10 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
-                    let notifier = accelerated_table.refresher().on_complete_notification();
+                    let notifier = accelerated_table
+                        .refresher()
+                        .refresh_completion()
+                        .map(|completion| completion.any());
                     let table_provider = table_provider_with_spicepod_metadata(
                         accelerated_table.table_provider(),
                         &dataset.metadata,
@@ -1268,13 +1461,13 @@ impl DataFusion {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
                         .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
-                    self.pending_sink_tables
-                        .write()
-                        .await
-                        .push(PendingSinkRegistration {
+                    self.pending_sink_tables.write().await.insert(
+                        dataset_table_ref.clone(),
+                        Arc::new(Mutex::new(Some(PendingSinkRegistration {
                             dataset: Arc::clone(&dataset),
                             secrets: Arc::clone(&secrets),
-                        });
+                        }))),
+                    );
                     None
                 } else {
                     self.register_accelerated_table(
@@ -1849,13 +2042,22 @@ impl DataFusion {
                 telemetry::cayenne::track_compaction_memory_pool_used_bytes(compaction_used, &[]);
                 // The RSS read touches the filesystem (procfs on Linux), so it
                 // goes to the blocking pool rather than this worker thread. Once
-                // per interval, off the critical path of every other task.
-                if let Ok(Some(rss)) = tokio::task::spawn_blocking(
-                    crate::resource_monitor::process_resident_memory_bytes,
-                )
-                .await
+                // per interval, off the critical path of every other task. The
+                // anonymous/file split comes from the same read, so it costs only
+                // the extra parse — and it is what makes the gap above readable:
+                // the file-backed half is reclaimable page cache, not memory
+                // anyone is accounting for wrongly.
+                if let Ok(Some(resident)) =
+                    tokio::task::spawn_blocking(crate::resource_monitor::process_resident_memory)
+                        .await
                 {
-                    telemetry::track_process_resident_memory_bytes(rss, &[]);
+                    telemetry::track_process_resident_memory_bytes(resident.total, &[]);
+                    // Only where the platform supplies it: a zeroed split would
+                    // read as "this process holds no anonymous memory", which is
+                    // the misattribution these two gauges exist to prevent.
+                    if let Some(split) = resident.split {
+                        telemetry::track_process_resident_split(split.anon, split.file, &[]);
+                    }
                 }
             }
         });
@@ -2198,62 +2400,103 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        // Claim the pending registration by removing it under the write lock, so exactly one
-        // caller registers a given pending sink. Concurrent OpenTelemetry exports for the same
-        // metric would otherwise both find it under a shared read lock and both register it;
-        // worse, the second caller's removal pass — no longer finding the entry the first
-        // already removed — used to fall back to index 0 and evict an unrelated pending
-        // dataset, leaving it permanently unregistered ("Table ... not registered" on every
-        // later write). A caller that finds nothing to claim was beaten to it (or the dataset
-        // is not a pending sink) and has nothing to do.
-        let pending_registration = {
-            let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-            let Some(idx) = pending_sink_registrations
-                .iter()
-                .position(|registration| registration.dataset.name == table_reference)
-            else {
-                return Ok(());
-            };
-            pending_sink_registrations.remove(idx)
+        // Match the entry the way `is_writable` matched the write, or a write it just
+        // accepted finds nothing to register and then fails against the unregistered table.
+        // `resolved_eq` is that match: a bare `foo` names a dataset in any schema. A scan is
+        // what it takes, since the key is not derivable from the write's name; the map only
+        // holds sink datasets awaiting their first write, so it stays short.
+        //
+        // Release the map guard before taking the entry mutex, so no writer holds the map
+        // while waiting.
+        let Some((pending_key, entry)) = self
+            .pending_sink_tables
+            .read()
+            .await
+            .iter()
+            .find(|(pending_name, _)| pending_name.resolved_eq(&table_reference))
+            .map(|(pending_name, entry)| (pending_name.clone(), Arc::clone(entry)))
+        else {
+            return Ok(());
         };
 
+        // One writer registers at a time; the rest wait here and find the slot empty once
+        // the table exists, rather than looking it up mid-registration and failing.
+        //
+        // Borrow the registration instead of taking it, so the slot stays filled until the
+        // provider is installed. If this writer is cancelled before that, the next writer
+        // still finds the entry and retries. An empty slot would instead look like a
+        // finished registration, and the dataset would stay unregistered until a restart.
+        let mut slot = entry.lock().await;
+        let Some(pending_registration) = slot.as_ref() else {
+            // Another writer completed the registration while this one waited.
+            return Ok(());
+        };
+        let dataset = Arc::clone(&pending_registration.dataset);
+        let secrets = Arc::clone(&pending_registration.secrets);
+
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
-        let registration = async {
-            let context = RuntimeConnectorContext::for_dataset(&pending_registration.dataset);
-            let read_provider = sink_connector
-                .read_provider(&context, &pending_registration.dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?;
-            let federated_table = FederatedTable::new_unchecked(read_provider);
-
-            tracing::info!(
-                "Dataset {} loading data...",
-                pending_registration.dataset.name
-            );
-            self.register_accelerated_table(
-                Arc::clone(&pending_registration.dataset),
-                Arc::clone(&sink_connector),
-                federated_table,
-                Arc::clone(&pending_registration.secrets),
-                BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-                None,                    // Sink datasets are not partition-scoped
-            )
+        let context = RuntimeConnectorContext::for_dataset(&dataset);
+        let read_provider = sink_connector
+            .read_provider(&context, &dataset)
             .await
-        }
-        .await;
+            .context(UnableToResolveTableProviderSnafu)?;
 
-        match registration {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Registration failed after we claimed the entry: return it to the queue so a
-                // later write retries it, rather than leaving the dataset unregistered.
-                self.pending_sink_tables
-                    .write()
-                    .await
-                    .push(pending_registration);
-                Err(e)
+        tracing::info!("Dataset {} loading data...", dataset.name);
+        // Returning early leaves the registration in the slot, so the next write retries it.
+        self.register_accelerated_table(
+            Arc::clone(&dataset),
+            sink_connector,
+            FederatedTable::new_unchecked(read_provider),
+            secrets,
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+            None,                    // Sink datasets are not partition-scoped
+        )
+        .await?;
+
+        // The table exists now: empty the slot for the writers waiting on it, and drop the
+        // entry so later writers skip this path.
+        *slot = None;
+        remove_if_same(
+            &mut *self.pending_sink_tables.write().await,
+            &pending_key,
+            &entry,
+        );
+        Ok(())
+    }
+
+    /// The lock that keeps this dataset's writes from overlapping a schema evolution's
+    /// provider swap (see `schema_evolve_locks`), created on first use.
+    ///
+    /// Keyed by the bare table name, because one dataset is written under several names: the
+    /// OpenTelemetry ingest and the evolution path use the bare name, a Flight `DoPut` the
+    /// qualified one. Separate keys would give them separate locks and let a write overlap
+    /// the swap. Two same-named datasets in different schemas share a lock, which costs
+    /// parallelism; splitting them would risk the data loss the lock exists to prevent.
+    async fn schema_evolve_lock(
+        &self,
+        table_reference: &TableReference,
+    ) -> Arc<tokio::sync::RwLock<()>> {
+        let key = TableReference::bare(table_reference.table().to_string());
+        {
+            let locks = self.schema_evolve_locks.read().await;
+            if let Some(lock) = locks.get(&key) {
+                return Arc::clone(lock);
             }
         }
+        let mut locks = self.schema_evolve_locks.write().await;
+        // A write is admitted for any name a writable catalog accepts, including one that
+        // resolves to no table and fails right after this. Those names would otherwise stay
+        // here forever, so once the map grows past its bound, drop the locks nobody holds.
+        // A lock with one reference is held only by the map, so no write or evolution is
+        // using it and re-creating it later is equivalent.
+        if locks.len() >= MAX_SCHEMA_EVOLVE_LOCKS {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        Arc::clone(
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))),
+        )
     }
 
     pub async fn write_data(
@@ -2270,6 +2513,12 @@ impl DataFusion {
 
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
             .await?;
+
+        // Hold the lock (shared) from the provider lookup until the insert finishes. A write
+        // that completes through a provider being replaced by a schema evolution succeeds,
+        // but its rows are invisible to the new provider.
+        let rebind_lock = self.schema_evolve_lock(table_reference).await;
+        let rebind_guard = rebind_lock.read().await;
 
         let table_provider = self.get_table_provider(table_reference).await?;
 
@@ -2326,6 +2575,9 @@ impl DataFusion {
                     table_name: table_reference.to_string(),
                 })?;
         }
+
+        // The write is done, so evolution is free to swap the provider now.
+        drop(rebind_guard);
 
         // Queue the committed write for Drasi, when `runtime.drasi` names this
         // table. After the write, so Drasi only sees rows the runtime kept; and
@@ -2408,6 +2660,11 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
             .await?;
 
+        // Same lock as `write_data`, for the same reason. Note a long-running stream holds
+        // it until the stream ends, which delays schema evolution for this dataset.
+        let rebind_lock = self.schema_evolve_lock(table_reference).await;
+        let rebind_guard = rebind_lock.read().await;
+
         let table_provider = self.get_table_provider(table_reference).await?;
 
         verify_schema(table_provider.schema().fields(), update_schema.fields())
@@ -2465,6 +2722,9 @@ impl DataFusion {
             .context(UnableToExecuteTableInsertSnafu {
                 table_name: table_reference.to_string(),
             })?;
+
+        // The write is done, so evolution is free to swap the provider now.
+        drop(rebind_guard);
 
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
@@ -2960,6 +3220,13 @@ impl DataFusion {
             .delete_expr(retention_delete_expr)
             .build();
 
+        // Whether a retention task will actually run, which is not the same as
+        // the dataset having configured one: the builder returns `None` for a
+        // policy it cannot assemble — no `retention_check_interval`, no
+        // `time_column`, no period or expression — and the caching branch below
+        // has to tell "bounded" from "configured to be bounded".
+        let declared_retention_runs = retention.is_some();
+
         accelerated_table_builder.retention(retention);
 
         accelerated_table_builder
@@ -3005,33 +3272,54 @@ impl DataFusion {
                 );
             }
 
-            // Auto-configure cache retention when stale_if_error is disabled.
-            // Expired cache entries (past max_age + SWR) are never served and waste storage.
-            if !acceleration_settings.caching_stale_if_error.is_enabled() {
-                if dataset.retention_period().is_some() {
+            // A caching accelerator's retention is enforced by
+            // `accelerated::caching_eviction`, attached as a retention filter by
+            // the accelerated-table builder. A `retention_period` or
+            // `retention_sql` the user sets still applies, but is evaluated per
+            // cache entry rather than per row: a cached response can span
+            // several rows (a paginated one is fetched a page at a time), and a
+            // row-level delete could take part of one and leave the rest to be
+            // served as though it were the whole response.
+            //
+            // Nothing in the caching read path removes an entry, so the
+            // accelerator is bounded by a retention policy or by nothing at all.
+            match caching_retention::caching_retention(
+                acceleration_settings.caching_stale_if_error.is_enabled(),
+                acceleration_settings.caching_ttl,
+                acceleration_settings.caching_stale_while_revalidate_ttl,
+                declared_retention_runs,
+            ) {
+                caching_retention::CachingRetention::Derive {
+                    period,
+                    check_interval,
+                } => {
+                    if dataset.retention_period().is_some() {
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                        );
+                    }
+
+                    let cache_retention = Retention::builder()
+                        .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
+                        .time_period(Some(period))
+                        .check_interval(Some(check_interval))
+                        .enabled(true)
+                        .build();
+
+                    accelerated_table_builder.retention(cache_retention);
+                }
+                // The policy built above this block is the dataset's own, and it
+                // is the only thing that can bound a stale-on-error cache.
+                caching_retention::CachingRetention::LeaveDeclared => {}
+                caching_retention::CachingRetention::Unbounded => {
                     tracing::warn!(
-                        dataset = %dataset.name,
-                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                        "{}",
+                        caching_retention::unbounded_caching_retention_warning(
+                            &dataset.name.to_string()
+                        )
                     );
                 }
-
-                let max_age = acceleration_settings
-                    .caching_ttl
-                    .unwrap_or(Duration::from_secs(30));
-                let swr = acceleration_settings
-                    .caching_stale_while_revalidate_ttl
-                    .unwrap_or_default();
-                let retention_period = max_age + swr;
-                let check_interval = retention_period.max(Duration::from_secs(30));
-
-                let cache_retention = Retention::builder()
-                    .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
-                    .time_period(Some(retention_period))
-                    .check_interval(Some(check_interval))
-                    .enabled(true)
-                    .build();
-
-                accelerated_table_builder.retention(cache_retention);
             }
 
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
@@ -3040,6 +3328,9 @@ impl DataFusion {
             );
             accelerated_table_builder
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+            accelerated_table_builder
+                .caching_max_size_bytes(acceleration_settings.caching_max_size);
+            accelerated_table_builder.caching_max_items(acceleration_settings.caching_max_items);
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)
@@ -3747,21 +4038,31 @@ impl DataFusion {
             return Ok(None);
         }
 
-        // Serialize evolution + rebind for this dataset so concurrent writes can't race
-        // the ALTER and re-registration. Distinct datasets keep independent locks.
-        let lock = {
-            let mut locks = self.schema_evolve_locks.write().await;
-            Arc::clone(
-                locks
-                    .entry(dataset.name.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _guard = lock.lock().await;
+        // Take the lock exclusively over the column add and the provider swap, so no write
+        // and no other evolution can overlap them. `write_data` and `write_streaming_data`
+        // take the same lock shared (see `schema_evolve_locks`).
+        let lock = self.schema_evolve_lock(&dataset.name).await;
+        let _guard = lock.write().await;
 
-        // Re-read the live provider schema *under the lock* so a serialized second export
-        // classifies against the first's already-applied evolution.
-        let provider = self.get_table_provider(&dataset.name).await?;
+        // Read the schema under the lock, so a second export that waited here sees the
+        // first export's new column.
+        //
+        // After a restart a sink dataset has no provider until its first write. Register it
+        // from the acceleration checkpoint first, or this lookup fails and an export that
+        // carries a new column is rejected.
+        let provider = match self.get_table_provider(&dataset.name).await {
+            Ok(provider) => provider,
+            Err(lookup_error) => {
+                let Some(checkpoint_schema) =
+                    crate::dataconnector::sink::accelerated_checkpoint_schema(dataset).await
+                else {
+                    return Err(lookup_error);
+                };
+                self.ensure_sink_dataset(dataset.name.clone(), checkpoint_schema)
+                    .await?;
+                self.get_table_provider(&dataset.name).await?
+            }
+        };
         let current = provider.schema();
         let constraint_columns =
             dataset_constraint_columns(dataset, provider.constraints(), &current);
@@ -3769,7 +4070,12 @@ impl DataFusion {
             constraint_columns: &constraint_columns,
         };
 
-        match arrow_tools::schema_evolution::classify(&current, target_schema, &ctx) {
+        // Restore the columns this write never saw, so it is judged on what it adds rather
+        // than on what it omits.
+        let target_schema =
+            arrow_tools::schema_evolution::retain_current_columns(&current, target_schema);
+
+        match arrow_tools::schema_evolution::classify(&current, &target_schema, &ctx) {
             // Another export already evolved to a superset (or nothing changed): the
             // caller rebuilds against `current`, which is a no-op.
             SchemaEvolution::Identical => Ok(Some(current)),
@@ -3990,7 +4296,7 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
         bootstrap_status: BootstrapStatus,
         initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         let mut accelerated_table = self
             .create_accelerated_table(
                 &dataset,
@@ -4001,7 +4307,10 @@ impl DataFusion {
                 initial_partition_filters,
             )
             .await?;
-        let notifier = accelerated_table.refresher().on_complete_notification();
+        let notifier = accelerated_table
+            .refresher()
+            .refresh_completion()
+            .map(|completion| completion.any());
 
         source
             .on_accelerated_table_registration(&dataset, &mut accelerated_table)
@@ -4031,7 +4340,7 @@ impl DataFusion {
         self: &Arc<Self>,
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         // If we're a scheduler with a partition service, forward refresh to executors
         // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
         if matches!(
@@ -4051,7 +4360,14 @@ impl DataFusion {
             table.as_ref(),
             spice_table::LayerWalk::Read,
         ) {
-            let notifier = accelerated_table.refresher().on_complete_notification();
+            // Taken before the trigger, for both halves of the correlation: the
+            // refresh it starts cannot finish unobserved between here and the
+            // caller's wait (#13086), and a refresh already running when the
+            // caller changed the table cannot answer for it (#13544).
+            let notifier = accelerated_table
+                .refresher()
+                .refresh_completion()
+                .map(|completion| completion.next());
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -4077,7 +4393,7 @@ impl DataFusion {
         partition_service: &PartitionService,
         dataset_name: &TableReference,
         overrides: Option<&RefreshOverrides>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<RefreshCompletionWaiter>> {
         // Run on-demand partition discovery before forwarding the refresh command.
         // This ensures that any new partition values in the source data are discovered,
         // assigned to executors, and executors are notified -- before they receive the
@@ -4347,7 +4663,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<JoinHandle<Option<Arc<Notify>>>> {
+    ) -> Result<JoinHandle<Option<ViewRegistration>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
             return TableAlreadyExistsSnafu.fail();
@@ -4374,7 +4690,7 @@ impl DataFusion {
         let table = view.name.clone();
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
-        let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
+        let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
@@ -4478,12 +4794,15 @@ impl DataFusion {
         Ok(register_task)
     }
 
+    /// Returns the waiter for the view's initial refresh together with the
+    /// identity of the provider this registered it as, so a caller acting once
+    /// that refresh lands can tell the view from a replacement.
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
         view_table: Arc<dyn TableProvider>,
         secrets: Arc<TokioRwLock<Secrets>>,
-    ) -> Result<Option<Arc<Notify>>> {
+    ) -> Result<Option<ViewRegistration>> {
         let table = &view.name;
 
         let acceleration =
@@ -4603,7 +4922,10 @@ impl DataFusion {
                     dataset_name: table.to_string(),
                 })?;
 
-        let is_ready = accelerated_table.refresher().on_complete_notification();
+        let is_ready = accelerated_table
+            .refresher()
+            .refresh_completion()
+            .map(|completion| completion.any());
 
         let table_provider = table_provider_with_spicepod_metadata(
             Arc::new(accelerated_table).table_provider(),
@@ -4612,10 +4934,20 @@ impl DataFusion {
         );
 
         self.ctx
-            .register_table(table.clone(), table_provider)
+            .register_table(table.clone(), Arc::clone(&table_provider))
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to register view: {e}"),
             })?;
+
+        // Taken from the provider just registered, rather than re-resolved by
+        // name once the caller resumes: by then the name may already answer with
+        // a replacement, and the schedule would be built for the wrong view.
+        let registration = is_ready.map(|waiter| {
+            (
+                Self::table_instance_as_registered(table.clone(), &table_provider),
+                waiter,
+            )
+        });
 
         tracing::info!("{}", view_registered_trace(table, Some(acceleration)));
 
@@ -4635,7 +4967,7 @@ impl DataFusion {
                 .update_view(&view.name, status::ComponentStatus::Ready);
         }
 
-        Ok(is_ready)
+        Ok(registration)
     }
 
     /// Returns all table names in user defined schemas (i.e. not system or runtime schemas).
@@ -5182,6 +5514,24 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
     None
 }
 
+/// Whether a write failed the schema check the runtime runs before inserting anything.
+///
+/// No rows were written, so the caller can rebuild its batch against the new schema and retry
+/// without duplicating rows. The wrapping this reads is applied by `write_data`'s
+/// [`QueryEngine`] impl, so the two must change together.
+#[must_use]
+pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> bool {
+    let runtime_query_engine::query_engine::Error::WriteData { source, .. } = error else {
+        return false;
+    };
+    let DataFusionError::External(inner) = source else {
+        return false;
+    };
+    inner
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
+}
+
 // Normalizes a table reference to a full table reference with catalog, schema, and table name
 // so it can be used for comparison.
 fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
@@ -5569,6 +5919,107 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    /// Every way of naming a dataset must give the same lock. The OpenTelemetry ingest uses
+    /// the bare name and a Flight `DoPut` uses the fully-qualified one; separate locks would
+    /// let one of those writes overlap a provider swap and lose its rows.
+    #[tokio::test]
+    async fn schema_evolve_lock_is_shared_across_table_reference_aliases() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        let bare = df.schema_evolve_lock(&TableReference::bare("metric")).await;
+        let partial = df
+            .schema_evolve_lock(&TableReference::partial(SPICE_DEFAULT_SCHEMA, "metric"))
+            .await;
+        let full = df
+            .schema_evolve_lock(&TableReference::full(
+                SPICE_DEFAULT_CATALOG,
+                SPICE_DEFAULT_SCHEMA,
+                "metric",
+            ))
+            .await;
+
+        assert!(
+            Arc::ptr_eq(&bare, &partial) && Arc::ptr_eq(&bare, &full),
+            "every alias of a dataset must share one rebind lock"
+        );
+
+        let other = df.schema_evolve_lock(&TableReference::bare("other")).await;
+        assert!(
+            !Arc::ptr_eq(&bare, &other),
+            "distinct datasets must keep independent locks"
+        );
+    }
+
+    /// A write is admitted for any table name a writable catalog accepts, so writes to names
+    /// that resolve to nothing must not grow the lock map for the life of the process.
+    #[tokio::test]
+    async fn schema_evolve_locks_drop_the_locks_nobody_holds() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        // Ask for far more locks than the bound, keeping none of them.
+        for i in 0..MAX_SCHEMA_EVOLVE_LOCKS * 3 {
+            let _ = df
+                .schema_evolve_lock(&TableReference::bare(format!("unknown_{i}")))
+                .await;
+        }
+
+        let held = df.schema_evolve_locks.read().await.len();
+        assert!(
+            held <= MAX_SCHEMA_EVOLVE_LOCKS,
+            "the lock map must stay bounded, holds {held} entries"
+        );
+    }
+
+    /// A lock in use must survive the cleanup, or two writers to the same dataset would take
+    /// different locks and stop excluding each other.
+    #[tokio::test]
+    async fn schema_evolve_locks_keep_the_locks_still_in_use() {
+        let rt = RuntimeBuilder::new().build().await;
+        let df = rt.datafusion();
+
+        let held_lock = df.schema_evolve_lock(&TableReference::bare("in_use")).await;
+
+        // Fill the map past its bound so the next call cleans up.
+        for i in 0..=MAX_SCHEMA_EVOLVE_LOCKS {
+            let _ = df
+                .schema_evolve_lock(&TableReference::bare(format!("unknown_{i}")))
+                .await;
+        }
+
+        let same_lock = df.schema_evolve_lock(&TableReference::bare("in_use")).await;
+        assert!(
+            Arc::ptr_eq(&held_lock, &same_lock),
+            "a lock someone still holds must not be replaced"
+        );
+    }
+
+    /// Reloading a dataset replaces its pending-registration entry. A registration finishing
+    /// against the old entry must leave the replacement alone, or the reloaded dataset can
+    /// never register on its first write.
+    #[test]
+    fn remove_if_same_leaves_a_replacement_entry_in_place() {
+        let key = TableReference::bare("metric");
+        let mut map: HashMap<TableReference, Arc<u8>> = HashMap::new();
+
+        // The entry a caller claimed, then replaced by a reload.
+        let claimed = Arc::new(1_u8);
+        let replacement = Arc::new(2_u8);
+        map.insert(key.clone(), Arc::clone(&replacement));
+
+        remove_if_same(&mut map, &key, &claimed);
+        assert!(
+            map.get(&key).is_some_and(|v| Arc::ptr_eq(v, &replacement)),
+            "the replacement entry must survive"
+        );
+
+        // The unreplaced case still removes.
+        map.insert(key.clone(), Arc::clone(&claimed));
+        remove_if_same(&mut map, &key, &claimed);
+        assert!(!map.contains_key(&key), "the claimed entry must be removed");
+    }
 
     #[test]
     fn accelerated_sink_dataset_writes_to_accelerator_only() {
@@ -6668,6 +7119,278 @@ mod tests {
             assert_eq!(strip_outer_parens("foo".to_string()), "foo");
             assert_eq!(strip_outer_parens("(foo".to_string()), "(foo");
             assert_eq!(strip_outer_parens("foo)".to_string()), "foo)");
+        }
+    }
+
+    /// Revalidating a deferred action against the table it was started for.
+    ///
+    /// A refresh completion resolves `Answered` for a table that has since been
+    /// removed or rebuilt — `Abandoned` reports only a drop that happens before
+    /// any completion is recorded — so the callers that act on one re-resolve the
+    /// table too. Regression tests for #13603.
+    mod deferred_refresh {
+        use super::*;
+        use crate::accelerated::refresh_completion::RefreshCompletion;
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+
+        fn test_df() -> DataFusion {
+            DataFusionBuilder::new(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build()
+        }
+
+        /// A distinct provider instance each call, so identity is the only thing
+        /// telling two registrations of the same name apart.
+        fn a_table() -> Arc<dyn TableProvider> {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table"))
+        }
+
+        fn register(df: &DataFusion, name: &TableReference) {
+            df.ctx
+                .register_table(name.clone(), a_table())
+                .expect("register");
+        }
+
+        #[tokio::test]
+        async fn a_refresh_on_an_untouched_table_applies() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record(completion.issue());
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Apply,
+                "an untouched table must still apply, or every deferred action is dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refresh_no_recorder_ever_answered_is_abandoned() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            drop(completion);
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Abandoned,
+            );
+        }
+
+        /// The reported bug: the completion *is* recorded, so the wait answers,
+        /// and only then does the table go. `Abandoned` cannot see this.
+        #[tokio::test]
+        async fn a_table_removed_after_its_refresh_landed_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record(completion.issue());
+
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::TableChanged,
+                "a completion recorded before the table went still reads as answered, so the table itself has to be re-resolved"
+            );
+        }
+
+        /// The case an existence check cannot see: the name is registered the
+        /// whole time, but not to the table the action was started for. Applying
+        /// here reports the old table's result against the new one.
+        #[tokio::test]
+        async fn a_table_rebuilt_after_its_refresh_landed_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record(completion.issue());
+
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+            register(&df, &name);
+
+            assert!(
+                df.table_exists(&name),
+                "precondition: the rebuild leaves a table registered under the name, so existence alone cannot detect this"
+            );
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::TableChanged,
+                "a rebuilt table is a different table: the action was captured against the instance the rebuild replaced"
+            );
+        }
+
+        /// Abandonment is reported ahead of the table check, so a caller can tell
+        /// "no refresh ran" from "it ran, for a table that is gone".
+        #[tokio::test]
+        async fn abandonment_is_reported_even_when_the_table_is_also_gone() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            drop(completion);
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Abandoned,
+            );
+        }
+
+        /// A caller with nothing to wait for still has a table that may have gone.
+        #[tokio::test]
+        async fn a_missing_waiter_still_re_resolves_the_table() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            assert_eq!(
+                df.await_refresh_completion(instance, None).await,
+                DeferredRefreshOutcome::Apply,
+            );
+
+            let instance = df.capture_table_instance(&name).await;
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+            assert_eq!(
+                df.await_refresh_completion(instance, None).await,
+                DeferredRefreshOutcome::TableChanged,
+            );
+        }
+
+        /// Nothing resolved at capture time leaves no identity to compare, so the
+        /// check falls back to existence. Refusing outright instead would strand
+        /// a legitimately registered table's readiness ack for good.
+        #[tokio::test]
+        async fn an_instance_captured_over_no_table_falls_back_to_existence() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+
+            let instance = df.capture_table_instance(&name).await;
+            assert!(
+                !df.table_instance_is_current(&instance).await,
+                "no table captured and none registered: nothing for the action to be about"
+            );
+
+            let absent = TableReference::bare("absent");
+            let instance = df.capture_table_instance(&absent).await;
+            register(&df, &absent);
+            assert!(
+                df.table_instance_is_current(&instance).await,
+                "with no captured identity the check can only ask whether the name is registered"
+            );
+        }
+
+        /// A provider that owns its `RefreshCompletion`, the way a real
+        /// `AcceleratedTable` owns the `Refresher` that holds one. The doubles
+        /// above let the test drop the recorder by hand, which is the one thing
+        /// production cannot do: there the recorder's lifetime *is* the
+        /// provider's.
+        #[derive(Debug)]
+        struct ProviderOwningItsCompletion {
+            inner: MemTable,
+            _completion: RefreshCompletion,
+        }
+
+        impl ProviderOwningItsCompletion {
+            fn new(completion: RefreshCompletion) -> Self {
+                let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                    "a",
+                    DataType::Int32,
+                    false,
+                )]));
+                Self {
+                    inner: MemTable::try_new(schema, vec![vec![]]).expect("mem table"),
+                    _completion: completion,
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TableProvider for ProviderOwningItsCompletion {
+            fn schema(&self) -> arrow::datatypes::SchemaRef {
+                self.inner.schema()
+            }
+            fn table_type(&self) -> datafusion::datasource::TableType {
+                self.inner.table_type()
+            }
+            async fn scan(
+                &self,
+                state: &dyn datafusion::catalog::Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[Expr],
+                limit: Option<usize>,
+            ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>
+            {
+                self.inner.scan(state, projection, filters, limit).await
+            }
+        }
+
+        /// Removing a table has to let a waiter taken from *that table's own*
+        /// recorder end. The recorder lives inside the provider, so an instance
+        /// that pinned the provider across the wait pinned the recorder with it,
+        /// and the signal the wait is watching could never close.
+        #[tokio::test]
+        async fn a_removed_table_does_not_pin_its_own_recorder_across_the_wait() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            // Moved, not cloned: the provider now holds the only recorder, the
+            // way an accelerated table holds the one inside its refresher.
+            df.ctx
+                .register_table(
+                    name.clone(),
+                    Arc::new(ProviderOwningItsCompletion::new(completion)),
+                )
+                .expect("register");
+
+            let instance = df.capture_table_instance(&name).await;
+            df.ctx.deregister_table(name.clone()).expect("deregister");
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                df.await_refresh_completion(instance, Some(waiter)),
+            )
+            .await
+            .expect(
+                "the wait must end: dropping the table drops its recorder, which closes the signal",
+            );
+
+            assert_eq!(
+                outcome,
+                DeferredRefreshOutcome::Abandoned,
+                "no refresh was ever recorded, and none can be now the table is gone"
+            );
         }
     }
 }

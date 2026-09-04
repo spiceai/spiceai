@@ -30,6 +30,7 @@ use data_components::RefreshableCatalogProvider;
 use data_components::mysql::provider::MySQLCatalogProvider;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -88,7 +89,15 @@ impl CatalogConnector for MySQLCatalog {
             })?;
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(MySQLTableFactory::new(Arc::clone(&pool)));
+        // Install the Spice function deny-list so federation evaluates Spice-only
+        // UDFs (`json_get_str`, the embedding/distance UDFs, etc.) locally instead
+        // of pushing them into the SQL sent to MySQL, where those functions don't
+        // exist and the query fails with an "unknown function" error. The dataset
+        // connector already does this; see issues #10703 and #13664.
+        let table_factory = Arc::new(
+            MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_functions_for_table_providers()),
+        );
 
         // Create a separate mysql_async::Pool for metadata queries.
         // `MySQLTableFactory` requires `MySQLConnectionPool` while metadata discovery uses

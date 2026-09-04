@@ -48,7 +48,7 @@ use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
-    logical_expr::{Expr, Operator, cast, col},
+    logical_expr::{Expr, Operator, col},
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
@@ -248,6 +248,11 @@ pub struct RefreshTaskBuilder {
     /// Per-dataset `cdc_*` parameter overrides drawn from
     /// `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// The cache keys a write is pending for, shared with the caching scan and
+    /// its batched writer. `RefreshMode::Caching`'s periodic stale-row refresh
+    /// replaces the entries it refreshes, so it has to claim each key for the
+    /// same reason every other writer does — see [`caching::CacheKeyClaim`].
+    in_flight_revalidations: super::caching::InFlightRevalidations,
 }
 
 impl RefreshTaskBuilder {
@@ -281,6 +286,9 @@ impl RefreshTaskBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
+            in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -369,6 +377,17 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Share the caching accelerator's claim set, so the periodic stale-row
+    /// refresh claims the keys it replaces.
+    #[must_use]
+    pub fn with_in_flight_revalidations(
+        mut self,
+        in_flight_revalidations: super::caching::InFlightRevalidations,
+    ) -> RefreshTaskBuilder {
+        self.in_flight_revalidations = in_flight_revalidations;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides. These layer on top of
     /// the process-global [`changes::CdcConfig`] only for this dataset's
     /// changes stream.
@@ -444,6 +463,7 @@ impl RefreshTaskBuilder {
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
+            in_flight_revalidations: self.in_flight_revalidations,
         }
     }
 }
@@ -522,6 +542,7 @@ pub struct RefreshTask {
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    in_flight_revalidations: super::caching::InFlightRevalidations,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -604,36 +625,40 @@ impl RefreshTask {
             .iter()
             .last()
             .unwrap_or_else(|| unreachable!("There is always at least one span"));
-        retry(retry_strategy, || async {
+        let result = retry(retry_strategy, || async {
             match self.run_once(&refresh).await {
                 Ok(()) => Ok(()),
-                Err(e) => {
-                    for label_set in self.get_dataset_label_sets(&refresh.mode).await {
-                        metrics::REFRESH_ERRORS.add(1, &label_set);
+                Err(retry_err) => {
+                    if !self.runtime_status.is_shutdown()
+                        && let Some(error) = attempt_refresh_error(&retry_err)
+                    {
+                        self.record_refresh_error(error, &refresh.mode).await;
                     }
-                    Err(e)
+                    Err(retry_err)
                 }
             }
         })
         .instrument(span.clone())
-        .await
-        .inspect_err(|e| {
-            // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
-            // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::error!(
-                    "Failed to refresh {} {}: {e}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    )
-                );
-                for span in &spans {
-                    tracing::error!(target: "task_history", parent: span, "{e}");
-                }
+        .await;
+
+        // Log any failure that ended the loop. Generation-change is counted
+        // here so a recovered 412 is silent; other errors were counted above
+        // on each attempt so unbounded retries stay visible.
+        if let Some(e) = terminal_refresh_error(&result, self.runtime_status.is_shutdown()) {
+            tracing::error!(
+                "Failed to refresh {} {}: {e}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref())
+            );
+            for span in &spans {
+                tracing::error!(target: "task_history", parent: span, "{e}");
             }
-        })
+            if let Some(error) = terminal_generation_change_refresh_error(&result, false) {
+                self.record_refresh_error(error, &refresh.mode).await;
+            }
+        }
+
+        result
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
@@ -1208,6 +1233,7 @@ impl RefreshTask {
             self.dataset_name.to_string().as_str(),
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
+            Arc::clone(&self.in_flight_revalidations),
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
@@ -2162,7 +2188,7 @@ impl RefreshTask {
         // Extract the max timestamp value based on the column's data type.
         // - String columns (ISO8601): parse the ISO string back to nanos
         // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
-        // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
+        // - Timestamp and date columns: normalized to nanoseconds in memory
         // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
         let iso_str_value = col_array
             .as_any()
@@ -2249,18 +2275,23 @@ impl RefreshTask {
                 }
             }
         } else {
-            let array = col_array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-                })?;
+            // The query returns the column in the acceleration's own type, so normalize
+            // the unit here instead of asking the engine to CAST (see `max_timestamp_df`).
+            let nanos = temporal_scalar_as_nanos(col_array).map_err(|e| {
+                super::Error::FailedToFindLatestTimestamp {
+                    reason: format!(
+                        "Failed to read the latest value of time column '{column}' ({}) in dataset '{}', so the append refresh cannot resume: {e}",
+                        accelerated_field.data_type(),
+                        self.dataset_name
+                    ),
+                }
+            })?;
 
-            if array.is_empty() || array.is_null(0) {
+            let Some(nanos) = nanos else {
                 return Ok(None);
-            }
+            };
 
-            array.value(0) as u128
+            nanos as u128
         };
 
         if is_integer_time_column {
@@ -2326,8 +2357,14 @@ impl RefreshTask {
             .collect()
     }
 
+    async fn record_refresh_error(&self, error: &super::Error, mode: &RefreshMode) {
+        emit_refresh_errors(
+            self.get_dataset_label_sets(mode).await,
+            refresh_error_reason(error),
+        );
+    }
+
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
-        let is_error = status.is_error();
         let is_ready = status == status::ComponentStatus::Ready;
 
         // Mark initial load complete BEFORE updating the runtime status to Ready.
@@ -2342,11 +2379,6 @@ impl RefreshTask {
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
-            if is_error {
-                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
-                metrics::REFRESH_ERRORS.add(1, &labels);
-            }
-
             if is_ready {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -2661,36 +2693,45 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let schema = accelerator.schema();
-    let needs_cast = schema.column_with_name(column).is_some_and(|(_, f)| {
-        // Only CAST for native date/time/timestamp types that need precision normalization.
-        // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
-        // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
-        // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
-        matches!(
-            f.data_type(),
-            DataType::Date32
-                | DataType::Date64
-                | DataType::Time32(_)
-                | DataType::Time64(_)
-                | DataType::Timestamp(_, _)
-        )
-    });
-
-    let expr = if needs_cast {
-        cast(
-            ident(column),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        )
-        .alias("a")
-    } else {
-        ident(column).alias("a")
-    };
-
+    // Sort on the raw column. A cast would land on the sort key, where `TopK` turns it
+    // into a dynamic filter the scan has to evaluate against its own statistics — Vortex
+    // has no kernel for a timestamp cast, so the refresh fails (#13468).
+    // `timestamp_nanos_for_append_query` normalizes the one value it reads back instead.
     accelerator_df(accelerator, &ctx)?
-        .select(vec![expr])?
+        .select(vec![ident(column).alias("a")])?
         .sort(vec![col("a").sort(false, false)])?
         .limit(0, Some(1))
+}
+
+/// Read the single temporal value `max_timestamp_df` returned as epoch nanoseconds,
+/// whatever unit and timezone the acceleration stores it in.
+///
+/// `safe: false` reports an out-of-range value as an error rather than a NULL, which the
+/// caller would read as "no watermark" and re-append history.
+fn temporal_scalar_as_nanos(array: &dyn Array) -> Result<Option<i64>, ArrowError> {
+    let nanos = arrow::compute::kernels::cast::cast_with_options(
+        array,
+        &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        &arrow::compute::CastOptions {
+            safe: false,
+            ..arrow::compute::CastOptions::default()
+        },
+    )?;
+
+    let nanos = nanos
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| {
+            ArrowError::CastError(
+                "cast to Timestamp(ns) did not yield a nanosecond timestamp".into(),
+            )
+        })?;
+
+    if nanos.is_empty() || nanos.is_null(0) {
+        return Ok(None);
+    }
+
+    Ok(Some(nanos.value(0)))
 }
 
 fn accelerator_df(
@@ -2955,7 +2996,7 @@ fn dedup_predicates(
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
-    if is_retriable_error(&error) {
+    if is_retriable_error(&error) || is_object_generation_changed_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector {
             source: find_datafusion_root(error),
         });
@@ -2963,6 +3004,158 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     RetryError::permanent(super::Error::FailedToRefreshDataset {
         source: find_datafusion_root(error),
     })
+}
+
+fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
+    for mut label_set in label_sets {
+        label_set.push(KeyValue::new(metrics::REFRESH_ERROR_REASON, reason));
+        metrics::REFRESH_ERRORS.add(1, &label_set);
+    }
+}
+
+/// One Prometheus registry + meter provider for this crate's tests.
+///
+/// `REFRESH_ERRORS` is a `LazyLock` on the global meter. Installing a second
+/// provider after the first instrument is built binds the counter to the
+/// other registry, so tests that scrape would read zero. Share this installer.
+#[cfg(test)]
+pub(crate) fn test_prometheus_registry() -> &'static prometheus::Registry {
+    static REGISTRY: std::sync::OnceLock<prometheus::Registry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let registry = prometheus::Registry::new();
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry.clone())
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()
+            .expect("to build prometheus exporter");
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(prometheus_exporter)
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+        registry
+    })
+}
+
+/// The error that ended a refresh retry loop, if the refresh itself failed.
+///
+/// A recovered retry (`Ok`) and a shutdown abort are not refresh failures.
+/// Used for the user-facing error log. Metric increments use
+/// [`attempt_refresh_error`] and [`terminal_generation_change_refresh_error`].
+#[must_use]
+fn terminal_refresh_error(result: &super::Result<()>, shutdown: bool) -> Option<&super::Error> {
+    if shutdown {
+        return None;
+    }
+    result.as_ref().err()
+}
+
+/// Failed attempts that are not a generation-change increment immediately so a
+/// persistent connector error stays visible while retries continue (`refresh_retry_max_attempts`
+/// defaults to unlimited). Generation-change waits for the terminal outcome.
+fn attempt_refresh_error(error: &RetryError<super::Error>) -> Option<&super::Error> {
+    let inner = inner_err_from_retry_ref(error);
+    if refresh_error_reason(inner) == metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+/// An exhausted generation-change after the retry loop. A recovered 412 is
+/// `Ok` and is not counted; a non-generation terminal was already counted
+/// per attempt.
+fn terminal_generation_change_refresh_error(
+    result: &super::Result<()>,
+    shutdown: bool,
+) -> Option<&super::Error> {
+    let error = terminal_refresh_error(result, shutdown)?;
+    if refresh_error_reason(error) == metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED {
+        Some(error)
+    } else {
+        None
+    }
+}
+
+/// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
+///
+/// Generation-change is checked first so a 412 wrapped in a Parquet fetch
+/// error is still filterable, not classified as decoder corruption.
+#[must_use]
+pub fn refresh_error_reason(error: &super::Error) -> &'static str {
+    if error_chain_matches(error, looks_like_generation_change) {
+        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+    } else if error_chain_matches(error, looks_like_parquet_decode) {
+        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+    } else {
+        metrics::REFRESH_ERROR_REASON_OTHER
+    }
+}
+
+/// Classify a refresh/scan error message the same way the metric does.
+///
+/// Used by the listing-table overwrite integration test to assert the
+/// filterable label against the real error text.
+#[must_use]
+pub fn refresh_error_reason_from_message(message: &str) -> &'static str {
+    if looks_like_generation_change(message) {
+        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+    } else if looks_like_parquet_decode(message) {
+        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+    } else {
+        metrics::REFRESH_ERROR_REASON_OTHER
+    }
+}
+
+/// A listed object was replaced while the scan still held the old generation.
+///
+/// Pinning turns that into a store precondition failure (`412` / `If-Match`)
+/// rather than a decoder error. Relisting and re-planning is the recovery.
+fn is_object_generation_changed_error(error: &DataFusionError) -> bool {
+    error_chain_matches(error, looks_like_generation_change)
+}
+
+fn looks_like_generation_change(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // object_store::Error::Precondition displays as "Request precondition
+    // failure for path …". "412 Precondition Failed" also appears on unrelated
+    // HTTP 412s, including GraphQL `HTTP 412 Precondition Failed: …` wrapped as
+    // `DataFusionError::Execution`.
+    lower.contains("request precondition failure")
+}
+
+fn looks_like_parquet_decode(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // `snappy:` is the codec prefix on `snappy: corrupt input`. A bare
+    // "snappy" also matches object keys like `snappy/archive/data.parquet`.
+    // A bare "corrupt input" is any decompressor (CSV, gzip, …), so it is
+    // not a Parquet label. Generic I/O (`unexpected eof`, `failed to fill
+    // whole buffer`, `eof:`) also appears on connector disconnects, so
+    // those need Parquet context.
+    lower.contains("snappy:")
+        || lower.contains("corrupt footer")
+        || lower.contains("invalid page header")
+        || lower.contains("parquet argument error")
+        || lower.contains("range length must match")
+        || lower.contains("does not match length")
+        || (lower.contains("parquet")
+            && (lower.contains("failed to fill whole buffer")
+                || lower.contains("unexpected eof")
+                || lower.contains("eof:")))
+}
+
+fn error_chain_matches(error: &dyn std::error::Error, predicate: fn(&str) -> bool) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(error);
+    while let Some(err) = current {
+        if predicate(&err.to_string()) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
@@ -3014,22 +3207,31 @@ mod tests {
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
-        Date32Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, UInt32Array, UInt64Array,
+        ArrayRef, Date32Array, Date64Array, Float16Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
+        UInt64Array,
     };
     use arrow::datatypes::{ArrowPrimitiveType, TimeUnit};
     use arrow_schema::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use data_components::arrow::write::MemTable;
+    use datafusion::catalog::Session;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
+    use opentelemetry::KeyValue;
+    use prometheus::proto::MetricType;
     use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+    use runtime_metrics::acceleration as metrics;
     use spice_table::IndexLayer;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
+    use util::fibonacci_backoff::FibonacciBackoffBuilder;
+    use util::{RetryError, retry};
 
     #[derive(Debug)]
     struct TestRefreshIndex;
@@ -3205,6 +3407,524 @@ mod tests {
         // Should not match partial error names
         assert!(!is_s3_express_upload_speed_error("ClientUpload"));
         assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn object_generation_change_is_a_transient_refresh_error() {
+        let precondition = DataFusionError::External(Box::new(std::io::Error::other(
+            "Request precondition failure for path listing/data.parquet: 412 Precondition Failed",
+        )));
+        assert!(is_object_generation_changed_error(&precondition));
+        let classified = retry_from_df_error(precondition);
+        assert!(
+            matches!(&classified, RetryError::Transient { .. }),
+            "a replaced object must re-list, not fail the refresh"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let path_digits = DataFusionError::External(Box::new(std::io::Error::other(
+            "Object at path listing/archive/412/data.parquet: AccessDenied",
+        )));
+        assert!(
+            !is_object_generation_changed_error(&path_digits),
+            "a 412 in the object key is not a generation change"
+        );
+        let classified = retry_from_df_error(path_digits);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "AccessDenied must stay permanent even when the key contains 412"
+        );
+
+        let plan = DataFusionError::Plan("column not found".to_string());
+        assert!(!is_object_generation_changed_error(&plan));
+        let classified = retry_from_df_error(plan);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "a planning error stays permanent"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+
+        let connector_precondition = DataFusionError::Plan(
+            "connector precondition is not satisfied: primary key is missing".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&connector_precondition),
+            "a planner 'precondition' is not an object replacement"
+        );
+        let classified = retry_from_df_error(connector_precondition);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "a planner precondition must stay permanent"
+        );
+
+        let sql_precondition = DataFusionError::Execution(
+            "SQL precondition failed before scanning any object".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&sql_precondition),
+            "an execution 'precondition' is not an object replacement"
+        );
+        let classified = retry_from_df_error(sql_precondition);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "an execution precondition must stay permanent"
+        );
+
+        let if_match_path = DataFusionError::External(Box::new(std::io::Error::other(
+            "Object at path listing/if-match/data.parquet: AccessDenied",
+        )));
+        assert!(
+            !is_object_generation_changed_error(&if_match_path),
+            "If-Match in the object key is not a generation change"
+        );
+        let classified = retry_from_df_error(if_match_path);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "AccessDenied must stay permanent even when the key contains if-match"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+
+        // GraphQL formats HTTP 412 as `HTTP {status}: {message}` and wraps it
+        // as `DataFusionError::Execution`. That is not an object-store
+        // generation pin (`Request precondition failure for path …`).
+        let graphql_412 = DataFusionError::Execution(
+            "HTTP 412 Precondition Failed: resource version conflict".to_string(),
+        );
+        assert!(
+            !is_object_generation_changed_error(&graphql_412),
+            "an unrelated HTTP 412 must not be a listing-table generation change"
+        );
+        let classified = retry_from_df_error(graphql_412);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "GraphQL HTTP 412 must not become a transient generation-change retry"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message(
+                "HTTP 412 Precondition Failed: resource version conflict"
+            ),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+    }
+
+    #[test]
+    fn parquet_decode_is_not_a_generation_change() {
+        let snappy = DataFusionError::External(Box::new(std::io::Error::other(
+            "Parquet error: Arrow: Parquet argument error: External: snappy: corrupt input \
+             (expected copy read of length 1; remaining src: 0)",
+        )));
+        assert!(!is_object_generation_changed_error(&snappy));
+        let classified = retry_from_df_error(snappy);
+        assert!(
+            matches!(&classified, RetryError::Permanent(_)),
+            "genuine Parquet corruption must not retry as a generation change"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&classified)),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+
+        let page_header = DataFusionError::External(Box::new(std::io::Error::other(
+            "Parquet error: Arrow: Parquet argument error: EOF: Invalid page header",
+        )));
+        assert_eq!(
+            refresh_error_reason_from_message(&page_header.to_string()),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        assert_ne!(
+            refresh_error_reason_from_message(&page_header.to_string()),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let footer = "Parquet error: Invalid Parquet file. Corrupt footer";
+        assert_eq!(
+            refresh_error_reason_from_message(footer),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        assert_ne!(
+            refresh_error_reason_from_message(footer),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+
+        let snappy_path = "Object at path snappy/archive/data.parquet: AccessDenied";
+        assert_eq!(
+            refresh_error_reason_from_message(snappy_path),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        let path_classified = retry_from_df_error(DataFusionError::External(Box::new(
+            std::io::Error::other(snappy_path),
+        )));
+        assert!(
+            matches!(&path_classified, RetryError::Permanent(_)),
+            "AccessDenied on a snappy-named path must stay permanent"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&path_classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message(
+                "Parquet error: Arrow: Parquet argument error: External: snappy: corrupt input \
+                 (expected copy read of length 1; remaining src: 0)"
+            ),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        let mysql_eof = "MySQL connection closed: unexpected eof during binlog stream";
+        assert_eq!(
+            refresh_error_reason_from_message(mysql_eof),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        assert_eq!(
+            refresh_error_reason_from_message("Parquet error: Arrow: failed to fill whole buffer"),
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        );
+        let csv_corrupt = "CSV decompression failed: corrupt input";
+        assert_eq!(
+            refresh_error_reason_from_message(csv_corrupt),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+        let csv_classified = retry_from_df_error(DataFusionError::External(Box::new(
+            std::io::Error::other(csv_corrupt),
+        )));
+        assert!(
+            matches!(&csv_classified, RetryError::Permanent(_)),
+            "unrelated corrupt-input text must stay a permanent non-Parquet error"
+        );
+        assert_eq!(
+            refresh_error_reason(inner_err_from_retry_ref(&csv_classified)),
+            metrics::REFRESH_ERROR_REASON_OTHER
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_generation_change_does_not_record_a_refresh_error() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(3))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let result: super::super::Result<()> = retry(retry_strategy, || async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Err(retry_from_df_error(DataFusionError::External(Box::new(
+                    std::io::Error::other(
+                        "Request precondition failure for path listing/data.parquet: \
+                         412 Precondition Failed",
+                    ),
+                ))));
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok(), "a 412 must recover on retry: {result:?}");
+        assert!(
+            terminal_refresh_error(&result, false).is_none(),
+            "a successful retry must not increment dataset_acceleration_refresh_errors"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the recovered path must have retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_generation_change_records_one_reason_labeled_error() {
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(0))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let result: super::super::Result<()> = retry(retry_strategy, || async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(retry_from_df_error(DataFusionError::External(Box::new(
+                std::io::Error::other(
+                    "Request precondition failure for path listing/data.parquet: \
+                     412 Precondition Failed",
+                ),
+            ))))
+        })
+        .await;
+        let recorded = terminal_refresh_error(&result, false)
+            .expect("an exhausted generation-change is a refresh error");
+        assert_eq!(
+            refresh_error_reason(recorded),
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        );
+        assert!(
+            terminal_refresh_error(&result, true).is_none(),
+            "shutdown must not increment dataset_acceleration_refresh_errors"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "max_retries=0 must attempt once and then count exactly one terminal error"
+        );
+    }
+
+    fn refresh_error_count(registry: &prometheus::Registry, dataset: &str, reason: &str) -> f64 {
+        for family in registry.gather() {
+            if family.name() != "dataset_acceleration_refresh_errors"
+                || family.get_field_type() != MetricType::COUNTER
+            {
+                continue;
+            }
+            for series in family.get_metric() {
+                let labels = series.get_label();
+                let dataset_ok = labels
+                    .iter()
+                    .any(|label| label.name() == "dataset" && label.value() == dataset);
+                let reason_ok = labels
+                    .iter()
+                    .any(|label| label.name() == "reason" && label.value() == reason);
+                if dataset_ok
+                    && reason_ok
+                    && let Some(counter) = series.get_counter().as_ref()
+                {
+                    return counter.value();
+                }
+            }
+        }
+        0.0
+    }
+
+    fn generation_change_labels() -> Vec<Vec<KeyValue>> {
+        vec![vec![
+            KeyValue::new("dataset", "generation_change_metric_test"),
+            KeyValue::new("mode", "full"),
+        ]]
+    }
+
+    fn generation_change_df_error() -> DataFusionError {
+        DataFusionError::External(Box::new(std::io::Error::other(
+            "Request precondition failure for path listing/data.parquet: \
+             412 Precondition Failed",
+        )))
+    }
+
+    #[tokio::test]
+    async fn generation_change_refresh_errors_are_scraped_once_from_the_terminal_outcome() {
+        let registry = super::test_prometheus_registry().clone();
+        let recovered_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(3))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let recovered: super::super::Result<()> = retry(recovered_strategy, || async {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Err(retry_from_df_error(generation_change_df_error()));
+            }
+            Ok(())
+        })
+        .await;
+        assert!(
+            recovered.is_ok(),
+            "a 412 must recover on retry: {recovered:?}"
+        );
+        if let Some(error) = terminal_refresh_error(&recovered, false) {
+            emit_refresh_errors(generation_change_labels(), refresh_error_reason(error));
+        }
+        let recovered_count = refresh_error_count(
+            &registry,
+            "generation_change_metric_test",
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            recovered_count.abs() < f64::EPSILON,
+            "a recovered 412 must emit zero dataset_acceleration_refresh_errors points (got {recovered_count})"
+        );
+
+        let exhausted_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(Some(0))
+            .max_duration(Some(Duration::from_millis(1)))
+            .build();
+        let exhausted: super::super::Result<()> = retry(exhausted_strategy, || async {
+            Err(retry_from_df_error(generation_change_df_error()))
+        })
+        .await;
+        let recorded = terminal_refresh_error(&exhausted, false)
+            .expect("an exhausted generation-change is a refresh error");
+        emit_refresh_errors(generation_change_labels(), refresh_error_reason(recorded));
+        let exhausted_count = refresh_error_count(
+            &registry,
+            "generation_change_metric_test",
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            (exhausted_count - 1.0).abs() < f64::EPSILON,
+            "an exhausted 412 must emit exactly one reason-labeled refresh error (got {exhausted_count})"
+        );
+    }
+
+    /// `attempt_refresh_error` classifies non-generation failures for immediate
+    /// per-attempt metric increments and suppresses generation-change so a
+    /// recovered 412 is counted once at the terminal outcome only.
+    #[test]
+    fn attempt_refresh_error_suppresses_generation_change_and_counts_other() {
+        // A generation-change transient must return None (counted at terminal).
+        let gen_change =
+            retry_from_df_error(DataFusionError::External(Box::new(std::io::Error::other(
+                "Request precondition failure for path listing/data.parquet: \
+                 412 Precondition Failed",
+            ))));
+        assert!(
+            attempt_refresh_error(&gen_change).is_none(),
+            "generation-change must be suppressed from per-attempt metric"
+        );
+
+        // A non-generation permanent failure must be returned immediately.
+        let io_err = RetryError::permanent(super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::External(Box::new(std::io::Error::other(
+                "Execution error: connection reset by peer",
+            ))),
+        });
+        assert!(
+            attempt_refresh_error(&io_err).is_some(),
+            "a non-generation failure must be returned for per-attempt increment"
+        );
+        assert_eq!(
+            refresh_error_reason(attempt_refresh_error(&io_err).expect("just asserted some")),
+            metrics::REFRESH_ERROR_REASON_OTHER,
+        );
+    }
+
+    /// A persistent non-generation failure on the real `RefreshTask::run`
+    /// retry path increments `dataset_acceleration_refresh_errors` on every
+    /// attempt. Removing the per-attempt `record_refresh_error` call in `run`
+    /// makes this fail (terminal generation-change counting does not apply).
+    #[tokio::test]
+    async fn non_generation_attempt_error_increments_on_each_retry() {
+        let registry = super::test_prometheus_registry().clone();
+
+        let dataset = "non_gen_run_retry_metric";
+        let reason = metrics::REFRESH_ERROR_REASON_OTHER;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(AlwaysFailingScan {
+            schema: Arc::clone(&schema),
+            attempts: Arc::clone(&attempts),
+        })));
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare(dataset),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let before = refresh_error_count(&registry, dataset, reason);
+        let refresh = Refresh::new(RefreshMode::Full).with_retry(true, Some(2));
+        let result = task.run(refresh).await;
+        assert!(
+            result.is_err(),
+            "a persistent connector failure must exhaust retries: {result:?}"
+        );
+
+        let scans = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            scans, 3,
+            "max_retries=2 must attempt once plus two retries (got {scans})"
+        );
+
+        let after = refresh_error_count(&registry, dataset, reason);
+        assert!(
+            (after - before - f64::from(scans)).abs() < f64::EPSILON,
+            "each failed RefreshTask::run attempt must emit one refresh-error point (before={before} after={after} scans={scans})"
+        );
+        let generation_count = refresh_error_count(
+            &registry,
+            dataset,
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED,
+        );
+        assert!(
+            generation_count.abs() < f64::EPSILON,
+            "a non-generation connector failure must not be labeled object_generation_changed (got {generation_count})"
+        );
+    }
+
+    #[derive(Debug)]
+    struct AlwaysFailingScan {
+        schema: SchemaRef,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl TableProvider for AlwaysFailingScan {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(DataFusionError::Execution(
+                "connection reset by peer".to_string(),
+            ))
+        }
+    }
+
+    /// `terminal_generation_change_refresh_error` is `None` for non-generation errors
+    /// (they were already counted per-attempt) and `Some` for exhausted 412s.
+    #[test]
+    fn terminal_generation_change_refresh_error_selects_only_generation_errors() {
+        let gen_result: super::super::Result<()> =
+            Err(super::super::Error::FailedToRefreshDataset {
+                source: DataFusionError::External(Box::new(std::io::Error::other(
+                    "Request precondition failure for path listing/data.parquet: \
+                     412 Precondition Failed",
+                ))),
+            });
+        assert!(
+            terminal_generation_change_refresh_error(&gen_result, false).is_some(),
+            "exhausted generation-change must be returned for terminal metric"
+        );
+        assert!(
+            terminal_generation_change_refresh_error(&gen_result, true).is_none(),
+            "shutdown must suppress even a generation-change terminal error"
+        );
+
+        let other_result: super::super::Result<()> =
+            Err(super::super::Error::FailedToRefreshDataset {
+                source: DataFusionError::External(Box::new(std::io::Error::other(
+                    "connection reset by peer",
+                ))),
+            });
+        assert!(
+            terminal_generation_change_refresh_error(&other_result, false).is_none(),
+            "a non-generation terminal error must not be counted again at terminal"
+        );
     }
 
     #[test]
@@ -3563,9 +4283,8 @@ mod tests {
         );
     }
 
-    /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
     #[tokio::test]
-    async fn test_max_timestamp_df_timestamp_uses_cast() {
+    async fn test_max_timestamp_df_timestamp_sorts_without_cast() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time_col",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -3588,11 +4307,119 @@ mod tests {
         let ctx = SessionContext::new();
         let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
 
-        // Verify the plan uses Cast, not MAX
+        // A cast here would land on the sort key, where `TopK` turns it into a dynamic
+        // filter the scan cannot evaluate (#13468).
         let plan_str = format!("{:?}", df.logical_plan());
         assert!(
-            plan_str.contains("Cast("),
-            "timestamp column should use Cast, got: {plan_str}"
+            !plan_str.contains("Cast("),
+            "timestamp column should sort without a cast, got: {plan_str}"
+        );
+    }
+
+    /// Read a one-column accelerator through `max_timestamp_df` and the same
+    /// normalization `timestamp_nanos_for_append_query` applies to the value it returns.
+    async fn max_as_nanos(column: ArrayRef) -> i64 {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            column.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+        let mem_table =
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("mem table");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let df = max_timestamp_df(&accelerator, SessionContext::new(), "time_col")
+            .expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first().expect("one batch");
+
+        temporal_scalar_as_nanos(result.column(0))
+            .expect("normalizes to nanoseconds")
+            .expect("a non-null value")
+    }
+
+    /// 2023-11-14T22:13:20Z as nanoseconds.
+    const FIXED_INSTANT_NANOS: i64 = 1_700_000_000_000_000_000;
+
+    #[tokio::test]
+    async fn test_max_timestamp_normalizes_every_unit_and_timezone() {
+        // Every column holds the same instant in its own unit, so reading a microsecond
+        // column as if it were nanoseconds would give a watermark 1000x too small.
+        for tz in [None, Some("UTC"), Some("+05:30")] {
+            let cases: [ArrayRef; 4] = [
+                Arc::new(
+                    TimestampSecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000_000_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![FIXED_INSTANT_NANOS / 1_000])
+                        .with_timezone_opt(tz),
+                ),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![FIXED_INSTANT_NANOS]).with_timezone_opt(tz),
+                ),
+            ];
+
+            for array in cases {
+                let data_type = array.data_type().clone();
+                assert_eq!(
+                    max_as_nanos(array).await,
+                    FIXED_INSTANT_NANOS,
+                    "{data_type} must normalize to the same instant"
+                );
+            }
+        }
+    }
+
+    /// The append path reads `None` as "no watermark" and starts over from the beginning,
+    /// so a value that cannot be scaled to nanoseconds has to be an error instead.
+    #[test]
+    fn test_temporal_scalar_as_nanos_rejects_an_out_of_range_value() {
+        let array: ArrayRef = Arc::new(TimestampSecondArray::from(vec![i64::MAX]));
+        assert!(
+            temporal_scalar_as_nanos(&array).is_err(),
+            "a seconds value too large to hold in nanoseconds must not read as no watermark"
+        );
+    }
+
+    #[test]
+    fn test_temporal_scalar_as_nanos_reads_null_and_empty_as_no_watermark() {
+        let null: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]));
+        assert_eq!(
+            temporal_scalar_as_nanos(&null).expect("a null value is not an error"),
+            None
+        );
+
+        let empty: ArrayRef = Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()));
+        assert_eq!(
+            temporal_scalar_as_nanos(&empty).expect("an empty array is not an error"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_normalizes_date_columns() {
+        // Midnight on the day of `FIXED_INSTANT_NANOS`.
+        const DAYS: i32 = 19_675;
+        const MIDNIGHT_NANOS: i64 = DAYS as i64 * 86_400 * 1_000_000_000;
+
+        assert_eq!(
+            max_as_nanos(Arc::new(Date32Array::from(vec![DAYS]))).await,
+            MIDNIGHT_NANOS,
+            "Date32 must normalize to midnight of that day"
+        );
+        assert_eq!(
+            max_as_nanos(Arc::new(Date64Array::from(vec![
+                i64::from(DAYS) * 86_400_000
+            ])))
+            .await,
+            MIDNIGHT_NANOS,
+            "Date64 must normalize to midnight of that day"
         );
     }
 

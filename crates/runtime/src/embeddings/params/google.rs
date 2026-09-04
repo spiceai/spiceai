@@ -17,13 +17,24 @@ limitations under the License.
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
-/// Parameters for `from: google` embedding models.
+/// Parameters for `from: google` embedding models. Authenticates via Vertex AI (GCP
+/// project/region-scoped, service-account auth).
 #[derive(TypedParams)]
 #[params(prefix = "google")]
 pub struct GoogleEmbeddingParams {
-    /// The Google API key.
+    /// The GCP project ID.
+    pub project: Option<String>,
+    /// The GCP region, e.g. `us-central1`, or `global`.
+    pub location: Option<String>,
+    /// Path to a GCP service account JSON key file. One of `google_service_account_path`,
+    /// `google_service_account_key`, or `google_application_default_credentials` is required.
+    pub service_account_path: Option<String>,
+    /// GCP service account JSON key as a string.
     #[param(autoload_secret)]
-    pub api_key: SecretString,
+    pub service_account_key: Option<SecretString>,
+    /// Use Google Application Default Credentials for authentication. If the
+    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, uses that path.
+    pub application_default_credentials: Option<bool>,
     /// The number of dimensions for the embedding output.
     #[param(runtime)]
     pub dimensions: Option<u32>,

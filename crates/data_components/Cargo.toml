@@ -50,6 +50,7 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+moka.workspace = true
 globset.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true

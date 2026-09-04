@@ -15,6 +15,9 @@ limitations under the License.
 */
 pub mod avoid_vector_columns_on_index;
 
+pub mod regexp_match_null_check;
+pub use regexp_match_null_check::RegexpMatchNullCheckRewrite;
+
 #[macro_export]
 macro_rules! concrete {
     ($var:expr, $t:ty) => {

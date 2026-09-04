@@ -507,6 +507,17 @@ pub(crate) trait CompactionRunner: Send + Sync {
     /// other [`CompactionRunner`] impls (e.g. test stubs) need not implement it.
     fn on_background_tick(&self) {}
 
+    /// Called once per background wake, alongside [`Self::on_background_tick`],
+    /// for per-tick observability that has to await — the footprint sample,
+    /// which reads the metastore's own file accounting.
+    ///
+    /// Separate from `on_background_tick` because that hook is synchronous and
+    /// these gauges need a metastore round trip. Kept off every write path
+    /// deliberately: this tick is the one place a table can afford aggregate
+    /// queries over its manifest. Default no-op so scheduler stubs need not
+    /// implement it.
+    async fn sample_footprint_metrics(&self) {}
+
     /// The (possibly dynamically-tuned) background interval to use for the NEXT
     /// wake. `None` keeps the spawn-time interval. Lets the auto-tuner widen or
     /// tighten the compaction cadence at runtime. Default `None`.
@@ -578,6 +589,7 @@ impl BackgroundCompactor {
                 // Runs before draining and before re-reading the interval so a
                 // just-applied cadence change takes effect on the next sleep.
                 runner.on_background_tick();
+                runner.sample_footprint_metrics().await;
                 if let Some(next) = runner.background_interval_hint() {
                     current = next;
                 }

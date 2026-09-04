@@ -201,10 +201,9 @@ pub(crate) fn is_pk_visible_i64(
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff. See
 /// [`is_pk_visible_i64`] for the rationale.
 ///
-/// The composite hot path now probes via [`KeyDeletionIndex::get_batch`] (one
-/// hash per row), so this per-row helper is retained only as the reference
-/// implementation the `get_batch` equivalence tests check against.
-#[cfg(test)]
+/// The composite hot path probes via [`KeyDeletionIndex::get_batch`] (one hash per
+/// row), so this per-row helper serves the `get_batch` equivalence tests and the
+/// delete sink's per-key liveness probe, which is already per-row.
 #[inline]
 pub(crate) fn is_pk_visible_row_key(
     key: &[u8],

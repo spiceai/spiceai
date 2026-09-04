@@ -17,6 +17,28 @@ test-threads = "num-cpus"
 [test-groups]
 cayenne-property-tests = { max-threads = 2 }
 
+# Every GitHub test authenticates as the same account, and GitHub's secondary
+# rate limit is per account rather than per connection. nextest runs each test in
+# its own process, so the connector's rate controller — a process-global that
+# paces one authentication context to GitHub's 2000 points per minute — is pacing
+# only its own test. N of them in parallel therefore aim N x 2000 points per
+# minute at a budget of 2000, and the group blows the limit while no single test
+# is anywhere near it.
+#
+# That is what run 32945876125 shows: `github::test_github_reviews` failed with
+# HTTP 403 "You have exceeded a secondary rate limit" on its first query, while
+# sibling GitHub tests were scanning the same repository in neighbouring
+# processes. `github::test_github_user` timed out in the same run for the same
+# reason once removed — a 403 is a transient error, so the runtime retries the
+# dataset load with no deadline (`crates/runtime/src/lib.rs`), and the test's own
+# readiness timeout is what finally fires.
+#
+# Serializing them makes each test's pacing meaningful again, because it is then
+# pacing the only caller. This bounds concurrency within a partition; the three
+# `Integration Tests (part N)` jobs still run as separate processes, so the ceiling
+# is one GitHub test per partition rather than one overall.
+github-api-tests = { max-threads = 1 }
+
 # Correctness/convergence property tests: the accelerated table MUST converge to
 # the reference model on every run. These are deterministic correctness checks,
 # not best-effort work — so a retry that happens to pass only HIDES a real bug
@@ -112,6 +134,13 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'binary(=mutation_model_test)'
 slow-timeout = { period = "120s", terminate-after = 8 }
+
+# Hold every GitHub test to the `github-api-tests` group — see its definition
+# above for why the shared secondary rate limit makes parallelism self-defeating
+# here.
+[[profile.default.overrides]]
+filter = 'test(/^github::/)'
+test-group = 'github-api-tests'
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]

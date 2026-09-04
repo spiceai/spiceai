@@ -22,5 +22,11 @@ telemetry = { path = "../telemetry" }
 tracing.workspace = true
 util = { path = "../util" }
 
+# `task_info(TASK_VM_INFO)` for the anonymous/file-backed resident split — one
+# syscall, and the same source `vmmap` reports from. Already in the lock file
+# transitively, so it adds no new build.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6.0"
+
 [lints]
 workspace = true

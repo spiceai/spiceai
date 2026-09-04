@@ -14,18 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::expect_used)]
-
 use google_genai::{
     generate::GenerateContentRequest,
     types::{CachedContent, Content},
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _api_key =
-        std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Example: Using cached content for optimized repeated queries\n");
     println!("Note: This example demonstrates the API structure.");
     println!("To use cached content, you must first create a cache using the");

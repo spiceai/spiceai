@@ -22,13 +22,10 @@ limitations under the License.
 
 //! End-to-end durable write-back against a Postgres source.
 //!
-//! The write is driven through a `BEGIN … COMMIT` transaction deliberately. An
-//! ordinary write on a `write_mode: write_back` dataset also forwards to the
-//! source fire-and-forget, so it reaches Postgres whether or not the delivery
-//! worker ever runs. A transactional write skips that forward and records
-//! dirty-key markers in its commit transaction instead, leaving the delivery
-//! worker as its only path to the source — so this is the shape that observes
-//! whether delivery actually happens (#13396).
+//! The write is driven through a `BEGIN … COMMIT` transaction because that is
+//! the only shape a write-back dataset accepts. Its commit records the dirty-key
+//! markers, and the delivery worker is the write's only path to the source — so
+//! reaching Postgres at all is what proves delivery ran (#13396).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,9 +224,9 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
             .await
             .map_err(|e| anyhow!("transactional write-back UPDATE failed: {}", describe(&e)))?;
 
-            // Only a commit-publish transaction marks primary keys. Observing
-            // the marker proves the write took the staged path rather than the
-            // fire-and-forget source forward.
+            // The markers are written by the commit itself, so observing one
+            // proves the write staged and published rather than failing short of
+            // the commit.
             let marked = wait_until_true(MARKER_VISIBLE_TIMEOUT, || async {
                 provider.dirty_key_count().await.is_ok_and(|n| n == 1)
             })

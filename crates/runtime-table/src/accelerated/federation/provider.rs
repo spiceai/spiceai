@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::OptimizerRule;
 use datafusion_federation::{FederationAnalyzerForLogicalPlan, FederationProvider};
 
 #[derive(Debug)]
@@ -58,6 +59,16 @@ impl FederationProvider for AcceleratedTableFederationProvider {
             return None;
         }
         self.federation_provider().and_then(|x| x.compute_context())
+    }
+
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        if !self.enabled {
+            return vec![];
+        }
+        self.federation_provider()
+            .map_or_else(Vec::new, |provider| {
+                provider.pre_federation_optimizer_rules()
+            })
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {

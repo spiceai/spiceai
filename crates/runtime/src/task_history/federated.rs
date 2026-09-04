@@ -170,10 +170,11 @@ impl FederatedTaskHistoryTable {
         executor_id: String,
         client: FlightSqlClient,
         sql: String,
+        table_ref: String,
     ) -> Result<Vec<RecordBatch>, (String, String)> {
         let cookie_store = Arc::new(CookieStore::new());
         let batches: Vec<RecordBatch> =
-            data_components::flightsql::query_to_stream(client, sql, cookie_store)
+            data_components::flightsql::query_to_stream(client, sql, cookie_store, table_ref)
                 .try_collect()
                 .await
                 .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
@@ -266,7 +267,8 @@ impl TableProvider for FederatedTaskHistoryTable {
             .into_iter()
             .map(|(executor_id, client)| {
                 let sql = sql.clone();
-                async move { Self::query_executor(executor_id, client, sql).await }
+                let table_ref = table_ref.clone();
+                async move { Self::query_executor(executor_id, client, sql, table_ref).await }
             })
             .collect();
 

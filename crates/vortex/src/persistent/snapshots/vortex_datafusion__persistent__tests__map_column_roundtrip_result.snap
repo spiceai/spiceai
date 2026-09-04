@@ -1,0 +1,11 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&batches)?
+---
++----+-----------------------------------------------+
+| id | headers                                       |
++----+-----------------------------------------------+
+| 1  | {content-type: application/json, etag: "abc"} |
+| 2  |                                               |
+| 3  | {content-type: text/plain}                    |
++----+-----------------------------------------------+
