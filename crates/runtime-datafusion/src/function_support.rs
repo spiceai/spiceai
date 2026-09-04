@@ -24,26 +24,53 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
-use runtime_udfs_api::{
-    FunctionSupportBuilder, datafusion_nested_function_names,
-    deny_spice_specific_functions_excluding,
-};
+use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
 /// every function the `DuckDB` dialect can rewrite into native SQL (e.g.
 /// `cosine_distance` → `array_cosine_distance`, `rand` → `random()`), derived
 /// from the dialect so it tracks it automatically.
+///
+/// On top of that carve-out, `regexp_match` is denied outright — see
+/// [`DUCKDB_DENIED_BUILTINS`] for why.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    deny_spice_specific_functions_excluding(&crate::dialect::duckdb_native_function_names())
+    Arc::new(duckdb_function_support())
 }
 
 /// `DuckDB` deny-list as a value, for
 /// `DuckDBTableFactory::with_function_support`. See issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
+    duckdb_function_support()
+}
+
+/// The `DataFusion` built-ins `DuckDB` must not be handed, despite having a
+/// function that looks like the one asked for.
+///
+/// `regexp_match` returns the first match's *capture groups* as a list, and
+/// NULL when nothing matches. `DuckDB` has no function with those semantics:
+/// `regexp_extract(s, p, 0)` returns the whole match as a plain string, and the
+/// empty string — not NULL — when nothing matches. Translating one into the
+/// other answered a different question on both counts (issue #13809), so the
+/// call now evaluates locally, above the federated scan, where `DataFusion`'s
+/// own implementation runs. That is the same treatment, and for the same
+/// reason, that `regexp_match` already gets for `BigQuery`
+/// (see [`deny_spice_functions_for_bigquery_table_providers`]).
+///
+/// The idiom that only asks "does it match at all" —
+/// `regexp_match(…) IS [NOT] NULL` — is rewritten into `regexp_like` by
+/// [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], and `regexp_like`
+/// the `DuckDB` dialect does render natively (`regexp_matches`), so that shape
+/// keeps a boolean instead of a list either way.
+pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[crate::dialect::REGEXP_MATCH_NAME];
+
+/// The one `DuckDB` policy both public accessors return, so the connector and
+/// the accelerator cannot be given different pushdown rules.
+fn duckdb_function_support() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
+        .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .build()
 }
 

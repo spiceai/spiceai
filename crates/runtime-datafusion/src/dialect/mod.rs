@@ -28,7 +28,6 @@ mod duckdb;
 pub use bigquery::SpiceBigQueryDialect;
 
 const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
-const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_match function calls
 const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
@@ -73,15 +72,6 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             Box::new(
                 duckdb::DuckDBRegexpFunction::Like
                     .to_datafusion_function(REGEXP_LIKE_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
-        ),
-        (
-            // DuckDB dialect: regexp_extract(string, pattern[, group = 0, options])
-            // DataFusion dialect: regexp_match(str, regexp[, flags])
-            REGEXP_MATCH_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Match
-                    .to_datafusion_function(REGEXP_MATCH_FLAGS_POSITION),
             ) as ScalarFnToSqlHandler,
         ),
         (
@@ -225,8 +215,8 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
-        duckdb_native_function_names,
+        REGEXP_MATCH_NAME, bigquery, bigquery_native_function_names,
+        duckdb_builtin_scalar_overrides, duckdb_native_function_names, duckdb_scalar_overrides,
     };
 
     #[test]
@@ -239,6 +229,29 @@ mod tests {
                  of the deny-list does nothing"
             );
         }
+    }
+
+    #[test]
+    fn the_duckdb_dialect_has_no_regexp_match_handler() {
+        // The handler rendered `regexp_match` as `ARRAY[regexp_extract(s, p, 0)]
+        // AS item`, which answers a different question (whole match, not the
+        // capture groups; empty string, not NULL) and is not even valid SQL
+        // wherever the expression carries an alias. `regexp_match` is denied for
+        // DuckDB instead — see
+        // `crate::function_support::DUCKDB_DENIED_BUILTINS`. A handler
+        // reappearing here would silently re-enable the pushdown, because the
+        // deny-list carve-out is derived from this very list (#13809).
+        assert!(
+            !duckdb_scalar_overrides()
+                .iter()
+                .any(|(name, _)| *name == REGEXP_MATCH_NAME),
+            "`{REGEXP_MATCH_NAME}` must have no DuckDB handler; adding one back would carve it \
+             out of the deny-list and push down a call DuckDB answers differently"
+        );
+        assert!(
+            !duckdb_native_function_names().contains(&REGEXP_MATCH_NAME),
+            "`{REGEXP_MATCH_NAME}` must not be advertised as a native DuckDB function"
+        );
     }
 
     #[test]

@@ -19,12 +19,11 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{
-    self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
+    self, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
 };
 use itertools::Itertools;
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
-pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
@@ -365,7 +364,6 @@ pub(crate) fn rand_to_random(
 }
 
 pub(super) enum DuckDBRegexpFunction {
-    Match,
     Like,
     Replace,
     Count,
@@ -374,17 +372,6 @@ pub(super) enum DuckDBRegexpFunction {
 impl DuckDBRegexpFunction {
     fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
         match self {
-            DuckDBRegexpFunction::Match if ast_args.len() == 3 => {
-                // regexp_extract has 4 positional args, position 3 = group not flags
-                // bump flags to 4, insert default 0 group
-                ast_args.insert(
-                    2,
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
-                        value: sqlparser::ast::Value::Number("0".to_string(), false),
-                        span: sqlparser::tokenizer::Span::empty(),
-                    }))),
-                );
-            }
             DuckDBRegexpFunction::Count if ast_args.len() == 3 => {
                 // arg #3 is start position
                 // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
@@ -452,17 +439,6 @@ impl DuckDBRegexpFunction {
 
     fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
         match self {
-            DuckDBRegexpFunction::Match => {
-                // DuckDB ``regexp_extract`` returns a plain string
-                // DataFusion ``regexp_match`` returns an array with a single string value
-                ast_fn = ast::Expr::Named {
-                    expr: Box::new(ast::Expr::Array(Array {
-                        elem: vec![ast_fn],
-                        named: true,
-                    })),
-                    name: Ident::new("item"),
-                }
-            }
             DuckDBRegexpFunction::Count => {
                 // Wrap the extract array in a ``len()``
                 ast_fn = wrap_in_call(ast_fn, "len");
@@ -475,7 +451,6 @@ impl DuckDBRegexpFunction {
 
     fn federated_function_name(&self) -> &str {
         match self {
-            DuckDBRegexpFunction::Match => REGEXP_MATCH_NAME,
             DuckDBRegexpFunction::Like => REGEXP_LIKE_NAME,
             DuckDBRegexpFunction::Replace => REGEXP_REPLACE_NAME,
             DuckDBRegexpFunction::Count => REGEXP_COUNT_NAME,

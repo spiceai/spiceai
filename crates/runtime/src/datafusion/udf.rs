@@ -1110,6 +1110,30 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_denies_regexp_match_but_not_its_siblings() {
+        // `regexp_match` has no DuckDB equivalent with the same semantics —
+        // `regexp_extract` returns the whole match rather than the capture
+        // groups, and the empty string rather than NULL for a non-match — so it
+        // must stay local while the regexp functions DuckDB *can* answer keep
+        // federating (regression test for #13809).
+        for support in [
+            deny_spice_functions_for_duckdb(),
+            Arc::new(deny_spice_functions_for_duckdb_table_providers()),
+        ] {
+            assert!(
+                !support.supports(&make_named_expr("regexp_match")),
+                "regexp_match has no faithful DuckDB rendering and must not be pushed down"
+            );
+            for name in ["regexp_like", "regexp_replace", "regexp_count"] {
+                assert!(
+                    support.supports(&make_named_expr(name)),
+                    "{name} is rendered natively by the DuckDB dialect and must be pushed down"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn duckdb_carveout_tracks_the_dialect() {
         // Regression guard: the DuckDB allow-state of every built-in deny-listed
         // function must match exactly what the DuckDB dialect can unparse, so the
