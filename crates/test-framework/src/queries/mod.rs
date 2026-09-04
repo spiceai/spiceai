@@ -1391,6 +1391,7 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
 /// spicepods that configure `full_text_search` on `customer`/`nation`/`region`
 /// (e.g. `mysql-cayenne[file]-fts`); the UDTF queries fail on a dataset with no
 /// full-text index.
+#[must_use]
 pub fn get_chbench_fts_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let mut queries = get_chbench_test_queries(overrides);
     queries.extend(generate_chbench_fts_queries!(1, 2, 3));
