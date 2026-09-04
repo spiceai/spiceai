@@ -1,9 +1,6 @@
 name: testoperator dispatch search
 
 on:
-  schedule:
-    - cron: '0 6 * * 2,5' # Every Monday and Thursday at 8pm PST (6am UTC next day)
-
   workflow_dispatch:
     inputs:
       spiced_commit:
