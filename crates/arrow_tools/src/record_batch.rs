@@ -1641,6 +1641,89 @@ mod test {
         );
     }
 
+    /// The claim `buffers_per_batch` rests on: the count is a property of the
+    /// type, so it can be read off the schema instead of walking every buffer.
+    ///
+    /// Checked against what real arrays hold, at two row counts — because "does
+    /// not depend on the data" is exactly what could be wrong — and in all
+    /// three nullability cases, since a null buffer is the one part the schema
+    /// cannot settle.
+    #[test]
+    fn buffers_per_batch_matches_what_the_arrays_actually_hold() {
+        use arrow::array::{Float64Array, Int64Array};
+
+        fn actual(batch: &RecordBatch) -> usize {
+            fn walk(data: &arrow::array::ArrayData) -> usize {
+                data.buffers().len()
+                    + usize::from(data.nulls().is_some())
+                    + data.child_data().iter().map(walk).sum::<usize>()
+            }
+            batch.columns().iter().map(|c| walk(&c.to_data())).sum()
+        }
+
+        // Non-nullable, and the count must not move with the rows.
+        for rows in [1_usize, 100] {
+            let ids: Vec<i64> = (0..rows)
+                .map(|i| i64::try_from(i).expect("a test row index fits an i64"))
+                .collect();
+            let names: Vec<String> = (0..rows).map(|i| format!("name-{i}")).collect();
+            let batch = RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int64Array::from(ids.clone())) as ArrayRef),
+                (
+                    "name",
+                    Arc::new(StringArray::from(
+                        names.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+                (
+                    "score",
+                    Arc::new(Float64Array::from(
+                        ids.iter()
+                            .map(|i| f64::from(u32::try_from(*i).expect("fits a u32")))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+            ])
+            .expect("a three-column batch");
+
+            assert_eq!(
+                buffers_per_batch(batch.schema_ref()),
+                actual(&batch),
+                "at {rows} rows the schema must predict exactly what the arrays hold"
+            );
+        }
+
+        // A nullable column that does hold a null: the null buffer exists, and
+        // the schema counted it.
+        let with_nulls = RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![Some(1_i64), None, Some(3)])) as ArrayRef,
+            true,
+        )])
+        .expect("a nullable column");
+        assert_eq!(
+            buffers_per_batch(with_nulls.schema_ref()),
+            actual(&with_nulls),
+            "a nullable column holding a null is counted exactly"
+        );
+
+        // A nullable column that holds none: no null buffer is allocated, so the
+        // schema runs one ahead. Deliberate — a byte budget would rather
+        // over-charge than under-charge — and this pins the size of that error
+        // at one buffer per column rather than letting it drift.
+        let no_nulls = RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+            true,
+        )])
+        .expect("a nullable column with no nulls");
+        assert_eq!(
+            buffers_per_batch(no_nulls.schema_ref()),
+            actual(&no_nulls) + 1,
+            "a nullable column with no nulls is over-counted by exactly its null buffer"
+        );
+    }
+
     #[test]
     fn compact_retained_buffers_leaves_a_compact_batch_untouched() {
         let batch = wide_string_batch(4, 16);
@@ -2459,5 +2542,94 @@ mod nullability_alignment_tests {
 
         assert_eq!(casted.schema().field(0).data_type(), &DataType::Int64);
         assert_eq!(casted.num_rows(), 2);
+    }
+}
+
+/// How many Arrow buffers one batch of `schema` holds, from the types alone.
+///
+/// The count is a property of the type, not of the rows: a `Utf8` column is an
+/// offsets buffer and a values buffer whether it holds one row or a hundred.
+/// Measured both ways to be sure — a five-column result from a database driver
+/// laid out identically at 1 row and at 100.
+///
+/// Two places the schema cannot quite settle it, both bounded and both rounded
+/// *up* here, since a byte budget would rather over-charge than under-charge:
+///
+/// * A null buffer exists only once an array actually holds a null, so every
+///   nullable field is counted as if it does.
+/// * A view type keeps its bytes in data buffers whose number depends on how
+///   the array was built. One is assumed, which is what compaction leaves
+///   behind — arrow's `gc` rewrites a view array into a single block.
+#[must_use]
+pub fn buffers_per_batch(schema: &Schema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| buffers_for(field.data_type()) + usize::from(field.is_nullable()))
+        .sum()
+}
+
+/// Buffers a value of `data_type` occupies, excluding its null buffer.
+fn buffers_for(data_type: &DataType) -> usize {
+    match data_type {
+        // A null array is all metadata.
+        DataType::Null => 0,
+        // One values buffer: a bitmap for booleans, a scalar block for the rest.
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Timestamp(..)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..)
+        | DataType::FixedSizeBinary(_) => 1,
+        // Two either way, for different reasons: `Utf8` and its relatives are
+        // an offsets buffer plus a values buffer, while a view type is its
+        // views buffer plus the single data block `gc` leaves behind.
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::Utf8View
+        | DataType::BinaryView => 2,
+        // Offsets, then whatever the child holds.
+        DataType::List(field) | DataType::LargeList(field) | DataType::Map(field, _) => {
+            1 + buffers_for(field.data_type()) + usize::from(field.is_nullable())
+        }
+        // No offsets: the child's length is fixed by the type.
+        DataType::FixedSizeList(field, _) | DataType::RunEndEncoded(_, field) => {
+            buffers_for(field.data_type()) + usize::from(field.is_nullable())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|f| buffers_for(f.data_type()) + usize::from(f.is_nullable()))
+            .sum(),
+        // Type ids, dense adds offsets, then every variant.
+        DataType::Union(fields, mode) => {
+            1 + usize::from(*mode == arrow::datatypes::UnionMode::Dense)
+                + fields
+                    .iter()
+                    .map(|(_, f)| buffers_for(f.data_type()) + usize::from(f.is_nullable()))
+                    .sum::<usize>()
+        }
+        // Keys, then the values array.
+        DataType::Dictionary(_, values) => 1 + buffers_for(values),
+        DataType::ListView(_) | DataType::LargeListView(_) => 3,
     }
 }
