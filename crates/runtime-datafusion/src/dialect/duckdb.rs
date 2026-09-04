@@ -438,12 +438,9 @@ impl DuckDBRegexpFunction {
     }
 
     fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
-        match self {
-            DuckDBRegexpFunction::Count => {
-                // Wrap the extract array in a ``len()``
-                ast_fn = wrap_in_call(ast_fn, "len");
-            }
-            _ => {}
+        if matches!(self, DuckDBRegexpFunction::Count) {
+            // Wrap the extract array in a ``len()``
+            ast_fn = wrap_in_call(ast_fn, "len");
         }
 
         ast_fn
