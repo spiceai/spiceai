@@ -23,6 +23,14 @@ expected-output CSVs come from **`v0.1.1`**.
 Nothing from the IBM repository is vendored. The suite is cloned at run
 time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
+## Mode A baseline (this pin)
+
+| Suite | Pass | Fail | Skip | Error | Total | Pass rate |
+|-------|------|------|------|-------|-------|-----------|
+| TPC-H SF 0.01 | 1 | 7 | 0 | 14 | 22 | **4.5%** |
+
+Per-query notes and failure groups: [`RESULTS.md`](RESULTS.md).
+
 ## Local run (Mode A)
 
 ```bash
@@ -48,7 +56,9 @@ cargo run -p spice-substrait-compliance -- --mode mode-b
 
 Registers the IBM TPC-H CSVs (pipe-delimited, no header, SF 0.01) with
 schemas matching the Isthmus plans (`LINEITEM`, `i32` keys,
-`decimal(15,2)`, `date`) and lowers each `.bin` plan with
+`decimal(15,2)`, `date`) via `TableReference::bare` so the catalog keeps
+the uppercase Isthmus names (`register_csv(&str)` would lowercase them).
+Each `.bin` plan is lowered with
 `datafusion_substrait::logical_plan::consumer::from_substrait_plan` —
 the same consumer `spiced` uses.
 
