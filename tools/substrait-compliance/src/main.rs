@@ -43,7 +43,7 @@ use crate::suite::load_tpch_suite;
 pub const IBM_TAG: &str = "v0.1.1";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
-pub const DATAFUSION_FORK_REV: &str = "2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c";
+pub const DATAFUSION_FORK_REV: &str = "6006901cb602d845ee1441269d6eaa142c2580a6";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {

@@ -13,7 +13,7 @@ report-only; it does not fail the repository on a low pass rate.
 |------|--------|
 | IBM tag | `v0.1.1` ([release](https://github.com/IBM/substrait-compliance/releases/tag/v0.1.1)) |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `lukekim/substrait-varchar-literal` @ `2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c` (workspace `[patch.crates-io]`; spiceai/datafusion#215) |
+| spiceai/datafusion fork | `spiceai-54` @ `6006901cb602d845ee1441269d6eaa142c2580a6` (workspace `[patch.crates-io]`; merged spiceai/datafusion#215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1**. The same example on tag

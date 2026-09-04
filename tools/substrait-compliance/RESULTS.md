@@ -2,6 +2,11 @@
 
 Captured on this box against the workspace DataFusion fork after the
 VarChar literal fix ([spiceai/datafusion#215](https://github.com/spiceai/datafusion/pull/215)).
+The workspace pin is now the `spiceai-54` merge commit
+`6006901cb602d845ee1441269d6eaa142c2580a6`. The measured table below was
+already taken on the pre-merge tip
+`2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c` (same VarChar fix); Mode A
+was not re-run after the merge-commit pin bump.
 Re-run the command below to regenerate `results/mode-a-tpch.json`
 (gitignored; CI uploads it as an artifact).
 
@@ -11,7 +16,7 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 |------|--------|
 | IBM tag | `v0.1.1` |
 | `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion rev | `2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c` (`lukekim/substrait-varchar-literal` / spiceai/datafusion#215) |
+| spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
 | Run | 2026-09-04T16:07:58Z → 16:08:02Z |
