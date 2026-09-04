@@ -512,11 +512,19 @@ async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyho
                 &run_query(&rt, instr_rows).await?
             );
 
-            // The sibling handlers the dialect still installs stay pushed down
-            // and keep agreeing — the deny covers `regexp_match` only.
+            // The sibling handlers the dialect still installs stay pushed down and
+            // keep agreeing — the deny covers `regexp_match` and `regexp_instr` only.
+            //
+            // Restricted to non-NULL input because `regexp_count` genuinely does
+            // *not* agree on a NULL one: the dialect renders it
+            // `len(regexp_extract_all(..))`, which is NULL for a NULL input where
+            // DataFusion answers 0. That is issue #13870, found by this test, and
+            // deliberately out of scope here — widening this assertion to the NULL
+            // row is the check that closes it.
             let siblings = "SELECT id, regexp_like(s, '(a)(b)') AS l, \
                             regexp_replace(s, '(a)(b)', 'X') AS r, \
-                            regexp_count(s, 'a') AS c FROM {table} ORDER BY id";
+                            regexp_count(s, 'a') AS c \
+                            FROM {table} WHERE s IS NOT NULL ORDER BY id";
             let accelerated = run_query(&rt, &siblings.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &siblings.replace("{table}", "local")).await?;
             assert_eq!(
@@ -524,6 +532,17 @@ async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyho
                 to_pretty_display(&local)?.to_string(),
                 "regexp_like/replace/count must still agree with local evaluation"
             );
+
+            // Pin #13870 itself, so the divergence is a recorded fact rather than a
+            // gap this test quietly steps around: the NULL row is where they part.
+            let null_row = "SELECT regexp_count(s, 'a') AS c FROM {table} WHERE s IS NULL";
+            let accelerated = run_query(&rt, &null_row.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &null_row.replace("{table}", "local")).await?;
+            assert_batches_eq!(
+                ["+---+", "| c |", "+---+", "|   |", "+---+",],
+                &accelerated
+            );
+            assert_batches_eq!(["+---+", "| c |", "+---+", "| 0 |", "+---+",], &local);
 
             let plan = to_pretty_display(
                 &run_query(&rt, "EXPLAIN SELECT regexp_like(s, 'a') FROM accelerated").await?,
