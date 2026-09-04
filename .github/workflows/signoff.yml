@@ -567,17 +567,22 @@ jobs:
         # wedged one must not spend the cleanup window that the handlers need.
         timeout-minutes: 2
         run: |
-          if [ "${SCCACHE_SETUP:-}" = "true" ]; then
-            # The `||` keeps a diagnostic from ever deciding a verdict — when
-            # the cache backend is gone `--show-stats` cannot answer either, and
-            # that is itself the finding.
-            sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
-          else
-            # `false` (the pre-flight cleared it) and unset (no endpoint, or the
-            # job never reached the setup) differ only in cause, and the value is
-            # reported rather than branched on so neither is described wrongly.
-            echo "::warning::The compiler cache was not in use for this run (SCCACHE_SETUP=${SCCACHE_SETUP:-unset}): the pre-flight found the backend unreachable and cleared RUSTC_WRAPPER, or it was never configured. If this run reached the gate then it compiled uncached, and its duration — including any budget expiry — reflects that rather than the branch or the budget."
-          fi
+          case "${SCCACHE_SETUP:-unset}" in
+            true)
+              # The `||` keeps a diagnostic from ever deciding a verdict — when
+              # the cache backend is gone `--show-stats` cannot answer either, and
+              # that is itself the finding.
+              sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+              ;;
+            false)
+              echo "::warning::This sign-off compiled without the compiler cache: the pre-flight found the backend unreachable and cleared RUSTC_WRAPPER. The step budget is calibrated against a cached run, so read this run's duration, and any budget expiry, as a cache-backend outage rather than as the branch or the budget."
+              ;;
+            *)
+              # Setup never ran (job died first, or no endpoint). A warning here
+              # would claim the gate compiled uncached when it may not have run.
+              echo "The compiler cache was never configured in this run, so there are no stats to report."
+              ;;
+          esac
 
       # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
       # non-zero under its `set +e`, falls into the failure branch, and posts
