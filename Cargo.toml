@@ -1,6 +1,10 @@
 [workspace]
 default-members = ["bin/spiced"]
-exclude = ["crates/data-connectors/connector-nfs"]
+exclude = [
+    "crates/data-connectors/connector-nfs",
+    # Standalone nightly harness; owns its own Cargo.lock and DataFusion pin.
+    "tools/substrait-compliance",
+]
 members = [
     "bin/spice/",
     "bin/spiced/",

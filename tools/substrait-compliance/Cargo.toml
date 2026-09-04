@@ -1,0 +1,47 @@
+# Standalone workspace so this harness does not join the root spiceai
+# workspace (no layers.toml, no lockfile re-fingerprint, no lint gate).
+[workspace]
+
+[package]
+name = "substrait-compliance"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.96.1"
+description = "Nightly Substrait compliance harness (IBM TPC-H) against the spiceai DataFusion fork"
+
+[[bin]]
+name = "substrait-compliance"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "f9a635e6b580d5fe6ed0a70975e36014ea86c476" }
+datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "f9a635e6b580d5fe6ed0a70975e36014ea86c476" }
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+snafu = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+
+# The spiceai DataFusion fork references `parquet::arrow::async_reader::ObjectVersionType`,
+# which exists only on the spiceai arrow-rs fork (workspace `[patch.crates-io]`).
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb" }

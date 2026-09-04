@@ -1,0 +1,19 @@
+This directory implements a Substrait compliance harness for Spice.ai.
+
+It consumes test suites (TPC-H plans, input CSVs, and expected outputs)
+from IBM/substrait-compliance at the tag recorded in pin.toml. Those
+suites are fetched at run time and are not vendored here.
+
+IBM/substrait-compliance is licensed under the Apache License, Version 2.0:
+
+    https://github.com/IBM/substrait-compliance/blob/v0.1.1/LICENSE
+
+The IBM project NOTICE (copyright 2024-2026 Substrait Compliance
+Framework Contributors) is reproduced in spirit: this product includes
+software and test data developed by the Substrait Compliance Framework
+contributors (https://github.com/IBM/substrait-compliance).
+
+Mode A follows the DataFusion consumer wiring published in
+IBM/substrait-compliance `examples/datafusion-rust` on `main` (DataFusion
+54.1). The v0.1.1 tag's copy of that example is structural only and pins
+DataFusion 35.0; this harness does not vendor that example.

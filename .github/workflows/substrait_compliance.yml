@@ -1,0 +1,97 @@
+name: substrait compliance (report-only)
+
+# Nightly DataFusion-consumer baseline against IBM/substrait-compliance TPC-H.
+# Report-only: a low pass rate must not fail the repo. Do not add pull_request
+# or merge_group triggers until Luke/CTO set a threshold from the baseline.
+
+on:
+  schedule:
+    # 07:00 UTC — offset from build_nightly (09:00) so the two do not pile on.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      query:
+        description: Optional single TPC-H query id (e.g. q01). Empty runs all 22.
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: substrait-compliance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  # Keep in sync with tools/substrait-compliance/pin.toml
+  IBM_SUBSTRAIT_COMPLIANCE_TAG: v0.1.1
+
+jobs:
+  mode-a-tpch:
+    name: Mode A TPC-H (DataFusion consumer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout spiceai
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout IBM/substrait-compliance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IBM/substrait-compliance
+          ref: ${{ env.IBM_SUBSTRAIT_COMPLIANCE_TAG }}
+          path: ibm-substrait-compliance
+          persist-credentials: false
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache Mode A target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/substrait-compliance/target
+          key: substrait-compliance-${{ runner.os }}-${{ hashFiles('tools/substrait-compliance/Cargo.lock') }}
+
+      - name: Run Mode A TPC-H
+        id: mode_a
+        # Report-only: a low pass rate is a DataFusion-consumer signal, not a
+        # repo gate. continue-on-error keeps the artifact step reachable if the
+        # harness itself crashes.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "${{ github.event.inputs.query }}" ]; then
+            extra+=(--query "${{ github.event.inputs.query }}")
+          fi
+          cargo run --manifest-path tools/substrait-compliance/Cargo.toml --release -- \
+            --mode a \
+            --suite-dir ibm-substrait-compliance/test-suites/tpch \
+            --output substrait-compliance-report.json \
+            "${extra[@]}"
+
+      - name: Upload JSON report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: substrait-compliance-report
+          path: substrait-compliance-report.json
+          if-no-files-found: warn
+          retention-days: 30

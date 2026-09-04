@@ -1,0 +1,13 @@
+# Pins for the Substrait compliance spike. Bump these together with
+# tools/substrait-compliance/Cargo.toml and .github/workflows/substrait_compliance.yml.
+
+ibm_substrait_compliance_tag = "v0.1.1"
+ibm_substrait_compliance_commit = "7fff86d04a7124123a3f2692fa2a69de0b0a1704"
+ibm_substrait_compliance_url = "https://github.com/IBM/substrait-compliance"
+
+# Workspace `[patch.crates-io]` DataFusion / datafusion-substrait rev.
+spiceai_datafusion_git = "https://github.com/spiceai/datafusion.git"
+spiceai_datafusion_rev = "f9a635e6b580d5fe6ed0a70975e36014ea86c476"
+spiceai_datafusion_major = "54.1"
+spiceai_arrow_rs_git = "https://github.com/spiceai/arrow-rs.git"
+spiceai_arrow_rs_rev = "ccb268d61bd49a0a42ba229a2af397d78bce7beb"
