@@ -23,7 +23,7 @@ limitations under the License.
 //! 3. Bulk-indexes the documents into Elasticsearch, using the primary key as
 //!    the document `_id`.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::array::{
     Array, FixedSizeListBuilder, Float32Builder, LargeStringArray, RecordBatch, StringArray,
@@ -291,16 +291,17 @@ fn build_documents(
 
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
 
-    // The `_id`s of rows this batch could not index. A document already stored under
-    // one of them holds a vector from an earlier value of the row's text, which a
-    // search would go on returning — see [`write_util::keys_to_evict`].
-    let mut rejected: Vec<String> = Vec::new();
+    // What this batch did with each row that names an `_id`, in row order. A document
+    // already stored under a rejected `_id` holds a vector from an earlier value of the
+    // row's text, which a search would go on returning — see
+    // [`write_util::keys_to_evict`], which also decides a repeated `_id` by its last row.
+    let mut outcomes: Vec<(String, write_util::RowOutcome)> = Vec::with_capacity(record.num_rows());
 
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
             if let Some(id) = primary_keys[row].as_ref() {
-                rejected.push(id.clone());
+                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
             }
             continue;
         };
@@ -333,7 +334,7 @@ fn build_documents(
                 zero_or_nan_samples.push(row);
             }
             if let Some(id) = primary_keys[row].as_ref() {
-                rejected.push(id.clone());
+                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -344,7 +345,7 @@ fn build_documents(
                 non_finite_samples.push(row);
             }
             if let Some(id) = primary_keys[row].as_ref() {
-                rejected.push(id.clone());
+                outcomes.push((id.clone(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -377,6 +378,9 @@ fn build_documents(
         );
         doc.insert(index.vector_field.clone(), vec_json);
 
+        if let Some(id) = primary_keys[row].as_ref() {
+            outcomes.push((id.clone(), write_util::RowOutcome::Indexed));
+        }
         docs.push((primary_keys[row].clone(), Value::Object(doc)));
     }
 
@@ -401,8 +405,15 @@ fn build_documents(
         );
     }
 
-    let indexed = docs.iter().filter_map(|(id, _)| id.as_deref());
-    let evicted = write_util::keys_to_evict(rejected, indexed);
+    let evicted = write_util::keys_to_evict(outcomes.iter().map(|(id, o)| (id.as_str(), *o)));
+
+    // A document whose `_id` is evicted must not be indexed by this same request: the
+    // delete runs first, so leaving it in `docs` would restore under that `_id` a row a
+    // later row of the same batch replaced with one this write could not index.
+    if !evicted.is_empty() {
+        let evicted_ids: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+        docs.retain(|(id, _)| !id.as_deref().is_some_and(|id| evicted_ids.contains(id)));
+    }
     Ok((docs, evicted))
 }
 
@@ -1116,6 +1127,56 @@ mod tests {
             assert_eq!(
                 evicted(&[1, 2], &[Some(vec![1.0, 2.0]), None]),
                 vec!["2".to_string()],
+            );
+        }
+
+        /// The `_id`s the `_bulk` body would carry, in the order it carries them.
+        fn indexed_ids(ids: &[i64], embeddings: &[Option<Vec<f32>>]) -> Vec<String> {
+            let index = index();
+            let (docs, _evicted) = build_documents(&index, &record(ids), embeddings, &keys(ids))
+                .expect("documents build");
+            docs.into_iter()
+                .map(|(id, _)| id.expect("every test row names an _id"))
+                .collect()
+        }
+
+        /// Regression test for #13848. One batch carries `_id` 1 twice, and the row that
+        /// *decides* it — the last — is one Elasticsearch cannot be given a vector for. The
+        /// document the earlier row would index is exactly the stale one, so it must neither
+        /// survive the delete nor be re-indexed by the `_bulk` that follows it.
+        #[test]
+        fn a_repeated_id_whose_deciding_row_is_rejected_is_evicted_and_not_indexed() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![1.0, 2.0]),
+                Some(vec![3.0, 4.0]),
+                Some(vec![0.0, 0.0]),
+            ];
+
+            assert_eq!(evicted(&ids, &embeddings), vec!["1".to_string()]);
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["2".to_string()],
+                "the delete runs first, so indexing the earlier row would restore the \
+                 document it just removed"
+            );
+        }
+
+        /// The other direction, unchanged: the deciding row is the indexable one, so the
+        /// `_bulk` re-establishes the document and a delete would only cost a request.
+        #[test]
+        fn a_repeated_id_indexed_after_being_rejected_is_not_evicted() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![0.0, 0.0]),
+                Some(vec![3.0, 4.0]),
+                Some(vec![5.0, 6.0]),
+            ];
+
+            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["2".to_string(), "1".to_string()],
             );
         }
 

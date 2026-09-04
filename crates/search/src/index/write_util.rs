@@ -344,6 +344,17 @@ pub fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// What a write did with one row, for the row's primary key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowOutcome {
+    /// The write is about to store this row under its key.
+    Indexed,
+    /// The write could not index this row — no embedding at all (a NULL or empty search
+    /// value), or one with no defined direction under any metric the index offers
+    /// (all-zero, all-NaN, non-finite).
+    Rejected,
+}
+
 /// The primary keys a write must remove from its index because it could not index
 /// the rows they name.
 ///
@@ -362,19 +373,35 @@ pub fn create_embedding_array(
 /// behaviour every backend can implement with the delete primitive it already has,
 /// and it is what these paths do.
 ///
-/// `indexed` is what this same write is about to store. A key in both — the batch
-/// carries the key twice, once indexable and once not — is not evicted: the write
-/// that follows re-establishes it, so issuing a delete for it would only cost a round
-/// trip. Callers must still delete before they write, so the two orders agree.
-pub fn keys_to_evict<'a>(
-    rejected: impl IntoIterator<Item = String>,
-    indexed: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
-    let indexed: std::collections::HashSet<&str> = indexed.into_iter().collect();
-    rejected
+/// `rows` is every row of the batch that names a key, **in batch order**, tagged with
+/// what the write did with it. A key the batch carries more than once is decided by its
+/// **last** row, because that is the row the table itself resolves the key to under
+/// last-write-wins — so a key whose deciding row is [`RowOutcome::Rejected`] is evicted
+/// even when an earlier row of the same batch was indexable, and a key rejected earlier
+/// and indexed later is not evicted at all. Order is what carries that distinction, which
+/// is why this takes a sequence rather than two sets.
+///
+/// Callers must do two things with the result, and neither alone is enough:
+///
+/// - **Delete these keys before writing**, so the two orders agree.
+/// - **Drop from the write every row whose key this returns.** An earlier indexable row
+///   for an evicted key would otherwise be stored straight back over the delete, which
+///   re-establishes exactly the stale entry the eviction exists to remove.
+pub fn keys_to_evict<'a>(rows: impl IntoIterator<Item = (&'a str, RowOutcome)>) -> Vec<String> {
+    let mut deciding: std::collections::HashMap<&str, RowOutcome> =
+        std::collections::HashMap::new();
+    // Eviction order follows first appearance, so a batch always produces the same delete
+    // request for the same rows.
+    let mut first_seen: Vec<&str> = Vec::new();
+    for (key, outcome) in rows {
+        if deciding.insert(key, outcome).is_none() {
+            first_seen.push(key);
+        }
+    }
+    first_seen
         .into_iter()
-        .filter(|key| !indexed.contains(key.as_str()))
-        .unique()
+        .filter(|key| deciding.get(key) == Some(&RowOutcome::Rejected))
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -675,9 +702,11 @@ mod tests {
         keys.iter().map(|k| (*k).to_string()).collect()
     }
 
+    use RowOutcome::{Indexed, Rejected};
+
     #[test]
     fn keys_to_evict_names_every_rejected_key_the_write_does_not_also_store() {
-        let evicted = keys_to_evict(owned(&["a", "b"]), ["c"]);
+        let evicted = keys_to_evict([("a", Rejected), ("b", Rejected), ("c", Indexed)]);
         assert_eq!(
             evicted,
             owned(&["a", "b"]),
@@ -685,17 +714,37 @@ mod tests {
         );
     }
 
-    /// The batch carries one key twice — once indexable, once not. The write that follows
-    /// re-establishes it, so a delete for it would be undone by this same write.
+    /// The batch carries one key twice, rejected first and indexed after. The row that
+    /// decides the key is the one this write stores, so the entry it is about to write is
+    /// the current one and a delete for it would only cost a round trip.
     #[test]
-    fn keys_to_evict_skips_a_key_the_same_write_also_indexes() {
-        let evicted = keys_to_evict(owned(&["a", "b"]), ["b"]);
+    fn keys_to_evict_skips_a_key_the_same_write_stores_after_rejecting_it() {
+        let evicted = keys_to_evict([("a", Rejected), ("b", Rejected), ("b", Indexed)]);
         assert_eq!(evicted, owned(&["a"]));
+    }
+
+    /// Regression test for #13848. The same pair the other way round: the row that decides
+    /// the key is the rejected one, so the entry the earlier row would leave behind is
+    /// exactly what has to go.
+    #[test]
+    fn keys_to_evict_names_a_key_whose_deciding_row_is_rejected() {
+        let evicted = keys_to_evict([("a", Indexed), ("b", Indexed), ("a", Rejected)]);
+        assert_eq!(
+            evicted,
+            owned(&["a"]),
+            "the table resolves a repeated key to its last row, so an earlier indexable row \
+             does not keep the key indexed"
+        );
     }
 
     #[test]
     fn keys_to_evict_deduplicates_a_key_rejected_more_than_once() {
-        let evicted = keys_to_evict(owned(&["a", "a", "b", "a"]), std::iter::empty());
+        let evicted = keys_to_evict([
+            ("a", Rejected),
+            ("a", Rejected),
+            ("b", Rejected),
+            ("a", Rejected),
+        ]);
         assert_eq!(
             evicted,
             owned(&["a", "b"]),
@@ -705,7 +754,12 @@ mod tests {
 
     #[test]
     fn keys_to_evict_is_empty_when_the_write_rejected_nothing() {
-        assert!(keys_to_evict(Vec::new(), ["a", "b"]).is_empty());
+        assert!(keys_to_evict([("a", Indexed), ("b", Indexed)]).is_empty());
+    }
+
+    #[test]
+    fn keys_to_evict_is_empty_for_a_batch_that_names_no_key() {
+        assert!(keys_to_evict(std::iter::empty()).is_empty());
     }
 
     #[test]
