@@ -58,6 +58,15 @@ const PERMISSION_DENIED_BODY: &str = r#"{"error":{"message":"Project `proj_429` 
 /// Serves one request with `status` and `body`, then closes. Returns the base URL to point a
 /// lister at.
 fn serve_one_error(status: &'static str, body: &'static str) -> String {
+    serve_one(status, "application/json", body)
+}
+
+/// As above, for a refusal that is not JSON at all.
+fn serve_one_text_error(status: &'static str, body: &'static str) -> String {
+    serve_one(status, "text/plain", body)
+}
+
+fn serve_one(status: &'static str, content_type: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
     let port = listener
         .local_addr()
@@ -80,7 +89,7 @@ fn serve_one_error(status: &'static str, body: &'static str) -> String {
         }
 
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(response.as_bytes());
@@ -210,6 +219,33 @@ async fn a_project_id_containing_429_is_not_rate_limiting() {
         assert!(
             !matches!(error, ListModelsError::RateLimited { .. }),
             "a permission refusal was reported as rate limiting: {error}"
+        );
+    }
+}
+
+/// A Spice runtime's own denial is not JSON. `AuthLayer` answers a rejected request with a 401
+/// whose whole body is the string `Unauthorized` (`crates/runtime-auth/src/layer/http.rs`), which
+/// `async-openai` cannot parse into an `ApiError` at all — it becomes `JSONDeserialize`. That is
+/// the credential failure a Spice user actually hits, so it has to classify as one.
+///
+/// Regression test for #13747.
+#[tokio::test]
+async fn a_spice_runtime_plain_text_401_is_a_credential_failure() {
+    for provider in Provider::ALL {
+        let base = serve_one_text_error("401 Unauthorized", "Unauthorized");
+        let error = provider
+            .lister(&base)
+            .list_models()
+            .await
+            .expect_err("the server answered with an error status");
+        eprintln!(
+            "PROBE {:<6} 401 text/plain -> {} | {error}",
+            provider.name(),
+            variant_of(&error)
+        );
+        assert!(
+            matches!(error, ListModelsError::InvalidCredentials { .. }),
+            "a plain-text 401 was not reported as a credential failure: {error}"
         );
     }
 }

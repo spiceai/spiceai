@@ -52,10 +52,14 @@ pub enum ListModelsError {
     #[snafu(display("Network error connecting to {provider}: {message}"))]
     NetworkError { provider: String, message: String },
 
-    /// The provider answered, and refused, for a reason this crate does not recognise. Distinct
-    /// from [`ListModelsError::NetworkError`], which says the request never got an answer: a
-    /// caller that cannot tell the two apart cannot tell "retry later" from "the request is
-    /// wrong".
+    /// The provider answered and did not serve the request, for a reason this crate does not
+    /// recognise. Distinct from [`ListModelsError::NetworkError`], which says no answer came back
+    /// at all.
+    ///
+    /// It says nothing about whether retrying would help, and must not be read that way: a
+    /// persistent 5xx lands here too, because `async-openai` does not parse a server-error body
+    /// and hands it over carrying neither `type` nor `code`. The variant's claim is only that the
+    /// provider responded and the reason was not one this crate can name.
     #[snafu(display("{provider} refused the request: {message}"))]
     ProviderRefused { provider: String, message: String },
 
@@ -179,39 +183,61 @@ pub fn map_status_to_error(status: StatusCode, provider: &str) -> ListModelsErro
 /// guess. The `OpenAI` taxonomy below is the one the client speaks; xAI and Spice endpoints are
 /// `OpenAI`-compatible and reach the same client, and anything they spell differently lands in
 /// that unrecognised arm instead of a wrong variant.
+///
+/// **A refusal that is not JSON at all is still classified.** A Spice runtime denies an
+/// unauthenticated request with a 401 whose body is the bare string `Unauthorized`, which the
+/// client cannot parse into an `ApiError` — it surfaces as
+/// [`OpenAIError::JSONDeserialize`]. That is the credential failure a Spice user actually hits,
+/// so the message tests are applied to the unparsed body too; see the arm for why an
+/// unrecognised one stays a network error there rather than becoming a refusal.
 #[must_use]
 pub fn classify_openai_compatible_error(error: &OpenAIError, provider: &str) -> ListModelsError {
-    let OpenAIError::ApiError(api_error) = error else {
-        // Reqwest, deserialization and client-side argument errors: the request did not come back
-        // as a provider refusal at all.
-        return ListModelsError::NetworkError {
-            provider: provider.to_string(),
-            message: error.to_string(),
-        };
+    // The same value for both arms below: the request did not come back as a refusal this can
+    // read anything out of.
+    let network_error = || ListModelsError::NetworkError {
+        provider: provider.to_string(),
+        message: error.to_string(),
+    };
+
+    let api_error = match error {
+        OpenAIError::ApiError(api_error) => api_error,
+        // The provider answered with a body `async-openai` could not parse into an `ApiError`.
+        // A Spice runtime's own denial is exactly this shape: `AuthLayer` answers a rejected
+        // request with a 401 whose entire body is the string `Unauthorized`
+        // (`crates/runtime-auth/src/layer/http.rs`), which is not the JSON envelope the client
+        // expects. The same variant also carries a *successful* response whose JSON did not
+        // match, and the error cannot tell the two apart — so a body with no recognisable signal
+        // stays a network error rather than being reported as a refusal that may never have
+        // happened.
+        OpenAIError::JSONDeserialize(_, content) => {
+            return signal_in(content, provider).unwrap_or_else(network_error);
+        }
+        // Reqwest and client-side argument errors: no answer came back at all.
+        _ => return network_error(),
     };
 
     if let Some(kind) = classify_by_code(api_error, provider) {
         return kind;
     }
 
-    match api_error.r#type.as_deref() {
-        Some("insufficient_quota") => ListModelsError::QuotaExceeded {
-            provider: provider.to_string(),
-        },
-        Some("rate_limit_error") => ListModelsError::RateLimited {
-            provider: provider.to_string(),
-        },
-        Some("authentication_error") => ListModelsError::InvalidCredentials {
-            provider: provider.to_string(),
-        },
-        Some(_) => ListModelsError::ProviderRefused {
-            provider: provider.to_string(),
-            message: api_error.to_string(),
-        },
-        // Neither field is present. `async-openai` builds exactly this for a 5xx, whose body it
-        // does not parse, and a proxy in front of the provider may answer this way too — so the
-        // message is all there is. Reached only here, where no caller data is mixed into it.
-        None => classify_untyped(&api_error.message, provider),
+    if let Some(kind) = classify_by_type(api_error, provider) {
+        return kind;
+    }
+
+    // The message tests, reached only when the body carried *neither* typed field. A body that
+    // named a `code` or a `type` has already had its say — falling through to the message there
+    // would let caller data the provider echoed back decide the variant after all, which is the
+    // whole defect (issue #13747).
+    if api_error.code.is_none()
+        && api_error.r#type.is_none()
+        && let Some(kind) = signal_in(&api_error.message, provider)
+    {
+        return kind;
+    }
+
+    ListModelsError::ProviderRefused {
+        provider: provider.to_string(),
+        message: api_error.to_string(),
     }
 }
 
@@ -234,26 +260,42 @@ fn classify_by_code(api_error: &ApiError, provider: &str) -> Option<ListModelsEr
     }
 }
 
-/// The message tests, reached only for a refusal carrying neither `code` nor `type`.
-fn classify_untyped(message: &str, provider: &str) -> ListModelsError {
+/// The documented `OpenAI` error types. `None` for an absent or unrecognised type.
+fn classify_by_type(api_error: &ApiError, provider: &str) -> Option<ListModelsError> {
+    match api_error.r#type.as_deref()? {
+        "insufficient_quota" => Some(ListModelsError::QuotaExceeded {
+            provider: provider.to_string(),
+        }),
+        "rate_limit_error" => Some(ListModelsError::RateLimited {
+            provider: provider.to_string(),
+        }),
+        "authentication_error" => Some(ListModelsError::InvalidCredentials {
+            provider: provider.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The message tests. `None` when the text carries no signal this can name, so each caller decides
+/// what an unrecognised body means for it. Kept deliberately narrow: it runs only where no typed
+/// field exists, and matches whole phrases rather than bare status digits, which is what let a
+/// model id (`gpt-4o-mini-2024-0401`) or a project id (`proj_429`) classify a refusal before.
+fn signal_in(message: &str, provider: &str) -> Option<ListModelsError> {
     let lowered = message.to_lowercase();
 
     if lowered.contains("too many requests") || lowered.contains("rate limit") {
-        return ListModelsError::RateLimited {
+        return Some(ListModelsError::RateLimited {
             provider: provider.to_string(),
-        };
+        });
     }
 
     if lowered.contains("unauthorized") || lowered.contains("invalid api key") {
-        return ListModelsError::InvalidCredentials {
+        return Some(ListModelsError::InvalidCredentials {
             provider: provider.to_string(),
-        };
+        });
     }
 
-    ListModelsError::ProviderRefused {
-        provider: provider.to_string(),
-        message: message.to_string(),
-    }
+    None
 }
 
 /// Helper to get a required parameter from a params map.
@@ -377,6 +419,54 @@ mod tests {
             matches!(classified, ListModelsError::ProviderRefused { .. }),
             "caller data decided the variant: {classified}"
         );
+    }
+
+    /// A `code` this crate does not recognise still counts as the body having had its say: the
+    /// message must not decide the variant behind it, even with `type` absent.
+    #[test]
+    fn an_unrecognised_code_does_not_fall_through_to_the_message() {
+        let classified = classify_openai_compatible_error(
+            &refusal(
+                "Unauthorized project `proj_429`.",
+                None,
+                Some("model_not_found"),
+            ),
+            "test",
+        );
+        assert!(
+            matches!(classified, ListModelsError::ProviderRefused { .. }),
+            "an unrecognised code fell through to the message tests: {classified}"
+        );
+    }
+
+    /// A Spice runtime's `AuthLayer` denies with a 401 whose body is the bare string
+    /// `Unauthorized`, so the client cannot build an `ApiError` at all. That is a credential
+    /// failure and must read as one.
+    #[test]
+    fn an_unparsable_denial_body_is_still_classified() {
+        let error = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<serde_json::Value>("Unauthorized").expect_err("not json"),
+            "Unauthorized".to_string(),
+        );
+        assert!(matches!(
+            classify_openai_compatible_error(&error, "test"),
+            ListModelsError::InvalidCredentials { .. }
+        ));
+    }
+
+    /// The same variant also carries a *successful* response whose JSON did not match. With no
+    /// signal in the body there is no way to tell that from a refusal, so it stays a network
+    /// error rather than claiming a refusal that may never have happened.
+    #[test]
+    fn an_unparsable_body_with_no_signal_stays_a_network_error() {
+        let error = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<serde_json::Value>("<html>").expect_err("not json"),
+            "<html>oops</html>".to_string(),
+        );
+        assert!(matches!(
+            classify_openai_compatible_error(&error, "test"),
+            ListModelsError::NetworkError { .. }
+        ));
     }
 
     /// `async-openai` builds an all-`None` `ApiError` for a 5xx, whose body it does not parse. The
