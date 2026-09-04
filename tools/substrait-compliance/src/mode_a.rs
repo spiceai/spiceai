@@ -28,7 +28,8 @@ use std::time::Instant;
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use datafusion::prelude::{CsvReadOptions, SessionContext};
+use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
+use datafusion::sql::TableReference;
 use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
 use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
@@ -48,16 +49,19 @@ pub struct ModeAEngine {
 }
 
 impl ModeAEngine {
-    /// Register every TPC-H CSV under both the Isthmus plan name (`LINEITEM`)
-    /// and the IBM metadata name (`lineitem`).
+    /// Register every TPC-H CSV under the Isthmus plan name (`LINEITEM`).
+    ///
+    /// `register_csv(&str, …)` goes through `TableReference::parse_str`, which
+    /// lowercases even when `enable_ident_normalization` is off. The Substrait
+    /// consumer then looks up the exact Isthmus name on a case-sensitive
+    /// catalog, so we register via `TableReference::bare`.
     pub async fn with_tpch_data(data_dir: &Path) -> Result<Self> {
-        let ctx = SessionContext::new();
+        let mut config = SessionConfig::new();
+        config.options_mut().sql_parser.enable_ident_normalization = false;
+        let ctx = SessionContext::new_with_config(config);
         for table in TPCH_TABLES {
             let csv_path = data_dir.join(format!("{}.csv", table.file_stem));
             register_csv(&ctx, table.plan_name, &csv_path, table.file_stem).await?;
-            if table.plan_name != table.file_stem {
-                register_csv(&ctx, table.file_stem, &csv_path, table.file_stem).await?;
-            }
         }
         Ok(Self { ctx })
     }
@@ -159,12 +163,16 @@ async fn register_csv(
         .has_header(false)
         .schema(schema.as_ref())
         .file_extension("csv");
-    ctx.register_csv(table_name, csv_path.to_string_lossy().as_ref(), options)
-        .await
-        .context(error::RegisterTableSnafu {
-            table: table_name.to_string(),
-            path: csv_path.to_path_buf(),
-        })
+    ctx.register_csv(
+        TableReference::bare(table_name),
+        csv_path.to_string_lossy().as_ref(),
+        options,
+    )
+    .await
+    .context(error::RegisterTableSnafu {
+        table: table_name.to_string(),
+        path: csv_path.to_path_buf(),
+    })
 }
 
 fn ensure_inputs_registered(case: &LoadedCase) -> std::result::Result<(), String> {
