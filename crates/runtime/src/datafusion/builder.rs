@@ -1077,9 +1077,9 @@ impl DataFusionBuilder {
             panic!("Unable to register JSON functions: {e}");
         }
 
-        // Register Spark-compatible functions, but skip Spark's `trunc` (scalar) and
-        // `avg` (aggregate): `register_all` would register them *over* the built-ins
-        // of the same name. Spark `trunc` is date-truncation and shadows numeric
+        // Register Spark-compatible functions, but skip Spark's `trunc` and
+        // `date_trunc` (scalar) and `avg` (aggregate): `register_all` would register
+        // them *over* the built-ins of the same name. Spark `trunc` is date-truncation and shadows numeric
         // `trunc(<float>, <int>)` (see spiceai/spiceai#11415). Spark `avg` uses a different
         // partial-aggregate state layout (`[sum, count:Int64]`) than the built-in
         // (`[count:UInt64, sum]`); harmless single-node, but it corrupts DISTRIBUTED
@@ -1089,7 +1089,12 @@ impl DataFusionBuilder {
         // array"). Keep the built-ins; register every other Spark function (mirrors
         // `datafusion_spark::register_all`).
         for udf in datafusion_spark::all_default_scalar_functions() {
-            if udf.name() == "trunc" {
+            // Spark `date_trunc` accepts only a string as the value to truncate,
+            // where the built-in also accepts a date. Registering it over the
+            // built-in makes `date_trunc(<unit>, <date>)` unplannable, and a
+            // federated filter comparing a timestamp against one loses the type
+            // its comparison needs and is pushed down as a pair BigQuery refuses.
+            if matches!(udf.name(), "trunc" | "date_trunc") {
                 continue;
             }
             let name = udf.name().to_string();

@@ -1156,12 +1156,24 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.timestamp_literal_cast_dtype(time_unit, tz)
     }
 
+    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
+        self.inner.decimal_type_to_sql(precision, scale)
+    }
+
     fn date_difference_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
         self.inner.date_difference_to_sql(lhs, rhs)
     }
 
     fn date_to_integer_to_sql(&self, date: ast::Expr) -> Option<ast::Expr> {
         self.inner.date_to_integer_to_sql(date)
+    }
+
+    fn string_to_timestamp_to_sql(
+        &self,
+        value: ast::Expr,
+        tz: Option<&Arc<str>>,
+    ) -> Option<ast::Expr> {
+        self.inner.string_to_timestamp_to_sql(value, tz)
     }
 
     fn requires_explicit_comparison_coercion(&self) -> bool {
@@ -2280,6 +2292,7 @@ mod tests {
     fn date_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new("d", DataType::Date32, true),
+            datafusion::arrow::datatypes::Field::new("note", DataType::Utf8, true),
             datafusion::arrow::datatypes::Field::new("e", DataType::Date32, true),
             datafusion::arrow::datatypes::Field::new(
                 "naive",
@@ -2340,6 +2353,18 @@ mod tests {
             .expect("filter")
             .project(vec![col("t.ts")])
             .expect("project")
+            .build()
+            .expect("build");
+
+        // A cast target carries no precision or scale, so the width has to come from
+        // the type: nine fractional digits fit `NUMERIC` and thirty-eight
+        // `BIGNUMERIC`.
+        let wide_decimal = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(38, 17),
+            )])
+            .expect("wide decimal projection")
             .build()
             .expect("build");
 
@@ -2410,6 +2435,18 @@ mod tests {
                 DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
             )])
             .expect("naive timestamp cast projection")
+            .build()
+            .expect("build");
+
+        // Text cast to a timestamp is parsed, not cast: BigQuery's DATETIME cast
+        // refuses every zone marker its TIMESTAMP cast takes, and neither takes
+        // more than six sub-second digits.
+        let text_to_timestamp = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.note"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+            )])
+            .expect("text to timestamp projection")
             .build()
             .expect("build");
 
@@ -2522,6 +2559,12 @@ mod tests {
                 "(key)",
             ),
             (
+                "wide decimal cast target",
+                &wide_decimal,
+                "AS BIGNUMERIC)",
+                "DECIMAL(38,17)",
+            ),
+            (
                 "date_trunc rewrite (fork PR #169)",
                 &truncated,
                 "TIMESTAMP_TRUNC(`t`.`ts`, MONTH)",
@@ -2571,6 +2614,12 @@ mod tests {
                 &naive_timestamp_cast,
                 "DATETIME",
                 "AS TIMESTAMP)",
+            ),
+            (
+                "text parsed into a timestamp (fork PR #212 follow-up)",
+                &text_to_timestamp,
+                "DATETIME(TIMESTAMP(REGEXP_REPLACE(",
+                "CAST(`d`.`note` AS DATETIME)",
             ),
             (
                 // BigQuery refuses a literal grouping key outright, and an engine

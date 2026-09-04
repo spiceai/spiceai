@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `f9a635e6b580d5fe6ed0a70975e36014ea86c476` | `spiceai-54` |
+| [datafusion](#datafusion) | `4732c47acdfc90766d02a6921739b00569adb6d9` | `spiceai-54` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a6c88abe381fa50d0b3bb1fbe20964eb5830f9bd` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -192,7 +192,10 @@ catch.
 | Unparser: `Dialect::range_window_default_nulls_first`, and the leading `IS NULL` key a dialect that reports one needs | A federated query with an aggregate window function fails outright: BigQuery accepts no NULL placement but its own inside a `RANGE` clause, and an `ORDER BY` with no explicit frame implies `RANGE` for an aggregate, so the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to `ASC NULLS LAST` is refused. Dropping the clause instead is worse than the failure: BigQuery defaults to NULLs *first* ascending where DataFusion defaults to last, so the NULL rows move to the other end of the ordering and every frame covers different rows — measured on real BigQuery as `(NULL,42) (1,10) (2,30) (3,35)` becoming `(NULL,7) (1,17) (2,37) (3,42)` | build (flag), then silent (query failure; wrong data if "fixed" by dropping the clause) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the RANGE-window arm), and in the fork `plan_to_sql.rs::test_range_window_nulls_placement_becomes_a_leading_key` with `::test_range_window_nulls_placement_left_alone_where_it_binds` as its controls; real-engine guard: `test/scripts/bigquery-pushdown.sh::aggregate-window-range-frame` |
 | Unparser: a `DISTINCT ON` output alias does not capture its own key (fork PR #209) | Naming a `DISTINCT ON`'s computed output changes which key it groups by where the name the output takes is also spelled as a bare column by `on_expr` or `sort_expr`: PostgreSQL resolves a bare name in both clauses against the output list first, so the new alias captures those references and the statement groups by the projected expression instead of the input column. Valid SQL, unchanged reported schema name, wrong rows | silent (wrong data) | **GAP** in this repo. The existing `…::a_derived_projection_names_the_output_its_scope_references` `distinct-on` arms assert the output *is* named, which still holds if this patch is lost, so they do not catch it; the fork's own `plan_to_sql.rs` `DISTINCT ON` tests are what guard it today. Carried in by the pin move for the two rows below rather than for itself |
 | Unparser: `Dialect::group_by_matches_select_subexpressions`, and the aggregate scope a dialect that answers `false` needs | A `Projection` over an `Aggregate` is flattened into one `SELECT`, leaving the grouping expression bare in `GROUP BY` and wrapped inside a select item. BigQuery matches a whole select item and a column reference and nothing in between, so it refuses the statement outright. The two cheaper renderings are worse than the failure: `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the value the projection computes, so a projection that is not injective over the grouping expression collapses distinct groups and sums their aggregates, with no error | build (flag), then silent (query failure) | `crates/data_components/src/federation.rs::a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped`, which reads the flag, so losing the patch fails `cargo check` before it can fail the assertion; real-engine guard: `test/scripts/bigquery-pushdown.sh::group-by-expr-nested-in-select` |
-| `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
+| Unparser: a subquery in a join predicate is routed out of `ON` — to `WHERE` on an inner join, and into the non-preserved input's own scope on an outer one (replaces the `supports_subquery_in_join_predicate` flag of fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject outright. No dialect opts in: both destinations select the same rows as `ON` does, so the routing needs no flag — which is what kept the flag disappearing, twice, on an upstream merge | silent (query failure) | in the fork, `plan_to_sql.rs::test_a_subquery_in_an_inner_join_predicate_moves_to_where` and `::test_a_pushed_down_subquery_filter_stays_in_the_null_extended_input`; both fail on the previous rendering |
+| Unparser: a call's return type is read through `return_field_from_args` | A function that reads a literal argument — a `date_trunc` granularity — answers only through that entry point and its `return_type` reports an internal error, so the call's type is unreadable and every rendering that needs it declines. A comparison against such a call is then pushed down uncoerced, and a dialect that spells an instant and a civil timestamp as different types refuses the pair | silent (query failure) | in the fork, `plan_to_sql.rs::test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date`, which fails on the previous rendering |
+| Unparser: `Dialect::decimal_type_to_sql`, and the unparameterized `NUMERIC`/`BIGNUMERIC` BigQuery selects through it | A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))` is refused as a parameterized type — and `DECIMAL(38, 13)` is refused for its scale, so the width has to come from the type. Nine fractional digits fit `NUMERIC` and thirty-eight `BIGNUMERIC`; the width arrives from arithmetic, so no declared column type reveals it | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the decimal arm); in the fork, `plan_to_sql.rs::test_bigquery_spells_a_wide_decimal_bignumeric` |
+| Unparser: a sort above an aggregate given a scope of its own names that scope's output | The sort key is unprojected into the grouping expression, which names the relation the scope encloses, so the remote binder reports the qualifier as unknown. One predicate now owns the scope decision for both the projection acting on it and the sort reading it | silent (query failure) | in the fork, `plan_to_sql.rs::test_a_sort_over_a_scoped_aggregate_names_the_scope_not_its_grouping_expr` |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
 | Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader` on the **scan** path; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag. Schema/statistics inference (`ParquetFormat::{infer_schema,infer_stats,infer_stats_and_ordering}`) does not forward the pin | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the scan footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` (listing/overwrite **scan** race). Planning-time schema/statistics footer reads are a remaining unpinned gap, unreproduced as a product failure |
 | Bloom-filter replacement readers reuse the version discovered on the listing-table scan | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | **GAP** — the scan/overwrite harness has no predicate and writes no bloom data; the fork's own bloom-filter reader tests are what cover this today |
@@ -500,7 +503,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -508,27 +511,26 @@ They are not equal in consequence; this is the order to close them in.
 
 **Wrong data or wrong text, silently.** These change what a user gets back:
 
-1. `datafusion` `supports_subquery_in_join_predicate` (fork PR #151).
-2. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
-3. `datafusion` `DISTINCT ON` output alias capture (fork PR #209) — the alias
+1. `datafusion` placeholder type inference (fork PRs #87, #88, #89).
+2. `datafusion` `DISTINCT ON` output alias capture (fork PR #209) — the alias
    captures the key, so the statement groups by the projected expression instead of
    the input column. The fork's own `plan_to_sql.rs` tests cover it; what is missing
    is a repo-side guard, and the existing `distinct-on` arms of
    `a_derived_projection_names_the_output_its_scope_references` do not catch it
    because they assert the output *is* named, which still holds if the patch is
    lost.
-4. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
-5. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
-6. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
+3. `iceberg-rust` pinned snapshot reads (fork PR #45) — time travel silently reads live data.
+4. `datafusion-ballista` null-aware anti-join swap (fork PR #58).
+5. `datafusion-ballista` stuck-query detection and stale `TaskStatus` rejection (fork
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
-7. `snowflake-rs` chunked JSON responses and record-batch ordering.
-8. `clickhouse-rs` `Date32` range.
-9. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
+6. `snowflake-rs` chunked JSON responses and record-batch ordering.
+7. `clickhouse-rs` `Date32` range.
+8. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
    federated date filter matches the wrong rows.
-10. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-11. `mistral.rs` `tool_calls` chat-template handling.
-12. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+10. `mistral.rs` `tool_calls` chat-template handling.
+11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
 
