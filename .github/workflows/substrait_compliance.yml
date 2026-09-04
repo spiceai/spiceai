@@ -1,0 +1,74 @@
+name: Substrait compliance (report-only)
+
+# Nightly + manual only. Not on pull_request or merge_group — this is a
+# DataFusion consumer baseline, not a merge gate. Do not fail the repository
+# on pass rate until a threshold is set from the Mode A numbers.
+
+on:
+  schedule:
+    - cron: '30 8 * * *' # 08:30 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: substrait-compliance-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  IBM_SUBSTRAIT_COMPLIANCE_TAG: v0.1.1
+
+jobs:
+  mode_a_tpch:
+    name: Mode A TPC-H (DataFusion consumer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout spiceai
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout IBM/substrait-compliance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IBM/substrait-compliance
+          ref: v0.1.1
+          path: tools/substrait-compliance/.ibm
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: '. -> target'
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Run Mode A TPC-H
+        # Report-only: a harness crash must not fail required repo checks
+        # (this workflow is not a merge gate). Pass rate is never a threshold.
+        continue-on-error: true
+        run: |
+          cargo run -p spice-substrait-compliance -- \
+            --mode mode-a \
+            --suite tools/substrait-compliance/.ibm/test-suites/tpch \
+            --out-json tools/substrait-compliance/results/mode-a-tpch.json \
+            --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
+
+      - name: Upload JSON report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: substrait-compliance-mode-a-tpch
+          path: |
+            tools/substrait-compliance/results/mode-a-tpch.json
+            tools/substrait-compliance/results/mode-a-tpch.csv
+          if-no-files-found: warn

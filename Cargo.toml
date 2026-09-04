@@ -114,6 +114,7 @@ members = [
     "tools/pdf-parse",
     "tools/pdf-split",
     "tools/pr-builds",
+    "tools/substrait-compliance",
     "crates/vendor/ttf-parser",
     "crates/vendor/lopdf",
     "crates/vendor/pdf-extract",

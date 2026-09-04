@@ -19988,6 +19988,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "spice-substrait-compliance"
+version = "2.3.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "bytes",
+ "chrono",
+ "clap",
+ "datafusion",
+ "datafusion-substrait",
+ "prost",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "yaml",
+]
+
+[[package]]
 name = "spice-table"
 version = "2.3.0-unstable"
 dependencies = [
