@@ -31,6 +31,21 @@ cargo run --manifest-path tools/substrait-compliance/Cargo.toml --release -- \
 
 This is **not** product CI. A low pass rate must not fail the repo. `--fail-below` exists for a future threshold once Luke/CTO set one; nightly leaves it unset.
 
+### Mode A TPC-H baseline (this pin)
+
+Captured in [`baseline-mode-a-tpch.json`](baseline-mode-a-tpch.json) against IBM v0.1.1 + spiceai DataFusion `f9a635e6…`:
+
+| status | count |
+|--------|------:|
+| pass | 7 |
+| fail | 1 |
+| skip | 0 |
+| error | 14 |
+| total | 22 |
+| **rate** | **31.8%** |
+
+14 errors are `from_substrait_plan` `NotImplemented` (`VarChar` literals on most queries; q09 is `Function argument non-Value type not supported`). The one fail is q01 `AVG` decimal precision vs DuckDB's expected double. 7 of the 8 plans that executed matched expected output.
+
 ## Mode B — Spice FlightSQL product path (stub)
 
 ```bash

@@ -1,0 +1,167 @@
+{
+  "mode": "a",
+  "engine": "DataFusion (spiceai fork consumer)",
+  "engine_version": "54.1",
+  "datafusion_rev": "f9a635e6b580d5fe6ed0a70975e36014ea86c476",
+  "ibm_substrait_compliance_tag": "v0.1.1",
+  "ibm_substrait_compliance_commit": "7fff86d04a7124123a3f2692fa2a69de0b0a1704",
+  "suite": "tpch",
+  "suite_version": "1.0.0",
+  "started_at": "2026-09-04T15:34:30.186291889Z",
+  "finished_at": "2026-09-04T15:34:30.384531035Z",
+  "passed": 7,
+  "failed": 1,
+  "skipped": 0,
+  "error": 14,
+  "total": 22,
+  "pass_rate_pct": 31.818181818181817,
+  "cases": [
+    {
+      "id": "q01",
+      "description": "Pricing Summary Report Query",
+      "status": "failed",
+      "execution_time_ms": 32,
+      "error": "cell [0,6] mismatch: actual \"25.575154\" vs expected \"25.575154611454693\""
+    },
+    {
+      "id": "q02",
+      "description": "Minimum Cost Supplier Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"EUROPE\", length: 25 }))"
+    },
+    {
+      "id": "q03",
+      "description": "Shipping Priority Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"BUILDING\", length: 10 }))"
+    },
+    {
+      "id": "q04",
+      "description": "Order Priority Checking Query",
+      "status": "passed",
+      "execution_time_ms": 20
+    },
+    {
+      "id": "q05",
+      "description": "Local Supplier Volume Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"ASIA\", length: 25 }))"
+    },
+    {
+      "id": "q06",
+      "description": "Forecasting Revenue Change Query",
+      "status": "passed",
+      "execution_time_ms": 16
+    },
+    {
+      "id": "q07",
+      "description": "Volume Shipping Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"FRANCE\", length: 25 }))"
+    },
+    {
+      "id": "q08",
+      "description": "National Market Share Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"AMERICA\", length: 25 }))"
+    },
+    {
+      "id": "q09",
+      "description": "Product Type Profit Measure Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported"
+    },
+    {
+      "id": "q10",
+      "description": "Returned Item Reporting Query",
+      "status": "passed",
+      "execution_time_ms": 26
+    },
+    {
+      "id": "q11",
+      "description": "Important Stock Identification Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"GERMANY\", length: 25 }))"
+    },
+    {
+      "id": "q12",
+      "description": "Shipping Modes and Order Priority Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"MAIL\", length: 10 }))"
+    },
+    {
+      "id": "q13",
+      "description": "Customer Distribution Query",
+      "status": "passed",
+      "execution_time_ms": 8
+    },
+    {
+      "id": "q14",
+      "description": "Promotion Effect Query",
+      "status": "passed",
+      "execution_time_ms": 18
+    },
+    {
+      "id": "q15",
+      "description": "Top Supplier Query",
+      "status": "passed",
+      "execution_time_ms": 31
+    },
+    {
+      "id": "q16",
+      "description": "Parts/Supplier Relationship Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"Brand#45\", length: 10 }))"
+    },
+    {
+      "id": "q17",
+      "description": "Small-Quantity-Order Revenue Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"Brand#23\", length: 10 }))"
+    },
+    {
+      "id": "q18",
+      "description": "Large Volume Customer Query",
+      "status": "passed",
+      "execution_time_ms": 37
+    },
+    {
+      "id": "q19",
+      "description": "Discounted Revenue Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"Brand#12\", length: 10 }))"
+    },
+    {
+      "id": "q20",
+      "description": "Potential Part Promotion Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"CANADA\", length: 25 }))"
+    },
+    {
+      "id": "q21",
+      "description": "Suppliers Who Kept Orders Waiting Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"SAUDI ARABIA\", length: 25 }))"
+    },
+    {
+      "id": "q22",
+      "description": "Global Sales Opportunity Query",
+      "status": "error",
+      "execution_time_ms": 0,
+      "error": "from_substrait_plan: This feature is not implemented: Unsupported literal_type: Some(VarChar(VarChar { value: \"13\", length: 15 }))"
+    }
+  ]
+}

@@ -14,13 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Result comparison matching IBM/substrait-compliance Rust SDK semantics
-//! (row/column counts, normalised types, epsilon on numerics).
+//! Result comparison based on IBM/substrait-compliance Rust SDK semantics
+//! (row/column counts, normalised types, epsilon on numerics), with three
+//! widenings needed for a DataFusion 54 result: `Integer`/`Bigint` are the
+//! same family (`COUNT(*)` is Int64), strings trim CHAR padding, and numeric
+//! compare uses relative as well as absolute 1e-9 epsilon.
 
 use chrono::NaiveDate;
 use datafusion::arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
-    StringArray,
+    StringArray, StringViewArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -73,7 +76,7 @@ pub fn compare_results(actual: &TableData, expected: &TableData) -> Result<(), S
         .zip(expected.columns.iter())
         .enumerate()
     {
-        if *actual_ty != *expected_ty {
+        if !types_compatible(*actual_ty, *expected_ty) {
             return Err(format!(
                 "column {idx} type mismatch: actual {actual_ty:?} vs expected {expected_ty:?}"
             ));
@@ -95,6 +98,18 @@ pub fn compare_results(actual: &TableData, expected: &TableData) -> Result<(), S
     Ok(())
 }
 
+/// `Integer` and `Bigint` compare as the same family: `COUNT(*)` is Int64 in
+/// DataFusion and `integer` in the IBM expected CSVs. Values are still
+/// checked cell-by-cell.
+fn types_compatible(actual: CanonicalType, expected: CanonicalType) -> bool {
+    actual == expected
+        || matches!(
+            (actual, expected),
+            (CanonicalType::Integer, CanonicalType::Bigint)
+                | (CanonicalType::Bigint, CanonicalType::Integer)
+        )
+}
+
 pub fn values_match(actual: &str, expected: &str) -> bool {
     if actual == expected {
         return true;
@@ -103,10 +118,20 @@ pub fn values_match(actual: &str, expected: &str) -> bool {
         if a.is_nan() && e.is_nan() {
             return true;
         }
-        return (a - e).abs() < NUMERIC_EPSILON;
+        let abs_diff = (a - e).abs();
+        if abs_diff <= NUMERIC_EPSILON {
+            return true;
+        }
+        let scale = a.abs().max(e.abs()).max(1.0);
+        return abs_diff / scale <= NUMERIC_EPSILON;
     }
-    actual.eq_ignore_ascii_case(expected)
-        && matches!(actual.to_ascii_lowercase().as_str(), "true" | "false")
+    let actual_trim = actual.trim();
+    let expected_trim = expected.trim();
+    if actual_trim == expected_trim {
+        return true;
+    }
+    actual_trim.eq_ignore_ascii_case(expected_trim)
+        && matches!(actual_trim.to_ascii_lowercase().as_str(), "true" | "false")
 }
 
 pub fn parse_data_type(s: &str) -> CanonicalType {
@@ -232,6 +257,13 @@ fn format_cell(array: &dyn Array, idx: usize) -> Result<String, String> {
                 .ok_or_else(|| "utf8 downcast failed".to_string())?;
             Ok(values.value(idx).to_string())
         }
+        DataType::Utf8View => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| "utf8view downcast failed".to_string())?;
+            Ok(values.value(idx).to_string())
+        }
         other => Ok(format!("<{other:?}>")),
     }
 }
@@ -266,7 +298,24 @@ mod tests {
     fn numeric_epsilon_matches() {
         assert!(values_match("380456.0", "380456"));
         assert!(values_match("1.0000000001", "1.0"));
+        assert!(values_match("1193053.2253", "1193053.225299999"));
+        assert!(values_match(
+            " are carefully. slyly ",
+            "are carefully. slyly"
+        ));
         assert!(!values_match("1.1", "1.0"));
+    }
+
+    #[test]
+    fn integer_and_bigint_are_compatible() {
+        assert!(types_compatible(
+            CanonicalType::Integer,
+            CanonicalType::Bigint
+        ));
+        assert!(!types_compatible(
+            CanonicalType::Integer,
+            CanonicalType::Double
+        ));
     }
 
     #[test]
