@@ -453,6 +453,89 @@ mod tests {
         Ok(())
     }
 
+    /// `array_length` / `array_length(_, 1)` / `list_length` over a list column is rewritten
+    /// to Vortex `list_length` and pushed into the scan. Port of spiraldb/vortex#8600.
+    ///
+    /// Semantics that must hold: `UInt64` length, `0` for a non-null empty list, `NULL` for
+    /// a null list. The two-argument form with `dim > 1` must stay above the scan.
+    #[tokio::test]
+    async fn test_array_length_pushes_down_and_handles_empty_and_null() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::with_nested_functions(true);
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE list_test (id INT NOT NULL, a INT[], b INT[]) \
+                STORED AS vortex LOCATION '/list_test/'",
+            )
+            .await?;
+        ctx.session
+            .sql(
+                "INSERT INTO list_test VALUES \
+                    (1, [10, 20, 30], [1]), \
+                    (2, [40, 50, 60, 70], [2, 3]), \
+                    (3, [80], [4, 5, 6]), \
+                    (4, [90, 100, 110, 120, 130], [7, 8, 9, 10]), \
+                    (5, [140, 150], []), \
+                    (6, NULL, [1, 2])",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Projection: `array_length` on both list columns must push into the Vortex
+        // scan and return exact lengths — including 0 for the empty `b` on row 5
+        // and NULL for the null `a` on row 6.
+        let proj_query = "SELECT id, array_length(a) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id";
+        let proj_plan = physical_plan_display(&ctx.session, proj_query).await?;
+        assert!(
+            proj_plan.contains("file_type=vortex") && !proj_plan.contains("FilterExec"),
+            "array_length projection should run as a Vortex scan, got plan:\n{proj_plan}"
+        );
+        let proj_result = ctx.session.sql(proj_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_pushdown_result",
+            pretty_format_batches(&proj_result)?
+        );
+
+        // `array_length(a, 1)` is equivalent and must return the same `a` lengths.
+        let dim1_result = ctx
+            .session
+            .sql("SELECT id, array_length(a, 1) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&dim1_result)?.to_string(),
+            "array_length(a, 1) must match array_length(a)"
+        );
+
+        // Filter: `array_length(a) >= 4` must push into the scan and drop the empty
+        // and null lists (NULL comparisons are not kept).
+        let filter_query = "SELECT id FROM list_test WHERE array_length(a) >= 4 ORDER BY id";
+        let filter_plan = physical_plan_display(&ctx.session, filter_query).await?;
+        assert!(
+            filter_plan.contains("predicate:") && !filter_plan.contains("FilterExec"),
+            "array_length filter should push into the Vortex scan, got plan:\n{filter_plan}"
+        );
+        let filter_result = ctx.session.sql(filter_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_filter_pushdown_result",
+            pretty_format_batches(&filter_result)?
+        );
+
+        // `array_length(a, 2)` has multidimensional semantics that `list_length` does
+        // not model, so it must stay in a FilterExec above the scan.
+        let dim2_query = "SELECT id FROM list_test WHERE array_length(a, 2) >= 4 ORDER BY id";
+        let dim2_plan = physical_plan_display(&ctx.session, dim2_query).await?;
+        assert!(
+            dim2_plan.contains("FilterExec") && !dim2_plan.contains("predicate:"),
+            "array_length(arr, 2) must stay in a FilterExec above the scan, got plan:\n{dim2_plan}"
+        );
+
+        Ok(())
+    }
+
     /// Doc example: demonstrates creating, writing, reading, and filtering a Vortex table.
     #[tokio::test]
     async fn doc_example() -> anyhow::Result<()> {
