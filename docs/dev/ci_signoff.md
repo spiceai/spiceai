@@ -306,11 +306,16 @@ The Actions workflow:
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
 
-The checks run under a step budget nested inside a job budget (both in
-`.github/workflows/signoff.yml`), so a run that overruns fails as a failed step
-rather than being terminated at the job wall (which reports as `cancelled`, with
-no failed step and no chance to clean up). GitHub bounds a self-hosted job at 5
-days, not the 6 hours it allows a GitHub-hosted one, so those budgets are sized
+The checks run under a budget enforced inside the sign-off step, nested in the
+job's own `timeout-minutes` (both in `.github/workflows/signoff.yml`), so a run
+that overruns fails as a failed step rather than being terminated at the job wall
+(which reports as `cancelled`, with no failed step and no chance to clean up).
+That inner budget is a `timeout` rather than the step's own `timeout-minutes`
+because GitHub caps a *step* at 360 minutes on every runner type, while the job
+attribute of the same name treats 360 as a default and yields to the runner's
+execution limit — 5 days on self-hosted, 6 hours on GitHub-hosted. The two read
+alike and behave differently; `check_workflow_yaml.py` fails the build on a step
+budget above 360 so the conflation cannot ship. The budgets are therefore sized
 for the work rather than against an external limit — a gate that has not yet
 been measured to completion on this pool gets headroom, not a tight fit. The gap
 between them is sized for the handlers below, not for the seconds a status post

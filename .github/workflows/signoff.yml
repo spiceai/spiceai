@@ -523,17 +523,32 @@ jobs:
 
       - name: Sign off
         id: sign_off
+        # The gate's budget is enforced by `timeout` here, not by this step's
+        # own `timeout-minutes`. GitHub caps a *step* at "Maximum: 360 for both
+        # GitHub-hosted and self-hosted runners" (the workflow-syntax
+        # reference), so a larger value there cannot be delivered — and 360 is
+        # below the >353 minutes two runs on this pool already needed, which is
+        # the whole reason the budget moved. The job's own `timeout-minutes`
+        # carries no such cap (360 is its *default*, and a self-hosted job runs
+        # to 5 days), so it stays the outer wall at 720.
+        #
+        # `timeout` reproduces the shape the step attribute would have given:
+        # the gate is signalled at its budget and this step exits non-zero, so
+        # an overrun is a failed step the next run can read rather than a job
+        # cancelled at its wall with nothing to show. scripts/signoff already
+        # treats a signal as "reached no verdict" and leaves the status as it
+        # found it. `--kill-after` covers a gate that ignores the TERM.
+        #
+        # Thirty minutes under the job budget above, leaving the handlers and
+        # `Show sccache stats` the window sized for them there. The gate's peak
+        # on this pool is headroom rather than a fit, for the reasons recorded
+        # with the job budget; if sign-offs start expiring here, re-check that
+        # budget before suspecting a branch.
+        #
         # -f: Actions checkouts have no @{push} upstream tracking, so the local
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
-        run: .trusted-ci/signoff -f
-        # Thirty minutes under the job budget above, so an overrun gives up as
-        # a failed step — which the run after it can read — and still leaves
-        # the handlers and `Show sccache stats` the window sized for them
-        # there. The gate's peak on this pool is headroom rather than a fit,
-        # for the reasons recorded with the job budget; if sign-offs start
-        # expiring here, re-check that budget before suspecting a branch.
-        timeout-minutes: 690
+        run: timeout --signal=TERM --kill-after=60s 690m .trusted-ci/signoff -f
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
