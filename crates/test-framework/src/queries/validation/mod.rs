@@ -998,10 +998,18 @@ pub fn compare_query_result_batches(
 /// Most of the suite corpus sorts without a `LIMIT` and is compared that way, so
 /// without this check an engine whose sort is wrong compares equal.
 ///
-/// Content is compared first: when both the rows and the order differ, the row
-/// difference is the more useful report. A tie under the sort key is never a
-/// violation, so the check adds no sensitivity to the engine-dependent ordering
-/// of equal rows that [`RowOrder::Multiset`] exists to absorb.
+/// A side that breaks its own `ORDER BY` is reported as that, in preference to
+/// the content difference it also causes. Under [`RowOrder::Preserved`] —
+/// `ORDER BY … LIMIT`, where the set of rows depends on the order — the same
+/// rows in the wrong order fail as a content mismatch, which says the two
+/// results differ without naming the side that is wrong on its own terms. A
+/// caller adjudicating a disagreement between engines needs that distinction:
+/// a content difference may come from dialect or arithmetic, a sort violation
+/// cannot. When no side violates, the content result stands.
+///
+/// A tie under the sort key is never a violation, so the check adds no
+/// sensitivity to the engine-dependent ordering of equal rows that
+/// [`RowOrder::Multiset`] exists to absorb.
 ///
 /// **A sort check that could not run is returned, not swallowed.** Whatever the
 /// check could not cover lands in [`SortCheckedComparison::unchecked`], because
@@ -1023,12 +1031,7 @@ pub fn compare_query_result_batches_with_sort_check(
     row_order: RowOrder,
 ) -> Result<SortCheckedComparison> {
     let content = compare_query_result_batches(query_name, left_batches, right_batches, row_order)?;
-    if content != QueryValidationResult::Pass {
-        return Ok(SortCheckedComparison {
-            result: content,
-            unchecked: Vec::new(),
-        });
-    }
+    let content_passed = content == QueryValidationResult::Pass;
 
     // Parsed once for both sides: the AST does not depend on which engine's rows
     // are being checked, and the corpus carries multi-kilobyte statements.
@@ -1043,8 +1046,13 @@ pub fn compare_query_result_batches_with_sort_check(
         match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
             SortCheck::Ordered => {}
             SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
-                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
-                unchecked.push(format!("{side}: {reason}"));
+                // A comparison that already failed carries its own finding, and
+                // what the sort check could not cover would only dilute it. The
+                // hole matters where the result would otherwise read as a pass.
+                if content_passed {
+                    println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                    unchecked.push(format!("{side}: {reason}"));
+                }
             }
             SortCheck::Violation(v) => {
                 println!(
@@ -1062,6 +1070,13 @@ pub fn compare_query_result_batches_with_sort_check(
                 });
             }
         }
+    }
+
+    if !content_passed {
+        return Ok(SortCheckedComparison {
+            result: content,
+            unchecked: Vec::new(),
+        });
     }
 
     Ok(SortCheckedComparison {

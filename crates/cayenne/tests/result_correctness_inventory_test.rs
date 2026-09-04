@@ -271,6 +271,44 @@ fn a_failure_carries_the_typed_reason_that_separates_a_sort_violation() {
     );
 }
 
+/// `ORDER BY … LIMIT` compares positionally, because the *set* of rows depends
+/// on the order. A side that breaks its own `ORDER BY` therefore fails the
+/// content comparison first, and reporting only that would say the rows differ
+/// without naming the side that is wrong — which is what lets the DuckDB lane
+/// adjudicate a real violation away as a dialect difference.
+#[test]
+fn an_order_by_limit_violation_is_named_as_one_not_as_a_content_mismatch() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let sorted = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("sorted");
+    let reversed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 1]))],
+    )
+    .expect("reversed");
+
+    let top_k = Query::new(
+        "ordered_limit".into(),
+        "SELECT v FROM t ORDER BY v LIMIT 10".into(),
+        false,
+    );
+    let (outcome, reason) = compare_actual_results_with_reason(&top_k, &[sorted], &[reversed]);
+    assert!(
+        matches!(outcome, support::ParityOutcome::Fail { .. }),
+        "a mis-ordered top-K side is a failure: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            reason,
+            Some(QueryValidationFailReason::SortOrderViolation { ref side, .. }) if side == "right"
+        ),
+        "the same rows in the wrong order is a sort violation, not just a content mismatch: {reason:?}"
+    );
+}
+
 /// Prove the harness routes through the shipped `compare_query_result_batches`.
 #[test]
 fn harness_compare_actual_results_drives_shipped_path() {
