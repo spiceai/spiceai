@@ -66,6 +66,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
+pub mod caching_eviction;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -257,6 +258,23 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeliverableKey {
+        dataset_name: String,
+        pk_columns: usize,
+    },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back marks and delivers each committed row keyed on '{resolved}', the primary key this dataset's accelerator resolved, but its source connector was configured to upsert on '{declared}'. Delivering on a different column would write a second row at the source instead of updating the one that was marked. Set 'acceleration.primary_key' to '{resolved}', or recreate the acceleration so it resolves the declared key. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackKeyMismatch {
+        dataset_name: String,
+        resolved: String,
+        declared: String,
+    },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -428,6 +446,8 @@ pub struct Builder {
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
+    caching_max_size_bytes: Option<u64>,
+    caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
@@ -485,6 +505,8 @@ impl Builder {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
+            caching_max_size_bytes: None,
+            caching_max_items: None,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
@@ -578,8 +600,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes commit to the local accelerator first,
-    /// then asynchronously persist to the federated source.
+    /// Enable write-back mode: writes commit to the local accelerator inside a
+    /// transaction, and a delivery worker carries them to the federated source
+    /// afterwards.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -736,6 +759,18 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set the byte budget (`caching_max_size`) for cache mode
+    pub fn caching_max_size_bytes(&mut self, max_size_bytes: Option<u64>) -> &mut Self {
+        self.caching_max_size_bytes = max_size_bytes;
+        self
+    }
+
+    /// Set the row budget (`caching_max_items`) for cache mode
+    pub fn caching_max_items(&mut self, max_items: Option<u64>) -> &mut Self {
+        self.caching_max_items = max_items;
         self
     }
 
@@ -932,7 +967,7 @@ impl Builder {
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
@@ -955,6 +990,7 @@ impl Builder {
         refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
+        refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
@@ -978,6 +1014,39 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source.
+        //
+        // Built before ANY background task starts, because building it can fail: a
+        // key the worker could never deliver on refuses the table rather than
+        // letting it accept writes it would never carry to the source. Every
+        // `return` after this point abandons whatever tasks already exist, and
+        // dropping a `JoinHandle` detaches its task rather than aborting it — only
+        // `Drop for AcceleratedTable` aborts them, and that never runs for a table
+        // that was never built. `refresher.start` below is the first such task, so
+        // this has to come before it, not merely before `handlers`.
+        //
+        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
+        // further down.
+        let write_back_worker = if self.write_back && !self.dual_write {
+            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+                Some(write::CayenneWriteTarget::Staged(cayenne))
+                    if cayenne.is_durable_write_back() =>
+                {
+                    Some(write_back_worker::WriteBackWorker::new(
+                        *cayenne,
+                        Arc::clone(&self.federated),
+                        self.dataset_name.to_string(),
+                        self.write_back_deliverer.clone(),
+                    )?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1053,7 +1122,30 @@ impl Builder {
             None
         };
 
-        if let Some(retention) = self.retention {
+        // A caching accelerator is bounded by `caching_eviction` as a computed
+        // retention policy rather than by a loop of its own, so the cache is
+        // swept by the same ticker, write lock and index-aware delete every
+        // other dataset uses. Attached before the retention task is spawned
+        // below.
+        let retention = if refresh_mode == RefreshMode::Caching {
+            Some(caching_eviction::retention(
+                caching_eviction::CacheLimits {
+                    max_size_bytes: self.caching_max_size_bytes,
+                    max_items: self.caching_max_items,
+                    ttl: self.caching_ttl,
+                    stale_while_revalidate: self.caching_stale_while_revalidate_ttl,
+                    stale_if_error: self.caching_stale_if_error,
+                },
+                self.retention,
+                &self.accelerator,
+                &self.dataset_name,
+                &self.io_runtime,
+            ))
+        } else {
+            self.retention
+        };
+
+        if let Some(retention) = retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
@@ -1199,21 +1291,14 @@ impl Builder {
             WriteMode::WriteThrough
         };
 
-        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
-        // commit path marks dirty keys gets a per-table delivery worker that
-        // reconciles those keys to the federated source. Aborted on drop with
-        // the other handlers.
-        if matches!(write_mode, WriteMode::WriteBack)
-            && let Some(write::CayenneWriteTarget::Staged(cayenne)) =
-                write::dual_write::extract_cayenne_write_target(&self.accelerator)
-            && cayenne.is_durable_write_back()
-        {
-            handlers.push(write_back_worker::WriteBackWorker::spawn(
-                *cayenne,
-                Arc::clone(&self.federated),
-                self.dataset_name.to_string(),
-                self.write_back_deliverer.clone(),
-            ));
+        // Started here rather than where it was built, so it is aborted on drop
+        // with the other handlers.
+        if let Some(worker) = write_back_worker {
+            debug_assert!(
+                matches!(write_mode, WriteMode::WriteBack),
+                "a delivery worker was built for a table that did not resolve to write-back"
+            );
+            handlers.push(worker.start());
         }
 
         Ok(AcceleratedTable {
@@ -1986,7 +2071,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2013,9 +2105,9 @@ impl TableLayer for AcceleratedTable {
                     input,
                     overwrite,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
                     Arc::clone(&self.refresher),
                     self.schema(),
+                    &self.dataset_name.to_string(),
                 )
             }
             WriteMode::DualWrite {
@@ -2045,6 +2137,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(self.write_mode, WriteMode::WriteBack) {
+            return Err(write::write_back::delete_not_supported(
+                &self.dataset_name.to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2053,15 +2153,7 @@ impl TableLayer for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.delete_from(state, filters).await
             }
-            WriteMode::WriteBack => {
-                write::write_back::delete_write_back(
-                    state,
-                    filters,
-                    Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
-                )
-                .await
-            }
+            WriteMode::WriteBack => unreachable!("refused above, before the timestamp moves"),
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
@@ -2091,7 +2183,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2107,7 +2206,8 @@ impl TableLayer for AcceleratedTable {
                     assignments,
                     filters,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
+                    &self.dataset_name.to_string(),
+                    Arc::clone(&self.last_updated_at),
                 )
                 .await
             }
@@ -2139,6 +2239,18 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(
+            self.write_mode,
+            WriteMode::WriteBack | WriteMode::DualWrite { .. }
+        ) {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                    .to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2148,10 +2260,7 @@ impl TableLayer for AcceleratedTable {
                 federated_table.truncate(state).await
             }
             WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
-                Err(datafusion::error::DataFusionError::Plan(
-                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
-                        .to_string(),
-                ))
+                unreachable!("refused above, before the timestamp moves")
             }
         }
     }
@@ -2233,6 +2342,41 @@ fn filters_for_accelerator_scan(
     }
 
     Ok(accelerator_filters)
+}
+
+/// Resolves what a retention check should delete, computed fresh on every tick.
+///
+/// The two static filter kinds can only express a predicate fixed when the
+/// dataset was configured. This one is asked each tick, so a policy that has to
+/// *measure* the table before it can decide — a byte or row budget, which is
+/// knowable only by aggregating what is stored — can be a retention filter
+/// rather than a second eviction loop running beside this one.
+///
+/// It is given whatever the dataset's own retention filters resolved to and has
+/// the last word on the result. An implementation may widen that predicate,
+/// narrow it, or ignore it: a caching accelerator translates it from rows to
+/// whole cache entries, because deleting part of a multi-row cached response
+/// would leave the rest to be served as though it were complete.
+#[async_trait::async_trait]
+pub trait RetentionPredicate: Send + Sync + std::fmt::Debug {
+    /// The rows to delete this tick, or `None` when there is nothing to remove.
+    ///
+    /// `configured` is what this dataset's static retention filters resolved
+    /// to, or `None` when it has none. An implementation that ignores it drops
+    /// a `retention_period` or `retention_sql` the user wrote, silently — so it
+    /// must either fold `configured` into what it returns or be able to say why
+    /// that rule cannot apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusionError` if the accelerator cannot be queried for
+    /// whatever the decision needs. The tick is skipped and retried on the next
+    /// interval.
+    async fn delete_expr(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        configured: Option<Expr>,
+    ) -> datafusion::error::Result<Option<Expr>>;
 }
 
 #[derive(Debug)]
@@ -2370,6 +2514,9 @@ impl RetentionBuilder {
         Some(Retention {
             filters,
             check_interval,
+            // The builder configures a dataset's own retention rules; a
+            // computed policy is attached by whatever owns it.
+            computed: None,
         })
     }
 }
@@ -2383,6 +2530,16 @@ impl Default for RetentionBuilder {
 pub struct Retention {
     pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
+    /// A policy decided per tick rather than at configuration time, which has
+    /// the last word on what `filters` resolved to: see [`RetentionPredicate`].
+    ///
+    /// A field rather than another `filters` variant, because it does not
+    /// compose the way they do. Every variant in that list is OR'd together;
+    /// this one is handed their combined result and may widen it, narrow it or
+    /// replace it. Putting it in the list would make "at most one, applied
+    /// last" a convention the loop has to enforce by hand, and a second one
+    /// would silently disable the first.
+    pub(crate) computed: Option<Arc<dyn RetentionPredicate>>,
 }
 
 impl Retention {

@@ -3182,6 +3182,15 @@ impl DataFusion {
                 );
             }
 
+            // A caching accelerator's retention is enforced by
+            // `accelerated::caching_eviction`, attached as a retention filter by
+            // the accelerated-table builder. A `retention_period` or
+            // `retention_sql` the user sets still applies, but is evaluated per
+            // cache entry rather than per row: a cached response can span
+            // several rows (a paginated one is fetched a page at a time), and a
+            // row-level delete could take part of one and leave the rest to be
+            // served as though it were the whole response.
+            //
             // Nothing in the caching read path removes an entry, so the
             // accelerator is bounded by a retention policy or by nothing at all.
             match caching_retention::caching_retention(
@@ -3229,6 +3238,9 @@ impl DataFusion {
             );
             accelerated_table_builder
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
+            accelerated_table_builder
+                .caching_max_size_bytes(acceleration_settings.caching_max_size);
+            accelerated_table_builder.caching_max_items(acceleration_settings.caching_max_items);
         }
 
         // Get the acceleration layout (used for snapshots and size metrics)

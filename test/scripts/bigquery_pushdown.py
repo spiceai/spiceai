@@ -64,6 +64,35 @@ DATASET_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 PROJECT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
 
 QUERIES = {
+    # --- fork PR #212 renderings, one per case ---
+    # `date - date` is an Int64 day count in the plan and an INTERVAL in
+    # BigQuery, so a bare `-` hands the next operator a duration.
+    "date-difference": """SELECT id, d - e AS days
+FROM temporal_values
+ORDER BY id""",
+    # BigQuery has no cast from DATE to INT64.
+    "date-to-integer": """SELECT id, CAST(d AS BIGINT) AS epoch_day
+FROM temporal_values
+ORDER BY id""",
+    # A civil timestamp compared against a civil literal: typed TIMESTAMP it
+    # becomes an instant, which BigQuery gives no supertype against DATETIME.
+    "naive-timestamp-compare": """SELECT id
+FROM temporal_values
+WHERE naive >= CAST('2026-05-11 00:00:00' AS TIMESTAMP)
+ORDER BY id""",
+    # BigQuery refuses a literal grouping key outright.
+    "constant-group-by": """SELECT 'POOLED' AS bucket, COUNT(*) AS n
+FROM temporal_values
+GROUP BY 1""",
+    # `array_element` is 1-based; a bare BigQuery subscript is 0-based.
+    "array-element-literal": """SELECT id, array_element(arr, 1) AS first_el
+FROM temporal_values
+ORDER BY id""",
+    # Control: an index whose sign is unknown cannot be rendered, so it must
+    # evaluate locally rather than fail or read the neighbouring element.
+    "array-element-non-literal-control": """SELECT id, array_element(arr, idx) AS nth_el
+FROM temporal_values
+ORDER BY id""",
     "union-distinct": """SELECT value
 FROM union_values
 WHERE value <= 2
@@ -195,6 +224,28 @@ ORDER BY u.value""",
 }
 
 EXPECTED_ROWS = {
+    "date-difference": [
+        {"id": 1, "days": 10},
+        {"id": 2, "days": 18},
+        {"id": 3, "days": -10},
+    ],
+    "date-to-integer": [
+        {"id": 1, "epoch_day": 20584},
+        {"id": 2, "epoch_day": 20592},
+        {"id": 3, "epoch_day": 20574},
+    ],
+    "naive-timestamp-compare": [{"id": 1}, {"id": 2}],
+    "constant-group-by": [{"bucket": "POOLED", "n": 3}],
+    "array-element-literal": [
+        {"id": 1, "first_el": 10},
+        {"id": 2, "first_el": 40},
+        {"id": 3, "first_el": 60},
+    ],
+    "array-element-non-literal-control": [
+        {"id": 1, "nth_el": 10},
+        {"id": 2, "nth_el": 50},
+        {"id": 3, "nth_el": 60},
+    ],
     "union-distinct": [{"value": 1}, {"value": 2}, {"value": 3}],
     "union-all-control": [
         {"value": 1},
@@ -414,6 +465,16 @@ FROM UNNEST([
   STRUCT(CAST(NULL AS TIMESTAMP), 'd')
 ]);
 
+CREATE OR REPLACE TABLE {prefix}.temporal_values` AS
+SELECT * FROM UNNEST([
+  STRUCT(1 AS id, DATE '2026-05-11' AS d, DATE '2026-05-01' AS e,
+         DATETIME '2026-05-11 03:00:00' AS naive, [10, 20, 30] AS arr, 1 AS idx),
+  STRUCT(2, DATE '2026-05-19', DATE '2026-05-01',
+         DATETIME '2026-05-19 05:00:00', [40, 50], 2),
+  STRUCT(3, DATE '2026-05-01', DATE '2026-05-11',
+         DATETIME '2026-05-01 00:00:00', [60], 1)
+]);
+
 CREATE OR REPLACE TABLE {prefix}.regexp_values` AS
 SELECT *
 FROM UNNEST([
@@ -452,6 +513,9 @@ datasets:
     params: *bigquery_params
   - from: adbc:bucket_values
     name: bucket_values
+    params: *bigquery_params
+  - from: adbc:temporal_values
+    name: temporal_values
     params: *bigquery_params
 """
 
@@ -545,6 +609,43 @@ def pushed_statement_count(explain_body: str) -> int:
 
 
 def assert_generated_sql(name: str, sql: str) -> None:
+    if name == "date-difference":
+        if "DATE_DIFF(" not in sql or re.search(r"`d` - `e`|`e` - `d`", sql):
+            raise HarnessError(
+                f"DATE - DATE was not pushed as DATE_DIFF, so BigQuery types the day "
+                f"count as an INTERVAL: {sql}"
+            )
+    if name == "date-to-integer":
+        if "UNIX_DATE(" not in sql or re.search(r"CAST\(`[^`]*`\.?`?d`? AS INT64\)", sql):
+            raise HarnessError(
+                f"CAST(date AS INT64) was not pushed as UNIX_DATE, a cast BigQuery does "
+                f"not have: {sql}"
+            )
+    if name == "naive-timestamp-compare":
+        if "DATETIME" not in sql:
+            raise HarnessError(
+                f"the civil timestamp was not typed DATETIME, so BigQuery has no "
+                f"supertype for the comparison: {sql}"
+            )
+    if name == "constant-group-by":
+        group_by = sql.split("GROUP BY", 1)[1] if "GROUP BY" in sql else ""
+        if "CAST(" not in group_by:
+            raise HarnessError(
+                f"the constant grouping key was not cast, which BigQuery refuses as a "
+                f"literal and other engines read as an ordinal: {sql}"
+            )
+    if name == "array-element-literal":
+        if "SAFE_ORDINAL(1)" not in sql:
+            raise HarnessError(
+                f"array_element was not pushed 1-based, so a bare 0-based subscript "
+                f"reads the neighbouring element: {sql}"
+            )
+    if name == "array-element-non-literal-control":
+        if "SAFE_ORDINAL" in sql or "array_element" in sql:
+            raise HarnessError(
+                f"an index whose sign is unknown must not be pushed down; it has to "
+                f"evaluate locally: {sql}"
+            )
     if name == "union-distinct" and " UNION DISTINCT " not in sql:
         raise HarnessError(f"distinct union is not explicit in pushed SQL: {sql}")
     if name == "union-all-control" and " UNION ALL " not in sql:
