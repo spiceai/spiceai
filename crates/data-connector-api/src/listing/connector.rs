@@ -3384,4 +3384,184 @@ mod tests {
             );
         }
     }
+
+    /// Unversioned buckets still report an `ETag` and never a version id. A
+    /// `Version` pin that only sends `version=` is then a no-op; every request
+    /// has to carry `If-Match` instead, or a replacement is read as a mixture.
+    #[tokio::test]
+    async fn a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::arrow::async_reader::{
+            ObjectVersionType, ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+        };
+        use futures::TryStreamExt;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("builds a batch");
+
+        let mut buffer = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None).expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let store = Arc::new(EtagRecordingStore::new());
+        let location = Path::from("unversioned.parquet");
+        store
+            .put(&location, buffer.into())
+            .await
+            .expect("stores the file");
+        let meta = store.head(&location).await.expect("heads the file");
+        let etag = meta
+            .e_tag
+            .clone()
+            .expect("an unversioned listing still carries an ETag");
+        assert!(
+            meta.version.is_none(),
+            "this test needs a listing with no version id"
+        );
+        store.forget_reads();
+        let store_handle = Arc::clone(&store);
+
+        let reader = ParquetObjectReader::new_with_meta(store as Arc<dyn ObjectStore>, meta)
+            .with_object_versioning_type(Some(ObjectVersionType::Version));
+        let rows: usize = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .expect("reads the Parquet metadata")
+            .build()
+            .expect("builds the record-batch stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("reads the data")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            rows, 3,
+            "the read has to reach the data, not just the footer"
+        );
+
+        let reads = store_handle.reads();
+        assert!(
+            !reads.is_empty(),
+            "the read issued no request at all, so this asserts nothing"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.if_match.as_deref(),
+                Some(etag.as_str()),
+                "a Version pin with no version id must send If-Match, or a replacement mid-scan \
+                 is read as a mixture of both generations: {options:?}"
+            );
+            assert!(
+                options.version.is_none(),
+                "must not invent a version id the listing did not have: {options:?}"
+            );
+            assert!(
+                !matches!(options.range, Some(object_store::GetRange::Suffix(_))),
+                "a read fell back to a suffix range, which Azure Blob Storage does not serve: \
+                 {options:?}"
+            );
+        }
+    }
+
+    /// Like [`VersionRecordingStore`], but the listing has an `ETag` and no version
+    /// id — the unversioned-bucket shape.
+    #[derive(Debug)]
+    struct EtagRecordingStore {
+        inner: object_store::memory::InMemory,
+        reads: std::sync::Mutex<Vec<object_store::GetOptions>>,
+    }
+
+    impl EtagRecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<object_store::GetOptions> {
+            self.reads.lock().expect("reads lock").clone()
+        }
+
+        fn forget_reads(&self) {
+            self.reads.lock().expect("reads lock").clear();
+        }
+    }
+
+    impl std::fmt::Display for EtagRecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "EtagRecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for EtagRecordingStore {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.reads.lock().expect("reads lock").push(options.clone());
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 }
