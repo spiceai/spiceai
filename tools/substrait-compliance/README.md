@@ -13,7 +13,7 @@ report-only; it does not fail the repository on a low pass rate.
 |------|--------|
 | IBM tag | `v0.1.1` ([release](https://github.com/IBM/substrait-compliance/releases/tag/v0.1.1)) |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `spiceai-54` @ `f9a635e6b580d5fe6ed0a70975e36014ea86c476` (workspace `[patch.crates-io]`) |
+| spiceai/datafusion fork | `lukekim/substrait-varchar-literal` @ `2e6ebfd97adcf6d6d192d1d4f23d2e67fff4395c` (workspace `[patch.crates-io]`; spiceai/datafusion#215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1**. The same example on tag
@@ -25,11 +25,13 @@ time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
 ## Mode A baseline (this pin)
 
-| Suite | Pass | Fail | Skip | Error | Total | Pass rate |
-|-------|------|------|------|-------|-------|-----------|
-| TPC-H SF 0.01 | 1 | 7 | 0 | 14 | 22 | **4.5%** |
+| Suite | PASS | FAIL | SKIP | ERROR | Total |
+|-------|------|------|------|-------|-------|
+| TPC-H SF 0.01 | 5 | 14 | 0 | 3 | 22 |
 
-Per-query notes and failure groups: [`RESULTS.md`](RESULTS.md).
+Isthmus `VarChar` literals no longer ERROR after DF #215. Remaining
+ERRORs are non-Value function arguments (q07, q08, q09). Per-query
+notes: [`RESULTS.md`](RESULTS.md).
 
 ## Local run (Mode A)
 
