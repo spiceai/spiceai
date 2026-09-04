@@ -924,8 +924,8 @@ mod tests {
     /// Regression test for #13848. One batch carries id=1 twice: an indexable row first,
     /// then the row that *decides* the key, whose text the write rejects. The table
     /// resolves a repeated key last-write-wins, so id=1's standing value is the rejected
-    /// one — and before this fix the earlier row's vector stayed searchable under it, so a
-    /// search answered from text the same batch had already replaced.
+    /// one; leaving the earlier row's vector searchable under that key would answer a
+    /// search from text the same batch had already replaced.
     #[tokio::test]
     async fn a_repeated_key_whose_deciding_row_is_rejected_keeps_nothing_indexed() {
         let index = memory_index();
@@ -950,8 +950,8 @@ mod tests {
         );
     }
 
-    /// The other direction, which this fix must leave alone: the key is rejected first and
-    /// stored after, so the row that decides it is the one the write indexes.
+    /// The other direction: the key is rejected first and stored after, so the row that
+    /// decides it is the one the write indexes and the key stays in the index.
     #[tokio::test]
     async fn a_repeated_key_stored_after_being_rejected_stays_indexed() {
         let index = memory_index();

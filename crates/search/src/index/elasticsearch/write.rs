@@ -1162,8 +1162,8 @@ mod tests {
             );
         }
 
-        /// The other direction, unchanged: the deciding row is the indexable one, so the
-        /// `_bulk` re-establishes the document and a delete would only cost a request.
+        /// The other direction: the deciding row is the indexable one, so the `_bulk`
+        /// re-establishes the document and a delete would only cost a request.
         #[test]
         fn a_repeated_id_indexed_after_being_rejected_is_not_evicted() {
             let ids = [1, 2, 1];
