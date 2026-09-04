@@ -27,11 +27,12 @@ time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
 | Suite | PASS | FAIL | SKIP | ERROR | Total |
 |-------|------|------|------|-------|-------|
-| TPC-H SF 0.01 | 5 | 14 | 0 | 3 | 22 |
+| TPC-H SF 0.01 | 15 | 4 | 0 | 3 | 22 |
 
+Before compare lifts (same pin): **PASS 5 | FAIL 14 | SKIP 0 | ERROR 3**.
 Isthmus `VarChar` literals no longer ERROR after DF #215. Remaining
 ERRORs are non-Value function arguments (q07, q08, q09). Per-query
-notes: [`RESULTS.md`](RESULTS.md).
+notes and known-fail flips: [`RESULTS.md`](RESULTS.md).
 
 ## Local run (Mode A)
 
@@ -72,7 +73,9 @@ cosmetics — values must still match:
 - column names are not compared (plan alias vs `DuckDB` name; IBM Rust SDK
   also skips names)
 - string cells are trimmed (`CHAR` padding)
-- numeric ε is absolute `1e-8` (IBM documents `1e-9`; q06 Δ ≈ 1.16e-9)
+- numeric ε is absolute `1e-8` or relative `1e-9` of magnitude, or
+  agreement at the coarser printed fractional scale (`decimal` vs
+  `DuckDB` float; IBM documents absolute `1e-9`)
 
 Not lifted: empty vs quoted-empty, row-count misses, `string` vs
 `integer` (q17 / q21 / q22).
