@@ -531,6 +531,7 @@ They are not equal in consequence; this is the order to close them in.
 12. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
+
 **Hangs, crashes and failures.** These take a query or the process down:
 
 13. `datafusion` bloom-filter replacement readers sharing the listed object
@@ -545,9 +546,11 @@ They are not equal in consequence; this is the order to close them in.
 17. `spark-connect-rs` `http` scheme when `use_ssl` is false.
 18. `model2vec-rs` optional `config.json`.
 19. `snowflake-rs` async query response support — long-running queries time out.
-20. `arrow-rs` `PushBuffers::push_range` short-read `ParquetError` (apache/arrow-rs#10564)
-    — an in-place shrink panics the reader thread; the overwrite harness 412s
-    before a short successful range body reaches the decoder.
+20. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+    on a short read — a footer prefetch racing an in-place shrink panics the
+    reader thread rather than surfacing a retriable decode error. The
+    listing/overwrite harness 412s before a short successful range body
+    reaches the decoder.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
