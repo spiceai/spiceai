@@ -482,14 +482,19 @@ mod tests {
             .collect()
             .await?;
 
-        // Projection: `array_length` on both list columns must push into the Vortex
-        // scan and return exact lengths — including 0 for the empty `b` on row 5
-        // and NULL for the null `a` on row 6.
+        // Projection: `array_length` on both list columns must be handed to the Vortex
+        // scan (on the DataSourceExec line, not a ProjectionExec above it) and return
+        // exact lengths — including 0 for the empty `b` on row 5 and NULL for the
+        // null `a` on row 6.
         let proj_query = "SELECT id, array_length(a) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id";
         let proj_plan = physical_plan_display(&ctx.session, proj_query).await?;
+        let scan_line = proj_plan
+            .lines()
+            .find(|line| line.contains("DataSourceExec") && line.contains("file_type=vortex"));
         assert!(
-            proj_plan.contains("file_type=vortex") && !proj_plan.contains("FilterExec"),
-            "array_length projection should run as a Vortex scan, got plan:\n{proj_plan}"
+            scan_line.is_some_and(|line| line.contains("array_length("))
+                && !proj_plan.contains("ProjectionExec"),
+            "array_length must appear on the Vortex scan itself, with no ProjectionExec above it, got plan:\n{proj_plan}"
         );
         let proj_result = ctx.session.sql(proj_query).await?.collect().await?;
         assert_snapshot!(
