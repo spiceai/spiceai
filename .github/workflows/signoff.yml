@@ -271,9 +271,14 @@ jobs:
     # repo already runs `testoperator_dispatch.yml` on this same pool at 720.
     # So the number answers to the work: two full-length runs of the gate here
     # (33706211503, 33731617339) were still going at 353 and 345 minutes, which
-    # bounds its peak from below but does not measure it. The budget leaves
-    # room for that rather than inheriting a figure calibrated against a pool
-    # with a warm `target/`.
+    # bounds its peak from below but does not measure it.
+    #
+    # Why it needs that much room is not established, and it is not a cold
+    # `target/`: both checkouts below leave actions/checkout's `clean` at its
+    # default, so `git clean -ffdx` removes `target/` on either pool, and a
+    # macOS sign-off starting equally cold (run 33805411465) completed the same
+    # gate in 100 minutes. Whatever accounts for the gap, this budget has to
+    # cover it rather than inherit a figure calibrated on the other pool.
     #
     # What has to hold is `setup + sign-off step + cleanup < 720`, not just
     # `690 < 720`: the job clock starts before the setup steps, the step clock
@@ -407,19 +412,18 @@ jobs:
           # tree so the boundary holds transitively rather than only one level
           # deep. Anchored on `./.github/actions/` so a `uses:` naming another
           # repository is untouched.
-          nested=$(grep -rlF 'uses: ./.github/actions/' .trusted-ci/actions || true)
-          if [ -n "$nested" ]; then
-            printf '%s\n' "$nested" | while IFS= read -r f; do
-              [ -n "$f" ] || continue
-              # Not `sed -i`: BSD sed requires an argument to it, and
-              # scripts/test_signoff_trusted_helpers.sh runs this very block on
-              # whatever machine a developer runs it from.
-              sed 's|uses: \./\.github/actions/|uses: ./.trusted-ci/actions/|g' "$f" >"$f.tmp" \
-                && mv "$f.tmp" "$f"
-            done
-            echo "Repointed nested action references at .trusted-ci in:"
-            printf '  %s\n' $nested
-          fi
+          nested="$(grep -rlF 'uses: ./.github/actions/' .trusted-ci/actions || true)"
+          while IFS= read -r f; do
+            # `grep` printing nothing still yields one empty line through the
+            # here-string, so this guard is what makes the no-match case a no-op.
+            [ -n "$f" ] || continue
+            # Not `sed -i`: BSD sed requires an argument to it, and
+            # scripts/test_signoff_trusted_helpers.sh runs this very block on
+            # whatever machine a developer runs it from.
+            sed 's|uses: \./\.github/actions/|uses: ./.trusted-ci/actions/|g' "$f" >"$f.tmp"
+            mv "$f.tmp" "$f"
+            echo "Repointed nested action references at .trusted-ci in $f"
+          done <<<"$nested"
           # Assert it, rather than trusting the rewrite: a nested reference that
           # survives here is a hole in exactly the boundary this step exists to
           # establish, and it must stop the run rather than be discovered later.
@@ -468,8 +472,8 @@ jobs:
           echo "merge-base with origin/trunk: $(git merge-base HEAD origin/trunk 2>/dev/null | cut -c1-12 || echo 'n/a (API fallback)')"
 
       # Before the toolchain setup, not after. The same floor is checked inside
-      # the sign-off run, but that check sits behind Rust, Nextest, spiceio,
-      # sccache, protoc, cc and make setup — so an already-full runner spent all
+      # the sign-off run, but that check sits behind the whole toolchain setup
+      # below — so an already-full runner spent all
       # of that before being told, and a volume that filled *during* those steps
       # failed the job with no indication that the volume, not the branch, was at
       # fault (#12427). Checking here stops the already-full case at once, with an
@@ -487,6 +491,11 @@ jobs:
       # done nothing but leave its `pending` behind.
       - name: Set up the GitHub CLI
         uses: ./.trusted-ci/actions/setup-gh
+        # A probe, one API call and one download. Bounded because it is the
+        # first network step of a job whose next step runs for hours: a wedged
+        # fetch here would otherwise spend the job budget before the gate
+        # started, and a job killed at its wall uploads no log to explain it.
+        timeout-minutes: 10
 
       - name: Set up Rust
         uses: ./.trusted-ci/actions/setup-rust
@@ -520,12 +529,10 @@ jobs:
         run: .trusted-ci/signoff -f
         # Thirty minutes under the job budget above, so an overrun gives up as
         # a failed step — which the run after it can read — and still leaves
-        # the handlers and `Show sccache stats` room to run; `clear-pending`
-        # alone has been seen taking 11m42s. The gate's peak duration on this
-        # pool is not measured, only bounded below by two runs still going at
-        # 345 and 353 minutes, so this is headroom rather than a fit. If
-        # sign-offs start expiring here, re-check this budget before suspecting
-        # a branch.
+        # the handlers and `Show sccache stats` the window sized for them
+        # there. The gate's peak on this pool is headroom rather than a fit,
+        # for the reasons recorded with the job budget; if sign-offs start
+        # expiring here, re-check that budget before suspecting a branch.
         timeout-minutes: 690
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -542,42 +549,35 @@ jobs:
       # and 33731617339 both died with the cache stats still pending). Cache
       # health is the first thing an overrun needs and the cheapest to get.
       - name: Show sccache stats
+        # This is the one step that reports cache health, so without `always()`
+        # it is skipped on exactly the failures it would explain (#12420) — and
+        # `always()` alone, not `always() && SCCACHE_SETUP == 'true'`, because a
+        # run that lost the cache is the one whose duration most needs
+        # explaining and the one that gate would keep silent. `setup-sccache`'s
+        # pre-flight degrades rather than fails — an unreachable backend is an
+        # infrastructure condition, not a fault in the code under test — so it
+        # clears `RUSTC_WRAPPER`, sets `SCCACHE_SETUP=false` and lets the gate
+        # compile uncached behind a single `::warning::` posted minutes into a
+        # run that lasts hours. The step budget is calibrated against a cached
+        # run, so that run overruns for a reason that has nothing to do with the
+        # branch or the budget. Report it where the reader is already looking.
         if: always()
         # Bounded because it sits in front of the status resolution now: this
         # asks the local sccache server, which is normally instant, but a
         # wedged one must not spend the cleanup window that the handlers need.
         timeout-minutes: 2
-        # `always()`: this is the one step that reports cache health, and without it
-        # it is skipped on exactly the failures it would explain (#12420).
-        #
-        # The condition is `always()` alone, not `always() && SCCACHE_SETUP ==
-        # 'true'`, because a run that lost the cache is the one whose duration
-        # most needs explaining and the one that would otherwise say nothing
-        # here. `setup-sccache`'s pre-flight degrades rather than fails — an
-        # unreachable backend is an infrastructure condition, not a fault in the
-        # code under test — so it clears `RUSTC_WRAPPER`, sets
-        # `SCCACHE_SETUP=false` and lets the gate compile uncached behind a
-        # single `::warning::` posted minutes into a run that lasts hours. The
-        # step budget is calibrated against a cached run, so that run overruns
-        # for a reason that has nothing to do with the branch or the budget, and
-        # the reader has to find one annotation to know it. Report it where they
-        # are already looking.
-        #
-        # The `||` keeps a diagnostic from ever deciding a verdict — when the
-        # cache backend is gone `--show-stats` cannot answer either, and that is
-        # itself the finding.
         run: |
-          case "${SCCACHE_SETUP:-unset}" in
-            true)
-              sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
-              ;;
-            false)
-              echo "::warning::This sign-off compiled without the compiler cache: the pre-flight found the backend unreachable and cleared RUSTC_WRAPPER. The step budget is calibrated against a cached run, so read this run's duration, and any budget expiry, as a cache-backend outage rather than as the branch or the budget."
-              ;;
-            *)
-              echo "The compiler cache was never configured in this run, so there are no stats to report."
-              ;;
-          esac
+          if [ "${SCCACHE_SETUP:-}" = "true" ]; then
+            # The `||` keeps a diagnostic from ever deciding a verdict — when
+            # the cache backend is gone `--show-stats` cannot answer either, and
+            # that is itself the finding.
+            sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+          else
+            # `false` (the pre-flight cleared it) and unset (no endpoint, or the
+            # job never reached the setup) differ only in cause, and the value is
+            # reported rather than branched on so neither is described wrongly.
+            echo "::warning::The compiler cache was not in use for this run (SCCACHE_SETUP=${SCCACHE_SETUP:-unset}): the pre-flight found the backend unreachable and cleared RUSTC_WRAPPER, or it was never configured. If this run reached the gate then it compiled uncached, and its duration — including any budget expiry — reflects that rather than the branch or the budget."
+          fi
 
       # A cancelled job is killed by signal, so `run_checks` in scripts/signoff returns
       # non-zero under its `set +e`, falls into the failure branch, and posts

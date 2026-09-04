@@ -64,27 +64,25 @@ runs:
         filename="gh_${version}_linux_${arch}.tar.gz"
         url="https://github.com/cli/cli/releases/download/v${version}/${filename}"
 
-        # Same shape as install-protoc: take the expected digest from the
-        # release metadata rather than trusting the download, and authenticate
-        # the API call so a shared runner IP does not hit the anonymous rate
-        # limit mid-run.
-        api_curl() {
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            curl -fsSL --retry 5 --retry-connrefused \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$1"
-          else
-            curl -fsSL --retry 5 --retry-connrefused "$1"
-          fi
-        }
-
         if ! command -v jq >/dev/null 2>&1; then
           sudo apt-get update -qq && sudo apt-get install -y -qq jq
         fi
 
-        release_json="$(api_curl "https://api.github.com/repos/cli/cli/releases/tags/v${version}")"
+        # Same shape as install-protoc: take the expected digest from the
+        # release metadata rather than trusting the download, and authenticate
+        # the call so a shared runner IP does not hit the anonymous rate limit
+        # mid-run. `github.token` always resolves, so the header is always
+        # present and there is no unauthenticated path to keep.
+        #
+        # Both requests here are bounded. This runs immediately before a gate
+        # measured in hours, and `--retry` does not bound a connection that
+        # hangs rather than refusing.
+        release_json="$(curl -fsSL --retry 5 --retry-connrefused \
+          --connect-timeout 15 --max-time 120 \
+          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/cli/cli/releases/tags/v${version}")"
         expected="$(jq -r --arg name "$filename" \
           '.assets[] | select(.name == $name) | .digest' <<<"$release_json" | sed 's/^sha256://')"
         if [ -z "$expected" ] || [ "$expected" = "null" ]; then
@@ -95,7 +93,8 @@ runs:
         tmp="$(mktemp -d)"
         trap 'rm -rf "$tmp"' EXIT
         echo "Downloading gh v${version}: ${url}"
-        curl -fsSL --retry 5 --retry-connrefused -o "${tmp}/${filename}" "$url"
+        curl -fsSL --retry 5 --retry-connrefused \
+          --connect-timeout 15 --max-time 600 -o "${tmp}/${filename}" "$url"
 
         actual="$(sha256sum "${tmp}/${filename}" | awk '{print $1}')"
         if [ "$actual" != "$expected" ]; then
