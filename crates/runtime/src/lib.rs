@@ -1158,19 +1158,22 @@ impl Runtime {
         loop {
             interval.tick().await;
 
-            // Swept whether or not a SQL cache is configured, and independently
-            // of whether metrics are enabled. The pool only reclaims a shard
-            // that interning happens to touch, so a shard that goes quiet after
-            // a burst — a cache invalidation, a retired Cayenne inline view —
-            // would otherwise hold its dead rows and their capacity for the
-            // process lifetime. Cayenne's inline-data cache interns too, so the
-            // pool holds memory even with every SQL cache switched off.
+            // Swept independently of whether metrics are enabled. A pool only
+            // reclaims a shard that interning happens to touch, so a shard that
+            // goes quiet after a burst — a cache invalidation, a wave of
+            // one-off query shapes — would otherwise hold its dead rows and
+            // their capacity for the process lifetime.
             //
-            // On a blocking thread: it takes each shard's lock and may
+            // On a blocking thread: each sweep takes every shard's lock and may
             // reallocate the shards it shrinks, which is unbounded by anything
             // this task controls.
-            if let Err(e) = tokio::task::spawn_blocking(arrow_tools::schema_intern::sweep).await {
-                tracing::debug!("Schema pool maintenance did not complete: {e}");
+            if let Err(e) = tokio::task::spawn_blocking(|| {
+                arrow_tools::schema_intern::sweep();
+                arrow_tools::table_set_intern::sweep();
+            })
+            .await
+            {
+                tracing::debug!("Interner pool maintenance did not complete: {e}");
             }
 
             if has_cache {
@@ -1387,7 +1390,7 @@ impl Runtime {
         // everything that retains batches, including Cayenne's inline-data
         // cache, so it holds — and must report — memory even with every SQL
         // cache switched off.
-        cache::metrics::init_schema_interner_metrics();
+        cache::metrics::init_interner_metrics();
     }
 
     /// Publishes the component counters at zero. Must be called after

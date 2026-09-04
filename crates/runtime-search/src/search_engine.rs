@@ -857,10 +857,7 @@ fn wrap_cache_to_result(
 
         tracing::trace!("Caching search results for key: {}", key.as_u64());
 
-        let result = CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(expected_keys),
-        };
+        let result = CachedSearchResult::new(Arc::new(results), Arc::new(expected_keys));
 
         if result.get_memory_size() > cache_provider.max_size() {
             tracing::trace!("Search results exceed cache size, not caching");

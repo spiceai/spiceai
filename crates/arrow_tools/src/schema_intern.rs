@@ -80,14 +80,16 @@ limitations under the License.
 //! in one place, by [`SchemaInterner::stats`] — so the memory stays visible
 //! without every item paying for it.
 
-use std::collections::HashMap;
-use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::mem::size_of;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
-use parking_lot::Mutex;
+
+use crate::intern::{Internable, Interner};
+#[cfg(test)]
+use crate::intern::{SHARDS, SWEEP_INTERVAL};
 
 /// Number of independently-locked shards.
 ///
@@ -95,46 +97,6 @@ use parking_lot::Mutex;
 /// the lock; see the module docs. Fixed rather than CPU-derived because the
 /// pool is touched once per retained item, not per row of data, so the count
 /// only needs to keep unrelated tables off a single lock.
-const SHARDS: usize = 16;
-
-/// Attempts a shard tolerates before sweeping its tombstones.
-///
-/// A sweep walks the whole shard, so it is amortised across attempts rather
-/// than run on each one.
-const SWEEP_INTERVAL: usize = 256;
-
-/// What the pool holds, and what it has done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct InternerStats {
-    /// Rows currently held — one per distinct schema.
-    pub rows: usize,
-    /// Total deep size of the schemas those rows point at.
-    ///
-    /// This is the memory that per-item accounting no longer charges. The pool
-    /// holds these schemas weakly, so the bytes belong to whichever holders
-    /// keep them alive; reporting them here is what keeps the saving visible
-    /// rather than invisible.
-    pub schema_bytes: usize,
-    /// The pool's own retained allocation: its hash-map slots and bucket
-    /// vectors, measured from capacity rather than from live rows so that
-    /// capacity left behind by a past burst is visible.
-    pub self_bytes: usize,
-    /// Interns that collapsed a *distinct* allocation onto the shared one.
-    ///
-    /// This is the only counter that evidences the pool doing its job: each one
-    /// is a duplicate `Schema` that existed a moment ago and does not now.
-    pub collapsed: u64,
-    /// Interns whose caller already held the shared allocation.
-    ///
-    /// Content-equal *and* pointer-equal, so there was no duplicate to remove.
-    /// Counted apart from [`Self::collapsed`] because lumping the two together
-    /// would let a pool that collapses nothing look busy: a caller re-interning
-    /// a schema it already had would register as a hit.
-    pub already_shared: u64,
-    /// Interns that adopted a schema the pool had not seen.
-    pub misses: u64,
-}
-
 /// The deep size of an Arrow [`Schema`]: the struct, the fields it owns, and
 /// its key-value metadata.
 ///
@@ -153,204 +115,24 @@ pub fn schema_deep_size(schema: &Schema) -> usize {
             .sum::<usize>()
 }
 
-/// One row: a weak handle plus the size of the schema it points at.
-///
-/// The size is kept alongside so a sweep can discount a dead row without
-/// upgrading it — by then there is nothing left to measure.
-struct Row {
-    schema: Weak<Schema>,
-    schema_size: usize,
-}
-
-#[derive(Default)]
-struct Shard {
-    /// Content hash -> candidate rows. A bucket holds more than one row only on
-    /// a hash collision, which content equality then resolves.
-    buckets: HashMap<u64, Vec<Row>>,
-    /// Interning attempts since this shard was last swept.
-    since_sweep: usize,
-}
-
-/// How many times larger than its live contents a collection may be before a
-/// sweep reallocates it.
-///
-/// `retain` removes rows but never gives back the capacity they occupied, so
-/// without this a burst of short-lived query shapes would leave every shard
-/// holding its peak allocation for the process lifetime — which is exactly what
-/// a weakly-held pool promises not to do. Shrinking only past a slack factor
-/// keeps a steady-state workload from reallocating on every sweep.
-const CAPACITY_SLACK: usize = 4;
-
-impl Shard {
-    /// Drops rows whose last holder is gone, and any bucket left empty, then
-    /// returns the capacity the survivors no longer need.
-    fn sweep(&mut self) {
-        self.buckets.retain(|_, candidates| {
-            candidates.retain(|row| row.schema.strong_count() > 0);
-            if candidates.capacity() > candidates.len().saturating_mul(CAPACITY_SLACK) {
-                candidates.shrink_to_fit();
-            }
-            !candidates.is_empty()
-        });
-        if self.buckets.capacity() > self.buckets.len().saturating_mul(CAPACITY_SLACK) {
-            self.buckets.shrink_to_fit();
-        }
-        self.since_sweep = 0;
+impl Internable for Schema {
+    /// `Schema`'s own `Hash` covers its fields and its metadata, field-level
+    /// metadata included, which is exactly the content `Eq` compares. Keying on
+    /// it is therefore safe: two schemas that hash alike and compare equal are
+    /// interchangeable to any holder.
+    fn content_hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash(self, state);
     }
 
-    /// Rows this shard holds, live and dead alike.
-    ///
-    /// Test-only: production reads what the pool *shares*, via
-    /// [`Self::live_counts`]. This is the figure that distinguishes a sweep
-    /// which reclaimed from one which merely found nothing live.
-    #[cfg(test)]
-    ///
-    fn retained_rows(&self) -> usize {
-        self.buckets.values().map(Vec::len).sum()
-    }
-
-    /// Live rows and the bytes of the schemas they point at, counted without
-    /// mutating anything.
-    ///
-    /// Reporting must not be what reclaims: a metrics reader that sweeps makes
-    /// the pool's memory depend on whether telemetry is enabled, and makes two
-    /// reads taken moments apart disagree for reasons that have nothing to do
-    /// with the workload. [`SchemaInterner::sweep`] is the mutator.
-    fn live_counts(&self) -> (usize, usize) {
-        let mut rows = 0;
-        let mut schema_bytes = 0;
-        for candidates in self.buckets.values() {
-            for row in candidates {
-                if row.schema.strong_count() > 0 {
-                    rows += 1;
-                    schema_bytes += row.schema_size;
-                }
-            }
-        }
-        (rows, schema_bytes)
-    }
-
-    /// The pool's own retained allocation for this shard: its hash-map slots and
-    /// its bucket vectors.
-    ///
-    /// Measured from capacity rather than from the live-row count, so capacity a
-    /// past burst left behind is visible rather than reported as zero.
-    fn self_bytes(&self) -> usize {
-        self.buckets.capacity() * (size_of::<u64>() + size_of::<Vec<Row>>())
-            + self
-                .buckets
-                .values()
-                .map(|candidates| candidates.capacity() * size_of::<Row>())
-                .sum::<usize>()
+    fn deep_size(&self) -> usize {
+        schema_deep_size(self)
     }
 }
 
-/// A pool of shared [`Schema`] allocations. See the module docs.
-///
-/// The hasher is a type parameter so that the collision path — where one bucket
-/// holds two genuinely different schemas — can be exercised by a test that
-/// forces every schema into the same bucket. Production uses the default.
-pub struct SchemaInterner<S = ahash::RandomState> {
-    shards: Box<[Mutex<Shard>]>,
-    hasher: S,
-    collapsed: AtomicU64,
-    already_shared: AtomicU64,
-    misses: AtomicU64,
-}
+/// A pool of shared [`Schema`] allocations. See [`Interner`].
+pub type SchemaInterner<S = ahash::RandomState> = Interner<Schema, S>;
 
-impl<S: BuildHasher> std::fmt::Debug for SchemaInterner<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stats = self.stats();
-        f.debug_struct("SchemaInterner")
-            .field("rows", &stats.rows)
-            .field("schema_bytes", &stats.schema_bytes)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for SchemaInterner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SchemaInterner {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_hasher(ahash::RandomState::new())
-    }
-}
-
-impl<S: BuildHasher> SchemaInterner<S> {
-    #[must_use]
-    pub fn with_hasher(hasher: S) -> Self {
-        let mut shards = Vec::with_capacity(SHARDS);
-        shards.resize_with(SHARDS, || Mutex::new(Shard::default()));
-
-        Self {
-            shards: shards.into_boxed_slice(),
-            hasher,
-            collapsed: AtomicU64::new(0),
-            already_shared: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-        }
-    }
-
-    /// Returns the pool's shared copy of `schema`'s content, adopting `schema`
-    /// itself if no equal schema is held yet.
-    ///
-    /// The result always compares equal to `schema`; only its identity may
-    /// differ. Callers that hold many items over one schema should intern once
-    /// and reuse the result: this hashes the schema's full contents, which is
-    /// cheap per retained item but not per row of data.
-    ///
-    /// Takes the schema by value because that is how it is meant to be used —
-    /// hand over the copy you were about to store, keep the canonical one.
-    #[must_use]
-    pub fn intern(&self, schema: SchemaRef) -> SchemaRef {
-        let hash = self.hash_of(&schema);
-        // The remainder is below SHARDS and so always fits; the fallback keeps
-        // this total rather than resting on that reasoning.
-        let shard_index = usize::try_from(hash % SHARDS as u64).unwrap_or(0);
-        let mut shard = self.shards[shard_index].lock();
-
-        shard.since_sweep += 1;
-        if shard.since_sweep >= SWEEP_INTERVAL {
-            shard.sweep();
-        }
-
-        if let Some(candidates) = shard.buckets.get(&hash) {
-            for row in candidates {
-                if let Some(existing) = row.schema.upgrade() {
-                    // Content equality, not merely a matching hash: two distinct
-                    // schemas that collide must never be conflated, and
-                    // `Schema`'s `Eq` covers its metadata as well as its fields.
-                    if existing.as_ref() == schema.as_ref() {
-                        // Pointer equality separates "a duplicate was collapsed"
-                        // from "the caller already had the shared copy". Only
-                        // the former is a saving; counting both as one number
-                        // would make a pool that dedupes nothing look effective.
-                        if Arc::ptr_eq(&existing, &schema) {
-                            self.already_shared.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            self.collapsed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return existing;
-                    }
-                }
-            }
-        }
-
-        let schema_size = schema_deep_size(&schema);
-        shard.buckets.entry(hash).or_default().push(Row {
-            schema: Arc::downgrade(&schema),
-            schema_size,
-        });
-        self.misses.fetch_add(1, Ordering::Relaxed);
-
-        schema
-    }
-
+impl<S: BuildHasher> Interner<Schema, S> {
     /// Replaces every batch's schema with the pool's shared copy, in place.
     ///
     /// Interning hashes a schema's full contents, so a batch whose schema is
@@ -396,86 +178,6 @@ impl<S: BuildHasher> SchemaInterner<S> {
             }
         }
     }
-
-    /// Reclaims every shard's tombstones and the capacity they left behind.
-    ///
-    /// Interning sweeps the shard it touches, which is enough while a shard
-    /// keeps seeing traffic — but a shard that goes quiet after a burst would
-    /// otherwise hold its dead rows indefinitely, since nothing else would ever
-    /// look at it. The runtime's cache-maintenance loop drives this on its own
-    /// schedule, so the pool shrinks when its holders disappear rather than
-    /// when they return.
-    ///
-    /// Deliberately not driven by anything that observes the pool: tying
-    /// reclamation to metrics collection would make the pool's memory depend on
-    /// whether telemetry is enabled.
-    pub fn sweep(&self) {
-        for shard in &self.shards {
-            shard.lock().sweep();
-        }
-    }
-
-    /// Interns that collapsed a distinct allocation onto the shared one,
-    /// cumulative. See [`InternerStats::collapsed`].
-    ///
-    /// Read straight from the counter rather than through [`Self::stats`],
-    /// which walks every shard: a reporter sampling these should not pay for a
-    /// full traversal to read three atomics.
-    #[must_use]
-    pub fn collapsed(&self) -> u64 {
-        self.collapsed.load(Ordering::Relaxed)
-    }
-
-    /// Interns whose caller already held the shared allocation, cumulative.
-    /// See [`InternerStats::already_shared`].
-    #[must_use]
-    pub fn already_shared(&self) -> u64 {
-        self.already_shared.load(Ordering::Relaxed)
-    }
-
-    /// Interns that adopted a schema the pool had not seen, cumulative.
-    ///
-    /// Read against [`Self::collapsed`], this is what says whether interning is
-    /// earning its place: misses without collapses means schemas are arriving
-    /// distinct and nothing is being shared — the case in which per-item
-    /// accounting has stopped charging for memory that is not in fact shared.
-    #[must_use]
-    pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-
-    /// A snapshot of what the pool holds, excluding rows whose holders are gone.
-    ///
-    /// Read-only. It does not sweep, so observing the pool never changes it:
-    /// reclamation is [`Self::sweep`]'s job and runs on its own schedule,
-    /// which keeps the pool's memory independent of whether anything is
-    /// watching it.
-    #[must_use]
-    pub fn stats(&self) -> InternerStats {
-        let mut rows = 0;
-        let mut schema_bytes = 0;
-        let mut self_bytes = 0;
-        for shard in &self.shards {
-            let shard = shard.lock();
-            let (live_rows, live_bytes) = shard.live_counts();
-            rows += live_rows;
-            schema_bytes += live_bytes;
-            self_bytes += shard.self_bytes();
-        }
-
-        InternerStats {
-            rows,
-            schema_bytes,
-            self_bytes,
-            collapsed: self.collapsed.load(Ordering::Relaxed),
-            already_shared: self.already_shared.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-        }
-    }
-
-    fn hash_of(&self, schema: &Schema) -> u64 {
-        self.hasher.hash_one(schema)
-    }
 }
 
 static GLOBAL: LazyLock<SchemaInterner> = LazyLock::new(SchemaInterner::new);
@@ -486,13 +188,12 @@ pub fn global() -> &'static SchemaInterner {
     &GLOBAL
 }
 
-/// Reclaims tombstones across the process-wide pool. See
-/// [`SchemaInterner::sweep`].
+/// Reclaims tombstones across the process-wide pool. See [`Interner::sweep`].
 pub fn sweep() {
     GLOBAL.sweep();
 }
 
-/// Interns `schema` in the process-wide pool. See [`SchemaInterner::intern`].
+/// Interns `schema` in the process-wide pool. See [`Interner::intern`].
 #[must_use]
 pub fn intern(schema: SchemaRef) -> SchemaRef {
     GLOBAL.intern(schema)
@@ -619,7 +320,7 @@ mod tests {
 
         let stats = interner.stats();
         assert_eq!(stats.rows, 0, "the pool must not keep a schema alive");
-        assert_eq!(stats.schema_bytes, 0, "its bytes are discounted with it");
+        assert_eq!(stats.value_bytes, 0, "its bytes are discounted with it");
     }
 
     /// The pool holds `Weak`s, so a row must never be what keeps a schema
@@ -796,12 +497,12 @@ mod tests {
         let stats = interner.stats();
         assert_eq!(stats.rows, 2);
         assert_eq!(
-            stats.schema_bytes,
+            stats.value_bytes,
             schema_deep_size(&narrow) + schema_deep_size(&wide),
             "reported bytes are the deep sizes of the live schemas"
         );
         assert!(
-            stats.self_bytes < stats.schema_bytes,
+            stats.self_bytes < stats.value_bytes,
             "the pool's own bookkeeping is far smaller than what it deduplicates"
         );
     }

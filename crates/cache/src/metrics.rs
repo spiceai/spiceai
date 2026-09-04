@@ -60,101 +60,135 @@ impl EvictionReason {
     }
 }
 
-/// Instruments for the process-wide Arrow schema pool.
+/// Instruments for one process-wide interner pool.
 ///
-/// Interned schemas are shared by every entry of the same shape, so they are
-/// not charged to any one entry's weight — see
+/// Interned values are shared by every entry of the same shape, so they are not
+/// charged to any one entry's weight — see
 /// [`crate::result::query::CachedQueryResult::memory_size`]. This is where that
-/// memory is reported instead: once per distinct schema, rather than once per
+/// memory is reported instead: once per distinct value, rather than once per
 /// entry holding it.
 ///
 /// The callbacks only read: `stats()` does not sweep, so collecting these
-/// gauges never changes what the pool holds. Reclamation is driven separately
-/// by the runtime's cache-maintenance loop, which runs whether or not metrics
-/// are enabled — tying it to collection would have made the pool's memory
-/// depend on `--metrics`, which is off by default.
-struct SchemaInternerMetrics {
+/// gauges never changes what a pool holds. Reclamation is driven separately by
+/// the runtime's cache-maintenance loop, which runs whether or not metrics are
+/// enabled — tying it to collection would have made a pool's memory depend on
+/// `--metrics`, which is off by default.
+struct InternerMetrics {
     _rows: ObservableGauge<u64>,
-    _schema_bytes: ObservableGauge<u64>,
+    _value_bytes: ObservableGauge<u64>,
     _self_bytes: ObservableGauge<u64>,
     _collapsed: ObservableCounter<u64>,
     _already_shared: ObservableCounter<u64>,
     _misses: ObservableCounter<u64>,
 }
 
-static SCHEMA_INTERNER_METRICS: LazyLock<SchemaInternerMetrics> = LazyLock::new(|| {
-    let meter = global::meter("schema_interner");
-    SchemaInternerMetrics {
+/// How a pool reports itself. One set per pool, so the instruments below are
+/// built once and read the right globals.
+struct InternerSource {
+    /// Instrument-name prefix, e.g. `schema_interner`.
+    prefix: &'static str,
+    /// What the pool holds, for the descriptions: e.g. "Arrow schemas".
+    noun: &'static str,
+    stats: fn() -> arrow_tools::intern::InternerStats,
+    collapsed: fn() -> u64,
+    already_shared: fn() -> u64,
+    misses: fn() -> u64,
+}
+
+fn build_interner_metrics(source: &'static InternerSource) -> InternerMetrics {
+    let meter = global::meter(source.prefix);
+    let (noun, prefix) = (source.noun, source.prefix);
+    InternerMetrics {
         _rows: meter
-            .u64_observable_gauge("schema_interner_schemas")
-            .with_description("Distinct Arrow schemas currently shared by the interner.")
-            .with_callback(|observer| {
-                let stats = arrow_tools::schema_intern::global().stats();
-                observer.observe(stats.rows as u64, &[]);
+            .u64_observable_gauge(format!("{prefix}_rows"))
+            .with_description(format!("Distinct {noun} currently shared by the interner."))
+            .with_callback(move |observer| {
+                observer.observe((source.stats)().rows as u64, &[]);
             })
             .build(),
-        _schema_bytes: meter
-            .u64_observable_gauge("schema_interner_schema_bytes")
-            .with_description(
-                "Total size of the Arrow schemas the interner shares. Counted once per distinct schema, not once per cache entry holding it.",
-            )
+        _value_bytes: meter
+            .u64_observable_gauge(format!("{prefix}_value_bytes"))
+            .with_description(format!(
+                "Total size of the {noun} the interner shares. Counted once per distinct value, not once per cache entry holding it."
+            ))
             .with_unit("By")
-            .with_callback(|observer| {
-                observer.observe(
-                    arrow_tools::schema_intern::global().stats().schema_bytes as u64,
-                    &[],
-                );
+            .with_callback(move |observer| {
+                observer.observe((source.stats)().value_bytes as u64, &[]);
             })
             .build(),
         _self_bytes: meter
-            .u64_observable_gauge("schema_interner_overhead_bytes")
-            .with_description("The interner's own bookkeeping: its hash-map slots and bucket vectors.")
+            .u64_observable_gauge(format!("{prefix}_overhead_bytes"))
+            .with_description(
+                "The interner's own bookkeeping: its hash-map slots and bucket vectors.",
+            )
             .with_unit("By")
-            .with_callback(|observer| {
-                observer.observe(
-                    arrow_tools::schema_intern::global().stats().self_bytes as u64,
-                    &[],
-                );
+            .with_callback(move |observer| {
+                observer.observe((source.stats)().self_bytes as u64, &[]);
             })
             .build(),
         // Cumulative, so counters rather than gauges — and read through the
         // dedicated accessors, which load one atomic instead of walking every
         // shard the way `stats()` does.
         _collapsed: meter
-            .u64_observable_counter("schema_interner_collapsed")
-            .with_description(
-                "Distinct Arrow schema allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates.",
-            )
-            .with_callback(|observer| {
-                observer.observe(arrow_tools::schema_intern::global().collapsed(), &[]);
+            .u64_observable_counter(format!("{prefix}_collapsed"))
+            .with_description(format!(
+                "Distinct {noun} allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates."
+            ))
+            .with_callback(move |observer| {
+                observer.observe((source.collapsed)(), &[]);
             })
             .build(),
         _already_shared: meter
-            .u64_observable_counter("schema_interner_already_shared")
+            .u64_observable_counter(format!("{prefix}_already_shared"))
             .with_description(
-                "Interns whose caller already held the shared allocation. Counted apart from collapsed schemas because no duplicate was removed.",
+                "Interns whose caller already held the shared allocation. Counted apart from collapsed values because no duplicate was removed.",
             )
-            .with_callback(|observer| {
-                observer.observe(arrow_tools::schema_intern::global().already_shared(), &[]);
+            .with_callback(move |observer| {
+                observer.observe((source.already_shared)(), &[]);
             })
             .build(),
         _misses: meter
-            .u64_observable_counter("schema_interner_misses")
-            .with_description(
-                "Interns that adopted a schema the pool had not seen. Misses without collapses means schemas are arriving distinct and nothing is being shared.",
-            )
-            .with_callback(|observer| {
-                observer.observe(arrow_tools::schema_intern::global().misses(), &[]);
+            .u64_observable_counter(format!("{prefix}_misses"))
+            .with_description(format!(
+                "Interns that adopted {noun} the pool had not seen. Misses without collapses means values are arriving distinct and nothing is being shared."
+            ))
+            .with_callback(move |observer| {
+                observer.observe((source.misses)(), &[]);
             })
             .build(),
     }
+}
+
+static SCHEMA_POOL: InternerSource = InternerSource {
+    prefix: "schema_interner",
+    noun: "Arrow schemas",
+    stats: || arrow_tools::schema_intern::global().stats(),
+    collapsed: || arrow_tools::schema_intern::global().collapsed(),
+    already_shared: || arrow_tools::schema_intern::global().already_shared(),
+    misses: || arrow_tools::schema_intern::global().misses(),
+};
+
+static TABLE_SET_POOL: InternerSource = InternerSource {
+    prefix: "table_set_interner",
+    noun: "input-table sets",
+    stats: || arrow_tools::table_set_intern::global().stats(),
+    collapsed: || arrow_tools::table_set_intern::global().collapsed(),
+    already_shared: || arrow_tools::table_set_intern::global().already_shared(),
+    misses: || arrow_tools::table_set_intern::global().misses(),
+};
+
+static INTERNER_METRICS: LazyLock<Vec<InternerMetrics>> = LazyLock::new(|| {
+    vec![
+        build_interner_metrics(&SCHEMA_POOL),
+        build_interner_metrics(&TABLE_SET_POOL),
+    ]
 });
 
-/// Registers the schema-pool gauges. Idempotent.
+/// Registers the interner-pool gauges. Idempotent.
 ///
 /// Must run after the meter provider is installed, like the cache instruments.
-pub fn init_schema_interner_metrics() {
-    LazyLock::force(&SCHEMA_INTERNER_METRICS);
+pub fn init_interner_metrics() {
+    LazyLock::force(&INTERNER_METRICS);
 }
 
 /// What an invalidation did to the entries that read the table, reported as the

@@ -33,7 +33,7 @@ use futures::task::{Context, Poll};
 use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
-use crate::sizing::{ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, table_refs_size};
+use crate::sizing::{ENTRY_OVERHEAD_BYTES, arc_heap_size};
 
 use super::CacheStatus;
 
@@ -85,7 +85,7 @@ impl CachedQueryResult {
         Self {
             data: CachedData::Raw(Arc::new(super::prepare_for_storage(batches))),
             schema: arrow_tools::schema_intern::intern(schema),
-            input_tables,
+            input_tables: arrow_tools::table_set_intern::intern(input_tables),
             cached_at,
             read_started_at,
             encoder: None,
@@ -105,7 +105,7 @@ impl CachedQueryResult {
         Self {
             data: CachedData::Encoded(encoded_data),
             schema: arrow_tools::schema_intern::intern(schema),
-            input_tables,
+            input_tables: arrow_tools::table_set_intern::intern(input_tables),
             cached_at,
             read_started_at,
             encoder,
@@ -140,7 +140,7 @@ impl CachedQueryResult {
         Ok(Self {
             data,
             schema: arrow_tools::schema_intern::intern(schema),
-            input_tables,
+            input_tables: arrow_tools::table_set_intern::intern(input_tables),
             cached_at,
             read_started_at,
             encoder,
@@ -225,7 +225,6 @@ impl CachedQueryResult {
             }
         }
 
-        size += ARC_HEADER_BYTES + table_refs_size(&self.input_tables);
         size += ENTRY_OVERHEAD_BYTES;
 
         size as u64
@@ -380,14 +379,12 @@ mod tests {
             + 2 * std::mem::size_of::<RecordBatch>() as u64
             + batch1.get_array_memory_size() as u64
             + batch2.get_array_memory_size() as u64
-            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::table_refs_size(&input_tables))
-                as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
 
         assert_eq!(
             cached_result.memory_size(),
             expected_size,
-            "an entry must be billed its batches, its input tables and the store's per-entry overhead — but not its interned schema"
+            "an entry must be billed its batches and the store's per-entry overhead — but not the schema or input-table set it shares"
         );
         assert!(
             cached_result.memory_size() < 10_000,
@@ -418,8 +415,6 @@ mod tests {
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
             + encoded_data.len() as u64
-            + (crate::sizing::ARC_HEADER_BYTES
-                + crate::sizing::table_refs_size(&cached_result.input_tables)) as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
 
         assert_eq!(

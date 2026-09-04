@@ -676,12 +676,12 @@ mod tests {
             cached_aggregation_result,
         );
 
-        CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+        CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
-        }
+        )
     }
 
     #[rstest]

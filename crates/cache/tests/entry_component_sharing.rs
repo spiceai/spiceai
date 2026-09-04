@@ -232,6 +232,16 @@ async fn a_shared_shape_is_not_billed_to_every_entry() {
     let table_name = "t".repeat(WIDE_NAME_LEN);
     let entries = store_entries(200, 64, &table_name).await;
 
+    // Not charging is only correct *because* the parts are shared. Asserted
+    // together, because the pair is the invariant: an entry that holds a
+    // private copy and is not billed for it is the worst of both, and a test
+    // that checked only the charge would call that state a pass.
+    let schemas: Vec<SchemaRef> = entries.iter().map(|e| Arc::clone(&e.schema)).collect();
+    let tables: Vec<Arc<HashSet<TableReference>>> =
+        entries.iter().map(|e| Arc::clone(&e.input_tables)).collect();
+    assert_all_share(&schemas, "schema");
+    assert_all_share(&tables, "input-table set");
+
     let per_entry = entries[0].memory_size();
     assert!(
         per_entry < WIDE_NAME_LEN as u64,

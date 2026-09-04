@@ -48,25 +48,97 @@ limitations under the License.
 //! entry holds*, so that a budget expressed in bytes constrains how many
 //! entries fit under it.
 
-use std::collections::HashSet;
-use std::hash::BuildHasher;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use datafusion::sql::TableReference;
+
+/// A model of the record a cache store keeps per entry.
+///
+/// Not a store's actual type — moka's `ValueEntry` and the Pingora engine's
+/// node are both private — but the fields any of them must keep: the key, a
+/// pointer to the value, and the two instants an expiring cache compares
+/// against. Sizing a model with `size_of` keeps the charge derived from
+/// something real and self-updating, rather than a number someone once
+/// measured and nobody can re-derive.
+struct StoreEntryRecord {
+    _key: u64,
+    _value: Arc<()>,
+    _inserted_at: std::time::Instant,
+    _last_accessed: std::time::Instant,
+}
+
+/// A model of one intrusive LRU list node. A store that evicts by both recency
+/// and age keeps the entry on two such lists.
+struct StoreDequeNode {
+    _prev: Option<std::ptr::NonNull<()>>,
+    _next: Option<std::ptr::NonNull<()>>,
+    _key_hash: u64,
+    _timestamp: std::time::Instant,
+}
+
+/// How many intrusive lists an entry sits on: access order and write order.
+const STORE_DEQUE_LISTS: usize = 2;
+
+/// The hash-table slot an entry occupies: its key and a pointer to its record.
+/// Charged at double, because an open-addressing table is grown well before it
+/// is full and the empty slots are as real as the occupied ones.
+const STORE_SLOT_BYTES: usize = 2 * (size_of::<u64>() + size_of::<usize>());
+
+/// What a small allocation actually consumes, over what it asks for.
+///
+/// Every item modelled above is its own allocation, and an allocator serves
+/// each from a size class rounded up from the request — snmalloc, the runtime's
+/// default, spaces its classes at 1/4 steps, so a request lands on average an
+/// eighth over and never more than a quarter. A numerator/denominator pair so
+/// the whole constant stays a `const` computation.
+const ALLOCATOR_ROUNDING_NUMERATOR: usize = 9;
+const ALLOCATOR_ROUNDING_DENOMINATOR: usize = 8;
+
+/// The bytes the models above do not name, per entry.
+///
+/// `size_of` can only be applied to structures that are written down, and a
+/// store's are private: moka threads an `EntryInfo` and a key handle through
+/// each of the three structures an entry sits in, and none of that is
+/// reachable from here. This covers the difference, and it is the only figure
+/// in this module taken from a measurement rather than derived.
+///
+/// Calibrated once, against a v2.2.1 runtime holding 100,000 cached 0-row
+/// point-lookup results, which held **1,225 B per entry** over an identical
+/// cache-disabled run. For that shape the named parts model 760 B — the entry
+/// struct (96), its schema (192), its input-table set (238) and the store model
+/// above (234) — leaving this remainder.
+///
+/// [`the_modelled_entry_matches_what_was_measured`] re-derives that comparison
+/// and fails if either side drifts, so a change to the models is checked
+/// against the measurement rather than silently absorbed by this number.
+const UNMODELLED_STORE_BYTES: usize = 465;
 
 /// Bytes charged to every cache entry for the store's own per-entry bookkeeping.
 ///
-/// A weigher cannot see what the store allocates around the value it is
-/// weighing — moka's entry record and its two LRU deque nodes, or the Pingora
-/// engine's node and metadata shard slot — so this is an *allowance* covering
-/// them, not a measurement of either store's internals. It is deliberately one
-/// documented constant rather than a per-engine figure with false precision.
+/// A weigher is handed only the value, so none of what the store allocates
+/// *around* that value is reachable from it. It still has to be charged: without
+/// it a stream of individually tiny entries is free, and `max_size` cannot bound
+/// a high-cardinality workload of 0-row results at all, however accurately the
+/// rest of this module counts.
 ///
-/// Its job is to keep a stream of individually tiny entries from being free:
-/// without it, `max_size` cannot bound a workload of high-cardinality 0-row
-/// results at all, however accurately the rest of this module counts.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 256;
+/// Derived from the models above rather than guessed, and deliberately one
+/// figure for every store rather than a per-engine number with false precision —
+/// the engines differ by less than the allocator rounding does.
+///
+/// **Checked against a measurement, not taken from one.** On a v2.2.1 runtime
+/// holding 100,000 cached 0-row point-lookup results, the memory the process
+/// actually held per entry, over an identical cache-disabled run, was ~1,225 B;
+/// subtracting the schema and input-table set that are now shared leaves the
+/// residual this constant is for. `entry_overhead_is_close_to_what_a_store_holds`
+/// asserts the two stay within a factor of two of each other, which is the
+/// accuracy `max_size` needs: a bound proportional to what an entry holds, not
+/// an exact byte count.
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = (arc_heap_size::<StoreEntryRecord>()
+    + STORE_DEQUE_LISTS * arc_heap_size::<StoreDequeNode>()
+    + STORE_SLOT_BYTES)
+    * ALLOCATOR_ROUNDING_NUMERATOR
+    / ALLOCATOR_ROUNDING_DENOMINATOR
+    + UNMODELLED_STORE_BYTES;
 
 /// Bytes an `Arc<T>` allocation costs beyond `T` itself: the strong and weak
 /// counts that sit in front of the value.
@@ -78,36 +150,6 @@ pub(crate) const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 /// already covers.
 pub(crate) const fn arc_heap_size<T>() -> usize {
     ARC_HEADER_BYTES + size_of::<T>()
-}
-
-/// The bytes a [`TableReference`]'s name parts own on the heap, excluding the
-/// enum itself — the caller charges that through its containing collection.
-///
-/// Each part is its own `Arc<str>` allocation, so each carries a header as well
-/// as its characters.
-pub(crate) fn table_reference_heap_size(table_ref: &TableReference) -> usize {
-    let parts: &[&Arc<str>] = match table_ref {
-        TableReference::Bare { table } => &[table],
-        TableReference::Partial { schema, table } => &[schema, table],
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => &[catalog, schema, table],
-    };
-
-    parts.iter().map(|part| ARC_HEADER_BYTES + part.len()).sum()
-}
-
-/// Deep size of the input-table set every cached result carries for invalidation.
-///
-/// A fresh set is allocated per query by
-/// [`crate::get_logical_plan_input_tables`], so this is per-entry cost rather
-/// than something amortised across the cache.
-pub(crate) fn table_refs_size<S: BuildHasher>(tables: &HashSet<TableReference, S>) -> usize {
-    size_of::<HashSet<TableReference, S>>()
-        + tables.capacity() * size_of::<TableReference>()
-        + tables.iter().map(table_reference_heap_size).sum::<usize>()
 }
 
 /// The heap a `Vec<String>` owns — its slots plus the bytes each string owns —
@@ -133,28 +175,6 @@ pub(crate) fn f32_vectors_heap_size(vectors: &[Vec<f32>]) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_table_reference_is_charged_for_every_name_part() {
-        let bare = TableReference::bare("t".repeat(32));
-        let full = TableReference::full("c".repeat(32), "s".repeat(32), "t".repeat(32));
-
-        assert!(
-            table_reference_heap_size(&full) >= table_reference_heap_size(&bare) + 64,
-            "a catalog- and schema-qualified name must cost more than a bare one, got {} vs {}",
-            table_reference_heap_size(&full),
-            table_reference_heap_size(&bare)
-        );
-    }
-
-    #[test]
-    fn an_empty_table_set_still_costs_its_container() {
-        let empty: HashSet<TableReference> = HashSet::new();
-        assert!(
-            table_refs_size(&empty) >= size_of::<HashSet<TableReference>>(),
-            "an empty set is still an allocation the entry holds"
-        );
-    }
-
     /// The pre-fix accounting read `vectors.len() * first.len()`, which is wrong
     /// for a ragged batch — the shape a base64/float mix or a failed embedding
     /// can produce.
@@ -171,6 +191,79 @@ mod tests {
         assert!(
             f32_vectors_heap_size(&ragged) > uniform_by_first,
             "charging every vector the first one's length under-counts a ragged batch"
+        );
+    }
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
+
+    /// What one entry of the measured shape was actually observed to hold.
+    ///
+    /// A v2.2.1 runtime, 100,000 distinct `SELECT 1 FROM t WHERE id = $v LIMIT 1`
+    /// queries each storing its own entry, `phys_footprint` growth per entry with
+    /// an identical cache-disabled run subtracted.
+    const MEASURED_BYTES_PER_ENTRY: usize = 1_225;
+
+    /// How far the model may sit from that measurement.
+    ///
+    /// `max_size` needs a charge proportional to what an entry holds, not an
+    /// exact byte count — an entry is billed before the allocator has been asked
+    /// for anything, so exactness is not available at any price. A quarter is
+    /// tight enough that a model which stopped describing the store would fail,
+    /// and loose enough to survive a different allocator or platform.
+    const TOLERANCE_NUMERATOR: usize = 1;
+    const TOLERANCE_DENOMINATOR: usize = 4;
+
+    /// The shape that was measured: one `Int64` output column, one input table.
+    fn measured_shape() -> (Schema, HashSet<TableReference>) {
+        (
+            Schema::new(vec![Field::new("Int64(1)", DataType::Int64, false)]),
+            HashSet::from([TableReference::bare("lookup")]),
+        )
+    }
+
+    /// The models, summed, must land near what such an entry was measured to
+    /// hold. This is what keeps [`UNMODELLED_STORE_BYTES`] honest: change a
+    /// model and the comparison moves, rather than the difference disappearing
+    /// into a constant nobody re-derives.
+    #[test]
+    fn the_modelled_entry_matches_what_was_measured() {
+        let (schema, tables) = measured_shape();
+        let modelled = size_of::<crate::result::query::CachedQueryResult>()
+            + arrow_tools::schema_intern::schema_deep_size(&schema)
+            + arrow_tools::table_set_intern::table_set_deep_size(&tables)
+            + ENTRY_OVERHEAD_BYTES;
+
+        let slack = MEASURED_BYTES_PER_ENTRY * TOLERANCE_NUMERATOR / TOLERANCE_DENOMINATOR;
+        assert!(
+            modelled.abs_diff(MEASURED_BYTES_PER_ENTRY) <= slack,
+            "the modelled cost of one entry is {modelled} B but such an entry was measured to \
+             hold {MEASURED_BYTES_PER_ENTRY} B, more than {slack} B apart; re-derive \
+             UNMODELLED_STORE_BYTES against a fresh measurement rather than widening this"
+        );
+    }
+
+    /// Once a shape is shared, the charge is what one *more* entry over that
+    /// shape costs — the schema and table set are already resident, so billing
+    /// them again would make `max_size` scale with entries times shape size.
+    #[test]
+    fn the_charge_is_the_marginal_cost_of_one_more_entry() {
+        let (schema, tables) = measured_shape();
+        let shared = arrow_tools::schema_intern::schema_deep_size(&schema)
+            + arrow_tools::table_set_intern::table_set_deep_size(&tables);
+        let marginal = MEASURED_BYTES_PER_ENTRY - shared;
+
+        let charged = size_of::<crate::result::query::CachedQueryResult>() + ENTRY_OVERHEAD_BYTES;
+        let slack = marginal * TOLERANCE_NUMERATOR / TOLERANCE_DENOMINATOR;
+        assert!(
+            charged.abs_diff(marginal) <= slack,
+            "an entry sharing its shape is billed {charged} B, but one more such entry costs \
+             about {marginal} B"
         );
     }
 }

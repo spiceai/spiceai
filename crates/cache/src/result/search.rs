@@ -21,9 +21,9 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 
+use arrow_tools::table_set_intern::table_reference_heap_size;
 use crate::sizing::{
-    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
-    table_reference_heap_size, table_refs_size,
+    ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
 };
 use crate::{AsTableRefs, Sizeable};
 
@@ -90,7 +90,26 @@ impl CachedAggregationResult {
 #[derive(Clone)]
 pub struct CachedSearchResult {
     pub results: Arc<HashMap<TableReference, CachedAggregationResult>>,
-    pub input_tables: Arc<HashSet<TableReference>>,
+    /// Private so every entry is built through [`Self::new`], which interns it.
+    /// A public field would let a new call site store an un-shared copy, and
+    /// nothing would fail — the entry would simply stop being billed for memory
+    /// it privately holds.
+    input_tables: Arc<HashSet<TableReference>>,
+}
+
+impl CachedSearchResult {
+    /// Builds an entry, interning the input-table set so entries over the same
+    /// tables share one allocation. See [`arrow_tools::table_set_intern`].
+    #[must_use]
+    pub fn new(
+        results: Arc<HashMap<TableReference, CachedAggregationResult>>,
+        input_tables: Arc<HashSet<TableReference>>,
+    ) -> Self {
+        Self {
+            results,
+            input_tables: arrow_tools::table_set_intern::intern(input_tables),
+        }
+    }
 }
 
 impl AsTableRefs for CachedSearchResult {
@@ -110,8 +129,6 @@ impl Sizeable for CachedSearchResult {
                 .iter()
                 .map(|(table, result)| table_reference_heap_size(table) + result.heap_size())
                 .sum::<usize>()
-            + ARC_HEADER_BYTES
-            + table_refs_size(&self.input_tables)
             + ENTRY_OVERHEAD_BYTES
     }
 }
@@ -163,13 +180,13 @@ mod tests {
             schema,
         );
 
-        let cached = CachedSearchResult {
-            results: Arc::new(HashMap::from([(
+        let cached = CachedSearchResult::new(
+            Arc::new(HashMap::from([(
                 TableReference::bare("docs"),
                 result.clone(),
             )])),
-            input_tables: Arc::new(HashSet::new()),
-        };
+            Arc::new(HashSet::new()),
+        );
         assert!(
             cached.get_memory_size() * 100 < scan_batch.get_array_memory_size(),
             "a one-row search entry should be billed a small fraction of its parent, got {} of {}",
@@ -191,8 +208,8 @@ mod tests {
     }
 
     fn empty_result_over(schema: SchemaRef, primary_keys: Vec<String>) -> CachedSearchResult {
-        CachedSearchResult {
-            results: Arc::new(HashMap::from([(
+        CachedSearchResult::new(
+            Arc::new(HashMap::from([(
                 TableReference::bare("docs"),
                 CachedAggregationResult::new(
                     Vec::new(),
@@ -202,8 +219,8 @@ mod tests {
                     schema,
                 ),
             )])),
-            input_tables: Arc::new(HashSet::from([TableReference::bare("docs")])),
-        }
+            Arc::new(HashSet::from([TableReference::bare("docs")])),
+        )
     }
 
     fn schema_of_width(columns: usize) -> SchemaRef {
