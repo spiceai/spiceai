@@ -211,6 +211,15 @@ const FILTER_REWRITE_IS_EXACT: &[&str] = &[
     "count", "sum", "min", "max", "avg", "bit_and", "bit_or", "bit_xor",
 ];
 
+/// The aggregates whose *only* `BigQuery` rendering comes from the dialect's
+/// aggregate override, which spells them by ordering the group.
+///
+/// `BigQuery` has neither name, so where the override declines — which it does
+/// for a descending ordering — the generic rendering emits the `DataFusion` name
+/// verbatim and `BigQuery` answers `Function not found`. Mirrors the match arms
+/// of `aggregate_function_to_sql_overrides` in the fork's `BigQuery` dialect.
+const PERCENTILE_REWRITES: &[&str] = &["median", "approx_percentile_cont"];
+
 /// Whether the `BigQuery` dialect can translate this particular *aggregate*
 /// call, given the `FILTER` it carries.
 ///
@@ -227,17 +236,48 @@ const FILTER_REWRITE_IS_EXACT: &[&str] = &[
 /// holding a null at all, so the rewrite fails for any filter that actually
 /// filters — where `DataFusion` answers `[2, 3]`.
 ///
+/// A **descending** ordering is refused separately, and for a different reason.
+/// The dialect tests it *before* either rewrite and falls back to the generic
+/// rendering, because a descending sort takes a percentile from the other end.
+/// That fallback is harmless for an aggregate `BigQuery` spells the same way, and
+/// a failed query for the two kinds that need the rewrite — one carrying a
+/// `FILTER` (there is no such clause to fall back to) and one named
+/// [`PERCENTILE_REWRITES`] (there is no such function). Measured on the branch
+/// before this refusal existed:
+///
+/// ```text
+/// sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
+///   -> SELECT sum(`id`) FILTER (WHERE (`id` > 1)) ...
+///   -> Syntax error: Expected ")" but got "("
+/// median(id ORDER BY id DESC)
+///   -> SELECT median(`id`) ... -> Function not found: median
+/// ```
+///
+/// An *ascending* ordering is still not refused: every aggregate on the list
+/// ignores input order, so an ordered `SUM … FILTER` rewrites and returns the
+/// same number.
+///
 /// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
 /// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
-/// verified on `BigQuery` — so refusing it would only cost the pushdown. Nor is an
-/// ordering refused on its own: every aggregate on the list ignores input order,
-/// so an ordered `SUM … FILTER` still rewrites.
+/// verified on `BigQuery` — so refusing it would only cost the pushdown.
 #[must_use]
 pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
+    let name = call.func.name();
+
+    // Checked ahead of the `FILTER` question, because it decides an unfiltered
+    // call too.
+    if call.params.order_by.iter().any(|sort| !sort.asc)
+        && (call.params.filter.is_some()
+            || PERCENTILE_REWRITES
+                .iter()
+                .any(|rewritten| name.eq_ignore_ascii_case(rewritten)))
+    {
+        return false;
+    }
+
     if call.params.filter.is_none() {
         return true;
     }
-    let name = call.func.name();
     if !FILTER_REWRITE_IS_EXACT
         .iter()
         .any(|exact| name.eq_ignore_ascii_case(exact))
@@ -2718,6 +2758,28 @@ mod tests {
                 .expect("ordered filtered sum"),
         );
 
+        let descending_filtered_sum = filtered(
+            datafusion::functions_aggregate::expr_fn::sum(col("t.v"))
+                .filter(col("t.v").is_not_null())
+                .order_by(vec![col("t.v").sort(false, false)])
+                .build()
+                .expect("descending filtered sum"),
+        );
+
+        // A negative Arrow scale widens rather than narrows: `Decimal128(28, -2)`
+        // is 30 integer digits, not 26. The unparser normalises it to
+        // `(30, 0)` before the dialect sees it, so the dialect never meets a
+        // negative scale — guarded here because that normalisation lives in the
+        // fork, and losing it renders `NUMERIC` for a width BigQuery refuses.
+        let negative_scale = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal128(28, -2),
+            )])
+            .expect("negative scale projection")
+            .build()
+            .expect("build");
+
         // The same overflow in a `Decimal256`, where the scale is small and the
         // *precision* is what exceeds `NUMERIC`. Selecting on scale alone would
         // render `NUMERIC` and lose every value past 29 integer digits.
@@ -2968,6 +3030,24 @@ mod tests {
                 &wide_scale,
                 "AS BIGNUMERIC)",
                 "DECIMAL(",
+            ),
+            (
+                // Falls back to a generic `FILTER` clause, which BigQuery has no
+                // syntax for — so `can_translate_aggregate` must refuse the same
+                // shape, or the statement reaches BigQuery and fails.
+                "a descending filtered sum is declined (fork PR #218)",
+                &descending_filtered_sum,
+                "FILTER",
+                "CASE WHEN",
+            ),
+            (
+                // 28 digits at scale -2 is a width of 30, so the widest type is
+                // what keeps it: rendering `NUMERIC` would refuse every value
+                // needing a thirtieth integer digit.
+                "a negative decimal scale widens the integer part (fork PR #218)",
+                &negative_scale,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
             ),
             (
                 // `Decimal256(76, 2)` is 74 integer digits at scale 2: the scale

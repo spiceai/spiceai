@@ -3002,6 +3002,46 @@ mod function_support_tests {
             "a sum ignores its ordering, so an ordered filtered sum still federates"
         );
 
+        // A *descending* ordering is refused whatever the aggregate, because the
+        // dialect tests it before either rewrite. Measured against a real
+        // project before this refusal existed, both of these federated as
+        // written and failed:
+        //   sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
+        //     -> Syntax error: Expected ")" but got "("
+        //   median(id ORDER BY id DESC)
+        //     -> Function not found: median
+        let descending_filtered_sum = datafusion::functions_aggregate::expr_fn::sum(col("id"))
+            .filter(keeps_rows.clone())
+            .order_by(vec![col("id").sort(false, false)])
+            .build()
+            .expect("descending filtered sum");
+        assert!(
+            !federates_aggregate("bigquery", descending_filtered_sum).await,
+            "a descending filtered sum falls back to a generic FILTER clause, \
+             which BigQuery has no syntax for"
+        );
+
+        let descending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
+            .order_by(vec![col("id").sort(false, false)])
+            .build()
+            .expect("descending median");
+        assert!(
+            !federates_aggregate("bigquery", descending_median).await,
+            "median has no BigQuery name of its own; a descending ordering \
+             declines the rewrite that supplies one"
+        );
+
+        // Ascending is the control: the allowlist ignores input order, so this
+        // one must keep federating.
+        let ascending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
+            .order_by(vec![col("id").sort(true, false)])
+            .build()
+            .expect("ascending median");
+        assert!(
+            federates_aggregate("bigquery", ascending_median).await,
+            "an ascending median still reaches the rewrite that renders it"
+        );
+
         // Just outside the allowlist: the dialect declines, so federation must
         // refuse, or the statement reaches BigQuery as SQL it cannot parse.
         let array_agg = datafusion::functions_aggregate::expr_fn::array_agg(col("id"))
