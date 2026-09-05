@@ -28,7 +28,7 @@ data_components = { path = "../../data_components", features = ["sqlite"] }
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
-runtime-udfs-api = { path = "../../runtime-udfs-api" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-table-partition = { path = "../../runtime-table-partition" }
 async-trait.workspace = true

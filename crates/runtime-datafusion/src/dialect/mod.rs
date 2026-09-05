@@ -32,9 +32,10 @@ const REGEXP_MATCH_FLAGS_POSITION: usize = 2; // The position of the flags argum
 const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
 const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
-const BTRIM_NAME: &str = "btrim";
+pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
 const CONCAT_NAME: &str = "concat";
+const SHA256_NAME: &str = "sha256";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
@@ -116,8 +117,10 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// unparser emits the `DataFusion` call verbatim, and `DuckDB` either rejects
 /// the name (`btrim`) or accepts it and answers differently (`to_hex`, whose
 /// digits come back upper-case; `concat`, which skips a NULL argument where
-/// the kernel returns NULL for the whole call). The second is the worse of the
-/// two: it is a silently different result rather than a query error.
+/// the kernel returns NULL for the whole call; `sha256`, which returns the
+/// digest's hex text where the kernel returns its bytes). The second is the
+/// worse of the two: it is a silently different result rather than a query
+/// error.
 fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
         (
@@ -139,6 +142,12 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
             // function of the same name, which skips it
             CONCAT_NAME,
             Box::new(duckdb::concat_to_string_concat) as ScalarFnToSqlHandler,
+        ),
+        (
+            // DuckDB dialect: sha256(x) — the digest's hex text, as VARCHAR
+            // DataFusion dialect: sha256(x) — the 32-byte digest, as Binary
+            SHA256_NAME,
+            Box::new(duckdb::sha256_to_digest_bytes) as ScalarFnToSqlHandler,
         ),
     ]
 }
