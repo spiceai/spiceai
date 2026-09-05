@@ -1155,9 +1155,7 @@ const MEMORY_MIXED: OpWeights = OpWeights {
     upsert: 45,
     delete: 25,
     delete_all: 0,
-    // 0 until spiceai/spiceai#12008: a filtered DELETE leaves un-checkpointed
-    // mem-tier rows live.
-    delete_predicate: 0,
+    delete_predicate: 10,
     overwrite: 0,
     compact: 25,
     restart: 5,

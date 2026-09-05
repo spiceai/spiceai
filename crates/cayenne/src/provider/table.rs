@@ -30387,28 +30387,15 @@ impl CayenneTableProvider {
     /// slot advancer and returns; in memory-resident mode it returns immediately,
     /// since there the tier is the permanent store.
     ///
-    /// In-flight pipelined publishes are drained first, as schema evolution and
-    /// warm-to-cold promotion drain before their checkpoints: a data-bearing
-    /// checkpoint folds the inline corpus into the snapshot it writes and then
-    /// clears that corpus, tombstones included, and an inline-conflict tombstone
-    /// whose Stage-B publish has not landed is the window
-    /// [`Self::apply_retention_filters`] and [`Self::sort_and_rewrite_data`] refuse
-    /// to flush inside. `write_lock` blocks new Stage-A commits, so the pending set
-    /// can only shrink, and Stage B needs only the visibility lock and listing
-    /// fence, so it completes under the held lock. A publish still pending after
-    /// [`STAGED_WRITE_DRAIN_TIMEOUT`] means a wedged Stage-B task; the delete then
-    /// fails having changed nothing rather than run against a half-published table.
+    /// It deliberately does NOT drain in-flight pipelined publishes the way schema
+    /// evolution and warm-to-cold promotion do before their checkpoints. Those
+    /// drain while holding `write_lock`, and a current-snapshot staged append
+    /// releases that lock after Stage A while staying registered as in flight until
+    /// `finish` — its Stage B re-acquires the lock in
+    /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
+    /// under the held lock therefore blocks the publish being waited for, and a
+    /// DELETE that raced one could only end in the drain's timeout.
     async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
-        if !self
-            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
-            .await
-        {
-            return Err(datafusion_common::DataFusionError::Execution(format!(
-                "Failed to delete from dataset '{}': a write to it was still publishing after {}s, so the delete was not applied and the rows are unchanged. Retry the DELETE once the write completes.",
-                self.table_metadata.table_name,
-                STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
-            )));
-        }
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -33546,8 +33533,7 @@ impl TableProvider for CayenneTableProvider {
         // subject to the sink's own tier-aware liveness rule.
         //
         // The checkpoint and the scan-source capture share ONE `write_lock` hold,
-        // so no CDC apply can land between them (the checkpoint helper first drains
-        // any pipelined publish still in flight — see its doc). They are not separable: a
+        // so no CDC apply can land between them. They are not separable: a
         // checkpoint publishes its rows as a PROTECTED snapshot, and
         // `build_deletion_vector_sink` freezes the protected set the sink will scan
         // (the sink re-reads only the main listing at execution), so a checkpoint
@@ -55588,6 +55574,83 @@ mod tests {
              per-snapshot sequence numbers (matching load_protected_snapshots), or \
              scans return different rows before vs after a reload"
         );
+    }
+
+    /// A key-based user `DELETE` must finish planning while a pipelined CDC
+    /// append sits between its stages.
+    ///
+    /// A current-snapshot append releases `write_lock` after Stage A
+    /// (`prepare` drops the guard for that target kind) and stays registered in
+    /// `inflight_staging_appends` until `finish`, while its Stage B RE-ACQUIRES
+    /// `write_lock` in `lock_current_snapshot_for_apply`. So a delete that holds
+    /// `write_lock` and waits for that set to drain blocks the very publish it is
+    /// waiting for, and can only end in the drain's timeout.
+    #[tokio::test]
+    async fn key_delete_does_not_wait_for_an_inflight_current_snapshot_append() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "key_delete_vs_inflight_append",
+            ctx.runtime_env(),
+            VortexConfig {
+                compaction_background_interval_ms: 0,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed CDC batch should prepare")
+            .finish()
+            .await
+            .expect("finalize seed CDC batch");
+
+        // A NEW key, so the batch carries no on-conflict deletions and stages
+        // into the CURRENT snapshot — the target kind whose Stage B needs the lock.
+        let pending = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second CDC batch should prepare");
+        assert!(
+            pending.has_pending_finalize(),
+            "precondition: the append must still be mid-flight"
+        );
+        assert!(
+            provider.has_inflight_staging_appends(),
+            "precondition: Stage B has not run yet"
+        );
+        assert!(
+            provider.write_lock.try_lock().is_ok(),
+            "precondition: a current-snapshot append leaves write_lock free between its stages, so a DELETE can take it"
+        );
+
+        let planned = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.delete_from(
+                &ctx.state(),
+                vec![col("value").eq(datafusion_expr::lit(10_i64))],
+            ),
+        )
+        .await;
+        assert!(
+            planned.is_ok(),
+            "the DELETE did not finish planning within 5s while a staged append was in flight"
+        );
+        planned
+            .expect("delete planning completed")
+            .expect("delete plan builds");
+
+        pending.finish().await.expect("finalize pending append");
     }
 
     #[tokio::test]
