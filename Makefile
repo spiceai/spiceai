@@ -149,7 +149,30 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
-NEXTEST_SELECTION := --all --exclude libnfs
+# `--features` here, not a per-crate default, because the result-correctness
+# lanes are the only reason the gate links an engine at all. Cargo skips a test
+# target whose `required-features` are unmet *without saying so*, so before this
+# the filterset below selected `result_correctness_vs_duckdb_test` and cargo
+# silently never built it — selection looked complete while three lanes never
+# ran. See `crates/cayenne/tests/correctness/README.md`.
+#
+# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
+# unlock runtime's accelerator-parity binary, but the feature flows through the
+# whole `--all --tests` build: every one of runtime's integration test binaries
+# relinks with them, and those link at hundreds of megabytes each. That is a
+# large, permanent cost on every sign-off and merge-queue run to gain two
+# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
+# integration workflow, which already builds with `duckdb,sqlite`.
+#
+# The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
+# build script fetches over the network, so folding it into the gate would make
+# every sign-off depend on that fetch and on a machine that can link it. CI runs
+# it instead (`.github/workflows/correctness_chdb.yml`). Because cargo drops a
+# target whose required-features are unmet *without saying so* — the very way
+# three lanes once went unbuilt — the `nextest` target says out loud that this
+# one did not run.
+NEXTEST_SELECTION := --all --exclude libnfs \
+	--features cayenne/result-correctness-duckdb
 NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
@@ -167,6 +190,8 @@ $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_E
 endif
 .PHONY: nextest
 nextest:
+	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
+	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
 	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
