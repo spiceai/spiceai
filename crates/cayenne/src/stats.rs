@@ -332,7 +332,13 @@ pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Stat
 /// Serialize `DataFusion` scan statistics to a persisted Vortex blob.
 ///
 /// Returns `None` when any column cannot be converted or serialization fails.
-pub(crate) fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Option<Vec<u8>> {
+///
+/// Public so a test can seed a `cayenne_snapshot_file_statistics` row with a blob
+/// of its choosing — in particular one carrying no per-column byte sizes, which is
+/// what rows written before those sizes were persisted look like. It is the
+/// serializing counterpart of the already-public `deserialize_file_statistics` and
+/// `file_statistics_to_df`.
+pub fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Option<Vec<u8>> {
     if stats.column_statistics.len() != schema.fields().len() {
         return None;
     }
