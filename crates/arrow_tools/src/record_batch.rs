@@ -686,10 +686,14 @@ fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
 fn can_be_copied_whole(column: &ArrayRef) -> bool {
     match column.data_type() {
         DataType::Utf8View | DataType::BinaryView => true,
-        // Rebuilt by `rebuild_dictionary`, unless its values are views —
-        // `take` copies a view array's views but shares the data buffers they
-        // point into, so the result would still rest on the same memory.
-        DataType::Dictionary(_, values) => !contains_view_type(values),
+        // Rebuilt by `rebuild_dictionary`, unless its values are themselves
+        // views or a dictionary. `take` shares what it selects from in both
+        // cases — a view array's data buffers, and an inner dictionary's values
+        // — so the rebuilt array would still rest on the same memory while
+        // claiming to have been copied off it.
+        DataType::Dictionary(_, values) => {
+            !contains_view_type(values) && !contains_dictionary(values)
+        }
         // A dictionary anywhere below the top cannot be copied at all:
         // `MutableArrayData` builds an extend per child and panics on one whose
         // value count does not fit its key type.
@@ -1025,16 +1029,18 @@ fn compaction_plan(batch: &RecordBatch, decouple: &[bool]) -> (Vec<Option<usize>
 /// cannot be copied off it.
 ///
 /// [`compact_retained_buffers`] copies a foreign-backed column so the entry
-/// stops pinning a producer's chunk and can be billed for what it holds. A view
-/// nested inside a container defeats that: `MutableArrayData` shares its data
-/// buffers wholesale rather than narrowing them, and no kernel rebuilds a view
-/// in place the way [`rebuild_dictionary`] rebuilds a dictionary. So such a
-/// column is left alone — and is then neither copied nor billed for what it
-/// keeps alive, which is the one case where `max_size` would still not bound the
+/// stops pinning a producer's chunk and can be billed for what it holds. A
+/// dictionary below the top level defeats that: `MutableArrayData` builds an
+/// extend per child and panics on one whose value count does not fit its key
+/// type, so no copy of the container around it can be made at all. Such a column
+/// is left alone — and is then neither copied nor billed for what it keeps
+/// alive, which is the one case where `max_size` would still not bound the
 /// memory.
 ///
 /// A caller that retains batches should decline them rather than store one it
-/// cannot bound.
+/// cannot bound. This is a *type* predicate, so it is only as good as
+/// [`can_be_copied_whole`]; the guard test on `compact_retained_buffers` is what
+/// keeps the two honest against a kernel that shares more than expected.
 #[must_use]
 pub fn has_unbounded_foreign_column(batch: &RecordBatch) -> bool {
     batch
@@ -1835,6 +1841,67 @@ mod test {
             read,
             vec![Some("aa"), Some("cc"), Some("aa"), None],
             "remapping the keys must not change what the rows say"
+        );
+    }
+
+    /// `take` hands an inner dictionary's values straight through, so an outer
+    /// dictionary rebuilt over them still rests on the memory they arrived on.
+    /// The predicate has to decline the shape rather than promise a copy that
+    /// [`rebuild_dictionary`] cannot deliver — otherwise the batch is stored
+    /// pinning an allocation nothing bills for.
+    #[test]
+    fn a_dictionary_of_dictionaries_is_not_promised_a_copy() {
+        use arrow::array::{ArrayData, DictionaryArray, Int8Array, Int32Array};
+        use arrow::datatypes::{Int8Type, Int32Type};
+
+        fn foreign(bytes: Vec<u8>) -> Buffer {
+            let backing: Arc<Vec<u8>> = Arc::new(bytes);
+            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+            // SAFETY: `backing` outlives the buffer through the `Allocation`,
+            // and is never mutated.
+            unsafe {
+                Buffer::from_custom_allocation(
+                    ptr,
+                    backing.len(),
+                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+                )
+            }
+        }
+
+        let inner_values = ArrayData::builder(DataType::Utf8)
+            .len(2)
+            .add_buffer(foreign(
+                [0_i32, 1, 2].iter().flat_map(|o| o.to_le_bytes()).collect(),
+            ))
+            .add_buffer(foreign(b"ab".to_vec()))
+            .build()
+            .expect("a valid Utf8 array");
+        let inner = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0_i8, 1]),
+            make_array(inner_values),
+        )
+        .expect("a valid inner dictionary");
+        let column: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1, 0]),
+                Arc::new(inner) as ArrayRef,
+            )
+            .expect("a valid outer dictionary"),
+        );
+
+        assert!(
+            rests_on_foreign_memory(&column),
+            "the fixture must actually rest on foreign memory, or this proves nothing"
+        );
+        assert!(
+            !can_be_copied_whole(&column),
+            "promising a copy here would store a batch still pinning the inner values"
+        );
+
+        let batch = RecordBatch::try_from_iter(vec![("d", column)]).expect("a one-column batch");
+        assert!(
+            has_unbounded_foreign_column(&batch),
+            "a batch a copy cannot decouple must be reported as unbounded"
         );
     }
 

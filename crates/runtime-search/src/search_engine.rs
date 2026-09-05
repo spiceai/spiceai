@@ -807,7 +807,12 @@ fn wrap_cache_to_result(
                 yield batch_result;
             }
 
-            if records_size < cache_max_size {
+            // The compaction above cannot decouple every shape: a dictionary
+            // below the top level has no copy at all, so an entry over it would
+            // pin the producer's allocation while being billed only for the
+            // buffers it declares. The SQL results cache declines such a result
+            // at its own admission; this one has the same budget to keep.
+            if records_size < cache_max_size && cache::batches_boundable(&records) {
                 let cached_result = CachedAggregationResult::new(
                     records,
                     cloned_primary_key,

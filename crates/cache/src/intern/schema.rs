@@ -91,12 +91,6 @@ use super::{Internable, Interner};
 #[cfg(test)]
 use super::{SHARDS, SWEEP_INTERVAL};
 
-/// Number of independently-locked shards.
-///
-/// Sharded because the content-equality check is a deep comparison held under
-/// the lock; see the module docs. Fixed rather than CPU-derived because the
-/// pool is touched once per retained item, not per row of data, so the count
-/// only needs to keep unrelated tables off a single lock.
 /// The deep size of an Arrow [`Schema`]: the struct, the fields it owns, and
 /// its key-value metadata.
 ///

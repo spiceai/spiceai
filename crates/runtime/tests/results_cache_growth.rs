@@ -48,8 +48,8 @@ use std::time::Duration;
 use app::AppBuilder;
 use runtime::Runtime;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
-use spicepod::component::dataset::Dataset;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, TaskHistory};
 
 /// Live heap bytes: everything allocated and not yet freed.
@@ -218,8 +218,11 @@ async fn the_cache_holds_about_what_it_reports_holding() {
             // Warm the plan and codegen paths, so their one-off allocation is
             // below the baseline rather than inside the measured window.
             for i in 0..50 {
-                run_query(&rt, &format!("SELECT 1 FROM lookup WHERE id = {} LIMIT 1", 9_000_000 + i))
-                    .await;
+                run_query(
+                    &rt,
+                    &format!("SELECT 1 FROM lookup WHERE id = {} LIMIT 1", 9_000_000 + i),
+                )
+                .await;
             }
             cache.run_pending_tasks().await;
 

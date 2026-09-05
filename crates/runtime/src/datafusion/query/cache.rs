@@ -636,6 +636,20 @@ impl Query {
                 return;
             }
 
+            // A separate question from the one above: the origin answered fine,
+            // but the result holds a column no copy can decouple from the memory
+            // its producer owns, so an entry over it could not be billed for
+            // what it keeps alive. Keep the stale entry rather than store one
+            // `max_size` cannot bound.
+            if !cache::batches_boundable(&batches) {
+                tracing::debug!(
+                    cache_key = cache_key_u64,
+                    "Background revalidation returned a result the cache cannot bound, preserving stale cache"
+                );
+                record_revalidation_outcome(RevalidationOutcome::Unboundable);
+                return;
+            }
+
             // Empty (0-row) revalidation results are cached too. The schema is
             // preserved separately in `CachedQueryResult`, so an empty result
             // refreshes the entry correctly rather than leaving the previous

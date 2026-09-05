@@ -185,21 +185,21 @@ impl CachedQueryResult {
     /// The memory this entry holds, as the cache's byte budget sees it.
     ///
     /// Everything the entry holds *of its own* is counted, not just its array
-    /// bytes: its batches, the input-table set, and a flat allowance for the
-    /// store's own per-entry bookkeeping. A 0-row result carries no array bytes
+    /// bytes: its batches and a flat allowance for the store's own per-entry
+    /// bookkeeping. A 0-row result carries no array bytes
     /// at all, so counting only those made it weigh a flat `size_of::<Self>()`
     /// regardless of how wide its schema was, and the byte budget could never
     /// evict one. See [`crate::sizing`] for the imprecisions this accepts.
     ///
-    /// The schema is deliberately **not** charged here. It is interned, so one
-    /// allocation is shared by every entry over the same shape, and charging it
-    /// per entry would bill a 200-column schema tens of thousands of times over
-    /// for memory that exists once.
+    /// The schema and the input-table set are deliberately **not** charged here.
+    /// Both are interned, so one allocation is shared by every entry over the
+    /// same shape, and charging either per entry would bill a 200-column schema
+    /// tens of thousands of times over for memory that exists once.
     ///
-    /// This holds even when a schema is **unique to one entry** — that case is
+    /// This holds even when a shape is **unique to one entry** — that case is
     /// intentional, not an oversight. Such an entry does hold an allocation no
     /// weigher charges, so a workload of unboundedly many distinct output
-    /// shapes can exceed `max_size` by the size of its schemas. The considered
+    /// shapes can exceed `max_size` by the size of its schemas and table sets. The considered
     /// alternative was charging `schema_size / Arc::strong_count` at insert,
     /// which self-corrects because it degrades to the full charge exactly when
     /// deduplication fails. It was rejected: making every entry's weight depend
@@ -211,8 +211,9 @@ impl CachedQueryResult {
     /// What keeps that residual case from being silent is reporting rather than
     /// admission: [`crate::intern::schema::SchemaInterner::stats`] counts
     /// each distinct schema once and is published as
-    /// `schema_interner_schema_bytes`, so a pool growing without bound is
-    /// visible even though it does not trigger eviction.
+    /// `schema_interner_value_bytes` (with `table_set_interner_value_bytes` for
+    /// the table sets), so a pool growing without bound is visible even though
+    /// it does not trigger eviction.
     #[must_use]
     pub fn memory_size(&self) -> u64 {
         let mut size = std::mem::size_of::<Self>();

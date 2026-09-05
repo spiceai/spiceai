@@ -74,12 +74,11 @@ const CAPACITY_SLACK: usize = 4;
 ///
 /// The point is what it cannot be built from: there is no way to make one from
 /// an arbitrary `Arc<T>`, only by interning. A cache entry that stores its
-/// schema and table set as `Interned` therefore cannot hold a private copy, so
-/// the weigher's decision not to charge for them stays true no matter how many
-/// constructors the entry grows. Before this, that decision rested on every
-/// call site remembering to intern — the class of mistake CLAUDE.md's
-/// *Trait evolution & wrapper delegation* section is about, where the wiring
-/// compiles and silently no-ops.
+/// schema and table set as `Interned` therefore cannot hold a private copy, and
+/// the weigher's decision not to charge for them holds for every constructor
+/// and store path the entry ever grows — including one written later by
+/// someone who has never read this module. The alternative is an invariant each
+/// call site has to remember, which compiles either way and fails silently.
 #[derive(Debug)]
 pub struct Interned<T>(Arc<T>);
 

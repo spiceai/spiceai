@@ -169,23 +169,34 @@ pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
         return false;
     }
 
-    // A batch resting on memory it does not own is normally copied on the way
-    // in, so the entry stops pinning the producer's chunk and can be billed for
-    // what it holds. A dictionary below the top level cannot be copied off it —
-    // see `has_unbounded_foreign_column` — and storing one would put memory in
-    // the cache that `max_size` cannot see or bound. Declining to cache it is
-    // the conservative half of that trade: a repeat query re-executes, where the
-    // alternative is a budget that does not hold. There is deliberately no log
-    // here: this runs once per cacheable result, which is as often as the
-    // runtime answers a query.
-    if batches
+    true
+}
+
+/// Whether an in-memory results-cache entry over `batches` could be bounded by
+/// the configured `max_size`.
+///
+/// Deliberately separate from [`batches_cacheable`], which answers a different
+/// question — whether the *origin* produced a result worth storing — and whose
+/// callers treat `false` as a failing origin and keep serving what is cached. A
+/// batch declined here is a perfectly good result; it just cannot be held in a
+/// budgeted cache.
+///
+/// A batch resting on memory it does not own is copied on the way in, so the
+/// entry stops pinning the producer's chunk and can be billed for what it holds.
+/// A dictionary below the top level cannot be copied off it — `MutableArrayData`
+/// builds an extend per child and panics on one whose value count does not fit
+/// its key type — so storing such a result would put memory in the cache that
+/// `max_size` cannot see. Declining is the conservative half of that trade: a
+/// repeat query re-executes, where the alternative is a budget that does not
+/// hold.
+///
+/// There is deliberately no log here: this runs once per storable result, which
+/// is as often as the runtime answers a query.
+#[must_use]
+pub fn batches_boundable(batches: &[RecordBatch]) -> bool {
+    !batches
         .iter()
         .any(arrow_tools::record_batch::has_unbounded_foreign_column)
-    {
-        return false;
-    }
-
-    true
 }
 
 /// How much larger than the cache limit a raw result may grow while
@@ -268,6 +279,8 @@ pub fn to_cached_record_batch_stream(
             // `batches_cacheable` is false only when transient HTTP error
             // responses (5xx/429) are present, which requires a non-empty
             // result set — skip the write to avoid caching a partial result.
+            // `batches_boundable` is the separate question of whether the entry
+            // could be billed for what it would hold.
             if cache_provider.tables_changed_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
@@ -275,7 +288,7 @@ pub fn to_cached_record_batch_stream(
                 tracing::debug!(
                     "A table read by this query changed while it ran, skipping cache storage"
                 );
-            } else if batches_cacheable(&records) {
+            } else if batches_cacheable(&records) && batches_boundable(&records) {
                 // Cache the result, including genuinely empty (0-row / 0-batch)
                 // result sets. The schema is stored separately in
                 // `CachedQueryResult`, so an empty result round-trips with the
@@ -428,7 +441,7 @@ pub(crate) mod tests {
             decoded.columns().iter().all(foreign),
             "the fixture must actually rest on the decoded frame, or this proves nothing"
         );
-        assert!(batches_cacheable(std::slice::from_ref(&decoded)));
+        assert!(batches_boundable(std::slice::from_ref(&decoded)));
 
         let stored = arrow_tools::record_batch::compact_retained_buffers(&decoded);
         assert!(
@@ -525,7 +538,7 @@ pub(crate) mod tests {
             RecordBatch::try_from_iter(vec![("n", nested)]).expect("a one-column batch");
 
         assert!(
-            !batches_cacheable(&[unbounded]),
+            !batches_boundable(&[unbounded]),
             "a nested dictionary resting on memory the cache cannot copy off must be \
              declined, or it is stored holding bytes `max_size` cannot see"
         );
@@ -544,7 +557,7 @@ pub(crate) mod tests {
         .expect("a valid dictionary");
         let rebuildable = RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)])
             .expect("a one-column batch");
-        assert!(batches_cacheable(&[rebuildable]));
+        assert!(batches_boundable(&[rebuildable]));
 
         // The ordinary case is unaffected: an owned batch is still cacheable.
         let owned = RecordBatch::try_from_iter(vec![(
@@ -552,7 +565,7 @@ pub(crate) mod tests {
             Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
         )])
         .expect("a one-column batch");
-        assert!(batches_cacheable(&[owned]));
+        assert!(batches_boundable(&[owned]));
     }
 
     use super::*;

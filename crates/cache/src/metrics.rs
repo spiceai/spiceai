@@ -322,6 +322,9 @@ pub enum RevalidationOutcome {
     /// The result carried transient HTTP error responses (5xx/429), so the
     /// previous entry was preserved rather than overwritten with them.
     TransientErrors,
+    /// The result held a column no copy can decouple from the memory its
+    /// producer owns, so an entry over it could not be bounded by `max_size`.
+    Unboundable,
     /// The result could not be encoded for storage.
     EncodeFailed,
     /// The cache write itself failed.
@@ -330,12 +333,13 @@ pub enum RevalidationOutcome {
 
 impl RevalidationOutcome {
     /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Stored,
         Self::QueryFailed,
         Self::CollectFailed,
         Self::InvalidatedMidFlight,
         Self::TransientErrors,
+        Self::Unboundable,
         Self::EncodeFailed,
         Self::PutFailed,
     ];
@@ -347,6 +351,7 @@ impl RevalidationOutcome {
             Self::CollectFailed => "collect_failed",
             Self::InvalidatedMidFlight => "invalidated_mid_flight",
             Self::TransientErrors => "transient_errors",
+            Self::Unboundable => "unboundable",
             Self::EncodeFailed => "encode_failed",
             Self::PutFailed => "put_failed",
         }
