@@ -30366,25 +30366,6 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Flush inlined rows to Vortex files when pending inline data exists.
-    ///
-    /// Callers must hold `write_lock` while calling this helper.
-    ///
-    /// Unlike `checkpoint_inlined_data_if_memtable_pressure_exceeded`, this does
-    /// NOT defer on `pending_inline_tombstones`, and is safe to do so by MUTUAL
-    /// EXCLUSIVITY rather than locking (the staged-tombstone finalize runs
-    /// WITHOUT `write_lock`, so the lock is not what protects it): the two DELETE
-    /// callers — the file-based retention delete (gated by
-    /// `file_based_deletes_preferred`, which requires a `time_retention_filter_builder`,
-    /// i.e. `has_retention_delete_filters()`, which BLOCKS inline upserts in
-    /// `mutation_writer::write_all_append`) and the position-based delete (whose tables
-    /// don't support upserts) — cannot coexist with a staged inline-conflict tombstone
-    /// on the same table.
-    ///
-    /// That argument does NOT extend to the third caller, the background retention pass
-    /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
-    /// `InlineMutationPolicy`, so its table can hold one. That caller checks
-    /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
     /// Materialize the in-memory CDC tier before a scanning delete, the way
     /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
     /// inline corpus: the deletion-vector sink scans durable tiers only, and it
@@ -30417,6 +30398,25 @@ impl CayenneTableProvider {
             })
     }
 
+    /// Flush inlined rows to Vortex files when pending inline data exists.
+    ///
+    /// Callers must hold `write_lock` while calling this helper.
+    ///
+    /// Unlike `checkpoint_inlined_data_if_memtable_pressure_exceeded`, this does
+    /// NOT defer on `pending_inline_tombstones`, and is safe to do so by MUTUAL
+    /// EXCLUSIVITY rather than locking (the staged-tombstone finalize runs
+    /// WITHOUT `write_lock`, so the lock is not what protects it): the two DELETE
+    /// callers — the file-based retention delete (gated by
+    /// `file_based_deletes_preferred`, which requires a `time_retention_filter_builder`,
+    /// i.e. `has_retention_delete_filters()`, which BLOCKS inline upserts in
+    /// `mutation_writer::write_all_append`) and the position-based delete (whose tables
+    /// don't support upserts) — cannot coexist with a staged inline-conflict tombstone
+    /// on the same table.
+    ///
+    /// That argument does NOT extend to the third caller, the background retention pass
+    /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
+    /// `InlineMutationPolicy`, so its table can hold one. That caller checks
+    /// `pending_inline_tombstones` itself, under `write_lock`, and defers instead.
     async fn checkpoint_inlined_data_if_present_for_delete(&self) -> datafusion_common::Result<()> {
         let inlined_count = self.cached_inlined_row_count();
 

@@ -177,8 +177,9 @@ async fn delete_where(
 }
 
 /// Number of files under the table's data directory — a durable write adds
-/// files, a RAM-tier write does not, so an unchanged count is the precondition
-/// that the second CDC write really stayed in RAM.
+/// files, a RAM-tier write does not. An increased count is the precondition that
+/// a checkpoint really made its rows durable; an unchanged count is the
+/// precondition that the second CDC write really stayed in RAM.
 fn count_files(dir: &std::path::Path) -> usize {
     let mut n = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -206,11 +207,16 @@ async fn predicate_delete_spanning_durable_and_ram_rows_impl(
     let sql = "SELECT id, value FROM durable_and_ram ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(7, 10), (8, 5)]).await?;
+    let files_before_checkpoint = count_files(&fixture.data_path);
     let durable_epoch = table.checkpoint_mem_tier().await?;
     let files_after_checkpoint = count_files(&fixture.data_path);
     let rows = collect_pairs(&ctx, sql).await?;
     eprintln!(
-        "[durable+ram] durable CDC (7,10),(8,5) + checkpoint (epoch {durable_epoch}, {files_after_checkpoint} data files): {rows:?}"
+        "[durable+ram] durable CDC (7,10),(8,5) + checkpoint (epoch {durable_epoch}, data files {files_before_checkpoint} -> {files_after_checkpoint}): {rows:?}"
+    );
+    assert!(
+        files_after_checkpoint > files_before_checkpoint,
+        "the first checkpoint must write a data file ({files_before_checkpoint} -> {files_after_checkpoint}), otherwise (7,10) never becomes a superseded durable version and this scenario does not exercise the durable+RAM path"
     );
     assert_eq!(rows, vec![(7, 10), (8, 5)], "durable baseline");
 
@@ -263,13 +269,20 @@ async fn predicate_delete_ram_only_row_impl(fixture: common::TestFixture) -> Tes
     let sql = "SELECT id, value FROM ram_only ORDER BY id";
 
     cdc_upsert(&table, &schema, &[(8, 5)]).await?;
+    let files_before_checkpoint = count_files(&fixture.data_path);
     let _ = table.checkpoint_mem_tier().await?;
     let files_after_checkpoint = count_files(&fixture.data_path);
+    assert!(
+        files_after_checkpoint > files_before_checkpoint,
+        "the checkpoint must write a data file ({files_before_checkpoint} -> {files_after_checkpoint}), otherwise (8,5) is not a durable row and this scenario does not span the durable and RAM tiers"
+    );
 
     cdc_upsert(&table, &schema, &[(9, 20)]).await?;
     let files_after_ram_write = count_files(&fixture.data_path);
     let rows = collect_pairs(&ctx, sql).await?;
-    eprintln!("[ram-only] durable (8,5) + checkpoint, then RAM-only (9,20): {rows:?}");
+    eprintln!(
+        "[ram-only] durable (8,5) + checkpoint (data files {files_before_checkpoint} -> {files_after_checkpoint}), then RAM-only (9,20) ({files_after_ram_write} data files): {rows:?}"
+    );
     assert_eq!(
         files_after_ram_write, files_after_checkpoint,
         "the second write must stay in the RAM tier (no new data file) for this test to exercise the RAM-tier path"
