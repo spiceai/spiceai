@@ -294,14 +294,15 @@ pub fn extract_and_format_metadata(
 
 /// Filter out the rows this batch will not store a vector for.
 ///
-/// A vector is dropped when it consists entirely of invalid values (zeros and/or NaNs).
-/// A vector with any valid non-zero, non-NaN value is kept.
-/// For example:
-/// - `[0.0, 0.0]` -> filtered (all zeros)
-/// - `[NaN, NaN]` -> filtered (all NaN)
-/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
-/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
-/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+/// A vector is dropped when it has no defined direction under any metric the index offers,
+/// which [`write_util::classify_vector`] decides: every component zero or `NaN`, or any
+/// component non-finite. For example:
+/// - `[0.0, 0.0]` -> filtered (no direction: all zero)
+/// - `[NaN, NaN]` -> filtered (no direction: all NaN)
+/// - `[0.0, NaN]` -> filtered (no direction: every component is zero or NaN)
+/// - `[1.0, NaN]` -> filtered (non-finite: every distance to it is `NaN`)
+/// - `[0.0, Inf]` -> filtered (non-finite, and note the all-zero test does not catch it)
+/// - `[1.0, 0.0]` -> kept (a finite, non-zero direction)
 ///
 /// The fourth element is the keys this batch will not store a vector for and so must
 /// delete, per [`write_util::keys_to_evict`]. It covers the rows filtered here and the
