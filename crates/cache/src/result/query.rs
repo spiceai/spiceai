@@ -390,12 +390,15 @@ mod tests {
             + 2 * std::mem::size_of::<RecordBatch>() as u64
             + batch1.get_array_memory_size() as u64
             + batch2.get_array_memory_size() as u64
+            + (crate::sizing::BUFFER_OVERHEAD_BYTES
+                * (arrow_tools::record_batch::buffers_in_batch(&batch1)
+                    + arrow_tools::record_batch::buffers_in_batch(&batch2))) as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
 
         assert_eq!(
             cached_result.memory_size(),
             expected_size,
-            "an entry must be billed its batches and the store's per-entry overhead — but not the schema or input-table set it shares"
+            "an entry must be billed its batches, a per-buffer allowance and the store's per-entry overhead — but not the schema or input-table set it shares"
         );
         assert!(
             cached_result.memory_size() < 10_000,

@@ -1144,23 +1144,24 @@ impl Runtime {
 
     /// Periodically drives moka housekeeping so invalidation predicates and
     /// expired entries are reclaimed even on caches with no `get`/`insert`
-    /// traffic, and reclaims the shared Arrow schema pool. Loops until the task
-    /// is cancelled at shutdown.
+    /// traffic. Returns immediately when no cache is configured; otherwise loops
+    /// until the task is cancelled at shutdown.
     pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
         let caching = self.datafusion().caching();
-        let has_cache = caching.results.is_some()
-            || caching.plans.is_some()
-            || caching.search.is_some()
-            || caching.embeddings.is_some();
+        if caching.results.is_none()
+            && caching.plans.is_none()
+            && caching.search.is_none()
+            && caching.embeddings.is_none()
+        {
+            return Ok(());
+        }
 
         let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
 
-            if has_cache {
-                caching.run_pending_maintenance().await;
-            }
+            caching.run_pending_maintenance().await;
         }
     }
 
@@ -1368,11 +1369,11 @@ impl Runtime {
             CachedEmbeddingResult::init();
         }
 
-        // Not gated on a cache being enabled: the schema pool is shared by
-        // everything that retains batches, including Cayenne's inline-data
-        // cache, so it holds — and must report — memory even with every SQL
-        // cache switched off.
-        cache::metrics::init_interner_metrics();
+        // Every value these pools share is held by a cache entry, so a runtime
+        // with no cache configured has nothing to report.
+        if caching.results.is_some() || caching.search.is_some() {
+            cache::metrics::init_interner_metrics();
+        }
     }
 
     /// Publishes the component counters at zero. Must be called after

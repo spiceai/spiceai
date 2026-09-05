@@ -24,7 +24,7 @@ use datafusion::sql::TableReference;
 use crate::intern::table_set::table_reference_heap_size;
 use crate::intern::Interned;
 use crate::sizing::{
-    ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
+    BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
 };
 use crate::{AsTableRefs, Sizeable};
 
@@ -78,7 +78,16 @@ impl CachedAggregationResult {
             + self
                 .records
                 .iter()
-                .map(RecordBatch::get_array_memory_size)
+                .map(|batch| {
+                    // The bytes the arrays asked for, plus what each of their
+                    // buffers costs beyond that — the same allowance a cached
+                    // query result is charged, for the same reason. Without it a
+                    // search entry is underweighted exactly where its schema and
+                    // table set stopped being charged.
+                    batch.get_array_memory_size()
+                        + BUFFER_OVERHEAD_BYTES
+                            * arrow_tools::record_batch::buffers_in_batch(batch)
+                })
                 .sum::<usize>()
             + string_vec_heap_size(&self.primary_keys)
             + string_vec_heap_size(&self.data_columns)
