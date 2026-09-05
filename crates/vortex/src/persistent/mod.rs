@@ -529,6 +529,23 @@ mod tests {
             pretty_format_batches(&filter_result)?
         );
 
+        // A CASE whose branches are list literals is list-typed, but those literals
+        // cannot convert to Vortex scalars. The query must still plan and run by
+        // keeping `array_length` above the scan rather than failing at convert time.
+        let case_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN id = 1 THEN [10, 20] ELSE a END) >= 2 \
+            ORDER BY id";
+        let case_plan = physical_plan_display(&ctx.session, case_query).await?;
+        assert!(
+            case_plan.contains("FilterExec"),
+            "array_length(CASE of list literals) must stay above the scan, got plan:\n{case_plan}"
+        );
+        let case_result = ctx.session.sql(case_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_list_literals_result",
+            pretty_format_batches(&case_result)?
+        );
+
         // `array_length(a, 2)` has multidimensional semantics that `list_length` does
         // not model, so it must stay in a FilterExec above the scan.
         let dim2_query = "SELECT id FROM list_test WHERE array_length(a, 2) >= 4 ORDER BY id";

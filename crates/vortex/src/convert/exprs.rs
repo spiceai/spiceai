@@ -548,7 +548,9 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
         || expr.downcast_ref::<df_expr::Column>().is_some()
         || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
-        || expr.downcast_ref::<df_expr::Literal>().is_some()
+        || expr
+            .downcast_ref::<df_expr::Literal>()
+            .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
         || expr
             .downcast_ref::<df_expr::CastExpr>()
             .is_some_and(|e| is_convertible_expr(e.expr()))
@@ -1518,6 +1520,46 @@ mod tests {
         let array_length = array_length_expr(vec![list, dimension], &test_schema);
 
         assert!(can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    fn int32_list_literal(elements: &[i32]) -> Arc<dyn PhysicalExpr> {
+        use datafusion_common::arrow::array::Int32Builder;
+        use datafusion_common::arrow::array::ListBuilder;
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for element in elements {
+            builder.values().append_value(*element);
+        }
+        builder.append(true);
+        Arc::new(df_expr::Literal::new(ScalarValue::List(Arc::new(
+            builder.finish(),
+        ))))
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_list_literals_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN active THEN [1, 2] ELSE [3] END` is list-typed and looks
+        // convertible (literals + ELSE), but `Scalar::from_df` has no `List` arm.
+        // Accepting it for pushdown would fail at scan planning instead of leaving
+        // `array_length` above the scan.
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>,
+            int32_list_literal(&[1, 2]),
+        )];
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, when_then, Some(int32_list_literal(&[3])))
+                .expect("CASE with list literals should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("list literals must not convert to a Vortex scalar");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE of list literals must not be accepted for pushdown"
+        );
     }
 
     #[rstest]
