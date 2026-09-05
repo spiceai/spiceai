@@ -3002,10 +3002,11 @@ mod function_support_tests {
             "a sum ignores its ordering, so an ordered filtered sum still federates"
         );
 
-        // A *descending* ordering is refused whatever the aggregate, because the
-        // dialect tests it before either rewrite. Measured against a real
-        // project before this refusal existed, both of these federated as
-        // written and failed:
+        // A *descending* ordering is refused only for the percentile rewrites,
+        // which are rendered by ordering the group. Everything on the FILTER
+        // allowlist ignores input order, so it keeps its pushdown either way.
+        // Measured against a real project before spiceai/datafusion#219 scoped
+        // the dialect's check, both of these federated as written and failed:
         //   sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
         //     -> Syntax error: Expected ")" but got "("
         //   median(id ORDER BY id DESC)
@@ -3016,9 +3017,9 @@ mod function_support_tests {
             .build()
             .expect("descending filtered sum");
         assert!(
-            !federates_aggregate("bigquery", descending_filtered_sum).await,
-            "a descending filtered sum falls back to a generic FILTER clause, \
-             which BigQuery has no syntax for"
+            federates_aggregate("bigquery", descending_filtered_sum).await,
+            "a sum ignores its ordering in either direction, so the dialect \
+             still moves the predicate inside and the pushdown is kept"
         );
 
         let descending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))

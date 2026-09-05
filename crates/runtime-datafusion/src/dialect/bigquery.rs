@@ -236,26 +236,24 @@ const PERCENTILE_REWRITES: &[&str] = &["median", "approx_percentile_cont"];
 /// holding a null at all, so the rewrite fails for any filter that actually
 /// filters — where `DataFusion` answers `[2, 3]`.
 ///
-/// A **descending** ordering is refused separately, and for a different reason.
-/// The dialect tests it *before* either rewrite and falls back to the generic
-/// rendering, because a descending sort takes a percentile from the other end.
-/// That fallback is harmless for an aggregate `BigQuery` spells the same way, and
-/// a failed query for the two kinds that need the rewrite — one carrying a
-/// `FILTER` (there is no such clause to fall back to) and one named
-/// [`PERCENTILE_REWRITES`] (there is no such function). Measured on the branch
-/// before this refusal existed:
+/// A **descending** ordering is refused only for [`PERCENTILE_REWRITES`]. Those
+/// are rendered by ordering the group, so a descending sort takes the value from
+/// the other end and the rendering would answer over the wrong row; the dialect
+/// declines, which leaves the `DataFusion` name in place for `BigQuery` to reject
+/// (`Function not found: median`) rather than answering quietly wrong.
+///
+/// Ordering is not consulted for anything else. Every aggregate on the rewrite
+/// allowlist skips nulls and ignores input order, so the `FILTER` rewrite drops
+/// an `ORDER BY` safely in either direction. Refusing those would not cost a
+/// pushdown but fail the query, since the fallback is a generic `FILTER` clause
+/// `BigQuery` cannot parse — measured before spiceai/datafusion#219 scoped the
+/// dialect's check to the percentiles:
 ///
 /// ```text
 /// sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
 ///   -> SELECT sum(`id`) FILTER (WHERE (`id` > 1)) ...
 ///   -> Syntax error: Expected ")" but got "("
-/// median(id ORDER BY id DESC)
-///   -> SELECT median(`id`) ... -> Function not found: median
 /// ```
-///
-/// An *ascending* ordering is still not refused: every aggregate on the list
-/// ignores input order, so an ordered `SUM … FILTER` rewrites and returns the
-/// same number.
 ///
 /// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
 /// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
@@ -267,10 +265,9 @@ pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
     // Checked ahead of the `FILTER` question, because it decides an unfiltered
     // call too.
     if call.params.order_by.iter().any(|sort| !sort.asc)
-        && (call.params.filter.is_some()
-            || PERCENTILE_REWRITES
-                .iter()
-                .any(|rewritten| name.eq_ignore_ascii_case(rewritten)))
+        && PERCENTILE_REWRITES
+            .iter()
+            .any(|rewritten| name.eq_ignore_ascii_case(rewritten))
     {
         return false;
     }
@@ -1279,6 +1276,14 @@ impl Dialect for SpiceBigQueryDialect {
         tz: Option<&Arc<str>>,
     ) -> Option<ast::Expr> {
         self.inner.string_to_timestamp_to_sql(value, tz)
+    }
+
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_to_date_to_sql(value)
+    }
+
+    fn supports_recursive_cte(&self) -> bool {
+        self.inner.supports_recursive_cte()
     }
 
     fn requires_explicit_comparison_coercion(&self) -> bool {
@@ -2423,6 +2428,92 @@ mod tests {
             .to_string()
     }
 
+    /// A recursive CTE renders as `WITH RECURSIVE` through the wrapper, and only
+    /// for a dialect that has opted in.
+    ///
+    /// Separate from [`the_wrapper_forwards_every_bigquery_specific_rendering`]
+    /// because this one asserts a *statement* shape rather than a fragment of a
+    /// `SELECT`, and because it needs the negative direction too: the gate is the
+    /// load-bearing half. A federated statement has no local-execution fallback,
+    /// so emitting `WITH RECURSIVE` to an engine that cannot run one turns a
+    /// query that used to evaluate locally into a failure.
+    #[test]
+    fn a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("n", DataType::Int64, true),
+        ]));
+        let working_table = |name: &str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                name,
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    Arc::clone(&schema),
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the working table")
+        };
+
+        // `SELECT n FROM counted WHERE n < 5`, the term that reads the working
+        // table by the CTE's own name — the self-reference a recursive CTE needs.
+        let recursive_term = working_table("counted")
+            .filter(col("counted.n").lt(lit(5_i64)))
+            .expect("filter")
+            .project(vec![col("counted.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+        let static_term = working_table("seed")
+            .project(vec![col("seed.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let plan = datafusion::logical_expr::LogicalPlan::RecursiveQuery(
+            datafusion::logical_expr::RecursiveQuery {
+                name: "counted".to_string(),
+                static_term: Arc::new(static_term),
+                recursive_term: Arc::new(recursive_term),
+                is_distinct: false,
+                schema: Arc::new(
+                    datafusion::common::DFSchema::try_from(Arc::clone(&schema)).expect("schema"),
+                ),
+            },
+        );
+
+        let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+        assert!(
+            wrapper.contains("WITH RECURSIVE"),
+            "a recursive CTE has to keep its RECURSIVE keyword: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("UNION ALL"),
+            "a non-distinct recursive query joins its terms with UNION ALL: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("`counted`"),
+            "the recursive term's self-reference has to name the CTE: {wrapper}"
+        );
+        assert_eq!(
+            wrapper,
+            unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                &plan
+            ),
+            "the wrapper and the inner BigQuery dialect have to render this the \
+             same way, or a federated recursive CTE diverges from the dialect's \
+             own rendering"
+        );
+
+        // The gate: a dialect that has not opted in still refuses, so nothing
+        // starts reaching an engine that cannot evaluate it.
+        assert!(
+            Unparser::new(&datafusion::sql::unparser::dialect::DefaultDialect {})
+                .plan_to_sql(&plan)
+                .is_err(),
+            "a dialect that does not support recursive CTEs must still refuse"
+        );
+    }
+
     /// Every `BigQuery`-specific rendering the fork's dialect fixes produce has to
     /// survive the wrapper.
     ///
@@ -2804,6 +2895,28 @@ mod tests {
                 .expect("descending filtered sum"),
         );
 
+        // Text narrowed to a date. BigQuery's DATE cast takes only a bare
+        // `YYYY-MM-DD`, so an ISO instant held as text has to be parsed to an
+        // instant first and then narrowed.
+        let text_to_date = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.note"),
+                DataType::Date32,
+            )])
+            .expect("text to date projection")
+            .build()
+            .expect("build");
+
+        // Text compared against a civil timestamp. BigQuery has no implicit
+        // parse and refuses the pair outright.
+        let text_against_timestamp = date_scan()
+            .filter(col("d.note").lt(col("d.naive")))
+            .expect("text against timestamp filter")
+            .project(vec![col("d.note")])
+            .expect("project")
+            .build()
+            .expect("build");
+
         // A negative Arrow scale widens rather than narrows: `Decimal128(28, -2)`
         // is 30 integer digits, not 26. The unparser normalises it to
         // `(30, 0)` before the dialect sees it, so the dialect never meets a
@@ -3157,13 +3270,30 @@ mod tests {
                 "first_value(`t`.`v`) OVER (ORDER BY `t`.`ts` ASC NULLS LAST)",
             ),
             (
-                // Falls back to a generic `FILTER` clause, which BigQuery has no
-                // syntax for — so `can_translate_aggregate` must refuse the same
-                // shape, or the statement reaches BigQuery and fails.
-                "a descending filtered sum is declined (fork PR #218)",
+                // A sum ignores its ordering in either direction, so the
+                // predicate moves inside exactly as it does ascending. This
+                // emitted a generic `FILTER` clause until spiceai/datafusion#219
+                // scoped the dialect's descending check to the percentiles.
+                "a descending filtered sum still rewrites (fork PR #219)",
                 &descending_filtered_sum,
-                "FILTER",
                 "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                // The plain cast is refused for every form carrying a time or a
+                // zone, which is every form this column actually holds.
+                "text is parsed into a date, not cast (fork PR #219)",
+                &text_to_date,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "CAST(`d`.`note` AS DATE)",
+            ),
+            (
+                // Losing this pushes the pair down as written, and BigQuery
+                // refuses "STRING, DATETIME" with "No matching signature".
+                "text compared with a timestamp is brought to one type (fork PR #219)",
+                &text_against_timestamp,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "`d`.`note` < `d`.`naive`",
             ),
             (
                 // 28 digits at scale -2 is a width of 30, so the widest type is
