@@ -6,11 +6,13 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_functions_nested::length::ArrayLength;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
@@ -26,6 +28,7 @@ use vortex::expr::and_collect;
 use vortex::expr::cast;
 use vortex::expr::get_item;
 use vortex::expr::list_contains;
+use vortex::expr::list_length;
 use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::pack;
@@ -123,8 +126,38 @@ pub trait ExpressionConvertor: Send + Sync {
 pub struct DefaultExpressionConvertor {}
 
 impl DefaultExpressionConvertor {
+    /// Attempts to convert `DataFusion`'s `array_length` function (aliased as `list_length`) to
+    /// Vortex `list_length`.
+    ///
+    /// Supports the single-argument form `array_length(arr)` and the equivalent two-argument
+    /// form with an explicit first dimension `array_length(arr, 1)`.
+    fn try_convert_array_length(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
+        let Some(input) = array_length_input(scalar_fn) else {
+            return Err(exec_datafusion_err!(
+                "array_length pushdown supports only the one-argument form or an explicit first dimension"
+            ));
+        };
+
+        let input = self.convert(input.as_ref())?;
+        let nullability = if scalar_fn.nullable() {
+            Nullability::Nullable
+        } else {
+            Nullability::NonNullable
+        };
+        // Match the DataFusion return field (UInt64, nullability from the list argument)
+        // so a pushed `array_length` has the same type the plan already expects.
+        let return_dtype = DType::from_arrow((scalar_fn.return_type(), nullability));
+        Ok(cast(list_length(input), return_dtype))
+    }
+
     /// Attempts to convert a `DataFusion` `ScalarFunctionExpr` to a Vortex expression.
     fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
+        if let Some(array_length_fn) =
+            ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        {
+            return self.try_convert_array_length(array_length_fn);
+        }
+
         if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
         {
             // DataFusion's GetFieldFunc flattens nested field access into a single call
@@ -511,26 +544,84 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr;
 
-    // Expression types that convert() handles
-    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
+    // Expression types that convert() handles. Every wrapper convert() rewrites
+    // must recurse into the children convert() will visit, and must enforce
+    // convert()-specific restrictions (supported binary operators, literal-only
+    // IN lists, UTF-8 get_field names, CASE with ELSE). Accepting a wrapper
+    // whose child convert() cannot rewrite would let
+    // `array_length(CASE WHEN lower(name) LIKE '%x%' THEN a ELSE b END)` pass
+    // the pushdown gate and then fail at scan planning.
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_some_and(|binary| {
+            try_operator_from_df(*binary.op()).is_ok()
+                && is_convertible_expr(binary.left())
+                && is_convertible_expr(binary.right())
+        })
         || expr.downcast_ref::<df_expr::Column>().is_some()
-        || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
-        || expr.downcast_ref::<df_expr::Literal>().is_some()
+        || expr
+            .downcast_ref::<df_expr::LikeExpr>()
+            .is_some_and(|like| {
+                is_convertible_expr(like.expr()) && is_convertible_expr(like.pattern())
+            })
+        || expr
+            .downcast_ref::<df_expr::Literal>()
+            .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
         || expr
             .downcast_ref::<df_expr::CastExpr>()
             .is_some_and(|e| is_convertible_expr(e.expr()))
-        || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
-        || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::IsNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
+        || expr
+            .downcast_ref::<df_expr::IsNotNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
         || expr
             .downcast_ref::<df_expr::NotExpr>()
             .is_some_and(|n| is_convertible_expr(n.arg()))
-        || expr.downcast_ref::<df_expr::InListExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::InListExpr>()
+            .is_some_and(is_convertible_in_list_expr)
         || expr
             .downcast_ref::<df_expr::CaseExpr>()
             .is_some_and(is_convertible_case_expr)
         || expr
             .downcast_ref::<ScalarFunctionExpr>()
-            .is_some_and(|sf| ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some())
+            .is_some_and(|sf| is_convertible_get_field(sf) || is_convertible_array_length(sf))
+}
+
+/// Type-only convertibility check for `InListExpr`, matching `convert()`:
+/// the haystack expression must be convertible, and every list value must be a
+/// literal `Scalar::from_df` accepts. `convert()` rejects non-literal list
+/// values (`Failed to cast sub-expression`), so accepting them here would break
+/// the "accepted for pushdown => convertible" invariant.
+fn is_convertible_in_list_expr(in_list: &df_expr::InListExpr) -> bool {
+    is_convertible_expr(in_list.expr())
+        && in_list.list().iter().all(|value| {
+            value
+                .downcast_ref::<df_expr::Literal>()
+                .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
+        })
+}
+
+/// Type-only convertibility check for `get_field`, matching `convert()`:
+/// the source expression must be convertible, and every field-name argument
+/// must be a UTF-8 string literal.
+fn is_convertible_get_field(scalar_fn: &ScalarFunctionExpr) -> bool {
+    if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_none() {
+        return false;
+    }
+
+    let Some((source, field_names)) = scalar_fn.args().split_first() else {
+        return false;
+    };
+
+    is_convertible_expr(source)
+        && field_names.iter().all(|field_name| {
+            field_name
+                .downcast_ref::<df_expr::Literal>()
+                .and_then(|literal| literal.value().try_as_str().flatten())
+                .is_some()
+        })
 }
 
 /// Type-only convertibility check for a `CASE` expression, mirroring
@@ -645,13 +736,62 @@ fn supported_data_types(dt: &DataType) -> bool {
 }
 
 /// Checks if a scalar function can be pushed down.
-/// Currently only `GetFieldFunc` is supported, and its arguments must also be pushable.
+/// Currently `GetFieldFunc` (when its arguments are pushable) and `ArrayLength` are supported.
 fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
-    ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some()
-        && scalar_fn
+    if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some() {
+        return scalar_fn
             .args()
             .iter()
-            .all(|arg| can_be_pushed_down_impl(arg, schema))
+            .all(|arg| can_be_pushed_down_impl(arg, schema));
+    }
+
+    ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        .is_some_and(|array_length| can_array_length_be_pushed_down(array_length, schema))
+}
+
+fn can_array_length_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
+    let Some(input) = array_length_input(scalar_fn) else {
+        return false;
+    };
+
+    // The argument must resolve to a list type. We gate on the resolved data type rather than
+    // `can_be_pushed_down_impl`, since list columns are intentionally rejected there. We still
+    // require the argument to be a convertible expression (e.g. a column or struct field access).
+    input.data_type(schema).as_ref().is_ok_and(|data_type| {
+        matches!(
+            data_type,
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+        )
+    }) && is_convertible_expr(input)
+}
+
+/// `true` when `convert()` can rewrite this `array_length` call to Vortex `list_length`.
+/// Higher-dimension forms (`array_length(arr, n)` with `n != 1`) must be declined so a
+/// `CAST(array_length(arr, 2) ...)` is not accepted for pushdown and then fail at scan time.
+fn is_convertible_array_length(scalar_fn: &ScalarFunctionExpr) -> bool {
+    ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
+        .and_then(array_length_input)
+        .is_some_and(is_convertible_expr)
+}
+
+/// Returns the list argument of an `array_length` call if the call is a form we can rewrite to
+/// `list_length`: either the single-argument form `array_length(arr)`, or the two-argument form
+/// with an explicit first dimension `array_length(arr, 1)`, which is equivalent. Higher
+/// dimensions recurse into nested lists and are not supported.
+fn array_length_input(scalar_fn: &ScalarFunctionExpr) -> Option<&Arc<dyn PhysicalExpr>> {
+    match scalar_fn.args() {
+        [input] => Some(input),
+        [input, dimension] if is_dimension_one(dimension) => Some(input),
+        _ => None,
+    }
+}
+
+/// Returns true if `expr` is an `Int64` literal equal to 1. `DataFusion` coerces the `array_length`
+/// dimension argument to `Int64`, so that is the only form we need to recognize; any other literal
+/// simply isn't pushed down.
+fn is_dimension_one(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<df_expr::Literal>()
+        .is_some_and(|literal| matches!(literal.value(), ScalarValue::Int64(Some(1))))
 }
 
 // TODO(adam): Replace with `DataType::is_decimal` once its released.
@@ -674,7 +814,9 @@ mod tests {
     use arrow_schema::Schema;
     use arrow_schema::TimeUnit as ArrowTimeUnit;
     use datafusion_common::ScalarValue;
+    use datafusion_common::config::ConfigOptions;
     use datafusion_expr::Operator as DFOperator;
+    use datafusion_expr::ScalarUDF;
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::expressions as df_expr;
     use insta::assert_snapshot;
@@ -704,7 +846,47 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
                 true,
             ),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
         ])
+    }
+
+    fn array_length_expr(
+        args: Vec<Arc<dyn PhysicalExpr>>,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(ScalarUDF::from(ArrayLength::new())),
+                args,
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .expect("array_length expression should be valid"),
+        )
+    }
+
+    fn lower_name_expr(schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                datafusion_functions::string::lower(),
+                vec![name],
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .expect("lower(name) expression should be valid"),
+        )
+    }
+
+    fn like_pattern(expr: Arc<dyn PhysicalExpr>, pattern: &str) -> Arc<dyn PhysicalExpr> {
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            pattern.to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern))
     }
 
     #[test]
@@ -1303,6 +1485,308 @@ mod tests {
             Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
 
         assert!(can_be_pushed_down_impl(&like_expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![expr], &test_schema);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect("array_length should convert to vortex.list.length");
+
+        assert_snapshot!(
+            "expr_from_df_array_length",
+            result.display_tree().to_string()
+        );
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length_dimension_one(test_schema: Schema) {
+        // `array_length(arr, 1)` is the first-dimension length, equivalent to `list_length`.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect("array_length(arr, 1) should convert to vortex.list.length");
+
+        let display = result.display_tree().to_string();
+        assert!(
+            display.contains("vortex.list.length"),
+            "array_length(arr, 1) must emit vortex.list.length: {display}"
+        );
+        assert!(
+            display.contains("vortex.get_item(tags)"),
+            "converted array_length must read the list column: {display}"
+        );
+    }
+
+    #[rstest]
+    fn test_expr_from_df_array_length_higher_dimension_errors(test_schema: Schema) {
+        // Dimensions other than 1 recurse into nested lists, which `list_length` does not model.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        let err = DefaultExpressionConvertor::default()
+            .convert(array_length.as_ref())
+            .expect_err("array_length(arr, 2) must not convert");
+        assert!(
+            err.to_string()
+                .contains("array_length pushdown supports only the one-argument form"),
+            "unexpected convert error: {err}"
+        );
+    }
+
+    #[rstest]
+    fn test_cast_array_length_higher_dimension_not_convertible(test_schema: Schema) {
+        // A CAST over `array_length(arr, 2)` must not be convertible: convert() errors on
+        // that form, so accepting it for pushdown would fail at scan time.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+        let cast = Arc::new(df_expr::CastExpr::new(
+            array_length,
+            DataType::Float64,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            !is_convertible_expr(&cast),
+            "CAST over array_length(arr, 2) must not be convertible"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_supported(test_schema: Schema) {
+        let expr = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![expr], &test_schema);
+
+        assert!(can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_unsupported_operand(test_schema: Schema) {
+        // `array_length` over a non-list column cannot be pushed down.
+        let expr = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        let array_length = Arc::new(ScalarFunctionExpr::new(
+            "array_length",
+            Arc::new(ScalarUDF::from(ArrayLength::new())),
+            vec![expr],
+            Arc::new(Field::new("array_length", DataType::UInt64, true)),
+            Arc::new(ConfigOptions::new()),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(!can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_dimension_one_supported(test_schema: Schema) {
+        // `array_length(arr, 1)` is the first-dimension length, equivalent to `list_length`.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        assert!(can_be_pushed_down_impl(&array_length, &test_schema));
+    }
+
+    fn int32_list_literal(elements: &[i32]) -> Arc<dyn PhysicalExpr> {
+        use datafusion_common::arrow::array::Int32Builder;
+        use datafusion_common::arrow::array::ListBuilder;
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for element in elements {
+            builder.values().append_value(*element);
+        }
+        builder.append(true);
+        Arc::new(df_expr::Literal::new(ScalarValue::List(Arc::new(
+            builder.finish(),
+        ))))
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_list_literals_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN active THEN [1, 2] ELSE [3] END` is list-typed and looks
+        // convertible (literals + ELSE), but `Scalar::from_df` has no `List` arm.
+        // Accepting it for pushdown would fail at scan planning instead of leaving
+        // `array_length` above the scan.
+        let when_then = vec![(
+            Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>,
+            int32_list_literal(&[1, 2]),
+        )];
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, when_then, Some(int32_list_literal(&[3])))
+                .expect("CASE with list literals should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("list literals must not convert to a Vortex scalar");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE of list literals must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_regex_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN CAST(id AS VARCHAR) ~ '^1$' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects RegexMatch, so the pushdown gate must
+        // decline this CASE and leave array_length above the scan.
+        let id = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let cast_id = Arc::new(df_expr::CastExpr::new(id, DataType::Utf8, None));
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "^1$".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let regex_when = Arc::new(df_expr::BinaryExpr::new(
+            cast_id,
+            DFOperator::RegexMatch,
+            pattern,
+        )) as Arc<dyn PhysicalExpr>;
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(regex_when, then_list)], Some(else_list))
+                .expect("CASE with regex WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("RegexMatch WHEN must not convert to a Vortex expression");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE with RegexMatch WHEN must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_unconvertible_like_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN lower(name) LIKE '%x%' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects `lower`, so LikeExpr must recurse
+        // into its children and decline — otherwise the pushdown gate accepts
+        // the CASE and convert() fails at scan planning.
+        let when = like_pattern(lower_name_expr(&test_schema), "%x%");
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let declined_case = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(when, then_list)], Some(else_list))
+                .expect("CASE with lower(name) LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined_case.as_ref())
+            .expect_err("LIKE over lower(name) must not convert to a Vortex expression");
+
+        assert!(
+            !is_convertible_expr(&declined_case),
+            "CASE WHEN lower(name) LIKE '%x%' must not be convertible"
+        );
+
+        let declined = array_length_expr(vec![declined_case], &test_schema);
+        assert!(
+            !is_convertible_expr(&declined),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be convertible"
+        );
+        assert!(
+            !can_be_pushed_down_impl(&declined, &test_schema),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be accepted for pushdown"
+        );
+
+        // The same CASE with only convertible children still pushes down.
+        let convertible_when = like_pattern(
+            Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>,
+            "%x%",
+        );
+        let convertible_then = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let convertible_else =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let convertible_case = Arc::new(
+            df_expr::CaseExpr::try_new(
+                None,
+                vec![(convertible_when, convertible_then)],
+                Some(convertible_else),
+            )
+            .expect("CASE with name LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible_case),
+            "CASE WHEN name LIKE '%x%' with list columns must stay convertible"
+        );
+
+        let pushable = array_length_expr(vec![convertible_case], &test_schema);
+        assert!(
+            is_convertible_expr(&pushable),
+            "array_length over a CASE with convertible LIKE WHEN must stay convertible"
+        );
+        assert!(
+            can_be_pushed_down_impl(&pushable, &test_schema),
+            "array_length over a CASE with convertible LIKE WHEN must still push down"
+        );
+    }
+
+    #[test]
+    fn test_in_list_non_literal_values_not_convertible() {
+        // convert() only rewrites IN-list values that are literals. A column
+        // value must decline convertibility so pushdown falls back to DataFusion.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("other", DataType::Int32, false),
+        ]);
+        let expr = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let non_literal = Arc::new(df_expr::Column::new("other", 1)) as Arc<dyn PhysicalExpr>;
+        let declined = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&expr), vec![non_literal], false, &schema)
+                .expect("IN-list with a column value should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined.as_ref())
+            .expect_err("non-literal IN list values must not convert");
+
+        assert!(
+            !is_convertible_expr(&declined),
+            "IN list with a non-literal value must not be convertible"
+        );
+
+        let literal_values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let convertible = Arc::new(
+            df_expr::InListExpr::try_new(expr, literal_values, false, &schema)
+                .expect("IN-list with literal values should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible),
+            "IN list with only convertible literals must stay convertible"
+        );
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_array_length_higher_dimension_not_supported(test_schema: Schema) {
+        // Dimensions other than 1 recurse into nested lists, which `list_length` does not model,
+        // so they must not be pushed down.
+        let list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let dimension =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let array_length = array_length_expr(vec![list, dimension], &test_schema);
+
+        assert!(!can_be_pushed_down_impl(&array_length, &test_schema));
     }
 
     #[rstest]
