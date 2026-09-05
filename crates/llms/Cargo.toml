@@ -108,6 +108,24 @@ distributed = [
     "mistralrs-core/ring",
     "mistralrs/ring",
 ]
+# Multi-node distributed inference via NCCL's on-device collectives. Unlike `distributed`
+# (the ring backend), the all-reduce stays on the GPU instead of staging every payload
+# through host memory, which is what dominates ring decode latency.
+#
+# MUTUALLY EXCLUSIVE WITH `distributed`: mistral.rs selects the backend at COMPILE time.
+# `get_global_tp_size_from_devices` has both a `cfg(all(cuda, ring))` and a
+# `cfg(all(cuda, nccl))` body, so enabling both yields two tail expressions and fails to
+# build; `prepare_distributed_mapper` likewise short-circuits on `cfg!(feature = "ring")`
+# before it ever reaches the NCCL path. Build one flavour or the other, never both.
+#
+# Requires the NCCL runtime on the host (`libnccl2`), hence `distributed`'s
+# "no system dependency" note does not apply here. Composes with `cuda`.
+nccl = [
+    "local_llm",
+    "cuda",
+    "mistralrs-core/nccl",
+    "mistralrs/nccl",
+]
 local_embed = [
     "dep:tei_backend",
     "dep:tei_backend_core",

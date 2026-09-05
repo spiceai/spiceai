@@ -37,13 +37,13 @@ pub struct HuggingFaceModelParams {
     pub chat_template: Option<String>,
     /// The Huggingface access token.
     pub token: Option<SecretString>,
-    /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
+    /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list using the pure-TCP ring all-reduce, or 'nccl' to use NCCL's on-device collectives; omit or 'none' for single-node. The backend is fixed when the binary is built, so a build accepts only the one it carries.
     #[param(runtime, default = "none")]
     pub distributed_backend: DistributedBackendSetting,
     /// This node's 0-indexed rank in the distributed `nodes` list. Rank 0 is the head and serves the API; other ranks are compute replicas.
     #[param(runtime)]
     pub node_rank: Option<String>,
-    /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. The node count (world size) must be a power of two; the 'ring' backend requires exactly 2.
+    /// Comma-separated, rank-ordered node addresses for distributed inference (e.g. '10.0.0.1,10.0.0.2'). Identical on every node; only `node_rank` differs. Any node count of 2 or more is accepted; whether a given model splits that many ways is the engine's call.
     #[param(runtime)]
     pub nodes: Option<String>,
 }
