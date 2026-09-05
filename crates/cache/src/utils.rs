@@ -290,7 +290,10 @@ pub fn to_cached_record_batch_stream(
                 tracing::debug!(
                     "The result carried transient HTTP error responses (5xx/429), skipping cache storage"
                 );
-            } else if !batches_boundable(&records) {
+            } else if !has_encoder && !batches_boundable(&records) {
+                // Only a raw entry can be pinned by what its batches rested on.
+                // An encoded one keeps the serialized bytes and drops the
+                // arrays, so it holds nothing of the producer's either way.
                 tracing::debug!(
                     "The result holds a column no copy can decouple from the memory its producer owns, so an entry over it could not be bounded by the cache size limit; skipping cache storage"
                 );
