@@ -531,8 +531,14 @@ async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Err
 /// alias or sat in a predicate. `regexp_match` is denied for `DuckDB` now, so
 /// the call evaluates locally and agrees with the control by construction
 /// (regression test for #13809).
+///
+/// The body covers the whole regexp deny-list decision, not `regexp_match`
+/// alone: `regexp_instr` and `regexp_count` are denied here too and are checked
+/// the same way, while `regexp_like` and `regexp_replace` are the controls that
+/// must *still* be pushed down -- `regexp_like` in particular is what keeps the
+/// negative assertions from being vacuous.
 #[tokio::test]
-async fn duckdb_accelerated_regexp_match_agrees_with_local() -> Result<(), anyhow::Error> {
+async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
