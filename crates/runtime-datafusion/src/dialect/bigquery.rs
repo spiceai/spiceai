@@ -309,7 +309,7 @@ pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunctio
 /// built-in with no handler here is either denied by name (`regexp_match`) or
 /// unparses through the inner dialect.
 #[must_use]
-pub fn can_translate(call: &ScalarFunction) -> bool {
+pub fn can_translate(call: &ScalarFunction, _scope: Option<&datafusion::common::DFSchema>) -> bool {
     let name = call.func.name();
     SCALAR_OVERRIDES
         .iter()
@@ -1523,30 +1523,37 @@ mod tests {
     }
 
     /// `array_element` renders only a non-negative index, so the gate has to
+    /// [`can_translate`] with no schema, which is what every case here needs:
+    /// these assert *shape*, and the scope only matters for a rendering whose
+    /// correctness depends on an operand's declared type.
+    fn translates(call: &ScalarFunction) -> bool {
+        can_translate(call, None)
+    }
+
     /// refuse the rest — otherwise the call is pushed down and the rendering
     /// then fails the whole query instead of evaluating locally.
     #[test]
     fn array_element_federates_only_for_a_non_negative_integer_index() {
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             "array_element",
             vec![col("arr"), lit(1i64)]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             "array_element",
             vec![col("arr"), lit(0i64)]
         )));
         // Counts from the end, which BigQuery cannot express.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), lit(-1i64)]
         )));
         // Sign unknown until it runs.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), col("i")]
         )));
         // Not an ordinal BigQuery would take.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), lit("1")]
         )));
@@ -1558,33 +1565,33 @@ mod tests {
 
     #[test]
     fn can_translate_answers_for_the_json_functions_and_defers_on_the_rest() {
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_INT_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_INT_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_STR_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_STR_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_BOOL_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_BOOL_NAME,
             vec![col("doc"), col("key")]
         )));
         for name in ["json_contains", "upper"] {
             assert!(
-                can_translate(&call(name, vec![col("doc"), col("key")])),
+                translates(&call(name, vec![col("doc"), col("key")])),
                 "{name} has no handler in this dialect, so it is not this check's business — \
                  the deny-list has not carved it out and it cannot federate at all"
             );
@@ -1776,7 +1783,7 @@ mod tests {
             ),
         ] {
             assert!(
-                can_translate(&call(REGEXP_LIKE_NAME, args)),
+                translates(&call(REGEXP_LIKE_NAME, args)),
                 "{accepted} must translate"
             );
         }
@@ -1867,7 +1874,7 @@ mod tests {
             ),
         ] {
             assert!(
-                !can_translate(&call(REGEXP_LIKE_NAME, args)),
+                !translates(&call(REGEXP_LIKE_NAME, args)),
                 "{rejected} must stay local"
             );
         }
@@ -2485,6 +2492,53 @@ mod tests {
             wrapper.contains("WITH RECURSIVE"),
             "a recursive CTE has to keep its RECURSIVE keyword: {wrapper}"
         );
+
+        // Where it sits matters as much as that it is there. `BigQuery` accepts
+        // `WITH RECURSIVE` only at the top of a statement, and a generator is
+        // rarely at the top of a *plan* — joined to a table it is a join input,
+        // which unparses as a derived table. Six corpus statements failed with
+        // "WITH RECURSIVE is only allowed at the top level of the SELECT" once
+        // the CTE started federating, so this pins the position for the shape
+        // that broke: the join nested inside a derived table.
+        let nested = {
+            // Its own column name, so the join condition is unambiguous against
+            // the generator's `n`.
+            let outer_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new("m", DataType::Int64, true),
+            ]));
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                "outer",
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    outer_schema,
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the outer table")
+            .join_on(
+                plan.clone(),
+                datafusion::logical_expr::JoinType::Inner,
+                [col("outer.m").eq(col("n"))],
+            )
+            .expect("join the generator")
+            .project(vec![col("outer.m")])
+            .expect("project")
+            .alias("inner_q")
+            .expect("alias")
+            .project(vec![col("inner_q.m")])
+            .expect("project")
+            .build()
+            .expect("build")
+        };
+        let nested_sql = unparse_plan(new_bigquery_dialect().as_ref(), &nested);
+        assert!(
+            nested_sql.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement, not sit inside a derived \
+             table: {nested_sql}"
+        );
+        assert!(
+            !nested_sql.contains("FROM (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {nested_sql}"
+        );
         assert!(
             wrapper.contains("UNION ALL"),
             "a non-distinct recursive query joins its terms with UNION ALL: {wrapper}"
@@ -2895,6 +2949,30 @@ mod tests {
                 .expect("descending filtered sum"),
         );
 
+        // The `date_part` fields BigQuery names differently. Without the
+        // rendering these reach it as the DataFusion name and it answers
+        // `Function not found: date_part`.
+        let day_of_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("dow"),
+                col("d.d"),
+            )])
+            .expect("day of week projection")
+            .build()
+            .expect("build");
+
+        // The trap: BigQuery's bare `WEEK` is Sunday-based and answered 13 where
+        // DataFusion answered 14, so the obvious mapping is a wrong number with
+        // no error.
+        let iso_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("week"),
+                col("d.d"),
+            )])
+            .expect("iso week projection")
+            .build()
+            .expect("build");
+
         // Text narrowed to a date. BigQuery's DATE cast takes only a bare
         // `YYYY-MM-DD`, so an ISO instant held as text has to be parsed to an
         // instant first and then narrowed.
@@ -3278,6 +3356,20 @@ mod tests {
                 &descending_filtered_sum,
                 "CASE WHEN",
                 "FILTER",
+            ),
+            (
+                "a day-of-week extraction is spelled DAYOFWEEK (fork PR #219)",
+                &day_of_week,
+                "EXTRACT(DAYOFWEEK FROM",
+                "date_part",
+            ),
+            (
+                // Measured: BigQuery's bare WEEK disagrees with DataFusion's ISO
+                // weeks by one at a year boundary, silently.
+                "a week extraction is spelled ISOWEEK, not WEEK (fork PR #219)",
+                &iso_week,
+                "EXTRACT(ISOWEEK FROM",
+                "EXTRACT(WEEK FROM",
             ),
             (
                 // The plain cast is refused for every form carrying a time or a
