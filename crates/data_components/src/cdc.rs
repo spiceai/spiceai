@@ -100,9 +100,22 @@ pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>
 /// An acceleration that holds no rows escapes the assumption outright, and it is
 /// the one case that can be settled by observation rather than inference: no row
 /// is present, so no row can be stale and no deletion can be missing. Only
-/// [`Self::Empty`] carries that proof. [`Self::Unknown`] is deliberately not a
-/// third answer callers may reason about — it means the question was not
-/// answered, and must be treated exactly like [`Self::NonEmpty`].
+/// [`Self::Empty`] carries that proof.
+///
+/// [`Self::Unknown`] means the question was not answered, so it is never proof of
+/// anything and never licenses skipping work. It is deliberately *not* a synonym
+/// for any other variant: which observed state it has to behave like depends on
+/// which way the caller reads emptiness, and the two readings disagree. Where
+/// emptiness licenses skipping a rebuild, an unanswered probe has to behave like
+/// [`Self::NonEmpty`] and keep it; where emptiness is instead *evidence of a gap*
+/// — a recorded position asserting rows are applied that are not there — it has
+/// to behave like [`Self::Empty`] and cause one. Both readings resolve the same
+/// way, toward the rebuild; only the variant they coincide with differs.
+///
+/// So callers match on the variant rather than collapsing it to a bool: see
+/// [`Self::is_provably_empty`] for the licensing direction, and
+/// `postgres_replication::rebuild_cause` for the gap direction, which
+/// distinguishes the two states in the cause it reports rather than merging them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AccelerationContents {
     /// Observed to hold no rows, so there is nothing that could be stale.
@@ -117,10 +130,19 @@ pub enum AccelerationContents {
 impl AccelerationContents {
     /// Whether the acceleration is *proven* to hold no rows.
     ///
-    /// The only safe direction to read this type in: everything that is not a
-    /// positive proof of emptiness — including [`Self::Unknown`] — answers
-    /// `false`, so a failed probe degrades to the conservative behavior instead
-    /// of silently skipping work that protects correctness.
+    /// The safe direction for a caller that reads emptiness as licence to skip
+    /// work: everything that is not a positive proof of emptiness — including
+    /// [`Self::Unknown`] — answers `false`, so a failed probe degrades to the
+    /// conservative behavior instead of silently skipping work that protects
+    /// correctness.
+    ///
+    /// Deliberately not offered as a pair with an inverted `may_be_empty`. A
+    /// caller reading emptiness as *evidence of a gap* needs the opposite answer
+    /// for [`Self::Unknown`], and a second bool accessor makes the two directions
+    /// look interchangeable at the call site — swapping one for the other still
+    /// compiles and still passes a test suite that checks each in isolation,
+    /// while silently restoring the unsafe resume. That caller matches on the
+    /// variant instead, so the compiler holds it to all three states.
     #[must_use]
     pub fn is_provably_empty(self) -> bool {
         matches!(self, Self::Empty)
