@@ -98,7 +98,7 @@ pub async fn register_metrics_table(
 ) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
-    let retention = Retention::builder()
+    let retention = Retention::builder(metrics_table_reference.to_string())
         .time_column(Some("time_unix_nano"))
         .time_format(Some(TimeFormat::Timestamptz))
         .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes

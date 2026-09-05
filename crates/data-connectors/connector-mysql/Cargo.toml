@@ -42,7 +42,7 @@ runtime-api-types = { path = "../../runtime-api-types" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }
-runtime-udfs-api = { path = "../../runtime-udfs-api" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
