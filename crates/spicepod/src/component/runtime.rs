@@ -1172,6 +1172,48 @@ pub struct Query {
     /// Unset = no timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+
+    /// Whether the Cayenne query path should materialize a non-recursive CTE
+    /// once and reuse the result at every reference.
+    ///
+    /// DataFusion inlines `WITH` bodies, so a CTE used twice is planned and
+    /// executed twice. `auto` finds those multi-reference CTEs whose body is
+    /// expensive (aggregation, join, window, distinct, sort, unnest, or union)
+    /// and that scan a Cayenne-accelerated table, computes the body once into
+    /// a memory-accounted buffer, and shares it. Simple pass-through CTEs are
+    /// left inlined so projection pushdown can still prune columns.
+    ///
+    /// Default `disabled` preserves the inlining behavior. No-op on queries
+    /// that do not scan Cayenne.
+    ///
+    /// ```yaml
+    /// runtime:
+    ///   query:
+    ///     cte_materialization: auto   # disabled (default) | auto
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub cte_materialization: CteMaterialization,
+}
+
+/// How the Cayenne query path treats multi-reference `WITH` clauses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CteMaterialization {
+    /// Inline every CTE at each reference (DataFusion's default).
+    #[default]
+    Disabled,
+    /// Materialize a CTE once when it is referenced more than once, its body is
+    /// expensive, and it scans a Cayenne-accelerated table.
+    Auto,
+}
+
+impl CteMaterialization {
+    /// Returns `true` when CTE materialization should run on the Cayenne path.
+    #[must_use]
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 impl Query {
@@ -1665,16 +1707,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("100MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1687,16 +1721,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1710,16 +1736,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
-                temp_directory: None,
                 memory_limit: Some("200MiB".to_string()),
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1740,16 +1758,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/foo".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1762,16 +1772,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1785,16 +1787,8 @@ mod tests {
         assert_eq!(
             runtime.query,
             Some(Query {
-                spill_compression: None,
                 temp_directory: Some("/bar".to_string()),
-                memory_limit: None,
-                target_partitions: None,
-                max_concurrent_queries: None,
-                prefer_hash_join: None,
-                eager_aggregation: None,
-                eager_aggregation_min_reduction_factor: None,
-                eager_aggregation_max_pushed_groups: None,
-                timeout: None,
+                ..Query::default()
             })
         );
 
@@ -1895,6 +1889,40 @@ mod tests {
             .expect_err("garbage timeout should be an error");
         assert!(
             err.to_string().contains("runtime.query.timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_query_cte_materialization_parses() {
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(empty.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: auto
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        let query = runtime.query.expect("query section should be present");
+        assert_eq!(query.cte_materialization, CteMaterialization::Auto);
+        assert!(query.cte_materialization.is_auto());
+
+        let yaml = r"
+            query:
+                cte_materialization: disabled
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("parses");
+        // `disabled` is the default, so a query section that only sets it is
+        // dropped on deserialize (same as an omitted `query:`).
+        assert_eq!(runtime.query, None);
+
+        let yaml = r"
+            query:
+                cte_materialization: always
+        ";
+        let err = yaml::from_str::<Runtime>(yaml).expect_err("unknown variant");
+        assert!(
+            err.to_string().contains("cte_materialization") || err.to_string().contains("always"),
             "unexpected error: {err}"
         );
     }

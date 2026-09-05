@@ -38,7 +38,7 @@ use cayenne::optimizer_rules::{
 };
 #[cfg(not(windows))]
 use cayenne::{
-    CayenneTableProvider,
+    CayenneCteMaterialization, CayenneCteMaterializationPlanner, CayenneTableProvider,
     logical_optimizer::{
         CayenneInListToRangeRewrite, CayennePropagateFilterAcrossEquiJoinKeys,
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
@@ -103,7 +103,7 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::SpillCompression as SpiceSpillCompression;
+use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -338,6 +338,7 @@ pub struct DataFusionBuilder {
     eager_aggregation: Option<bool>,
     eager_aggregation_min_reduction_factor: Option<usize>,
     eager_aggregation_max_pushed_groups: Option<usize>,
+    cte_materialization: CteMaterialization,
     temp_directory: Option<String>,
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
@@ -427,6 +428,7 @@ impl DataFusionBuilder {
             eager_aggregation: None,
             eager_aggregation_min_reduction_factor: None,
             eager_aggregation_max_pushed_groups: None,
+            cte_materialization: CteMaterialization::Disabled,
             temp_directory: None,
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
@@ -505,6 +507,16 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn eager_aggregation_max_pushed_groups(mut self, cap: Option<usize>) -> Self {
         self.eager_aggregation_max_pushed_groups = cap;
+        self
+    }
+
+    /// Materialize multi-reference CTEs on the Cayenne query path.
+    ///
+    /// `CteMaterialization::Disabled` (the default) keeps DataFusion's inlining
+    /// behavior. `Auto` registers the Cayenne CTE materialization optimizer.
+    #[must_use]
+    pub fn cte_materialization(mut self, cte_materialization: CteMaterialization) -> Self {
+        self.cte_materialization = cte_materialization;
         self
     }
 
@@ -994,7 +1006,15 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}));
 
-        state = with_spice_logical_optimizers(state, self.cayenne_optimizer_rules);
+        if self.cte_materialization.is_auto() {
+            tracing::info!("Applied runtime.query.cte_materialization=auto");
+        }
+
+        state = with_spice_logical_optimizers(
+            state,
+            self.cayenne_optimizer_rules,
+            self.cte_materialization,
+        );
 
         #[cfg(not(windows))]
         {
@@ -1307,6 +1327,7 @@ impl DataFusionBuilder {
 fn with_spice_logical_optimizers(
     mut state: SessionStateBuilder,
     cayenne_optimizer_rules: CayenneOptimizerRules,
+    cte_materialization: CteMaterialization,
 ) -> SessionStateBuilder {
     let trailing_rules = state.optimizer_rules().take().unwrap_or_default();
     let mut optimizer_rules = state
@@ -1317,6 +1338,9 @@ fn with_spice_logical_optimizers(
     insert_regexp_match_null_check_rewrite(&mut optimizer_rules);
     #[cfg(not(windows))]
     {
+        if cte_materialization.is_auto() {
+            insert_cayenne_cte_materialization(&mut optimizer_rules);
+        }
         if cayenne_optimizer_rules.filter_propagation() {
             insert_cayenne_filter_propagation_rule(&mut optimizer_rules);
         }
@@ -1334,9 +1358,31 @@ fn with_spice_logical_optimizers(
         }
     }
     #[cfg(windows)]
-    let _ = cayenne_optimizer_rules;
+    {
+        let _ = cayenne_optimizer_rules;
+        let _ = cte_materialization;
+    }
     optimizer_rules.extend(trailing_rules);
     state.with_optimizer_rules(optimizer_rules)
+}
+
+#[cfg(not(windows))]
+fn insert_cayenne_cte_materialization(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
+    // Run first so the two inlined CTE copies are still identical, before
+    // projection/filter pushdown specializes each reference.
+    if !rules
+        .iter()
+        .any(|rule| rule.name() == "cayenne_cte_materialization")
+    {
+        rules.insert(
+            0,
+            Arc::new(
+                CayenneCteMaterialization::new_with_table_provider_predicate(
+                    is_cayenne_accelerated_table_provider,
+                ),
+            ),
+        );
+    }
 }
 
 fn insert_regexp_match_null_check_rewrite(rules: &mut Vec<Arc<dyn OptimizerRule + Send + Sync>>) {
@@ -1967,6 +2013,8 @@ pub(crate) fn default_extension_planners(
         Arc::new(datafusion_dml::DmlExtensionPlanner),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
+        #[cfg(not(windows))]
+        Arc::new(CayenneCteMaterializationPlanner),
     ];
     planners
 }

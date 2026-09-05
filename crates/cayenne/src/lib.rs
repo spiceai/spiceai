@@ -65,6 +65,7 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub(crate) mod bounded_fifo;
+pub mod cte_materialization;
 pub mod logical_optimizer;
 pub mod maintained_aggregate;
 pub mod metadata;
@@ -93,6 +94,10 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
+pub use cte_materialization::{
+    CTE_SCAN_NODE_NAME, CayenneCteMaterialization, CayenneCteMaterializationPlanner,
+    MATERIALIZED_CTE_NODE_NAME,
+};
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
