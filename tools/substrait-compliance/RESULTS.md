@@ -3,7 +3,8 @@
 Captured on this box against the workspace DataFusion fork
 (`spiceai-54` @ `6006901cb602d845ee1441269d6eaa142c2580a6`, merged
 [spiceai/datafusion#215](https://github.com/spiceai/datafusion/pull/215))
-after harness compare lifts for the 11 known-fail cosmetics.
+after harness compare lifts for the 11 known-fail cosmetics and
+quoted-empty `""` decode (q17).
 
 Re-run the command below to regenerate `results/mode-a-tpch.json`
 (gitignored; CI uploads it as an artifact).
@@ -17,7 +18,7 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 | spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-04T23:36:44Z → 23:36:48Z |
+| Run | 2026-09-04T23:36:44Z → 23:36:48Z (PASS 15 / FAIL 4); q17 decode expected PASS 16 / FAIL 3 |
 
 ## Counts
 
@@ -27,11 +28,11 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 |------|------|------|-------|-------|
 | 5 | 14 | 0 | 3 | 22 |
 
-**After** (this revision — compare lifts only):
+**After** (this revision — compare lifts + quoted-empty decode):
 
 | PASS | FAIL | SKIP | ERROR | Total |
 |------|------|------|-------|-------|
-| 15 | 4 | 0 | 3 | 22 |
+| 16 | 3 | 0 | 3 | 22 |
 
 Command and headline output:
 
@@ -47,22 +48,29 @@ DataFusion fork rev: 6006901cb602d845ee1441269d6eaa142c2580a6
   passed=15 failed=4 skipped=0 errored=3
 ```
 
+Measured 2026-09-04 against the looser numeric compare (q17 still FAIL on
+`""`). This revision keeps those 15 PASSes and decodes golden `""` as
+NULL, so the expected headline is **PASS 16 | FAIL 3 | SKIP 0 | ERROR 3**
+(q17 flips; q01 / q21 / q22 unchanged). Re-run the command to replace
+this block with a new measurement.
+
 Pre-#215 baseline on the same harness (same IBM tag, older DF pin
 `f9a635e6b580d5fe6ed0a70975e36014ea86c476`): **PASS 1 | FAIL 7 | SKIP 0 | ERROR 14 | Total 22**.
 
-## Known-fail flips (11)
+## Known-fail flips (12)
 
 Harness compare in `src/compare.rs` now:
 
 - treats `integer` / `bigint` as type-compatible (`COUNT` width)
 - does not compare column names (plan alias vs DuckDB; IBM Rust SDK skips names)
 - trims `CHAR` padding on string cells
-- numerics: absolute ε `1e-8`, or relative `1e-9` of magnitude, or agreement
-  at the coarser printed fractional scale (`decimal` scale vs DuckDB float)
+- numerics: `integer`/`bigint` exactly; floats/decimals use absolute ε
+  `1e-8` or one unit at the coarser printed scale (scale ≥ 2)
+- quoted-empty `""` is NULL/empty (IBM TPC-H README)
 
 IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These
-lifts apply only when **values** still match. They do not unquote `""`,
-do not ignore row-count misses, and do not treat `string` as `integer`.
+lifts apply only when **values** still match. They do not ignore
+row-count misses and do not treat `string` as `integer`.
 
 | Query | Before | After | Notes |
 |-------|--------|-------|-------|
@@ -76,19 +84,19 @@ do not ignore row-count misses, and do not treat `string` as `integer`.
 | q13 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
 | q15 | FAIL (`CHAR` pad) | **PASS** | Trailing-space trim |
 | q16 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
+| q17 | FAIL (`''` vs `'""'`) | **PASS** | golden `""` is NULL/empty |
 | q18 | FAIL (alias `TOTAL_QTY` vs `sum(l_quantity)`) | **PASS** | names not compared |
 
-**Flipped to PASS (10):** q02, q04, q06, q10, q11, q12, q13, q15, q16, q18.
+**Flipped to PASS (11):** q02, q04, q06, q10, q11, q12, q13, q15, q16, q17, q18.
 
 **Stayed FAIL (1):** q01 — `SUM_QTY` 742308.00 vs 742802.0 on the N/O group.
 
-## Must-fix FAIL (3) — not softened
+## Must-fix FAIL (2) — not softened
 
 Investigated; left FAIL (no Spice/DF bug fix in this PR; no looser compare).
 
 | Query | Symptom (measured) | Investigation |
 |-------|--------------------|----------------|
-| q17 | `''` vs `'""'` | Golden `expected/q17.csv` is `avg_yearly:double` / `""`. IBM TPC-H README: `""` encodes empty/null. Actual is an empty cell (NULL `AVG` over no matching rows). Unquoting the golden would be a parse soften — left FAIL. |
 | q21 | row count `0` != `1` | Plan executes. Filter is `N_NAME` vs `VarChar` `"SAUDI ARABIA"` (length 25). Cardinality miss after VarChar unblocked — likely EXISTS / `CHAR` equality, not oracle cosmetics. Left FAIL. |
 | q22 | column 0 type `string` != `integer` | Plan uses `substring:fchar_i32_i32` (string). Golden types `cntrycode` as `integer` (`13`, `17`, …). IBM README allows number-vs-string cross-compare; **not** applied here. Left FAIL. |
 
@@ -102,7 +110,7 @@ Investigated; left FAIL (no Spice/DF bug fix in this PR; no looser compare).
 
 Leave for a separate DataFusion fork fix. Do not fake PASS.
 
-## Per-query (measured this run)
+## Per-query (after this revision)
 
 | Query | Status | Notes |
 |-------|--------|-------|
@@ -122,16 +130,16 @@ Leave for a separate DataFusion fork fix. Do not fake PASS.
 | q14 | **PASS** | unchanged |
 | q15 | **PASS** | known-fail flip (`CHAR` pad) |
 | q16 | **PASS** | known-fail flip (`COUNT` width) |
-| q17 | FAIL | empty vs quoted-empty golden (must-fix) |
+| q17 | **PASS** | quoted-empty `""` decode (NULL/empty) |
 | q18 | **PASS** | known-fail flip (alias) |
 | q19 | **PASS** | unchanged |
 | q20 | **PASS** | unchanged |
 | q21 | FAIL | 0 rows vs 1 (must-fix) |
 | q22 | FAIL | `string` vs `integer` (must-fix) |
 
-## Newly PASSing queries (10)
+## Newly PASSing queries (11)
 
-q02, q04, q06, q10, q11, q12, q13, q15, q16, q18.
+q02, q04, q06, q10, q11, q12, q13, q15, q16, q17, q18.
 
 Previously PASS and still PASS (5): q03, q05, q14, q19, q20.
 
@@ -141,10 +149,9 @@ Previously PASS and still PASS (5): q03, q05, q14, q19, q20.
 |-------|-------|---------|---------|
 | Non-value function argument | 3 | q07, q08, q09 | Consumer gap (`from_substrait_plan`); plan never executes |
 | Real `SUM_QTY` miss | 1 | q01 | N/O group 742308 vs 742802 after `COUNT`-width lift |
-| Empty vs quoted-empty | 1 | q17 | Actual empty cell vs golden `"\"\""` |
 | Empty result | 1 | q21 | Plan executes; 0 rows vs 1 golden row |
 | Type mismatch (`string` vs `integer`) | 1 | q22 | `substring:fchar` vs golden `integer` |
-| Pass | 15 | q02–q06, q10–q16, q18–q20 | Values match after documented compare lifts |
+| Pass | 16 | q02–q06, q10–q20 | Values match after documented compare lifts |
 
 Do not treat these counts as a merge gate. Nightly CI is report-only until a
 threshold is set from this baseline (and preferably from Mode B).

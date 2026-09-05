@@ -26,21 +26,21 @@ limitations under the License.
 //! - Column names are not compared (plan alias `TOTAL_VALUE` vs `DuckDB`
 //!   `value`; Isthmus `L_RETURNFLAG` vs golden `l_returnflag`).
 //! - String cells are compared after trimming `CHAR` pad / loader whitespace.
-//! - Numerics: absolute ε = `1e-8`, or relative `1e-9` of magnitude, or
-//!   agreement at the coarser printed fractional scale (`decimal` scale
-//!   6 vs `DuckDB` float). IBM README is absolute `1e-9` only. Off-by-one
-//!   `COUNT` still fails.
+//! - Quoted-empty `""` in a golden cell is NULL/empty (IBM TPC-H README).
+//! - Numerics: `integer`/`bigint` cells compare exactly. Floats/decimals
+//!   match when `|Δ| < 1e-8`, or when `|Δ|` is under one unit in the last
+//!   place of the coarser printed fractional scale (scale ≥ 2; q01 `AVG`
+//!   scale 6, q06). IBM README is absolute `1e-9` only.
 //!
-//! Not lifted: empty vs quoted-empty (`""`), row-count misses, `string` vs
-//! `integer` (q17 / q21 / q22).
+//! Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 
 /// Absolute numeric floor. IBM documents `1e-9`; `1e-8` covers q06's
 /// `DuckDB`-vs-`DataFusion` rounding (Δ ≈ 1.16e-9).
 const NUMERIC_ABS_EPSILON: f64 = 1e-8;
 
-/// Relative tolerance for large `DECIMAL` sums (q01 `sum_base_price`
-/// Δ ≈ 1.2e-6 on ~5.3e8). An off-by-one `COUNT` still misses.
-const NUMERIC_REL_EPSILON: f64 = 1e-9;
+/// Minimum printed fractional length treated as a decimal scale. A single
+/// digit (`.0`, `.1`) is float formatting, not `decimal(p, 1)`.
+const MIN_DECIMAL_SCALE: i32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnSpec {
@@ -133,7 +133,8 @@ pub fn compare(actual: &TableData, expected: &TableData) -> Option<CompareMismat
     }
     for (row_idx, (a_row, e_row)) in actual.rows.iter().zip(expected.rows.iter()).enumerate() {
         for (col_idx, (a_val, e_val)) in a_row.iter().zip(e_row.iter()).enumerate() {
-            if !values_match(a_val, e_val) {
+            let type_token = expected.columns.get(col_idx).map(|c| c.type_token.as_str());
+            if !cells_match(a_val, e_val, type_token) {
                 return Some(CompareMismatch::Value {
                     row: row_idx,
                     column: col_idx,
@@ -172,7 +173,26 @@ pub fn types_compatible(actual: &str, expected: &str) -> bool {
 
 #[must_use]
 pub fn values_match(actual: &str, expected: &str) -> bool {
+    cells_match(actual, expected, None)
+}
+
+fn cells_match(actual: &str, expected: &str, type_token: Option<&str>) -> bool {
     if actual == expected {
+        return true;
+    }
+    if is_null_cell(actual) && is_null_cell(expected) {
+        return true;
+    }
+
+    let kind = type_token.map(normalize_type);
+    if matches!(kind, Some("integer") | Some("bigint")) {
+        return integers_equal(actual, expected);
+    }
+    if kind == Some("string") {
+        return actual.trim() == expected.trim();
+    }
+
+    if integers_equal(actual, expected) {
         return true;
     }
     if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
@@ -188,8 +208,31 @@ pub fn values_match(actual: &str, expected: &str) -> bool {
         return a_lower == e_lower;
     }
     // Isthmus `CHAR` / fixed-char padding vs trimmed `DuckDB` goldens (q02, q10, q15).
-    // Quoted-empty `""` is not unquoted to empty — q17 stays a Value miss.
     actual.trim() == expected.trim()
+}
+
+fn is_null_cell(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == "\"\""
+}
+
+fn parse_integer(value: &str) -> Option<i128> {
+    let value = value.trim();
+    if let Ok(n) = value.parse::<i128>() {
+        return Some(n);
+    }
+    let (whole, frac) = value.split_once('.')?;
+    if frac.is_empty() || !frac.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    whole.parse().ok()
+}
+
+fn integers_equal(actual: &str, expected: &str) -> bool {
+    match (parse_integer(actual), parse_integer(expected)) {
+        (Some(a), Some(e)) => a == e,
+        _ => false,
+    }
 }
 
 fn numerics_close(actual: f64, expected: f64, actual_s: &str, expected_s: &str) -> bool {
@@ -197,17 +240,14 @@ fn numerics_close(actual: f64, expected: f64, actual_s: &str, expected_s: &str) 
     if abs_diff < NUMERIC_ABS_EPSILON {
         return true;
     }
-    let magnitude = actual.abs().max(expected.abs());
-    if abs_diff < NUMERIC_REL_EPSILON * magnitude {
-        return true;
-    }
-    same_at_printed_scale(actual, expected, actual_s, expected_s)
+    same_at_decimal_scale(abs_diff, actual_s, expected_s)
 }
 
 /// `DataFusion` prints `decimal` at its scale (q01 `AVG_*` is 6 places);
-/// `DuckDB` goldens are float64. Agree if truncation *or* rounding at the
-/// coarser printed scale matches. Integers (no fraction) are not scaled.
-fn same_at_printed_scale(actual: f64, expected: f64, actual_s: &str, expected_s: &str) -> bool {
+/// `DuckDB` goldens are float64. Accept when `|Δ|` is under one unit in the
+/// last place of the coarser printed scale. Scale `< 2` is ignored so
+/// `.0` float formatting cannot hide a 0.09-level error.
+fn same_at_decimal_scale(abs_diff: f64, actual_s: &str, expected_s: &str) -> bool {
     let Some(actual_places) = frac_digits(actual_s) else {
         return false;
     };
@@ -215,16 +255,11 @@ fn same_at_printed_scale(actual: f64, expected: f64, actual_s: &str, expected_s:
         return false;
     };
     let places = actual_places.min(expected_places);
-    if places <= 0 {
+    if places < MIN_DECIMAL_SCALE {
         return false;
     }
-    let factor = 10f64.powi(places);
-    let a_scaled = actual * factor;
-    let e_scaled = expected * factor;
-    // Scaled values are integer-valued; `< 0.5` is equality without `==` on `f64`.
-    let trunc_match = (a_scaled.trunc() - e_scaled.trunc()).abs() < 0.5;
-    let round_match = (a_scaled.round() - e_scaled.round()).abs() < 0.5;
-    trunc_match || round_match
+    let unit = 10f64.powi(-places);
+    abs_diff < unit
 }
 
 fn frac_digits(value: &str) -> Option<i32> {
@@ -278,12 +313,7 @@ pub fn parse_typed_csv(text: &str) -> TableData {
     let rows = data_lines
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.split('|')
-                .map(str::trim)
-                .map(ToString::to_string)
-                .collect()
-        })
+        .map(parse_pipe_row)
         .collect();
     TableData { columns, rows }
 }
@@ -293,12 +323,7 @@ fn parse_untyped(text: &str) -> TableData {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| {
-            line.split('|')
-                .map(str::trim)
-                .map(ToString::to_string)
-                .collect()
-        })
+        .map(parse_pipe_row)
         .collect();
     let ncols = rows.first().map_or(0, Vec::len);
     let columns = (1..=ncols)
@@ -308,6 +333,24 @@ fn parse_untyped(text: &str) -> TableData {
         })
         .collect();
     TableData { columns, rows }
+}
+
+fn parse_pipe_row(line: &str) -> Vec<String> {
+    line.split('|').map(decode_csv_cell).collect()
+}
+
+/// Pipe-delimited IBM goldens quote a field when it is empty/NULL (`""`)
+/// or contains the delimiter. Unwrap one layer of RFC-4180 quotes.
+fn decode_csv_cell(raw: &str) -> String {
+    unquote_pipe_cell(raw.trim())
+}
+
+fn unquote_pipe_cell(cell: &str) -> String {
+    if cell.len() >= 2 && cell.starts_with('"') && cell.ends_with('"') {
+        cell[1..cell.len() - 1].replace("\"\"", "\"")
+    } else {
+        cell.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -414,7 +457,7 @@ mod tests {
     fn char_padding_is_trimmed_for_string_cells() {
         assert!(values_match(" foxes boost", "foxes boost"));
         assert!(values_match("TZoQwNFFO ", "TZoQwNFFO"));
-        assert!(!values_match("", "\"\""));
+        assert!(values_match("", "\"\""));
         assert!(!values_match("alpha", "beta"));
     }
 
@@ -426,15 +469,15 @@ mod tests {
     }
 
     #[test]
-    fn numeric_relative_epsilon_covers_q01_decimal_sum() {
+    fn decimal_scale_covers_q01_sum_without_relative_epsilon() {
+        // `|Δ| ≈ 1.2e-6` at printed scale 2 is under one cent (`0.01`).
         assert!(values_match("532348211.65", "532348211.6499988"));
         assert!(!values_match("14876", "14877"));
     }
 
     #[test]
     fn printed_scale_covers_q01_avg_decimal_vs_float() {
-        // decimal scale 6 vs DuckDB float64. Truncation or rounding at
-        // the coarser printed scale; not a global ε widen.
+        // decimal scale 6 vs DuckDB float64: `|Δ|` under `1e-6`.
         assert!(values_match("25.575154", "25.575154611454693"));
         assert!(values_match("0.050081", "0.05008133906964134"));
         assert!(!values_match("25.575154", "26.575154611454693"));
@@ -442,7 +485,54 @@ mod tests {
     }
 
     #[test]
-    fn quoted_empty_does_not_match_empty_cell() {
+    fn printed_scale_does_not_accept_tenth_errors() {
+        // Truncation at printed scale 1 accepted `1.09` vs `1.0`.
+        assert!(!values_match("1.09", "1.0"));
+        assert!(!values_match("1.0", "1.09"));
+    }
+
+    #[test]
+    fn decimal_scale_does_not_accept_half_unit_money_error() {
+        // Relative `1e-9` of ~`5.3e8` is ~`0.53` and accepted Δ ≈ `0.50`.
+        assert!(!values_match("532348211.15", "532348211.6499988"));
+        assert!(!values_match("532348211.6499988", "532348211.15"));
+    }
+
+    #[test]
+    fn integer_counts_compare_exactly() {
+        // Relative ε accepted `COUNT` `1000000001` vs `1000000000`.
+        assert!(!values_match("1000000001", "1000000000"));
+        assert!(!values_match("1000000000", "1000000001"));
+
+        let actual = TableData {
+            columns: vec![ColumnSpec {
+                name: "count_order".to_string(),
+                type_token: "bigint".to_string(),
+            }],
+            rows: vec![vec!["1000000001".to_string()]],
+        };
+        let expected = TableData {
+            columns: vec![ColumnSpec {
+                name: "count_order".to_string(),
+                type_token: "integer".to_string(),
+            }],
+            rows: vec![vec!["1000000000".to_string()]],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn quoted_empty_matches_empty_null_cell() {
+        let parsed = parse_typed_csv("avg_yearly:double\n\"\"\n");
+        assert_eq!(parsed.rows, vec![vec![String::new()]]);
+
         let actual = TableData {
             columns: vec![ColumnSpec {
                 name: "avg_yearly".to_string(),
@@ -454,14 +544,8 @@ mod tests {
             columns: actual.columns.clone(),
             rows: vec![vec!["\"\"".to_string()]],
         };
-        assert!(matches!(
-            compare(&actual, &expected),
-            Some(CompareMismatch::Value {
-                row: 0,
-                column: 0,
-                ..
-            })
-        ));
+        assert_eq!(compare(&actual, &expected), None);
+        assert!(values_match("", "\"\""));
     }
 
     #[test]
