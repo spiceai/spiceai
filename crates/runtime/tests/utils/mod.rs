@@ -131,22 +131,93 @@ where
     false
 }
 
-/// Returns the duration until the next occurrence of the nearest second.
-/// Optionally, add an overhead to apply to wait for a bit longer after the nearest second is reached.
+/// Returns how long to sleep to land `wait` seconds after the next wall-clock second that
+/// is a multiple of `nearest_second`.
+///
+/// Every caller has one shape: change something a cron-scheduled refresh should pick up,
+/// sleep here, then assert the refresh happened. That only holds when the boundary this
+/// targets is one whose tick has not fired yet, so the boundary is always strictly in the
+/// future. A reading that already sits on a boundary second therefore counts as a whole
+/// period away: that second's tick fired before the caller's change existed, so only the
+/// following tick can pick it up (#13759).
+///
+/// The reading is truncated to whole seconds, so the sleep can end up to a second past
+/// the boundary rather than before it. That direction spends none of the caller's grace.
 pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Duration {
-    assert!(
-        nearest_second < 60,
-        "nearest_second must be between 0 and 59"
-    );
-    let now_second = chrono::Utc::now().second();
-    let modulus = now_second % nearest_second;
-    let time_until_nearest = if modulus == 0 {
-        0
-    } else {
-        nearest_second - modulus
-    };
+    time_till_second_at(chrono::Utc::now().second(), nearest_second, wait)
+}
 
-    Duration::from_secs(u64::from(time_until_nearest + wait.unwrap_or(0)))
+/// [`time_till_second`] against a supplied clock reading, so the boundary arithmetic can
+/// be checked without waiting for a boundary to come round.
+fn time_till_second_at(now_second: u32, nearest_second: u32, wait: Option<u32>) -> Duration {
+    // Cron restarts its `*/n` count every minute, so a period that does not divide 60 has
+    // a short final gap this arithmetic does not model: `*/7` runs at :56 and then :00,
+    // which it would place at :63. Every caller uses 10, 15 or 30; refuse the rest here
+    // rather than let a future one sleep through the tick it is waiting for.
+    assert!(
+        nearest_second > 0 && nearest_second < 60 && 60 % nearest_second == 0,
+        "nearest_second must divide 60"
+    );
+
+    // In `1..=nearest_second`: a reading anywhere inside a boundary second yields a whole
+    // period, because that boundary's tick has already run.
+    let till_boundary = nearest_second - now_second % nearest_second;
+
+    Duration::from_secs(u64::from(till_boundary) + u64::from(wait.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod time_till_second_tests {
+    use super::{Duration, time_till_second_at};
+
+    #[test]
+    fn a_reading_between_boundaries_waits_out_the_remainder() {
+        assert_eq!(time_till_second_at(7, 15, None), Duration::from_secs(8));
+        assert_eq!(
+            time_till_second_at(7, 15, Some(5)),
+            Duration::from_secs(13),
+            "the grace is added to the wait for the boundary, not to the boundary"
+        );
+    }
+
+    #[test]
+    fn a_reading_inside_a_boundary_second_waits_for_the_next_boundary() {
+        // The tick at :15 has already run, so a sleep of only the grace ends before the
+        // tick that can see the caller's change (#13759, as seen by
+        // `acceleration::cron::test_append_cron_schedule`).
+        assert_eq!(
+            time_till_second_at(15, 15, Some(5)),
+            Duration::from_secs(20),
+            "a boundary second is behind us, not ahead"
+        );
+        assert_eq!(time_till_second_at(0, 30, None), Duration::from_secs(30));
+        assert_eq!(
+            time_till_second_at(30, 30, Some(20)),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn no_reading_waits_longer_than_one_period() {
+        // One period is the ceiling the callers' nextest slow-timeout is sized for. 60 is
+        // the second chrono reports during a leap second; every accepted period divides
+        // it, so it needs no case of its own.
+        for nearest in [10_u32, 15, 30] {
+            for second in 0..=60 {
+                let waited = time_till_second_at(second, nearest, None);
+                assert!(
+                    waited > Duration::ZERO && waited <= Duration::from_secs(u64::from(nearest)),
+                    "second {second} with period {nearest} waited {waited:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "nearest_second must divide 60")]
+    fn a_period_that_does_not_divide_60_is_refused() {
+        let _ = time_till_second_at(59, 7, None);
+    }
 }
 
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
