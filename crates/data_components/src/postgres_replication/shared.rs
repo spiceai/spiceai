@@ -2489,6 +2489,12 @@ async fn attach_member(
         contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();
+    // Recorded, not exported: the operator is told which cause fired by the
+    // warning below, and this is the same fact in the form an integration test
+    // can assert (see `ReplicationMetricsCollector::rebuild_cause`). Set
+    // unconditionally, so a clean resume clears a cause an earlier attach left
+    // behind on the reused collector.
+    metrics.set_rebuild_cause(rebuild_cause.map(super::RebuildCause::label));
 
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
