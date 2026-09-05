@@ -205,13 +205,12 @@ pub(crate) fn concat_to_string_concat(
     args: &[Expr],
 ) -> Result<Option<ast::Expr>, DataFusionError> {
     let Some((first, rest)) = args.split_first() else {
-        // `concat`'s signature demands at least one argument, so the planner
-        // cannot build this. Fail rather than fall through to `Ok(None)`,
-        // which would put `concat` back into the DuckDB SQL.
-        return Err(DataFusionError::Plan(
-            "concat takes at least one argument, got 0; cannot render it as DuckDB SQL."
-                .to_string(),
-        ));
+        // `SparkConcat` accepts zero arguments and answers the empty string:
+        // its `coerce_types` passes an empty argument list through, and
+        // `spark_concat` returns `''` for it. So the planner does build
+        // `concat()`, and failing here would turn a query that evaluates
+        // locally into a federated plan error. Render the same constant.
+        return Ok(Some(unparser.expr_to_sql(&datafusion::prelude::lit(""))?));
     };
 
     let mut concatenated = unparser.expr_to_sql(first)?;
@@ -946,18 +945,17 @@ mod tests {
     }
 
     #[test]
-    fn concat_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+    fn concat_with_zero_arguments_renders_the_empty_string() {
+        // `the_registered_concat_accepts_zero_arguments` shows the planner
+        // builds `concat()` and evaluates it to `''`. Erroring here instead
+        // would fail a query that runs unaccelerated (issue #13849).
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
 
-        let error =
-            concat_to_string_concat(&unparser, &[]).expect_err("zero arguments cannot be rendered");
-        assert!(
-            error
-                .to_string()
-                .contains("concat takes at least one argument"),
-            "unexpected error: {error}"
-        );
+        let rendered = concat_to_string_concat(&unparser, &[])
+            .expect("a zero-argument concat renders")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), "''");
     }
 
     #[test]
@@ -1030,6 +1028,40 @@ mod tests {
                 "|    | true  |",
                 "| yz | false |",
                 "+----+-------+",
+            ],
+            &batches
+        );
+    }
+
+    /// Refutation probe: does the planner actually build a zero-argument
+    /// `concat`? Run against the registered function, not the built-in.
+    #[tokio::test]
+    async fn the_registered_concat_accepts_zero_arguments() {
+        use datafusion::assert_batches_eq;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+        ctx.register_udf(concat.as_ref().clone());
+
+        let batches = ctx
+            .sql("SELECT concat() AS c, concat() IS NULL AS isn")
+            .await
+            .expect("a zero-argument concat plans")
+            .collect()
+            .await
+            .expect("a zero-argument concat executes");
+
+        assert_batches_eq!(
+            &[
+                "+---+-------+",
+                "| c | isn   |",
+                "+---+-------+",
+                "|   | false |",
+                "+---+-------+",
             ],
             &batches
         );
