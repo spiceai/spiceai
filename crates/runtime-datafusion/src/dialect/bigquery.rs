@@ -51,6 +51,7 @@ pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
 pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
 pub(crate) const JSON_GET_BOOL_NAME: &str = "json_get_bool";
 pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
+pub(crate) const JSON_CONTAINS_NAME: &str = "json_contains";
 pub(crate) const JSON_LENGTH_NAME: &str = "json_length";
 /// `json_length`'s alias. `ScalarUDF::name` returns the canonical name, so a
 /// plan never carries this one — but the federation deny-list is built from
@@ -194,7 +195,7 @@ fn key_is_renderable(key: &str) -> bool {
 
 /// Whether the path arguments of a `json_get_*` call can be rendered. Reads
 /// [`json_path`], so it answers exactly the question the handlers can answer.
-fn json_path_is_renderable(args: &[Expr]) -> bool {
+fn json_path_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     json_path(args).is_some()
 }
 /// The aggregates whose `FILTER` the `BigQuery` dialect rewrites exactly.
@@ -236,26 +237,24 @@ const PERCENTILE_REWRITES: &[&str] = &["median", "approx_percentile_cont"];
 /// holding a null at all, so the rewrite fails for any filter that actually
 /// filters — where `DataFusion` answers `[2, 3]`.
 ///
-/// A **descending** ordering is refused separately, and for a different reason.
-/// The dialect tests it *before* either rewrite and falls back to the generic
-/// rendering, because a descending sort takes a percentile from the other end.
-/// That fallback is harmless for an aggregate `BigQuery` spells the same way, and
-/// a failed query for the two kinds that need the rewrite — one carrying a
-/// `FILTER` (there is no such clause to fall back to) and one named
-/// [`PERCENTILE_REWRITES`] (there is no such function). Measured on the branch
-/// before this refusal existed:
+/// A **descending** ordering is refused only for [`PERCENTILE_REWRITES`]. Those
+/// are rendered by ordering the group, so a descending sort takes the value from
+/// the other end and the rendering would answer over the wrong row; the dialect
+/// declines, which leaves the `DataFusion` name in place for `BigQuery` to reject
+/// (`Function not found: median`) rather than answering quietly wrong.
+///
+/// Ordering is not consulted for anything else. Every aggregate on the rewrite
+/// allowlist skips nulls and ignores input order, so the `FILTER` rewrite drops
+/// an `ORDER BY` safely in either direction. Refusing those would not cost a
+/// pushdown but fail the query, since the fallback is a generic `FILTER` clause
+/// `BigQuery` cannot parse — measured before spiceai/datafusion#219 scoped the
+/// dialect's check to the percentiles:
 ///
 /// ```text
 /// sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
 ///   -> SELECT sum(`id`) FILTER (WHERE (`id` > 1)) ...
 ///   -> Syntax error: Expected ")" but got "("
-/// median(id ORDER BY id DESC)
-///   -> SELECT median(`id`) ... -> Function not found: median
 /// ```
-///
-/// An *ascending* ordering is still not refused: every aggregate on the list
-/// ignores input order, so an ordered `SUM … FILTER` rewrites and returns the
-/// same number.
 ///
 /// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
 /// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
@@ -267,10 +266,9 @@ pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
     // Checked ahead of the `FILTER` question, because it decides an unfiltered
     // call too.
     if call.params.order_by.iter().any(|sort| !sort.asc)
-        && (call.params.filter.is_some()
-            || PERCENTILE_REWRITES
-                .iter()
-                .any(|rewritten| name.eq_ignore_ascii_case(rewritten)))
+        && PERCENTILE_REWRITES
+            .iter()
+            .any(|rewritten| name.eq_ignore_ascii_case(rewritten))
     {
         return false;
     }
@@ -312,13 +310,13 @@ pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunctio
 /// built-in with no handler here is either denied by name (`regexp_match`) or
 /// unparses through the inner dialect.
 #[must_use]
-pub fn can_translate(call: &ScalarFunction) -> bool {
+pub fn can_translate(call: &ScalarFunction, scope: Option<&datafusion::common::DFSchema>) -> bool {
     let name = call.func.name();
     SCALAR_OVERRIDES
         .iter()
         .chain(BUILTIN_SCALAR_OVERRIDES)
         .find(|entry| entry.name == name)
-        .is_none_or(|entry| (entry.can_translate)(&call.args))
+        .is_none_or(|entry| (entry.can_translate)(&call.args, scope))
 }
 
 /// A function the `BigQuery` dialect rewrites into native SQL.
@@ -334,7 +332,14 @@ pub(crate) struct ScalarOverride {
     /// Renders the call, or fails if it cannot — see [`json_get_number_to_sql`].
     pub(crate) handler: fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>>,
     /// Whether `handler` can render a call with these arguments.
-    pub(crate) can_translate: fn(&[Expr]) -> bool,
+    ///
+    /// The scope is the schema the arguments resolve against, and is `None`
+    /// where the type cannot be established — see
+    /// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`].
+    /// A rendering whose correctness depends on an operand's *declared* type
+    /// must answer `false` there rather than assume one; every other check
+    /// ignores it.
+    pub(crate) can_translate: fn(&[Expr], Option<&datafusion::common::DFSchema>) -> bool,
 }
 
 /// Every function the `BigQuery` dialect rewrites, with what each consumer
@@ -365,6 +370,11 @@ pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
         name: JSON_LENGTH_NAME,
         handler: json_length_to_sql,
         can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_CONTAINS_NAME,
+        handler: json_contains_to_sql,
+        can_translate: json_contains_is_renderable,
     },
     ScalarOverride {
         name: JSON_LEN_NAME,
@@ -410,7 +420,7 @@ pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
 /// a non-negative index and refuses the rest; this is the check that keeps the
 /// refusal off the pushdown path, leaving such a call to evaluate locally rather
 /// than failing the query.
-fn array_index_is_renderable(args: &[Expr]) -> bool {
+fn array_index_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     let [_, Expr::Literal(index, _)] = args else {
         return false;
     };
@@ -429,6 +439,147 @@ fn array_index_is_renderable(args: &[Expr]) -> bool {
 /// the generic 0-based subscript, which reads the neighbouring element.
 fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
     BigQueryDialect::new().scalar_function_to_sql_overrides(unparser, "array_element", args)
+}
+
+/// The error a JSON handler raises for a call it cannot render.
+///
+/// Unreachable with the deny-list installed, which refuses exactly these calls.
+/// Reachable only if this dialect is used without
+/// `deny_spice_functions_for_bigquery_table_providers`, and there the
+/// alternative — `Ok(None)` — makes the unparser emit the function verbatim into
+/// `BigQuery` SQL, which is the wrong answer dressed as a remote error.
+fn unrenderable_json_call(function: &str) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
+         cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
+         built only from plain keys, and for a JSON document whose column type the source \
+         declares: every path argument must be a literal, there must be at least one, a key \
+         cannot contain a quote, a backslash or a control character, and the document must be a \
+         column rather than a computed expression. Rewrite the call to a constant path of plain \
+         keys over a column, or set 'query_federation: disabled' on the dataset to evaluate it \
+         locally instead. \
+         See: https://spiceai.org/docs/components/data-connectors/adbc"
+    ))
+}
+
+/// How `BigQuery` holds the document a JSON call reads, when the source said.
+///
+/// Not a `DataType` question: a native `JSON` column and a `STRING` column both
+/// arrive as `Utf8`, and the canonical `arrow.json` extension that distinguishes
+/// them lives in the field's *metadata*.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum JsonDocument {
+    /// A native `BigQuery` `JSON` column.
+    Native,
+    /// A `STRING` column holding JSON text.
+    Text,
+}
+
+/// What the source said the document column is, or `None` if it did not say.
+///
+/// `None` is the answer for anything that is not a column the driver described —
+/// a computed expression such as `COALESCE(a, b)` resolves to bare `Utf8` and
+/// carries neither marker. That case must **refuse**, not guess: the two
+/// renderings below are not interchangeable, and picking wrong is a wrong answer
+/// on one type and a hard type error on the other.
+pub(crate) fn json_document_kind(
+    document: &Expr,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> Option<JsonDocument> {
+    use datafusion::logical_expr::ExprSchemable as _;
+    let field = document.to_field(scope?).ok().map(|(_, field)| field)?;
+    json_document_kind_of(&field)
+}
+
+/// [`json_document_kind`] once the field is in hand.
+pub(crate) fn json_document_kind_of(
+    field: &datafusion::arrow::datatypes::Field,
+) -> Option<JsonDocument> {
+    let metadata = field.metadata();
+    // The canonical Arrow extension first; `BIGQUERY:type` is the driver's own
+    // statement of the remote type and agrees with it.
+    if metadata
+        .get("ARROW:extension:name")
+        .is_some_and(|n| n == "arrow.json")
+        || metadata.get("BIGQUERY:type").is_some_and(|t| t == "JSON")
+    {
+        return Some(JsonDocument::Native);
+    }
+    if metadata.get("BIGQUERY:type").is_some_and(|t| t == "STRING") {
+        return Some(JsonDocument::Text);
+    }
+    None
+}
+
+/// Whether `json_contains` can be rendered for this call.
+///
+/// Needs a renderable path *and* a document whose remote type the source
+/// declared — see [`json_document_kind`].
+fn json_contains_is_renderable(
+    args: &[Expr],
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    json_path(args).is_some()
+        && args
+            .first()
+            .and_then(|document| json_document_kind(document, scope))
+            .is_some()
+}
+
+/// `json_contains(doc, path…)` → whether the path resolves to a node.
+///
+/// `json_contains` is true for a node of *any* type, a JSON `null` included, and
+/// false when the path does not resolve. Which `BigQuery` expression says that
+/// depends on how the column is held, and the two are not interchangeable —
+/// measured over all node kinds on both:
+///
+/// * native `JSON`: `JSON_QUERY(doc, '<path>') IS NOT NULL`. A present JSON
+///   `null` comes back as a JSON `null` value, which is not SQL NULL, so it is
+///   told apart from a missing key.
+/// * `STRING`: the same test over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+///   string, `JSON_QUERY` returns SQL **NULL** for a present JSON `null` — the
+///   very confusion this function was denied for — and `SAFE.` is what makes a
+///   malformed document `false` rather than an error.
+///
+/// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a type
+/// error, and the direct form on a `STRING` column reads a present null as
+/// absent, quietly. The alternative of normalising both with `FORMAT('%t', …)`
+/// is measured equivalent but refuses past 1 MiB of output ("Output string too
+/// long while evaluating FORMAT"), which would turn a working query into a
+/// failure on a large document; the type-directed pair is clean at 9 MB.
+pub(crate) fn json_contains_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    // `NeverResolves` is a path no lookup matches, so the answer is `false` for
+    // every row — not NULL, which is what the shared `json_call_to_sql` emits
+    // for the accessors.
+    let JsonPath::Path(path) = path else {
+        return Ok(Some(ast::Expr::Value(ast::Value::Boolean(false).into())));
+    };
+
+    let Some(kind) = unparser
+        .resolved_field(document)
+        .as_deref()
+        .and_then(json_document_kind_of)
+    else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    let document = unparser.expr_to_sql(document)?;
+    let document = match kind {
+        JsonDocument::Native => document,
+        JsonDocument::Text => call_function("SAFE.PARSE_JSON", vec![document]),
+    };
+
+    Ok(Some(ast::Expr::IsNotNull(Box::new(call_function(
+        "JSON_QUERY",
+        vec![document, ast::Expr::Value(raw_string(&path).into())],
+    )))))
 }
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
@@ -453,15 +604,7 @@ fn json_call_to_sql(
     render: impl FnOnce(ast::Expr, ast::Expr) -> ast::Expr,
 ) -> Result<Option<ast::Expr>> {
     let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
-        return Err(DataFusionError::Plan(format!(
-            "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
-             cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
-             built only from plain keys: every path argument must be a literal, there must be at \
-             least one, and a key cannot contain a quote, a backslash or a control character. \
-             Rewrite the call to a constant path of plain keys, or set 'query_federation: disabled' \
-             on the dataset to evaluate it locally instead. \
-             See: https://spiceai.org/docs/components/data-connectors/adbc"
-        )));
+        return Err(unrenderable_json_call(function));
     };
 
     let path = match path {
@@ -828,7 +971,7 @@ pub(crate) fn regexp_like_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<O
 /// Whether the arguments of a `regexp_like` call can be rendered. Reads
 /// [`regexp_contains`], so it answers exactly the question the handler can
 /// answer.
-fn regexp_like_is_renderable(args: &[Expr]) -> bool {
+fn regexp_like_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     regexp_contains(args).is_some()
 }
 
@@ -1281,6 +1424,14 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.string_to_timestamp_to_sql(value, tz)
     }
 
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        self.inner.string_to_date_to_sql(value)
+    }
+
+    fn supports_recursive_cte(&self) -> bool {
+        self.inner.supports_recursive_cte()
+    }
+
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
     }
@@ -1518,30 +1669,37 @@ mod tests {
     }
 
     /// `array_element` renders only a non-negative index, so the gate has to
+    /// [`can_translate`] with no schema, which is what every case here needs:
+    /// these assert *shape*, and the scope only matters for a rendering whose
+    /// correctness depends on an operand's declared type.
+    fn translates(call: &ScalarFunction) -> bool {
+        can_translate(call, None)
+    }
+
     /// refuse the rest — otherwise the call is pushed down and the rendering
     /// then fails the whole query instead of evaluating locally.
     #[test]
     fn array_element_federates_only_for_a_non_negative_integer_index() {
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             "array_element",
             vec![col("arr"), lit(1i64)]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             "array_element",
             vec![col("arr"), lit(0i64)]
         )));
         // Counts from the end, which BigQuery cannot express.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), lit(-1i64)]
         )));
         // Sign unknown until it runs.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), col("i")]
         )));
         // Not an ordinal BigQuery would take.
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             "array_element",
             vec![col("arr"), lit("1")]
         )));
@@ -1553,35 +1711,220 @@ mod tests {
 
     #[test]
     fn can_translate_answers_for_the_json_functions_and_defers_on_the_rest() {
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_INT_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_INT_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_STR_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_STR_NAME,
             vec![col("doc"), col("key")]
         )));
-        assert!(can_translate(&call(
+        assert!(translates(&call(
             JSON_GET_BOOL_NAME,
             vec![col("doc"), lit("a")]
         )));
-        assert!(!can_translate(&call(
+        assert!(!translates(&call(
             JSON_GET_BOOL_NAME,
             vec![col("doc"), col("key")]
         )));
-        for name in ["json_contains", "upper"] {
+        assert!(
+            translates(&call("upper", vec![col("doc"), col("key")])),
+            "upper has no handler in this dialect, so it is not this check's business — \
+             the deny-list has not carved it out and it cannot federate at all"
+        );
+
+        // `json_contains` *does* have a handler now, and its check is stricter
+        // than a renderable path: the rendering differs for a native `JSON`
+        // column and a `STRING` one, so a document whose remote type the source
+        // did not declare is refused rather than guessed at. With no scope
+        // nothing is declared, so every shape here refuses.
+        for args in [vec![col("doc"), lit("a")], vec![col("doc"), col("key")]] {
             assert!(
-                can_translate(&call(name, vec![col("doc"), col("key")])),
-                "{name} has no handler in this dialect, so it is not this check's business — \
-                 the deny-list has not carved it out and it cannot federate at all"
+                !translates(&call(super::JSON_CONTAINS_NAME, args)),
+                "json_contains must refuse a document whose BigQuery type is not \
+                 established — the two renderings are not interchangeable"
+            );
+        }
+    }
+
+    /// A recursive CTE behind a derived table opens the statement, on the plan
+    /// the runtime actually unparses.
+    ///
+    /// `BigQuery` accepts `WITH RECURSIVE` only at the top of a statement. Six
+    /// corpus statements join a literal generator through a derived table, and
+    /// once the CTE started federating they failed with "WITH RECURSIVE is only
+    /// allowed at the top level of the SELECT".
+    ///
+    /// This builds the plan through a `SessionContext` — from SQL, **optimized**
+    /// — rather than assembling one, and that is the whole point. The failing
+    /// arrangement (`SubqueryAlias` over a `Projection` over the
+    /// `RecursiveQuery`) is produced by the optimizer, and it routes through the
+    /// *top-level* renderer rather than the nested one. Three hand-built plans
+    /// that looked like the failing shape routed elsewhere and passed with the
+    /// fix reverted; the fork's own test cannot run the optimizer, so this is
+    /// the guard that covers it.
+    #[tokio::test]
+    async fn a_recursive_cte_behind_a_derived_table_opens_the_statement() {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
+        ]));
+        ctx.register_table(
+            "t",
+            Arc::new(
+                datafusion::catalog::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("build the table"),
+            ) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .expect("register the table");
+
+        let generator = "WITH RECURSIVE g AS (                           SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 5                         ) ";
+        let rendered = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let plan = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan the statement")
+                    .into_optimized_plan()
+                    .expect("optimize the plan");
+                unparse_plan(new_bigquery_dialect().as_ref(), &plan)
+            }
+        };
+
+        // The shape that failed: the generator behind a derived table.
+        let behind_derived = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN (SELECT n FROM g) gg ON t.id = gg.n"
+        ))
+        .await;
+        assert!(
+            behind_derived.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement: {behind_derived}"
+        );
+        assert!(
+            !behind_derived.contains("JOIN (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {behind_derived}"
+        );
+
+        // The control: joined directly, which was already hoisted and must stay so.
+        let joined_directly = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN g ON t.id = g.n"
+        ))
+        .await;
+        assert!(
+            joined_directly.starts_with("WITH RECURSIVE"),
+            "a directly joined generator still opens the statement: {joined_directly}"
+        );
+    }
+
+    /// `json_contains` renders by the document's *declared* type, and refuses
+    /// when the source did not declare one.
+    ///
+    /// The two spellings are not interchangeable, measured over every node kind:
+    ///
+    /// * native `JSON` — `JSON_QUERY(doc, path) IS NOT NULL`. A present JSON
+    ///   `null` is a JSON `null` value, not SQL NULL, so it is told apart from a
+    ///   missing key.
+    /// * `STRING` — the same over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+    ///   string, `JSON_QUERY` answers SQL NULL for a present JSON `null` too,
+    ///   which is the confusion this function was denied for.
+    ///
+    /// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a
+    /// type error, and the direct form on a `STRING` column reads a present null
+    /// as absent, quietly. So a document the source did not describe — a
+    /// computed expression carries no marker — is refused rather than guessed.
+    #[test]
+    fn json_contains_renders_by_the_documents_declared_type() {
+        let column = |name: &str, bigquery_type: Option<&str>| {
+            let mut field = datafusion::arrow::datatypes::Field::new(name, DataType::Utf8, true);
+            if let Some(bigquery_type) = bigquery_type {
+                field = field.with_metadata(
+                    [("BIGQUERY:type".to_string(), bigquery_type.to_string())]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            field
+        };
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    column("native", Some("JSON")),
+                    column("text", Some("STRING")),
+                    column("undeclared", None),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(Arc::clone(&scope));
+        let render = |document: &str| {
+            dialect
+                .scalar_function_to_sql_overrides(
+                    &unparser,
+                    super::JSON_CONTAINS_NAME,
+                    &[col(document), lit("a")],
+                )
+                .map(|rendered| rendered.map(|expr| expr.to_string()))
+        };
+
+        let native = render("native")
+            .expect("a native JSON document renders")
+            .expect("a rendering");
+        assert!(
+            native.contains("JSON_QUERY(`native`, R'$.\"a\"')") && native.contains("IS NOT NULL"),
+            "a native JSON column is asked directly: {native}"
+        );
+        assert!(
+            !native.contains("PARSE_JSON"),
+            "PARSE_JSON on a JSON column is a type error: {native}"
+        );
+
+        let text = render("text")
+            .expect("a STRING document renders")
+            .expect("a rendering");
+        assert!(
+            text.contains("SAFE.PARSE_JSON(`text`)"),
+            "a STRING column has to be parsed first, and SAFE. is what makes a \
+             malformed document false rather than an error: {text}"
+        );
+        assert!(
+            text.contains("IS NOT NULL"),
+            "the parsed document is still asked whether the path resolves: {text}"
+        );
+
+        // Undeclared: refused by the per-call check, and the handler raises
+        // rather than guessing if it is ever reached without the deny-list.
+        assert!(
+            !can_translate(
+                &call(super::JSON_CONTAINS_NAME, vec![col("undeclared"), lit("a")]),
+                Some(scope.as_ref()),
+            ),
+            "a document with no declared BigQuery type must not federate"
+        );
+        assert!(
+            render("undeclared").is_err(),
+            "the handler must raise rather than pick a rendering at random"
+        );
+
+        // And the two declared forms *do* federate.
+        for document in ["native", "text"] {
+            assert!(
+                can_translate(
+                    &call(super::JSON_CONTAINS_NAME, vec![col(document), lit("a")]),
+                    Some(scope.as_ref()),
+                ),
+                "{document} has a declared type, so it federates"
             );
         }
     }
@@ -1771,7 +2114,7 @@ mod tests {
             ),
         ] {
             assert!(
-                can_translate(&call(REGEXP_LIKE_NAME, args)),
+                translates(&call(REGEXP_LIKE_NAME, args)),
                 "{accepted} must translate"
             );
         }
@@ -1862,7 +2205,7 @@ mod tests {
             ),
         ] {
             assert!(
-                !can_translate(&call(REGEXP_LIKE_NAME, args)),
+                !translates(&call(REGEXP_LIKE_NAME, args)),
                 "{rejected} must stay local"
             );
         }
@@ -1971,7 +2314,7 @@ mod tests {
                 _ => [col("code"), lit("^R[0-9]{2}")],
             };
             assert!(
-                (entry.can_translate)(&args),
+                (entry.can_translate)(&args, None),
                 "`{name}`'s representative call must be translatable",
                 name = entry.name
             );
@@ -2160,7 +2503,24 @@ mod tests {
         // the dialect has no handler for would be unparsed verbatim, so the
         // list is only safe while the dialect answers for all of it.
         let dialect = new_bigquery_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
+        // A scope declaring `doc` as a BigQuery STRING column. `json_contains`
+        // renders differently for a native JSON column and refuses a document
+        // whose type the source did not declare, so it needs one; every other
+        // handler ignores it.
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    datafusion::arrow::datatypes::Field::new("doc", DataType::Utf8, true)
+                        .with_metadata(
+                            [("BIGQUERY:type".to_string(), "STRING".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(scope);
         for name in crate::dialect::bigquery_native_function_names() {
             let rendered = dialect
                 .scalar_function_to_sql_overrides(&unparser, name, &[col("doc"), lit("a")])
@@ -2421,6 +2781,139 @@ mod tests {
             .plan_to_sql(plan)
             .expect("unparse the plan")
             .to_string()
+    }
+
+    /// A recursive CTE renders as `WITH RECURSIVE` through the wrapper, and only
+    /// for a dialect that has opted in.
+    ///
+    /// Separate from [`the_wrapper_forwards_every_bigquery_specific_rendering`]
+    /// because this one asserts a *statement* shape rather than a fragment of a
+    /// `SELECT`, and because it needs the negative direction too: the gate is the
+    /// load-bearing half. A federated statement has no local-execution fallback,
+    /// so emitting `WITH RECURSIVE` to an engine that cannot run one turns a
+    /// query that used to evaluate locally into a failure.
+    #[test]
+    fn a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("n", DataType::Int64, true),
+        ]));
+        let working_table = |name: &str| {
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                name,
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    Arc::clone(&schema),
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the working table")
+        };
+
+        // `SELECT n FROM counted WHERE n < 5`, the term that reads the working
+        // table by the CTE's own name — the self-reference a recursive CTE needs.
+        let recursive_term = working_table("counted")
+            .filter(col("counted.n").lt(lit(5_i64)))
+            .expect("filter")
+            .project(vec![col("counted.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+        let static_term = working_table("seed")
+            .project(vec![col("seed.n")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        let plan = datafusion::logical_expr::LogicalPlan::RecursiveQuery(
+            datafusion::logical_expr::RecursiveQuery {
+                name: "counted".to_string(),
+                static_term: Arc::new(static_term),
+                recursive_term: Arc::new(recursive_term),
+                is_distinct: false,
+                schema: Arc::new(
+                    datafusion::common::DFSchema::try_from(Arc::clone(&schema)).expect("schema"),
+                ),
+            },
+        );
+
+        let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+        assert!(
+            wrapper.contains("WITH RECURSIVE"),
+            "a recursive CTE has to keep its RECURSIVE keyword: {wrapper}"
+        );
+
+        // Where it sits matters as much as that it is there. `BigQuery` accepts
+        // `WITH RECURSIVE` only at the top of a statement, and a generator is
+        // rarely at the top of a *plan* — joined to a table it is a join input,
+        // which unparses as a derived table. Six corpus statements failed with
+        // "WITH RECURSIVE is only allowed at the top level of the SELECT" once
+        // the CTE started federating, so this pins the position for the shape
+        // that broke: the join nested inside a derived table.
+        let nested = {
+            // Its own column name, so the join condition is unambiguous against
+            // the generator's `n`.
+            let outer_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new("m", DataType::Int64, true),
+            ]));
+            datafusion::logical_expr::LogicalPlanBuilder::scan(
+                "outer",
+                Arc::new(datafusion::logical_expr::builder::LogicalTableSource::new(
+                    outer_schema,
+                )) as Arc<dyn datafusion::logical_expr::TableSource>,
+                None,
+            )
+            .expect("scan the outer table")
+            .join_on(
+                plan.clone(),
+                datafusion::logical_expr::JoinType::Inner,
+                [col("outer.m").eq(col("n"))],
+            )
+            .expect("join the generator")
+            .project(vec![col("outer.m")])
+            .expect("project")
+            .alias("inner_q")
+            .expect("alias")
+            .project(vec![col("inner_q.m")])
+            .expect("project")
+            .build()
+            .expect("build")
+        };
+        let nested_sql = unparse_plan(new_bigquery_dialect().as_ref(), &nested);
+        assert!(
+            nested_sql.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement, not sit inside a derived \
+             table: {nested_sql}"
+        );
+        assert!(
+            !nested_sql.contains("FROM (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {nested_sql}"
+        );
+        assert!(
+            wrapper.contains("UNION ALL"),
+            "a non-distinct recursive query joins its terms with UNION ALL: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("`counted`"),
+            "the recursive term's self-reference has to name the CTE: {wrapper}"
+        );
+        assert_eq!(
+            wrapper,
+            unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                &plan
+            ),
+            "the wrapper and the inner BigQuery dialect have to render this the \
+             same way, or a federated recursive CTE diverges from the dialect's \
+             own rendering"
+        );
+
+        // The gate: a dialect that has not opted in still refuses, so nothing
+        // starts reaching an engine that cannot evaluate it.
+        assert!(
+            Unparser::new(&datafusion::sql::unparser::dialect::DefaultDialect {})
+                .plan_to_sql(&plan)
+                .is_err(),
+            "a dialect that does not support recursive CTEs must still refuse"
+        );
     }
 
     /// Every `BigQuery`-specific rendering the fork's dialect fixes produce has to
@@ -2804,6 +3297,52 @@ mod tests {
                 .expect("descending filtered sum"),
         );
 
+        // The `date_part` fields BigQuery names differently. Without the
+        // rendering these reach it as the DataFusion name and it answers
+        // `Function not found: date_part`.
+        let day_of_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("dow"),
+                col("d.d"),
+            )])
+            .expect("day of week projection")
+            .build()
+            .expect("build");
+
+        // The trap: BigQuery's bare `WEEK` is Sunday-based and answered 13 where
+        // DataFusion answered 14, so the obvious mapping is a wrong number with
+        // no error.
+        let iso_week = date_scan()
+            .project(vec![datafusion::functions::expr_fn::date_part(
+                lit("week"),
+                col("d.d"),
+            )])
+            .expect("iso week projection")
+            .build()
+            .expect("build");
+
+        // Text narrowed to a date. BigQuery's DATE cast takes only a bare
+        // `YYYY-MM-DD`, so an ISO instant held as text has to be parsed to an
+        // instant first and then narrowed.
+        let text_to_date = date_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("d.note"),
+                DataType::Date32,
+            )])
+            .expect("text to date projection")
+            .build()
+            .expect("build");
+
+        // Text compared against a civil timestamp. BigQuery has no implicit
+        // parse and refuses the pair outright.
+        let text_against_timestamp = date_scan()
+            .filter(col("d.note").lt(col("d.naive")))
+            .expect("text against timestamp filter")
+            .project(vec![col("d.note")])
+            .expect("project")
+            .build()
+            .expect("build");
+
         // A negative Arrow scale widens rather than narrows: `Decimal128(28, -2)`
         // is 30 integer digits, not 26. The unparser normalises it to
         // `(30, 0)` before the dialect sees it, so the dialect never meets a
@@ -3157,13 +3696,44 @@ mod tests {
                 "first_value(`t`.`v`) OVER (ORDER BY `t`.`ts` ASC NULLS LAST)",
             ),
             (
-                // Falls back to a generic `FILTER` clause, which BigQuery has no
-                // syntax for — so `can_translate_aggregate` must refuse the same
-                // shape, or the statement reaches BigQuery and fails.
-                "a descending filtered sum is declined (fork PR #218)",
+                // A sum ignores its ordering in either direction, so the
+                // predicate moves inside exactly as it does ascending. This
+                // emitted a generic `FILTER` clause until spiceai/datafusion#219
+                // scoped the dialect's descending check to the percentiles.
+                "a descending filtered sum still rewrites (fork PR #219)",
                 &descending_filtered_sum,
-                "FILTER",
                 "CASE WHEN",
+                "FILTER",
+            ),
+            (
+                "a day-of-week extraction is spelled DAYOFWEEK (fork PR #219)",
+                &day_of_week,
+                "EXTRACT(DAYOFWEEK FROM",
+                "date_part",
+            ),
+            (
+                // Measured: BigQuery's bare WEEK disagrees with DataFusion's ISO
+                // weeks by one at a year boundary, silently.
+                "a week extraction is spelled ISOWEEK, not WEEK (fork PR #219)",
+                &iso_week,
+                "EXTRACT(ISOWEEK FROM",
+                "EXTRACT(WEEK FROM",
+            ),
+            (
+                // The plain cast is refused for every form carrying a time or a
+                // zone, which is every form this column actually holds.
+                "text is parsed into a date, not cast (fork PR #219)",
+                &text_to_date,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "CAST(`d`.`note` AS DATE)",
+            ),
+            (
+                // Losing this pushes the pair down as written, and BigQuery
+                // refuses "STRING, DATETIME" with "No matching signature".
+                "text compared with a timestamp is brought to one type (fork PR #219)",
+                &text_against_timestamp,
+                "TIMESTAMP(REGEXP_REPLACE(",
+                "`d`.`note` < `d`.`naive`",
             ),
             (
                 // 28 digits at scale -2 is a width of 30, so the widest type is
