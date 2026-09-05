@@ -147,7 +147,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A named scalar UDF expression, for asserting what a connector's federation
 /// deny-list does and does not allow. The deny-list matches on the function's
 /// name, so the body and the argument types are irrelevant -- only the name and
-/// the argument count are.
+/// the argument count are. A backend that also answers per *call* is the
+/// exception: reach for [`stub_udf_called_with`] there, since the arguments are
+/// then part of the question.
 #[cfg(test)]
 pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
     use datafusion::arrow::datatypes::DataType;
@@ -164,6 +166,30 @@ pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Ex
     Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
         udf,
         (0..arity).map(|i| col(format!("c{i}"))).collect(),
+    ))
+}
+
+/// The same stub called with `args` instead of bare columns, for a backend whose
+/// [`FunctionSupport`](datafusion_table_providers::util::supported_functions::FunctionSupport)
+/// answers per *call* — where a literal argument is what decides whether the
+/// dialect can render it.
+#[cfg(test)]
+pub(crate) fn stub_udf_called_with(
+    name: &str,
+    args: Vec<datafusion::logical_expr::Expr>,
+) -> datafusion::logical_expr::Expr {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, create_udf};
+
+    let udf = std::sync::Arc::new(create_udf(
+        name,
+        vec![DataType::Utf8; args.len()],
+        DataType::Utf8,
+        Volatility::Immutable,
+        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    ));
+    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+        udf, args,
     ))
 }
 
