@@ -64,6 +64,20 @@ pub enum Error {
 
     #[snafu(display("Metrics collection failed for executors: [{failed_executors}]"))]
     PartialFailure { failed_executors: String },
+
+    #[snafu(display(
+        "Failed to acquire the executor registry lock while resolving search executors for {table}; retry the query"
+    ))]
+    SearchExecutorRegistryLockContended { table: String },
+
+    #[snafu(display(
+        "{} partition(s) of {table} are not assigned to any live executor",
+        missing.len()
+    ))]
+    MissingSearchExecutorPartitions {
+        table: String,
+        missing: Vec<PartitionValue>,
+    },
 }
 
 impl Error {
@@ -749,6 +763,100 @@ impl ExecutorRegistry {
             self.node_id.as_deref(),
         )
     }
+
+    /// Resolve the disjoint covering set of executors for a distributed search
+    /// over `table`, as `(executor_id, FlightSqlClient)` pairs.
+    ///
+    /// Distributed full-text search queries each executor's local index directly
+    /// and merges the results, so the executor set must be disjoint — a replica
+    /// counted twice would return duplicate rows and skew the merged ranking.
+    /// This is the same minimal-cover selection a partitioned table scan uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error rather than an empty set when the executor set cannot
+    /// be established (a contended registry lock, or a partition with no live
+    /// executor) — the caller must not treat that as "no rows", or a transient
+    /// condition would silently return an incomplete result for a populated
+    /// table. An empty `Ok` return means the table itself has no partitions.
+    pub fn resolve_search_executors(
+        &self,
+        table: &TableReference,
+    ) -> Result<Vec<(String, FlightSqlClient)>> {
+        let Ok(connections) = self.connections.try_read() else {
+            return SearchExecutorRegistryLockContendedSnafu {
+                table: table.to_string(),
+            }
+            .fail();
+        };
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            return SearchExecutorRegistryLockContendedSnafu {
+                table: table.to_string(),
+            }
+            .fail();
+        };
+        let executors = ready_executors(&connections, &flight_sql_clients);
+        let ids = covering_executor_ids(&self.accelerations_partition_store, &executors, table)?;
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| {
+                let (_, client) = executors.get(&id)?;
+                Some((id, (*client).clone()))
+            })
+            .collect())
+    }
+}
+
+/// The disjoint covering set of executor ids for `table`: a single live executor
+/// when there is no partition metadata (it holds the whole table), otherwise the
+/// minimal set of executors that together cover every partition. Empty only when
+/// the table itself has no partitions.
+///
+/// # Errors
+///
+/// Returns an error when a required partition has no live executor to cover it,
+/// rather than silently dropping it from the result.
+fn covering_executor_ids(
+    partition_store: &PartitionStore,
+    executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
+    table: &TableReference,
+) -> Result<Vec<String>> {
+    let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
+        // No partition metadata: route to a single live executor to avoid
+        // duplicate results, matching `get_partitions_from_store`.
+        return Ok(executors.keys().min().cloned().into_iter().collect());
+    };
+
+    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
+        .partitions
+        .iter()
+        .map(|p| p.partition_value.clone())
+        .collect();
+    if required_partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    for partition_meta in &table_metadata.partitions {
+        for executor_id in &partition_meta.assigned_executors {
+            if !executors.contains_key(executor_id) {
+                continue;
+            }
+            executor_partition_map
+                .entry(executor_id.clone())
+                .or_default()
+                .push(partition_meta.partition_value.clone());
+        }
+    }
+
+    executor_selection::select_executors(&required_partitions, &executor_partition_map).map_err(
+        |executor_selection::Error::MissingPartitions(missing)| {
+            Error::MissingSearchExecutorPartitions {
+                table: table.to_string(),
+                missing,
+            }
+        },
+    )
 }
 
 /// Returns executors that have both an active connection and a `FlightSQL` client.
@@ -1524,5 +1632,99 @@ mod tests {
             "got {err:?}"
         );
         assert!(!err.is_retryable());
+    }
+
+    /// Regression test: a partition with no live executor must fail search
+    /// executor resolution with a structured error, not silently disappear from
+    /// the covering set — see `MissingSearchExecutorPartitions`.
+    #[tokio::test]
+    async fn resolve_search_executors_errors_on_uncovered_partition() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("orders");
+        let store = registry.accelerations_partition_store();
+
+        let covered: PartitionValue =
+            HashMap::from([("region".to_string(), Some("east".to_string()))]);
+        let uncovered: PartitionValue =
+            HashMap::from([("region".to_string(), Some("west".to_string()))]);
+
+        store
+            .set_unassigned_partitions(
+                &table,
+                vec![covered.clone(), uncovered],
+                vec!["region".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        store
+            .assign_partition(&table, &covered, "executor-1")
+            .await
+            .expect("assign the covered partition");
+        // The `west` partition is intentionally left unassigned.
+
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("executor-1".to_string(), tx).await;
+        registry
+            .flight_sql_clients
+            .write()
+            .await
+            .insert("executor-1".to_string(), dummy_flight_sql_client());
+
+        let err = registry
+            .resolve_search_executors(&table)
+            .expect_err("an unassigned partition must error, not be silently dropped");
+        assert!(
+            matches!(err, Error::MissingSearchExecutorPartitions { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// When every partition has a live executor, resolution succeeds and returns
+    /// exactly the covering set (mirrors the happy path `resolve_search_executors`
+    /// is meant to serve).
+    #[tokio::test]
+    async fn resolve_search_executors_succeeds_when_fully_covered() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("orders");
+        let store = registry.accelerations_partition_store();
+
+        let p0: PartitionValue = HashMap::from([("region".to_string(), Some("east".to_string()))]);
+        let p1: PartitionValue = HashMap::from([("region".to_string(), Some("west".to_string()))]);
+
+        store
+            .set_unassigned_partitions(
+                &table,
+                vec![p0.clone(), p1.clone()],
+                vec!["region".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        store
+            .assign_partition(&table, &p0, "executor-1")
+            .await
+            .expect("assign p0");
+        store
+            .assign_partition(&table, &p1, "executor-2")
+            .await
+            .expect("assign p1");
+
+        for executor_id in ["executor-1", "executor-2"] {
+            let (tx, _rx) = mpsc::channel(1);
+            registry.register(executor_id.to_string(), tx).await;
+            registry
+                .flight_sql_clients
+                .write()
+                .await
+                .insert(executor_id.to_string(), dummy_flight_sql_client());
+        }
+
+        let mut executors: Vec<String> = registry
+            .resolve_search_executors(&table)
+            .expect("fully covered table should resolve")
+            .into_iter()
+            .map(|(id, _client)| id)
+            .collect();
+        executors.sort();
+        assert_eq!(executors, vec!["executor-1", "executor-2"]);
     }
 }

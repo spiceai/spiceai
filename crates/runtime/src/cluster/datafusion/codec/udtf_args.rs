@@ -94,6 +94,8 @@ mod tests {
             column: Some("content".to_string()),
             limit: Some(10),
             include_score: Some(true),
+            global_stats: None,
+            expected_generation: None,
         });
         let bytes = args.encode_to_vec();
         let deserialized = UdtfArgs::decode(bytes.as_slice()).expect("decode");
@@ -145,6 +147,8 @@ mod tests {
                         column: None,
                         limit: Some(10),
                         include_score: Some(true),
+                        global_stats: None,
+                        expected_generation: None,
                     },
                     Some(1.0),
                 ),

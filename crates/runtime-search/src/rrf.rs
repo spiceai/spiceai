@@ -457,6 +457,10 @@ impl ReciprocalRankFusionArgs {
                         column: search_args.2,
                         limit: search_args.3.map(|l| l as u64),
                         include_score: search_args.4,
+                        // RRF nests independent per-node searches; global BM25
+                        // statistics do not apply to its fused ranking.
+                        global_stats: None,
+                        expected_generation: None,
                     },
                     rank_weight,
                 ))
