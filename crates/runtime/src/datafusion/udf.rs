@@ -956,6 +956,18 @@ mod tests {
         ))
     }
 
+    /// The same probe with one argument, for a name whose backend answers
+    /// per-call as well as per-name: a `FunctionSupport` carrying a
+    /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
+    /// asks its dialect to render the call, and the no-arg probe is a call the
+    /// planner cannot build and the dialect refuses on arity alone.
+    fn make_named_expr_of_one_arg(name: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(stub_scalar_udf(name)),
+            vec![col("s")],
+        ))
+    }
+
     #[test]
     fn table_providers_default_deny_list_denies_spice_functions() {
         // The default table-providers-typed deny-list (wired into the ADBC
@@ -1092,7 +1104,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                support.supports(&make_named_expr("btrim")),
+                support.supports(&make_named_expr_of_one_arg("btrim")),
                 !denied,
                 "btrim pushdown for {backend} is wrong: expected denied={denied}"
             );

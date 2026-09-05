@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
@@ -172,6 +173,43 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
     Arc::new(dialect) as Arc<dyn Dialect>
 }
 
+/// One `DuckDB` dialect, built once, for [`duckdb_can_translate`] to ask
+/// whether a call renders. It is consulted per scalar call during federation
+/// planning, and building the override table each time would be the expensive
+/// part of an otherwise trivial check.
+static DUCKDB_DIALECT: LazyLock<Arc<dyn Dialect>> = LazyLock::new(new_duckdb_dialect);
+
+/// Whether the `DuckDB` dialect can render this particular call.
+///
+/// A handler renders a *call*, not a name, and several of the `DuckDB`
+/// handlers refuse a call they cannot render faithfully — the regex family
+/// refuses the `U` and `R` flags, which `DuckDB` has no equivalent of, and
+/// `regexp_count` refuses a start position that is not an integer literal,
+/// because the rewrite has to turn it into a `substring` offset. Refusing is
+/// right; what was wrong is where the refusal landed. Federation asks for the
+/// SQL after it has already decided to federate the plan, so the refusal came
+/// back as a planning error and failed a query `DataFusion` can answer on its
+/// own (issue #13900).
+///
+/// The deny-list installs this so the decision is made while it is still a
+/// decision: a call the dialect cannot render is not federated, and evaluates
+/// locally above the federated scan instead. That costs the pushdown for those
+/// plans and returns the right rows, which is the trade the deny-list exists
+/// to make.
+///
+/// The answer comes from running the dialect's own handler rather than from a
+/// second table describing it, so the check cannot drift from what the dialect
+/// does: whatever [`new_duckdb_dialect`] installs is what is asked. A name the
+/// dialect has no handler for renders as `Ok(None)` and is deferred to, which
+/// is why an ordinary function is unaffected.
+#[must_use]
+pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
+    let unparser = Unparser::new(DUCKDB_DIALECT.as_ref());
+    DUCKDB_DIALECT
+        .scalar_function_to_sql_overrides(&unparser, call.func.name(), &call.args)
+        .is_ok()
+}
+
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
 /// `BigQuery` SQL. The federation deny-list derives its `BigQuery` carve-out
 /// from this list; see [`crate::function_support::deny_spice_functions_for_bigquery_table_providers`].
@@ -234,8 +272,138 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 mod tests {
     use super::{
         bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
-        duckdb_native_function_names,
+        duckdb_can_translate, duckdb_native_function_names, new_duckdb_dialect,
     };
+    use datafusion::functions::expr_fn::upper;
+    use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::sql::unparser::Unparser;
+
+    /// The [`ScalarFunction`] inside a call built by `DataFusion`'s own
+    /// `expr_fn` helpers, so these guards run against the real UDFs rather
+    /// than a stub that only shares their name.
+    fn call_of(expr: Expr) -> ScalarFunction {
+        match expr {
+            Expr::ScalarFunction(call) => call,
+            other => panic!("expected a scalar function call, got {other:?}"),
+        }
+    }
+
+    /// Regression test for #13900: the `U` flag has no `DuckDB` equivalent, so
+    /// the dialect's regex handler refuses to render the call. Before this
+    /// check the refusal surfaced as a planning error for the whole query;
+    /// declining to federate leaves the call for `DataFusion` to evaluate.
+    #[test]
+    fn duckdb_declines_a_regex_flag_duckdb_has_no_equivalent_of() {
+        for flag in ["U", "R", "gU", "iR"] {
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_replace(
+                    col("s"),
+                    lit("a"),
+                    lit("X"),
+                    Some(lit(flag)),
+                ))),
+                "regexp_replace with flags `{flag}` has no DuckDB rendering"
+            );
+            assert!(
+                !duckdb_can_translate(&call_of(regexp_like(col("s"), lit("a"), Some(lit(flag))))),
+                "regexp_like with flags `{flag}` has no DuckDB rendering"
+            );
+        }
+
+        // The flags DuckDB does have keep federating.
+        for flag in ["g", "i", "gi"] {
+            assert!(
+                duckdb_can_translate(&call_of(regexp_replace(
+                    col("s"),
+                    lit("a"),
+                    lit("X"),
+                    Some(lit(flag)),
+                ))),
+                "regexp_replace with flags `{flag}` renders as DuckDB SQL"
+            );
+        }
+
+        // No flags argument at all is the common shape and must federate.
+        assert!(duckdb_can_translate(&call_of(regexp_replace(
+            col("s"),
+            lit("a"),
+            lit("X"),
+            None,
+        ))));
+    }
+
+    /// Regression test for #13900: `regexp_count`'s start position becomes a
+    /// `substring` offset in the `DuckDB` rewrite, which needs the value at
+    /// unparse time. A column cannot supply one, and neither can a start
+    /// below 1.
+    #[test]
+    fn duckdb_declines_a_regexp_count_start_it_cannot_turn_into_an_offset() {
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(col("start")),
+                None,
+            ))),
+            "a column start position has no DuckDB rendering"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(0)),
+                None,
+            ))),
+            "a start position below 1 has no DuckDB rendering"
+        );
+        assert!(
+            duckdb_can_translate(&call_of(regexp_count(
+                col("s"),
+                lit("a"),
+                Some(lit(1)),
+                None,
+            ))),
+            "an integer start position renders as a DuckDB substring offset"
+        );
+    }
+
+    /// A function the dialect installs no handler for is deferred to, so an
+    /// ordinary call keeps federating.
+    #[test]
+    fn duckdb_defers_on_a_function_the_dialect_does_not_rewrite() {
+        assert!(duckdb_can_translate(&call_of(upper(col("s")))));
+    }
+
+    /// The check must answer exactly what the unparser does, or a call it
+    /// admits still fails the query and a call it refuses loses its pushdown
+    /// for nothing. Asking through `expr_to_sql` reaches the handler by the
+    /// unparser's own dispatch rather than by the accessor the check uses.
+    #[test]
+    fn duckdb_can_translate_agrees_with_what_the_unparser_renders() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        for expr in [
+            regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("U"))),
+            regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("g"))),
+            regexp_replace(col("s"), lit("a"), lit("X"), None),
+            regexp_like(col("s"), lit("a"), Some(lit("R"))),
+            regexp_like(col("s"), lit("a"), None),
+            regexp_count(col("s"), lit("a"), Some(col("start")), None),
+            regexp_count(col("s"), lit("a"), Some(lit(0)), None),
+            regexp_count(col("s"), lit("a"), Some(lit(2)), None),
+            upper(col("s")),
+        ] {
+            let renders = unparser.expr_to_sql(&expr).is_ok();
+            assert_eq!(
+                duckdb_can_translate(&call_of(expr.clone())),
+                renders,
+                "the per-call check and the unparser disagree about {expr:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
