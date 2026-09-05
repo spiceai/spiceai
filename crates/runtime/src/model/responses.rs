@@ -226,28 +226,22 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Responses>, LlmError> {
+    super::chat::validate_temperature(raw_params, "openai")?;
+
+    if params.auth.is_codex() {
+        super::chat::validate_codex_params(params)?;
+        return Ok(Arc::new(llms::openai::new_codex_client(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            params.endpoint.clone(),
+            Some(params.usage_tier),
+        )) as Arc<dyn Responses>);
+    }
+
     let api_base = Some(params.endpoint.as_str());
-    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let api_key = params.auth.api_key().map(ExposeSecret::expose_secret);
     let org_id = params.org_id.as_deref();
     let project_id = params.project_id.as_deref();
     let usage_tier = Some(params.usage_tier);
-
-    // Reject a negative or unparseable `temperature` override at load time. The
-    // value is read from the raw params map because overrides are passthrough
-    // (see `crate::model::params::common`), accepting the unprefixed,
-    // `openai_`-prefixed forms.
-    let temperature = raw_params
-        .get("temperature")
-        .or_else(|| raw_params.get("openai_temperature"))
-        .map(ExposeSecret::expose_secret);
-    if let Some(temperature_str) = temperature
-        && !matches!(temperature_str.parse::<f64>(), Ok(t) if t >= 0.0)
-    {
-        return Err(LlmError::InvalidParamValueError {
-            param: "openai_temperature".to_string(),
-            message: "Ensure it is a non-negative number.".to_string(),
-        });
-    }
 
     Ok(Arc::new(llms::openai::new_openai_client(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),

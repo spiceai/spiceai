@@ -80,6 +80,13 @@ impl HostedModelConfig {
             .insert(HeaderName::from_static(key), value);
         self
     }
+
+    /// Replaces the default headers used for each request.
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.default_headers = headers;
+        self
+    }
 }
 
 /// A generic authentication mechanism that supports either an API key or a Bearer token.

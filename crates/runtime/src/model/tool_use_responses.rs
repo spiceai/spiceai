@@ -141,6 +141,7 @@ impl ToolUsingResponses {
                             })
                             .unwrap_or(json!({})),
                     ),
+                    defer_loading: None,
                 })
             })
             .collect()
@@ -242,6 +243,7 @@ impl ToolUsingResponses {
             messages.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
                 arguments: tool_call.arguments.clone(),
                 call_id: tool_call.id.clone().unwrap_or_default(),
+                namespace: None,
                 name: tool_call.name.clone(),
                 id: Some(tool_call.name.clone()),
                 status: None,
@@ -708,6 +710,7 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
             content: EasyInputContent::Text(text),
             role: Role::User,
             r#type: MessageType::Message,
+            phase: None,
         })],
         InputParam::Items(items) => items,
     }

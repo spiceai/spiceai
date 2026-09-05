@@ -123,8 +123,87 @@ mod tests {
             llms::openai::ChatBackend::ChatCompletions
         );
         assert_eq!(
-            typed.api_key.as_ref().map(ExposeSecret::expose_secret),
+            typed.auth.api_key().map(ExposeSecret::expose_secret),
             Some("sk-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_rejects_api_key_with_codex_authentication() {
+        for auth_mode in ["codex", "codex_plan"] {
+            let err = openai::OpenAiModelParams::try_from_params(
+                "model openai",
+                params(&[("openai_auth_mode", auth_mode), ("openai_api_key", "sk-1")]),
+                &empty_secrets(),
+            )
+            .await
+            .expect_err("Codex authentication must not accept an API key");
+
+            assert!(
+                err.to_string()
+                    .contains("`codex` and `codex_plan` cannot be combined with `openai_api_key`"),
+                "unexpected message: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_codex_authentication_defaults_to_openai_endpoint() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex authentication params should deserialize");
+
+        assert_eq!(typed.endpoint, "https://api.openai.com/v1");
+        assert_eq!(typed.responses_api, llms::openai::ChatBackend::Responses);
+    }
+
+    #[tokio::test]
+    async fn openai_codex_plan_authentication_defaults_to_codex_endpoint() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex_plan")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex plan authentication params should deserialize");
+
+        assert_eq!(typed.endpoint, openai::CODEX_API_BASE);
+        assert_eq!(typed.responses_api, llms::openai::ChatBackend::Responses);
+    }
+
+    #[tokio::test]
+    async fn openai_codex_plan_authentication_preserves_endpoint_override() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[
+                ("openai_auth_mode", "codex_plan"),
+                ("endpoint", "https://codex.example/v1"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex plan authentication params should deserialize");
+
+        assert_eq!(typed.endpoint, "https://codex.example/v1");
+    }
+
+    #[tokio::test]
+    async fn openai_codex_authentication_preserves_responses_api_override() {
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_auth_mode", "codex"), ("responses_api", "disabled")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("Codex authentication params should deserialize");
+
+        assert_eq!(
+            typed.responses_api,
+            llms::openai::ChatBackend::ChatCompletions
         );
     }
 

@@ -9,7 +9,7 @@ use async_openai::types::responses::{
 };
 use axum::{
     Extension, Json,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -164,9 +164,13 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMResponsesModelStore>>>,
+    headers: HeaderMap,
     Json(req): Json<CreateResponse>,
 ) -> Response {
     let context = RequestContext::current(AsyncMarker::new().await);
+    context.insert_extension(llms::openai::codex::CodexRequestHeaders::from_headers(
+        &headers,
+    ));
 
     let span = tracing::span!(
         target: "task_history",
@@ -212,7 +216,10 @@ pub(crate) async fn post(
                     }
                     tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                    Json(response).into_response()
+                    let mut http_response = Json(response).into_response();
+                    llms::openai::codex::apply_response_headers(http_response.headers_mut())
+                        .await;
+                    http_response
                 }
                 Err(e) => {
                     tracing::error!(target: "task_history", parent: &span_clone, "{e}");
@@ -317,9 +324,11 @@ async fn create_response_sse_response(
         )
     };
 
-    Sse::new(Box::pin(sse_stream))
+    let mut http_response = Sse::new(Box::pin(sse_stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_INTERVAL)))
-        .into_response()
+        .into_response();
+    llms::openai::codex::apply_response_headers(http_response.headers_mut()).await;
+    http_response
 }
 
 #[cfg(test)]

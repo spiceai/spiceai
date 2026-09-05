@@ -1,0 +1,392 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::any::Any;
+use std::sync::{Arc, LazyLock};
+
+use async_openai::Client;
+use async_openai::error::OpenAIError;
+use async_openai::types::chat::{
+    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+};
+use async_openai::types::responses::{CreateResponse, Response, ResponseStream};
+use async_trait::async_trait;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, USER_AGENT};
+use runtime_rate_control::RateController;
+use runtime_request_context::{AsyncMarker, Extension, RequestContext};
+
+use crate::chat::nsql::SqlGeneration;
+use crate::chat::{Chat, Error as ChatError};
+use crate::config::HostedModelConfig;
+use crate::openai::responses_adapter;
+use crate::responses::{Responses, Result as ResponsesResult};
+
+const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
+const ORIGINATOR: HeaderName = HeaderName::from_static("originator");
+const SESSION_ID: HeaderName = HeaderName::from_static("session-id");
+const THREAD_ID: HeaderName = HeaderName::from_static("thread-id");
+const X_CLIENT_REQUEST_ID: HeaderName = HeaderName::from_static("x-client-request-id");
+const X_CODEX_BETA_FEATURES: HeaderName = HeaderName::from_static("x-codex-beta-features");
+const X_CODEX_TURN_METADATA: HeaderName = HeaderName::from_static("x-codex-turn-metadata");
+const X_CODEX_TURN_STATE: HeaderName = HeaderName::from_static("x-codex-turn-state");
+const X_CODEX_WINDOW_ID: HeaderName = HeaderName::from_static("x-codex-window-id");
+
+static FORWARDED_HEADERS: LazyLock<[HeaderName; 13]> = LazyLock::new(|| {
+    [
+        ACCEPT,
+        AUTHORIZATION,
+        CHATGPT_ACCOUNT_ID,
+        CONTENT_TYPE,
+        ORIGINATOR,
+        SESSION_ID,
+        THREAD_ID,
+        USER_AGENT,
+        X_CLIENT_REQUEST_ID,
+        X_CODEX_BETA_FEATURES,
+        X_CODEX_TURN_METADATA,
+        X_CODEX_TURN_STATE,
+        X_CODEX_WINDOW_ID,
+    ]
+});
+
+/// Backend response headers that a Codex-compatible caller must see and replay
+/// on its next request in the same turn (`openai/codex`,
+/// `codex-rs/core/tests/suite/turn_state.rs`).
+static REPLAYED_RESPONSE_HEADERS: LazyLock<[HeaderName; 1]> =
+    LazyLock::new(|| [X_CODEX_TURN_STATE]);
+
+/// The Codex request headers that may be forwarded to the Codex backend.
+///
+/// This owns only an explicit allowlist. In particular, transport-controlled
+/// headers such as `host` and `content-length` are never forwarded.
+#[derive(Clone)]
+pub struct CodexRequestHeaders {
+    headers: HeaderMap,
+}
+
+impl CodexRequestHeaders {
+    #[must_use]
+    pub fn from_headers(source: &HeaderMap) -> Self {
+        let mut headers = HeaderMap::with_capacity(FORWARDED_HEADERS.len());
+        for name in FORWARDED_HEADERS.iter() {
+            for value in source.get_all(name).iter() {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+        Self { headers }
+    }
+
+    #[must_use]
+    fn authorization_present(&self) -> bool {
+        self.headers.contains_key(AUTHORIZATION)
+    }
+
+    #[must_use]
+    fn headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+}
+
+#[async_trait]
+impl Extension for CodexRequestHeaders {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The Codex backend response headers that must be relayed back to the caller
+/// so it can replay them on the next request in the same turn.
+///
+/// Stashed on the [`RequestContext`] by [`Codex::responses_request`] /
+/// [`Codex::responses_stream`] once the backend response arrives, and read
+/// back by the `/v1/responses` HTTP handler once it builds the outgoing
+/// response.
+#[derive(Clone)]
+pub struct CodexResponseHeaders {
+    headers: HeaderMap,
+}
+
+impl CodexResponseHeaders {
+    /// Returns `None` if the backend response carried none of the headers a
+    /// Codex-compatible caller needs replayed.
+    fn from_headers(source: &HeaderMap) -> Option<Self> {
+        let mut headers = HeaderMap::with_capacity(REPLAYED_RESPONSE_HEADERS.len());
+        for name in REPLAYED_RESPONSE_HEADERS.iter() {
+            for value in source.get_all(name).iter() {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+        (!headers.is_empty()).then_some(Self { headers })
+    }
+
+    #[must_use]
+    pub fn headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+}
+
+#[async_trait]
+impl Extension for CodexResponseHeaders {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Stashes the Codex backend's turn-continuation headers on the current
+/// [`RequestContext`] so the HTTP handler can copy them onto its response.
+async fn stash_response_headers(source: &HeaderMap) {
+    if let Some(response_headers) = CodexResponseHeaders::from_headers(source) {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        context.insert_extension(response_headers);
+    }
+}
+
+/// Copies any stashed [`CodexResponseHeaders`] from the current
+/// [`RequestContext`] onto an outgoing HTTP response, so a Codex-compatible
+/// caller sees `x-codex-turn-state` and can replay it on the next request in
+/// the same turn.
+pub async fn apply_response_headers(headers: &mut HeaderMap) {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    if let Some(response_headers) = context.extension::<CodexResponseHeaders>() {
+        headers.extend(response_headers.headers());
+    }
+}
+
+/// An OpenAI Responses API client authenticated by a Codex caller's headers.
+pub struct Codex {
+    api_base: String,
+    http_client: reqwest::Client,
+    model: String,
+    rate_controller: Arc<RateController>,
+}
+
+fn normalize_codex_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::JSONDeserialize(parse_error, body) = error else {
+        return error;
+    };
+
+    #[derive(serde::Deserialize)]
+    struct CodexErrorDetail {
+        detail: String,
+    }
+
+    match serde_json::from_str::<CodexErrorDetail>(&body) {
+        Ok(error) => OpenAIError::InvalidArgument(error.detail),
+        Err(_) => OpenAIError::JSONDeserialize(parse_error, body),
+    }
+}
+
+impl Codex {
+    #[must_use]
+    pub(super) fn new(
+        model: String,
+        api_base: String,
+        rate_controller: Arc<RateController>,
+    ) -> Self {
+        Self {
+            api_base,
+            http_client: reqwest::Client::new(),
+            model,
+            rate_controller,
+        }
+    }
+
+    async fn client(&self) -> Result<Client<HostedModelConfig>, OpenAIError> {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        let headers = context.extension::<CodexRequestHeaders>().ok_or_else(|| {
+            OpenAIError::InvalidArgument(
+                "Codex authentication headers are required. Use Codex to call this gateway."
+                    .to_string(),
+            )
+        })?;
+
+        if !headers.authorization_present() {
+            return Err(OpenAIError::InvalidArgument(
+                "Codex authorization is required. Sign in with Codex and retry.".to_string(),
+            ));
+        }
+
+        let config = HostedModelConfig::from_url(&self.api_base).with_headers(headers.headers());
+        Ok(Client::with_config(config).with_http_client(self.http_client.clone()))
+    }
+}
+
+#[async_trait]
+impl Responses for Codex {
+    async fn health(&self) -> ResponsesResult<()> {
+        Ok(())
+    }
+
+    async fn responses_stream(
+        &self,
+        mut req: CreateResponse,
+    ) -> ResponsesResult<ResponseStream, OpenAIError> {
+        req.model = Some(self.model.clone());
+        let client = self.client().await?;
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let (stream, headers) = client
+            .responses()
+            .create_stream_with_headers(req)
+            .await
+            .map_err(normalize_codex_error)?;
+        drop(permit);
+        stash_response_headers(&headers).await;
+        Ok(Box::pin(stream))
+    }
+
+    async fn responses_request(
+        &self,
+        mut req: CreateResponse,
+    ) -> ResponsesResult<Response, OpenAIError> {
+        req.model = Some(self.model.clone());
+        let client = self.client().await?;
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let (response, headers) = client
+            .responses()
+            .create_with_headers(req)
+            .await
+            .map_err(normalize_codex_error)?;
+        drop(permit);
+        stash_response_headers(&headers).await;
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl Chat for Codex {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+
+    async fn chat_stream(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let outer_model = req.model.clone();
+        let inner_req =
+            responses_adapter::responses_request_from_chat_completion_request(req, &self.model)?;
+        let client = self.client().await?;
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let stream = client
+            .responses()
+            .create_stream(inner_req)
+            .await
+            .map_err(normalize_codex_error)?;
+        drop(permit);
+        Ok(responses_adapter::chat_completion_stream_from_response_stream(stream, outer_model))
+    }
+
+    async fn health(&self) -> Result<(), ChatError> {
+        Ok(())
+    }
+
+    async fn chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let outer_model = req.model.clone();
+        let inner_req =
+            responses_adapter::responses_request_from_chat_completion_request(req, &self.model)?;
+        let client = self.client().await?;
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let response = client
+            .responses()
+            .create(inner_req)
+            .await
+            .map_err(normalize_codex_error)?;
+        drop(permit);
+        responses_adapter::chat_completion_response_from_response(response, outer_model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn forwards_only_the_codex_header_allowlist() {
+        let mut source = HeaderMap::new();
+        source.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        source.insert(CHATGPT_ACCOUNT_ID, HeaderValue::from_static("account"));
+        source.insert("host", HeaderValue::from_static("gateway.example"));
+        source.insert("content-length", HeaderValue::from_static("42"));
+        source.insert("x-unrelated", HeaderValue::from_static("not-forwarded"));
+
+        let forwarded = CodexRequestHeaders::from_headers(&source).headers();
+
+        assert_eq!(
+            forwarded.get(AUTHORIZATION),
+            Some(&HeaderValue::from_static("Bearer token"))
+        );
+        assert_eq!(
+            forwarded.get(CHATGPT_ACCOUNT_ID),
+            Some(&HeaderValue::from_static("account"))
+        );
+        assert!(!forwarded.contains_key("host"));
+        assert!(!forwarded.contains_key("content-length"));
+        assert!(!forwarded.contains_key("x-unrelated"));
+    }
+
+    #[test]
+    fn extracts_only_the_replayed_response_headers() {
+        let mut source = HeaderMap::new();
+        source.insert(X_CODEX_TURN_STATE, HeaderValue::from_static("turn-abc"));
+        source.insert("x-unrelated", HeaderValue::from_static("not-replayed"));
+
+        let replayed = CodexResponseHeaders::from_headers(&source)
+            .expect("a turn-state header should produce a replay set")
+            .headers();
+        assert_eq!(
+            replayed.get(X_CODEX_TURN_STATE),
+            Some(&HeaderValue::from_static("turn-abc"))
+        );
+        assert!(!replayed.contains_key("x-unrelated"));
+
+        assert!(CodexResponseHeaders::from_headers(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn normalizes_codex_backend_detail_errors() {
+        let error = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<serde_json::Value>("not json")
+                .expect_err("invalid JSON should produce a parse error"),
+            r#"{"detail":"The model is not supported for this account."}"#.to_string(),
+        );
+
+        assert!(matches!(
+            normalize_codex_error(error),
+            OpenAIError::InvalidArgument(message)
+                if message == "The model is not supported for this account."
+        ));
+    }
+}
