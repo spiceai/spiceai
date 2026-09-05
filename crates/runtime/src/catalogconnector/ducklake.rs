@@ -28,6 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::duckdb::with_utc_session_timezone;
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -228,7 +229,7 @@ impl CatalogConnector for DuckLakeCatalog {
         let pool =
             tokio::task::spawn_blocking(move || -> super::Result<Arc<DuckDbConnectionPool>> {
                 let pool = if let Some(path) = open_path.as_deref() {
-                    Arc::new(
+                    Arc::new(with_utc_session_timezone(
                         DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
                             super::Error::UnableToGetCatalogProvider {
                                 connector: PREFIX.to_string(),
@@ -236,15 +237,17 @@ impl CatalogConnector for DuckLakeCatalog {
                                 source: e,
                             }
                         })?,
-                    )
+                    ))
                 } else {
-                    Arc::new(DuckDbConnectionPool::new_memory().map_err(|e| {
-                        super::Error::UnableToGetCatalogProvider {
-                            connector: PREFIX.to_string(),
-                            connector_component: connector_component_for_pool.clone(),
-                            source: e,
-                        }
-                    })?)
+                    Arc::new(with_utc_session_timezone(
+                        DuckDbConnectionPool::new_memory().map_err(|e| {
+                            super::Error::UnableToGetCatalogProvider {
+                                connector: PREFIX.to_string(),
+                                connector_component: connector_component_for_pool.clone(),
+                                source: e,
+                            }
+                        })?,
+                    ))
                 };
 
                 let conn = Arc::clone(&pool).connect_sync().map_err(|e| {

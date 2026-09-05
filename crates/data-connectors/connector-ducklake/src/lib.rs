@@ -20,6 +20,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::duckdb::with_utc_session_timezone;
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -133,7 +134,7 @@ fn create_ducklake_factory(
     params: &ConnectorParams,
 ) -> AnyErrorResult<(DuckDBTableFactory, Arc<DuckDbConnectionPool>, String)> {
     let pool = if let Some(path) = open_path {
-        Arc::new(
+        Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -145,9 +146,9 @@ fn create_ducklake_factory(
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        )
+        ))
     } else {
-        Arc::new(
+        Arc::new(with_utc_session_timezone(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -159,7 +160,7 @@ fn create_ducklake_factory(
                         .unsupported_type_action
                         .unwrap_or(UnsupportedTypeAction::Error),
                 ),
-        )
+        ))
     };
 
     let conn = Arc::clone(&pool).connect_sync().map_err(|source| {
