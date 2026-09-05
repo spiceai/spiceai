@@ -181,6 +181,38 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
         stats.set(Stat::Sum, precision);
     }
 
+    // Persist the column's uncompressed byte size so a scan served from this blob
+    // reports the same size the Vortex footer reports. `JoinSelection` compares
+    // `total_byte_size` before anything else, so a column that loses its size here
+    // changes which side of a join is built (spiceai/spiceai#13829).
+    if let Some(size) = cs.byte_size.get_value() {
+        // `usize -> u64` is lossless on every supported target; `try_from` keeps a
+        // hypothetical wider pointer from truncating to a wrong size, in which case
+        // the stat is skipped rather than persisted wrong.
+        match u64::try_from(*size) {
+            Ok(size_u64) => {
+                let vortex_sv = vortex::scalar::ScalarValue::from(size_u64);
+                if cs.byte_size.is_exact().is_some() {
+                    stats.set(
+                        Stat::UncompressedSizeInBytes,
+                        VortexPrecision::Exact(vortex_sv),
+                    );
+                } else {
+                    stats.set(
+                        Stat::UncompressedSizeInBytes,
+                        VortexPrecision::Inexact(vortex_sv),
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "column_stats_to_stats_set: byte_size {} exceeds u64::MAX; skipping stat",
+                    size,
+                );
+            }
+        }
+    }
+
     if let Some(count) = cs.null_count.get_value() {
         // `usize -> u64` is lossless on all currently supported targets
         // (cayenne requires \u2265 64-bit pointers per project policy), but use
@@ -236,13 +268,25 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
             .and_then(|v| vortex_stat_to_df(&v, Stat::Sum, dtype)),
     );
 
+    // The uncompressed size the footer reported when this blob was written. A blob
+    // written before this stat was persisted has none, which `file_statistics_to_df`
+    // reads as a stale blob.
+    let byte_size = vortex_precision_to_df(
+        stats
+            .get_as::<u64>(
+                Stat::UncompressedSizeInBytes,
+                &vortex::dtype::PType::U64.into(),
+            )
+            .and_then(|size| usize::try_from(size).ok()),
+    );
+
     ColumnStatistics {
         null_count,
         max_value,
         min_value,
         sum_value,
         distinct_count: Precision::Absent,
-        byte_size: Precision::Absent,
+        byte_size,
     }
 }
 
@@ -264,9 +308,23 @@ pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Stat
 
     let num_rows = usize::try_from(num_rows).map_or(Precision::Absent, Precision::Exact);
 
+    // Sum the per-column sizes the way the footer path does
+    // (`VortexFormat::infer_stats`, whose Vortex `Precision::zip` absorbs `Absent`
+    // identically), so the same file reports the same `total_byte_size` whichever
+    // source served it. `Precision::add` is absorbing: one column without a size
+    // makes the whole total `Absent` and keeps it there. That is deliberate — a
+    // blob written before the size was persisted has none on any column, and a
+    // total summed from only the columns that happen to carry one would report a
+    // file as a fraction of its real size rather than as unknown.
+    let total_byte_size = column_statistics
+        .iter()
+        .fold(Precision::Exact(0_usize), |acc, col| {
+            acc.add(&col.byte_size)
+        });
+
     Statistics {
         num_rows,
-        total_byte_size: Precision::Absent,
+        total_byte_size,
         column_statistics,
     }
 }
@@ -405,8 +463,117 @@ pub(crate) fn merge_serialized_stats(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{ColumnStatistics, ScalarValue, stats::Precision as DfPrecision};
+    use datafusion_common::{
+        ColumnStatistics, ScalarValue, Statistics, stats::Precision as DfPrecision,
+    };
     use std::sync::Arc;
+
+    /// The size a scan reports must survive the blob, or the same file answers
+    /// one size from its footer and another from the blob written off that very
+    /// footer — which is what decides a join's build side (#13829).
+    #[test]
+    fn per_column_byte_size_survives_the_persisted_blob() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let stats = Statistics {
+            num_rows: DfPrecision::Exact(4),
+            total_byte_size: DfPrecision::Exact(96),
+            column_statistics: vec![
+                ColumnStatistics {
+                    null_count: DfPrecision::Exact(0),
+                    min_value: DfPrecision::Absent,
+                    max_value: DfPrecision::Absent,
+                    sum_value: DfPrecision::Absent,
+                    distinct_count: DfPrecision::Absent,
+                    byte_size: DfPrecision::Exact(32),
+                },
+                ColumnStatistics {
+                    null_count: DfPrecision::Exact(1),
+                    min_value: DfPrecision::Absent,
+                    max_value: DfPrecision::Absent,
+                    sum_value: DfPrecision::Absent,
+                    distinct_count: DfPrecision::Absent,
+                    byte_size: DfPrecision::Exact(64),
+                },
+            ],
+        };
+
+        let blob = statistics_to_persisted_blob(&stats, &schema).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &schema, 4).expect("blob restores");
+
+        assert_eq!(
+            restored.column_statistics[0].byte_size,
+            DfPrecision::Exact(32),
+            "fixed-width column keeps its byte size"
+        );
+        assert_eq!(
+            restored.column_statistics[1].byte_size,
+            DfPrecision::Exact(64),
+            "variable-width column keeps its byte size"
+        );
+        // Summed the way `VortexFormat::infer_stats` sums them, so the two
+        // sources agree on the total and not merely on the parts.
+        assert_eq!(
+            restored.total_byte_size,
+            DfPrecision::Exact(96),
+            "total is the sum of the per-column sizes"
+        );
+    }
+
+    /// A blob written before byte sizes were persisted has none, and a total
+    /// summed from only the columns that happen to carry one would be wrong
+    /// rather than missing. `Absent` is also the signal
+    /// `collect_scan_file_statistics` re-infers such a blob from the footer on.
+    #[test]
+    fn a_missing_column_byte_size_leaves_the_total_absent() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let sized = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Absent,
+            max_value: DfPrecision::Absent,
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Exact(32),
+        };
+        let unsized_column = ColumnStatistics {
+            byte_size: DfPrecision::Absent,
+            ..sized.clone()
+        };
+
+        // A legacy blob: no column carries a size.
+        let legacy = Statistics {
+            num_rows: DfPrecision::Exact(4),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: vec![unsized_column.clone(), unsized_column.clone()],
+        };
+        let blob = statistics_to_persisted_blob(&legacy, &schema).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &schema, 4).expect("blob restores");
+        assert_eq!(
+            restored.total_byte_size,
+            DfPrecision::Absent,
+            "a blob with no sizes reports no total"
+        );
+
+        // The partial case is the dangerous one: summing 32 here would report a
+        // table a third of its real size and skew every join that reads it.
+        let partial = Statistics {
+            num_rows: DfPrecision::Exact(4),
+            total_byte_size: DfPrecision::Absent,
+            column_statistics: vec![sized, unsized_column],
+        };
+        let blob = statistics_to_persisted_blob(&partial, &schema).expect("blob serializes");
+        let restored = statistics_from_persisted_blob(&blob, &schema, 4).expect("blob restores");
+        assert_eq!(
+            restored.total_byte_size,
+            DfPrecision::Absent,
+            "one column without a size makes the total absent, not a partial sum"
+        );
+    }
 
     #[test]
     fn utf8_min_max_roundtrip_through_file_statistics() {
