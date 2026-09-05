@@ -288,7 +288,15 @@ pub fn to_cached_record_batch_stream(
                 tracing::debug!(
                     "A table read by this query changed while it ran, skipping cache storage"
                 );
-            } else if batches_cacheable(&records) && batches_boundable(&records) {
+            } else if !batches_cacheable(&records) {
+                tracing::debug!(
+                    "The result carried transient HTTP error responses (5xx/429), skipping cache storage"
+                );
+            } else if !batches_boundable(&records) {
+                tracing::debug!(
+                    "The result holds a column no copy can decouple from the memory its producer owns, so an entry over it could not be bounded by the cache size limit; skipping cache storage"
+                );
+            } else {
                 // Cache the result, including genuinely empty (0-row / 0-batch)
                 // result sets. The schema is stored separately in
                 // `CachedQueryResult`, so an empty result round-trips with the
@@ -325,10 +333,6 @@ pub fn to_cached_record_batch_stream(
                         tracing::error!("Failed to encode query results for caching: {e}");
                     }
                 }
-            } else {
-                tracing::debug!(
-                    "Transient HTTP error responses were present, skipping cache storage"
-                );
             }
         }
     };
