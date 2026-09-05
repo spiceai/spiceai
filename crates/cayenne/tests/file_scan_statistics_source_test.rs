@@ -217,10 +217,24 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     // Overwrite every per-file row with a pre-change blob, which is the state an
     // installation that upgrades into this change is already in.
     let table_id = table.table_id().to_string();
-    let files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
+    // The manifest rows are published by the checkpoint/maintenance passes above, and
+    // `flush_pending_maintenance` does not guarantee they are committed by the time it
+    // returns. Poll for them rather than asserting once: on a loaded runner the first
+    // read comes back empty, which is a readiness race in this test and not a missing
+    // file (spiceai/spiceai#13906 is the same shape in a neighbouring suite).
+    let mut files = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
+        if !files.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
         !files.is_empty(),
-        "the settle must have produced a data file"
+        "the settle must have produced a data file within 30s; \
+         `get_all_snapshot_files` still returns no manifest row for table {table_id}"
     );
     let scan_snapshot_id = files[0].snapshot_id.clone();
     // Per-file statistics rows are keyed by the object-store location, which is the
