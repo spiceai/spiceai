@@ -1339,7 +1339,7 @@ assert_failure_kind "the preflight refusal stays a disk failure with a cache fla
 # A signalled run reached no verdict at all, which is a different statement from
 # either disk kind: both of those describe a `make` that returned. The statuses
 # here are what bash reports for a killed foreground child — 128+N — which is how
-# a `Sign off` step whose 353-minute budget expires reads (#12518).
+# a `Sign off` step whose budget expires reads (#12518).
 assert_failure_kind "calls a SIGTERM'd run signalled, not a check failure" 143 "signalled" \
   STUB_FREE_KB="$(gib_to_kb 200)"
 assert_failure_kind "calls an interrupted run signalled" 130 "signalled" \

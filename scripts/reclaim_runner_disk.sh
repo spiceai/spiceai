@@ -70,8 +70,8 @@ readonly DEFAULT_MAX_AGE_DAYS=7
 # 163 GiB on the healthy hosts, 26 then 1 GiB and 5 GiB on the two that broke.
 # A floor between those populations reclaims where it matters and touches
 # nothing where it does not -- which is the point, because a pruned cache is not
-# free. Sign-offs on this pool run 2-5 hours against a 353-minute step budget,
-# and a budget expiry publishes `signoff=failure`, disqualifying the commit as
+# free. Sign-offs on this pool run for hours against the sign-off step's budget
+# (see .github/workflows/signoff.yml), and an expiry disqualifies the commit as
 # if the branch were broken. Trading that risk for space a host already has
 # would be a bad trade in both directions.
 readonly DEFAULT_FREE_GIB=100
