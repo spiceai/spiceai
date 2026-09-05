@@ -1409,7 +1409,8 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
                        (2, [1e20, 0.0, 0.0]::FLOAT[3],       [1e20, 0.0, 0.0]::FLOAT[3]),
                        (3, ['nan'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
                        (4, ['inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
-                       (5, [0.0, 0.0, 0.0]::FLOAT[3],        [1.0, 2.0, 3.0]::FLOAT[3]);",
+                       (5, ['-inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (6, [0.0, 0.0, 0.0]::FLOAT[3],        [1.0, 2.0, 3.0]::FLOAT[3]);",
                 )
                 .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
             }
@@ -1454,14 +1455,20 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
                 .await
                 .map_err(|e| format!("query `{query}` collect failed: {e}"))?;
 
-            // Rows 2-4 overflow or carry a non-finite element; the kernel calls
+            // Rows 2-5 overflow or carry a non-finite element; the kernel calls
             // each of those undefined, so the federated answer must be NULL too.
-            // Rows 1 and 5 are ordinary and must survive the screen.
+            // Rows 1 and 6 are ordinary and must survive the screen.
+            //
+            // Both infinities are rows because they fail a screen in opposite
+            // directions: `-inf` sorts below every real number under `ORDER BY
+            // … DESC`, so it never surfaced as the top row that made #13787
+            // visible, and an upper-bound screen would reject `+inf` while
+            // letting `-inf` through.
             //
             // Asserted per value rather than against a rendered table: a NULL
             // and a `nan` are both blank in the pretty-printed form, which is
             // exactly the difference this test exists to catch.
-            let expected = vec![Some(32.0_f64), None, None, None, Some(0.0_f64)];
+            let expected = vec![Some(32.0_f64), None, None, None, None, Some(0.0_f64)];
             let scores: Vec<Option<f64>> = result
                 .iter()
                 .flat_map(|batch| {
@@ -1481,8 +1488,9 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
                 scores, expected,
                 "a federated inner_product must match the kernel wherever the result \
                  is not a finite number: NULL for the overflow (id 2), the NaN \
-                 element (id 3) and the infinite element (id 4). Finite results are \
-                 not claimed to agree exactly — see #13893"
+                 element (id 3) and the positive and negative infinite elements \
+                 (ids 4 and 5). Finite results are not claimed to agree exactly \
+                 — see #13893"
             );
 
             let explain: Vec<RecordBatch> = rt
