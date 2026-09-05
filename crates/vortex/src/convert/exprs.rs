@@ -544,11 +544,13 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr;
 
-    // Expression types that convert() handles. BinaryExpr must also have a
-    // Vortex-supported operator and convertible children: convert() rejects
-    // RegexMatch and similar ops, so accepting any BinaryExpr here would let
-    // array_length(CASE WHEN col ~ 'p' THEN a ELSE b END) pass the pushdown
-    // gate and then fail at scan planning.
+    // Expression types that convert() handles. Every wrapper convert() rewrites
+    // must recurse into the children convert() will visit, and must enforce
+    // convert()-specific restrictions (supported binary operators, literal-only
+    // IN lists, UTF-8 get_field names, CASE with ELSE). Accepting a wrapper
+    // whose child convert() cannot rewrite would let
+    // `array_length(CASE WHEN lower(name) LIKE '%x%' THEN a ELSE b END)` pass
+    // the pushdown gate and then fail at scan planning.
     expr.downcast_ref::<df_expr::BinaryExpr>()
         .is_some_and(|binary| {
             try_operator_from_df(*binary.op()).is_ok()
@@ -556,25 +558,69 @@ fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
                 && is_convertible_expr(binary.right())
         })
         || expr.downcast_ref::<df_expr::Column>().is_some()
-        || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::LikeExpr>()
+            .is_some_and(|like| {
+                is_convertible_expr(like.expr()) && is_convertible_expr(like.pattern())
+            })
         || expr
             .downcast_ref::<df_expr::Literal>()
             .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
         || expr
             .downcast_ref::<df_expr::CastExpr>()
             .is_some_and(|e| is_convertible_expr(e.expr()))
-        || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
-        || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::IsNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
+        || expr
+            .downcast_ref::<df_expr::IsNotNullExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
         || expr
             .downcast_ref::<df_expr::NotExpr>()
             .is_some_and(|n| is_convertible_expr(n.arg()))
-        || expr.downcast_ref::<df_expr::InListExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::InListExpr>()
+            .is_some_and(is_convertible_in_list_expr)
         || expr
             .downcast_ref::<df_expr::CaseExpr>()
             .is_some_and(is_convertible_case_expr)
-        || expr.downcast_ref::<ScalarFunctionExpr>().is_some_and(|sf| {
-            ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some()
-                || is_convertible_array_length(sf)
+        || expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|sf| is_convertible_get_field(sf) || is_convertible_array_length(sf))
+}
+
+/// Type-only convertibility check for `InListExpr`, matching `convert()`:
+/// the haystack expression must be convertible, and every list value must be a
+/// literal `Scalar::from_df` accepts. `convert()` rejects non-literal list
+/// values (`Failed to cast sub-expression`), so accepting them here would break
+/// the "accepted for pushdown => convertible" invariant.
+fn is_convertible_in_list_expr(in_list: &df_expr::InListExpr) -> bool {
+    is_convertible_expr(in_list.expr())
+        && in_list.list().iter().all(|value| {
+            value
+                .downcast_ref::<df_expr::Literal>()
+                .is_some_and(|literal| Scalar::from_df(literal.value()).is_ok())
+        })
+}
+
+/// Type-only convertibility check for `get_field`, matching `convert()`:
+/// the source expression must be convertible, and every field-name argument
+/// must be a UTF-8 string literal.
+fn is_convertible_get_field(scalar_fn: &ScalarFunctionExpr) -> bool {
+    if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_none() {
+        return false;
+    }
+
+    let Some((source, field_names)) = scalar_fn.args().split_first() else {
+        return false;
+    };
+
+    is_convertible_expr(source)
+        && field_names.iter().all(|field_name| {
+            field_name
+                .downcast_ref::<df_expr::Literal>()
+                .and_then(|literal| literal.value().try_as_str().flatten())
+                .is_some()
         })
 }
 
@@ -821,6 +867,26 @@ mod tests {
             )
             .expect("array_length expression should be valid"),
         )
+    }
+
+    fn lower_name_expr(schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(datafusion_functions::string::lower()),
+                vec![name],
+                schema,
+                Arc::new(ConfigOptions::new()),
+            )
+            .expect("lower(name) expression should be valid"),
+        )
+    }
+
+    fn like_pattern(expr: Arc<dyn PhysicalExpr>, pattern: &str) -> Arc<dyn PhysicalExpr> {
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            pattern.to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern))
     }
 
     #[test]
@@ -1602,6 +1668,112 @@ mod tests {
         assert!(
             !can_be_pushed_down_impl(&array_length, &test_schema),
             "array_length over a CASE with RegexMatch WHEN must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_unconvertible_like_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN lower(name) LIKE '%x%' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects `lower`, so LikeExpr must recurse
+        // into its children and decline — otherwise the pushdown gate accepts
+        // the CASE and convert() fails at scan planning.
+        let when = like_pattern(lower_name_expr(&test_schema), "%x%");
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let declined_case = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(when, then_list)], Some(else_list))
+                .expect("CASE with lower(name) LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined_case.as_ref())
+            .expect_err("LIKE over lower(name) must not convert to a Vortex expression");
+
+        assert!(
+            !is_convertible_expr(&declined_case),
+            "CASE WHEN lower(name) LIKE '%x%' must not be convertible"
+        );
+
+        let declined = array_length_expr(vec![declined_case], &test_schema);
+        assert!(
+            !is_convertible_expr(&declined),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be convertible"
+        );
+        assert!(
+            !can_be_pushed_down_impl(&declined, &test_schema),
+            "array_length over a CASE with lower(name) LIKE WHEN must not be accepted for pushdown"
+        );
+
+        // The same CASE with only convertible children still pushes down.
+        let convertible_when = like_pattern(
+            Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>,
+            "%x%",
+        );
+        let convertible_then = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let convertible_else =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let convertible_case = Arc::new(
+            df_expr::CaseExpr::try_new(
+                None,
+                vec![(convertible_when, convertible_then)],
+                Some(convertible_else),
+            )
+            .expect("CASE with name LIKE WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible_case),
+            "CASE WHEN name LIKE '%x%' with list columns must stay convertible"
+        );
+
+        let pushable = array_length_expr(vec![convertible_case], &test_schema);
+        assert!(
+            is_convertible_expr(&pushable),
+            "array_length over a CASE with convertible LIKE WHEN must stay convertible"
+        );
+        assert!(
+            can_be_pushed_down_impl(&pushable, &test_schema),
+            "array_length over a CASE with convertible LIKE WHEN must still push down"
+        );
+    }
+
+    #[test]
+    fn test_in_list_non_literal_values_not_convertible() {
+        // convert() only rewrites IN-list values that are literals. A column
+        // value must decline convertibility so pushdown falls back to DataFusion.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("other", DataType::Int32, false),
+        ]);
+        let expr = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let non_literal = Arc::new(df_expr::Column::new("other", 1)) as Arc<dyn PhysicalExpr>;
+        let declined = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&expr), vec![non_literal], false, &schema)
+                .expect("IN-list with a column value should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(declined.as_ref())
+            .expect_err("non-literal IN list values must not convert");
+
+        assert!(
+            !is_convertible_expr(&declined),
+            "IN list with a non-literal value must not be convertible"
+        );
+
+        let literal_values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let convertible = Arc::new(
+            df_expr::InListExpr::try_new(expr, literal_values, false, &schema)
+                .expect("IN-list with literal values should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            is_convertible_expr(&convertible),
+            "IN list with only convertible literals must stay convertible"
         );
     }
 
