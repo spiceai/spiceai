@@ -51,6 +51,7 @@ pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
 pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
 pub(crate) const JSON_GET_BOOL_NAME: &str = "json_get_bool";
 pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
+pub(crate) const JSON_CONTAINS_NAME: &str = "json_contains";
 pub(crate) const JSON_LENGTH_NAME: &str = "json_length";
 /// `json_length`'s alias. `ScalarUDF::name` returns the canonical name, so a
 /// plan never carries this one — but the federation deny-list is built from
@@ -194,7 +195,7 @@ fn key_is_renderable(key: &str) -> bool {
 
 /// Whether the path arguments of a `json_get_*` call can be rendered. Reads
 /// [`json_path`], so it answers exactly the question the handlers can answer.
-fn json_path_is_renderable(args: &[Expr]) -> bool {
+fn json_path_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     json_path(args).is_some()
 }
 /// The aggregates whose `FILTER` the `BigQuery` dialect rewrites exactly.
@@ -309,13 +310,13 @@ pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunctio
 /// built-in with no handler here is either denied by name (`regexp_match`) or
 /// unparses through the inner dialect.
 #[must_use]
-pub fn can_translate(call: &ScalarFunction, _scope: Option<&datafusion::common::DFSchema>) -> bool {
+pub fn can_translate(call: &ScalarFunction, scope: Option<&datafusion::common::DFSchema>) -> bool {
     let name = call.func.name();
     SCALAR_OVERRIDES
         .iter()
         .chain(BUILTIN_SCALAR_OVERRIDES)
         .find(|entry| entry.name == name)
-        .is_none_or(|entry| (entry.can_translate)(&call.args))
+        .is_none_or(|entry| (entry.can_translate)(&call.args, scope))
 }
 
 /// A function the `BigQuery` dialect rewrites into native SQL.
@@ -331,7 +332,14 @@ pub(crate) struct ScalarOverride {
     /// Renders the call, or fails if it cannot — see [`json_get_number_to_sql`].
     pub(crate) handler: fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>>,
     /// Whether `handler` can render a call with these arguments.
-    pub(crate) can_translate: fn(&[Expr]) -> bool,
+    ///
+    /// The scope is the schema the arguments resolve against, and is `None`
+    /// where the type cannot be established — see
+    /// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`].
+    /// A rendering whose correctness depends on an operand's *declared* type
+    /// must answer `false` there rather than assume one; every other check
+    /// ignores it.
+    pub(crate) can_translate: fn(&[Expr], Option<&datafusion::common::DFSchema>) -> bool,
 }
 
 /// Every function the `BigQuery` dialect rewrites, with what each consumer
@@ -362,6 +370,11 @@ pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
         name: JSON_LENGTH_NAME,
         handler: json_length_to_sql,
         can_translate: json_path_is_renderable,
+    },
+    ScalarOverride {
+        name: JSON_CONTAINS_NAME,
+        handler: json_contains_to_sql,
+        can_translate: json_contains_is_renderable,
     },
     ScalarOverride {
         name: JSON_LEN_NAME,
@@ -407,7 +420,7 @@ pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
 /// a non-negative index and refuses the rest; this is the check that keeps the
 /// refusal off the pushdown path, leaving such a call to evaluate locally rather
 /// than failing the query.
-fn array_index_is_renderable(args: &[Expr]) -> bool {
+fn array_index_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     let [_, Expr::Literal(index, _)] = args else {
         return false;
     };
@@ -426,6 +439,147 @@ fn array_index_is_renderable(args: &[Expr]) -> bool {
 /// the generic 0-based subscript, which reads the neighbouring element.
 fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
     BigQueryDialect::new().scalar_function_to_sql_overrides(unparser, "array_element", args)
+}
+
+/// The error a JSON handler raises for a call it cannot render.
+///
+/// Unreachable with the deny-list installed, which refuses exactly these calls.
+/// Reachable only if this dialect is used without
+/// `deny_spice_functions_for_bigquery_table_providers`, and there the
+/// alternative — `Ok(None)` — makes the unparser emit the function verbatim into
+/// `BigQuery` SQL, which is the wrong answer dressed as a remote error.
+fn unrenderable_json_call(function: &str) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
+         cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
+         built only from plain keys, and for a JSON document whose column type the source \
+         declares: every path argument must be a literal, there must be at least one, a key \
+         cannot contain a quote, a backslash or a control character, and the document must be a \
+         column rather than a computed expression. Rewrite the call to a constant path of plain \
+         keys over a column, or set 'query_federation: disabled' on the dataset to evaluate it \
+         locally instead. \
+         See: https://spiceai.org/docs/components/data-connectors/adbc"
+    ))
+}
+
+/// How `BigQuery` holds the document a JSON call reads, when the source said.
+///
+/// Not a `DataType` question: a native `JSON` column and a `STRING` column both
+/// arrive as `Utf8`, and the canonical `arrow.json` extension that distinguishes
+/// them lives in the field's *metadata*.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum JsonDocument {
+    /// A native `BigQuery` `JSON` column.
+    Native,
+    /// A `STRING` column holding JSON text.
+    Text,
+}
+
+/// What the source said the document column is, or `None` if it did not say.
+///
+/// `None` is the answer for anything that is not a column the driver described —
+/// a computed expression such as `COALESCE(a, b)` resolves to bare `Utf8` and
+/// carries neither marker. That case must **refuse**, not guess: the two
+/// renderings below are not interchangeable, and picking wrong is a wrong answer
+/// on one type and a hard type error on the other.
+pub(crate) fn json_document_kind(
+    document: &Expr,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> Option<JsonDocument> {
+    use datafusion::logical_expr::ExprSchemable as _;
+    let field = document.to_field(scope?).ok().map(|(_, field)| field)?;
+    json_document_kind_of(&field)
+}
+
+/// [`json_document_kind`] once the field is in hand.
+pub(crate) fn json_document_kind_of(
+    field: &datafusion::arrow::datatypes::Field,
+) -> Option<JsonDocument> {
+    let metadata = field.metadata();
+    // The canonical Arrow extension first; `BIGQUERY:type` is the driver's own
+    // statement of the remote type and agrees with it.
+    if metadata
+        .get("ARROW:extension:name")
+        .is_some_and(|n| n == "arrow.json")
+        || metadata.get("BIGQUERY:type").is_some_and(|t| t == "JSON")
+    {
+        return Some(JsonDocument::Native);
+    }
+    if metadata.get("BIGQUERY:type").is_some_and(|t| t == "STRING") {
+        return Some(JsonDocument::Text);
+    }
+    None
+}
+
+/// Whether `json_contains` can be rendered for this call.
+///
+/// Needs a renderable path *and* a document whose remote type the source
+/// declared — see [`json_document_kind`].
+fn json_contains_is_renderable(
+    args: &[Expr],
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    json_path(args).is_some()
+        && args
+            .first()
+            .and_then(|document| json_document_kind(document, scope))
+            .is_some()
+}
+
+/// `json_contains(doc, path…)` → whether the path resolves to a node.
+///
+/// `json_contains` is true for a node of *any* type, a JSON `null` included, and
+/// false when the path does not resolve. Which `BigQuery` expression says that
+/// depends on how the column is held, and the two are not interchangeable —
+/// measured over all node kinds on both:
+///
+/// * native `JSON`: `JSON_QUERY(doc, '<path>') IS NOT NULL`. A present JSON
+///   `null` comes back as a JSON `null` value, which is not SQL NULL, so it is
+///   told apart from a missing key.
+/// * `STRING`: the same test over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+///   string, `JSON_QUERY` returns SQL **NULL** for a present JSON `null` — the
+///   very confusion this function was denied for — and `SAFE.` is what makes a
+///   malformed document `false` rather than an error.
+///
+/// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a type
+/// error, and the direct form on a `STRING` column reads a present null as
+/// absent, quietly. The alternative of normalising both with `FORMAT('%t', …)`
+/// is measured equivalent but refuses past 1 MiB of output ("Output string too
+/// long while evaluating FORMAT"), which would turn a working query into a
+/// failure on a large document; the type-directed pair is clean at 9 MB.
+pub(crate) fn json_contains_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    // `NeverResolves` is a path no lookup matches, so the answer is `false` for
+    // every row — not NULL, which is what the shared `json_call_to_sql` emits
+    // for the accessors.
+    let JsonPath::Path(path) = path else {
+        return Ok(Some(ast::Expr::Value(ast::Value::Boolean(false).into())));
+    };
+
+    let Some(kind) = unparser
+        .resolved_field(document)
+        .as_deref()
+        .and_then(json_document_kind_of)
+    else {
+        return Err(unrenderable_json_call(JSON_CONTAINS_NAME));
+    };
+
+    let document = unparser.expr_to_sql(document)?;
+    let document = match kind {
+        JsonDocument::Native => document,
+        JsonDocument::Text => call_function("SAFE.PARSE_JSON", vec![document]),
+    };
+
+    Ok(Some(ast::Expr::IsNotNull(Box::new(call_function(
+        "JSON_QUERY",
+        vec![document, ast::Expr::Value(raw_string(&path).into())],
+    )))))
 }
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
@@ -450,15 +604,7 @@ fn json_call_to_sql(
     render: impl FnOnce(ast::Expr, ast::Expr) -> ast::Expr,
 ) -> Result<Option<ast::Expr>> {
     let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
-        return Err(DataFusionError::Plan(format!(
-            "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
-             cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
-             built only from plain keys: every path argument must be a literal, there must be at \
-             least one, and a key cannot contain a quote, a backslash or a control character. \
-             Rewrite the call to a constant path of plain keys, or set 'query_federation: disabled' \
-             on the dataset to evaluate it locally instead. \
-             See: https://spiceai.org/docs/components/data-connectors/adbc"
-        )));
+        return Err(unrenderable_json_call(function));
     };
 
     let path = match path {
@@ -825,7 +971,7 @@ pub(crate) fn regexp_like_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<O
 /// Whether the arguments of a `regexp_like` call can be rendered. Reads
 /// [`regexp_contains`], so it answers exactly the question the handler can
 /// answer.
-fn regexp_like_is_renderable(args: &[Expr]) -> bool {
+fn regexp_like_is_renderable(args: &[Expr], _scope: Option<&datafusion::common::DFSchema>) -> bool {
     regexp_contains(args).is_some()
 }
 
@@ -1589,11 +1735,196 @@ mod tests {
             JSON_GET_BOOL_NAME,
             vec![col("doc"), col("key")]
         )));
-        for name in ["json_contains", "upper"] {
+        assert!(
+            translates(&call("upper", vec![col("doc"), col("key")])),
+            "upper has no handler in this dialect, so it is not this check's business — \
+             the deny-list has not carved it out and it cannot federate at all"
+        );
+
+        // `json_contains` *does* have a handler now, and its check is stricter
+        // than a renderable path: the rendering differs for a native `JSON`
+        // column and a `STRING` one, so a document whose remote type the source
+        // did not declare is refused rather than guessed at. With no scope
+        // nothing is declared, so every shape here refuses.
+        for args in [vec![col("doc"), lit("a")], vec![col("doc"), col("key")]] {
             assert!(
-                translates(&call(name, vec![col("doc"), col("key")])),
-                "{name} has no handler in this dialect, so it is not this check's business — \
-                 the deny-list has not carved it out and it cannot federate at all"
+                !translates(&call(super::JSON_CONTAINS_NAME, args)),
+                "json_contains must refuse a document whose BigQuery type is not \
+                 established — the two renderings are not interchangeable"
+            );
+        }
+    }
+
+    /// A recursive CTE behind a derived table opens the statement, on the plan
+    /// the runtime actually unparses.
+    ///
+    /// `BigQuery` accepts `WITH RECURSIVE` only at the top of a statement. Six
+    /// corpus statements join a literal generator through a derived table, and
+    /// once the CTE started federating they failed with "WITH RECURSIVE is only
+    /// allowed at the top level of the SELECT".
+    ///
+    /// This builds the plan through a `SessionContext` — from SQL, **optimized**
+    /// — rather than assembling one, and that is the whole point. The failing
+    /// arrangement (`SubqueryAlias` over a `Projection` over the
+    /// `RecursiveQuery`) is produced by the optimizer, and it routes through the
+    /// *top-level* renderer rather than the nested one. Three hand-built plans
+    /// that looked like the failing shape routed elsewhere and passed with the
+    /// fix reverted; the fork's own test cannot run the optimizer, so this is
+    /// the guard that covers it.
+    #[tokio::test]
+    async fn a_recursive_cte_behind_a_derived_table_opens_the_statement() {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", DataType::Int64, true),
+        ]));
+        ctx.register_table(
+            "t",
+            Arc::new(
+                datafusion::catalog::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                    .expect("build the table"),
+            ) as Arc<dyn datafusion::catalog::TableProvider>,
+        )
+        .expect("register the table");
+
+        let generator = "WITH RECURSIVE g AS (                           SELECT 1 AS n UNION ALL SELECT n + 1 AS n FROM g WHERE n < 5                         ) ";
+        let rendered = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                let plan = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan the statement")
+                    .into_optimized_plan()
+                    .expect("optimize the plan");
+                unparse_plan(new_bigquery_dialect().as_ref(), &plan)
+            }
+        };
+
+        // The shape that failed: the generator behind a derived table.
+        let behind_derived = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN (SELECT n FROM g) gg ON t.id = gg.n"
+        ))
+        .await;
+        assert!(
+            behind_derived.starts_with("WITH RECURSIVE"),
+            "the CTE has to open the statement: {behind_derived}"
+        );
+        assert!(
+            !behind_derived.contains("JOIN (WITH"),
+            "a WITH inside a derived table is what BigQuery refuses: {behind_derived}"
+        );
+
+        // The control: joined directly, which was already hoisted and must stay so.
+        let joined_directly = rendered(format!(
+            "{generator}SELECT t.id FROM t JOIN g ON t.id = g.n"
+        ))
+        .await;
+        assert!(
+            joined_directly.starts_with("WITH RECURSIVE"),
+            "a directly joined generator still opens the statement: {joined_directly}"
+        );
+    }
+
+    /// `json_contains` renders by the document's *declared* type, and refuses
+    /// when the source did not declare one.
+    ///
+    /// The two spellings are not interchangeable, measured over every node kind:
+    ///
+    /// * native `JSON` — `JSON_QUERY(doc, path) IS NOT NULL`. A present JSON
+    ///   `null` is a JSON `null` value, not SQL NULL, so it is told apart from a
+    ///   missing key.
+    /// * `STRING` — the same over `SAFE.PARSE_JSON(doc)`. Applied to the raw
+    ///   string, `JSON_QUERY` answers SQL NULL for a present JSON `null` too,
+    ///   which is the confusion this function was denied for.
+    ///
+    /// Swapping them is not a near miss: `PARSE_JSON` on a `JSON` column is a
+    /// type error, and the direct form on a `STRING` column reads a present null
+    /// as absent, quietly. So a document the source did not describe — a
+    /// computed expression carries no marker — is refused rather than guessed.
+    #[test]
+    fn json_contains_renders_by_the_documents_declared_type() {
+        let column = |name: &str, bigquery_type: Option<&str>| {
+            let mut field = datafusion::arrow::datatypes::Field::new(name, DataType::Utf8, true);
+            if let Some(bigquery_type) = bigquery_type {
+                field = field.with_metadata(
+                    [("BIGQUERY:type".to_string(), bigquery_type.to_string())]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            field
+        };
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    column("native", Some("JSON")),
+                    column("text", Some("STRING")),
+                    column("undeclared", None),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(Arc::clone(&scope));
+        let render = |document: &str| {
+            dialect
+                .scalar_function_to_sql_overrides(
+                    &unparser,
+                    super::JSON_CONTAINS_NAME,
+                    &[col(document), lit("a")],
+                )
+                .map(|rendered| rendered.map(|expr| expr.to_string()))
+        };
+
+        let native = render("native")
+            .expect("a native JSON document renders")
+            .expect("a rendering");
+        assert!(
+            native.contains("JSON_QUERY(`native`, R'$.\"a\"')") && native.contains("IS NOT NULL"),
+            "a native JSON column is asked directly: {native}"
+        );
+        assert!(
+            !native.contains("PARSE_JSON"),
+            "PARSE_JSON on a JSON column is a type error: {native}"
+        );
+
+        let text = render("text")
+            .expect("a STRING document renders")
+            .expect("a rendering");
+        assert!(
+            text.contains("SAFE.PARSE_JSON(`text`)"),
+            "a STRING column has to be parsed first, and SAFE. is what makes a \
+             malformed document false rather than an error: {text}"
+        );
+        assert!(
+            text.contains("IS NOT NULL"),
+            "the parsed document is still asked whether the path resolves: {text}"
+        );
+
+        // Undeclared: refused by the per-call check, and the handler raises
+        // rather than guessing if it is ever reached without the deny-list.
+        assert!(
+            !can_translate(
+                &call(super::JSON_CONTAINS_NAME, vec![col("undeclared"), lit("a")]),
+                Some(scope.as_ref()),
+            ),
+            "a document with no declared BigQuery type must not federate"
+        );
+        assert!(
+            render("undeclared").is_err(),
+            "the handler must raise rather than pick a rendering at random"
+        );
+
+        // And the two declared forms *do* federate.
+        for document in ["native", "text"] {
+            assert!(
+                can_translate(
+                    &call(super::JSON_CONTAINS_NAME, vec![col(document), lit("a")]),
+                    Some(scope.as_ref()),
+                ),
+                "{document} has a declared type, so it federates"
             );
         }
     }
@@ -1983,7 +2314,7 @@ mod tests {
                 _ => [col("code"), lit("^R[0-9]{2}")],
             };
             assert!(
-                (entry.can_translate)(&args),
+                (entry.can_translate)(&args, None),
                 "`{name}`'s representative call must be translatable",
                 name = entry.name
             );
@@ -2172,7 +2503,24 @@ mod tests {
         // the dialect has no handler for would be unparsed verbatim, so the
         // list is only safe while the dialect answers for all of it.
         let dialect = new_bigquery_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
+        // A scope declaring `doc` as a BigQuery STRING column. `json_contains`
+        // renders differently for a native JSON column and refuses a document
+        // whose type the source did not declare, so it needs one; every other
+        // handler ignores it.
+        let scope = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                vec![
+                    datafusion::arrow::datatypes::Field::new("doc", DataType::Utf8, true)
+                        .with_metadata(
+                            [("BIGQUERY:type".to_string(), "STRING".to_string())]
+                                .into_iter()
+                                .collect(),
+                        ),
+                ],
+            ))
+            .expect("scope"),
+        );
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(scope);
         for name in crate::dialect::bigquery_native_function_names() {
             let rendered = dialect
                 .scalar_function_to_sql_overrides(&unparser, name, &[col("doc"), lit("a")])
