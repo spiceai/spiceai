@@ -44,6 +44,15 @@ pub enum Error {
     #[snafu(display("TPC-H suite directory '{}' is missing `{name}`", path.display()))]
     SuitePathMissing { path: PathBuf, name: String },
 
+    #[snafu(display(
+        "Failed to load expected output '{}', so the case cannot be certified: {source}",
+        path.display()
+    ))]
+    InvalidGolden {
+        path: PathBuf,
+        source: crate::compare::ParseTypedCsvError,
+    },
+
     #[snafu(display("Unknown TPC-H table '{name}' referenced by test '{test_id}'"))]
     UnknownTable { name: String, test_id: String },
 

@@ -142,9 +142,12 @@ impl ModeAEngine {
             .execute_logical_plan(logical_plan)
             .await
             .map_err(|e| format!("execute_logical_plan: {e}"))?;
+        // Collect can return no batches for an empty result; keep the plan
+        // schema so a header-only golden can still type-check.
+        let schema = df.schema().as_arrow().clone();
         let batches = df.collect().await.map_err(|e| format!("collect: {e}"))?;
 
-        Ok(batches_to_table(&batches))
+        Ok(batches_to_table(&batches, &schema))
     }
 }
 
@@ -198,14 +201,7 @@ fn ensure_inputs_registered(case: &LoadedCase) -> std::result::Result<(), String
     Ok(())
 }
 
-fn batches_to_table(batches: &[RecordBatch]) -> TableData {
-    if batches.is_empty() {
-        return TableData {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        };
-    }
-    let schema = batches[0].schema();
+fn batches_to_table(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) -> TableData {
     let columns = schema
         .fields()
         .iter()
@@ -331,5 +327,26 @@ fn format_date32(days: i32) -> String {
     match chrono::DateTime::from_timestamp(i64::from(days) * 86_400, 0) {
         Some(ts) => ts.format("%Y-%m-%d").to_string(),
         None => days.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema};
+
+    #[test]
+    fn empty_batches_preserve_execution_schema() {
+        let schema = Schema::new(vec![
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+        ]);
+        let table = batches_to_table(&[], &schema);
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(table.columns[0].name, "flag");
+        assert_eq!(table.columns[0].type_token, "string");
+        assert_eq!(table.columns[1].name, "n");
+        assert_eq!(table.columns[1].type_token, "integer");
+        assert!(table.rows.is_empty());
     }
 }

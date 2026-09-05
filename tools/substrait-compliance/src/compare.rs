@@ -90,6 +90,9 @@ pub enum CompareMismatch {
         actual: String,
         expected: String,
     },
+    /// Expected table has no typed columns. A zero-byte or headerless
+    /// golden must not compare equal to an empty execution result.
+    MissingTypedHeader,
 }
 
 impl std::fmt::Display for CompareMismatch {
@@ -121,12 +124,19 @@ impl std::fmt::Display for CompareMismatch {
                 actual,
                 expected,
             } => write!(f, "cell ({row},{column}) '{actual}' != '{expected}'"),
+            Self::MissingTypedHeader => write!(
+                f,
+                "expected output has no typed columns (zero-byte or headerless golden)"
+            ),
         }
     }
 }
 
 #[must_use]
 pub fn compare(actual: &TableData, expected: &TableData) -> Option<CompareMismatch> {
+    if expected.columns.is_empty() {
+        return Some(CompareMismatch::MissingTypedHeader);
+    }
     if actual.rows.len() != expected.rows.len() {
         return Some(CompareMismatch::RowCount {
             actual: actual.rows.len(),
@@ -320,71 +330,66 @@ fn shared_decimal_scale(actual_type: Option<&str>, expected_type: Option<&str>) 
     (actual_scale == expected_scale).then_some(actual_scale)
 }
 
+/// Why a golden CSV was rejected at parse time. A zero-byte or
+/// headerless file is not an empty result — that needs a typed header
+/// and zero data rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseTypedCsvError {
+    MissingTypedHeader,
+}
+
+impl ParseTypedCsvError {
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::MissingTypedHeader => {
+                "missing typed header (`col:type|...`). A zero-byte or headerless golden is not an empty result; use a typed header with zero data rows"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ParseTypedCsvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ParseTypedCsvError {}
+
 /// Parse a pipe-delimited expected-output CSV with a typed header
 /// (`col:type|col:type|...`) as documented in the IBM TPC-H suite README.
 /// Short or wide rows are kept so [`compare`] can report a row-width
 /// mismatch instead of silently `zip`-truncating.
-#[must_use]
-pub fn parse_typed_csv(text: &str) -> TableData {
-    let mut lines = text.lines().peekable();
+///
+/// A zero-byte or headerless file is an error, not an empty table. A
+/// legitimate empty result is a typed header with zero data rows.
+pub fn parse_typed_csv(text: &str) -> std::result::Result<TableData, ParseTypedCsvError> {
+    let mut lines = text.lines();
     let Some(header) = lines.next() else {
-        return TableData {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        };
+        return Err(ParseTypedCsvError::MissingTypedHeader);
     };
     let fields: Vec<&str> = header.split('|').collect();
-    let has_typed_header = fields.iter().all(|f| f.contains(':'));
-    let columns = if has_typed_header {
-        fields
-            .iter()
-            .map(|f| {
-                let (name, type_str) = f.split_once(':').unwrap_or((f, "varchar"));
-                ColumnSpec {
-                    name: name.trim().to_string(),
-                    type_token: type_str.trim().to_string(),
-                }
-            })
-            .collect()
-    } else {
-        fields
-            .iter()
-            .enumerate()
-            .map(|(i, _)| ColumnSpec {
-                name: format!("column_{}", i + 1),
-                type_token: "varchar".to_string(),
-            })
-            .collect()
-    };
-    let data_lines = if has_typed_header {
-        lines
-    } else {
-        // Header was actually the first data row; re-parse including it.
-        return parse_untyped(text);
-    };
-    let rows = data_lines
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(parse_pipe_row)
-        .collect();
-    TableData { columns, rows }
-}
-
-fn parse_untyped(text: &str) -> TableData {
-    let rows: Vec<Vec<String>> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(parse_pipe_row)
-        .collect();
-    let ncols = rows.first().map_or(0, Vec::len);
-    let columns = (1..=ncols)
-        .map(|i| ColumnSpec {
-            name: format!("column_{i}"),
-            type_token: "varchar".to_string(),
+    let has_typed_header = !fields.is_empty() && fields.iter().all(|f| f.contains(':'));
+    if !has_typed_header {
+        return Err(ParseTypedCsvError::MissingTypedHeader);
+    }
+    let columns = fields
+        .iter()
+        .map(|f| {
+            let (name, type_str) = f.split_once(':').unwrap_or((f, "varchar"));
+            ColumnSpec {
+                name: name.trim().to_string(),
+                type_token: type_str.trim().to_string(),
+            }
         })
         .collect();
-    TableData { columns, rows }
+    let rows = lines
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(parse_pipe_row)
+        .collect();
+    Ok(TableData { columns, rows })
 }
 
 fn parse_pipe_row(line: &str) -> Vec<String> {
@@ -429,7 +434,7 @@ mod tests {
     #[test]
     fn typed_csv_round_trip_q01_header() {
         let text = "l_returnflag:string|count_order:integer\nA|14876\n";
-        let table = parse_typed_csv(text);
+        let table = parse_typed_csv(text).expect("typed q01 header");
         assert_eq!(table.columns.len(), 2);
         assert_eq!(table.columns[0].name, "l_returnflag");
         assert_eq!(table.columns[1].type_token, "integer");
@@ -641,7 +646,7 @@ mod tests {
 
     #[test]
     fn quoted_empty_matches_empty_null_cell() {
-        let parsed = parse_typed_csv("avg_yearly:double\n\"\"\n");
+        let parsed = parse_typed_csv("avg_yearly:double\n\"\"\n").expect("quoted-empty golden");
         assert_eq!(parsed.rows, vec![vec![String::new()]]);
 
         let actual = TableData {
@@ -661,7 +666,7 @@ mod tests {
 
     #[test]
     fn incomplete_golden_row_is_a_mismatch() {
-        let expected = parse_typed_csv("a:integer|b:integer\n1\n");
+        let expected = parse_typed_csv("a:integer|b:integer\n1\n").expect("short-row golden");
         assert_eq!(expected.columns.len(), 2);
         assert_eq!(expected.rows, vec![vec!["1".to_string()]]);
 
@@ -682,7 +687,7 @@ mod tests {
 
     #[test]
     fn extra_actual_fields_are_a_mismatch() {
-        let expected = parse_typed_csv("a:integer|b:integer\n1|2\n");
+        let expected = parse_typed_csv("a:integer|b:integer\n1|2\n").expect("two-column golden");
         let actual = TableData {
             columns: expected.columns.clone(),
             rows: vec![vec![
@@ -719,6 +724,66 @@ mod tests {
             compare(&actual, &expected),
             Some(CompareMismatch::RowCount {
                 actual: 1,
+                expected: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_byte_golden_is_a_parse_error() {
+        assert_eq!(
+            parse_typed_csv(""),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv("   \n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert!(
+            ParseTypedCsvError::MissingTypedHeader
+                .message()
+                .contains("typed header")
+        );
+    }
+
+    #[test]
+    fn headerless_golden_is_a_parse_error() {
+        assert_eq!(
+            parse_typed_csv("1|2\n3|4\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+    }
+
+    #[test]
+    fn zero_byte_golden_cannot_pass_against_empty_actual() {
+        let actual = TableData::default();
+        let expected = TableData::default();
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::MissingTypedHeader)
+        ));
+    }
+
+    #[test]
+    fn header_only_golden_passes_empty_actual_with_matching_schema() {
+        let expected =
+            parse_typed_csv("flag:string|n:integer\n").expect("header-only typed golden");
+        assert_eq!(expected.columns.len(), 2);
+        assert!(expected.rows.is_empty());
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: Vec::new(),
+        };
+        assert_eq!(compare(&actual, &expected), None);
+
+        // Empty execution that dropped schema cannot type-check a header-only
+        // golden — Mode A must preserve the DataFrame schema on zero batches.
+        let schema_less = TableData::default();
+        assert!(matches!(
+            compare(&schema_less, &expected),
+            Some(CompareMismatch::ColumnCount {
+                actual: 0,
                 expected: 2
             })
         ));

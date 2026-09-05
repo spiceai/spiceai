@@ -105,9 +105,10 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
                 None => root.join("expected").join(format!("{}.csv", tc.id)),
             };
             if csv_path.exists() {
-                let csv = std::fs::read_to_string(&csv_path)
-                    .context(error::ReadFileSnafu { path: csv_path })?;
-                Some(parse_typed_csv(&csv))
+                let csv = std::fs::read_to_string(&csv_path).context(error::ReadFileSnafu {
+                    path: csv_path.clone(),
+                })?;
+                Some(parse_typed_csv(&csv).context(error::InvalidGoldenSnafu { path: csv_path })?)
             } else {
                 None
             }
@@ -180,5 +181,61 @@ testCases:
         assert_eq!(def.test_cases.len(), 1);
         assert_eq!(def.test_cases[0].id, "q01");
         assert_eq!(def.test_cases[0].input_tables[0].name, "lineitem");
+    }
+
+    fn write_mini_suite(label: &str, expected_csv: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spice-substrait-golden-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("plans")).expect("mini suite plans dir");
+        std::fs::create_dir_all(dir.join("expected")).expect("mini suite expected dir");
+        std::fs::write(
+            dir.join("metadata.yaml"),
+            r#"
+name: "tpch"
+version: "1.0.0"
+testCases:
+  - id: "q99"
+    planBinary: "plans/q99.bin"
+    expectedOutput: "expected/q99.csv"
+"#,
+        )
+        .expect("write mini suite metadata");
+        std::fs::write(dir.join("plans/q99.bin"), []).expect("write mini suite plan");
+        std::fs::write(dir.join("expected/q99.csv"), expected_csv).expect("write mini suite golden");
+        dir
+    }
+
+    #[test]
+    fn zero_byte_golden_is_a_load_error() {
+        let dir = write_mini_suite("zero-byte", &[]);
+        let err = load_tpch_suite(&dir).expect_err("zero-byte golden must fail load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typed header"),
+            "load error should name the missing typed header: {msg}"
+        );
+        assert!(
+            msg.contains("q99.csv"),
+            "load error should name the golden file: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
+    }
+
+    #[test]
+    fn header_only_golden_loads_as_empty_typed_table() {
+        let dir = write_mini_suite("header-only", b"flag:string|n:integer\n");
+        let suite = load_tpch_suite(&dir).expect("header-only golden must load");
+        let expected = suite.cases[0]
+            .expected
+            .as_ref()
+            .expect("header-only golden is present");
+        assert_eq!(expected.columns.len(), 2);
+        assert_eq!(expected.columns[0].name, "flag");
+        assert_eq!(expected.columns[1].type_token, "integer");
+        assert!(expected.rows.is_empty());
+        std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
     }
 }
