@@ -27,9 +27,9 @@ use http::header::CONTENT_TYPE;
 use serde::Deserialize;
 
 use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext, current_principal_requires_read_only};
 
-use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_response};
+use super::{ResponseMimeType, sql_to_http_response};
 
 /// SQL Query
 ///
