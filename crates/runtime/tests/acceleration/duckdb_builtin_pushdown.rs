@@ -19,6 +19,7 @@ limitations under the License.
 //! local evaluation.
 
 use app::AppBuilder;
+use arrow::array::Array;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
@@ -93,6 +94,26 @@ fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
          1,ab\n\
          2,xyz\n\
          3,aXbY\n\
+         4,\n",
+    )?;
+    Ok(())
+}
+
+/// Strings whose SHA-256 exercises the hex-text-vs-bytes divergence: ASCII, a
+/// mixed-case string with a space, a non-ASCII one (whose UTF-8 bytes are what
+/// gets hashed), and NULL.
+///
+/// The empty string is not a row here — the CSV reader reads a quoted empty
+/// field as NULL, so it cannot be expressed in the source. The test reaches it
+/// through `coalesce(name, '')` over the NULL row instead, which is still
+/// evaluated by `DuckDB`.
+fn write_digest_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,name\n\
+         1,alpha\n\
+         2,BeTa gamma\n\
+         3,Ünïcödé\n\
          4,\n",
     )?;
     Ok(())
@@ -366,6 +387,133 @@ async fn duckdb_accelerated_to_hex_agrees_with_local() -> Result<(), anyhow::Err
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "a predicate over to_hex must select the same rows accelerated and local"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `sha256` exists in both engines, so nothing denied the call and — before
+/// the dialect rewrote it — nothing changed it either: it was pushed into the
+/// accelerated store verbatim. `DataFusion` returns the 32-byte digest as
+/// `Binary`; `DuckDB` returns its 64-character hex rendering as `VARCHAR`,
+/// which the scan then cast into the plan's `Binary` column. The accelerated
+/// dataset therefore held 64 bytes of ASCII hex text where the unaccelerated
+/// one held the digest — every non-NULL row different in length as well as
+/// content, with no error and no warning (regression test for #13850).
+///
+/// The empty string and NULL are here because they are where a decode-based
+/// rewrite could go wrong in the other direction. The pushed-down expression
+/// is `unhex(sha256(..))`, so those two cases are `unhex(sha256(''))`, which
+/// must stay the empty-input digest, and `unhex(sha256(NULL))`, which must
+/// stay NULL — rather than either collapsing into the other.
+#[tokio::test]
+async fn duckdb_accelerated_sha256_agrees_with_local() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("digest.csv");
+            write_digest_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_sha256")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // The call must reach DuckDB for this to be testing anything: an
+            // accelerated query that evaluated `sha256` locally would agree
+            // with the control even with the rewrite removed.
+            let plan = to_pretty_display(
+                &run_query(&rt, "EXPLAIN SELECT sha256(name) FROM accelerated").await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                remote_sql.contains("unhex(sha256("),
+                "the digest must be pushed down to DuckDB inside an `unhex(..)`; \
+                 plan was:\n{plan}"
+            );
+
+            let query = "SELECT id, sha256(name) AS d FROM {table} ORDER BY id";
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+
+            // 64 hex characters is a 32-byte digest. Before the rewrite this
+            // column held 128 of them: the hex text's own ASCII bytes.
+            let expected = [
+                "+----+------------------------------------------------------------------+",
+                "| id | d                                                                |",
+                "+----+------------------------------------------------------------------+",
+                "| 1  | 8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8 |",
+                "| 2  | 5b771e77826caa5ec36e3fbf8f5b2c59b606253913fcfe10104a43410b7a380b |",
+                "| 3  | 39af95d07d82b5d68b6639fea9557192025b64fcc79d700c4cce10f94c16bfc8 |",
+                "| 4  |                                                                  |",
+                "+----+------------------------------------------------------------------+",
+            ];
+            assert_batches_eq!(expected, &accelerated);
+
+            // Row 4's blank cell above does not pin the NULL half of the
+            // contract on its own: `pretty_format_batches` renders a SQL NULL
+            // and a zero-length `Binary` value identically, so a rewrite that
+            // turned `unhex(sha256(NULL))` into the empty blob would print the
+            // same table. Only the null bitmap separates them. The query is
+            // `ORDER BY id` over four rows, so the last one is id=4.
+            let nulls: Vec<bool> = accelerated
+                .iter()
+                .flat_map(|batch| {
+                    let d = batch.column_by_name("d").expect("the digest column");
+                    (0..batch.num_rows())
+                        .map(|row| d.is_null(row))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                nulls,
+                vec![false, false, false, true],
+                "only the NULL name may produce a NULL digest, and the empty blob prints alike"
+            );
+
+            // The accelerator's answer is only right if it is the answer
+            // DataFusion gives; the hex-text rendering shows up here as a
+            // divergence, not as a query error.
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated sha256 must agree with local evaluation"
+            );
+
+            // The empty string, reached over the NULL row. DuckDB's
+            // sha256('') is the empty-input digest's hex text, so the pushed
+            // unhex(sha256('')) decodes back to that digest; a rewrite that
+            // confused "no bytes" with "no value" would answer NULL here while
+            // the kernel answers the digest.
+            let empty = "SELECT id, sha256(coalesce(name, '')) AS d FROM {table} WHERE id = 4";
+            let accelerated = run_query(&rt, &empty.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &empty.replace("{table}", "local")).await?;
+            assert_batches_eq!(
+                [
+                    "+----+------------------------------------------------------------------+",
+                    "| id | d                                                                |",
+                    "+----+------------------------------------------------------------------+",
+                    "| 4  | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 |",
+                    "+----+------------------------------------------------------------------+",
+                ],
+                &accelerated
+            );
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated sha256 of the empty string must agree with local evaluation"
             );
 
             rt.shutdown().await;
