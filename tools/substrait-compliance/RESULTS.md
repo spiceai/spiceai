@@ -80,9 +80,10 @@ Harness compare in `src/compare.rs` now:
 - treats `integer` / `bigint` as type-compatible (`COUNT` width)
 - does not compare column names (plan alias vs DuckDB; IBM Rust SDK skips names)
 - trims `CHAR` padding on string cells
-- numerics: `integer`/`bigint` exactly; floats/decimals use absolute ε
-  `1e-8`, one unit at the coarser printed scale (scale ≥ 2), or relative
-  `1e-14`
+- numerics: `integer`/`bigint` exactly; floats/`double` use absolute ε
+  `1e-8` or relative `1e-14`. Printed fractional length is not a
+  tolerance. One ULP at a declared decimal scale only when both headers
+  share that scale (≥ 2)
 - quoted-empty `""` is NULL/empty (IBM TPC-H README)
 
 IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These

@@ -75,11 +75,12 @@ cosmetics — values must still match:
 - column names are not compared (plan alias vs `DuckDB` name; IBM Rust SDK
   also skips names)
 - string cells are trimmed (`CHAR` padding)
-- numeric ε is absolute `1e-8`, one unit in the last place of the
-  coarser printed fractional scale when that scale is at least 2, or
-  relative `1e-14` (`decimal` vs `DuckDB` float; IBM documents absolute
-  `1e-9`). `integer`/`bigint` cells compare exactly. Quoted-empty `""`
-  is NULL.
+- numeric ε is absolute `1e-8` or relative `1e-14` for floats/`double`
+  (`decimal` vs `DuckDB` float; IBM documents absolute `1e-9`). Printed
+  fractional length is not a tolerance. One ULP at a declared decimal
+  scale applies only when both headers are `decimal(p,s)` with the same
+  scale ≥ 2. `integer`/`bigint` cells compare exactly. Quoted-empty `""`
+  is NULL. Incomplete CSV rows (field count ≠ header width) mismatch.
 
 Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 

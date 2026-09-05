@@ -27,12 +27,14 @@ limitations under the License.
 //!   `value`; Isthmus `L_RETURNFLAG` vs golden `l_returnflag`).
 //! - String cells are compared after trimming `CHAR` pad / loader whitespace.
 //! - Quoted-empty `""` in a golden cell is NULL/empty (IBM TPC-H README).
-//! - Numerics: `integer`/`bigint` cells compare exactly. Floats/decimals
-//!   match when `|Δ| < 1e-8`, when `|Δ|` is under one unit in the last
-//!   place of the coarser printed fractional scale (scale ≥ 2; q01 `AVG`
-//!   scale 6, q06), or when the relative error is `< 1e-14` (q01
-//!   `sum_charge` `DataFusion`/`DuckDB` conversion). IBM README is
-//!   absolute `1e-9` only.
+//! - Numerics: `integer`/`bigint` cells compare exactly. Floats/`double`
+//!   match when `|Δ| < 1e-8` (q06) or relative error is `< 1e-14` (q01
+//!   `sum_charge` `DataFusion`/`DuckDB` conversion). Printed fractional
+//!   length is not a tolerance — a 2-digit actual like `0.06` must not
+//!   match `0.05008…`. One ULP at a declared decimal scale applies only
+//!   when both typed headers are `decimal(p,s)` / `numeric(p,s)` with
+//!   the same scale ≥ 2 (q01 `AVG` scale 6). IBM README is absolute
+//!   `1e-9` only.
 //!
 //! Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 
@@ -40,8 +42,8 @@ limitations under the License.
 /// `DuckDB`-vs-`DataFusion` rounding (Δ ≈ 1.16e-9).
 const NUMERIC_ABS_EPSILON: f64 = 1e-8;
 
-/// Minimum printed fractional length treated as a decimal scale. A single
-/// digit (`.0`, `.1`) is float formatting, not `decimal(p, 1)`.
+/// Minimum declared decimal scale treated as a ULP tolerance. Scale 1 is
+/// float formatting (`.0`, `.1`), not `decimal(p, 1)`.
 const MIN_DECIMAL_SCALE: i32 = 2;
 
 /// Relative cap for large `DECIMAL` vs float64 conversion (q01 `sum_charge`
@@ -76,6 +78,12 @@ pub enum CompareMismatch {
         actual: String,
         expected: String,
     },
+    RowWidth {
+        row: usize,
+        actual: usize,
+        expected: usize,
+        columns: usize,
+    },
     Value {
         row: usize,
         column: usize,
@@ -98,6 +106,15 @@ impl std::fmt::Display for CompareMismatch {
                 actual,
                 expected,
             } => write!(f, "column {index} type '{actual}' != '{expected}'"),
+            Self::RowWidth {
+                row,
+                actual,
+                expected,
+                columns,
+            } => write!(
+                f,
+                "row {row} field count actual={actual} expected={expected} schema={columns}"
+            ),
             Self::Value {
                 row,
                 column,
@@ -138,10 +155,20 @@ pub fn compare(actual: &TableData, expected: &TableData) -> Option<CompareMismat
             });
         }
     }
+    let columns = expected.columns.len();
     for (row_idx, (a_row, e_row)) in actual.rows.iter().zip(expected.rows.iter()).enumerate() {
+        if a_row.len() != columns || e_row.len() != columns {
+            return Some(CompareMismatch::RowWidth {
+                row: row_idx,
+                actual: a_row.len(),
+                expected: e_row.len(),
+                columns,
+            });
+        }
         for (col_idx, (a_val, e_val)) in a_row.iter().zip(e_row.iter()).enumerate() {
-            let type_token = expected.columns.get(col_idx).map(|c| c.type_token.as_str());
-            if !cells_match(a_val, e_val, type_token) {
+            let actual_type = actual.columns.get(col_idx).map(|c| c.type_token.as_str());
+            let expected_type = expected.columns.get(col_idx).map(|c| c.type_token.as_str());
+            if !cells_match(a_val, e_val, actual_type, expected_type) {
                 return Some(CompareMismatch::Value {
                     row: row_idx,
                     column: col_idx,
@@ -156,7 +183,10 @@ pub fn compare(actual: &TableData, expected: &TableData) -> Option<CompareMismat
 
 #[must_use]
 pub fn normalize_type(token: &str) -> &'static str {
-    match token.to_ascii_lowercase().as_str() {
+    let trimmed = token.trim();
+    let base_end = trimmed.find('(').unwrap_or(trimmed.len());
+    let base = trimmed[..base_end].trim().to_ascii_lowercase();
+    match base.as_str() {
         "integer" | "int" | "int32" | "i32" | "i8" | "i16" | "int4" | "smallint" | "tinyint" => {
             "integer"
         }
@@ -181,10 +211,15 @@ pub fn types_compatible(actual: &str, expected: &str) -> bool {
 #[must_use]
 #[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
 pub fn values_match(actual: &str, expected: &str) -> bool {
-    cells_match(actual, expected, None)
+    cells_match(actual, expected, None, None)
 }
 
-fn cells_match(actual: &str, expected: &str, type_token: Option<&str>) -> bool {
+fn cells_match(
+    actual: &str,
+    expected: &str,
+    actual_type: Option<&str>,
+    expected_type: Option<&str>,
+) -> bool {
     if actual == expected {
         return true;
     }
@@ -192,7 +227,7 @@ fn cells_match(actual: &str, expected: &str, type_token: Option<&str>) -> bool {
         return true;
     }
 
-    let kind = type_token.map(normalize_type);
+    let kind = expected_type.or(actual_type).map(normalize_type);
     if matches!(kind, Some("integer" | "bigint")) {
         return integers_equal(actual, expected);
     }
@@ -207,7 +242,7 @@ fn cells_match(actual: &str, expected: &str, type_token: Option<&str>) -> bool {
         if a.is_nan() && e.is_nan() {
             return true;
         }
-        return numerics_close(a, e, actual, expected);
+        return numerics_close(a, e, shared_decimal_scale(actual_type, expected_type));
     }
     let a_lower = actual.to_ascii_lowercase();
     let e_lower = expected.to_ascii_lowercase();
@@ -243,47 +278,52 @@ fn integers_equal(actual: &str, expected: &str) -> bool {
     }
 }
 
-fn numerics_close(actual: f64, expected: f64, actual_s: &str, expected_s: &str) -> bool {
+fn numerics_close(actual: f64, expected: f64, decimal_scale: Option<i32>) -> bool {
     let abs_diff = (actual - expected).abs();
     if abs_diff < NUMERIC_ABS_EPSILON {
         return true;
     }
-    if same_at_decimal_scale(abs_diff, actual_s, expected_s) {
-        return true;
+    if let Some(places) = decimal_scale
+        && places >= MIN_DECIMAL_SCALE
+    {
+        let unit = 10f64.powi(-places);
+        if abs_diff < unit {
+            return true;
+        }
     }
     let magnitude = actual.abs().max(expected.abs());
     abs_diff < NUMERIC_REL_EPSILON * magnitude
 }
 
-/// `DataFusion` prints `decimal` at its scale (q01 `AVG_*` is 6 places);
-/// `DuckDB` goldens are float64. Accept when `|Δ|` is under one unit in the
-/// last place of the coarser printed scale. Scale `< 2` is ignored so
-/// `.0` float formatting cannot hide a 0.09-level error.
-fn same_at_decimal_scale(abs_diff: f64, actual_s: &str, expected_s: &str) -> bool {
-    let Some(actual_places) = frac_digits(actual_s) else {
-        return false;
-    };
-    let Some(expected_places) = frac_digits(expected_s) else {
-        return false;
-    };
-    let places = actual_places.min(expected_places);
-    if places < MIN_DECIMAL_SCALE {
-        return false;
-    }
-    let unit = 10f64.powi(-places);
-    abs_diff < unit
-}
-
-fn frac_digits(value: &str) -> Option<i32> {
-    let frac = value.trim().split_once('.')?.1;
-    if frac.is_empty() {
+/// Declared scale from `decimal(p,s)` / `numeric(p,s)`. Bare `decimal` or
+/// `double` has no scale — floats then use abs/rel only.
+fn declared_decimal_scale(token: &str) -> Option<i32> {
+    let trimmed = token.trim();
+    let (base, params) = trimmed.split_once('(')?;
+    if !matches!(
+        base.trim().to_ascii_lowercase().as_str(),
+        "decimal" | "numeric"
+    ) {
         return None;
     }
-    i32::try_from(frac.len()).ok()
+    let inner = params.strip_suffix(')')?.trim();
+    let scale_str = inner.split(',').nth(1).unwrap_or(inner).trim();
+    scale_str.parse().ok()
+}
+
+/// One ULP at a decimal scale is allowed only when both headers declare
+/// that same scale. IBM TPC-H goldens type money/`AVG` as `double`, so
+/// Mode A stays on abs/rel and cannot hide a cent behind a 2-digit print.
+fn shared_decimal_scale(actual_type: Option<&str>, expected_type: Option<&str>) -> Option<i32> {
+    let actual_scale = declared_decimal_scale(actual_type?)?;
+    let expected_scale = declared_decimal_scale(expected_type?)?;
+    (actual_scale == expected_scale).then_some(actual_scale)
 }
 
 /// Parse a pipe-delimited expected-output CSV with a typed header
 /// (`col:type|col:type|...`) as documented in the IBM TPC-H suite README.
+/// Short or wide rows are kept so [`compare`] can report a row-width
+/// mismatch instead of silently `zip`-truncating.
 #[must_use]
 pub fn parse_typed_csv(text: &str) -> TableData {
     let mut lines = text.lines().peekable();
@@ -368,6 +408,23 @@ fn unquote_pipe_cell(cell: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed_numeric_table(type_token: &str, value: &str) -> TableData {
+        TableData {
+            columns: vec![ColumnSpec {
+                name: "n".to_string(),
+                type_token: type_token.to_string(),
+            }],
+            rows: vec![vec![value.to_string()]],
+        }
+    }
+
+    #[test]
+    fn parameterized_decimal_type_is_double_compatible() {
+        assert_eq!(normalize_type("decimal(15,6)"), "double");
+        assert_eq!(normalize_type("numeric(10, 2)"), "double");
+        assert!(types_compatible("decimal(15,2)", "double"));
+    }
 
     #[test]
     fn typed_csv_round_trip_q01_header() {
@@ -481,8 +538,8 @@ mod tests {
     }
 
     #[test]
-    fn decimal_scale_covers_q01_sum_without_loose_relative_epsilon() {
-        // `|Δ| ≈ 1.2e-6` at printed scale 2 is under one cent (`0.01`).
+    fn relative_epsilon_covers_q01_sum_decimal_conversion() {
+        // `|Δ| ≈ 1.2e-6` / `5.3e8` ≈ `2e-15` is under relative `1e-14`.
         assert!(values_match("532348211.65", "532348211.6499988"));
         // q01 `sum_charge`: DF decimal vs DuckDB float64 (`|Δ| ≈ 1.4e-6`).
         assert!(values_match("526165934.000839", "526165934.0008404"));
@@ -490,12 +547,24 @@ mod tests {
     }
 
     #[test]
-    fn printed_scale_covers_q01_avg_decimal_vs_float() {
-        // decimal scale 6 vs DuckDB float64: `|Δ|` under `1e-6`.
-        assert!(values_match("25.575154", "25.575154611454693"));
-        assert!(values_match("0.050081", "0.05008133906964134"));
-        assert!(!values_match("25.575154", "26.575154611454693"));
-        assert!(!values_match("0.050081", "0.15008133906964134"));
+    fn declared_decimal_scale_covers_q01_avg() {
+        // Shared `decimal(15,6)` ULP (`1e-6`); untyped/`double` uses abs/rel only.
+        let actual = typed_numeric_table("decimal(15,6)", "25.575154");
+        let expected = typed_numeric_table("decimal(15,6)", "25.575154611454693");
+        assert_eq!(compare(&actual, &expected), None);
+
+        let actual = typed_numeric_table("decimal(15,6)", "0.050081");
+        let expected = typed_numeric_table("decimal(15,6)", "0.05008133906964134");
+        assert_eq!(compare(&actual, &expected), None);
+
+        let actual = typed_numeric_table("decimal(15,6)", "25.575154");
+        let expected = typed_numeric_table("decimal(15,6)", "26.575154611454693");
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::Value { .. })
+        ));
+        assert!(!values_match("25.575154", "25.575154611454693"));
+        assert!(!values_match("0.050081", "0.05008133906964134"));
     }
 
     #[test]
@@ -503,6 +572,34 @@ mod tests {
         // Truncation at printed scale 1 accepted `1.09` vs `1.0`.
         assert!(!values_match("1.09", "1.0"));
         assert!(!values_match("1.0", "1.09"));
+    }
+
+    #[test]
+    fn printed_fractional_length_does_not_match_wrong_avg() {
+        // Actual print scale 2 used to accept Δ ≈ 0.01 against a q01-like AVG.
+        assert!(!values_match("0.06", "0.05008133906964134"));
+        assert!(!values_match("0.05008133906964134", "0.06"));
+
+        let actual = typed_numeric_table("double", "0.06");
+        let expected = typed_numeric_table("double", "0.05008133906964134");
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::Value { .. })
+        ));
+    }
+
+    #[test]
+    fn printed_fractional_length_does_not_hide_a_cent() {
+        // Fails abs/rel; printed scale 2 used to accept Δ ≈ 0.01.
+        assert!(!values_match("532348211.64", "532348211.6499988"));
+        assert!(!values_match("532348211.6499988", "532348211.64"));
+
+        let actual = typed_numeric_table("double", "532348211.64");
+        let expected = typed_numeric_table("double", "532348211.6499988");
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::Value { .. })
+        ));
     }
 
     #[test]
@@ -560,6 +657,49 @@ mod tests {
         };
         assert_eq!(compare(&actual, &expected), None);
         assert!(values_match("", "\"\""));
+    }
+
+    #[test]
+    fn incomplete_golden_row_is_a_mismatch() {
+        let expected = parse_typed_csv("a:integer|b:integer\n1\n");
+        assert_eq!(expected.columns.len(), 2);
+        assert_eq!(expected.rows, vec![vec!["1".to_string()]]);
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![vec!["1".to_string(), "999".to_string()]],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::RowWidth {
+                row: 0,
+                actual: 2,
+                expected: 1,
+                columns: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn extra_actual_fields_are_a_mismatch() {
+        let expected = parse_typed_csv("a:integer|b:integer\n1|2\n");
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![vec![
+                "1".to_string(),
+                "2".to_string(),
+                "999".to_string(),
+            ]],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::RowWidth {
+                row: 0,
+                actual: 3,
+                expected: 2,
+                columns: 2
+            })
+        ));
     }
 
     #[test]
