@@ -180,10 +180,10 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 ///
 /// `read_started_at` is when the query began, and is recorded on the entry so
 /// every later cache hit can check it — see
-/// [`QueryResultsCacheProvider::tables_invalidated_since`], which documents why
+/// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
 /// the comparison is deliberately conservative. It must be the start of the
-/// read, not the moment the result is stored: an invalidation landing in
-/// between has to disqualify the entry too.
+/// read, not the moment the result is stored: a change landing in between has
+/// to disqualify the entry too.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -248,12 +248,12 @@ pub fn to_cached_record_batch_stream(
             // `batches_cacheable` is false only when transient HTTP error
             // responses (5xx/429) are present, which requires a non-empty
             // result set — skip the write to avoid caching a partial result.
-            if cache_provider.tables_invalidated_since(&input_tables, read_started_at) {
+            if cache_provider.tables_changed_since(&input_tables, read_started_at) {
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only avoids encoding and storing a result
                 // already known to be unservable.
                 tracing::debug!(
-                    "A table read by this query was invalidated while it ran, skipping cache storage"
+                    "A table read by this query changed while it ran, skipping cache storage"
                 );
             } else if batches_cacheable(&records) {
                 // Cache the result, including genuinely empty (0-row / 0-batch)

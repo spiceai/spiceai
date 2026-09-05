@@ -29,6 +29,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, dml::InsertOp};
+use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -165,6 +166,17 @@ impl FederationProvider for SnowflakeTableProvider {
         self.read_provider
             .downcast_ref::<FederatedTableProviderAdaptor>()
             .and_then(|a| a.source.federation_provider().compute_context())
+    }
+
+    fn pre_federation_optimizer_rules(&self) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+        self.read_provider
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .map_or_else(Vec::new, |adaptor| {
+                adaptor
+                    .source
+                    .federation_provider()
+                    .pre_federation_optimizer_rules()
+            })
     }
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {

@@ -19,7 +19,7 @@ use std::{pin::Pin, sync::Arc};
 use arrow_schema::SchemaRef;
 use arrow_tools::{
     schema_evolution::is_widening_cast,
-    type_rewrite::{TypeRewriteRules, normalize_dictionary_types, rewrite_data_type},
+    type_rewrite::{TypeRewriteRules, normalize_for_comparison, rewrite_data_type},
 };
 use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
@@ -79,14 +79,18 @@ fn narrowing_schema_cast_changes(
 ) -> SchemaCastChanges {
     // Hot path: this runs once per insert. Identical schemas (the common
     // no-schema-change case) cannot narrow, so skip the two
-    // `normalize_dictionary_types` allocations entirely. A dictionary-only
-    // difference is neither pointer- nor structurally equal and still falls
+    // `normalize_for_comparison` allocations entirely. A difference that only the
+    // normalization resolves is neither pointer- nor structurally equal and still falls
     // through to the normalized comparison below (correctly reported as no-op).
     if Arc::ptr_eq(input_schema, target_schema) || input_schema == target_schema {
         return SchemaCastChanges::default();
     }
-    let input = normalize_dictionary_types(input_schema);
-    let target = normalize_dictionary_types(target_schema);
+    // The same normalization `schema_evolution::classify` compares through, so the two
+    // agree on what counts as a difference at all: a `Map` declaring its `entries` field
+    // nullable is a declaration the Arrow layout forbids rather than a narrowing, and no
+    // widening rule can reconcile it, so left in it would be warned about on every insert.
+    let input = normalize_for_comparison(input_schema);
+    let target = normalize_for_comparison(target_schema);
 
     let mut changes = SchemaCastChanges::default();
     for input_field in input.fields() {
@@ -435,6 +439,36 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
             Field::new("extra", DataType::Utf8, true),
         ]);
+
+        let changes = narrowing_schema_cast_changes(&input, &target, &[]);
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    /// Regression test for #13549, insert-plan leg. The Arrow map layout forbids a nullable
+    /// `entries` field, so a target that declares it correctly against a source that does not
+    /// is not a narrowing - nothing is lost, because the two describe the same physical
+    /// layout. No widening rule and no engine rewrite can reconcile the pair, so without the
+    /// shared normalization this warns on every insert for a schema that never narrowed.
+    #[test]
+    fn a_map_entries_declaration_the_layout_forbids_is_not_a_narrowing() {
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let input = schema(vec![Field::new("headers", map_of(true), true)]);
+        let target = schema(vec![Field::new("headers", map_of(false), true)]);
 
         let changes = narrowing_schema_cast_changes(&input, &target, &[]);
         assert!(changes.is_empty(), "{changes:?}");

@@ -66,6 +66,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 pub mod caching;
+pub mod caching_eviction;
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -82,7 +83,7 @@ pub mod write_back_worker;
 pub(crate) use write::WriteMode;
 
 pub use refresh_completion::{
-    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter,
+    RefreshCompletion, RefreshCompletionOutcome, RefreshCompletionWaiter, RefreshRequestId,
 };
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -257,6 +258,23 @@ pub enum AcceleratedTableBuilderError {
 
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackUndeliverableKey {
+        dataset_name: String,
+        pk_columns: usize,
+    },
+
+    #[snafu(display(
+        "Failed to accelerate dataset {dataset_name}: durable write-back marks and delivers each committed row keyed on '{resolved}', the primary key this dataset's accelerator resolved, but its source connector was configured to upsert on '{declared}'. Delivering on a different column would write a second row at the source instead of updating the one that was marked. Set 'acceleration.primary_key' to '{resolved}', or recreate the acceleration so it resolves the declared key. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackKeyMismatch {
+        dataset_name: String,
+        resolved: String,
+        declared: String,
+    },
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
@@ -428,6 +446,8 @@ pub struct Builder {
     caching_ttl: Option<Duration>,
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
+    caching_max_size_bytes: Option<u64>,
+    caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
@@ -485,6 +505,8 @@ impl Builder {
             caching_ttl: None,
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
+            caching_max_size_bytes: None,
+            caching_max_items: None,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
@@ -578,8 +600,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes commit to the local accelerator first,
-    /// then asynchronously persist to the federated source.
+    /// Enable write-back mode: writes commit to the local accelerator inside a
+    /// transaction, and a delivery worker carries them to the federated source
+    /// afterwards.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -736,6 +759,18 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set the byte budget (`caching_max_size`) for cache mode
+    pub fn caching_max_size_bytes(&mut self, max_size_bytes: Option<u64>) -> &mut Self {
+        self.caching_max_size_bytes = max_size_bytes;
+        self
+    }
+
+    /// Set the row budget (`caching_max_items`) for cache mode
+    pub fn caching_max_items(&mut self, max_items: Option<u64>) -> &mut Self {
+        self.caching_max_items = max_items;
         self
     }
 
@@ -932,7 +967,7 @@ impl Builder {
         let refresh_params = Arc::new(RwLock::new(self.refresh));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
-            Arc::new(Mutex::new(std::collections::HashSet::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
@@ -955,6 +990,7 @@ impl Builder {
         refresher.with_refresh_completion(refresh_completion.clone());
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
+        refresher.in_flight_revalidations(Arc::clone(&in_flight_revalidations));
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
@@ -978,6 +1014,39 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
+
+        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
+        // commit path marks dirty keys gets a per-table delivery worker that
+        // reconciles those keys to the federated source.
+        //
+        // Built before ANY background task starts, because building it can fail: a
+        // key the worker could never deliver on refuses the table rather than
+        // letting it accept writes it would never carry to the source. Every
+        // `return` after this point abandons whatever tasks already exist, and
+        // dropping a `JoinHandle` detaches its task rather than aborting it — only
+        // `Drop for AcceleratedTable` aborts them, and that never runs for a table
+        // that was never built. `refresher.start` below is the first such task, so
+        // this has to come before it, not merely before `handlers`.
+        //
+        // `WriteMode::WriteBack` is `write_back` without `dual_write`, resolved
+        // further down.
+        let write_back_worker = if self.write_back && !self.dual_write {
+            match write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+                Some(write::CayenneWriteTarget::Staged(cayenne))
+                    if cayenne.is_durable_write_back() =>
+                {
+                    Some(write_back_worker::WriteBackWorker::new(
+                        *cayenne,
+                        Arc::clone(&self.federated),
+                        self.dataset_name.to_string(),
+                        self.write_back_deliverer.clone(),
+                    )?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1053,7 +1122,30 @@ impl Builder {
             None
         };
 
-        if let Some(retention) = self.retention {
+        // A caching accelerator is bounded by `caching_eviction` as a computed
+        // retention policy rather than by a loop of its own, so the cache is
+        // swept by the same ticker, write lock and index-aware delete every
+        // other dataset uses. Attached before the retention task is spawned
+        // below.
+        let retention = if refresh_mode == RefreshMode::Caching {
+            Some(caching_eviction::retention(
+                caching_eviction::CacheLimits {
+                    max_size_bytes: self.caching_max_size_bytes,
+                    max_items: self.caching_max_items,
+                    ttl: self.caching_ttl,
+                    stale_while_revalidate: self.caching_stale_while_revalidate_ttl,
+                    stale_if_error: self.caching_stale_if_error,
+                },
+                self.retention,
+                &self.accelerator,
+                &self.dataset_name,
+                &self.io_runtime,
+            ))
+        } else {
+            self.retention
+        };
+
+        if let Some(retention) = retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
@@ -1199,21 +1291,14 @@ impl Builder {
             WriteMode::WriteThrough
         };
 
-        // Durable federated write-back (#11838): a WriteBack Cayenne table whose
-        // commit path marks dirty keys gets a per-table delivery worker that
-        // reconciles those keys to the federated source. Aborted on drop with
-        // the other handlers.
-        if matches!(write_mode, WriteMode::WriteBack)
-            && let Some(write::CayenneWriteTarget::Staged(cayenne)) =
-                write::dual_write::extract_cayenne_write_target(&self.accelerator)
-            && cayenne.is_durable_write_back()
-        {
-            handlers.push(write_back_worker::WriteBackWorker::spawn(
-                *cayenne,
-                Arc::clone(&self.federated),
-                self.dataset_name.to_string(),
-                self.write_back_deliverer.clone(),
-            ));
+        // Started here rather than where it was built, so it is aborted on drop
+        // with the other handlers.
+        if let Some(worker) = write_back_worker {
+            debug_assert!(
+                matches!(write_mode, WriteMode::WriteBack),
+                "a delivery worker was built for a table that did not resolve to write-back"
+            );
+            handlers.push(worker.start());
         }
 
         Ok(AcceleratedTable {
@@ -1986,7 +2071,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2013,9 +2105,9 @@ impl TableLayer for AcceleratedTable {
                     input,
                     overwrite,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
                     Arc::clone(&self.refresher),
                     self.schema(),
+                    &self.dataset_name.to_string(),
                 )
             }
             WriteMode::DualWrite {
@@ -2045,6 +2137,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(self.write_mode, WriteMode::WriteBack) {
+            return Err(write::write_back::delete_not_supported(
+                &self.dataset_name.to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2053,15 +2153,7 @@ impl TableLayer for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.delete_from(state, filters).await
             }
-            WriteMode::WriteBack => {
-                write::write_back::delete_write_back(
-                    state,
-                    filters,
-                    Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
-                )
-                .await
-            }
+            WriteMode::WriteBack => unreachable!("refused above, before the timestamp moves"),
             WriteMode::DualWrite {
                 cayenne_target,
                 federated_provider,
@@ -2091,7 +2183,14 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
-        self.update_last_updated_at();
+        // A write-back write is refused unless it is inside a transaction, and
+        // that is decided when the sink executes rather than here — so this path
+        // cannot yet know whether the table will change. Its sinks mark the table
+        // themselves once the accelerator accepts the write, so a refused write
+        // leaves the freshness timestamp alone.
+        if !matches!(self.write_mode, WriteMode::WriteBack) {
+            self.update_last_updated_at();
+        }
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {
@@ -2107,7 +2206,8 @@ impl TableLayer for AcceleratedTable {
                     assignments,
                     filters,
                     Arc::clone(&self.accelerator),
-                    Arc::clone(&self.federated),
+                    &self.dataset_name.to_string(),
+                    Arc::clone(&self.last_updated_at),
                 )
                 .await
             }
@@ -2139,6 +2239,18 @@ impl TableLayer for AcceleratedTable {
             )));
         }
 
+        // Refused before the timestamp moves: nothing about this table changes,
+        // so nothing should claim it did.
+        if matches!(
+            self.write_mode,
+            WriteMode::WriteBack | WriteMode::DualWrite { .. }
+        ) {
+            return Err(datafusion::error::DataFusionError::Plan(
+                "TRUNCATE is not supported for write_back or dual_write accelerated tables"
+                    .to_string(),
+            ));
+        }
+
         self.update_last_updated_at();
 
         match &self.write_mode {
@@ -2148,10 +2260,7 @@ impl TableLayer for AcceleratedTable {
                 federated_table.truncate(state).await
             }
             WriteMode::WriteBack | WriteMode::DualWrite { .. } => {
-                Err(datafusion::error::DataFusionError::Plan(
-                    "TRUNCATE is not supported for write_back or dual_write accelerated tables"
-                        .to_string(),
-                ))
+                unreachable!("refused above, before the timestamp moves")
             }
         }
     }
@@ -2235,6 +2344,41 @@ fn filters_for_accelerator_scan(
     Ok(accelerator_filters)
 }
 
+/// Resolves what a retention check should delete, computed fresh on every tick.
+///
+/// The two static filter kinds can only express a predicate fixed when the
+/// dataset was configured. This one is asked each tick, so a policy that has to
+/// *measure* the table before it can decide — a byte or row budget, which is
+/// knowable only by aggregating what is stored — can be a retention filter
+/// rather than a second eviction loop running beside this one.
+///
+/// It is given whatever the dataset's own retention filters resolved to and has
+/// the last word on the result. An implementation may widen that predicate,
+/// narrow it, or ignore it: a caching accelerator translates it from rows to
+/// whole cache entries, because deleting part of a multi-row cached response
+/// would leave the rest to be served as though it were complete.
+#[async_trait::async_trait]
+pub trait RetentionPredicate: Send + Sync + std::fmt::Debug {
+    /// The rows to delete this tick, or `None` when there is nothing to remove.
+    ///
+    /// `configured` is what this dataset's static retention filters resolved
+    /// to, or `None` when it has none. An implementation that ignores it drops
+    /// a `retention_period` or `retention_sql` the user wrote, silently — so it
+    /// must either fold `configured` into what it returns or be able to say why
+    /// that rule cannot apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusionError` if the accelerator cannot be queried for
+    /// whatever the decision needs. The tick is skipped and retried on the next
+    /// interval.
+    async fn delete_expr(
+        &self,
+        accelerator: &Arc<dyn TableProvider>,
+        configured: Option<Expr>,
+    ) -> datafusion::error::Result<Option<Expr>>;
+}
+
 #[derive(Debug)]
 pub enum DataRetentionFilter {
     Time {
@@ -2250,6 +2394,7 @@ pub enum DataRetentionFilter {
 }
 
 pub struct RetentionBuilder {
+    dataset_name: Arc<str>,
     time_column: Option<String>,
     time_format: Option<TimeFormat>,
     time_period: Option<Duration>,
@@ -2262,8 +2407,9 @@ pub struct RetentionBuilder {
 
 impl RetentionBuilder {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(dataset_name: impl Into<Arc<str>>) -> Self {
         Self {
+            dataset_name: dataset_name.into(),
             time_column: None,
             time_format: None,
             time_partition_column: None,
@@ -2326,22 +2472,57 @@ impl RetentionBuilder {
         self
     }
 
+    /// Assemble the policy, reporting a refusal that leaves the dataset unbounded.
     #[must_use]
     pub fn build(self) -> Option<Retention> {
+        let dataset_name = Arc::clone(&self.dataset_name);
+        match self.declared_policy() {
+            Ok(retention) => retention,
+            Err(refusal) => {
+                tracing::error!("{}", refusal.message(&dataset_name));
+                None
+            }
+        }
+    }
+
+    /// [`Self::build`], but silent about a refusal because the caller decides what
+    /// bounds the accelerator and reports that itself.
+    ///
+    /// Caching mode is the one such caller. When `caching_stale_if_error` is disabled
+    /// the caching parameters derive a retention policy of their own and install it
+    /// over whatever this builder produced, so a refusal reported here would say
+    /// nothing evicts while a policy that does was about to replace it.
+    /// `caching_retention` owns that decision, and its unbounded arm carries a warning
+    /// that already explains a declared policy which started nothing.
+    #[must_use]
+    pub fn build_unreported(self) -> Option<Retention> {
+        self.declared_policy().unwrap_or_default()
+    }
+
+    /// The policy this configuration declares — `None` for an operator who opted out —
+    /// or why a configuration that asked for one describes none.
+    ///
+    /// `enabled: false` is the one absent policy that is not a refusal, and it lives
+    /// here rather than in each `build` so the two cannot come to disagree about it.
+    fn declared_policy(self) -> Result<Option<Retention>, RetentionRefusal> {
         if !self.enabled {
-            return None;
+            return Ok(None);
         }
 
-        let check_interval = self.check_interval?;
+        self.assemble().map(Some)
+    }
+
+    /// The policy this configuration describes, or why it describes none.
+    ///
+    /// Split from [`Self::build`] so the refusal is a value a test can assert on
+    /// rather than a log line, and so every refusal is reported by one call site.
+    fn assemble(self) -> Result<Retention, RetentionRefusal> {
         let mut filters = Vec::new();
 
         // Add time-based filter if period and time_column are provided
         if let Some(period) = self.time_period {
             let Some(time_column) = self.time_column else {
-                tracing::error!(
-                    "[retention] The `time_column` must be specified for time-based retention"
-                );
-                return None;
+                return Err(RetentionRefusal::TimeColumnUnset);
             };
 
             filters.push(DataRetentionFilter::Time {
@@ -2361,34 +2542,93 @@ impl RetentionBuilder {
         }
 
         if filters.is_empty() {
-            tracing::error!(
-                "[retention] The `retention_period` or `retention_sql` must be specified for retention"
-            );
-            return None;
+            return Err(RetentionRefusal::NothingToDelete);
         }
 
-        Some(Retention {
+        // Checked after the filters so that a configuration missing both is still
+        // reported by the filter arm, as it was before the interval had an arm at
+        // all: `retention_check_interval` has no default, so this is the arm a
+        // dataset reaches when it configures everything else a policy needs.
+        let check_interval = self.check_interval.ok_or(RetentionRefusal::Unscheduled)?;
+
+        Ok(Retention {
             filters,
             check_interval,
+            // The builder configures a dataset's own retention rules; a
+            // computed policy is attached by whatever owns it.
+            computed: None,
         })
     }
 }
 
-impl Default for RetentionBuilder {
-    fn default() -> Self {
-        Self::new()
+/// The docs page every retention refusal points at.
+const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accelerators";
+
+/// Why [`RetentionBuilder::assemble`] could not assemble a retention policy.
+///
+/// Every variant has the same user-visible outcome — no *scheduled* retention pass runs —
+/// reached through a different missing setting, so [`Self::message`] states that impact
+/// once and each variant supplies its own cause and fix.
+///
+/// The impact stops at "nothing deletes on a schedule" deliberately. Two callers install
+/// something that still evicts: `create_accelerated_table` copies `retention_sql` into
+/// `refresh.write_retention_sql_delete_expr` for Arrow engines *before* building this, so
+/// refreshes go on deleting matching rows while `Unscheduled` or `TimeColumnUnset` refuses;
+/// and caching mode derives a policy after it (see [`RetentionBuilder::build_unreported`]).
+/// A claim about the table being unbounded is therefore not this builder's to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionRefusal {
+    /// Neither `retention_period` nor `retention_sql` says what to delete.
+    NothingToDelete,
+    /// `retention_period` is set but `time_column` does not say what to compare.
+    TimeColumnUnset,
+    /// Nothing says how often to delete, and `retention_check_interval` has no default.
+    Unscheduled,
+}
+
+impl RetentionRefusal {
+    fn message(self, dataset_name: &str) -> String {
+        // `escape_debug` rather than the raw name, matching
+        // `unbounded_caching_retention_warning`: a Spicepod identifier may be quoted,
+        // and a quoted one may legally contain a newline, so a validated name can
+        // otherwise break this line in two and forge a second one.
+        let dataset_name = dataset_name.escape_debug();
+        let cause_and_fix = match self {
+            Self::NothingToDelete => {
+                "Cause: neither `retention_period` nor `retention_sql` is set to a valid value, so nothing says which rows to delete. Set one of them."
+            }
+            Self::TimeColumnUnset => {
+                "Cause: time-based retention compares `time_column` against the cutoff, and it is not set. Set `time_column` on the dataset, or delete by expression with `retention_sql` instead."
+            }
+            Self::Unscheduled => {
+                "Cause: `retention_check_interval` is missing or is not a valid duration, and it has no default. Set it, for example `retention_check_interval: 1h`."
+            }
+        };
+        format!(
+            "[retention] Retention is enabled for dataset '{dataset_name}' but no scheduled retention pass runs, so nothing deletes rows on a schedule. {cause_and_fix} See: {RETENTION_DOCS_URL}"
+        )
     }
 }
 
 pub struct Retention {
     pub(crate) filters: Vec<DataRetentionFilter>,
     pub(crate) check_interval: Duration,
+    /// A policy decided per tick rather than at configuration time, which has
+    /// the last word on what `filters` resolved to: see [`RetentionPredicate`].
+    ///
+    /// A field rather than another `filters` variant, because it does not
+    /// compose the way they do. Every variant in that list is OR'd together;
+    /// this one is handed their combined result and may widen it, narrow it or
+    /// replace it. Putting it in the list would make "at most one, applied
+    /// last" a convention the loop has to enforce by hand, and a second one
+    /// would silently disable the first.
+    pub(crate) computed: Option<Arc<dyn RetentionPredicate>>,
 }
 
 impl Retention {
     #[must_use]
-    pub fn builder() -> RetentionBuilder {
-        RetentionBuilder::new()
+    pub fn builder(dataset_name: impl Into<Arc<str>>) -> RetentionBuilder {
+        RetentionBuilder::new(dataset_name)
     }
 }
 
@@ -2669,6 +2909,192 @@ mod tests {
 
         assert!(
             matches!(err, DataFusionError::Internal(message) if message.contains("accelerator filter support length mismatch"))
+        );
+    }
+
+    /// A retention policy an operator would reasonably think complete, minus the one
+    /// setting that has no default.
+    fn interval_less_builder() -> RetentionBuilder {
+        Retention::builder("events")
+            .time_column(Some("ts"))
+            .time_period(Some(Duration::from_secs(30)))
+            .enabled(true)
+    }
+
+    #[test]
+    fn test_a_retention_policy_without_a_check_interval_is_refused_and_named() {
+        assert_eq!(
+            interval_less_builder().assemble().err(),
+            Some(RetentionRefusal::Unscheduled),
+            "a policy whose only missing setting is `retention_check_interval` must refuse with that reason, not silently"
+        );
+        assert!(
+            interval_less_builder().build().is_none(),
+            "an unassemblable policy still builds into no retention task"
+        );
+    }
+
+    #[test]
+    fn test_a_complete_retention_policy_builds() {
+        let retention = interval_less_builder()
+            .check_interval(Some(Duration::from_secs(1)))
+            .build()
+            .expect("a policy with a time column, a period and a check interval must build");
+        assert_eq!(retention.check_interval, Duration::from_secs(1));
+        assert_eq!(retention.filters.len(), 1);
+    }
+
+    #[test]
+    fn test_retention_disabled_is_not_a_refusal() {
+        assert!(
+            Retention::builder("events")
+                .enabled(false)
+                .build()
+                .is_none(),
+            "`retention_check_enabled: false` is an operator opting out, so it must not report a refusal"
+        );
+    }
+
+    #[test]
+    fn test_a_period_without_a_time_column_is_refused() {
+        assert_eq!(
+            Retention::builder("events")
+                .time_period(Some(Duration::from_secs(30)))
+                .check_interval(Some(Duration::from_secs(1)))
+                .enabled(true)
+                .assemble()
+                .err(),
+            Some(RetentionRefusal::TimeColumnUnset)
+        );
+    }
+
+    #[test]
+    fn test_a_policy_with_nothing_to_delete_is_refused_on_the_filter() {
+        // Precedence: a configuration missing both a filter and the interval keeps
+        // reporting the filter, which is the message it reported before the interval
+        // had an arm of its own.
+        for check_interval in [None, Some(Duration::from_secs(1))] {
+            assert_eq!(
+                Retention::builder("events")
+                    .check_interval(check_interval)
+                    .enabled(true)
+                    .assemble()
+                    .err(),
+                Some(RetentionRefusal::NothingToDelete),
+                "check_interval={check_interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_retention_refusal_names_the_dataset_the_impact_and_the_fix() {
+        for refusal in [
+            RetentionRefusal::NothingToDelete,
+            RetentionRefusal::TimeColumnUnset,
+            RetentionRefusal::Unscheduled,
+        ] {
+            let message = refusal.message("events");
+            assert!(
+                message.contains("dataset 'events'"),
+                "{refusal:?} must name the dataset: {message}"
+            );
+            assert!(
+                message.contains("no scheduled retention pass runs"),
+                "{refusal:?} must state what the operator will observe: {message}"
+            );
+            assert!(
+                message.contains(RETENTION_DOCS_URL),
+                "{refusal:?} must link the docs: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "{refusal:?} must stay on one line: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_refusal_cannot_forge_a_second_log_line_through_the_dataset_name() {
+        // A quoted Spicepod identifier may legally contain a newline.
+        let message = RetentionRefusal::Unscheduled
+            .message("events\n2026-01-01T00:00:00Z ERROR forged: line");
+        assert!(
+            !message.contains('\n'),
+            "the dataset name must be escaped, not break the line: {message}"
+        );
+        assert!(
+            message.contains(r"events\n"),
+            "the newline must survive as an escape rather than vanish: {message}"
+        );
+    }
+
+    #[test]
+    fn test_build_unreported_refuses_the_same_policies_build_does() {
+        // The caching call site swaps `build` for this, so the only difference must
+        // be whether the refusal is logged.
+        assert!(interval_less_builder().build_unreported().is_none());
+        assert!(
+            Retention::builder("events")
+                .enabled(true)
+                .build_unreported()
+                .is_none(),
+            "a policy with nothing to delete assembles into nothing either way"
+        );
+        assert!(
+            interval_less_builder()
+                .check_interval(Some(Duration::from_secs(1)))
+                .build_unreported()
+                .is_some(),
+            "a complete policy must still build when the caller owns the reporting"
+        );
+    }
+
+    #[test]
+    fn test_no_refusal_claims_the_table_is_unbounded() {
+        // `create_accelerated_table` installs `retention_sql` on the Arrow refresh write
+        // path before building this, and caching mode derives a policy after it, so both
+        // `Unscheduled` and `TimeColumnUnset` are reachable while something still evicts.
+        // Measured on a running spiced: the refusal printed 64ms before
+        // "[retention] Evicted 7 records for events". See #13804.
+        for refusal in [
+            RetentionRefusal::NothingToDelete,
+            RetentionRefusal::TimeColumnUnset,
+            RetentionRefusal::Unscheduled,
+        ] {
+            let message = refusal.message("events");
+            for overclaim in [
+                "no data is ever evicted",
+                "grows without limit",
+                "never deleted",
+                "is unbounded",
+            ] {
+                assert!(
+                    !message.contains(overclaim),
+                    "{refusal:?} must not claim {overclaim:?} — the builder only knows that no scheduled pass runs: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_refusal_blames_the_value_not_the_key_where_a_bad_value_collapses_to_none() {
+        // `Dataset::retention_period` warns on an unparseable value and returns `None`, so
+        // this arm is reached with the key set. Saying it "is not set" told the operator to
+        // set a key they had already set. Measured: `retention_period: 7dd` logs
+        // "Unable to parse retention period" and then this refusal. See #13804.
+        let message = RetentionRefusal::NothingToDelete.message("events");
+        assert!(
+            message.contains("is set to a valid value"),
+            "the cause must fault the value, since an invalid one arrives here as absent: {message}"
+        );
+    }
+
+    #[test]
+    fn test_the_missing_check_interval_refusal_names_the_setting_that_has_no_default() {
+        let message = RetentionRefusal::Unscheduled.message("events");
+        assert!(
+            message.contains("`retention_check_interval`") && message.contains("no default"),
+            "the refusal must name the unset setting and say it has no default: {message}"
         );
     }
 }

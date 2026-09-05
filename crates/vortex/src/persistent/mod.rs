@@ -598,14 +598,12 @@ mod tests {
     /// it takes no build with it — the plan still pushes the filter down and the
     /// scan then fails on a cast Vortex no longer knows how to do.
     ///
-    /// This asserts the kernel directly rather than through a SQL filter, because
-    /// the two are not the same question: the kernel is registered on
-    /// `ExtensionArray`, and the scan also evaluates the pushed-down predicate
-    /// against *constant* arrays built from chunk statistics, which reach a
-    /// different cast path the fork does not patch. That second path fails today
-    /// (`No CastReduce to cast constant array from vortex.date[days] to
-    /// vortex.timestamp[ns]`), so a SQL-level assertion would be pinning a bug
-    /// rather than the patch.
+    /// This asserts the kernel directly rather than through a SQL filter, because the
+    /// two are not the same question: the kernel converts the rows of a chunk, and a
+    /// scan casts a file's `max` statistic — a scalar — through the same expression
+    /// to decide whether to read the chunk at all.
+    /// [`a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows`] covers that
+    /// second path.
     #[test]
     fn test_date_to_timestamp_extension_cast() -> anyhow::Result<()> {
         use datafusion::arrow::array::{Array as _, AsArray as _, Date32Array};
@@ -654,6 +652,211 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Assert that `sql`'s `CAST(event_date AS TIMESTAMP)` is evaluated inside the Vortex
+    /// scan.
+    ///
+    /// Both date-cast guards below assert a row count, and `DataFusion` returns the same
+    /// count when it evaluates the filter itself in a `FilterExec` above the scan. Without
+    /// this, a pushdown that stopped happening would leave them green and guarding nothing.
+    async fn assert_cast_pushes_into_the_scan(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<()> {
+        let plan = ctx
+            .session
+            .state()
+            .create_physical_plan(ctx.session.sql(sql).await?.logical_plan())
+            .await?;
+        let plan_display = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_display.contains("predicate: CAST(event_date"),
+            "the cast has to push into the Vortex scan, got plan:\n{plan_display}"
+        );
+        Ok(())
+    }
+
+    /// A pushed-down `CAST(date_col AS TIMESTAMP)` has to return the matching rows.
+    ///
+    /// The filter goes into the Vortex scan whole, and the scan uses it twice: it
+    /// falsifies `cast(col as timestamp) > lit` into `cast(max(col) as timestamp) <= lit`
+    /// and casts the file's `max` **statistic** to decide whether to read the file, then
+    /// casts the column's rows to filter the ones it read. The first of those is a scalar
+    /// cast, which `Extension`'s array kernel does not cover, and it failed the scan
+    /// outright: `No CastReduce to cast constant array from vortex.date[days](i32?) to
+    /// vortex.timestamp[ns](i64?)` ([#13624](https://github.com/spiceai/spiceai/issues/13624)).
+    ///
+    /// The literal carries a time of day so `unwrap_cast_in_comparison` cannot rewrite the
+    /// comparison back to a bare `DATE` and drop the cast — without that the filter never
+    /// reaches Vortex as a cast at all, and the test guards nothing.
+    #[tokio::test]
+    async fn a_pushed_down_date_to_timestamp_cast_returns_the_matching_rows() -> anyhow::Result<()>
+    {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE events (event_date DATE) \
+                STORED AS vortex LOCATION '/date_cast/'",
+            )
+            .await?;
+
+        // One row before the bound, one on the same day as it but before the time of day,
+        // a NULL, and one after: a filter that was dropped rather than evaluated would
+        // return more than the one match.
+        ctx.session
+            .sql(
+                "INSERT INTO events VALUES \
+                    (DATE '1999-12-31'), (DATE '2024-01-15'), (NULL), (DATE '2024-03-01')",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let sql = "SELECT count(*) FROM events \
+                   WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
+
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
+        assert_eq!(
+            scalar_count(&ctx, sql).await?,
+            1,
+            "only 2024-03-01 is after the bound"
+        );
+
+        Ok(())
+    }
+
+    /// The same filter over a `Date64` column has to return the same row.
+    ///
+    /// `Date64` is stored as `vortex.date[ms]`, which shares its `i64` storage with
+    /// `vortex.timestamp[ns]`. A scalar cast that re-labelled the storage value instead of
+    /// converting it therefore did not fail here — it returned the millisecond count as a
+    /// nanosecond one, an instant 10^6 too small, so the falsifier concluded the file held
+    /// no matching row and the scan skipped it. The query returned zero rows and no error,
+    /// which is why this is a separate guard from the `Date32` one above and asserts a row
+    /// count rather than that the query succeeds.
+    ///
+    /// The file is written directly because `CREATE EXTERNAL TABLE … DATE` is `Date32`;
+    /// `Date64` has no SQL spelling to declare a column with.
+    #[tokio::test]
+    async fn a_pushed_down_date64_to_timestamp_cast_does_not_prune_the_matching_file()
+    -> anyhow::Result<()> {
+        use datafusion::arrow::array::Date64Array;
+        use vortex::array::ArrayRef as VortexArrayRef;
+        use vortex::arrow::FromArrowArray;
+
+        let ctx = TestSessionContext::default();
+        let session = VortexSession::default();
+
+        // 1999-12-31, 2024-01-15, NULL, 2024-03-01 as milliseconds since the epoch.
+        let dates = Date64Array::from(vec![
+            Some(946_598_400_000i64),
+            Some(1_705_276_800_000),
+            None,
+            Some(1_709_251_200_000),
+        ]);
+        let events = StructArray::try_new(
+            ["event_date"].into(),
+            vec![VortexArrayRef::from_arrow(&dates, true)?],
+            4,
+            Validity::NonNullable,
+        )?;
+
+        let mut writer = ObjectStoreWrite::new(ctx.store.clone(), &"date64.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut writer, events.into_array().to_array_stream())
+            .await?;
+        writer.shutdown().await?;
+
+        let sql = "SELECT count(*) FROM '/date64.vortex' \
+                   WHERE CAST(event_date AS TIMESTAMP) > TIMESTAMP '2024-01-15 12:00:00'";
+
+        assert_cast_pushes_into_the_scan(&ctx, sql).await?;
+        assert_eq!(
+            scalar_count(&ctx, sql).await?,
+            1,
+            "2024-03-01 matches, so the file cannot be pruned"
+        );
+
+        Ok(())
+    }
+
+    /// Every `i64` is a nanosecond instant a timestamp scalar can carry, its floor included.
+    ///
+    /// The two guards above cover the fork's date-to-timestamp conversion; this one covers the
+    /// range the converted value has to land inside. The fork validates a timestamp scalar
+    /// against the timestamp's own range. Validating it by building a Jiff span instead — the
+    /// span's nanosecond floor is one above `i64::MIN` — refuses 1677-09-21, an instant a
+    /// `timestamp[ns]` column holds, so a file whose `min` statistic is that value fails to
+    /// bind and the scan errors on data it can read. Losing only that half of the fork patch
+    /// would leave both guards above passing.
+    #[test]
+    fn a_nanosecond_timestamp_scalar_spans_the_whole_i64_range() {
+        use vortex::dtype::{DType, Nullability};
+        use vortex::extension::datetime::{TimeUnit, Timestamp};
+        use vortex::scalar::Scalar;
+
+        let dtype =
+            DType::Extension(Timestamp::new(TimeUnit::Nanoseconds, Nullability::Nullable).erased());
+
+        for value in [i64::MIN, i64::MIN + 1, 0, i64::MAX] {
+            let scalar = Scalar::try_new(dtype.clone(), Some(value.into())).unwrap_or_else(|err| {
+                panic!("{value} nanoseconds is an instant a timestamp can represent: {err}")
+            });
+            // Rendering reaches the same value through a second path, which the fork also
+            // keeps off Jiff spans. A `Display` impl cannot report a failure, so building one
+            // on them turns this value into an abort rather than an error.
+            assert!(
+                !scalar.to_string().is_empty(),
+                "{value} nanoseconds has to render"
+            );
+        }
+    }
+
+    /// A timestamp count that denotes no instant renders instead of taking the process down.
+    ///
+    /// The guard above covers nanoseconds, where the fix is that the whole `i64` is admitted.
+    /// The other three units keep a Jiff span, so what the fork patch changes for them is that
+    /// the span is built with the *checked* constructors and added with `checked_add`. Both of
+    /// the unchecked forms abort, and a `Display` impl has no way to report a failure, so a
+    /// re-cut that restored either one would panic on these — while the nanosecond guard above
+    /// stayed green. `TimestampValue` is public, so these are reachable without a scalar.
+    #[test]
+    fn a_timestamp_count_that_is_not_an_instant_renders_instead_of_aborting() {
+        use vortex::extension::datetime::TimestampValue;
+
+        // Past the span range: the unchecked `Span` constructors abort here.
+        assert_eq!(
+            TimestampValue::Seconds(i64::MAX, None).to_string(),
+            "9223372036854775807s"
+        );
+        assert_eq!(
+            TimestampValue::Seconds(i64::MIN, None).to_string(),
+            "-9223372036854775808s"
+        );
+        assert_eq!(
+            TimestampValue::Milliseconds(i64::MAX, None).to_string(),
+            "9223372036854775807ms"
+        );
+        assert_eq!(
+            TimestampValue::Microseconds(i64::MAX, None).to_string(),
+            "9223372036854775807\u{b5}s"
+        );
+        // Inside the span range but past the last instant: `Timestamp + Span` aborts here, so
+        // this pins the second of the two abort paths.
+        assert_eq!(
+            TimestampValue::Seconds(253_402_300_800, None).to_string(),
+            "253402300800s"
+        );
+        // An instant still renders as one rather than falling back.
+        assert_eq!(
+            TimestampValue::Seconds(1_709_251_200, None).to_string(),
+            "2024-03-01T00:00:00Z"
+        );
     }
 
     /// A large `IN` list has to stay evaluable.

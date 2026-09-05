@@ -29,6 +29,16 @@ pub const METRIC_REFRESH_LAG_MS: &str = "dataset_acceleration_refresh_lag_ms";
 pub const METRIC_INGESTION_LAG_MS: &str = "dataset_acceleration_ingestion_lag_ms";
 pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_worker_panics";
 
+/// Low-cardinality `reason` on `dataset_acceleration_refresh_errors`.
+///
+/// Always emit this label. A listed object replaced mid-scan is
+/// `object_generation_changed` so it can be filtered without hiding genuine
+/// Parquet corruption (`parquet_decode`) or other refresh failures (`other`).
+pub const REFRESH_ERROR_REASON: &str = "reason";
+pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generation_changed";
+pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";
+pub const REFRESH_ERROR_REASON_OTHER: &str = "other";
+
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
 pub static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {

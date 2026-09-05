@@ -23,6 +23,7 @@ limitations under the License.
 use super::metadata::{
     ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -727,6 +728,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// the live set and reconstructs the referenced physical paths.
     async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
+    /// Drop all non-authoritative cached metadata rows for one snapshot that has
+    /// left the live set — both its `cayenne_snapshot_file` manifest rows and its
+    /// `cayenne_snapshot_file_statistics` stats-cache rows. Coupling the two
+    /// deletions in one method keeps the sibling caches from drifting: a caller
+    /// can never delete the manifest rows and forget the stats rows, or the reverse.
+    async fn clear_snapshot_cached_metadata(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
     /// Drop manifest rows for snapshots other than the given one (snapshot GC).
     async fn clear_snapshot_files_except(
         &self,
@@ -829,6 +841,19 @@ pub trait MetadataCatalog: Send + Sync {
     /// tombstones, in one round trip. See [`InlinedDataStats`] for why the
     /// checkpoint needs both.
     async fn get_inlined_data_stats(&self, table_id: &str) -> CatalogResult<InlinedDataStats>;
+
+    /// Aggregate the table's disk and metastore footprint from the metastore's
+    /// own file accounting.
+    ///
+    /// Answers "how large is this dataset, and which layer is growing" — the
+    /// live data files, the deletion vectors shadowing them, the cold tier, the
+    /// inline tier, and the metastore rows each of those costs — without
+    /// listing a single directory.
+    ///
+    /// Read-only aggregates intended for the background maintenance tick, never
+    /// a write path: a table with thousands of files scans thousands of index
+    /// rows here.
+    async fn table_storage_stats(&self, table_id: &str) -> CatalogResult<TableStorageStats>;
 
     /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
     async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
