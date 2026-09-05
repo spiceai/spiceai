@@ -436,6 +436,11 @@ tonic = { version = "0.14", features = [
     "tls-connect-info",
 ] }
 tonic-health = { version = "0.14" }
+# Pure-Rust TPC-H generator (the one the DataFusion benchmarks use). Test
+# fixtures only, so the correctness lanes need no network fetch of DuckDB's tpch
+# extension. `tpchgen-arrow` would be the natural fit but wants arrow 59 and this
+# workspace is on the 58 fork; the core crate has no dependencies at all.
+tpchgen = "3.0.0"
 tower = "0.5.2"
 tower-http = { version = "0.6.2", features = ["cors", "limit"] }
 tracing = "0.1.43"

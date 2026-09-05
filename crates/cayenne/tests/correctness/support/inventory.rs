@@ -73,7 +73,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             suite: "tpcds",
             name: q.name.to_string(),
             sql: q.sql.to_string(),
-            duckdb_exclusion: None,
+            duckdb_exclusion: tpcds_duckdb_exclusion(&q),
             chdb_exclusion: Some(
                 "TPC-DS multi-table SQL targets DataFusion/DuckDB dialect; \
                  chDB runs SQLLancer + micro on all three engines",
@@ -198,6 +198,24 @@ fn sqllancer_sqlite_exclusion(q: &Query) -> Option<&'static str> {
         Some("SQLLancer query uses DataFusion-only SQL not supported by SQLite")
     } else {
         None
+    }
+}
+
+fn tpcds_duckdb_exclusion(q: &Query) -> Option<&'static str> {
+    // Both queries name a column that two relations in scope expose, and leave it
+    // unqualified. DuckDB's binder rejects the ambiguity; DataFusion resolves it.
+    // A property of the SQL, checkable by running either query against DuckDB — not
+    // a disagreement about results.
+    match q.name.as_ref() {
+        "tpcds_q58" => Some(
+            "TPC-DS q58 orders by an unqualified `item_id` that both the `ss_items` and \
+             `cs_items` subqueries expose; DuckDB's binder rejects the ambiguous reference",
+        ),
+        "tpcds_q72" => Some(
+            "TPC-DS q72 references an unqualified `d_week_seq` that both the `d1` and `d2` \
+             aliases of date_dim expose; DuckDB's binder rejects the ambiguous reference",
+        ),
+        _ => None,
     }
 }
 

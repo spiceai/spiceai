@@ -19,6 +19,8 @@
 //!    (TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro).
 //! 2. Shipped `compare_query_result_batches` fails on value mismatches and
 //!    passes multiset-equal reordered results.
+//! 3. The sort check rejects a side that does not honor the query's own
+//!    top-level `ORDER BY`, while still tolerating permuted ties.
 //!
 //! See `tests/correctness/README.md`.
 
@@ -33,13 +35,15 @@ mod support;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use support::compare_actual_results;
 use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
+use support::{compare_actual_results, compare_actual_results_detailed, keep_unverified_order};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
-    QueryValidationFailReason, QueryValidationResult, RowOrder, compare_query_result_batches,
+    QueryValidationFailReason, QueryValidationResult, RowOrder, SortKeyColumn, SortKeyResolution,
+    SortOrderViolation, compare_query_result_batches, compare_query_result_batches_with_sort_check,
+    has_top_level_limit, has_top_level_order_by, resolve_sort_key,
 };
 
 #[test]
@@ -183,11 +187,14 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     let ordered = Query::new("ordered".into(), "SELECT v FROM t ORDER BY v".into(), false);
     let unordered = Query::new("unordered".into(), "SELECT v FROM t".into(), false);
 
-    // ORDER BY without LIMIT: multiset (tie order is not guaranteed).
+    // ORDER BY without LIMIT: content is compared as a multiset so tied rows may
+    // come back in either order, but `[2, 1]` is not a legal answer to `ORDER BY v`
+    // — 1 and 2 are not tied. The sort check catches it even though the two sides
+    // hold the same rows.
     let out = compare_actual_results(&ordered, &[a.clone()], &[b.clone()]);
     assert!(
-        matches!(out, support::ParityOutcome::Pass),
-        "ORDER BY without LIMIT must accept multiset reordering: {out:?}"
+        matches!(out, support::ParityOutcome::Fail { .. }),
+        "ORDER BY without LIMIT must reject a side whose rows are not sorted: {out:?}"
     );
 
     // Multiset path: same multiset → pass
@@ -207,6 +214,206 @@ fn compare_results_wrapper_uses_order_by_from_sql() {
     assert!(
         matches!(out, support::ParityOutcome::Fail { .. }),
         "ORDER BY+LIMIT must preserve order: {out:?}"
+    );
+}
+
+/// A `Fail` must carry its typed reason, not just a rendered one. The DuckDB
+/// lane re-adjudicates a Cayenne/DuckDB disagreement against a DataFusion
+/// baseline, and that baseline can speak to a content mismatch but says nothing
+/// about whether the *other* engine honored its own `ORDER BY`. Re-adjudicating
+/// a sort violation therefore returns it as `Excluded`, which counts as a pass.
+/// Telling the two apart on a `Debug` string would make that control flow depend
+/// on a format.
+#[test]
+fn a_failure_carries_the_typed_reason_that_separates_a_sort_violation() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let sorted = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("sorted");
+    let reversed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 1]))],
+    )
+    .expect("reversed");
+    let other_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![7, 8]))],
+    )
+    .expect("other rows");
+
+    // Same rows, but the right side does not honor the query's own ORDER BY.
+    let ordered = Query::new("ordered".into(), "SELECT v FROM t ORDER BY v".into(), false);
+    let compared = compare_actual_results_detailed(&ordered, &[sorted.clone()], &[reversed]);
+    let (outcome, reason) = (compared.outcome, compared.reason);
+    assert!(
+        matches!(outcome, support::ParityOutcome::Fail { .. }),
+        "a side that breaks its own ORDER BY is a failure: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            reason,
+            Some(QueryValidationFailReason::SortOrderViolation { ref side, .. }) if side == "right"
+        ),
+        "the reason must name the violating side, not just render it: {reason:?}"
+    );
+
+    // Different rows: a content mismatch, which the baseline *may* adjudicate.
+    let content = compare_actual_results_detailed(&ordered, &[sorted], &[other_rows]).reason;
+    assert!(
+        content.is_some()
+            && !matches!(
+                content,
+                Some(QueryValidationFailReason::SortOrderViolation { .. })
+            ),
+        "a content mismatch must not read as a sort violation: {content:?}"
+    );
+}
+
+/// `ORDER BY … LIMIT` compares positionally, because the *set* of rows depends
+/// on the order. A side that breaks its own `ORDER BY` therefore fails the
+/// content comparison first, and reporting only that would say the rows differ
+/// without naming the side that is wrong — which is what lets the DuckDB lane
+/// adjudicate a real violation away as a dialect difference.
+#[test]
+fn an_order_by_limit_violation_is_named_as_one_not_as_a_content_mismatch() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let sorted = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("sorted");
+    let reversed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 1]))],
+    )
+    .expect("reversed");
+
+    let top_k = Query::new(
+        "ordered_limit".into(),
+        "SELECT v FROM t ORDER BY v LIMIT 10".into(),
+        false,
+    );
+    let compared = compare_actual_results_detailed(&top_k, &[sorted], &[reversed]);
+    let (outcome, reason) = (compared.outcome, compared.reason);
+    assert!(
+        matches!(outcome, support::ParityOutcome::Fail { .. }),
+        "a mis-ordered top-K side is a failure: {outcome:?}"
+    );
+    assert!(
+        matches!(
+            reason,
+            Some(QueryValidationFailReason::SortOrderViolation { ref side, .. }) if side == "right"
+        ),
+        "the same rows in the wrong order is a sort violation, not just a content mismatch: {reason:?}"
+    );
+}
+
+/// A `COLLATE` asks for an ordering the comparison cannot reproduce: it runs on
+/// Arrow's native ordering, which for strings is byte order. SQLite returns
+/// `['a', 'B']` for `ORDER BY v COLLATE NOCASE`, and byte order calls that an
+/// inversion because `B` is 0x42 and `a` is 0x61. Checking it anyway would fail
+/// correct output, so the term is reported as unchecked instead.
+#[test]
+fn a_collated_term_is_reported_unchecked_not_judged_by_byte_order() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let collated = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec!["a", "B"]))],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "collated",
+        "SELECT v COLLATE NOCASE AS v FROM t ORDER BY v COLLATE NOCASE",
+        &[collated.clone()],
+        &[collated],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert_eq!(
+        comparison.result,
+        QueryValidationResult::Pass,
+        "NOCASE makes ['a', 'B'] correctly ordered; byte order must not overrule it"
+    );
+    assert!(
+        !comparison.unchecked.is_empty(),
+        "and the collation must be reported as a hole rather than a silent pass"
+    );
+}
+
+/// What the sort check could not cover must survive a failed content
+/// comparison. A caller that recovers from the failure — the chDB lane retries a
+/// schema mismatch as string rows — would otherwise turn an order that was never
+/// verified into a clean pass, which is the outcome this whole check exists to
+/// make impossible.
+#[test]
+fn an_unverified_order_survives_a_failed_content_comparison() {
+    let text = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let number = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let left = RecordBatch::try_new(
+        Arc::clone(&text),
+        vec![Arc::new(StringArray::from(vec!["a", "B"]))],
+    )
+    .expect("left");
+    let right = RecordBatch::try_new(
+        Arc::clone(&number),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("right");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "schema_mismatch_with_unchecked_order",
+        "SELECT v COLLATE NOCASE AS v FROM t ORDER BY v COLLATE NOCASE",
+        &[left],
+        &[right],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        matches!(comparison.result, QueryValidationResult::Fail(_)),
+        "the schemas differ, so the content comparison fails: {:?}",
+        comparison.result
+    );
+    assert!(
+        !comparison.unchecked.is_empty(),
+        "the collation left the order unverified, and a caller that recovers from \
+         the content failure must still be told that"
+    );
+}
+
+/// A lane that recovers from a failed comparison by re-comparing content — the
+/// chDB lane retries a schema mismatch as sorted string rows — establishes the
+/// rows and nothing about their order. Its pass must not overwrite a hole the
+/// sort check already reported.
+#[test]
+fn a_content_only_recovery_cannot_pass_an_unverified_order() {
+    let hole = vec!["left: ORDER BY term 'v COLLATE NOCASE' requests a collation".to_string()];
+
+    assert!(
+        matches!(
+            keep_unverified_order(support::ParityOutcome::Pass, hole.clone()),
+            support::ParityOutcome::OrderUnchecked { .. }
+        ),
+        "content matched, but nothing verified the order"
+    );
+    assert!(
+        matches!(
+            keep_unverified_order(support::ParityOutcome::Pass, Vec::new()),
+            support::ParityOutcome::Pass
+        ),
+        "with the order verified, the recovery stands as a pass"
+    );
+    let failed = support::ParityOutcome::Fail {
+        detail: "rows differ".to_string(),
+    };
+    assert!(
+        matches!(
+            keep_unverified_order(failed, hole),
+            support::ParityOutcome::Fail { .. }
+        ),
+        "a recovery that did not pass keeps its own verdict"
     );
 }
 
@@ -251,4 +458,888 @@ fn harness_compare_actual_results_drives_shipped_path() {
         shipped,
         QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Row order: an engine must honor its own top-level ORDER BY
+//
+// Multiset content equality canonically sorts both sides before comparing, so it
+// establishes that two engines returned the same rows and nothing about the order.
+// Most of the corpus sorts without a LIMIT — every CH-benCHmark query, every SSB
+// query with an ORDER BY, 14 of TPC-H's 28 — and was compared that way, so a wrong
+// sort over the right rows compared equal. These pin the check that closes it, and
+// the tie tolerance that must survive it.
+// ---------------------------------------------------------------------------
+
+fn i64_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).expect("batch")
+}
+
+/// Two columns, so a tie on the first can be permuted on the second.
+fn keyed_batch(keys: Vec<i64>, payload: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("p", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .expect("batch")
+}
+
+#[test]
+fn sort_check_rejects_unsorted_side_with_identical_rows() {
+    let sorted = i64_batch("v", vec![1, 2, 3]);
+    let scrambled = i64_batch("v", vec![3, 1, 2]);
+
+    // Identical multisets: content comparison alone cannot tell these apart.
+    assert_eq!(
+        compare_query_result_batches(
+            "content",
+            &[sorted.clone()],
+            &[scrambled.clone()],
+            RowOrder::Multiset
+        )
+        .expect("content compare"),
+        QueryValidationResult::Pass,
+        "precondition: the two sides hold the same rows"
+    );
+
+    let result = compare_query_result_batches_with_sort_check(
+        "sorted",
+        "SELECT v FROM t ORDER BY v",
+        &[sorted],
+        &[scrambled],
+        RowOrder::Multiset,
+    )
+    .expect("sort-checked compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                ref side,
+                ..
+            }) if side == "right"
+        ),
+        "expected a SortOrderViolation naming the unsorted side, got {result:?}"
+    );
+}
+
+#[test]
+fn sort_check_tolerates_permuted_ties() {
+    // Same key on every row, so any payload order is a legal answer.
+    let left = keyed_batch(vec![7, 7, 7], vec!["a", "b", "c"]);
+    let right = keyed_batch(vec![7, 7, 7], vec!["c", "a", "b"]);
+
+    let result = compare_query_result_batches_with_sort_check(
+        "ties",
+        "SELECT k, p FROM t ORDER BY k",
+        &[left],
+        &[right],
+        RowOrder::Multiset,
+    )
+    .expect("sort-checked compare");
+    assert!(
+        result.is_fully_verified_pass(),
+        "tied rows may be returned in any order: {result:?}"
+    );
+}
+
+#[test]
+fn sort_check_honors_desc_and_multi_column_keys() {
+    let descending = i64_batch("v", vec![3, 2, 1]);
+    assert_eq!(
+        compare_query_result_batches_with_sort_check(
+            "desc",
+            "SELECT v FROM t ORDER BY v DESC",
+            &[descending.clone()],
+            &[descending],
+            RowOrder::Multiset,
+        )
+        .expect("desc compare")
+        .result,
+        QueryValidationResult::Pass
+    );
+
+    // Sorted on k, unsorted within a k group on the second key.
+    let good = keyed_batch(vec![1, 1, 2], vec!["a", "b", "a"]);
+    let bad = keyed_batch(vec![1, 1, 2], vec!["b", "a", "a"]);
+    let result = compare_query_result_batches_with_sort_check(
+        "two_keys",
+        "SELECT k, p FROM t ORDER BY k, p",
+        &[good],
+        &[bad],
+        RowOrder::Multiset,
+    )
+    .expect("two-key compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "p"
+        ),
+        "expected the violation to name the secondary key, got {result:?}"
+    );
+}
+
+#[test]
+fn sort_key_resolves_ordinals_aliases_and_projected_expressions() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("d_year", DataType::Int64, false),
+        Field::new("revenue", DataType::Int64, false),
+    ]));
+
+    for (sql, expected) in [
+        (
+            "SELECT d_year, SUM(lo_revenue) AS revenue FROM t GROUP BY d_year ORDER BY 2 DESC",
+            vec![SortKeyColumn {
+                index: 1,
+                name: "revenue".to_string(),
+                descending: true,
+                nulls_first: None,
+            }],
+        ),
+        (
+            "SELECT d_year, SUM(lo_revenue) AS revenue FROM t GROUP BY d_year \
+             ORDER BY d_year ASC, revenue DESC",
+            vec![
+                SortKeyColumn {
+                    index: 0,
+                    name: "d_year".to_string(),
+                    descending: false,
+                    nulls_first: None,
+                },
+                SortKeyColumn {
+                    index: 1,
+                    name: "revenue".to_string(),
+                    descending: true,
+                    nulls_first: None,
+                },
+            ],
+        ),
+        (
+            "SELECT d_year, SUM(lo_revenue) FROM t GROUP BY d_year ORDER BY SUM(lo_revenue)",
+            vec![SortKeyColumn {
+                index: 1,
+                name: "revenue".to_string(),
+                descending: false,
+                nulls_first: None,
+            }],
+        ),
+    ] {
+        assert_eq!(
+            resolve_sort_key(sql, &schema),
+            SortKeyResolution::Resolved {
+                key: expected,
+                unresolved_suffix: None
+            },
+            "unexpected resolution for {sql}"
+        );
+    }
+
+    assert_eq!(
+        resolve_sort_key("SELECT v FROM t", &schema),
+        SortKeyResolution::Unordered
+    );
+}
+
+/// An `ORDER BY` inside a subquery constrains that subquery, not the result, so
+/// it must not be read as a sort key for the outer rows.
+#[test]
+fn sort_key_ignores_order_by_below_the_top_level() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    assert_eq!(
+        resolve_sort_key(
+            "SELECT v FROM (SELECT v FROM t ORDER BY v) AS inner_q",
+            &schema
+        ),
+        SortKeyResolution::Unordered
+    );
+}
+
+/// A key the parser cannot map onto an output column must report itself rather
+/// than silently reading as ordered — an unchecked cell has to stay countable.
+#[test]
+fn unresolvable_sort_key_reports_a_reason() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let resolution = resolve_sort_key("SELECT v FROM t ORDER BY other_col", &schema);
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "expected Unresolved, got {resolution:?}"
+    );
+}
+
+/// Engines disagree on where NULLs sort absent an explicit `NULLS FIRST`/`LAST`,
+/// so a key pair involving a NULL is treated as tied rather than as a violation.
+#[test]
+fn sort_check_does_not_police_null_placement() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let nulls_last = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(1), Some(2), None]))],
+    )
+    .expect("nulls last");
+    let nulls_first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![None, Some(1), Some(2)]))],
+    )
+    .expect("nulls first");
+
+    assert_eq!(
+        compare_query_result_batches_with_sort_check(
+            "nulls",
+            "SELECT v FROM t ORDER BY v",
+            &[nulls_last],
+            &[nulls_first],
+            RowOrder::Multiset,
+        )
+        .expect("null compare")
+        .result,
+        QueryValidationResult::Pass
+    );
+}
+
+/// A `NULL` in a leading key must not let the check fall through to the
+/// tiebreaker. TPC-DS q71 sorts on a `SUM` that is `NULL` for nine rows, and
+/// reading the second key across that boundary reported a violation on a result
+/// that was correctly ordered — the engine had simply placed `NULL`s first.
+#[test]
+fn sort_check_does_not_consult_tiebreaker_across_a_null_in_a_leading_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("brand_id", DataType::Int64, false),
+        Field::new("ext_price", DataType::Int64, true),
+    ]));
+    // NULLs first under DESC, then descending values. brand_id descends exactly
+    // at the NULL/non-NULL boundary, which is where the tiebreaker must not run.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 10_005_003, 6_012_008])),
+            Arc::new(Int64Array::from(vec![None, None, None, Some(22_262)])),
+        ],
+    )
+    .expect("batch");
+
+    assert_eq!(
+        compare_query_result_batches_with_sort_check(
+            "null_leading_key",
+            "SELECT brand_id, ext_price FROM t ORDER BY ext_price DESC, brand_id",
+            &[batch.clone()],
+            &[batch],
+            RowOrder::Multiset,
+        )
+        .expect("compare")
+        .result,
+        QueryValidationResult::Pass
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two false-green paths an adversarial review reproduced against this
+// branch: a NULL key column that swallowed the tiebreaker, and an unverifiable
+// ORDER BY that reported as a clean pass.
+// ---------------------------------------------------------------------------
+
+/// Two rows that are both `NULL` in a key column are tied under every placement
+/// convention, so SQL requires the next key column to decide. Skipping it left
+/// TPC-DS q71's nine `NULL`-`SUM` rows free to come back in any `brand_id` order.
+#[test]
+fn sort_check_consults_the_tiebreaker_inside_a_null_group() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("brand_id", DataType::Int64, false),
+        Field::new("ext_price", DataType::Int64, true),
+    ]));
+    let scrambled_within_null_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 1])),
+            Arc::new(Int64Array::from(vec![None, None])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "null_group_tiebreak",
+        "SELECT brand_id, ext_price FROM t ORDER BY ext_price DESC, brand_id",
+        &[scrambled_within_null_group.clone()],
+        &[scrambled_within_null_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "brand_id"
+        ),
+        "a tie on the NULL key must still require brand_id to ascend, got {result:?}"
+    );
+}
+
+/// `[2, NULL, 1]` is illegal under `NULLS FIRST` and `NULLS LAST` alike, but
+/// neither adjacent pair can be judged on its own. Each key column's non-`NULL`
+/// values are compared as a subsequence so the inversion is still caught.
+#[test]
+fn sort_check_catches_an_inversion_straddling_a_null() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let straddling = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(2), None, Some(1)]))],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "straddling_null",
+        "SELECT v FROM t ORDER BY v",
+        &[straddling.clone()],
+        &[straddling],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "2 before 1 is out of order under either NULL placement, got {result:?}"
+    );
+}
+
+/// An `ORDER BY` the checker cannot locate must not read as a verified pass.
+#[test]
+fn an_unverifiable_sort_key_is_not_reported_as_a_clean_pass() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let scrambled = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "unresolvable",
+        "SELECT v FROM t ORDER BY not_a_projected_column",
+        &[scrambled.clone()],
+        &[scrambled],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+
+    assert_eq!(comparison.result, QueryValidationResult::Pass);
+    assert!(
+        !comparison.is_fully_verified_pass(),
+        "an unchecked ORDER BY must not read as a fully verified pass"
+    );
+    assert_eq!(
+        comparison.unchecked.len(),
+        2,
+        "both sides should report the hole: {:?}",
+        comparison.unchecked
+    );
+}
+
+/// Dropping a whole key because a later term is unmappable left TPC-DS q70's
+/// `lochierarchy` unverified for no reason. The mappable prefix is checked, and
+/// the rest is named.
+#[test]
+fn an_unmappable_term_still_checks_the_prefix_before_it() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("lochierarchy", DataType::Int64, false),
+        Field::new("rank_within_parent", DataType::Int64, false),
+    ]));
+    let sql = "SELECT lochierarchy, rank_within_parent FROM t \
+               ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END, \
+               rank_within_parent";
+
+    let SortKeyResolution::Resolved {
+        key,
+        unresolved_suffix,
+    } = resolve_sort_key(sql, &schema)
+    else {
+        panic!("expected the leading term to resolve");
+    };
+    assert_eq!(key.len(), 1, "only the prefix before the CASE resolves");
+    assert_eq!(key[0].name, "lochierarchy");
+    assert!(
+        unresolved_suffix.is_some(),
+        "the dropped suffix must be named"
+    );
+
+    // And the prefix is genuinely enforced.
+    let descending_violated = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![1, 1])),
+        ],
+    )
+    .expect("batch");
+    let comparison = compare_query_result_batches_with_sort_check(
+        "prefix",
+        sql,
+        &[descending_violated.clone()],
+        &[descending_violated],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        matches!(
+            comparison.result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "the resolved prefix must still be enforced, got {:?}",
+        comparison.result
+    );
+}
+
+/// An explicit `NULLS FIRST`/`NULLS LAST` makes placement part of the requested
+/// order, so it is enforced rather than left to the engine.
+#[test]
+fn sort_check_enforces_null_placement_when_the_query_states_it() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let nulls_last = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(1), Some(2), None]))],
+    )
+    .expect("batch");
+
+    let stated_first = compare_query_result_batches_with_sort_check(
+        "nulls_first_stated",
+        "SELECT v FROM t ORDER BY v NULLS FIRST",
+        &[nulls_last.clone()],
+        &[nulls_last.clone()],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            stated_first,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation { .. })
+        ),
+        "NULLS FIRST was stated and violated, got {stated_first:?}"
+    );
+
+    let stated_last = compare_query_result_batches_with_sort_check(
+        "nulls_last_stated",
+        "SELECT v FROM t ORDER BY v NULLS LAST",
+        &[nulls_last.clone()],
+        &[nulls_last],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        stated_last.is_fully_verified_pass(),
+        "NULLS LAST was stated and honored: {stated_last:?}"
+    );
+}
+
+/// Both predicates that pick the content-comparison mode must read the top level
+/// only — a subquery's `ORDER BY`/`LIMIT` does not constrain the outer result.
+#[test]
+fn top_level_predicates_ignore_subquery_clauses() {
+    assert!(has_top_level_order_by("SELECT v FROM t ORDER BY v"));
+    assert!(!has_top_level_order_by(
+        "SELECT v FROM (SELECT v FROM t ORDER BY v) AS inner_q"
+    ));
+    assert!(has_top_level_limit("SELECT v FROM t LIMIT 10"));
+    assert!(has_top_level_limit("SELECT v FROM t OFFSET 5"));
+    assert!(!has_top_level_limit(
+        "SELECT v FROM (SELECT v FROM t LIMIT 10) AS inner_q"
+    ));
+    assert!(!has_top_level_limit("SELECT v FROM t"));
+}
+
+/// A later key column is still constrained *within* a run of rows tied on the
+/// columns before it, so a `NULL` there can hide an inversion the same way one
+/// in the leading column can. Both adjacent pairs below are unjudged.
+#[test]
+fn sort_check_catches_an_inversion_straddling_a_null_in_a_later_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let inverted_within_a_tie = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1])),
+            Arc::new(Int64Array::from(vec![Some(2), None, Some(1)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "later_key_null",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[inverted_within_a_tie.clone()],
+        &[inverted_within_a_tie],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2 goes 2 then 1 inside a k1 tie, which no NULL placement makes legal: {result:?}"
+    );
+}
+
+/// The same shape must stay legal once an earlier key separates the rows: a
+/// secondary key only orders within a tie, so it may step backwards freely.
+#[test]
+fn sort_check_allows_a_later_key_to_restart_when_an_earlier_one_changes() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cnt", DataType::Int64, false),
+        Field::new("state", DataType::Int64, true),
+    ]));
+    let restarts_per_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(5), None, Some(1), Some(3)])),
+        ],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "group_restart",
+        "SELECT cnt, state FROM t ORDER BY cnt, state",
+        &[restarts_per_group.clone()],
+        &[restarts_per_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        comparison.is_fully_verified_pass(),
+        "state may drop from 5 to 1 when cnt changes: {comparison:?}"
+    );
+}
+
+/// A `NULL` block that is neither first nor last is illegal under every
+/// placement convention, even though its non-`NULL` values ascend and every
+/// adjacent pair touching the `NULL` goes unjudged.
+#[test]
+fn sort_check_rejects_a_null_block_that_is_neither_first_nor_last() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let interleaved = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "interleaved_null",
+        "SELECT v FROM t ORDER BY v",
+        &[interleaved.clone()],
+        &[interleaved],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "v"
+        ),
+        "NULLS FIRST orders this [NULL, 1, 2] and NULLS LAST [1, 2, NULL]; neither is [1, NULL, 2]: {result:?}"
+    );
+}
+
+/// The same rule holds for a later key inside a tie group, which is the only
+/// span that key orders.
+#[test]
+fn sort_check_rejects_an_interleaved_null_block_in_a_later_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let interleaved_within_a_tie = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1])),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(2)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "later_key_interleaved_null",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[interleaved_within_a_tie.clone()],
+        &[interleaved_within_a_tie],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2's NULL sits between two non-NULLs inside one k1 tie: {result:?}"
+    );
+}
+
+/// Both boundary placements are legal — the check never says which end `NULL`s
+/// belong at — but the end an engine picks holds for the whole result.
+#[test]
+fn sort_check_allows_either_null_boundary() {
+    let one_column = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    for (name, values) in [
+        ("nulls_first", vec![None, Some(1), Some(2)]),
+        ("nulls_last", vec![Some(1), Some(2), None]),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&one_column),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .expect("batch");
+        let comparison = compare_query_result_batches_with_sort_check(
+            name,
+            "SELECT v FROM t ORDER BY v",
+            &[batch.clone()],
+            &[batch],
+            RowOrder::Multiset,
+        )
+        .expect("compare");
+        assert!(
+            comparison.is_fully_verified_pass(),
+            "{name} places every NULL at one boundary: {comparison:?}"
+        );
+    }
+}
+
+/// A secondary key's `NULL`s must land at the same end in every tie group. The
+/// placement belongs to the `ORDER BY` term, which the engine sorts the whole
+/// result by — so trailing in one group and leading in the next is an order no
+/// placement produces, even though each group on its own looks fine.
+#[test]
+fn sort_check_rejects_null_placement_that_changes_between_tie_groups() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let placement_flips = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(1), None, None, Some(2)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "placement_flips",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[placement_flips.clone()],
+        &[placement_flips],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "NULLS FIRST gives [(1,NULL),(1,1),(2,NULL),(2,2)] and NULLS LAST gives \
+         [(1,1),(1,NULL),(2,2),(2,NULL)]; this is neither: {result:?}"
+    );
+}
+
+/// The same shape with one consistent placement is legal, and must stay so:
+/// every group trails its `NULL`s.
+#[test]
+fn sort_check_allows_one_null_placement_across_every_tie_group() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let nulls_last_throughout = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![Some(5), None, Some(3), None])),
+        ],
+    )
+    .expect("batch");
+
+    let comparison = compare_query_result_batches_with_sort_check(
+        "one_placement",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[nulls_last_throughout.clone()],
+        &[nulls_last_throughout],
+        RowOrder::Multiset,
+    )
+    .expect("compare");
+    assert!(
+        comparison.is_fully_verified_pass(),
+        "both k1 groups trail their NULLs, and k2 may restart at 3 when k1 changes: {comparison:?}"
+    );
+}
+
+/// A bare name matching two output columns identifies neither. Guessing the
+/// first would check the wrong column; the hole is reported instead.
+#[test]
+fn an_ambiguous_column_name_is_not_guessed() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let resolution = resolve_sort_key("SELECT a.id, b.id FROM a, b ORDER BY id", &schema);
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "an ambiguous name must report, not pick the first: {resolution:?}"
+    );
+}
+
+/// Keyword and identifier case is not significant in SQL, but the case inside a
+/// string literal is: `'a'` and `'A'` select different rows. An expression that
+/// differs only there is a different expression, and matching it to the
+/// projection would check a column the query never asked to be ordered.
+#[test]
+fn an_expression_differing_inside_a_string_literal_is_not_the_projected_one() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "bucket",
+        DataType::Int64,
+        false,
+    )]));
+    let resolution = resolve_sort_key(
+        "SELECT CASE WHEN x = 'a' THEN 0 ELSE 1 END AS bucket FROM t \
+         ORDER BY CASE WHEN x = 'A' THEN 0 ELSE 1 END",
+        &schema,
+    );
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "'a' and 'A' match different rows, so this term is not the projected expression: {resolution:?}"
+    );
+}
+
+/// The case that is *not* significant must still match, or every corpus query
+/// spelling its aggregate differently from the projection goes unchecked.
+#[test]
+fn an_expression_matches_the_projection_across_keyword_case() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::Int64,
+        false,
+    )]));
+    let resolution = resolve_sort_key(
+        "SELECT SUM(l_quantity) AS total FROM t ORDER BY sum(l_quantity)",
+        &schema,
+    );
+    assert_eq!(
+        resolution,
+        SortKeyResolution::Resolved {
+            key: vec![SortKeyColumn {
+                index: 0,
+                name: "total".to_string(),
+                descending: false,
+                nulls_first: None,
+            }],
+            unresolved_suffix: None,
+        },
+        "SUM and sum are the same function"
+    );
+}
+
+/// A qualifier that names a column the query never projected identifies no
+/// result column, so the term is unresolved. Matching on the trailing name alone
+/// would check an unrelated column and report its order as this term's.
+#[test]
+fn a_qualified_name_does_not_match_an_unrelated_column() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+    let resolution = resolve_sort_key("SELECT a.x FROM a CROSS JOIN b ORDER BY b.x", &schema);
+    assert!(
+        matches!(resolution, SortKeyResolution::Unresolved { .. }),
+        "b.x is not projected; the only result column is a.x: {resolution:?}"
+    );
+}
+
+/// A qualified term still resolves when the projection names it exactly, even
+/// though the bare name is ambiguous across the result columns.
+#[test]
+fn a_qualified_name_resolves_through_the_projection() {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    assert_eq!(
+        resolve_sort_key("SELECT a.id, b.id FROM a, b ORDER BY b.id", &schema),
+        SortKeyResolution::Resolved {
+            key: vec![SortKeyColumn {
+                index: 1,
+                name: "id".to_string(),
+                descending: false,
+                nulls_first: None,
+            }],
+            unresolved_suffix: None,
+        }
+    );
+}
+
+/// Two `NULL`s in a preceding key are a tie under every placement convention, so
+/// they hold the tie group together. Resetting on them would hide an inversion
+/// inside a run of `NULL`s: this is illegal under `NULLS FIRST` and `NULLS LAST`
+/// alike, and every pair ties on `k1`.
+#[test]
+fn sort_check_keeps_a_tie_group_across_null_values_in_a_preceding_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, true),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    let inverted_inside_a_null_group = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![None, None, None])),
+            Arc::new(Int64Array::from(vec![Some(2), None, Some(1)])),
+        ],
+    )
+    .expect("batch");
+
+    let result = compare_query_result_batches_with_sort_check(
+        "null_group_inversion",
+        "SELECT k1, k2 FROM t ORDER BY k1, k2",
+        &[inverted_inside_a_null_group.clone()],
+        &[inverted_inside_a_null_group],
+        RowOrder::Multiset,
+    )
+    .expect("compare")
+    .result;
+    assert!(
+        matches!(
+            result,
+            QueryValidationResult::Fail(QueryValidationFailReason::SortOrderViolation {
+                violation: SortOrderViolation { ref column, .. },
+                ..
+            }) if column == "k2"
+        ),
+        "k2 goes 2 then 1 inside a k1 tie of NULLs: {result:?}"
+    );
 }

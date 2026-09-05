@@ -38,6 +38,11 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'binary(=mutation_model_test)'
 slow-timeout = { period = "120s", terminate-after = 8 }
+
+[[profile.default.overrides]]
+filter = 'binary(=result_correctness_vs_duckdb_test)'
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 12 }
 """
 
 # The ceiling sized against the 3.7x contention factor measured for #12336: high
