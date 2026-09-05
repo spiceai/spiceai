@@ -926,8 +926,7 @@ mod tests {
 
     #[test]
     fn header_only_decimal_golden_passes_empty_actual() {
-        let expected =
-            parse_typed_csv("n:decimal(15,2)\n").expect("header-only decimal golden");
+        let expected = parse_typed_csv("n:decimal(15,2)\n").expect("header-only decimal golden");
         assert_eq!(expected.columns[0].type_token, "decimal(15,2)");
         assert!(expected.rows.is_empty());
 
