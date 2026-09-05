@@ -532,12 +532,8 @@ async fn add_missing_primary_key_mappings(
     };
 
     let mut properties = serde_json::Map::new();
-    for field in primary_key {
-        if existing.contains_key(field.name()) {
-            continue;
-        }
-        properties.insert(field.name().clone(), primary_key_mapping(field.data_type()));
-    }
+    add_primary_key_mappings(&mut properties, primary_key);
+    properties.retain(|name, _| !existing.contains_key(name));
     if properties.is_empty() {
         return;
     }

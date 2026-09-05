@@ -661,13 +661,12 @@ async fn resolve_term_exact_paths(
                     .map(|m| ("keyword", m))
             })
             .or_else(|| {
-                let mut exact: Vec<_> = sub_fields
+                sub_fields
                     .into_iter()
                     .flatten()
                     .filter(|(_, m)| is_term_exact(m))
-                    .collect();
-                exact.sort_by(|(a, _), (b, _)| a.cmp(b));
-                exact.into_iter().next().map(|(n, m)| (n.as_str(), m))
+                    .min_by(|(a, _), (b, _)| a.cmp(b))
+                    .map(|(n, m)| (n.as_str(), m))
             });
 
         let Some((sub_name, sub_mapping)) = exact_sub else {
