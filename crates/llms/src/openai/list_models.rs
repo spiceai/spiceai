@@ -21,7 +21,9 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 
-use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
+use crate::provider::{
+    ListModels, ListModelsResult, classify_openai_compatible_error, get_required_param,
+};
 
 const PROVIDER_NAME: &str = "OpenAI";
 const API_BASE: &str = "https://api.openai.com/v1";
@@ -71,28 +73,12 @@ impl ListModels for OpenAiModelLister {
     }
 
     async fn list_models(&self) -> ListModelsResult<Vec<String>> {
-        let response = self.client.models().list().await.map_err(|e| {
-            // Map OpenAI errors to our error types
-            let message = e.to_string();
-            if message.contains("401") || message.contains("Unauthorized") {
-                ListModelsError::InvalidCredentials {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("429") || message.contains("rate") {
-                ListModelsError::RateLimited {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("402") || message.contains("quota") {
-                ListModelsError::QuotaExceeded {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else {
-                ListModelsError::NetworkError {
-                    provider: PROVIDER_NAME.to_string(),
-                    message,
-                }
-            }
-        })?;
+        let response = self
+            .client
+            .models()
+            .list()
+            .await
+            .map_err(|e| classify_openai_compatible_error(&e, PROVIDER_NAME))?;
 
         // Filter to commonly used chat models
         let chat_models: Vec<String> = response
@@ -114,6 +100,7 @@ impl ListModels for OpenAiModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ListModelsError;
 
     #[test]
     fn test_from_params_missing_key() {
