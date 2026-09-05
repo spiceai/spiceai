@@ -1596,6 +1596,7 @@ This document is a point-in-time snapshot of a fast-moving crate. Each entry rec
 
 | Date | Reviewed commit | Changes |
 |------|-----------------|---------|
+| 2026-09-05 | PR #13922 | Restored this *Document changelog* — removed whole, rather than extended by one row, in #13356 — together with the *Scope and sourcing* pointer to it, and back-filled one row per pull request that changed this document in between. |
 | 2026-09-03 | PR #13638 | Write-back delivery upserts only the keys its point scan returned; a claimed key the scan did **not** return is withheld and its marker kept for a later pass, instead of being read as a deletion and deleted from the source (#13398). A write-back dataset accepts writes only inside a transaction and refuses `DELETE` outright. |
 | 2026-09-01 | PR #13619 | Added *Appendix C — Observability: maintenance and footprint*: the `cayenne` meter's metrics for which maintenance pass ran and why one declined, and for on-disk and in-memory footprint growth. |
 | 2026-08-30 | PR #13670 | Superseded snapshot directories are reclaimed against live state — every commit that advances the snapshot pointer schedules one debounced sweep — rather than on a timer. |
