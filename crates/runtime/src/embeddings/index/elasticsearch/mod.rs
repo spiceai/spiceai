@@ -19,12 +19,14 @@ limitations under the License.
 //! Constructs [`ElasticsearchIndex`] instances from dataset configuration
 //! and wires them into the [`IndexedTableProvider`] pipeline.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::Elasticsearch;
+use elasticsearch_datafusion_filter::SPICE_MANAGED_KEYWORD_IGNORE_ABOVE;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 pub(crate) use search::index::elasticsearch::{
@@ -95,14 +97,31 @@ pub async fn try_from_table(
         .clone()
         .unwrap_or_else(|| format!("{column}_embedding"));
 
+    // Resolve spicepod `vectors: filterable | non-filterable` hints into
+    // [`search::metadata::MetadataColumns`]. These shape the ES mapping
+    // (`index: true` / `index: false`) so filterable fields participate in
+    // query filters, and non-filterable fields are stored only in `_source`.
+    // Computed before `text_fields` below so a string column explicitly marked
+    // non-filterable can be excluded from the full-text mapping entirely, rather
+    // than being inserted as indexed `text` first and then left that way (see
+    // `add_metadata_column_mappings`, which skips a name already in `properties`).
+    let metadata_columns =
+        es_metadata_columns(&dataset_columns, &inner_schema, &[&column, &vector_field]);
+    let non_filterable_names: HashSet<&str> = metadata_columns
+        .iter()
+        .filter(|c| matches!(c, MetadataColumn::NonFilterable(_)))
+        .map(MetadataColumn::name)
+        .collect();
+
     // Determine text fields for full-text search from the dataset columns.
     // Match both Utf8 and LargeUtf8 since accelerated tables may use LargeUtf8.
     let text_fields: Vec<String> = dataset_columns
         .iter()
         .filter(|c| {
-            inner_schema
-                .field_with_name(&c.name)
-                .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+            !non_filterable_names.contains(c.name.as_str())
+                && inner_schema
+                    .field_with_name(&c.name)
+                    .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
         })
         .map(|c| c.name.clone())
         .collect();
@@ -153,13 +172,6 @@ pub async fn try_from_table(
     } else {
         DEFAULT_BATCH_WRITE_ROWS
     };
-
-    // Resolve spicepod `vectors: filterable | non-filterable` hints into
-    // [`search::metadata::MetadataColumns`]. These shape the ES mapping
-    // (`index: true` / `index: false`) so filterable fields participate in
-    // query filters, and non-filterable fields are stored only in `_source`.
-    let metadata_columns =
-        es_metadata_columns(&dataset_columns, &inner_schema, &column, &vector_field);
 
     // Normalize the source schema to match what the Elasticsearch HTTP client actually produces.
     // Accelerated tables (e.g. DuckDB) may store columns with types that differ from what ES
@@ -238,6 +250,15 @@ pub async fn try_from_table(
     )
     .await?;
 
+    // `ensure_index_with_mapping` is best-effort for a pre-existing incompatible index (it logs a
+    // warning and continues on a `put_mapping` failure), so the mapping it just applied may not
+    // match what Spice asked for. Read the real mapping back so the filter-pushdown schema
+    // reflects what Elasticsearch actually indexed, not what Spice assumed — pushing a filter
+    // against a field that isn't actually filterable the way we expect would silently drop
+    // matching rows. The index was just confirmed to exist, so a `get_mapping` failure here is a
+    // real error worth surfacing, not one to mask with a fallback.
+    let filter_schema = fetch_filter_schema(client.as_ref(), &es_index).await?;
+
     Ok(ElasticsearchIndex {
         client,
         es_index,
@@ -252,7 +273,52 @@ pub async fn try_from_table(
         metadata_columns,
         batch_write_rows,
         write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options)),
+        filter_schema,
     })
+}
+
+/// Fetch the real Elasticsearch mapping for `es_index` and derive an [`EsFilterSchema`] from it,
+/// using the field's actual `type`, `index`, `doc_values`, `null_value`, `ignore_above`, and
+/// keyword-sibling info — the same machinery the externally-managed SQL connector path uses (see
+/// [`data_components::elasticsearch::schema::mapping_to_filter_schema`]) — rather than assuming
+/// the mapping came out the way Spice requested.
+pub(crate) async fn fetch_filter_schema(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+) -> Result<elasticsearch_datafusion_filter::EsFilterSchema, Box<dyn std::error::Error + Send + Sync>>
+{
+    let mapping_response = client
+        .get_mapping(es_index)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    // ES keys the response by resolved concrete index name (which can differ from `es_index`,
+    // e.g. an alias), so take the mapping by value rather than indexing by `es_index`. If
+    // `es_index` is an alias over more than one concrete index, their mappings can diverge
+    // (different fields, types, or `index`/`doc_values`/`normalizer` settings); deriving filter
+    // capabilities from an arbitrary one of them could enable pushdown against a field that
+    // another backing index doesn't support, silently dropping matching rows. Require exactly one
+    // concrete index rather than guess.
+    let mut mappings = mapping_response.into_values();
+    let index_mapping = mappings
+        .next()
+        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::from(format!(
+                "Failed to prepare Elasticsearch index '{es_index}': the mapping response contained no index entry."
+            ))
+        })?;
+    if mappings.next().is_some() {
+        return Err(Box::from(format!(
+            "Failed to prepare Elasticsearch index '{es_index}': it resolves to more than one \
+            concrete index (it may be an alias spanning multiple indices), and their mappings \
+            may not agree on which columns are filterable. Point 'index' at a single concrete \
+            index."
+        )));
+    }
+    Ok(
+        data_components::elasticsearch::schema::mapping_to_filter_schema(
+            &index_mapping.mappings.properties,
+        ),
+    )
 }
 
 /// Default number of rows per Elasticsearch `_bulk` request.
@@ -268,17 +334,17 @@ struct VectorMappingOptions {
 
 /// Resolve spicepod `vectors` metadata hints from dataset columns into
 /// [`MetadataColumns`]. Columns marked `filterable`/`non-filterable` contribute
-/// to the ES mapping (index: true / index: false respectively). The embedded
-/// column and the vector field itself are excluded.
-fn es_metadata_columns(
+/// to the ES mapping (index: true / index: false respectively). Columns named in
+/// `exclude` (the embedded/vector-field or search-field columns, which carry their
+/// own mapping and must not also be treated as metadata) are skipped.
+pub(crate) fn es_metadata_columns(
     columns: &[Column],
     schema: &SchemaRef,
-    embedded_column: &str,
-    vector_field: &str,
+    exclude: &[&str],
 ) -> MetadataColumns {
     let cols: Vec<MetadataColumn> = columns
         .iter()
-        .filter(|c| c.name != embedded_column && c.name != vector_field)
+        .filter(|c| !exclude.contains(&c.name.as_str()))
         .filter_map(|c| {
             let kind = c.as_vector_metadata()?;
             let field = schema.field_with_name(&c.name).ok()?.clone();
@@ -289,6 +355,57 @@ fn es_metadata_columns(
         })
         .collect();
     cols.into()
+}
+
+/// Add mapping entries for `metadata_columns` to `properties`. Filterable columns get
+/// mapped with `index: true` so they can participate in ES query filters; non-filterable
+/// columns are stored in `_source` only (`index: false`, `doc_values: false`) — retrieved
+/// on hits but never scanned for filtering. A column already present in `properties`
+/// (e.g. `skip`, or a column also covered by a text/vector mapping) is left alone.
+pub(crate) fn add_metadata_column_mappings(
+    properties: &mut serde_json::Map<String, serde_json::Value>,
+    metadata_columns: &MetadataColumns,
+    skip: &str,
+) {
+    for c in metadata_columns.iter() {
+        let name = c.name().to_string();
+        if name == skip || properties.contains_key(&name) {
+            continue;
+        }
+        let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
+        if let Some(obj) = mapping.as_object_mut() {
+            let indexable = matches!(c, MetadataColumn::Filterable(_));
+            obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
+            if !indexable {
+                // `doc_values` is not supported on `text` fields in Elasticsearch;
+                // attempting to set it causes mapping creation/updates to fail.
+                // For `text` mappings (and other field types that don't support
+                // doc_values), skip the override — `_source` retrieval still works.
+                let field_type = obj
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if field_type != "text" {
+                    obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                }
+                // A string column's mapping (see `arrow_type_to_es_mapping`) always attaches a
+                // `.keyword` multi-field. Disabling only the parent `text` field's `index`
+                // leaves that sub-field indexed (ES defaults multi-fields to `index: true`
+                // independently of their parent), so a "non-filterable" column would still be
+                // fully searchable via `col.keyword`. Disable indexing on every multi-field too.
+                if let Some(sub_fields) = obj.get_mut("fields").and_then(|f| f.as_object_mut()) {
+                    for sub_mapping in sub_fields.values_mut() {
+                        if let Some(sub_obj) = sub_mapping.as_object_mut() {
+                            sub_obj.insert("index".to_string(), serde_json::Value::Bool(false));
+                            sub_obj
+                                .insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                        }
+                    }
+                }
+            }
+        }
+        properties.insert(name, mapping);
+    }
 }
 
 /// Create the ES index with a `dense_vector` mapping for `vector_field` if the index
@@ -352,41 +469,12 @@ async fn ensure_index_with_mapping(
             t.clone(),
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } },
             }),
         );
     }
 
-    // Filterable metadata columns get mapped with `index: true` so they can
-    // participate in ES query filters. Non-filterable columns are stored in
-    // `_source` only (`index: false`, `doc_values: false`) — retrieved on hits
-    // but never scanned for filtering. Columns already covered by the text
-    // mapping above are skipped.
-    for c in metadata_columns.iter() {
-        let name = c.name().to_string();
-        if name == vector_field || properties.contains_key(&name) {
-            continue;
-        }
-        let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
-        if let Some(obj) = mapping.as_object_mut() {
-            let indexable = matches!(c, MetadataColumn::Filterable(_));
-            obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
-            if !indexable {
-                // `doc_values` is not supported on `text` fields in Elasticsearch;
-                // attempting to set it causes mapping creation/updates to fail.
-                // For `text` mappings (and other field types that don't support
-                // doc_values), skip the override — `_source` retrieval still works.
-                let field_type = obj
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                if field_type != "text" {
-                    obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
-                }
-            }
-        }
-        properties.insert(name, mapping);
-    }
+    add_metadata_column_mappings(&mut properties, metadata_columns, vector_field);
 
     // Explicitly map the chunk key when chunking is enabled. `_source` retrieval works via
     // dynamic mapping regardless; the explicit `index: false` mapping documents that it is a
@@ -492,13 +580,17 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
         DataType::Int64 | DataType::UInt64 => serde_json::json!({ "type": "long" }),
         DataType::Float32 => serde_json::json!({ "type": "float" }),
         DataType::Float64 => serde_json::json!({ "type": "double" }),
+        // Elasticsearch's 16-bit floating point type; falling through to `keyword` below would
+        // make the pushdown side (which maps `Float16` to a numeric `EsFieldType`) build
+        // numeric/range queries against a field actually mapped as a non-numeric string.
+        DataType::Float16 => serde_json::json!({ "type": "half_float" }),
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
             serde_json::json!({ "type": "date" })
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } },
             })
         }
         _ => serde_json::json!({ "type": "keyword" }),
@@ -557,6 +649,7 @@ pub(crate) async fn ensure_index_with_text_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,
     text_fields: &[String],
+    metadata_columns: &MetadataColumns,
     index_settings: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut properties = serde_json::Map::new();
@@ -565,9 +658,35 @@ pub(crate) async fn ensure_index_with_text_mapping(
             field.clone(),
             serde_json::json!({
                 "type": "text",
-                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+                "fields": { "keyword": { "type": "keyword", "ignore_above": SPICE_MANAGED_KEYWORD_IGNORE_ABOVE } }
             }),
         );
+    }
+    add_metadata_column_mappings(&mut properties, metadata_columns, "");
+
+    // Metadata fields must be mapped explicitly: filterable fields participate in SQL filter
+    // pushdown, while non-filterable fields remain available only through `_source`. Search fields
+    // retain their text mapping when a column is both searched and declared as metadata.
+    for column in metadata_columns.iter() {
+        let name = column.name().to_string();
+        if properties.contains_key(&name) {
+            continue;
+        }
+        let mut mapping = arrow_type_to_es_mapping(column.field().data_type());
+        if let Some(object) = mapping.as_object_mut() {
+            let indexable = matches!(column, MetadataColumn::Filterable(_));
+            object.insert("index".to_string(), serde_json::Value::Bool(indexable));
+            if !indexable {
+                let field_type = object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if field_type != "text" {
+                    object.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+        properties.insert(name, mapping);
     }
 
     let exists = client
@@ -651,5 +770,45 @@ fn derive_primary_keys(
         Ok(ChunkedSearchIndex::augment_primary_key(primary_key))
     } else {
         Ok(primary_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_filterable_text_column_disables_keyword_subfield() {
+        let field = Arc::new(arrow_schema::Field::new("note", DataType::Utf8, true));
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(field)].into();
+        let mut properties = serde_json::Map::new();
+
+        add_metadata_column_mappings(&mut properties, &metadata_columns, "");
+
+        let mapping = properties
+            .get("note")
+            .expect("note column should be mapped");
+        assert_eq!(mapping["index"], serde_json::Value::Bool(false));
+        let keyword = &mapping["fields"]["keyword"];
+        assert_eq!(
+            keyword["index"],
+            serde_json::Value::Bool(false),
+            "non-filterable text column must disable its keyword sub-field too, \
+             or it stays fully searchable via col.keyword despite index: false on the parent"
+        );
+        assert_eq!(keyword["doc_values"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn filterable_text_column_keeps_keyword_subfield_indexed() {
+        let field = Arc::new(arrow_schema::Field::new("tag", DataType::Utf8, true));
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::Filterable(field)].into();
+        let mut properties = serde_json::Map::new();
+
+        add_metadata_column_mappings(&mut properties, &metadata_columns, "");
+
+        let mapping = properties.get("tag").expect("tag column should be mapped");
+        assert_eq!(mapping["index"], serde_json::Value::Bool(true));
+        assert_eq!(mapping["fields"]["keyword"].get("index"), None);
     }
 }

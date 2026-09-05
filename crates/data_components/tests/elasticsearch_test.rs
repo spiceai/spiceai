@@ -274,6 +274,7 @@ async fn test_knn_table_search() {
         source_schema,
         query_text: None,
         embedder: None,
+        filter_schema: elasticsearch_datafusion_filter::EsFilterSchema::new(),
     };
 
     let ctx = SessionContext::new();
@@ -319,6 +320,7 @@ async fn test_text_search_table() {
         limit: 10,
         schema,
         source_schema,
+        filter_schema: elasticsearch_datafusion_filter::EsFilterSchema::new(),
     };
 
     let ctx = SessionContext::new();

@@ -83,16 +83,52 @@ pub struct Mappings {
     pub properties: HashMap<String, FieldMapping>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldMapping {
     #[serde(rename = "type")]
     pub field_type: Option<String>,
     #[serde(default)]
     pub properties: Option<HashMap<String, FieldMapping>>,
+    /// Multi-field sub-mappings (Elasticsearch's `"fields"` key), e.g. the `keyword`
+    /// sibling Spice and many external mappings attach to a `text` field.
+    #[serde(default)]
+    pub fields: Option<HashMap<String, FieldMapping>>,
     /// For `dense_vector` fields.
+    #[serde(default)]
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).
+    #[serde(default)]
     pub similarity: Option<String>,
+    /// Elasticsearch truncates indexing of a `keyword`-family field above this length —
+    /// values longer than it are simply absent from the index.
+    #[serde(default)]
+    pub ignore_above: Option<u32>,
+    /// Present if the mapping substitutes an explicit value for a source JSON `null`. When set,
+    /// a document with a real `null` still has an indexed value, so `exists` cannot distinguish
+    /// it from a genuine value.
+    #[serde(default)]
+    pub null_value: Option<serde_json::Value>,
+    /// Whether the field is searchable. Elasticsearch defaults this to `true` when the mapping
+    /// declares no `index` parameter; `Some(false)` means Elasticsearch cannot search the field
+    /// at all, so a query against it would be rejected or silently mis-answered.
+    #[serde(default)]
+    pub index: Option<bool>,
+    /// Whether the field has doc values (needed for sort/aggregation/scripting, and for a
+    /// `range` query against a `keyword`-family field). Elasticsearch defaults this to `true`
+    /// when the mapping declares no `doc_values` parameter.
+    #[serde(default)]
+    pub doc_values: Option<bool>,
+    /// The `normalizer` applied to a `keyword`-family field before indexing (e.g. lowercasing).
+    /// Elasticsearch compares normalized indexed terms while SQL compares the raw `_source`
+    /// value, and normalization is not order-preserving, so a configured normalizer makes range
+    /// pushdown against this field unsafe — see `EsFieldType::supports_range`.
+    #[serde(default)]
+    pub normalizer: Option<String>,
+    /// Elasticsearch `enabled` on an `object`-typed field. Defaults to `true`; `Some(false)`
+    /// means Elasticsearch never parses or indexes this subtree at all — its children still
+    /// appear under `properties` but are not searchable, even though they remain in `_source`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// A search request body sent to `POST /<index>/_search`.
@@ -118,6 +154,11 @@ pub struct KnnQuery {
     pub query_vector: Vec<f32>,
     pub k: usize,
     pub num_candidates: usize,
+    /// Optional pre-filter applied by Elasticsearch *before* selecting the top-`k` nearest
+    /// neighbours, so a matching row ranked below `num_candidates` is not silently dropped.
+    /// Serialized as the native kNN `filter` and expected to be a `bool.filter`-context clause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<serde_json::Value>,
 }
 
 /// Top-level search response.
@@ -710,7 +751,29 @@ pub fn knn_query(field: &str, vector: Vec<f32>, k: usize, num_candidates: usize)
         query_vector: vector,
         k,
         num_candidates,
+        filter: None,
     }
+}
+
+/// Wrap a query in a `bool.filter` context alongside the given non-scoring filter clauses.
+///
+/// When `filters` is empty the query is returned unchanged. Otherwise the query becomes the
+/// scoring `must` and the filter clauses are applied as non-scoring constraints — the optimal
+/// shape for combining a relevance query with metadata predicates.
+#[must_use]
+pub fn query_with_filters(
+    query: Option<serde_json::Value>,
+    filters: Vec<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if filters.is_empty() {
+        return query;
+    }
+    let mut bool_query = serde_json::Map::new();
+    if let Some(query) = query {
+        bool_query.insert("must".to_string(), serde_json::json!([query]));
+    }
+    bool_query.insert("filter".to_string(), serde_json::Value::Array(filters));
+    Some(serde_json::json!({ "bool": bool_query }))
 }
 
 /// Trait for pluggable Elasticsearch backends (useful for testing).
