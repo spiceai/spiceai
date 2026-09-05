@@ -459,12 +459,12 @@ impl Query {
                 plan,
                 raw_key,
                 request_context.cache_namespace(),
-                Arc::clone(&cached_result.input_tables),
+                cached_result.input_tables.arc(),
             );
         }
 
         tracker = tracker.map(|t| {
-            t.datasets(Arc::clone(&cached_result.input_tables))
+            t.datasets(cached_result.input_tables.arc())
                 .results_cache_hit(true)
         });
 
@@ -488,7 +488,7 @@ impl Query {
             cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
         }
 
-        let record_batch_stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
+        let record_batch_stream = CachedStream::new(records, cached_result.schema.arc());
 
         Ok(CacheResponse::from(
             CacheResult::Hit(QueryResult::new(

@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use parking_lot::Mutex;
 use std::sync::LazyLock;
 
 use opentelemetry::{
     KeyValue, global,
-    metrics::{Counter, Gauge, Meter},
+    metrics::{Counter, Gauge, Meter, ObservableCounter, ObservableGauge},
 };
 
 use crate::result::{
@@ -58,6 +59,172 @@ impl EvictionReason {
     fn key_value(self) -> KeyValue {
         KeyValue::new("reason", self.as_str())
     }
+}
+
+/// Instruments for one process-wide interner pool.
+///
+/// Interned values are shared by every entry of the same shape, so they are not
+/// charged to any one entry's weight — see
+/// [`crate::result::query::CachedQueryResult::memory_size`]. This is where that
+/// memory is reported instead: once per distinct value, rather than once per
+/// entry holding it.
+///
+/// The callbacks only read: `stats()` does not sweep, so collecting these
+/// gauges never changes what a pool holds. Reclamation is driven separately by
+/// the runtime's cache-maintenance loop, which runs whether or not metrics are
+/// enabled — tying it to collection would have made a pool's memory depend on
+/// `--metrics`, which is off by default.
+struct InternerMetrics {
+    _rows: ObservableGauge<u64>,
+    _value_bytes: ObservableGauge<u64>,
+    _self_bytes: ObservableGauge<u64>,
+    _collapsed: ObservableCounter<u64>,
+    _already_shared: ObservableCounter<u64>,
+    _misses: ObservableCounter<u64>,
+}
+
+/// How a pool reports itself. One set per pool, so the instruments below are
+/// built once and read the right globals.
+///
+/// One accessor, not four: `stats()` already carries the counters, and taking
+/// them from the same snapshot is what makes a scrape internally consistent.
+struct InternerSource {
+    /// Instrument-name prefix, e.g. `schema_interner`.
+    prefix: &'static str,
+    /// What the pool holds, for the descriptions: e.g. "Arrow schemas".
+    noun: &'static str,
+    stats: fn() -> crate::intern::InternerStats,
+}
+
+/// The last snapshot taken of a pool, and when.
+///
+/// `stats()` takes all 16 shard mutexes and walks every row and bucket — the
+/// same mutexes the cache write path contends for. Six instruments read from
+/// one pool, so a scrape that called it per instrument would do that six times
+/// over and could still report six mutually inconsistent numbers. Prometheus
+/// pulls, so the rate is whatever the scraper chooses. One snapshot per pool
+/// per scrape window serves every instrument from the same walk.
+struct StatsCache {
+    taken_at: std::time::Instant,
+    stats: crate::intern::InternerStats,
+}
+
+/// How long a snapshot serves. Shorter than any sane scrape interval, so a
+/// scrape still sees fresh numbers, but long enough that the six instruments of
+/// one scrape share a single walk.
+const STATS_FRESH_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl InternerSource {
+    /// The pool's stats, recomputed only when the last snapshot has aged out.
+    fn snapshot(&'static self, cell: &Mutex<Option<StatsCache>>) -> crate::intern::InternerStats {
+        let mut held = cell.lock();
+        if let Some(cached) = held.as_ref()
+            && cached.taken_at.elapsed() < STATS_FRESH_FOR
+        {
+            return cached.stats;
+        }
+        let stats = (self.stats)();
+        *held = Some(StatsCache {
+            taken_at: std::time::Instant::now(),
+            stats,
+        });
+        stats
+    }
+}
+
+fn build_interner_metrics(
+    source: &'static InternerSource,
+    snapshot: &'static Mutex<Option<StatsCache>>,
+) -> InternerMetrics {
+    let meter = global::meter(source.prefix);
+    let (noun, prefix) = (source.noun, source.prefix);
+    InternerMetrics {
+        _rows: meter
+            .u64_observable_gauge(format!("{prefix}_rows"))
+            .with_description(format!("Distinct {noun} currently shared by the interner."))
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).rows as u64, &[]);
+            })
+            .build(),
+        _value_bytes: meter
+            .u64_observable_gauge(format!("{prefix}_value_bytes"))
+            .with_description(format!(
+                "Total size of the {noun} the interner shares. Counted once per distinct value, not once per cache entry holding it."
+            ))
+            .with_unit("By")
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).value_bytes as u64, &[]);
+            })
+            .build(),
+        _self_bytes: meter
+            .u64_observable_gauge(format!("{prefix}_overhead_bytes"))
+            .with_description(
+                "The interner's own bookkeeping: its hash-map slots and bucket vectors.",
+            )
+            .with_unit("By")
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).self_bytes as u64, &[]);
+            })
+            .build(),
+        // Cumulative, so counters rather than gauges — and read through the
+        // dedicated accessors, which load one atomic instead of walking every
+        // shard the way `stats()` does.
+        _collapsed: meter
+            .u64_observable_counter(format!("{prefix}_collapsed"))
+            .with_description(format!(
+                "Distinct {noun} allocations collapsed onto a shared one. The direct evidence that interning is removing duplicates."
+            ))
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).collapsed, &[]);
+            })
+            .build(),
+        _already_shared: meter
+            .u64_observable_counter(format!("{prefix}_already_shared"))
+            .with_description(
+                "Interns whose caller already held the shared allocation. Counted apart from collapsed values because no duplicate was removed.",
+            )
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).already_shared, &[]);
+            })
+            .build(),
+        _misses: meter
+            .u64_observable_counter(format!("{prefix}_misses"))
+            .with_description(format!(
+                "Interns that adopted {noun} the pool had not seen. Misses without collapses means values are arriving distinct and nothing is being shared."
+            ))
+            .with_callback(move |observer| {
+                observer.observe(source.snapshot(snapshot).misses, &[]);
+            })
+            .build(),
+    }
+}
+
+static SCHEMA_POOL: InternerSource = InternerSource {
+    prefix: "schema_interner",
+    noun: "Arrow schemas",
+    stats: || crate::intern::schema::global().stats(),
+};
+static SCHEMA_POOL_SNAPSHOT: Mutex<Option<StatsCache>> = Mutex::new(None);
+
+static TABLE_SET_POOL: InternerSource = InternerSource {
+    prefix: "table_set_interner",
+    noun: "input-table sets",
+    stats: || crate::intern::table_set::global().stats(),
+};
+static TABLE_SET_POOL_SNAPSHOT: Mutex<Option<StatsCache>> = Mutex::new(None);
+
+static INTERNER_METRICS: LazyLock<Vec<InternerMetrics>> = LazyLock::new(|| {
+    vec![
+        build_interner_metrics(&SCHEMA_POOL, &SCHEMA_POOL_SNAPSHOT),
+        build_interner_metrics(&TABLE_SET_POOL, &TABLE_SET_POOL_SNAPSHOT),
+    ]
+});
+
+/// Registers the interner-pool gauges. Idempotent.
+///
+/// Must run after the meter provider is installed, like the cache instruments.
+pub fn init_interner_metrics() {
+    LazyLock::force(&INTERNER_METRICS);
 }
 
 /// What an invalidation did to the entries that read the table, reported as the
