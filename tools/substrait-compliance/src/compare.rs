@@ -361,6 +361,8 @@ impl std::error::Error for ParseTypedCsvError {}
 /// (`col:type|col:type|...`) as documented in the IBM TPC-H suite README.
 /// Short, wide, or blank data rows are kept so [`compare`] can report a
 /// row-count or row-width mismatch instead of silently dropping them.
+/// Data-row `|` inside RFC-4180 quotes is part of the field, so
+/// `"left|right"|7` is two cells and width checks use that count.
 ///
 /// The first line is a typed header only when every field is `name:type`
 /// with a nonempty name and a supported type token (IBM vocabulary,
@@ -504,8 +506,33 @@ fn decimal_type_params_ok(inner: &str) -> bool {
     }
 }
 
+/// Split a data record on `|` outside RFC-4180 quotes, then unwrap one
+/// quote layer. Blank and whitespace-only lines stay one empty field.
 fn parse_pipe_row(line: &str) -> Vec<String> {
-    line.split('|').map(decode_csv_cell).collect()
+    split_pipe_record(line)
+        .into_iter()
+        .map(decode_csv_cell)
+        .collect()
+}
+
+/// Field boundaries ignore `|` inside `"`; `""` is an escaped quote and
+/// does not end the field. Unclosed quotes run to end of line.
+fn split_pipe_record(line: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '|' if !in_quotes => {
+                fields.push(&line[start..i]);
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    fields.push(&line[start..]);
+    fields
 }
 
 /// Pipe-delimited IBM goldens quote a field when it is empty/NULL (`""`)
@@ -1035,5 +1062,58 @@ mod tests {
                 expected: 2
             })
         ));
+    }
+
+    #[test]
+    fn quoted_embedded_pipe_is_one_field() {
+        let expected =
+            parse_typed_csv("a:string|b:integer\n\"left|right\"|7\n").expect("quoted pipe golden");
+        assert_eq!(
+            expected.rows,
+            vec![vec!["left|right".to_string(), "7".to_string()]]
+        );
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![vec!["left|right".to_string(), "7".to_string()]],
+        };
+        assert_eq!(compare(&actual, &expected), None);
+    }
+
+    #[test]
+    fn quoted_delimiter_does_not_inflate_short_row_width() {
+        // Naive `|` split of `"left|right"` is two fields and used to
+        // bypass the incomplete-row guard on a two-column schema.
+        let expected = parse_typed_csv("a:string|b:integer\n\"left|right\"\n")
+            .expect("quoted short-row golden");
+        assert_eq!(expected.rows, vec![vec!["left|right".to_string()]]);
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![vec!["left|right".to_string(), "7".to_string()]],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::RowWidth {
+                row: 0,
+                actual: 2,
+                expected: 1,
+                columns: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn quoted_empty_beside_quoted_pipe_stays_null() {
+        let parsed = parse_typed_csv("a:string|b:string|c:integer\n\"left|right\"|\"\"|7\n")
+            .expect("quoted pipe and quoted-empty");
+        assert_eq!(
+            parsed.rows,
+            vec![vec![
+                "left|right".to_string(),
+                String::new(),
+                "7".to_string()
+            ]]
+        );
     }
 }
