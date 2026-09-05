@@ -57,6 +57,14 @@ const LIST_EXTRACT_NAME: &str = "list_extract";
 /// The lambda parameter [`finite_or_null`] binds the screened value to.
 const SCREENED_VALUE_PARAM: &str = "v";
 
+/// The name both engines give the SHA-256 function. They disagree on what it
+/// returns — see [`sha256_to_digest_bytes`].
+const SHA256_NAME: &str = "sha256";
+
+/// `DuckDB`'s hex-text-to-`BLOB` decoder, applied over [`SHA256_NAME`] so a
+/// federated digest comes back as the same bytes the kernel produces.
+const UNHEX_NAME: &str = "unhex";
+
 /// Renders `args` as a call to `duckdb_fn`, in the order given.
 ///
 /// The caller is responsible for having already put `args` into the shape
@@ -191,6 +199,50 @@ pub(crate) fn to_hex_to_lowercase_hex(
         // the un-lowered `to_hex` back into the DuckDB SQL.
         _ => Err(DataFusionError::Plan(format!(
             "to_hex takes one argument, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
+/// into the 32 raw bytes `DataFusion` returns.
+///
+/// Both engines have a `sha256`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim, and the two
+/// return different things. `DataFusion`'s `sha256` returns the 32-byte digest
+/// as `Binary`; `DuckDB`'s returns its 64-character hex rendering as
+/// `VARCHAR`. The scan then casts that text into the plan's `Binary` column,
+/// so the federated column held the *ASCII bytes of the hex string* — 64 bytes
+/// that are not the digest of anything — with no error and no warning (issue
+/// #13850). Every non-NULL row differed, in length as well as content, so
+/// anything comparing a stored digest against `sha256(col)`, deduplicating on
+/// it, or joining on it changed behaviour the moment a dataset was
+/// accelerated.
+///
+/// `unhex` reverses exactly that rendering: measured on `DuckDB` v1.4.4,
+/// `unhex(sha256(x))` is a 32-byte `BLOB` holding the same digest the kernel
+/// computes, for an ASCII string, the empty string, a non-ASCII one, and NULL
+/// (which stays NULL). It also holds for a `BLOB` argument, which is what an
+/// Arrow `Binary` column becomes: `DuckDB` hashes a `BLOB`'s raw bytes rather
+/// than a text rendering of them, so a column carrying bytes that are not
+/// valid UTF-8 hashes the same on both sides.
+///
+/// The sibling digests need no handler for the same reason they cannot produce
+/// wrong data: `md5` agrees with the kernel (both render lower-case hex text),
+/// and `DuckDB` has no `sha224`, `sha384` or `sha512` at all, so those fail
+/// loudly rather than silently — the unknown-function class tracked by #10583.
+pub(crate) fn sha256_to_digest_bytes(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, SHA256_NAME)?
+            .map(|hex_text| wrap_in_call(hex_text, UNHEX_NAME))),
+        // `sha256` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the undecoded `sha256` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "sha256 takes one argument, got {}; cannot render it as DuckDB SQL.",
             args.len()
         ))),
     }
@@ -965,6 +1017,60 @@ mod tests {
             .expr_to_sql(&call)
             .expect("to_hex unparses for DuckDB");
         assert_eq!(rendered.to_string(), "lower(to_hex(255))");
+    }
+
+    /// Both engines have a `sha256`, so the call federated verbatim and came
+    /// back as the digest's hex *text* where the kernel returns the digest's
+    /// 32 bytes — a silently different column, not an error (regression test
+    /// for #13850).
+    #[test]
+    fn sha256_unparses_to_a_duckdb_sha256_decoded_back_to_bytes() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = sha256_to_digest_bytes(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"unhex(sha256("t"."name"))"#);
+    }
+
+    /// `sha256` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the undecoded
+    /// `sha256` straight back to `DuckDB`.
+    #[test]
+    fn sha256_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = sha256_to_digest_bytes(&unparser, &[lit("a"), lit("b")])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("sha256 takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `sha256` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_sha256_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::crypto::sha256(),
+            vec![lit("alpha")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("sha256 unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "unhex(sha256('alpha'))");
     }
 
     #[test]
