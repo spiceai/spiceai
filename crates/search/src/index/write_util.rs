@@ -344,6 +344,122 @@ pub fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Why a write cannot index a vector.
+///
+/// The variants are the two shapes [`keys_to_evict`] names, kept apart because each has
+/// its own diagnostic on the paths that count them separately, not because they call for
+/// different handling: both are [`RowOutcome::Rejected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorRejection {
+    /// No component carries a direction — every one is zero or `NaN`, so the vector points
+    /// nowhere and a cosine distance to it is undefined.
+    NoDirection,
+    /// At least one component is `NaN` or `±Inf`, so every metric the index offers answers
+    /// `NaN`/`Inf` for this vector whatever it is compared against.
+    NonFinite,
+}
+
+impl VectorRejection {
+    /// The cause clause for the user-facing line the caller logs, worded to sit after the
+    /// name of the record being skipped.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoDirection => "its embedding has no direction — every component is zero or NaN",
+            Self::NonFinite => {
+                "its embedding has a NaN or infinite component, so every distance to it is undefined"
+            }
+        }
+    }
+}
+
+/// Whether a vector can be indexed, by the one criterion [`keys_to_evict`] states: it must
+/// have a defined direction under the metrics the index offers.
+///
+/// Every vector write path classifies through this rather than spelling the test itself.
+/// The three paths did spell it separately, and two of the three carried only the
+/// [`VectorRejection::NoDirection`] limb — so a *partially* non-finite vector (`[1.0, NaN]`,
+/// `[0.0, Inf]`) was stored as if it were indexable and, being no rejection, evicted
+/// nothing (#13872). `Inf` is neither `== 0.0` nor `is_nan()`, so it does not merely escape
+/// the narrow limb, it actively prevents it from matching.
+///
+/// `NoDirection` is tested first so that a vector which is both — `[NaN, NaN]` — is
+/// reported under the more specific of the two, which is what the paths counting the
+/// two separately have always reported it as.
+#[must_use]
+pub fn classify_vector(vector: &[f32]) -> Option<VectorRejection> {
+    if vector.iter().all(|&x| x == 0.0 || x.is_nan()) {
+        return Some(VectorRejection::NoDirection);
+    }
+    if vector.iter().any(|x| !x.is_finite()) {
+        return Some(VectorRejection::NonFinite);
+    }
+    None
+}
+
+/// The vector shapes no index may store, as `dims`-component vectors paired with the
+/// rejection each must classify as.
+///
+/// Shared by the classifier's own test and by every backend's guard, so a backend cannot
+/// come to cover a narrower set than the criterion does — which is the shape of #13872,
+/// where two of three backends carried only the [`VectorRejection::NoDirection`] limb.
+/// `dims` must be at least 2, since the partially non-finite shapes need a finite
+/// component to sit beside the non-finite one.
+#[cfg(test)]
+pub(crate) fn unindexable_shapes(dims: usize) -> Vec<(&'static str, Vec<f32>, VectorRejection)> {
+    assert!(
+        dims >= 2,
+        "a partially non-finite shape needs two components"
+    );
+    let last = dims - 1;
+    let with_last = |fill: f32, last_value: f32| {
+        let mut vector = vec![fill; dims];
+        vector[last] = last_value;
+        vector
+    };
+    vec![
+        ("all zero", vec![0.0; dims], VectorRejection::NoDirection),
+        (
+            "all NaN",
+            vec![f32::NAN; dims],
+            VectorRejection::NoDirection,
+        ),
+        (
+            "finite, one NaN",
+            with_last(1.0, f32::NAN),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "finite, one +Inf",
+            with_last(1.0, f32::INFINITY),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "finite, one -Inf",
+            with_last(1.0, f32::NEG_INFINITY),
+            VectorRejection::NonFinite,
+        ),
+        (
+            "all +Inf",
+            vec![f32::INFINITY; dims],
+            VectorRejection::NonFinite,
+        ),
+        (
+            "zero, one +Inf",
+            with_last(0.0, f32::INFINITY),
+            VectorRejection::NonFinite,
+        ),
+    ]
+}
+
+/// A vector every backend must store, as the control the shapes above are measured
+/// against. Deliberately the `1.0`-filled base of the partially non-finite shapes, so the
+/// only difference between this and a rejection is the one component under test.
+#[cfg(test)]
+pub(crate) fn indexable_shape(dims: usize) -> Vec<f32> {
+    vec![1.0; dims]
+}
+
 /// What a write did with one row, for the row's primary key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowOutcome {
@@ -779,5 +895,33 @@ mod tests {
         assert_eq!(keys[0].as_deref(), Some("{\"id\":1,\"tenant\":\"a\"}"));
         assert_eq!(keys[1].as_deref(), Some("{\"tenant\":\"b\"}"));
         assert_eq!(keys[2], None);
+    }
+
+    /// Regression test for #13872. The criterion [`keys_to_evict`] states covers every
+    /// vector with no usable direction, and the classifier is the one place it is spelled.
+    #[test]
+    fn classify_vector_rejects_every_unindexable_shape() {
+        for (name, vector, expected) in unindexable_shapes(3) {
+            assert_eq!(
+                classify_vector(&vector),
+                Some(expected),
+                "{name} has no defined direction under any metric an index offers"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_vector_accepts_an_ordinary_vector() {
+        assert_eq!(classify_vector(&indexable_shape(3)), None);
+    }
+
+    /// A vector that is both all-NaN and non-finite is reported as the more specific of
+    /// the two, which is what the paths counting them separately have always logged it as.
+    #[test]
+    fn an_all_nan_vector_is_reported_as_having_no_direction() {
+        assert_eq!(
+            classify_vector(&[f32::NAN, f32::NAN]),
+            Some(VectorRejection::NoDirection)
+        );
     }
 }
