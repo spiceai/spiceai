@@ -330,9 +330,9 @@ fn shared_decimal_scale(actual_type: Option<&str>, expected_type: Option<&str>) 
     (actual_scale == expected_scale).then_some(actual_scale)
 }
 
-/// Why a golden CSV was rejected at parse time. A zero-byte or
-/// headerless file is not an empty result — that needs a typed header
-/// and zero data rows.
+/// Why a golden CSV was rejected at parse time. A zero-byte,
+/// headerless, or malformed first line is not an empty result — that
+/// needs a typed header and zero data rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseTypedCsvError {
     MissingTypedHeader,
@@ -343,7 +343,7 @@ impl ParseTypedCsvError {
     pub fn message(self) -> &'static str {
         match self {
             Self::MissingTypedHeader => {
-                "missing typed header (`col:type|...`). A zero-byte or headerless golden is not an empty result; use a typed header with zero data rows"
+                "missing typed header (`col:type|...`). A zero-byte, headerless, or malformed first line is not an empty result; use a typed header (nonempty names and supported type tokens) with zero data rows"
             }
         }
     }
@@ -362,34 +362,135 @@ impl std::error::Error for ParseTypedCsvError {}
 /// Short or wide rows are kept so [`compare`] can report a row-width
 /// mismatch instead of silently `zip`-truncating.
 ///
-/// A zero-byte or headerless file is an error, not an empty table. A
-/// legitimate empty result is a typed header with zero data rows.
+/// The first line is a typed header only when every field is `name:type`
+/// with a nonempty name and a supported type token (IBM vocabulary,
+/// including `decimal(p,s)` / `numeric(p,s)`). A zero-byte file, a
+/// headerless data row (including timestamp-like `12:34:56`), or a
+/// truncated field (`flag:`, `:`) is an error. A legitimate empty
+/// result is a typed header with zero data rows.
 pub fn parse_typed_csv(text: &str) -> std::result::Result<TableData, ParseTypedCsvError> {
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
         return Err(ParseTypedCsvError::MissingTypedHeader);
     };
-    let fields: Vec<&str> = header.split('|').collect();
-    let has_typed_header = !fields.is_empty() && fields.iter().all(|f| f.contains(':'));
-    if !has_typed_header {
+    let columns = header
+        .split('|')
+        .map(parse_typed_header_field)
+        .collect::<Option<Vec<_>>>()
+        .filter(|columns| !columns.is_empty());
+    let Some(columns) = columns else {
         return Err(ParseTypedCsvError::MissingTypedHeader);
-    }
-    let columns = fields
-        .iter()
-        .map(|f| {
-            let (name, type_str) = f.split_once(':').unwrap_or((f, "varchar"));
-            ColumnSpec {
-                name: name.trim().to_string(),
-                type_token: type_str.trim().to_string(),
-            }
-        })
-        .collect();
+    };
     let rows = lines
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(parse_pipe_row)
         .collect();
     Ok(TableData { columns, rows })
+}
+
+/// `name:type` with a nonempty name and a supported type token.
+fn parse_typed_header_field(field: &str) -> Option<ColumnSpec> {
+    let (name, type_str) = field.split_once(':')?;
+    let name = name.trim();
+    let type_str = type_str.trim();
+    if name.is_empty() || !is_supported_type_token(type_str) {
+        return None;
+    }
+    Some(ColumnSpec {
+        name: name.to_string(),
+        type_token: type_str.to_string(),
+    })
+}
+
+/// IBM TPC-H README type vocabulary, plus the aliases [`normalize_type`]
+/// already accepts. Parameterised `decimal(p,s)` / `numeric(p,s)` /
+/// `varchar(n)` / `char(n)` are valid; empty or unknown tokens are not.
+fn is_supported_type_token(token: &str) -> bool {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (base, params_ok) = match trimmed.find('(') {
+        None => (trimmed, true),
+        Some(idx) => {
+            let base = trimmed[..idx].trim();
+            let rest = trimmed[idx..].trim();
+            let Some(inner) = rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+                return false;
+            };
+            if inner.trim().is_empty() {
+                return false;
+            }
+            (base, parameterized_type_params_ok(base, inner))
+        }
+    };
+    !base.is_empty() && params_ok && is_supported_type_base(base)
+}
+
+fn is_supported_type_base(base: &str) -> bool {
+    matches!(
+        base.to_ascii_lowercase().as_str(),
+        "integer"
+            | "int"
+            | "int32"
+            | "i32"
+            | "i8"
+            | "i16"
+            | "int4"
+            | "smallint"
+            | "tinyint"
+            | "bigint"
+            | "long"
+            | "int64"
+            | "i64"
+            | "int8"
+            | "double"
+            | "fp64"
+            | "float8"
+            | "numeric"
+            | "decimal"
+            | "number"
+            | "float"
+            | "fp32"
+            | "real"
+            | "float4"
+            | "boolean"
+            | "bool"
+            | "string"
+            | "varchar"
+            | "char"
+            | "text"
+            | "utf8"
+            | "date"
+            | "timestamp"
+            | "timestamptz"
+            | "time"
+    )
+}
+
+fn parameterized_type_params_ok(base: &str, inner: &str) -> bool {
+    match base.to_ascii_lowercase().as_str() {
+        "decimal" | "numeric" => decimal_type_params_ok(inner),
+        "varchar" | "char" | "timestamp" | "timestamptz" | "time" => {
+            inner.trim().parse::<u32>().is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn decimal_type_params_ok(inner: &str) -> bool {
+    let mut parts = inner.split(',').map(str::trim);
+    let Some(precision) = parts.next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    if precision.parse::<i32>().is_err() {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(scale) => scale.parse::<i32>().is_ok() && parts.next().is_none(),
+    }
 }
 
 fn parse_pipe_row(line: &str) -> Vec<String> {
@@ -752,6 +853,36 @@ mod tests {
             parse_typed_csv("1|2\n3|4\n"),
             Err(ParseTypedCsvError::MissingTypedHeader)
         );
+    }
+
+    #[test]
+    fn truncated_typed_header_fields_are_parse_errors() {
+        assert_eq!(
+            parse_typed_csv("flag:\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv(":\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+    }
+
+    #[test]
+    fn headerless_timestamp_like_line_is_a_parse_error() {
+        // A colon is not enough: `12:34:56` is a data value, not `name:type`.
+        assert_eq!(
+            parse_typed_csv("12:34:56\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+    }
+
+    #[test]
+    fn parameterized_decimal_header_is_typed() {
+        let table =
+            parse_typed_csv("avg_qty:decimal(15,6)\n").expect("parameterized decimal header");
+        assert_eq!(table.columns[0].name, "avg_qty");
+        assert_eq!(table.columns[0].type_token, "decimal(15,6)");
+        assert!(table.rows.is_empty());
     }
 
     #[test]
