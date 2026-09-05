@@ -66,6 +66,7 @@ use super::pk_index::{
     RowLocation, ShardedPkIndex, approx_captured_file_bytes, deserialize_pk_bloom_sidecar,
     pk_digest, serialize_pk_bloom_sidecar, shard_of_pk,
 };
+use super::pk_validation::null_primary_key_message;
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -8279,19 +8280,27 @@ impl CayenneTableProvider {
             .downcast_ref::<crate::CayenneCatalog>()
     }
 
-    /// List up to `limit` undelivered write-back markers (oldest commit first)
-    /// as `(pk_bytes, sequence_number)`. The `pk_bytes` are opaque `OwnedRow`
+    /// List up to `limit` undelivered write-back markers in delivery order
+    /// (oldest commit first, then key) starting after `after`, or at the oldest
+    /// marker when that is `None`, as `(pk_bytes, sequence_number)`.
+    ///
+    /// `after` lets a caller page past markers it could not deliver, so one
+    /// undeliverable key cannot pin the claim and starve every newer write. The `pk_bytes` are opaque `OwnedRow`
     /// encodings — feed them back to [`Self::decode_pk_keys`] /
     /// [`Self::clear_dirty_keys`].
     ///
     /// # Errors
     /// Propagates the underlying metastore error.
-    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<(Vec<u8>, i64)>> {
+    pub async fn list_dirty_keys(
+        &self,
+        limit: usize,
+        after: Option<&(i64, Vec<u8>)>,
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(Vec::new());
         };
         Ok(catalog
-            .list_pending_write_back(self.table_id(), limit)
+            .list_pending_write_back(self.table_id(), limit, after)
             .await?)
     }
 
@@ -13147,7 +13156,7 @@ impl CayenneTableProvider {
             if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
-                    message: "Primary key values must be non-null".to_string(),
+                    message: null_primary_key_message(&batch, ctx.pk_indices),
                 });
             }
 
@@ -13550,7 +13559,7 @@ impl CayenneTableProvider {
                 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, pk_indices),
                     });
                 }
                 filtered_batches.push(batch);
@@ -14132,7 +14141,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices[..1]),
                     });
                 }
                 // Bulk values() iteration: the null gate proves the buffer
@@ -14168,7 +14177,7 @@ impl CayenneTableProvider {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(Error::DataValidation {
                             table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
+                            message: null_primary_key_message(&batch, pk_indices),
                         });
                     }
                     let should_delete = deleted_row_keys.contains(rows.row(row_index).as_ref());
@@ -26423,7 +26432,7 @@ impl CayenneTableProvider {
                 if pk_array.null_count() > 0 {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, std::slice::from_ref(&pk_index)),
                     });
                 }
                 // Column sweep (see `DeletionIndex::get_batch`): bulk PK slice
@@ -26488,7 +26497,7 @@ impl CayenneTableProvider {
                 if pk_has_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
-                        message: "Primary key values must be non-null".to_string(),
+                        message: null_primary_key_message(&batch, &pk_indices),
                     });
                 }
 
@@ -30636,8 +30645,9 @@ impl CayenneTableProvider {
                     })?;
                 if pk_array.null_count() > 0 {
                     return Err(datafusion_common::DataFusionError::Execution(format!(
-                        "Primary key values must be non-null for table {}",
-                        self.table_metadata.table_name
+                        "Data validation failed for table '{}': {}",
+                        self.table_metadata.table_name,
+                        null_primary_key_message(batch, std::slice::from_ref(&pk_index))
                     )));
                 }
                 // Bulk slice copy (~5x over the per-row is_null+value+push
@@ -30665,8 +30675,9 @@ impl CayenneTableProvider {
                 for row_index in 0..batch.num_rows() {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
                         return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "Primary key values must be non-null for table {}",
-                            self.table_metadata.table_name
+                            "Data validation failed for table '{}': {}",
+                            self.table_metadata.table_name,
+                            null_primary_key_message(batch, &pk_indices)
                         )));
                     }
                     row_keys.push(bytes_key(rows.row(row_index).as_ref()));
