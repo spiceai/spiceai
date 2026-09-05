@@ -180,6 +180,61 @@ pub(crate) fn to_hex_to_lowercase_hex(
     }
 }
 
+/// Renders `concat` as `DuckDB`'s `||` operator, the only rendering whose NULL
+/// handling matches the `concat` this runtime actually evaluates.
+///
+/// The `concat` a Spice query resolves is Spark's, not `DataFusion`'s:
+/// `crates/runtime/src/datafusion/builder.rs` registers every
+/// `datafusion-spark` scalar function over the built-in of the same name,
+/// skipping only `trunc` and `avg`. `SparkConcat` computes a null mask,
+/// delegates to `DataFusion`'s `ConcatFunc`, and applies the mask, so it
+/// returns NULL when *any* argument is NULL. `DuckDB`'s `concat` — like
+/// `ConcatFunc` itself — skips a NULL argument and concatenates the rest.
+///
+/// Both engines have a function called `concat`, so nothing denied the call
+/// and nothing rewrote it: it was pushed into the accelerated store verbatim
+/// and answered differently. Over a column with one NULL row,
+/// `concat(name, 'z')` is `'z'` from `DuckDB` and NULL locally — a different
+/// value *and* a different truth under `IS NULL`, decided by whether the
+/// dataset happened to be accelerated, with no error and no warning
+/// (issue #13849).
+///
+/// `DuckDB`'s `||` propagates NULL, so `a || b || …` answers what the
+/// registered function answers. Rendering the operator rather than denying
+/// `concat` keeps the call pushed down: a deny unfederates the whole plan it
+/// appears in, which for a function this common costs every other pushdown in
+/// the query.
+///
+/// The operands are rendered as `unparser` gives them and are not cast. That
+/// is deliberate: it leaves a non-string argument to `DuckDB`'s own implicit
+/// cast, which is what the un-rewritten `concat` call already relied on.
+pub(crate) fn concat_to_string_concat(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let Some((first, rest)) = args.split_first() else {
+        // `SparkConcat` accepts zero arguments and answers the empty string:
+        // its `coerce_types` passes an empty argument list through, and
+        // `spark_concat` returns `''` for it. So the planner does build
+        // `concat()`, and failing here would turn a query that evaluates
+        // locally into a federated plan error. Render the same constant.
+        return Ok(Some(unparser.expr_to_sql(&datafusion::prelude::lit(""))?));
+    };
+
+    let mut concatenated = unparser.expr_to_sql(first)?;
+    for arg in rest {
+        concatenated = ast::Expr::BinaryOp {
+            left: Box::new(concatenated),
+            op: ast::BinaryOperator::StringConcat,
+            right: Box::new(unparser.expr_to_sql(arg)?),
+        };
+    }
+
+    // Parenthesised so the operator keeps the precedence the function call it
+    // replaces had, wherever the expression is spliced in.
+    Ok(Some(ast::Expr::Nested(Box::new(concatenated))))
+}
+
 /// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
 /// into the 32 raw bytes `DataFusion` returns.
 ///
@@ -956,6 +1011,165 @@ mod tests {
             names.len(),
             crate::dialect::duckdb_scalar_overrides().len(),
             "name list and scalar-override list must have the same length"
+        );
+    }
+
+    #[test]
+    fn concat_unparses_to_the_duckdb_string_concat_operator() {
+        // The operator, not the function: DuckDB's `concat` skips a NULL
+        // argument, `||` propagates it as the kernel does (issue #13849).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let name = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = concat_to_string_concat(&unparser, &[name.clone(), lit("z")])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"("t"."name" || 'z')"#);
+
+        let three = concat_to_string_concat(&unparser, &[name.clone(), lit("z"), name.clone()])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(
+            three.to_string(),
+            r#"("t"."name" || 'z' || "t"."name")"#,
+            "every argument must join the operator chain"
+        );
+
+        let one = concat_to_string_concat(&unparser, &[name])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(
+            one.to_string(),
+            r#"("t"."name")"#,
+            "a one-argument concat is the argument itself, NULL included"
+        );
+    }
+
+    #[test]
+    fn concat_with_zero_arguments_renders_the_empty_string() {
+        // `the_registered_concat_accepts_zero_arguments` shows the planner
+        // builds `concat()` and evaluates it to `''`. Erroring here instead
+        // would fail a query that runs unaccelerated (issue #13849).
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let rendered = concat_to_string_concat(&unparser, &[])
+            .expect("a zero-argument concat renders")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), "''");
+    }
+
+    #[test]
+    fn duckdb_dialect_installs_the_concat_override() {
+        // The handler is only reached if the dialect registers it, and a
+        // missing registration is exactly the shape of #13849: the call is
+        // emitted verbatim and DuckDB answers it differently.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::concat(),
+            vec![lit("a"), lit("b")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("concat unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "('a' || 'b')");
+    }
+
+    /// The premise the rewrite rests on, pinned against the function the
+    /// runtime actually registers.
+    ///
+    /// `crates/runtime/src/datafusion/builder.rs` registers every
+    /// `datafusion-spark` scalar function over the built-in of the same name
+    /// (skipping only `trunc` and `avg`), so the `concat` a Spice query
+    /// resolves is `SparkConcat`, not `DataFusion`'s `ConcatFunc` — and the
+    /// two disagree about exactly this. `SparkConcat` computes a null mask,
+    /// delegates to `ConcatFunc`, and applies the mask; `ConcatFunc` alone
+    /// skips a NULL argument and concatenates the rest.
+    ///
+    /// `||` is the faithful `DuckDB` rendering *because* of that mask. If the
+    /// registration ever stops shadowing the built-in, or Spark's NULL
+    /// handling changes, this test fails rather than
+    /// [`concat_to_string_concat`] silently inverting.
+    #[tokio::test]
+    async fn the_registered_concat_propagates_a_null_argument() {
+        use datafusion::assert_batches_eq;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+        ctx.register_udf(concat.as_ref().clone());
+
+        let batches = ctx
+            .sql(
+                "SELECT concat(a, 'z') AS c, concat(a, 'z') IS NULL AS isn \
+                 FROM (VALUES ('x'), (NULL), ('y')) AS t(a)",
+            )
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("executes");
+
+        // The middle row is the whole point: DataFusion's own `concat` answers
+        // `z` here, and if this ever does too, `concat_to_string_concat` is
+        // rendering the wrong semantics into DuckDB SQL (issue #13849). It
+        // carries `isn` because an empty cell alone cannot tell
+        // NULL from the empty string.
+        assert_batches_eq!(
+            &[
+                "+----+-------+",
+                "| c  | isn   |",
+                "+----+-------+",
+                "| xz | false |",
+                "|    | true  |",
+                "| yz | false |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+    }
+
+    /// Refutation probe: does the planner actually build a zero-argument
+    /// `concat`? Run against the registered function, not the built-in.
+    #[tokio::test]
+    async fn the_registered_concat_accepts_zero_arguments() {
+        use datafusion::assert_batches_eq;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let concat = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "concat")
+            .expect("datafusion-spark provides a concat");
+        ctx.register_udf(concat.as_ref().clone());
+
+        let batches = ctx
+            .sql("SELECT concat() AS c, concat() IS NULL AS isn")
+            .await
+            .expect("a zero-argument concat plans")
+            .collect()
+            .await
+            .expect("a zero-argument concat executes");
+
+        assert_batches_eq!(
+            &[
+                "+---+-------+",
+                "| c | isn   |",
+                "+---+-------+",
+                "|   | false |",
+                "+---+-------+",
+            ],
+            &batches
         );
     }
 }
