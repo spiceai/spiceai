@@ -873,7 +873,7 @@ mod tests {
         let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
         Arc::new(
             ScalarFunctionExpr::try_new(
-                Arc::new(datafusion_functions::string::lower()),
+                datafusion_functions::string::lower(),
                 vec![name],
                 schema,
                 Arc::new(ConfigOptions::new()),
