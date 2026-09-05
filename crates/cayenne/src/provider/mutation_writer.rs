@@ -670,24 +670,38 @@ impl<'a> AppendMutationWriter<'a> {
                     None
                 };
 
-                if stage_on_conflict {
-                    let record_seq = self.table.sequence_high_water().await;
-                    self.table.record_file_pk_keys(&validated_keys, record_seq);
-                    // Unlike every other `record_file_pk_keys` call site, this one
-                    // records BEFORE the publish: the staged files are not yet
-                    // discoverable and the read filter skips the unpublished
-                    // tombstone, so until `CayenneCdcWrite::finish` these keys exist
-                    // only in the PK cache. Anything that drops that cache
-                    // (`clear_cached_pk_keyset`, a discarded index, an abandoned
-                    // validation) does so on the premise that the next rebuild reads
-                    // the commit back from the table, which is not true yet — so
-                    // also hand the keys to the in-flight registration, where a
-                    // rebuild folds them in and the publish retires them.
-                    self.table.attach_inflight_staged_pk_keys(
-                        prepared_append.staging_snapshot_id(),
-                        &validated_keys,
-                    );
-                }
+                // Record the validated keys for BOTH arms. Unlike every other
+                // `record_file_pk_keys` call site, this one records BEFORE the
+                // publish: the staged files are not yet discoverable and the read
+                // filter skips the unpublished tombstone, so until
+                // `CayenneCdcWrite::finish` these keys exist only in the PK cache.
+                // Anything that drops that cache (`clear_cached_pk_keyset`, a
+                // discarded index, an abandoned validation) does so on the premise
+                // that the next rebuild reads the commit back from the table, which
+                // is not true yet — so also hand the keys to the in-flight
+                // registration, where a rebuild folds them in and the publish
+                // retires them.
+                //
+                // Both arms need it. The pipeline lets the next Stage A begin before
+                // this write's Stage B publishes, so this record is what carries a
+                // batch's keys into the validation of a batch that overlaps it. That
+                // includes the `!stage_on_conflict` arm, which takes purely-new keys
+                // into a table holding no tombstones — the ordinary `do_nothing`
+                // steady state, where the overlap decides whether one key ends up
+                // with one live row or two (#13642).
+                //
+                // `sequence_high_water()` is the stamp, matching
+                // `CayenneCdcWrite::finish`. On this arm it buys existence, not
+                // ordering: no sequence is reserved here, so the stamp can equal a
+                // concurrent transaction's begin token and per-key OCC does not see
+                // this append at all (#13685). The publish re-stamps with the
+                // commit's own high water.
+                let record_seq = self.table.sequence_high_water().await;
+                self.table.record_file_pk_keys(&validated_keys, record_seq);
+                self.table.attach_inflight_staged_pk_keys(
+                    prepared_append.staging_snapshot_id(),
+                    &validated_keys,
+                );
                 drop(held_write_guard);
 
                 tracing::debug!(
