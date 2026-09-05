@@ -165,7 +165,29 @@ fn has_transient_http_error_responses(batches: &[RecordBatch]) -> bool {
 /// unrelated business logic.
 #[must_use]
 pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
-    !has_transient_http_error_responses(batches)
+    if has_transient_http_error_responses(batches) {
+        return false;
+    }
+
+    // A batch resting on memory it does not own is normally copied on the way
+    // in, so the entry stops pinning the producer's chunk and can be billed for
+    // what it holds. A dictionary or a nested view cannot be copied off it — see
+    // `has_unbounded_foreign_column` — and storing one would put memory in the
+    // cache that `max_size` cannot see or bound. Declining to cache it is the
+    // conservative half of that trade: a repeat query re-executes, where the
+    // alternative is a budget that does not hold.
+    if let Some(batch) = batches
+        .iter()
+        .find(|batch| arrow_tools::record_batch::has_unbounded_foreign_column(batch))
+    {
+        tracing::debug!(
+            columns = batch.num_columns(),
+            "Not caching a result holding a dictionary or nested view that cannot be copied off the memory its producer owns, since its size could not be bounded"
+        );
+        return false;
+    }
+
+    true
 }
 
 /// How much larger than the cache limit a raw result may grow while
@@ -336,6 +358,61 @@ pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<TableReferen
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// A batch the cache cannot bound must not be stored.
+    ///
+    /// `compact_retained_buffers` copies a foreign-backed column so the entry
+    /// stops pinning the producer's allocation, but a dictionary cannot be
+    /// copied off it — `MutableArrayData` shares its values wholesale. Such a
+    /// column is therefore neither copied nor billed, which is the one case
+    /// where `max_size` would still not bound what the cache holds, so the
+    /// write path declines it.
+    #[test]
+    fn a_result_that_cannot_be_bounded_is_not_cacheable() {
+        use arrow::array::{ArrayData, ArrayRef, DictionaryArray, Int32Array, StringArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Int32Type};
+        use std::sync::Arc;
+
+        let backing: Arc<Vec<u8>> = Arc::new(0_i32.to_le_bytes().repeat(4));
+        let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+        let foreign_keys = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+            )
+        };
+        let keys = ArrayData::builder(DataType::Int32)
+            .len(4)
+            .add_buffer(foreign_keys)
+            .build()
+            .expect("a valid key array");
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(keys),
+            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+        )
+        .expect("a valid dictionary");
+        let foreign = RecordBatch::try_from_iter(vec![(
+            "d",
+            Arc::new(dictionary) as ArrayRef,
+        )])
+        .expect("a one-column batch");
+
+        assert!(
+            !batches_cacheable(&[foreign]),
+            "a dictionary resting on memory the cache cannot copy off must be declined, \
+             or it is stored holding bytes `max_size` cannot see"
+        );
+
+        // The ordinary case is unaffected: an owned batch is still cacheable.
+        let owned = RecordBatch::try_from_iter(vec![(
+            "v",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .expect("a one-column batch");
+        assert!(batches_cacheable(&[owned]));
+    }
+
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;

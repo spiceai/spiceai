@@ -890,6 +890,28 @@ fn compaction_plan(batch: &RecordBatch, decouple: &[bool]) -> (Vec<Option<usize>
     }
 }
 
+/// Whether `batch` holds a column that rests on memory it does not own and
+/// cannot be copied off it.
+///
+/// [`compact_retained_buffers`] copies a foreign-backed column so the entry
+/// stops pinning a producer's chunk and can be billed for what it holds. Two
+/// types defeat that: `MutableArrayData` shares a dictionary's values and a
+/// nested view's data buffers wholesale rather than narrowing them, and panics
+/// outright building an extend for a dictionary whose value count does not fit
+/// its key type. So such a column is left alone — and is then neither copied
+/// nor billed for what it keeps alive, which is the one case where `max_size`
+/// would still not bound the memory.
+///
+/// A caller that retains batches should decline them rather than store one it
+/// cannot bound.
+#[must_use]
+pub fn has_unbounded_foreign_column(batch: &RecordBatch) -> bool {
+    batch
+        .columns()
+        .iter()
+        .any(|column| !can_be_copied_whole(column) && rests_on_foreign_memory(column))
+}
+
 /// Which columns must be copied to decouple them from memory someone else owns,
 /// regardless of what [`compaction_plan`] estimates.
 ///
