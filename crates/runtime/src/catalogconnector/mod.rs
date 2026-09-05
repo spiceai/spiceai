@@ -152,21 +152,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// then part of the question.
 #[cfg(test)]
 pub(crate) fn stub_udf(name: &str, arity: usize) -> datafusion::logical_expr::Expr {
-    use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, create_udf};
     use datafusion::prelude::col;
 
-    let udf = std::sync::Arc::new(create_udf(
-        name,
-        vec![DataType::Utf8; arity],
-        DataType::Utf8,
-        Volatility::Immutable,
-        std::sync::Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
-    ));
-    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-        udf,
-        (0..arity).map(|i| col(format!("c{i}"))).collect(),
-    ))
+    stub_udf_called_with(name, (0..arity).map(|i| col(format!("c{i}"))).collect())
 }
 
 /// The same stub called with `args` instead of bare columns, for a backend whose
