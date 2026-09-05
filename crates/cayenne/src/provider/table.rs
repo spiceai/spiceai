@@ -2248,18 +2248,21 @@ pub struct CayenneTableProvider {
     /// is empty, so the same WALs are treated as crash-recovery input.
     ///
     /// The value carries the primary keys that append validated while its rows
-    /// were still private, for the arm that records them BEFORE publishing
-    /// (`AppendMutationWriter`'s pipelined `stage_on_conflict` path). Those keys
-    /// exist nowhere a keyset rebuild can read them — the staged files are not
-    /// yet discoverable and the read filter skips the unpublished tombstone — so
-    /// [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the same
-    /// way [`Self::fold_mem_tier_keys_into_keyset`] folds the un-checkpointed RAM
-    /// tier. Holding them HERE rather than only in the PK cache is what makes
-    /// that sound: [`Self::clear_cached_pk_keyset`] and the index-discard paths
-    /// empty the cache, and their stated premise — the next rebuild reads this
-    /// commit from the table — does not hold while the commit is still staged.
-    /// Empty for every other append (they record after publishing, so the scan
-    /// sees their rows).
+    /// were still private. `AppendMutationWriter`'s pipelined staged append is
+    /// the one path that records BEFORE publishing, and it does so on BOTH of
+    /// its arms: `stage_on_conflict`, and the `!stage_on_conflict` arm that
+    /// takes purely-new keys into a table holding no tombstones (#13642). Those
+    /// keys exist nowhere a keyset rebuild can read them — the staged files are
+    /// not yet discoverable and the read filter skips the unpublished tombstone
+    /// — so [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the
+    /// same way [`Self::fold_mem_tier_keys_into_keyset`] folds the
+    /// un-checkpointed RAM tier. Holding them HERE rather than only in the PK
+    /// cache is what makes that sound: [`Self::clear_cached_pk_keyset`] and the
+    /// index-discard paths empty the cache, and their stated premise — the next
+    /// rebuild reads this commit from the table — does not hold while the
+    /// commit is still staged.
+    /// Empty for an inline append, which records after publishing, so the scan
+    /// sees its rows.
     inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
