@@ -22,6 +22,7 @@ use crate::{
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
+use arrow::array::{Array, Float64Array};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -1391,14 +1392,11 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
 
     test_request_context()
         .scope(async {
-            let db_file = tempfile::Builder::new()
-                .suffix(".db")
-                .tempfile()
-                .expect("should create temp duckdb file");
-            let db_path = db_file.path().to_path_buf();
-            // `duckdb::Connection` needs the path free of the empty file
-            // `NamedTempFile` created, or it refuses it as not a database.
-            db_file.close().expect("should release the temp path");
+            // A TempDir rather than a NamedTempFile: `duckdb::Connection::open`
+            // wants to create the database itself, and the directory guard is
+            // what removes it (and DuckDB's `.wal` sidecar) when the test ends.
+            let db_dir = tempfile::tempdir().expect("should create temp dir");
+            let db_path = db_dir.path().join("vecs.db");
 
             {
                 let conn = duckdb::Connection::open(&db_path)
@@ -1416,8 +1414,11 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
             }
 
             let mut dataset = Dataset::new("duckdb:vecs", "vecs");
+            // `duckdb_open`, not `duckdb_file`: the latter is the accelerator's
+            // parameter, and the connector ignores it with a warning and then
+            // fails to load the dataset for want of a database to open.
             dataset.params = Some(spicepod::param::Params::from_string_map(
-                vec![("duckdb_file".to_string(), db_path.display().to_string())]
+                vec![("duckdb_open".to_string(), db_path.display().to_string())]
                     .into_iter()
                     .collect(),
             ));
@@ -1455,19 +1456,31 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
             // Rows 2-4 overflow or carry a non-finite element; the kernel calls
             // each of those undefined, so the federated answer must be NULL too.
             // Rows 1 and 5 are ordinary and must survive the screen.
-            assert_batches_eq!(
-                [
-                    "+----+------+",
-                    "| id | ip   |",
-                    "+----+------+",
-                    "| 1  | 32.0 |",
-                    "| 2  |      |",
-                    "| 3  |      |",
-                    "| 4  |      |",
-                    "| 5  | 0.0  |",
-                    "+----+------+",
-                ],
-                &result
+            //
+            // Asserted per value rather than against a rendered table: a NULL
+            // and a `nan` are both blank in the pretty-printed form, which is
+            // exactly the difference this test exists to catch.
+            let expected = vec![Some(32.0_f64), None, None, None, Some(0.0_f64)];
+            let scores: Vec<Option<f64>> = result
+                .iter()
+                .flat_map(|batch| {
+                    let scores = batch
+                        .column_by_name("ip")
+                        .expect("result carries an `ip` column")
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("`ip` is the kernel's Float64 return type")
+                        .clone();
+                    (0..scores.len())
+                        .map(|row| (!scores.is_null(row)).then(|| scores.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                scores, expected,
+                "a federated inner_product must answer what the kernel answers: \
+                 NULL for the overflow (id 2), the NaN element (id 3) and the \
+                 infinite element (id 4), and the real value otherwise"
             );
 
             let explain: Vec<RecordBatch> = rt
