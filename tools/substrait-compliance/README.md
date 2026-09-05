@@ -80,7 +80,9 @@ cosmetics — values must still match:
   fractional length is not a tolerance. One ULP at a declared decimal
   scale applies only when both headers are `decimal(p,s)` with the same
   scale ≥ 2. `integer`/`bigint` cells compare exactly. Quoted-empty `""`
-  is NULL. Incomplete CSV rows (field count ≠ header width) mismatch.
+  in a golden CSV decodes to empty/NULL; after decode only the empty
+  string is NULL. Incomplete CSV rows (field count ≠ header width)
+  mismatch.
 
 Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 

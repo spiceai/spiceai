@@ -26,7 +26,9 @@ limitations under the License.
 //! - Column names are not compared (plan alias `TOTAL_VALUE` vs `DuckDB`
 //!   `value`; Isthmus `L_RETURNFLAG` vs golden `l_returnflag`).
 //! - String cells are compared after trimming `CHAR` pad / loader whitespace.
-//! - Quoted-empty `""` in a golden cell is NULL/empty (IBM TPC-H README).
+//! - Quoted-empty `""` in a golden CSV cell decodes to empty/NULL
+//!   (IBM TPC-H README). After decode, only the empty string is NULL;
+//!   a literal `""` (two quote characters) is a nonempty string.
 //! - Numerics: `integer`/`bigint` cells compare exactly. Floats/`double`
 //!   match when `|Δ| < 1e-8` (q06) or relative error is `< 1e-14` (q01
 //!   `sum_charge` `DataFusion`/`DuckDB` conversion). Printed fractional
@@ -265,8 +267,7 @@ fn cells_match(
 }
 
 fn is_null_cell(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.is_empty() || trimmed == "\"\""
+    value.trim().is_empty()
 }
 
 fn parse_integer(value: &str) -> Option<i128> {
@@ -670,7 +671,6 @@ mod tests {
     fn char_padding_is_trimmed_for_string_cells() {
         assert!(values_match(" foxes boost", "foxes boost"));
         assert!(values_match("TZoQwNFFO ", "TZoQwNFFO"));
-        assert!(values_match("", "\"\""));
         assert!(!values_match("alpha", "beta"));
     }
 
@@ -785,22 +785,16 @@ mod tests {
 
     #[test]
     fn quoted_empty_matches_empty_null_cell() {
+        // CSV `""` is quoted-empty and decodes to the empty string (NULL).
         let parsed = parse_typed_csv("avg_yearly:double\n\"\"\n").expect("quoted-empty golden");
         assert_eq!(parsed.rows, vec![vec![String::new()]]);
 
         let actual = TableData {
-            columns: vec![ColumnSpec {
-                name: "avg_yearly".to_string(),
-                type_token: "double".to_string(),
-            }],
+            columns: parsed.columns.clone(),
             rows: vec![vec![String::new()]],
         };
-        let expected = TableData {
-            columns: actual.columns.clone(),
-            rows: vec![vec!["\"\"".to_string()]],
-        };
-        assert_eq!(compare(&actual, &expected), None);
-        assert!(values_match("", "\"\""));
+        assert_eq!(compare(&actual, &parsed), None);
+        assert!(values_match("", ""));
     }
 
     #[test]
@@ -1115,5 +1109,53 @@ mod tests {
                 "7".to_string()
             ]]
         );
+    }
+
+    #[test]
+    fn escaped_quote_literal_does_not_match_null() {
+        // CSV `""""""` is one quoted field of two escaped quotes → literal `""`.
+        let expected =
+            parse_typed_csv("a:string|b:integer\n\"\"\"\"\"\"|7\n").expect("escaped-quote golden");
+        assert_eq!(
+            expected.rows,
+            vec![vec!["\"\"".to_string(), "7".to_string()]]
+        );
+
+        let null_actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![vec![String::new(), "7".to_string()]],
+        };
+        assert!(matches!(
+            compare(&null_actual, &expected),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
+        ));
+
+        let empty_expected =
+            parse_typed_csv("a:string|b:integer\n\"\"|7\n").expect("quoted-empty golden");
+        assert_eq!(
+            empty_expected.rows,
+            vec![vec![String::new(), "7".to_string()]]
+        );
+        assert_eq!(compare(&null_actual, &empty_expected), None);
+
+        let quote_actual = TableData {
+            columns: empty_expected.columns.clone(),
+            rows: vec![vec!["\"\"".to_string(), "7".to_string()]],
+        };
+        assert!(matches!(
+            compare(&quote_actual, &empty_expected),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
+        ));
+
+        assert!(!values_match("", "\"\""));
+        assert!(!values_match("\"\"", ""));
     }
 }
