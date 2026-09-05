@@ -2542,7 +2542,7 @@ mod tests {
             .ctx
             .sql("SELECT date_trunc('month', DATE '2024-03-17') AS m")
             .await
-            .and_then(|frame| frame.into_optimized_plan());
+            .and_then(datafusion::dataframe::DataFrame::into_optimized_plan);
         assert!(
             over_a_date.is_ok(),
             "date_trunc over a date must stay plannable, or a federated \
