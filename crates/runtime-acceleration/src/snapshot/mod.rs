@@ -3146,6 +3146,10 @@ mod tests {
             Ok(Some(Arc::clone(&self.schema)))
         }
 
+        async fn set_schema(&self, _schema: &SchemaRef) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+
         async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
             Ok(None)
         }

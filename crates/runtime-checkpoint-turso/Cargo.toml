@@ -32,5 +32,8 @@ serde_json.workspace = true
 data_components = { path = "../data_components", features = ["turso"] }
 turso.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

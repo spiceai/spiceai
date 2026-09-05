@@ -186,6 +186,26 @@ impl TursoDatasetCheckpointer {
         Ok(())
     }
 
+    async fn set_schema_inner(&self, schema: &SchemaRef) -> Result<(), CheckpointError> {
+        let pool = &self.pool;
+        let _schema_guard = pool.acquire_schema_read_lock().await;
+        let conn = pool.connect().await.map_err(store_error)?;
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+
+        // Not an upsert: an absent row must stay absent rather than gain a fresh
+        // `updated_at`, which is the deferral this exists to avoid.
+        let update =
+            format!("UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ?2 WHERE dataset_name = ?1");
+        conn.execute(
+            &update,
+            turso::params![self.dataset_name.clone(), schema_json],
+        )
+        .await
+        .map_err(store_error)?;
+
+        Ok(())
+    }
+
     async fn get_schema_inner(&self) -> Result<Option<SchemaRef>, CheckpointError> {
         let pool = &self.pool;
         let conn = pool.connect().await.map_err(store_error)?;
@@ -254,6 +274,13 @@ impl DatasetCheckpointer for TursoDatasetCheckpointer {
             .map_err(Into::into)
     }
 
+    async fn set_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        self.set_schema_inner(schema).await.map_err(Into::into)
+    }
+
     async fn get_schema(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SchemaRef>> {
@@ -274,5 +301,129 @@ impl DatasetCheckpointer for TursoDatasetCheckpointer {
 
     async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         self.delete_inner().await.map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    async fn create_in_memory_turso_checkpoint()
+    -> (TursoDatasetCheckpointer, Arc<TursoConnectionPool>) {
+        let pool = Arc::new(
+            TursoConnectionPool::new(":memory:")
+                .await
+                .expect("to build an in-memory Turso pool"),
+        );
+        let checkpoint =
+            TursoDatasetCheckpointer::try_new(Arc::clone(&pool), "test_dataset".to_string())
+                .await
+                .expect("to initialize the Turso checkpoint table");
+        (checkpoint, pool)
+    }
+
+    /// A schema repair must correct the recorded schema without telling the refresh
+    /// scheduler the data was just refreshed. Regression test for #13817.
+    #[tokio::test]
+    async fn set_schema_rewrites_the_schema_without_touching_the_freshness_clock() {
+        let (checkpoint, pool) = create_in_memory_turso_checkpoint().await;
+
+        let original = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        // What a repair writes back: the same columns, `name` no longer nullable.
+        let repaired = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        checkpoint
+            .checkpoint(&original, Some("SELECT 1"))
+            .await
+            .expect("seed checkpoint");
+
+        backdate_checkpoint_by_seven_days(&pool).await;
+
+        let before = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+
+        checkpoint
+            .set_schema(&repaired)
+            .await
+            .expect("schema-only write");
+
+        // Read back through a fresh checkpointer over the same store: acceptance is what
+        // the row holds, not what the call returned.
+        let reader = TursoDatasetCheckpointer::new(Arc::clone(&pool), "test_dataset".to_string());
+
+        let after = reader
+            .last_checkpoint_time()
+            .await
+            .expect("read checkpoint time")
+            .expect("checkpoint time present");
+        assert_eq!(
+            after, before,
+            "a schema-only write must leave the freshness clock alone"
+        );
+
+        assert_eq!(
+            reader
+                .get_schema()
+                .await
+                .expect("read schema")
+                .expect("schema present"),
+            repaired,
+            "the repaired schema must be the one stored"
+        );
+
+        assert_eq!(
+            reader.get_refresh_sql().await.expect("read refresh sql"),
+            Some("SELECT 1".to_string()),
+            "a schema-only write must preserve the stored refresh SQL"
+        );
+    }
+
+    /// A dataset with no checkpoint must not gain one — a row created here would carry a
+    /// fresh `updated_at`, which is the deferral the schema-only write exists to avoid.
+    #[tokio::test]
+    async fn set_schema_leaves_an_absent_checkpoint_absent() {
+        let (checkpoint, _pool) = create_in_memory_turso_checkpoint().await;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        checkpoint
+            .set_schema(&schema)
+            .await
+            .expect("schema-only write on an absent checkpoint");
+
+        assert!(
+            !checkpoint.exists().await,
+            "a schema-only write must not create a checkpoint row"
+        );
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("read checkpoint time")
+                .is_none(),
+            "an absent checkpoint must not gain a freshness timestamp"
+        );
+    }
+
+    /// Backdates the checkpoint's recorded refresh by seven days, as a dataset
+    /// bootstrapping from a legacy snapshot would be.
+    async fn backdate_checkpoint_by_seven_days(pool: &Arc<TursoConnectionPool>) {
+        let conn = pool.connect().await.expect("turso connection");
+        conn.execute(
+            &format!("UPDATE {CHECKPOINT_TABLE_NAME} SET updated_at = datetime('now', '-7 days')"),
+            (),
+        )
+        .await
+        .expect("backdate updated_at");
     }
 }
