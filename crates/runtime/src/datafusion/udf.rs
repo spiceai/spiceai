@@ -408,6 +408,23 @@ pub async fn apply_function_diff(
     current_app: &Arc<app::App>,
     new_app: &Arc<app::App>,
 ) {
+    if apply_function_diff_inner(runtime, current_app, new_app).await {
+        // A cached logical plan embeds the `ScalarUDF` it was planned against, so it keeps
+        // calling the function this diff just deregistered or redefined — answering from the
+        // previous body, or federating a call the deny-list no longer covers. Discard the
+        // cached plans so the next query replans against the registry as it now stands, the
+        // same reason dataset and view registration discard them.
+        runtime.df.clear_cached_plans().await;
+    }
+}
+
+/// The body of [`apply_function_diff`], reporting whether it deregistered or
+/// registered anything — a diff that changed no function leaves cached plans valid.
+async fn apply_function_diff_inner(
+    runtime: &crate::Runtime,
+    current_app: &Arc<app::App>,
+    new_app: &Arc<app::App>,
+) -> bool {
     let ctx = &runtime.df.ctx;
     let current_enabled = current_app.runtime.functions.enabled;
     let new_enabled = new_app.runtime.functions.enabled;
@@ -456,14 +473,16 @@ pub async fn apply_function_diff(
         }
     }
 
+    let dropped_a_function = !functions_to_drop.is_empty();
+
     if new_app.functions.is_empty() {
-        return;
+        return dropped_a_function;
     }
     if !new_enabled {
         tracing::error!(
             "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
         );
-        return;
+        return dropped_a_function;
     }
 
     let functions_to_register = new_app
@@ -533,10 +552,13 @@ pub async fn apply_function_diff(
             }
         }
     }
+    let registered_a_function = !registered_function_names.is_empty();
     add_user_functions_to_deny_list(registered_function_names);
     for next in functions_to_expose_as_tools {
         maybe_register_function_as_tool(runtime, &next).await;
     }
+
+    dropped_a_function || registered_a_function
 }
 
 /// Names of UDFs whose invocation can execute external code or make RPC/API
@@ -715,6 +737,7 @@ mod deny_list_registration_tests {
 
 #[cfg(test)]
 mod tests {
+    use cache::{CacheProvider, key::CacheKey};
     use datafusion::arrow::array::AsArray;
     use datafusion::arrow::datatypes::{DataType, Float64Type};
     use datafusion::execution::SessionStateBuilder;
@@ -1302,5 +1325,99 @@ mod tests {
                 "{name}: expected a FixedSizeList coercion error from Spice's impl, got: {err}"
             );
         }
+    }
+
+    /// The plan cache `crate::Runtime::builder().build()` installs unconditionally
+    /// (`init/caching.rs`) is what these drive; no cache configuration is needed to reach it.
+    async fn cache_one_plan(runtime: &crate::Runtime) {
+        const SQL: &str = "SELECT 1";
+        let session = runtime.df.ctx.state();
+        let key = CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        runtime
+            .df
+            .get_or_create_logical_plan(&session, Some(&key), SQL)
+            .await
+            .expect("SELECT 1 should plan");
+    }
+
+    async fn cached_plan_count(runtime: &crate::Runtime) -> u64 {
+        let provider = runtime
+            .df
+            .plans_cache_provider()
+            .expect("the plans cache is installed unconditionally");
+        provider.checkpoint().await;
+        provider.item_count().await
+    }
+
+    fn app_with_user_functions(bodies: &[(&str, &str)]) -> Arc<app::App> {
+        let mut builder = app::AppBuilder::new("function_reload").with_runtime(
+            spicepod::component::runtime::Runtime {
+                functions: spicepod::component::runtime::Functions::enabled(),
+                ..Default::default()
+            },
+        );
+        for (name, body) in bodies {
+            let mut function = test_user_function(name, true);
+            function.body = Some((*body).to_string());
+            builder = builder.with_function(function);
+        }
+        Arc::new(builder.build())
+    }
+
+    /// #13873: a cached logical plan embeds the `ScalarUDF` it was planned against, so a hot
+    /// reload that redefines a `functions:` entry leaves the next query answering from the
+    /// previous body — for the whole hour the plan cache holds an entry.
+    #[tokio::test]
+    async fn redefining_a_user_function_discards_cached_plans() {
+        let runtime = crate::Runtime::builder().build().await;
+        cache_one_plan(&runtime).await;
+        assert_eq!(cached_plan_count(&runtime).await, 1);
+
+        apply_function_diff(
+            &runtime,
+            &app_with_user_functions(&[("bump", "x + 1")]),
+            &app_with_user_functions(&[("bump", "x + 100")]),
+        )
+        .await;
+
+        assert_eq!(
+            cached_plan_count(&runtime).await,
+            0,
+            "a redefined function is deregistered and re-registered, so a plan holding the previous one is stale"
+        );
+    }
+
+    /// The drop-everything path returns before the registration half, so it needs its own
+    /// guard: removing the last declared function must still discard the cached plans, or the
+    /// removed function keeps being called.
+    #[tokio::test]
+    async fn dropping_the_last_user_function_discards_cached_plans() {
+        let runtime = crate::Runtime::builder().build().await;
+        cache_one_plan(&runtime).await;
+
+        apply_function_diff(
+            &runtime,
+            &app_with_user_functions(&[("bump", "x + 1")]),
+            &app_with_user_functions(&[]),
+        )
+        .await;
+
+        assert_eq!(cached_plan_count(&runtime).await, 0);
+    }
+
+    /// A reload that leaves every function exactly as it was must not throw the plan cache away.
+    #[tokio::test]
+    async fn a_reload_that_changes_no_function_keeps_cached_plans() {
+        let runtime = crate::Runtime::builder().build().await;
+        cache_one_plan(&runtime).await;
+
+        apply_function_diff(
+            &runtime,
+            &app_with_user_functions(&[("bump", "x + 1")]),
+            &app_with_user_functions(&[("bump", "x + 1")]),
+        )
+        .await;
+
+        assert_eq!(cached_plan_count(&runtime).await, 1);
     }
 }
