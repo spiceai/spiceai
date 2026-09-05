@@ -331,15 +331,17 @@ fn filter_zero_vectors(
         .zip(primary_keys.iter())
         .map(|(embedding, key)| {
             let outcome = match embedding {
-                // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-                Some(embedding) if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) => {
-                    let key_str = key.as_deref().unwrap_or("unknown");
-                    tracing::warn!(
-                        "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
-                    );
-                    write_util::RowOutcome::Rejected
-                }
-                Some(_) => write_util::RowOutcome::Indexed,
+                Some(embedding) => match write_util::classify_vector(embedding) {
+                    Some(rejection) => {
+                        let key_str = key.as_deref().unwrap_or("unknown");
+                        let reason = rejection.reason();
+                        tracing::warn!(
+                            "Skipping record '{key_str}' for S3 Vector index '{index_name}': {reason}. Any vector already stored for this record is removed, so it is not returned at its previous value"
+                        );
+                        write_util::RowOutcome::Rejected
+                    }
+                    None => write_util::RowOutcome::Indexed,
+                },
                 // `write_data` skips a row whose embedding is `None` (a NULL or empty search
                 // text), so those keys keep whatever vector an earlier text stored.
                 None => write_util::RowOutcome::Rejected,
@@ -392,6 +394,64 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, UnionArray};
     use arrow_schema::{DataType, Schema, UnionFields, UnionMode};
+
+    /// Regression test for #13872. The batch carries one key twice and the row that
+    /// *decides* it carries a vector the index cannot use. Before the shared classifier,
+    /// only the all-zero / all-NaN shapes were a rejection here, so a partially non-finite
+    /// deciding row evicted nothing and the stale vector stayed searchable — while the
+    /// unusable vector was itself put alongside it.
+    #[test]
+    fn every_unindexable_shape_evicts_its_key_and_is_not_put() {
+        for (name, deciding, _) in write_util::unindexable_shapes(2) {
+            let embeddings = vec![
+                Some(vec![1.0_f32, 2.0]),
+                Some(vec![3.0_f32, 4.0]),
+                Some(deciding),
+            ];
+            let keys = vec![
+                Some("same".to_string()),
+                Some("other".to_string()),
+                Some("same".to_string()),
+            ];
+            let (kept, kept_keys, _metadata, evicted) =
+                filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+            assert_eq!(
+                evicted,
+                vec!["same".to_string()],
+                "the deciding row for 'same' is a {name} vector, so whatever S3 Vectors \
+                 already holds under that key must be removed"
+            );
+            assert_eq!(
+                kept_keys.into_iter().flatten().collect::<Vec<_>>(),
+                vec!["other".to_string()],
+                "the delete runs before the put, so putting the earlier row would restore \
+                 the entry the eviction exists to remove"
+            );
+            assert_eq!(kept.len(), 1);
+        }
+    }
+
+    /// The control: an ordinary deciding vector leaves both rows in the put and evicts
+    /// nothing, so the guard above is measuring the shapes and not the repeated key.
+    #[test]
+    fn an_ordinary_deciding_vector_evicts_nothing_and_puts_every_row() {
+        let embeddings = vec![
+            Some(vec![1.0_f32, 2.0]),
+            Some(vec![3.0_f32, 4.0]),
+            Some(write_util::indexable_shape(2)),
+        ];
+        let keys = vec![
+            Some("same".to_string()),
+            Some("other".to_string()),
+            Some("same".to_string()),
+        ];
+        let (kept, _kept_keys, _metadata, evicted) =
+            filter_zero_vectors(embeddings, keys, HashMap::new(), "test_index");
+
+        assert!(evicted.is_empty());
+        assert_eq!(kept.len(), 3);
+    }
 
     #[test]
     fn test_filter_zero_vectors() {
