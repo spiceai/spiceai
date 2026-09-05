@@ -225,8 +225,8 @@ impl SqliteDatasetCheckpointer {
 
         conn.conn
             .call(move |conn| {
-                // No upsert: an absent row must stay absent rather than gain a fresh
-                // `updated_at`, and `refresh_sql`/`created_at`/`updated_at` are untouched.
+                // Not an upsert: an absent row must stay absent rather than gain a fresh
+                // `updated_at`, which is the deferral this exists to avoid.
                 let update = format!(
                     "UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ?2 WHERE dataset_name = ?1"
                 );

@@ -217,8 +217,8 @@ impl DuckDbDatasetCheckpointer {
             .get_underlying_conn_mut();
 
         let schema_json = serialize_schema(schema).map_err(store_error)?;
-        // No upsert: an absent row must stay absent rather than gain a fresh
-        // `updated_at`, and `refresh_sql`/`created_at`/`updated_at` are untouched.
+        // Not an upsert: an absent row must stay absent rather than gain a fresh
+        // `updated_at`, which is the deferral this exists to avoid.
         // No `CHECKPOINT` either — this writes no rows, so there is nothing to snapshot.
         let update =
             format!("UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ? WHERE dataset_name = ?");

@@ -192,8 +192,8 @@ impl TursoDatasetCheckpointer {
         let conn = pool.connect().await.map_err(store_error)?;
         let schema_json = serialize_schema(schema).map_err(store_error)?;
 
-        // No upsert: an absent row must stay absent rather than gain a fresh
-        // `updated_at`, and `refresh_sql`/`created_at`/`updated_at` are untouched.
+        // Not an upsert: an absent row must stay absent rather than gain a fresh
+        // `updated_at`, which is the deferral this exists to avoid.
         let update =
             format!("UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = ?2 WHERE dataset_name = ?1");
         conn.execute(
