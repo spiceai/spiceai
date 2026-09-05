@@ -51,7 +51,6 @@ limitations under the License.
 
 use std::mem::size_of;
 
-
 /// Bytes charged to every cache entry for the store's own per-entry bookkeeping.
 ///
 /// A weigher is handed only the value, so nothing the store allocates *around*
@@ -161,4 +160,3 @@ mod tests {
         );
     }
 }
-

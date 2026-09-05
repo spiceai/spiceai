@@ -21,8 +21,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::sql::TableReference;
 
-use crate::intern::table_set::table_reference_heap_size;
 use crate::intern::Interned;
+use crate::intern::table_set::table_reference_heap_size;
 use crate::sizing::{
     BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
 };
@@ -85,8 +85,7 @@ impl CachedAggregationResult {
                     // search entry is underweighted exactly where its schema and
                     // table set stopped being charged.
                     batch.get_array_memory_size()
-                        + BUFFER_OVERHEAD_BYTES
-                            * arrow_tools::record_batch::buffers_in_batch(batch)
+                        + BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch)
                 })
                 .sum::<usize>()
             + string_vec_heap_size(&self.primary_keys)

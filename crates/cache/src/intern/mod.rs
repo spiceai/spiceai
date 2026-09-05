@@ -321,9 +321,6 @@ impl<T, S: BuildHasher> Interner<T, S> {
         }
     }
 
-
-
-
     /// A snapshot of what the pool holds, excluding rows whose holders are gone.
     ///
     /// Read-only. It does not sweep, so observing the pool never changes it:

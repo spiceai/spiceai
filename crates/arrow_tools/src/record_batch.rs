@@ -16,13 +16,16 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray, MutableArrayData,
-        RecordBatch, RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
+        Array, ArrayData, ArrayRef, BinaryViewArray, DictionaryArray, GenericByteViewArray,
+        ListArray, MutableArrayData, PrimitiveArray, RecordBatch, RecordBatchOptions,
+        StringViewArray, StructArray, UInt64Array, downcast_dictionary_array, make_array,
+        new_null_array,
     },
-    buffer::{Buffer, OffsetBuffer},
+    buffer::{Buffer, NullBuffer, OffsetBuffer},
+    compute::take,
     datatypes::{
-        BinaryViewType, ByteViewType, DataType, Field, FieldRef, SchemaRef, StringViewType,
-        TimeUnit,
+        ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, BinaryViewType, ByteViewType,
+        DataType, Field, FieldRef, SchemaRef, StringViewType, TimeUnit,
     },
     error::ArrowError,
 };
@@ -673,16 +676,27 @@ fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
 /// Whether [`compact_column`] can produce a copy of `column` that shares nothing
 /// with the original.
 ///
-/// The mirror of the structural declines in [`reclaimable_bytes`], kept beside
-/// them so the two cannot drift: a top-level view column is rebuilt through
-/// arrow's `gc`, and everything else goes through `MutableArrayData`, which
-/// shares a dictionary's values and a nested view's data buffers wholesale
-/// rather than narrowing them — and panics outright building an extend for a
-/// dictionary whose value count does not fit its key type.
+/// A top-level view column is rebuilt through arrow's `gc`, a dictionary through
+/// [`rebuild_dictionary`], and a container's view leaves through
+/// [`rebuild_view_leaves`] once [`MutableArrayData`] has copied the rest. What
+/// is left over is a dictionary below the top level: `MutableArrayData` shares
+/// its values wholesale rather than narrowing them, and panics outright building
+/// an extend for one whose value count does not fit its key type, so no copy of
+/// the container around it can be made at all.
 fn can_be_copied_whole(column: &ArrayRef) -> bool {
     match column.data_type() {
         DataType::Utf8View | DataType::BinaryView => true,
-        data_type if contains_view_type(data_type) || contains_dictionary(data_type) => false,
+        // Rebuilt by `rebuild_dictionary`, unless its values are views —
+        // `take` copies a view array's views but shares the data buffers they
+        // point into, so the result would still rest on the same memory.
+        DataType::Dictionary(_, values) => !contains_view_type(values),
+        // A dictionary anywhere below the top cannot be copied at all:
+        // `MutableArrayData` builds an extend per child and panics on one whose
+        // value count does not fit its key type.
+        data_type if contains_dictionary(data_type) => false,
+        // Everything else, views nested in containers included —
+        // `MutableArrayData` rebases the offsets and copies the validity, and
+        // `rebuild_view_leaves` finishes the job on the leaves it shares.
         _ => true,
     }
 }
@@ -719,16 +733,24 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
     match column.data_type() {
         DataType::Utf8View => return view_reclaimable_bytes::<StringViewType>(column),
         DataType::BinaryView => return view_reclaimable_bytes::<BinaryViewType>(column),
+        // `rebuild_view_leaves` can copy a container's views, but nothing
+        // measures a *slice* of one: `get_slice_memory_size` counts a view's
+        // views buffer without the data it points into, and `compacted_memory_size`
+        // feeds an admission pre-check from this estimate, so guessing here would
+        // under-predict what the entry holds. A foreign one is still decoupled —
+        // that path runs off `columns_to_decouple`, not off this measurement.
         data_type if contains_view_type(data_type) => return None,
-        // A dictionary is declined on both counts. `MutableArrayData` shares
-        // the values wholesale rather than narrowing them, so only the keys
-        // could be reclaimed; and it panics outright building an extend for a
-        // dictionary whose value count does not fit its key type — a
+        // A top-level dictionary goes to `rebuild_dictionary`, and its size is
+        // measurable like any other array's. One nested inside a container is
+        // still left alone: `MutableArrayData` shares a dictionary's values
+        // wholesale rather than narrowing them, and panics outright building an
+        // extend for one whose value count does not fit its key type — a
         // `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow and
         // trips it (`build_extend_dictionary` returns `None`, which
-        // `MutableArrayData::with_capacities` unwraps with `expect`). Both
-        // reasons hold for a dictionary at any depth: the extend is built per
-        // child, so a `Struct<Dictionary<UInt8, _>>` reaches the same `expect`.
+        // `MutableArrayData::with_capacities` unwraps with `expect`). The extend
+        // is built per child, so a `Struct<Dictionary<UInt8, _>>` reaches the
+        // same `expect`.
+        DataType::Dictionary(..) => {}
         data_type if contains_dictionary(data_type) => return None,
         _ => {}
     }
@@ -741,6 +763,93 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
     worth_compacting(column.get_array_memory_size(), needed)
 }
 
+/// Rebuilds `dictionary` over only the values its keys still reference.
+///
+/// `MutableArrayData` cannot do this: it shares a dictionary's values wholesale
+/// rather than narrowing them, and panics outright building an extend for one
+/// whose value count does not fit its key type. Taking the referenced values and
+/// remapping the keys onto them allocates both afresh, so the rebuilt dictionary
+/// both reclaims the unreferenced values and stops resting on memory it does not
+/// own — and it does so unconditionally, which matters because the array that
+/// most needs decoupling is usually the one where every value is referenced.
+fn rebuild_dictionary<K: ArrowDictionaryKeyType>(
+    dictionary: &DictionaryArray<K>,
+) -> Option<ArrayRef> {
+    let referenced = dictionary.occupancy();
+    let mut remap = vec![K::Native::ZERO; dictionary.values().len()];
+    let mut keep = Vec::with_capacity(referenced.count_set_bits());
+    for (new, old) in referenced.set_indices().enumerate() {
+        // `new <= old`, and `old` indexed a dictionary already keyed by `K`.
+        *remap.get_mut(old)? = K::Native::from_usize(new)?;
+        keep.push(old as u64);
+    }
+
+    let values = take(dictionary.values(), &UInt64Array::from(keep), None).ok()?;
+    let keys = dictionary
+        .keys()
+        .values()
+        .iter()
+        // A null key's index is arbitrary rather than in range; it stays null
+        // whatever it maps to.
+        .map(|key| {
+            remap
+                .get(key.as_usize())
+                .copied()
+                .unwrap_or(K::Native::ZERO)
+        })
+        .collect::<Vec<_>>();
+    // Collecting the validity copies it too. Sharing it would keep the whole
+    // foreign array alive: every buffer an FFI import produces holds the same
+    // release callback, so retaining any one of them retains all of them.
+    let nulls = dictionary
+        .keys()
+        .nulls()
+        .map(|nulls| nulls.iter().collect::<NullBuffer>());
+
+    DictionaryArray::try_new(PrimitiveArray::<K>::new(keys.into(), nulls), values)
+        .ok()
+        .map(|dictionary| Arc::new(dictionary) as ArrayRef)
+}
+
+/// Rebuilds every view nested inside `array` over data buffers it owns.
+///
+/// [`MutableArrayData`] copies a container's offsets and validity but hands a
+/// view child the data buffers it selects from, so a container that has just
+/// been copied still points into the producer's memory. `gc`ing each view leaf
+/// and rebuilding the parents around it is the remaining half — and it is only
+/// the remaining half, which is why this runs *after* the copy rather than
+/// instead of it: `gc` alone would leave the offsets and validity shared.
+fn rebuild_view_leaves(array: &ArrayRef) -> ArrayRef {
+    match array.data_type() {
+        // `compact_column` gc's a view leaf and copies it; it recurses no
+        // further, since a leaf holds no children.
+        DataType::Utf8View | DataType::BinaryView => return compact_column(array),
+        data_type if contains_view_type(data_type) => {}
+        _ => return Arc::clone(array),
+    }
+
+    let data = array.to_data();
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| rebuild_view_leaves(&make_array(child.clone())).to_data())
+        .collect::<Vec<_>>();
+
+    let mut builder = ArrayData::builder(data.data_type().clone())
+        .len(data.len())
+        .offset(data.offset())
+        .nulls(data.nulls().cloned())
+        .child_data(children);
+    for buffer in data.buffers() {
+        builder = builder.add_buffer(buffer.clone());
+    }
+    // A rebuild that does not validate is not worth having: leave the column as
+    // it is rather than store one whose children no longer match its offsets.
+    builder
+        .build()
+        .map_or_else(|_| Arc::clone(array), make_array)
+}
+
 /// Copies `column`'s rows into buffers sized for exactly those rows.
 ///
 /// ([`arrow::compute::concat`] cannot be used: it returns a single input
@@ -749,6 +858,16 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
 /// the views and null allocations that `gc`'s fast paths reuse, which for a
 /// slice belong to the parent.
 fn compact_column(column: &ArrayRef) -> ArrayRef {
+    if matches!(column.data_type(), DataType::Dictionary(..)) {
+        let rebuilt = downcast_dictionary_array!(
+            column => rebuild_dictionary(column),
+            _ => None,
+        );
+        if let Some(rebuilt) = rebuilt {
+            return rebuilt;
+        }
+    }
+
     let gced: Option<ArrayRef> = match column.data_type() {
         DataType::Utf8View => column
             .as_any()
@@ -765,7 +884,19 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
     let data = source.to_data();
     let mut compacted = MutableArrayData::new(vec![&data], false, source.len());
     compacted.extend(0, 0, source.len());
-    make_array(compacted.freeze())
+    let copied = make_array(compacted.freeze());
+
+    // A container's view children come out of that copy still selecting from
+    // the buffers they arrived on, so they need a second pass. A view leaf was
+    // already gc'd above.
+    if matches!(
+        copied.data_type(),
+        DataType::Utf8View | DataType::BinaryView
+    ) {
+        copied
+    } else {
+        rebuild_view_leaves(&copied)
+    }
 }
 
 /// Returns `batch` with every column that retains substantially more memory
@@ -894,13 +1025,13 @@ fn compaction_plan(batch: &RecordBatch, decouple: &[bool]) -> (Vec<Option<usize>
 /// cannot be copied off it.
 ///
 /// [`compact_retained_buffers`] copies a foreign-backed column so the entry
-/// stops pinning a producer's chunk and can be billed for what it holds. Two
-/// types defeat that: `MutableArrayData` shares a dictionary's values and a
-/// nested view's data buffers wholesale rather than narrowing them, and panics
-/// outright building an extend for a dictionary whose value count does not fit
-/// its key type. So such a column is left alone — and is then neither copied
-/// nor billed for what it keeps alive, which is the one case where `max_size`
-/// would still not bound the memory.
+/// stops pinning a producer's chunk and can be billed for what it holds. A view
+/// nested inside a container defeats that: `MutableArrayData` shares its data
+/// buffers wholesale rather than narrowing them, and no kernel rebuilds a view
+/// in place the way [`rebuild_dictionary`] rebuilds a dictionary. So such a
+/// column is left alone — and is then neither copied nor billed for what it
+/// keeps alive, which is the one case where `max_size` would still not bound the
+/// memory.
 ///
 /// A caller that retains batches should decline them rather than store one it
 /// cannot bound.
@@ -923,10 +1054,10 @@ pub fn has_unbounded_foreign_column(batch: &RecordBatch) -> bool {
 /// entry can bound what it holds at all, and it cannot while it shares the
 /// producer's memory.
 ///
-/// A column [`reclaimable_bytes`] declined for a *structural* reason is left
-/// alone even so, because copying it would not decouple it: `MutableArrayData`
-/// shares a dictionary's values and a nested view's data buffers wholesale, so
-/// the copy would pay for itself and still pin the original.
+/// A column [`can_be_copied_whole`] declines is left alone even so, because
+/// copying it would not decouple it: `MutableArrayData` cannot narrow a nested
+/// dictionary's values, so the copy would pay for itself and still pin the
+/// original.
 fn columns_to_decouple(batch: &RecordBatch) -> Vec<bool> {
     batch
         .columns()
@@ -1624,6 +1755,89 @@ mod test {
         }
     }
 
+    /// Every buffer an FFI import produces carries the same release callback, so
+    /// retaining any one of them retains the whole foreign array. A rebuilt
+    /// dictionary must therefore share none of them — keys, validity, offsets or
+    /// value data.
+    #[test]
+    fn a_foreign_dictionary_is_rebuilt_onto_memory_the_batch_owns() {
+        use arrow::array::{ArrayData, DictionaryArray, cast::AsArray};
+        use arrow::datatypes::UInt8Type;
+
+        fn foreign(bytes: Vec<u8>) -> Buffer {
+            let backing: Arc<Vec<u8>> = Arc::new(bytes);
+            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+            // SAFETY: `backing` is kept alive by the `Allocation` handed to the
+            // buffer, and is never mutated.
+            unsafe {
+                Buffer::from_custom_allocation(
+                    ptr,
+                    backing.len(),
+                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+                )
+            }
+        }
+
+        let values = ArrayData::builder(DataType::Utf8)
+            .len(3)
+            .add_buffer(foreign(
+                [0_i32, 2, 4, 6]
+                    .iter()
+                    .flat_map(|o| o.to_le_bytes())
+                    .collect(),
+            ))
+            .add_buffer(foreign(b"aabbcc".to_vec()))
+            .build()
+            .expect("a valid Utf8 array");
+        let dictionary: ArrayRef = make_array(
+            ArrayData::builder(DataType::Dictionary(
+                Box::new(DataType::UInt8),
+                Box::new(DataType::Utf8),
+            ))
+            .len(4)
+            .add_buffer(foreign(vec![0, 2, 0, 1]))
+            // The last row is null, so value 1 ("bb") is unreferenced.
+            .null_bit_buffer(Some(foreign(vec![0b0000_0111])))
+            .add_child_data(values)
+            .build()
+            .expect("a valid dictionary"),
+        );
+        assert!(
+            rests_on_foreign_memory(&dictionary),
+            "the fixture must actually rest on foreign memory, or this proves nothing"
+        );
+
+        let batch = RecordBatch::try_from_iter(vec![("d", dictionary)]).expect("a batch");
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            !rests_on_foreign_memory(compacted.column(0)),
+            "a rebuilt dictionary must share no buffer with the array it came from"
+        );
+
+        let rebuilt = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("still a dictionary");
+        assert_eq!(
+            rebuilt.values().len(),
+            2,
+            "the value only a null key pointed at is dropped"
+        );
+        let strings = rebuilt.values().as_string::<i32>();
+        let read: Vec<Option<&str>> = (0..rebuilt.len())
+            .map(|row| {
+                (!rebuilt.is_null(row)).then(|| strings.value(rebuilt.keys().value(row) as usize))
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![Some("aa"), Some("cc"), Some("aa"), None],
+            "remapping the keys must not change what the rows say"
+        );
+    }
+
     /// A batch that retains nothing extra is shared, not copied.
     /// Guard for the `Buffer::has_custom_allocation` patch on our arrow-rs fork
     /// (spiceai/arrow-rs#25, branch `spiceai-58`). See `docs/dev/fork_patches.md`.
@@ -1659,11 +1873,9 @@ mod test {
             .add_buffer(foreign)
             .build()
             .expect("a valid Int64 array");
-        let batch = RecordBatch::try_from_iter(vec![(
-            "v",
-            Arc::new(Int64Array::from(data)) as ArrayRef,
-        )])
-        .expect("a one-column batch");
+        let batch =
+            RecordBatch::try_from_iter(vec![("v", Arc::new(Int64Array::from(data)) as ArrayRef)])
+                .expect("a one-column batch");
 
         let compacted = compact_retained_buffers(&batch);
 
@@ -1741,7 +1953,11 @@ mod test {
             true,
         )])
         .expect("a nullable column with no nulls");
-        assert_eq!(buffers_in_batch(&with_nulls), 2, "values plus a null buffer");
+        assert_eq!(
+            buffers_in_batch(&with_nulls),
+            2,
+            "values plus a null buffer"
+        );
         assert_eq!(
             buffers_in_batch(&no_nulls),
             1,
@@ -1893,8 +2109,15 @@ mod test {
         );
     }
 
-    /// A view nested inside a container cannot be measured or reached by the
-    /// view path, so such a column is left alone rather than copied blindly.
+    /// A sliced view nested inside a container is left alone.
+    ///
+    /// `rebuild_view_leaves` can copy such a column — that is what decouples one
+    /// arriving over Flight — but nothing measures how much a *slice* of it
+    /// retains. `get_slice_memory_size` counts a view's views buffer without the
+    /// data it points into, and `compacted_memory_size` feeds the admission
+    /// pre-check from that estimate, so measuring the container that way would
+    /// under-predict what the entry holds. Until the per-container windowing is
+    /// written, the reclaim is passed up rather than guessed at.
     #[test]
     fn compact_retained_buffers_leaves_a_nested_view_column_alone() {
         let inner: ArrayRef = Arc::new(StringViewArray::from_iter_values(payloads(2_000, 4_096)));
@@ -1915,16 +2138,15 @@ mod test {
 
         assert!(
             Arc::ptr_eq(sliced.column(0), compacted.column(0)),
-            "a nested view column must not be compacted"
+            "a nested view slice must not be compacted while nothing measures it"
         );
     }
 
     /// A `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow, but
     /// arrow's `MutableArrayData` panics building an extend for it. Compaction
-    /// must never reach that path — a cache write is not allowed to abort the
-    /// query that filled it.
+    /// must never reach that path. `rebuild_dictionary` goes nowhere near it.
     #[test]
-    fn compact_retained_buffers_leaves_a_full_range_dictionary_alone() {
+    fn compact_retained_buffers_rebuilds_a_full_range_dictionary() {
         use arrow::array::{DictionaryArray, UInt8Array};
         use arrow::datatypes::UInt8Type;
 
@@ -1934,7 +2156,7 @@ mod test {
                 .collect::<Vec<_>>(),
         );
         // A key buffer far past the reclaim floor, so nothing but the type
-        // check can keep this column away from compaction.
+        // check could keep this column away from compaction.
         let keys = UInt8Array::from(
             (0..200_000)
                 .map(|row| u8::try_from(row % 256).unwrap_or_default())
@@ -1951,15 +2173,50 @@ mod test {
         )]));
         let batch = RecordBatch::try_new(schema, vec![dictionary]).expect("valid batch");
         let sliced = batch.slice(100_000, 1);
+        let expected = logical_value(sliced.column(0));
 
-        // Must not panic, and must hand back the column untouched.
+        // Must not panic — a cache write is not allowed to abort the query that
+        // filled it.
         let compacted = compact_retained_buffers(&sliced);
 
-        assert!(
-            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
-            "a dictionary column must not be compacted"
-        );
         assert_eq!(compacted.num_rows(), 1);
+        assert_eq!(
+            logical_value(compacted.column(0)),
+            expected,
+            "rebuilding the dictionary must not change what the row says"
+        );
+
+        let rebuilt = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("still a dictionary");
+        assert_eq!(
+            rebuilt.values().len(),
+            1,
+            "only the value the surviving key references is kept"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a one-row slice of a 200k-key dictionary must not keep the whole key buffer: {} vs {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// The one string a single-row dictionary column stands for.
+    fn logical_value(column: &ArrayRef) -> String {
+        use arrow::array::{DictionaryArray, cast::AsArray};
+        use arrow::datatypes::UInt8Type;
+
+        let dictionary = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("a dictionary column");
+        let values = dictionary.values().as_string::<i32>();
+        values
+            .value(dictionary.keys().value(0) as usize)
+            .to_string()
     }
 
     /// `MutableArrayData` builds an extend per child, so a dictionary nested in
@@ -2594,4 +2851,3 @@ pub fn buffers_in_batch(batch: &RecordBatch) -> usize {
 
     batch.columns().iter().map(|c| walk(&c.to_data())).sum()
 }
-

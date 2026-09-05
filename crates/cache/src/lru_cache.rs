@@ -657,7 +657,9 @@ mod tests {
         .expect("Failed to create cached result")
     }
 
-    fn cache_intern_schema(schema: arrow::datatypes::SchemaRef) -> crate::intern::Interned<arrow::datatypes::Schema> {
+    fn cache_intern_schema(
+        schema: arrow::datatypes::SchemaRef,
+    ) -> crate::intern::Interned<arrow::datatypes::Schema> {
         crate::intern::schema::intern(schema)
     }
 

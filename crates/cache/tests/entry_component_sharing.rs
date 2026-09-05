@@ -69,7 +69,13 @@ const WIDE_NAME_LEN: usize = 4_000;
 /// without the cache doing anything. See `inputs_start_out_unshared`.
 fn fresh_schema(field_count: usize, name_len: usize) -> SchemaRef {
     let fields: Vec<Field> = (0..field_count)
-        .map(|i| Field::new(format!("{}_{i}", "c".repeat(name_len)), DataType::Int64, true))
+        .map(|i| {
+            Field::new(
+                format!("{}_{i}", "c".repeat(name_len)),
+                DataType::Int64,
+                true,
+            )
+        })
         .collect();
     Arc::new(Schema::new(fields))
 }
@@ -154,10 +160,7 @@ async fn store_entries(
 }
 
 /// Asserts the fixture handed the cache genuinely distinct allocations.
-fn inputs_start_out_unshared(
-    schemas: &[SchemaRef],
-    tables: &[Arc<HashSet<TableReference>>],
-) {
+fn inputs_start_out_unshared(schemas: &[SchemaRef], tables: &[Arc<HashSet<TableReference>>]) {
     for i in 1..schemas.len() {
         assert!(
             !Arc::ptr_eq(&schemas[0], &schemas[i]),
@@ -180,7 +183,8 @@ fn assert_all_share<T>(items: &[Arc<T>], what: &str) {
         ptrs.len()
     };
     assert_eq!(
-        distinct, 1,
+        distinct,
+        1,
         "{} entries over one shape kept {distinct} distinct {what} allocations; \
          the cache should hold one and point every entry at it",
         items.len()

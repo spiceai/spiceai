@@ -200,7 +200,9 @@ mod tests {
     #[test]
     fn the_pool_reports_the_bytes_it_shares() {
         let interner = TableSetInterner::new();
-        let held = interner.intern(set(&["a_table_with_a_reasonably_long_name"])).arc();
+        let held = interner
+            .intern(set(&["a_table_with_a_reasonably_long_name"]))
+            .arc();
         let stats = interner.stats();
         assert_eq!(stats.rows, 1);
         assert_eq!(stats.value_bytes, table_set_deep_size(&held));

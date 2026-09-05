@@ -510,7 +510,9 @@ mod tests {
     #[test]
     fn repeated_interning_collapses_duplicates_into_one_row() {
         let interner = SchemaInterner::new();
-        let held: Vec<SchemaRef> = (0..64).map(|_| interner.intern(schema_of(8)).arc()).collect();
+        let held: Vec<SchemaRef> = (0..64)
+            .map(|_| interner.intern(schema_of(8)).arc())
+            .collect();
 
         let stats = interner.stats();
         assert_eq!(stats.rows, 1, "64 equal schemas occupy one row");

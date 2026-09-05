@@ -227,8 +227,8 @@ impl CachedQueryResult {
                     // ...but not for what each of those buffers costs beyond
                     // the bytes it asked the allocator for. See
                     // `BUFFER_OVERHEAD_BYTES`.
-                    size += BUFFER_OVERHEAD_BYTES
-                        * arrow_tools::record_batch::buffers_in_batch(batch);
+                    size +=
+                        BUFFER_OVERHEAD_BYTES * arrow_tools::record_batch::buffers_in_batch(batch);
                 }
             }
             CachedData::Encoded(bytes) => {
