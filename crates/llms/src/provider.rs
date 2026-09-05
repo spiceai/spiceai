@@ -206,10 +206,14 @@ pub fn classify_openai_compatible_error(error: &OpenAIError, provider: &str) -> 
         // request with a 401 whose entire body is the string `Unauthorized`
         // (`crates/runtime-auth/src/layer/http.rs`), which is not the JSON envelope the client
         // expects. The same variant also carries a *successful* response whose JSON did not
-        // match, and the error cannot tell the two apart — so a body with no recognisable signal
-        // stays a network error rather than being reported as a refusal that may never have
-        // happened.
+        // match, and the error carries no status to tell the two apart — so the message tests
+        // are applied only to a body that is not JSON at all, which is the shape this arm exists
+        // for. A body that *is* JSON may be a models payload, whose model ids and descriptions
+        // are provider data that must not decide the variant; it stays a network error.
         OpenAIError::JSONDeserialize(_, content) => {
+            if is_json(content) {
+                return network_error();
+            }
             return signal_in(content, provider).unwrap_or_else(network_error);
         }
         // Reqwest and client-side argument errors: no answer came back at all.
@@ -274,6 +278,22 @@ fn classify_by_type(api_error: &ApiError, provider: &str) -> Option<ListModelsEr
         }),
         _ => None,
     }
+}
+
+/// Whether `body` is well-formed JSON.
+///
+/// The discriminator for [`classify_openai_compatible_error`]'s
+/// [`OpenAIError::JSONDeserialize`] arm: that variant carries both a refusal whose body is not
+/// the JSON envelope the client expects and a *successful* response whose JSON did not match
+/// `ListModelResponse`, and nothing in the error separates them. A body that parses as JSON may
+/// be the successful one, so its contents — provider-supplied model ids among them — are not read
+/// for auth phrases.
+///
+/// Deserialized into [`serde::de::IgnoredAny`] rather than a `serde_json::Value`: the answer is
+/// whether the bytes parse, and this body is whatever the provider sent, so there is no reason
+/// to materialise a document from it.
+fn is_json(body: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(body).is_ok()
 }
 
 /// The message tests. `None` when the text carries no signal this can name, so each caller decides
@@ -467,6 +487,24 @@ mod tests {
             classify_openai_compatible_error(&error, "test"),
             ListModelsError::NetworkError { .. }
         ));
+    }
+
+    /// A *successful* models response whose payload does not match `ListModelResponse` reaches
+    /// the same variant as a refusal, and the provider's own model ids are in that body. Reading
+    /// them for auth phrases is the caller-data defect of issue #13747 in a second place.
+    #[test]
+    fn a_successful_payload_that_did_not_match_is_not_a_credential_failure() {
+        let body = r#"{"object":"list","data":[{"id":"unauthorized-model"}]}"#;
+        let error = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<async_openai::types::models::ListModelResponse>(body)
+                .expect_err("the payload does not match ListModelResponse"),
+            body.to_string(),
+        );
+        let classified = classify_openai_compatible_error(&error, "test");
+        assert!(
+            matches!(classified, ListModelsError::NetworkError { .. }),
+            "a 200 models payload was reported as a refusal: {classified}"
+        );
     }
 
     /// `async-openai` builds an all-`None` `ApiError` for a 5xx, whose body it does not parse. The
