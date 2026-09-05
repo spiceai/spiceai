@@ -507,7 +507,7 @@ lto = "off"
 adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" } # branch: spiceai (fork PR #4)
 adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" }
 adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "34a465e97fb529075f953adf40bc2e02de755bec" }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "39f73f4e8f631aba98532ae82d26315caf3dce22" } # branch: spiceai-54 (merged PRs #216, #218)
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "39f73f4e8f631aba98532ae82d26315caf3dce22" } # branch: spiceai-54 (the spiceai/datafusion#218 merge commit, which contains #216)
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "39f73f4e8f631aba98532ae82d26315caf3dce22" }
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "39f73f4e8f631aba98532ae82d26315caf3dce22" }
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "39f73f4e8f631aba98532ae82d26315caf3dce22" }

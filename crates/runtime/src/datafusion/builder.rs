@@ -2021,9 +2021,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// The JSON extraction semantics the BigQuery federation guidance rests on.
+    /// The JSON extraction semantics the `BigQuery` federation guidance rests on.
     ///
-    /// Which of these forms pushes down to BigQuery is decided by the federation
+    /// Which of these forms pushes down to `BigQuery` is decided by the federation
     /// deny-list, and the advice we give a customer follows from what each one
     /// *means*:
     ///
@@ -2044,7 +2044,7 @@ mod tests {
     /// would silently start returning NULL where it used to return digits, so it
     /// is pinned here rather than left to the crate.
     ///
-    /// `json_as_text` cannot be federated to BigQuery at all: no BigQuery
+    /// `json_as_text` cannot be federated to `BigQuery` at all: no `BigQuery`
     /// function returns a container node's *original* bytes — `JSON_QUERY`
     /// re-renders it — so there is no faithful rendering to push down.
     #[cfg(not(windows))]
@@ -2107,7 +2107,7 @@ mod tests {
     /// That is why the guidance can offer the cast form as an alternative to
     /// editing every call: `CAST(… AS VARCHAR)` becomes `json_get_str`,
     /// `AS BIGINT` becomes `json_get_int`, `AS DOUBLE` becomes `json_get_float`
-    /// — and those are the names the BigQuery deny-list carves out, so the
+    /// — and those are the names the `BigQuery` deny-list carves out, so the
     /// statement pushes down. A bare `json_get` stays a JSON union with no SQL
     /// type to unparse into, and stays local.
     ///
@@ -2511,6 +2511,73 @@ mod tests {
                 .optimizer
                 .hash_join_inlist_pushdown_max_size,
             "A larger runtime query memory limit should not raise DataFusion's configured hash join in-list cap"
+        );
+    }
+
+    /// The built session keeps the **built-in** `date_trunc`, not Spark's.
+    ///
+    /// Spark's `date_trunc` accepts only a string as the value to truncate. If
+    /// `datafusion_spark::register_all` were allowed to register it over the
+    /// built-in, `date_trunc(<unit>, <date>)` would stop planning at all, and a
+    /// federated filter comparing a timestamp against one would lose the type
+    /// its comparison needs and reach `BigQuery` as a pair it refuses.
+    ///
+    /// This goes through `DataFusionBuilder::build` rather than a hand-built
+    /// `SessionState`, because the thing that can regress is the registration
+    /// loop's skip: a test that registers its own functions would still pass
+    /// with the skip deleted.
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_keeps_the_built_in_date_trunc() {
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+
+        // A date argument is what Spark's overload cannot take, so this is the
+        // call that stops planning if the built-in is shadowed.
+        let over_a_date = df
+            .ctx
+            .sql("SELECT date_trunc('month', DATE '2024-03-17') AS m")
+            .await
+            .and_then(|frame| frame.into_optimized_plan());
+        assert!(
+            over_a_date.is_ok(),
+            "date_trunc over a date must stay plannable, or a federated \
+             comparison against it is pushed down untyped: {:?}",
+            over_a_date.err()
+        );
+
+        // The truncation a BigQuery filter compares against is over a
+        // timestamp, and both overloads accept one — so this asserts the answer,
+        // which is what a silently swapped implementation would change.
+        let over_a_timestamp = df
+            .ctx
+            .sql("SELECT date_trunc('month', TIMESTAMP '2024-03-17T12:34:56') AS m")
+            .await
+            .expect("plan the timestamp truncation")
+            .collect()
+            .await
+            .expect("run the timestamp truncation");
+        let rendered = arrow::util::pretty::pretty_format_batches(&over_a_timestamp)
+            .expect("format the truncation")
+            .to_string();
+        assert!(
+            rendered.contains("2024-03-01T00:00:00"),
+            "date_trunc must truncate to the month, got {rendered}"
+        );
+
+        // Spark's *other* functions must still be there — the skip is meant to
+        // be two names, not a disabled registration.
+        assert!(
+            df.ctx
+                .state()
+                .scalar_functions()
+                .contains_key("array_append"),
+            "only `trunc` and `date_trunc` are skipped; the rest of the Spark \
+             functions must still register"
         );
     }
 

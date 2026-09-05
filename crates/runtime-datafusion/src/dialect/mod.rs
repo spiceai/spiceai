@@ -222,7 +222,7 @@ pub fn bigquery_can_translate_aggregate(call: &AggregateFunction) -> bool {
 /// Whether the `BigQuery` dialect can translate this particular window call.
 ///
 /// A `FILTER` on a window call reaches no rewriting at all, so it renders
-/// verbatim into SQL BigQuery refuses. The deny-list installs this so the window
+/// verbatim into SQL `BigQuery` refuses. The deny-list installs this so the window
 /// evaluates locally instead.
 #[must_use]
 pub fn bigquery_can_translate_window(call: &WindowFunction) -> bool {

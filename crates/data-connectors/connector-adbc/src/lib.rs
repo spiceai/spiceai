@@ -2911,21 +2911,22 @@ mod function_support_tests {
         )
     }
 
-    /// BigQuery refuses exactly the filtered-aggregate shapes its dialect cannot
+    /// `BigQuery` refuses exactly the filtered-aggregate shapes its dialect cannot
     /// rewrite, and keeps the rest.
     ///
     /// This tests the **boundary** rather than a fixed list, because the two
     /// sides live in different repositories and the set has moved more than
-    /// once. The dialect (fork PR #218) rewrites a `FILTER` into `COUNTIF` or
-    /// `CASE WHEN p THEN arg END`, which is exact only for an aggregate that
-    /// skips nulls and ignores input order — `count`, `sum`, `min`, `max`,
-    /// `avg` — and declines anything else. A declined rendering is a *failed
+    /// once. The dialect (spiceai/datafusion#218) rewrites a `FILTER` into
+    /// `COUNTIF` or `CASE WHEN p THEN arg END`, which is exact only for an
+    /// aggregate that skips nulls and ignores input order — `count`, `sum`,
+    /// `min`, `max`, `avg`, `bit_and`, `bit_or` and `bit_xor` — and declines
+    /// anything else. A declined rendering is a *failed
     /// query* unless federation refuses the same shape, since a federated
     /// statement has no local-execution fallback. So:
     ///
     /// * just inside the allowlist still federates — refusing it would cost the
     ///   pushdown for nothing;
-    /// * just outside it does not — federating it would reach BigQuery as SQL it
+    /// * just outside it does not — federating it would reach `BigQuery` as SQL it
     ///   cannot parse.
     ///
     /// This is the repo-side guard for `with_aggregate_call_support`, the hook
@@ -2964,6 +2965,18 @@ mod function_support_tests {
             (
                 "avg",
                 datafusion::functions_aggregate::expr_fn::avg(col("id")),
+            ),
+            (
+                "bit_and",
+                datafusion::functions_aggregate::expr_fn::bit_and(col("id")),
+            ),
+            (
+                "bit_or",
+                datafusion::functions_aggregate::expr_fn::bit_or(col("id")),
+            ),
+            (
+                "bit_xor",
+                datafusion::functions_aggregate::expr_fn::bit_xor(col("id")),
             ),
         ] {
             let filtered = aggregate
@@ -3013,7 +3026,7 @@ mod function_support_tests {
     /// refused too — otherwise the aggregate check above is trivially bypassed
     /// by spelling the same thing `COUNT(x) FILTER (…) OVER (…)`.
     ///
-    /// Measured against a real BigQuery project:
+    /// Measured against a real `BigQuery` project:
     /// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federated
     /// as written and came back `Syntax error: Expected ")" but got "("`. This
     /// is the repo-side guard for `with_window_call_support`.

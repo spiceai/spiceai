@@ -200,7 +200,7 @@ fn json_path_is_renderable(args: &[Expr]) -> bool {
 /// The aggregates whose `FILTER` the `BigQuery` dialect rewrites exactly.
 ///
 /// Mirrors `filter_rewrite_is_exact` in the fork's unparser, and has to stay
-/// equal to it — the bitwise three are on it because BigQuery spells them under
+/// equal to it — the bitwise three are on it because `BigQuery` spells them under
 /// the same names, so they federate; `bool_and`/`bool_or` are not, because it
 /// spells those `LOGICAL_AND`/`LOGICAL_OR` and they never federate at all: the dialect declines what this list omits, and a declined
 /// rendering is a *failed query* unless federation also refuses it, since a
@@ -214,22 +214,22 @@ const FILTER_REWRITE_IS_EXACT: &[&str] = &[
 /// Whether the `BigQuery` dialect can translate this particular *aggregate*
 /// call, given the `FILTER` it carries.
 ///
-/// BigQuery has no `FILTER (WHERE …)` clause — measured, `COUNT(*) FILTER
+/// `BigQuery` has no `FILTER (WHERE …)` clause — measured, `COUNT(*) FILTER
 /// (WHERE x > 1)` is a syntax error — so the dialect moves the predicate inside
 /// the aggregate as `COUNTIF(p)` or `CASE WHEN p THEN arg END`. That is exact
 /// only for an aggregate that both skips null inputs and ignores input order,
 /// which is what [`FILTER_REWRITE_IS_EXACT`] lists; the dialect declines
 /// anything else, and this refuses the same set so it evaluates locally instead
-/// of reaching BigQuery as SQL it cannot parse.
+/// of reaching `BigQuery` as SQL it cannot parse.
 ///
 /// `array_agg` is the one that matters in practice: the `CASE` gives it an
-/// element for every *rejected* row, and BigQuery will not build an array
+/// element for every *rejected* row, and `BigQuery` will not build an array
 /// holding a null at all, so the rewrite fails for any filter that actually
-/// filters — where DataFusion answers `[2, 3]`.
+/// filters — where `DataFusion` answers `[2, 3]`.
 ///
 /// Note what is *not* refused. `COUNT(NULL) FILTER (…)` renders correctly as
 /// `COUNT(CASE WHEN p THEN NULL END)`, which is 0 exactly as `COUNT(NULL)` is —
-/// verified on BigQuery — so refusing it would only cost the pushdown. Nor is an
+/// verified on `BigQuery` — so refusing it would only cost the pushdown. Nor is an
 /// ordering refused on its own: every aggregate on the list ignores input order,
 /// so an ordered `SUM … FILTER` still rewrites.
 #[must_use]
@@ -253,7 +253,7 @@ pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
 ///
 /// A `FILTER` on a window call has no rewriting at all — the dialect's
 /// aggregate handling is not reached for one — so it renders verbatim and
-/// BigQuery refuses the statement. Measured through the runtime:
+/// `BigQuery` refuses the statement. Measured through the runtime:
 /// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federates and
 /// comes back `Syntax error: Expected ")" but got "("`.
 ///
@@ -2692,11 +2692,11 @@ mod tests {
                 .build()
                 .expect("filtered count of null"),
         );
-        // The rewriting carries no ordering. For an order-sensitive aggregate
-        // that is a wrong answer, so it declines; for a sum the same rows give
-        // the same number in any order, so it still federates. Both directions
-        // are guarded, because declining everything ordered failed queries that
-        // were correct.
+        // What decides a filtered aggregate is the allowlist, not the ordering:
+        // every name on the list is order-insensitive, so the rewriting may drop
+        // an ORDER BY safely, and every name off it declines whether ordered or
+        // not. Both directions are guarded, because an earlier decline keyed on
+        // the ordering instead failed queries that were correct.
         let ordered_filtered_array_agg = filtered(
             datafusion::functions_aggregate::expr_fn::array_agg(col("t.v"))
                 .filter(keeps_rows.clone())
@@ -2717,6 +2717,18 @@ mod tests {
                 .build()
                 .expect("ordered filtered sum"),
         );
+
+        // The same overflow in a `Decimal256`, where the scale is small and the
+        // *precision* is what exceeds `NUMERIC`. Selecting on scale alone would
+        // render `NUMERIC` and lose every value past 29 integer digits.
+        let wide_precision = timestamp_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                lit(1.5_f64),
+                DataType::Decimal256(76, 2),
+            )])
+            .expect("wide precision projection")
+            .build()
+            .expect("build");
 
         // A scale wider than BIGNUMERIC's thirty-eight is *rounded away
         // silently* by BigQuery, unlike an integer overflow, which it refuses
@@ -2917,8 +2929,10 @@ mod tests {
                 "COUNTIF(",
             ),
             (
-                // Order-sensitive: the rewriting carries no ordering, so applying
-                // it here would answer differently rather than fail.
+                // Declined for being off the allowlist, exactly as the unordered
+                // one above is — the ORDER BY changes nothing. Guarded so that
+                // relaxing the ordering rule cannot quietly let `array_agg`
+                // through, which is the rewriting BigQuery refuses to build.
                 "an ordered filtered array_agg is declined (fork PR #218)",
                 &ordered_filtered_array_agg,
                 "FILTER",
@@ -2954,6 +2968,15 @@ mod tests {
                 &wide_scale,
                 "AS BIGNUMERIC)",
                 "DECIMAL(",
+            ),
+            (
+                // `Decimal256(76, 2)` is 74 integer digits at scale 2: the scale
+                // fits `NUMERIC` and the precision does not, so this is the arm
+                // that fails if the selector ever reads scale alone.
+                "a wide-precision Decimal256 still widens (fork PR #218)",
+                &wide_precision,
+                "AS BIGNUMERIC)",
+                "AS NUMERIC)",
             ),
             (
                 // `NUMERIC` holds 29 integer digits; a value needing a thirtieth
