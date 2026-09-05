@@ -3,8 +3,9 @@
 Captured on this box against the workspace DataFusion fork
 (`spiceai-54` @ `6006901cb602d845ee1441269d6eaa142c2580a6`, merged
 [spiceai/datafusion#215](https://github.com/spiceai/datafusion/pull/215))
-after harness compare lifts for the 11 known-fail cosmetics and
-quoted-empty `""` decode (q17).
+after harness compare lifts for the 11 known-fail cosmetics,
+quoted-empty `""` decode (q17), and the printed-scale / short-row
+compare tighten (PASS count unchanged).
 
 Re-run the command below to regenerate `results/mode-a-tpch.json`
 (gitignored; CI uploads it as an artifact).
@@ -18,7 +19,7 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 | spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-05T04:25:41Z → 04:25:45Z |
+| Run | 2026-09-05T04:44:27Z → 04:44:31Z |
 
 ## Counts
 
@@ -44,7 +45,7 @@ cargo run -p spice-substrait-compliance -- \
   --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
 
 DataFusion fork rev: 6006901cb602d845ee1441269d6eaa142c2580a6
-  FAIL  q01  (cell (2,2) '742308.00' != '742802.0')
+  FAIL  q01  (cell (0,6) '25.575154' != '25.575154611454693')
   PASS  q02
   PASS  q03
   PASS  q04
@@ -92,7 +93,7 @@ row-count misses and do not treat `string` as `integer`.
 
 | Query | Before | After | Notes |
 |-------|--------|-------|-------|
-| q01 | FAIL (`COUNT` `bigint` vs `integer`) | **FAIL** (stayed) | Type lift applied; values do **not** match. After cosmetics, cell `(2,2)` `SUM_QTY` is `742308.00` vs golden `742802.0` (N/O group, Δ = 494). Real miss — not a compare soften. |
+| q01 | FAIL (`COUNT` `bigint` vs `integer`) | **FAIL** (stayed) | Type lift applied; values do **not** match. First mismatch is now cell `(0,6)` `AVG_QTY` `25.575154` vs golden `25.575154611454693` (IBM types the column `double`; printed-scale ULP no longer applies). A prior run with printed-scale on reported cell `(2,2)` `SUM_QTY` `742308.00` vs `742802.0` (N/O group, Δ = 494) — also a real miss, not re-observed here because compare stops at the first cell. |
 | q02 | FAIL (`CHAR` pad) | **PASS** | Leading-space trim |
 | q04 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
 | q06 | FAIL (ε 1.16e-9) | **PASS** | abs ε `1e-8` |
@@ -107,7 +108,7 @@ row-count misses and do not treat `string` as `integer`.
 
 **Flipped to PASS (11):** q02, q04, q06, q10, q11, q12, q13, q15, q16, q17, q18.
 
-**Stayed FAIL (1):** q01 — `SUM_QTY` 742308.00 vs 742802.0 on the N/O group.
+**Stayed FAIL (1):** q01 — first cell `(0,6)` `AVG_QTY` `25.575154` vs `25.575154611454693`. PASS count unchanged.
 
 ## Must-fix FAIL (2) — not softened
 
@@ -132,7 +133,7 @@ Leave for a separate DataFusion fork fix. Do not fake PASS.
 
 | Query | Status | Notes |
 |-------|--------|-------|
-| q01 | FAIL | `SUM_QTY` `742308.00` vs `742802.0` (N/O group) |
+| q01 | FAIL | `AVG_QTY` `25.575154` vs `25.575154611454693` (cell `(0,6)`) |
 | q02 | **PASS** | known-fail flip (`CHAR` pad) |
 | q03 | **PASS** | unchanged |
 | q04 | **PASS** | known-fail flip (`COUNT` width) |
@@ -166,7 +167,7 @@ Previously PASS and still PASS (5): q03, q05, q14, q19, q20.
 | Group | Count | Queries | Meaning |
 |-------|-------|---------|---------|
 | Non-value function argument | 3 | q07, q08, q09 | Consumer gap (`from_substrait_plan`); plan never executes |
-| Real `SUM_QTY` miss | 1 | q01 | N/O group 742308 vs 742802 after `COUNT`-width lift |
+| `AVG_QTY` scale-6 vs `double` | 1 | q01 | First cell `(0,6)` after printed-scale removal; prior run also had `SUM_QTY` 742308 vs 742802 |
 | Empty result | 1 | q21 | Plan executes; 0 rows vs 1 golden row |
 | Type mismatch (`string` vs `integer`) | 1 | q22 | `substring:fchar` vs golden `integer` |
 | Pass | 16 | q02–q06, q10–q20 | Values match after documented compare lifts |
