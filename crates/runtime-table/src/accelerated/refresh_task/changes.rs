@@ -7802,10 +7802,16 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
-        // `Refresh::default()` carries `RefreshMode::Full`; a changes-mode dataset
-        // would carry `Changes` here and `rebuild_from_source` overrides it to
-        // `Full` either way, which is what produces the `mode` label below.
-        let refresh = Arc::new(RwLock::new(Refresh::default()));
+        // Seated at `Changes`, the mode a dataset on this path actually carries.
+        // `Refresh::default()` is `Full`, and starting there would leave the test
+        // green even with `rebuild_from_source`'s `Changes` -> `Full` override
+        // deleted — while production would reach `run_once`'s
+        // `RefreshMode::Changes => unreachable!` instead. The override is the link
+        // under test, so the fixture has to make its absence observable.
+        let refresh = Arc::new(RwLock::new(Refresh {
+            mode: RefreshMode::Changes,
+            ..Refresh::default()
+        }));
         let mut context = ApplyContext {
             refresh_sql: None,
             refresh: &refresh,

@@ -2637,10 +2637,12 @@ async fn attach_member(
         Box::pin(signal.chain(live_flip_hook(source, &member_key)))
     } else if snapshotting {
         // Reading a whole table is the most expensive thing an acceleration does,
-        // and the metrics only say that it happened and how long it took — this
-        // line is the only place the operator is told which of the several
-        // conditions asked for it, so it names the one that fired rather than
-        // leaving them to infer it from the slot and publication state.
+        // and on this path the metrics say the least: the bootstrap counters
+        // report rows and completion but never a duration (only a rebuild runs
+        // through the timed refresh path), and none of them say why the read is
+        // happening. So this line is the operator's whole account of it, and it
+        // names the condition that fired rather than leaving them to infer it
+        // from the slot and publication state.
         // `snapshotting` implies a cause, so the `if let` never falls through.
         if let Some(cause) = creation_cause {
             tracing::info!(

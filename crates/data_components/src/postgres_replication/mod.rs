@@ -608,8 +608,14 @@ pub fn creation_log_message(dataset: &str, cause: CreationCause) -> String {
 ///
 /// Reported in the log and not as a metric label, for the reason spelled out on
 /// [`RebuildCause`]: creating an acceleration is an event rather than a rate, so
-/// the cause belongs in the sentence an operator reads and the metrics carry only
-/// what the sentence cannot — how long the read took, and how much it moved.
+/// the cause belongs in the sentence an operator reads.
+///
+/// Note the metrics are thinner here than on the rebuild path. A creation is read
+/// by the connector as the slot's initial snapshot, which reports its progress
+/// (`bootstrap_rows_total`, `bootstrap_rows_expected`, `bootstrap_complete`) but
+/// is never timed: only a rebuild runs through `RefreshTask::run` and lands on
+/// `dataset_acceleration_refresh_duration_ms`. So for a creation this log line is
+/// the whole account of why it happened, and there is no duration beside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreationCause {
     /// The acceleration does not survive a restart, so it starts empty and only
