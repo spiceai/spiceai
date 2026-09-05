@@ -376,12 +376,17 @@ impl VectorRejection {
 /// Whether a vector can be indexed, by the one criterion [`keys_to_evict`] states: it must
 /// have a defined direction under the metrics the index offers.
 ///
-/// Every vector write path classifies through this rather than spelling the test itself.
-/// The three paths did spell it separately, and two of the three carried only the
+/// The three write paths that participate in [`keys_to_evict`] — Elasticsearch, the
+/// in-memory index, and S3 Vectors — classify through this rather than spelling the test
+/// themselves. They did spell it separately, and two of the three carried only the
 /// [`VectorRejection::NoDirection`] limb — so a *partially* non-finite vector (`[1.0, NaN]`,
 /// `[0.0, Inf]`) was stored as if it were indexable and, being no rejection, evicted
 /// nothing (#13872). `Inf` is neither `== 0.0` nor `is_nan()`, so it does not merely escape
 /// the narrow limb, it actively prevents it from matching.
+///
+/// **Not every vector write reaches this.** The DuckDB vector index applies no criterion at
+/// all, and `PutVectors`' DataFusion sink spells its own — see #13901. Do not read a call to
+/// this as a guarantee that some other path enforced it.
 ///
 /// `NoDirection` is tested first so that a vector which is both — `[NaN, NaN]` — is
 /// reported under the more specific of the two, which is what the paths counting the
@@ -400,9 +405,10 @@ pub fn classify_vector(vector: &[f32]) -> Option<VectorRejection> {
 /// The vector shapes no index may store, as `dims`-component vectors paired with the
 /// rejection each must classify as.
 ///
-/// Shared by the classifier's own test and by every backend's guard, so a backend cannot
-/// come to cover a narrower set than the criterion does — which is the shape of #13872,
-/// where two of three backends carried only the [`VectorRejection::NoDirection`] limb.
+/// Shared by the classifier's own test and by the guard of each backend that classifies
+/// through it, so one of them cannot come to cover a narrower set than the criterion does —
+/// which is the shape of #13872, where two of the three carried only the
+/// [`VectorRejection::NoDirection`] limb.
 /// `dims` must be at least 2, since the partially non-finite shapes need a finite
 /// component to sit beside the non-finite one.
 #[cfg(test)]
