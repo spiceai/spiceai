@@ -546,6 +546,24 @@ mod tests {
             pretty_format_batches(&case_result)?
         );
 
+        // A CASE whose WHEN uses `~` (RegexMatch) is list-typed when both branches
+        // are lists, but convert() rejects RegexMatch. Use a pattern DataFusion
+        // does not fold to `id = …`, so the physical plan still carries RegexMatch.
+        // The query must still plan and run by keeping `array_length` above the scan.
+        let regex_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN CAST(id AS VARCHAR) ~ '^[0-9]+$' THEN a ELSE b END) >= 2 \
+            ORDER BY id";
+        let regex_plan = physical_plan_display(&ctx.session, regex_query).await?;
+        assert!(
+            regex_plan.contains("FilterExec"),
+            "array_length(CASE with RegexMatch WHEN) must stay above the scan, got plan:\n{regex_plan}"
+        );
+        let regex_result = ctx.session.sql(regex_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_regex_when_result",
+            pretty_format_batches(&regex_result)?
+        );
+
         // `array_length(a, 2)` has multidimensional semantics that `list_length` does
         // not model, so it must stay in a FilterExec above the scan.
         let dim2_query = "SELECT id FROM list_test WHERE array_length(a, 2) >= 4 ORDER BY id";

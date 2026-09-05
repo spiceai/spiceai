@@ -544,8 +544,17 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
 fn is_convertible_expr(df_expr: &Arc<dyn PhysicalExpr>) -> bool {
     let expr = df_expr;
 
-    // Expression types that convert() handles
-    expr.downcast_ref::<df_expr::BinaryExpr>().is_some()
+    // Expression types that convert() handles. BinaryExpr must also have a
+    // Vortex-supported operator and convertible children: convert() rejects
+    // RegexMatch and similar ops, so accepting any BinaryExpr here would let
+    // array_length(CASE WHEN col ~ 'p' THEN a ELSE b END) pass the pushdown
+    // gate and then fail at scan planning.
+    expr.downcast_ref::<df_expr::BinaryExpr>()
+        .is_some_and(|binary| {
+            try_operator_from_df(*binary.op()).is_ok()
+                && is_convertible_expr(binary.left())
+                && is_convertible_expr(binary.right())
+        })
         || expr.downcast_ref::<df_expr::Column>().is_some()
         || expr.downcast_ref::<df_expr::LikeExpr>().is_some()
         || expr
@@ -1559,6 +1568,40 @@ mod tests {
         assert!(
             !can_be_pushed_down_impl(&array_length, &test_schema),
             "array_length over a CASE of list literals must not be accepted for pushdown"
+        );
+    }
+
+    #[rstest]
+    fn test_array_length_case_with_regex_when_not_pushed_down(test_schema: Schema) {
+        // `CASE WHEN CAST(id AS VARCHAR) ~ '^1$' THEN tags ELSE unsupported_list END`
+        // is list-typed. convert() rejects RegexMatch, so the pushdown gate must
+        // decline this CASE and leave array_length above the scan.
+        let id = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let cast_id = Arc::new(df_expr::CastExpr::new(id, DataType::Utf8, None));
+        let pattern = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "^1$".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let regex_when = Arc::new(df_expr::BinaryExpr::new(
+            cast_id,
+            DFOperator::RegexMatch,
+            pattern,
+        )) as Arc<dyn PhysicalExpr>;
+        let then_list = Arc::new(df_expr::Column::new("tags", 6)) as Arc<dyn PhysicalExpr>;
+        let else_list =
+            Arc::new(df_expr::Column::new("unsupported_list", 5)) as Arc<dyn PhysicalExpr>;
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, vec![(regex_when, then_list)], Some(else_list))
+                .expect("CASE with regex WHEN should build"),
+        ) as Arc<dyn PhysicalExpr>;
+
+        DefaultExpressionConvertor::default()
+            .convert(case_expr.as_ref())
+            .expect_err("RegexMatch WHEN must not convert to a Vortex expression");
+
+        let array_length = array_length_expr(vec![case_expr], &test_schema);
+        assert!(
+            !can_be_pushed_down_impl(&array_length, &test_schema),
+            "array_length over a CASE with RegexMatch WHEN must not be accepted for pushdown"
         );
     }
 
