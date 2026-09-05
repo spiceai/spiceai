@@ -110,7 +110,7 @@ mod tests {
     }
 
     /// `with_connection_setup_queries` replaces the whole list, so the pin has to append to
-    /// what a caller already set rather than dropping it — `search`'s DuckDB index relies on a
+    /// what a caller already set rather than dropping it — `search`'s `DuckDB` index relies on a
     /// `LOAD vss` setup query, and losing one would be silent.
     #[test]
     fn the_pin_keeps_the_setup_queries_already_on_the_pool() {
