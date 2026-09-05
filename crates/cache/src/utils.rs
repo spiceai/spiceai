@@ -172,23 +172,21 @@ pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
     true
 }
 
-/// Whether an in-memory results-cache entry over `batches` could be bounded by
+/// Whether an in-memory results-cache entry over `batches` can be bounded by
 /// the configured `max_size`.
+///
+/// Expects batches [`arrow_tools::record_batch::compact_retained_buffers`] has
+/// already been over — it asks what the copy achieved, rather than predicting it
+/// from the column types. Anything still resting on the producer's memory is a
+/// copy that did not decouple, and an entry over it would be billed for the
+/// buffers it declares while pinning the producer's whole chunk.
 ///
 /// Deliberately separate from [`batches_cacheable`], which answers a different
 /// question — whether the *origin* produced a result worth storing — and whose
 /// callers treat `false` as a failing origin and keep serving what is cached. A
 /// batch declined here is a perfectly good result; it just cannot be held in a
-/// budgeted cache.
-///
-/// A batch resting on memory it does not own is copied on the way in, so the
-/// entry stops pinning the producer's chunk and can be billed for what it holds.
-/// A dictionary below the top level cannot be copied off it — `MutableArrayData`
-/// builds an extend per child and panics on one whose value count does not fit
-/// its key type — so storing such a result would put memory in the cache that
-/// `max_size` cannot see. Declining is the conservative half of that trade: a
-/// repeat query re-executes, where the alternative is a budget that does not
-/// hold.
+/// budgeted cache. Declining is the conservative half of that trade: a repeat
+/// query re-executes, where the alternative is a budget that does not hold.
 ///
 /// There is deliberately no log here: this runs once per storable result, which
 /// is as often as the runtime answers a query.
@@ -196,7 +194,7 @@ pub fn batches_cacheable(batches: &[RecordBatch]) -> bool {
 pub fn batches_boundable(batches: &[RecordBatch]) -> bool {
     !batches
         .iter()
-        .any(arrow_tools::record_batch::has_unbounded_foreign_column)
+        .any(arrow_tools::record_batch::rests_on_unowned_memory)
 }
 
 /// How much larger than the cache limit a raw result may grow while
@@ -378,17 +376,21 @@ pub(crate) mod tests {
     /// Every buffer an IPC decode produces is a slice of the gRPC frame's
     /// `Bytes` — the construction `flight_data_to_arrow_batch` performs on a
     /// `FlightData` body — so a `Struct<Utf8View>` from a Flight source rests on
-    /// memory the runtime does not own. Before `rebuild_view_leaves` the write
-    /// path could not copy it off and declined the result outright, so such a
-    /// source never cached anything.
+    /// memory the runtime does not own. Before `rebuild_view_leaves` and
+    /// `rebuild_dictionary_leaves` the write path could not copy either off and
+    /// declined the result outright, so such a source never cached anything.
+    ///
+    /// The two are rebuilt on opposite sides of the `MutableArrayData` copy, so
+    /// a column holding both is the case that catches dropping either pass.
     #[test]
-    fn a_nested_view_decoded_over_ipc_is_copied_rather_than_declined() {
+    fn a_nested_view_and_dictionary_decoded_over_ipc_are_copied_rather_than_declined() {
         use arrow::array::{
-            Array, ArrayRef, ListArray, StringViewArray, StructArray, cast::AsArray,
+            Array, ArrayRef, DictionaryArray, ListArray, StringViewArray, StructArray,
+            cast::AsArray,
         };
         use arrow::buffer::Buffer;
         use arrow::buffer::OffsetBuffer;
-        use arrow::datatypes::{DataType, Field, Fields};
+        use arrow::datatypes::{DataType, Field, Fields, Int32Type};
         use arrow::ipc::reader::StreamDecoder;
         use arrow::ipc::writer::StreamWriter;
         use std::sync::Arc;
@@ -413,8 +415,21 @@ pub(crate) mod tests {
             "a considerably longer string that will not fit inline at all".to_string(),
         ];
         let nested: ArrayRef = Arc::new(StructArray::new(
-            Fields::from(vec![Field::new("s", DataType::Utf8View, false)]),
-            vec![Arc::new(StringViewArray::from(rows.clone())) as ArrayRef],
+            Fields::from(vec![
+                Field::new("s", DataType::Utf8View, false),
+                Field::new_dictionary("d", DataType::Int32, DataType::Utf8, false),
+            ]),
+            vec![
+                Arc::new(StringViewArray::from(rows.clone())) as ArrayRef,
+                // A dictionary below the top level, which `MutableArrayData`
+                // shares rather than narrows: it needs the pre-pass, where the
+                // view beside it needs the pass after the copy.
+                Arc::new(
+                    rows.iter()
+                        .map(|row| Some(row.as_str()))
+                        .collect::<DictionaryArray<Int32Type>>(),
+                ) as ArrayRef,
+            ],
             None,
         ));
         // A list carries offsets, which the copy has to rebase — get that wrong
@@ -445,9 +460,11 @@ pub(crate) mod tests {
             decoded.columns().iter().all(foreign),
             "the fixture must actually rest on the decoded frame, or this proves nothing"
         );
-        assert!(batches_boundable(std::slice::from_ref(&decoded)));
-
         let stored = arrow_tools::record_batch::compact_retained_buffers(&decoded);
+        assert!(
+            batches_boundable(std::slice::from_ref(&stored)),
+            "the copy must decouple the batch, or the write path declines the result"
+        );
         assert!(
             !stored.columns().iter().any(foreign),
             "the stored batch must not keep the decoded frame alive, or `max_size` \
@@ -465,6 +482,17 @@ pub(crate) mod tests {
             rows,
             "copying a nested view must not change what the rows say"
         );
+        let nested_dictionary = stored.column(0).as_struct().column(1);
+        assert_eq!(
+            (0..nested_dictionary.len())
+                .map(
+                    |row| arrow::util::display::array_value_to_string(nested_dictionary, row)
+                        .expect("a displayable value")
+                )
+                .collect::<Vec<_>>(),
+            rows,
+            "rebuilding a nested dictionary must not change what the rows say"
+        );
         let list = stored.column(1).as_list::<i32>();
         assert_eq!(
             (0..list.len())
@@ -475,101 +503,63 @@ pub(crate) mod tests {
         );
     }
 
-    /// A batch the cache cannot bound must not be stored.
+    /// A batch still resting on the producer's memory must not be stored.
     ///
-    /// `compact_retained_buffers` copies a foreign-backed column so the entry
-    /// stops pinning the producer's allocation. A dictionary below the top level
-    /// cannot be copied off it: `MutableArrayData` builds an extend per child
-    /// and panics on one whose value count does not fit its key type, so it
-    /// cannot be run over the container at all. Such a column is therefore
-    /// neither copied nor billed, which is the one case where `max_size` would
-    /// still not bound what the cache holds, so the write path declines it.
+    /// The guard behind [`batches_boundable`], exercised on a batch that has not
+    /// been through `compact_retained_buffers` — which stands in for the case it
+    /// exists to catch: a copy that ran and did not decouple. No arrow type is
+    /// known to do that today, since a dictionary-bearing container goes through
+    /// `take` and every other copy is a `MutableArrayData` extend that exists for
+    /// every type. That is exactly why the check observes the batch instead of
+    /// enumerating types: what a kernel shares is arrow's to change, and a list
+    /// of types would be wrong silently, billing an entry for the buffers it
+    /// declares while it pins the producer's whole chunk.
     #[test]
-    fn a_result_that_cannot_be_bounded_is_not_cacheable() {
-        use arrow::array::{
-            ArrayData, ArrayRef, DictionaryArray, Int32Array, StringArray, make_array,
-        };
+    fn a_batch_still_resting_on_the_producers_memory_is_not_cacheable() {
+        use arrow::array::{ArrayData, ArrayRef, Int32Array, make_array};
         use arrow::buffer::Buffer;
-        use arrow::datatypes::{DataType, Field, Int32Type};
+        use arrow::datatypes::DataType;
         use std::sync::Arc;
 
-        fn foreign(bytes: Vec<u8>) -> Buffer {
-            let backing: Arc<Vec<u8>> = Arc::new(bytes);
-            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
-            // SAFETY: `backing` is kept alive by the `Allocation` handed to the
-            // buffer, and is never mutated.
-            unsafe {
-                Buffer::from_custom_allocation(
-                    ptr,
-                    backing.len(),
-                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
-                )
-            }
-        }
-
-        let values = ArrayData::builder(DataType::Utf8)
-            .len(1)
-            .add_buffer(foreign(
-                [0_i32, 1].iter().flat_map(|o| o.to_le_bytes()).collect(),
-            ))
-            .add_buffer(foreign(b"a".to_vec()))
-            .build()
-            .expect("a valid Utf8 array");
-        let dictionary_child = ArrayData::builder(DataType::Dictionary(
-            Box::new(DataType::Int32),
-            Box::new(DataType::Utf8),
-        ))
-        .len(4)
-        .add_buffer(foreign(0_i32.to_le_bytes().repeat(4)))
-        .add_child_data(values)
-        .build()
-        .expect("a valid dictionary");
-        let nested = make_array(
-            ArrayData::builder(DataType::Struct(
-                vec![Field::new(
-                    "d",
-                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                    false,
-                )]
-                .into(),
-            ))
-            .len(4)
-            .add_child_data(dictionary_child)
-            .build()
-            .expect("a valid struct array"),
+        let backing: Arc<Vec<u8>> = Arc::new(7_i32.to_le_bytes().repeat(4));
+        let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+        // SAFETY: `backing` outlives the buffer through the `Allocation`, and is
+        // never mutated.
+        let foreign = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+            )
+        };
+        let column: ArrayRef = make_array(
+            ArrayData::builder(DataType::Int32)
+                .len(4)
+                .add_buffer(foreign)
+                .build()
+                .expect("a valid Int32 array"),
         );
-        let unbounded =
-            RecordBatch::try_from_iter(vec![("n", nested)]).expect("a one-column batch");
+        let pinned = RecordBatch::try_from_iter(vec![("v", column)]).expect("a one-column batch");
 
         assert!(
-            !batches_boundable(&[unbounded]),
-            "a nested dictionary resting on memory the cache cannot copy off must be \
-             declined, or it is stored holding bytes `max_size` cannot see"
+            !batches_boundable(std::slice::from_ref(&pinned)),
+            "a batch pinning the producer's allocation must be declined, or it is \
+             stored holding bytes `max_size` cannot see"
         );
 
-        // A foreign dictionary is bounded, because `rebuild_dictionary` copies
-        // it onto memory the entry owns.
-        let keys = ArrayData::builder(DataType::Int32)
-            .len(4)
-            .add_buffer(foreign(0_i32.to_le_bytes().repeat(4)))
-            .build()
-            .expect("a valid key array");
-        let dictionary = DictionaryArray::<Int32Type>::try_new(
-            Int32Array::from(keys),
-            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
-        )
-        .expect("a valid dictionary");
-        let rebuildable = RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)])
-            .expect("a one-column batch");
-        assert!(batches_boundable(&[rebuildable]));
-
-        // The ordinary case is unaffected: an owned batch is still cacheable.
-        let owned = RecordBatch::try_from_iter(vec![(
-            "v",
-            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-        )])
-        .expect("a one-column batch");
-        assert!(batches_boundable(&[owned]));
+        // And the copy the write path actually takes clears it.
+        let stored = arrow_tools::record_batch::compact_retained_buffers(&pinned);
+        assert!(batches_boundable(std::slice::from_ref(&stored)));
+        assert_eq!(
+            stored
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("still an Int32Array")
+                .values(),
+            &[7_i32; 4],
+            "decoupling must not change the rows"
+        );
     }
 
     use super::*;

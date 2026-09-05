@@ -637,10 +637,16 @@ impl Query {
             }
 
             // A separate question from the one above: the origin answered fine,
-            // but the result holds a column no copy can decouple from the memory
-            // its producer owns, so an entry over it could not be billed for
-            // what it keeps alive. Keep the stale entry rather than store one
-            // `max_size` cannot bound.
+            // but the result may hold a column the copy could not decouple from
+            // the memory its producer owns, so an entry over it could not be
+            // billed for what it keeps alive. Compact first — `batches_boundable`
+            // reports what the copy achieved rather than guessing from the column
+            // types, and the copy this repeats is the one the entry will store,
+            // which leaves an already-compact batch untouched.
+            let batches: Vec<arrow::array::RecordBatch> = batches
+                .iter()
+                .map(arrow_tools::record_batch::compact_retained_buffers)
+                .collect();
             if !cache::batches_boundable(&batches) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
