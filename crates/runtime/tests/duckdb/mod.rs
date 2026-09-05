@@ -1370,3 +1370,142 @@ async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
         })
         .await
 }
+
+/// A federated `inner_product` must answer what the kernel answers, including
+/// for a row whose dot product is not a finite number.
+///
+/// `array_inner_product` hands back the `inf` or `nan` it computed, where
+/// Spice's kernel calls an undefined dot product NULL — and `DuckDB` sorts
+/// `nan` above every real number under `ORDER BY … DESC`, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// (issue #13787). The dialect now screens the pushed-down call with
+/// `isfinite`.
+///
+/// The `EXPLAIN` assertion is the half a unit test cannot reach: it pins that
+/// the screen is in the SQL `DuckDB` actually receives, rather than an
+/// expression the runtime happened to evaluate locally.
+#[tokio::test]
+async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let db_file = tempfile::Builder::new()
+                .suffix(".db")
+                .tempfile()
+                .expect("should create temp duckdb file");
+            let db_path = db_file.path().to_path_buf();
+            // `duckdb::Connection` needs the path free of the empty file
+            // `NamedTempFile` created, or it refuses it as not a database.
+            db_file.close().expect("should release the temp path");
+
+            {
+                let conn = duckdb::Connection::open(&db_path)
+                    .map_err(|e| format!("failed to open duckdb file: {e}"))?;
+                conn.execute_batch(
+                    "CREATE TABLE vecs (id INTEGER, emb FLOAT[3], q FLOAT[3]);
+                     INSERT INTO vecs VALUES
+                       (1, [1.0, 2.0, 3.0]::FLOAT[3],        [4.0, 5.0, 6.0]::FLOAT[3]),
+                       (2, [1e20, 0.0, 0.0]::FLOAT[3],       [1e20, 0.0, 0.0]::FLOAT[3]),
+                       (3, ['nan'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (4, ['inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (5, [0.0, 0.0, 0.0]::FLOAT[3],        [1.0, 2.0, 3.0]::FLOAT[3]);",
+                )
+                .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
+            }
+
+            let mut dataset = Dataset::new("duckdb:vecs", "vecs");
+            dataset.params = Some(spicepod::param::Params::from_string_map(
+                vec![("duckdb_file".to_string(), db_path.display().to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+
+            let app = AppBuilder::new("duckdb_inner_product_non_finite")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT id, inner_product(emb, q) AS ip FROM vecs ORDER BY id";
+            let result: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("query `{query}` collect failed: {e}"))?;
+
+            // Rows 2-4 overflow or carry a non-finite element; the kernel calls
+            // each of those undefined, so the federated answer must be NULL too.
+            // Rows 1 and 5 are ordinary and must survive the screen.
+            assert_batches_eq!(
+                [
+                    "+----+------+",
+                    "| id | ip   |",
+                    "+----+------+",
+                    "| 1  | 32.0 |",
+                    "| 2  |      |",
+                    "| 3  |      |",
+                    "| 4  |      |",
+                    "| 5  | 0.0  |",
+                    "+----+------+",
+                ],
+                &result
+            );
+
+            let explain: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("explain for `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("explain for `{query}` collect failed: {e}"))?;
+            let plan = arrow::util::pretty::pretty_format_batches(&explain)
+                .map_err(|e| format!("failed to format explain: {e}"))?
+                .to_string();
+
+            let federated_sql: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains("base_sql=") || line.contains("DuckSqlExec sql="))
+                .collect();
+            assert!(
+                !federated_sql.is_empty(),
+                "expected the scan to be pushed down to DuckDB; plan was:\n{plan}"
+            );
+            for line in federated_sql {
+                assert!(
+                    line.contains("array_inner_product"),
+                    "inner_product must still push down to DuckDB:\n{line}"
+                );
+                assert!(
+                    line.contains("isfinite"),
+                    "the pushed-down inner_product must be screened by isfinite, so a \
+                     non-finite result comes back NULL rather than topping the ranking:\n{line}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}

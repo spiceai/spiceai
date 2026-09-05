@@ -18,6 +18,7 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
 };
@@ -42,6 +43,10 @@ const TO_HEX_NAME: &str = "to_hex";
 /// `DuckDB`'s lower-casing function, applied over [`TO_HEX_NAME`] to match
 /// `DataFusion`'s lower-case hex digits.
 const LOWER_NAME: &str = "lower";
+
+/// `DuckDB`'s finite-number test, applied over `array_inner_product` to adopt
+/// the kernel's NULL-for-undefined rule — see [`inner_product_to_sql`].
+const IS_FINITE_NAME: &str = "isfinite";
 
 /// Renders `args` as a call to `duckdb_fn`, in the order given.
 ///
@@ -270,14 +275,59 @@ pub(crate) fn cosine_distance_to_sql(
 }
 
 /// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
-/// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
-/// call to `DuckDB` (>= 1.5.3) is exact.
+/// product, `sum(a[i] * b[i])`), screened so a result that is not a finite
+/// number comes back NULL.
 /// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
+///
+/// The screen is what makes the two sides answer the same thing. Spice's kernel
+/// treats an undefined dot product as NULL — `compute_fsl_f32` appends a null
+/// whenever the result is not finite — because `_score` is derived from it and
+/// a fabricated score outranks every real match. `array_inner_product` has no
+/// such rule and hands back the `inf` or `nan` it computed, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// instead (issue #13787). Measured on `DuckDB` 1.5.5 for a dot product that
+/// overflows `FLOAT` and for a vector carrying `nan` or an infinity; a null
+/// operand is already NULL on both sides.
+///
+/// Screening the *result* rather than the inputs is what the kernel does, and
+/// for this kernel the two coincide: a non-finite element always reaches the
+/// sum (`inf * 0` is `nan`, `inf + -inf` is `nan`), so there is no input that
+/// produces a finite dot product. `Kernel::hides_non_finite_input` records the
+/// same reasoning on the Rust side, where only `Cosine` needs the input screen.
 pub(crate) fn inner_product_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_inner_product")
+    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(finite_or_null))
+}
+
+/// Wraps `value` so that a non-finite result renders as NULL:
+/// `CASE WHEN isfinite(<value>) THEN <value> END`.
+///
+/// `value` appears twice, which is why this is reserved for calls whose
+/// arguments are a column reference or an array literal: neither shape can
+/// carry a side effect that a second evaluation would repeat.
+///
+/// The duplicate is not a doubling of the work. Measured on `DuckDB` 1.5.5,
+/// `ORDER BY … DESC LIMIT 10` over `array_inner_product` costs ~6% more
+/// screened than bare, and that margin is flat from 8-element vectors
+/// (2M rows) to 384-element ones (200k rows) — over a 38x range in per-row
+/// vector work. A second dot product would grow the margin toward 2x as the
+/// vector work came to dominate, so what the screen adds is the `isfinite`
+/// test and the `CASE` dispatch, not the product.
+fn finite_or_null(value: ast::Expr) -> ast::Expr {
+    ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![ast::CaseWhen {
+            condition: wrap_in_call(value.clone(), IS_FINITE_NAME),
+            result: value,
+        }],
+        // No ELSE: a CASE with no matching WHEN is NULL, which is the answer
+        // the kernel gives for a result that is not a finite number.
+        else_result: None,
+    }
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -633,7 +683,9 @@ mod tests {
     #[test]
     fn test_inner_product_to_sql_column_and_scalar() {
         // inner_product(column, [4,5,6]) must unparse to DuckDB's native
-        // array_inner_product with the ::FLOAT[N] casts the array functions need.
+        // array_inner_product with the ::FLOAT[N] casts the array functions
+        // need, wrapped in the `isfinite` screen that gives a non-finite
+        // result the NULL the kernel gives it (issue #13787).
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         let args = vec![
@@ -655,8 +707,7 @@ mod tests {
         let result = inner_product_to_sql(&unparser, &args)
             .expect("should execute successfully")
             .expect("should return expression");
-        let expected =
-            r#"array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])"#;
+        let expected = r#"CASE WHEN isfinite(array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])) THEN array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3]) END"#;
         assert_eq!(result.to_string(), expected);
     }
 
