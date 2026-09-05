@@ -359,15 +359,17 @@ impl std::error::Error for ParseTypedCsvError {}
 
 /// Parse a pipe-delimited expected-output CSV with a typed header
 /// (`col:type|col:type|...`) as documented in the IBM TPC-H suite README.
-/// Short or wide rows are kept so [`compare`] can report a row-width
-/// mismatch instead of silently `zip`-truncating.
+/// Short, wide, or blank data rows are kept so [`compare`] can report a
+/// row-count or row-width mismatch instead of silently dropping them.
 ///
 /// The first line is a typed header only when every field is `name:type`
 /// with a nonempty name and a supported type token (IBM vocabulary,
 /// including `decimal(p,s)` / `numeric(p,s)`). A zero-byte file, a
 /// headerless data row (including timestamp-like `12:34:56`), or a
 /// truncated field (`flag:`, `:`) is an error. A legitimate empty
-/// result is a typed header with zero data rows.
+/// result is a typed header plus its terminating newline and no further
+/// line. A blank or whitespace-only line after that header is a data
+/// record (typically one empty field), not an empty result.
 pub fn parse_typed_csv(text: &str) -> std::result::Result<TableData, ParseTypedCsvError> {
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
@@ -381,11 +383,7 @@ pub fn parse_typed_csv(text: &str) -> std::result::Result<TableData, ParseTypedC
     let Some(columns) = columns else {
         return Err(ParseTypedCsvError::MissingTypedHeader);
     };
-    let rows = lines
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(parse_pipe_row)
-        .collect();
+    let rows = lines.map(parse_pipe_row).collect();
     Ok(TableData { columns, rows })
 }
 
@@ -804,11 +802,7 @@ mod tests {
         let expected = parse_typed_csv("a:integer|b:integer\n1|2\n").expect("two-column golden");
         let actual = TableData {
             columns: expected.columns.clone(),
-            rows: vec![vec![
-                "1".to_string(),
-                "2".to_string(),
-                "999".to_string(),
-            ]],
+            rows: vec![vec!["1".to_string(), "2".to_string(), "999".to_string()]],
         };
         assert!(matches!(
             compare(&actual, &expected),
@@ -967,6 +961,77 @@ mod tests {
             compare(&schema_less, &expected),
             Some(CompareMismatch::ColumnCount {
                 actual: 0,
+                expected: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn blank_data_record_after_header_does_not_pass_empty_actual() {
+        // A whitespace-only line after the typed header is a data record,
+        // not a dropped row that would false-PASS against empty execution.
+        let expected =
+            parse_typed_csv("a:integer|b:integer\n \n").expect("blank record after header");
+        assert_eq!(expected.columns.len(), 2);
+        assert_eq!(expected.rows, vec![vec![String::new()]]);
+
+        let empty_line = parse_typed_csv("a:integer|b:integer\n\n").expect("empty-line record");
+        assert_eq!(empty_line.rows, vec![vec![String::new()]]);
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: Vec::new(),
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::RowCount {
+                actual: 0,
+                expected: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn blank_data_record_between_rows_does_not_pass() {
+        let expected = parse_typed_csv("a:integer|b:integer\n1|2\n \n3|4\n")
+            .expect("blank record between populated rows");
+        assert_eq!(
+            expected.rows,
+            vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec![String::new()],
+                vec!["3".to_string(), "4".to_string()],
+            ]
+        );
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec!["3".to_string(), "4".to_string()],
+            ],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::RowCount {
+                actual: 2,
+                expected: 3
+            })
+        ));
+
+        // Trailing whitespace-only line after a matching row must not drop
+        // and false-PASS against the populated row alone.
+        let trailing = parse_typed_csv("a:integer|b:integer\n1|2\n \n")
+            .expect("blank record after populated row");
+        assert_eq!(trailing.rows.len(), 2);
+        let one_row = TableData {
+            columns: trailing.columns.clone(),
+            rows: vec![vec!["1".to_string(), "2".to_string()]],
+        };
+        assert!(matches!(
+            compare(&one_row, &trailing),
+            Some(CompareMismatch::RowCount {
+                actual: 1,
                 expected: 2
             })
         ));
