@@ -33,6 +33,7 @@ runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs", optional = true
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 s3_vectors = { path = "../s3_vectors", optional = true }
+qdrant = { path = "../qdrant", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
@@ -47,6 +48,7 @@ util = { path = "../util", features = ["datafusion"] }
 default = ["text_search", "s3_vectors"]
 duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
 elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
+qdrant = ["data_components/qdrant", "dep:qdrant", "llms"]
 llms = ["dep:llms", "dep:runtime-datafusion-udfs"]
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
 text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
