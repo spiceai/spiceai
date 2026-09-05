@@ -1422,6 +1422,18 @@ impl PendingPkKeys {
 /// open a window it does not also own.
 pub(crate) struct PkCheckoutGuard {
     pending: Arc<ParkingMutex<PendingPkKeys>>,
+    /// Republishes the resident-byte accounting of the cache this window covers.
+    /// Keys recorded while the window is open are accounted against that cache's
+    /// published bytes as they land (`record_pending_pk_keys`), on top of the bytes
+    /// the checked-out index itself still holds. A restore overwrites both with the
+    /// stored index's size; an abandoned window restores nothing, so without this
+    /// the bytes of an index that no longer exists and of keys that were just
+    /// dropped would stay reserved against the table's memory account until an
+    /// unrelated publish happened to overwrite them.
+    ///
+    /// Run by [`Drop`] on the abandon path only — [`Self::close`] hands the window
+    /// to a restore, which publishes the truth itself.
+    release_accounting: Option<Box<dyn FnOnce() + Send + Sync>>,
     /// Set by [`Self::close`], which has already closed the window and owns the
     /// keys it handed back, so [`Drop`] must not close it a second time.
     closed: bool,
@@ -1429,10 +1441,18 @@ pub(crate) struct PkCheckoutGuard {
 
 impl PkCheckoutGuard {
     /// Open a checkout window over `pending`.
-    pub(crate) fn open(pending: &Arc<ParkingMutex<PendingPkKeys>>) -> Self {
+    ///
+    /// `release_accounting` is what an *abandoned* window must do to the published
+    /// resident bytes of the cache it covers (see the field); the table passes a
+    /// closure that republishes what the cache cell actually holds.
+    pub(crate) fn open(
+        pending: &Arc<ParkingMutex<PendingPkKeys>>,
+        release_accounting: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
         pending.lock().begin_checkout();
         Self {
             pending: Arc::clone(pending),
+            release_accounting: Some(Box::new(release_accounting)),
             closed: false,
         }
     }
@@ -1457,6 +1477,11 @@ impl Drop for PkCheckoutGuard {
         // stays cold — the next validation rebuilds from the table and sees every
         // committed key.
         let _ = self.pending.lock().end_checkout();
+        // The pending lock is released before this runs: the release takes the
+        // cache cell's lock and the publish lock, never the pending log's.
+        if let Some(release) = self.release_accounting.take() {
+            release();
+        }
     }
 }
 
@@ -2957,15 +2982,47 @@ mod tests {
     ///
     /// [`PkCheckoutGuard`] is what makes the window impossible to abandon; this
     /// pins the behaviour it buys.
+    /// The accounting release runs only when a window is abandoned. A restore
+    /// closes the window and publishes the stored index's size itself, so running
+    /// the release there too would publish a stale figure over the true one.
+    #[test]
+    fn only_an_abandoned_checkout_runs_its_accounting_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
+        let released = Arc::new(AtomicUsize::new(0));
+        let release = |released: &Arc<AtomicUsize>| {
+            let released = Arc::clone(released);
+            move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        let closed = PkCheckoutGuard::open(&pending, release(&released));
+        drop(closed.close());
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "a restore publishes the truth itself, so a closed window must not release"
+        );
+
+        drop(PkCheckoutGuard::open(&pending, release(&released)));
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "an abandoned window must release the accounting it grew"
+        );
+    }
+
     #[test]
     fn an_abandoned_checkout_leaves_the_next_one_usable() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
         // A validation that fails, panics, or is cancelled part-way: the window
         // opened, nothing restored an index, and the guard closed it on the way out.
-        drop(PkCheckoutGuard::open(&pending));
+        drop(PkCheckoutGuard::open(&pending, || {}));
 
-        let checkout = PkCheckoutGuard::open(&pending);
+        let checkout = PkCheckoutGuard::open(&pending, || {});
         let mut keys = PkDigestSet::with_capacity(1);
         let k = owned_key(&key(7));
         keys.insert_with_digest(pk_digest(&k), k.clone());
@@ -3002,8 +3059,8 @@ mod tests {
     fn closing_a_checkout_does_not_also_close_it_on_drop() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
-        let outer = PkCheckoutGuard::open(&pending);
-        let inner = PkCheckoutGuard::open(&pending);
+        let outer = PkCheckoutGuard::open(&pending, || {});
+        let inner = PkCheckoutGuard::open(&pending, || {});
         assert_eq!(pending.lock().outstanding, 2, "two windows are open");
 
         drop(inner.close());
@@ -3032,8 +3089,8 @@ mod tests {
     fn two_concurrent_checkouts_are_both_discarded() {
         let pending = Arc::new(ParkingMutex::new(PendingPkKeys::default()));
 
-        let first = PkCheckoutGuard::open(&pending);
-        let second = PkCheckoutGuard::open(&pending);
+        let first = PkCheckoutGuard::open(&pending, || {});
+        let second = PkCheckoutGuard::open(&pending, || {});
 
         assert!(
             second.close().index_must_be_discarded(),
@@ -3046,7 +3103,7 @@ mod tests {
 
         // ...and the flags clear once the last window closes, so the NEXT
         // checkout is trusted again.
-        let third = PkCheckoutGuard::open(&pending);
+        let third = PkCheckoutGuard::open(&pending, || {});
         assert!(
             !third.close().index_must_be_discarded(),
             "the discard must not outlive the overlap that caused it"
