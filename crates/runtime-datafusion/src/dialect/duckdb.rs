@@ -285,9 +285,9 @@ pub(crate) fn cosine_distance_to_sql(
 /// a fabricated score outranks every real match. `array_inner_product` has no
 /// such rule and hands back the `inf` or `nan` it computed, so a vector the
 /// kernel drops as undefined became the top row of every federated query
-/// instead (issue #13787). Measured on `DuckDB` 1.5.5 for a dot product that
-/// overflows `FLOAT` and for a vector carrying `nan` or an infinity; a null
-/// operand is already NULL on both sides.
+/// instead (issue #13787). Measured on the pinned `DuckDB` 1.4.4 (and on
+/// 1.5.5) for a dot product that overflows `FLOAT` and for a vector carrying
+/// `nan` or an infinity; a null operand is already NULL on both sides.
 ///
 /// Screening the *result* rather than the inputs is what the kernel does, and
 /// for this kernel the two coincide: a non-finite element always reaches the
@@ -308,12 +308,12 @@ pub(crate) fn inner_product_to_sql(
 /// arguments are a column reference or an array literal: neither shape can
 /// carry a side effect that a second evaluation would repeat.
 ///
-/// The duplicate is not a doubling of the work. Measured on `DuckDB` 1.5.5,
-/// `ORDER BY … DESC LIMIT 10` over `array_inner_product` costs ~6% more
-/// screened than bare, and that margin is flat from 8-element vectors
-/// (2M rows) to 384-element ones (200k rows) — over a 38x range in per-row
-/// vector work. A second dot product would grow the margin toward 2x as the
-/// vector work came to dominate, so what the screen adds is the `isfinite`
+/// The duplicate is not a doubling of the work. Measured on the pinned
+/// `DuckDB` 1.4.4, `ORDER BY … DESC LIMIT 10` over `array_inner_product` costs
+/// 14% more screened than bare on 8-element vectors (2M rows) and is
+/// indistinguishable from it on 384-element ones (200k rows) — the margin
+/// *shrinks* as the per-row vector work grows by ~38x. A second dot product
+/// would push it toward 2x instead, so what the screen adds is the `isfinite`
 /// test and the `CASE` dispatch, not the product.
 fn finite_or_null(value: ast::Expr) -> ast::Expr {
     ast::Expr::Case {
