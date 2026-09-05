@@ -155,6 +155,8 @@ mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
 #[cfg(not(windows))]
+mod otel_ingest_races;
+#[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
@@ -171,6 +173,7 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
+mod s3_parquet_overwrite;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",

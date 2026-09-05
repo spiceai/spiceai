@@ -97,7 +97,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `a6c88abe381fa50d0b3bb1fbe20964eb5830f9bd` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `1512f78ffff223deab25bf76c3f1d950229f8555` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `7752b0ed353597d6f83686a698fe21535d5a9ba1` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
@@ -194,7 +194,8 @@ catch.
 | Unparser: `Dialect::group_by_matches_select_subexpressions`, and the aggregate scope a dialect that answers `false` needs | A `Projection` over an `Aggregate` is flattened into one `SELECT`, leaving the grouping expression bare in `GROUP BY` and wrapped inside a select item. BigQuery matches a whole select item and a column reference and nothing in between, so it refuses the statement outright. The two cheaper renderings are worse than the failure: `GROUP BY <output alias>` and `GROUP BY <ordinal>` group by the value the projection computes, so a projection that is not injective over the grouping expression collapses distinct groups and sums their aggregates, with no error | build (flag), then silent (query failure) | `crates/data_components/src/federation.rs::a_projection_wrapping_a_grouping_expression_keeps_the_aggregate_scoped`, which reads the flag, so losing the patch fails `cargo check` before it can fail the assertion; real-engine guard: `test/scripts/bigquery-pushdown.sh::group-by-expr-nested-in-select` |
 | `supports_subquery_in_join_predicate` dialect flag (fork PR #151) | A subquery is emitted inside a `JOIN … ON`, which several engines reject | build (flag) + silent (behaviour) | **GAP** |
 | Metadata columns (`_location`, `_last_modified`, `_size`) on `ListingOptions`/`FileScanConfig`, and their projection, pushdown and statistics handling | Datasets that select file metadata columns lose them, or project the wrong column | build | `crates/data-connector-api/src/listing/connector.rs` (metadata-column tests) |
-| Object-version pinning on `ListingOptions` (`with_object_versioning_type`) | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
+| Object-version pinning on `ListingOptions` (`with_object_versioning_type`), forwarded through `DFParquetMetadata` and `CachedParquetFileReader` on the **scan** path; `HEAD` when the listing has no version id, kept only when HEAD's ETag matches the listed ETag. Schema/statistics inference (`ParquetFormat::{infer_schema,infer_stats,infer_stats_and_ordering}`) does not forward the pin | A scan stops pinning the object version, so a file replaced mid-scan is read half-old and half-new. Losing only the metadata-path forward is enough: the scan footer is unpinned while the pages stay pinned. Losing the `HEAD` leaves versioned buckets pinning by ETag, so a replace 412s instead of reading the listed generation | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id`, `crates/runtime/tests/s3_parquet_overwrite/mod.rs::listing_table_scan_does_not_decode_a_replaced_object` (listing/overwrite **scan** race). Planning-time schema/statistics footer reads are a remaining unpinned gap, unreproduced as a product failure |
+| Bloom-filter replacement readers reuse the version discovered on the listing-table scan | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | **GAP** — the scan/overwrite harness has no predicate and writes no bloom data; the fork's own bloom-filter reader tests are what cover this today |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | **GAP** |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
@@ -210,9 +211,8 @@ path (`parquet/src/util/push_buffers.rs` and its callers).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
-| `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version` |
+| `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
-
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
 
 ## datafusion-ballista
@@ -265,14 +265,15 @@ satisfied … there are multiple different versions of crate `datafusion_federat
 in the dependency graph", and `scripts/check_fork_patches.py` reports the same
 thing as two pinned revisions at once.
 
-Two patches here have rows, because losing either is a wrong answer rather than a
-build failure:
+The patches below have rows, because losing one of them is a wrong answer or a
+silently disabled optimization rather than a build failure:
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`, and `sql.rs::a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for; the fourth names the two sentinel counts, so a revert that renders them instead of declining them fails there rather than inside a generated statement |
 | Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the `arrow-adbc` one is missing |
 | Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | **GAP** |
+| `DuckDBTable` carries its index list onto the `DuckSqlExec` it builds (fork PR #69) | `DuckDBIntermediateIndexMaterialization` reads that list off the exec node and returns the plan untouched when it is empty, so a DuckDB accelerator declaring `indexes` stops materializing the indexed filters into a CTE and every such query goes back to scanning the whole table. The field has twice survived a refactor that defaulted it to empty, which is why it has a row | silent (perf) | `crates/datafusion-optimizer-rules/src/physical_plan/duckdb/intermediate_index_cte.rs::tests::a_tables_indexes_reach_the_rule_through_the_exec_node`, which plans a filtered scan off a `DuckDBTable` built with an index and asserts the rule rewrites it. Needs `--features duckdb`. The neighbouring `test_rewrite_statement` passes either way — it hands `rewrite_statement` its indexes directly and never crosses the table/exec boundary the patch restores |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 | Analyzer: federate a statement whose only tables are inside a subquery — `contains_federated_table` descends into subquery expressions, and a correlated reference to a relation that scans nothing is neutral rather than ambiguous | A query whose outer `FROM` is a constant relation and whose federated tables are all inside a scalar/`IN`/`EXISTS` subquery is not federated *at all, in any part*: the analyzer returns before doing anything, or the unresolved correlation reads as a second engine and that verdict propagates through every enclosing node. The statement reaches the engine as one scan per table reference — each re-executed for every place the plan mentions it — with every join and aggregate evaluated locally. A dashboard card of this shape was measured at 24 statements where one was correct | silent (perf, badly) | `datafusion-federation/src/sql/mod.rs::tests::a_correlation_against_a_scanless_relation_federates_as_one_statement` (in the fork, with `::a_correlation_against_a_scanning_relation_still_federates_as_one_statement` as the control); real-engine guard: `test/scripts/bigquery-pushdown.sh::correlated-subquery-over-constant-relation`. The neutral verdict is deliberately narrow — it needs a unique relation of that name that scans nothing — because binding a correlation to the wrong relation of the same name would return wrong rows rather than fail |
 
@@ -500,7 +501,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**39 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -534,11 +535,11 @@ They are not equal in consequence; this is the order to close them in.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-13. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
-    on a short read — a footer prefetch racing an in-place shrink panics the
-    reader thread rather than surfacing a retriable decode error. The
-    listing/overwrite harness 412s before a short body reaches it; runtime
-    #13847 carries the scan-path guards for the rest of this revision.
+13. `datafusion` bloom-filter replacement readers sharing the listed object
+    version — a predicate scan whose bloom-filter reader is built separately
+    falls back to stale `If-Match`, so a replaced object 412s; the query retries
+    or fails rather than mixing generations. The overwrite harness has no
+    bloom data.
 14. `vortex` session lock re-entry in writer init (fork PR #29).
 15. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
@@ -546,26 +547,31 @@ They are not equal in consequence; this is the order to close them in.
 17. `spark-connect-rs` `http` scheme when `use_ssl` is false.
 18. `model2vec-rs` optional `config.json`.
 19. `snowflake-rs` async query response support — long-running queries time out.
+20. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+    on a short read — a footer prefetch racing an in-place shrink panics the
+    reader thread rather than surfacing a retriable decode error. The
+    listing/overwrite harness 412s before a short successful range body
+    reaches the decoder.
 
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-20. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+21. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-21. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+22. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-22. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+23. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-23. `model2vec-rs` HF cache directory read from the environment — models are
+24. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-24. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+25. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-25. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-26. `graph-rs-sdk` tower middleware application.
+26. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+27. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -573,7 +579,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-27. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+28. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
