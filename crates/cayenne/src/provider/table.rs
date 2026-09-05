@@ -30386,7 +30386,29 @@ impl CayenneTableProvider {
     /// empty tier the checkpoint is a storage no-op that re-fires the last durable
     /// slot advancer and returns; in memory-resident mode it returns immediately,
     /// since there the tier is the permanent store.
+    ///
+    /// In-flight pipelined publishes are drained first, as schema evolution and
+    /// warm-to-cold promotion drain before their checkpoints: a data-bearing
+    /// checkpoint folds the inline corpus into the snapshot it writes and then
+    /// clears that corpus, tombstones included, and an inline-conflict tombstone
+    /// whose Stage-B publish has not landed is the window
+    /// [`Self::apply_retention_filters`] and [`Self::sort_and_rewrite_data`] refuse
+    /// to flush inside. `write_lock` blocks new Stage-A commits, so the pending set
+    /// can only shrink, and Stage B needs only the visibility lock and listing
+    /// fence, so it completes under the held lock. A publish still pending after
+    /// [`STAGED_WRITE_DRAIN_TIMEOUT`] means a wedged Stage-B task; the delete then
+    /// fails having changed nothing rather than run against a half-published table.
     async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
+        {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "Failed to delete from dataset '{}': a write to it was still publishing after {}s, so the delete was not applied and the rows are unchanged. Retry the DELETE once the write completes.",
+                self.table_metadata.table_name,
+                STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+            )));
+        }
         self.checkpoint_mem_tier_holding_write_lock()
             .await
             .map(|_rows| ())
@@ -33524,7 +33546,8 @@ impl TableProvider for CayenneTableProvider {
         // subject to the sink's own tier-aware liveness rule.
         //
         // The checkpoint and the scan-source capture share ONE `write_lock` hold,
-        // so no CDC apply can land between them. They are not separable: a
+        // so no CDC apply can land between them (the checkpoint helper first drains
+        // any pipelined publish still in flight — see its doc). They are not separable: a
         // checkpoint publishes its rows as a PROTECTED snapshot, and
         // `build_deletion_vector_sink` freezes the protected set the sink will scan
         // (the sink re-reads only the main listing at execution), so a checkpoint
