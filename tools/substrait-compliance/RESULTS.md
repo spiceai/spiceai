@@ -5,8 +5,8 @@ Captured on this box against the workspace DataFusion fork
 [spiceai/datafusion#215](https://github.com/spiceai/datafusion/pull/215))
 after harness compare lifts for the 11 known-fail cosmetics,
 quoted-empty `""` decode (q17), the printed-scale / short-row
-compare tighten, and the empty-golden load reject (PASS count
-unchanged).
+compare tighten, the empty-golden load reject, and typed-header
+name/type validation (PASS count unchanged).
 
 Re-run the command below to regenerate `results/mode-a-tpch.json`
 (gitignored; CI uploads it as an artifact).
@@ -20,7 +20,7 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 | spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-05T05:00:08Z → 05:00:12Z |
+| Run | 2026-09-05T05:14:02Z → 05:14:06Z |
 
 ## Counts
 
@@ -87,9 +87,10 @@ Harness compare in `src/compare.rs` now:
   tolerance. One ULP at a declared decimal scale only when both headers
   share that scale (≥ 2)
 - quoted-empty `""` is NULL/empty (IBM TPC-H README)
-- a zero-byte or headerless golden is an oracle-load error, not an
-  empty PASS; a legitimate empty result is a typed header with zero
-  data rows
+- a zero-byte, headerless, or malformed first line is an oracle-load
+  error, not an empty PASS. A typed header requires nonempty names
+  and supported type tokens (`flag:`, `:`, and `12:34:56` are not).
+  A legitimate empty result is a typed header with zero data rows
 
 IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These
 lifts apply only when **values** still match. They do not ignore
