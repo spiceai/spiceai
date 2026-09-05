@@ -2689,6 +2689,44 @@ mod tests {
                 .expect("build")
         };
 
+        // The control for the arm above: a navigation function that *does* take a
+        // frame must keep it, or an over-broad re-cut that drops every frame
+        // passes the `LEAD` arm while silently changing which rows each window
+        // covers.
+        let first_value_with_frame = {
+            let windowed = datafusion::logical_expr::Expr::from(
+                datafusion::logical_expr::expr::WindowFunction {
+                    fun: datafusion::logical_expr::WindowFunctionDefinition::WindowUDF(
+                        datafusion::functions_window::nth_value::first_value_udwf(),
+                    ),
+                    params: datafusion::logical_expr::expr::WindowFunctionParams {
+                        args: vec![col("t.v")],
+                        partition_by: vec![],
+                        order_by: vec![datafusion::logical_expr::expr::Sort::new(
+                            col("t.ts"),
+                            true,
+                            false,
+                        )],
+                        window_frame: datafusion::logical_expr::WindowFrame::new_bounds(
+                            datafusion::logical_expr::window_frame::WindowFrameUnits::Rows,
+                            datafusion::logical_expr::window_frame::WindowFrameBound::Preceding(
+                                ScalarValue::UInt64(None),
+                            ),
+                            datafusion::logical_expr::window_frame::WindowFrameBound::CurrentRow,
+                        ),
+                        null_treatment: None,
+                        filter: None,
+                        distinct: false,
+                    },
+                },
+            );
+            windowed_scan()
+                .window(vec![windowed])
+                .expect("window")
+                .build()
+                .expect("build")
+        };
+
         // BigQuery has no `FILTER (WHERE ...)` — measured, it is a syntax error —
         // so the predicate has to move inside the aggregate. Which rewriting is
         // correct depends on the aggregate, so each of these is its own arm.
@@ -2831,6 +2869,85 @@ mod tests {
             .expect("project")
             .build()
             .expect("build");
+
+        // `bigquery_refuses_only_the_filtered_aggregate_shapes_it_cannot_rewrite`
+        // in `connector-adbc` checks that federation *allows* each allowlisted
+        // name. That is only half of it: the rewrite that has to render them
+        // lives in the fork, behind its own `filter_rewrite_is_exact`. If the
+        // two lists drift — a name dropped there, kept here — federation sends a
+        // `FILTER` clause BigQuery cannot parse, and a test that only asks
+        // whether the call federates stays green. So every name on the mirror
+        // list is rendered here too.
+        let allowlisted: Vec<(&str, datafusion::logical_expr::Expr)> = vec![
+            (
+                "count",
+                datafusion::functions_aggregate::expr_fn::count(col("t.v")),
+            ),
+            (
+                "sum",
+                datafusion::functions_aggregate::expr_fn::sum(col("t.v")),
+            ),
+            (
+                "min",
+                datafusion::functions_aggregate::expr_fn::min(col("t.v")),
+            ),
+            (
+                "max",
+                datafusion::functions_aggregate::expr_fn::max(col("t.v")),
+            ),
+            (
+                "avg",
+                datafusion::functions_aggregate::expr_fn::avg(col("t.v")),
+            ),
+            (
+                "bit_and",
+                datafusion::functions_aggregate::expr_fn::bit_and(col("t.v")),
+            ),
+            (
+                "bit_or",
+                datafusion::functions_aggregate::expr_fn::bit_or(col("t.v")),
+            ),
+            (
+                "bit_xor",
+                datafusion::functions_aggregate::expr_fn::bit_xor(col("t.v")),
+            ),
+        ];
+        assert_eq!(
+            allowlisted
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            super::FILTER_REWRITE_IS_EXACT,
+            "every name on the mirror list needs a rendering case here, or \
+             adding one federates a FILTER the fork may not rewrite"
+        );
+        for (name, aggregate) in allowlisted {
+            let plan = filtered(
+                aggregate
+                    .filter(col("t.v").is_not_null())
+                    .build()
+                    .unwrap_or_else(|e| panic!("filtered {name}: {e}")),
+            );
+            let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+            let inner = unparse_plan(
+                &datafusion::sql::unparser::dialect::BigQueryDialect::new(),
+                &plan,
+            );
+            assert_eq!(
+                wrapper, inner,
+                "{name}: the wrapper and the inner BigQuery dialect disagree"
+            );
+            assert!(
+                !wrapper.contains("FILTER"),
+                "{name} is on the rewrite allowlist, so its FILTER must move \
+                 inside the aggregate; got {wrapper}"
+            );
+            assert!(
+                wrapper.contains("CASE WHEN") || wrapper.contains("COUNTIF("),
+                "{name}: the predicate has to reach the aggregate's argument; \
+                 got {wrapper}"
+            );
+        }
 
         for (property, plan, must_contain, must_not_contain) in [
             (
@@ -3030,6 +3147,14 @@ mod tests {
                 &wide_scale,
                 "AS BIGNUMERIC)",
                 "DECIMAL(",
+            ),
+            (
+                // The control: a frame here must survive, so "drop every frame"
+                // cannot pass as a fix for the arm above.
+                "a frame on FIRST_VALUE is kept (fork PR #216)",
+                &first_value_with_frame,
+                "ROWS BETWEEN",
+                "first_value(`t`.`v`) OVER (ORDER BY `t`.`ts` ASC NULLS LAST)",
             ),
             (
                 // Falls back to a generic `FILTER` clause, which BigQuery has no
