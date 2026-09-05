@@ -17639,6 +17639,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-checkpoint-api",
  "serde_json",
+ "spicepod",
  "tempfile",
  "tokio",
  "tracing",
