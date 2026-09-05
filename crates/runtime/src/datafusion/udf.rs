@@ -964,7 +964,7 @@ mod tests {
     fn make_named_expr_of_one_arg(name: &str) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),
-            vec![col("s")],
+            vec![lit("  padded  ")],
         ))
     }
 

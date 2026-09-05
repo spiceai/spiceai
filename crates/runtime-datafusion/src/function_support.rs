@@ -170,25 +170,23 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 #[cfg(test)]
 mod tests {
     use super::deny_spice_functions_for_duckdb_table_providers;
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
-    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, Projection, table_scan};
+    use datafusion::logical_expr::{LogicalPlan, table_scan};
     use datafusion::prelude::{Expr, col, lit};
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
-    use std::sync::Arc;
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
     fn plan_projecting(expr: Expr) -> LogicalPlan {
-        let schema = arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("s", arrow::datatypes::DataType::Utf8, true),
-            arrow::datatypes::Field::new("start", arrow::datatypes::DataType::Int64, true),
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, true),
         ]);
-        let scan = table_scan(Some("t"), &schema, None)
+        table_scan(Some("t"), &schema, None)
             .expect("scan t")
-            .build()
-            .expect("build scan");
-        let projection = Projection::try_new(vec![expr], Arc::new(scan)).expect("projection");
-        LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+            .project(vec![expr])
+            .expect("project")
             .build()
             .expect("build plan")
     }
