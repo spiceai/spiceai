@@ -1433,7 +1433,7 @@ pub(crate) struct PkCheckoutGuard {
     ///
     /// Run by [`Drop`] on the abandon path only — [`Self::close`] hands the window
     /// to a restore, which publishes the truth itself.
-    release_accounting: Option<Box<dyn FnOnce() + Send + Sync>>,
+    release_accounting: Option<Box<dyn FnOnce() + Send>>,
     /// Set by [`Self::close`], which has already closed the window and owns the
     /// keys it handed back, so [`Drop`] must not close it a second time.
     closed: bool,
@@ -1447,7 +1447,7 @@ impl PkCheckoutGuard {
     /// closure that republishes what the cache cell actually holds.
     pub(crate) fn open(
         pending: &Arc<ParkingMutex<PendingPkKeys>>,
-        release_accounting: impl FnOnce() + Send + Sync + 'static,
+        release_accounting: impl FnOnce() + Send + 'static,
     ) -> Self {
         pending.lock().begin_checkout();
         Self {
