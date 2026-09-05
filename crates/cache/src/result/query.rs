@@ -34,7 +34,7 @@ use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
 use crate::intern::Interned;
-use crate::sizing::{ENTRY_OVERHEAD_BYTES, arc_heap_size};
+use crate::sizing::{BUFFER_OVERHEAD_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size};
 
 use super::CacheStatus;
 
@@ -224,6 +224,11 @@ impl CachedQueryResult {
                 for batch in batches.iter() {
                     // get_array_memory_size accounts for all array data.
                     size += batch.get_array_memory_size();
+                    // ...but not for what each of those buffers costs beyond
+                    // the bytes it asked the allocator for. See
+                    // `BUFFER_OVERHEAD_BYTES`.
+                    size += BUFFER_OVERHEAD_BYTES
+                        * arrow_tools::record_batch::buffers_in_batch(batch);
                 }
             }
             CachedData::Encoded(bytes) => {

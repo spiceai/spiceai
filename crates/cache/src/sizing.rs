@@ -57,29 +57,55 @@ use std::mem::size_of;
 /// A weigher is handed only the value, so nothing the store allocates *around*
 /// that value is reachable from it: moka's entry record, the two intrusive
 /// lists an entry sits on, its key handle, its hash-table slot, and the
-/// allocator's rounding on each of those. It still has to be charged, or a
-/// stream of individually tiny entries is free and `max_size` cannot bound a
+/// allocator's rounding on each. It still has to be charged, or a stream of
+/// individually tiny entries is free and `max_size` cannot bound a
 /// high-cardinality workload of 0-row results at all.
 ///
-/// **A flat allowance, calibrated once against a measurement.** An earlier
-/// version of this derived most of it with `size_of` over invented structs
-/// modelling moka's internals; that was worse than useless, because moka's
-/// types are private so the models could not track them, and the fitted
-/// remainder was two thirds of the total anyway. One honest number beats
-/// arithmetic that looks derived and is not.
+/// **Measured, and scale-dependent.** A `spiced` was filled to 1.4M cached
+/// 0-row results — a shape that holds no arrays and no buffers, so what is left
+/// is exactly this — sampled every 100k, against an identical cache-disabled
+/// run (`phys_footprint`, macOS/arm64, snmalloc):
 ///
-/// The measurement: a `spiced` holding 100,000 cached 0-row point-lookup
-/// results gave up ~1,225 B per entry over an identical cache-disabled run
-/// (`phys_footprint`, macOS/arm64, snmalloc). Of that, the entry struct and its
-/// batch vector account for ~136 B and the shared schema and input-table set
-/// for ~430 B across *all* entries, leaving this as what one more entry costs.
+/// | entries | per entry |
+/// |---|---|
+/// | 100k | 712 B |
+/// | 200k | 517 B |
+/// | 300k | 342 B |
+/// | 400k – 1.4M | 348–375 B, flat |
 ///
-/// It is a per-entry cost of the store and the allocator, so it moves with
-/// platform, allocator and moka version. `results_cache_growth` in the runtime
-/// crate is what keeps it honest: it fills a real cache and asserts the
-/// reported total stays within a factor of the live heap, so a platform where
-/// this is badly wrong fails there rather than silently over- or under-billing.
-pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 700;
+/// Small caches sit higher still: `results_cache_growth` measures ~820 B an
+/// entry at 3,000. So the true figure spans roughly 820 B down to 355 B, and no
+/// single constant is right everywhere.
+///
+/// This one is chosen to minimise the *worst* error across that span rather
+/// than to fit either end. Against the four measured points — 3k, 100k, 200k
+/// and the plateau — 500 is never more than 1.50x out, where anchoring on the
+/// plateau (360) is 1.93x out at 3k and anchoring on 100k (700) is 1.70x out at
+/// 1.4M. Erring high at scale is also the safer half of that: it evicts early
+/// rather than letting the cache outgrow `max_size`.
+///
+/// The *marginal* cost per 100k interval swings from −9 B to 712 B — negative
+/// meaning the allocator handed slabs back while the cache grew — so the
+/// cumulative figures above are what to calibrate against; a marginal reading
+/// would be fitting noise.
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 500;
+
+/// Bytes charged per Arrow buffer a cached entry holds, on top of the bytes the
+/// buffer reports.
+///
+/// `get_array_memory_size` counts what each buffer asked the allocator for. It
+/// does not count what the allocator actually set aside — every buffer is its
+/// own allocation, rounded up to a size class — nor the `ArrayData` around it.
+/// A five-column row is eight or more separate buffers, so on the small results
+/// worth caching this is not a rounding error: it was the whole of the residual
+/// once the shared schema and table set stopped being charged.
+///
+/// **Fitted on `DuckDB` and Parquet, validated on Flight**, which contributed
+/// nothing to the fit: 1M cached one-row results per source, cache-enabled
+/// minus cache-disabled. The two-term model — this per buffer, plus
+/// [`ENTRY_OVERHEAD_BYTES`] per entry — predicted Flight's held memory to within
+/// 1.0% on a one-row result and 2.9% on an empty one.
+pub(crate) const BUFFER_OVERHEAD_BYTES: usize = 150;
 
 /// Bytes an `Arc<T>` allocation costs beyond `T` itself: the strong and weak
 /// counts that sit in front of the value.
