@@ -562,9 +562,9 @@ assert_preflight_lock "quotes what cargo actually said" "$with_lock_dir" 72 \
 # The toolchain matters and is easy to get wrong: rustup picks a toolchain from the
 # *current directory's* rust-toolchain.toml, so a fixture under $TMPDIR gets the
 # runner's default cargo rather than the one this repository pins — measured on one
-# machine as 1.97.1 in the temp directory against the pinned 1.96.1 at the repo
-# root. Testing the wrong cargo's wording is indistinguishable from testing none,
-# so RUSTUP_TOOLCHAIN is set from rust-toolchain.toml explicitly.
+# machine as a newer default in the temp directory against the pinned channel at
+# the repo root. Testing the wrong cargo's wording is indistinguishable from
+# testing none, so RUSTUP_TOOLCHAIN is set from rust-toolchain.toml explicitly.
 #
 # And a skip is not a pass. In CI, being unable to exercise this is fatal: the whole
 # point is that the guard cannot quietly stop working, and "the fixture did not run"

@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Set up make
         if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
