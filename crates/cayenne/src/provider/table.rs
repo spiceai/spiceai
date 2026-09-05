@@ -30366,6 +30366,60 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Materialize the in-memory CDC tier before a scanning delete, the way
+    /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
+    /// inline corpus: the deletion-vector sink scans durable tiers only, and it
+    /// scans its `ListingTable`s directly rather than under `listing_fence`, so it
+    /// carries no barrier of its own against a checkpoint still in flight.
+    ///
+    /// There is deliberately no empty-tier fast path. An empty tier does not imply
+    /// nothing is in flight: [`Self::purge_mem_tier_all`] clears a captured but
+    /// not-yet-published prefix while holding only `write_lock`, so a checkpoint
+    /// that captured those rows and is still encoding off-lock leaves the tier
+    /// reading empty with its snapshot unpublished. Awaiting `mem_checkpoint_lock`
+    /// unconditionally is what makes that checkpoint's snapshot visible before the
+    /// caller captures its scan sources.
+    ///
+    /// The caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock`
+    /// itself — the `write -> mem` order every other holder settles on, and the one
+    /// [`Self::acquire_capture_locks_blocking`] yields to rather than invert. On an
+    /// empty tier the checkpoint is a storage no-op that re-fires the last durable
+    /// slot advancer and returns; in memory-resident mode it returns immediately,
+    /// since there the tier is the permanent store.
+    ///
+    /// In-flight pipelined publishes are drained first, as schema evolution and
+    /// warm-to-cold promotion drain before their checkpoints: a data-bearing
+    /// checkpoint folds the inline corpus into the snapshot it writes and then
+    /// clears that corpus, tombstones included, and an inline-conflict tombstone
+    /// whose Stage-B publish has not landed is the window
+    /// [`Self::apply_retention_filters`] and [`Self::sort_and_rewrite_data`] refuse
+    /// to flush inside. `write_lock` blocks new Stage-A commits, so the pending set
+    /// can only shrink, and Stage B needs only the visibility lock and listing
+    /// fence, so it completes under the held lock. A publish still pending after
+    /// [`STAGED_WRITE_DRAIN_TIMEOUT`] means a wedged Stage-B task; the delete then
+    /// fails having changed nothing rather than run against a half-published table.
+    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+        if !self
+            .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+            .await
+        {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "Failed to delete from dataset '{}': a write to it was still publishing after {}s, so the delete was not applied and the rows are unchanged. Retry the DELETE once the write completes.",
+                self.table_metadata.table_name,
+                STAGED_WRITE_DRAIN_TIMEOUT.as_secs()
+            )));
+        }
+        self.checkpoint_mem_tier_holding_write_lock()
+            .await
+            .map(|_rows| ())
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to delete from dataset '{}': could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
     /// Flush inlined rows to Vortex files when pending inline data exists.
     ///
     /// Callers must hold `write_lock` while calling this helper.
@@ -33480,9 +33534,37 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-            .await?;
+        // Key-based deletion-vector path. The sink scans main, the protected
+        // snapshots and the cold tier — every durable tier — and never the
+        // in-memory CDC tier, and its liveness probe reads the durable deletion
+        // index alone. A predicate that matches only a RAM-resident row would
+        // leave it alive, and one that matches the durable version an
+        // un-checkpointed upsert has superseded would tombstone the KEY and take
+        // the live RAM replacement with it — the shape #13574 closed for protected
+        // snapshots, one tier over. Materialize the tier, exactly as the two
+        // branches above materialize inline rows; once durable, the rows are
+        // subject to the sink's own tier-aware liveness rule.
+        //
+        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
+        // so no CDC apply can land between them (the checkpoint helper first drains
+        // any pipelined publish still in flight — see its doc). They are not separable: a
+        // checkpoint publishes its rows as a PROTECTED snapshot, and
+        // `build_deletion_vector_sink` freezes the protected set the sink will scan
+        // (the sink re-reads only the main listing at execution), so a checkpoint
+        // that lands after the capture is invisible to this delete. Nothing under
+        // the sink builder takes `write_lock`, so holding it across the build
+        // cannot deadlock.
+        //
+        // This lock is released before `DeletionExec` runs the sink, which takes
+        // `write_lock` again; a CDC apply between the two is still invisible to the
+        // scan sources frozen here (#13828). Closing that window means building the
+        // sink inside the execution-time critical section, not here.
+        let file_sink = {
+            let _guard = self.write_lock.lock().await;
+            self.checkpoint_mem_tier_for_delete().await?;
+            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+                .await?
+        };
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
