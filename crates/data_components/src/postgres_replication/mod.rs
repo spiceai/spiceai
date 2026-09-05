@@ -491,8 +491,8 @@ impl RebuildCause {
         }
     }
 
-    /// The operator-facing clause, phrased to complete "this acceleration will be
-    /// rebuilt from the source before changes are applied: ...".
+    /// The operator-facing clause, phrased to complete the sentence
+    /// [`rebuild_log_message`] builds.
     #[must_use]
     pub fn reason(self) -> &'static str {
         match self {
@@ -588,17 +588,37 @@ pub fn creation_cause(inputs: CreationInputs) -> Option<CreationCause> {
         .then_some(CreationCause::SlotCreated)
 }
 
+/// The connector page an operator is sent to when the source is read into an
+/// acceleration. One constant, so the created and rebuilt lines cannot drift
+/// onto different pages.
+const CONNECTOR_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
+
 /// The line an operator reads when an acceleration is about to be created by
 /// reading the source.
 ///
 /// A pure function so the composition can be asserted: the dataset it happened
 /// to, which of the conditions asked for it, and where to read about changing
 /// that — a reword must not quietly drop one (see
-/// `a_creation_message_names_the_dataset_the_cause_and_where_to_read_more`).
+/// `a_source_read_message_names_the_dataset_the_cause_and_where_to_read_more`).
 #[must_use]
 pub fn creation_log_message(dataset: &str, cause: CreationCause) -> String {
     format!(
-        "Dataset '{dataset}' will have its acceleration created by reading the source: {}. See: https://spiceai.org/docs/components/data-connectors/postgres",
+        "Dataset '{dataset}' will have its acceleration created by reading the source: {}. See: {CONNECTOR_DOCS}",
+        cause.reason()
+    )
+}
+
+/// The line an operator reads when an acceleration's contents are about to be
+/// replaced by a fresh read of the source.
+///
+/// Built the same way as [`creation_log_message`] and asserted by the same test.
+/// It names the cost as well as the cause: unlike a creation, this re-reads a
+/// table the dataset was already serving, and that is the part an operator is
+/// being asked to account for.
+#[must_use]
+pub fn rebuild_log_message(dataset: &str, cause: RebuildCause) -> String {
+    format!(
+        "Dataset '{dataset}' will have its acceleration rebuilt from the source before changes are applied, which re-reads the whole table: {}. See: {CONNECTOR_DOCS}",
         cause.reason()
     )
 }
@@ -923,9 +943,10 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccelerationContents, AppliedLsn, CreationCause, CreationInputs, RebuildCause,
-        RecordedPosition, SourceReadPolicy, UnusableReason, creation_cause, creation_log_message,
-        rebuild_cause, recorded_position_is_ahead_of_source,
+        AccelerationContents, AppliedLsn, CONNECTOR_DOCS, CreationCause, CreationInputs,
+        RebuildCause, RecordedPosition, SourceReadPolicy, UnusableReason, creation_cause,
+        creation_log_message, rebuild_cause, rebuild_log_message,
+        recorded_position_is_ahead_of_source,
     };
 
     /// A slot that reaches everything, so a case varies only what it is about.
@@ -1268,34 +1289,65 @@ mod tests {
         }
     }
 
-    /// The creation line is the only explanation an operator gets for a full
-    /// re-read of their source, so it must carry all three of the things they
-    /// would act on. Asserted on the composed string, not on `reason()` alone,
-    /// because dropping the dataset or the link is a reword of the wrapper.
+    /// These lines are the only explanation an operator gets for a full read of
+    /// their source, so each must carry all three of the things they would act
+    /// on. Asserted on the composed string, not on `reason()` alone, because
+    /// dropping the dataset or the link is a reword of the wrapper — which is
+    /// exactly how the rebuild line came to have neither.
     #[test]
-    fn a_creation_message_names_the_dataset_the_cause_and_where_to_read_more() {
-        for cause in [
+    fn a_source_read_message_names_the_dataset_the_cause_and_where_to_read_more() {
+        let messages: Vec<(String, &str, String)> = [
             CreationCause::EphemeralAcceleration,
             CreationCause::SnapshotAlways,
             CreationCause::TableAdded,
             CreationCause::SlotCreated,
-        ] {
-            let message = creation_log_message("sales.orders", cause);
+        ]
+        .into_iter()
+        .map(|cause| {
+            (
+                creation_log_message("sales.orders", cause),
+                cause.reason(),
+                format!("{cause:?}"),
+            )
+        })
+        .chain(
+            [
+                RebuildCause::NoRecord,
+                RebuildCause::ForeignSource,
+                RebuildCause::Unreadable,
+                RebuildCause::RewoundSource,
+                RebuildCause::AcknowledgedPast,
+                RebuildCause::RetentionLost,
+                RebuildCause::EmptyWithUsablePosition,
+                RebuildCause::UnprovenContentsWithUsablePosition,
+            ]
+            .into_iter()
+            .map(|cause| {
+                (
+                    rebuild_log_message("sales.orders", cause),
+                    cause.reason(),
+                    format!("{cause:?}"),
+                )
+            }),
+        )
+        .collect();
+
+        for (message, reason, name) in &messages {
             assert!(
                 message.contains("'sales.orders'"),
-                "{cause:?} message does not name the dataset it happened to: {message}"
+                "{name} message does not name the dataset it happened to: {message}"
             );
             assert!(
-                message.contains(cause.reason()),
-                "{cause:?} message does not say which condition asked for the read: {message}"
+                message.contains(reason),
+                "{name} message does not say which condition asked for the read: {message}"
             );
             assert!(
-                message.contains("https://spiceai.org/docs/components/data-connectors/postgres"),
-                "{cause:?} message does not say where to read about changing it: {message}"
+                message.contains(CONNECTOR_DOCS),
+                "{name} message does not say where to read about changing it: {message}"
             );
             assert!(
                 !message.contains('\n'),
-                "{cause:?} message spans more than one line: {message}"
+                "{name} message spans more than one line: {message}"
             );
         }
     }

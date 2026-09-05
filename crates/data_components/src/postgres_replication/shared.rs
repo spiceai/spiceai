@@ -2633,8 +2633,14 @@ async fn attach_member(
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
             rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
-            "this acceleration will be rebuilt from the source before changes are applied: {}",
-            rebuild_cause.map_or("", super::RebuildCause::reason)
+            "{}",
+            // `rebuild_via_consumer` is `rebuild_cause.is_some()`, so this arm
+            // always has a cause; the fallback is unreachable rather than a
+            // default worth reading.
+            rebuild_cause.map_or_else(String::new, |cause| super::rebuild_log_message(
+                &dataset_name,
+                cause
+            ))
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
