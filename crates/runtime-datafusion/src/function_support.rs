@@ -24,26 +24,98 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_table_providers::util::supported_functions::FunctionSupport;
-use runtime_udfs_api::{
-    FunctionSupportBuilder, datafusion_nested_function_names,
-    deny_spice_specific_functions_excluding,
-};
+use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names};
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
 /// every function the `DuckDB` dialect can rewrite into native SQL (e.g.
 /// `cosine_distance` → `array_cosine_distance`, `rand` → `random()`), derived
 /// from the dialect so it tracks it automatically.
+///
+/// On top of that carve-out, the built-ins in [`DUCKDB_DENIED_BUILTINS`] are
+/// denied outright — see there for which, and why.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    deny_spice_specific_functions_excluding(&crate::dialect::duckdb_native_function_names())
+    Arc::new(duckdb_function_support())
 }
 
 /// `DuckDB` deny-list as a value, for
 /// `DuckDBTableFactory::with_function_support`. See issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
+    duckdb_function_support()
+}
+
+/// The `DataFusion` built-ins `DuckDB` must not be handed, because `DuckDB`
+/// cannot evaluate them faithfully: two have a function that looks like the one
+/// asked for but answers a different question, and one has no such function at
+/// all.
+///
+/// `regexp_match` returns the first match's *capture groups* as a list, and
+/// NULL when nothing matches. `DuckDB` has no function with those semantics:
+/// `regexp_extract(s, p, 0)` returns the whole match as a plain string, and the
+/// empty string — not NULL — when nothing matches. Translating one into the
+/// other answered a different question on both counts (issue #13809), so the
+/// call now evaluates locally, above the federated scan, where `DataFusion`'s
+/// own implementation runs. That is the same treatment, and for the same
+/// reason, that `regexp_match` already gets for `BigQuery`
+/// (see [`deny_spice_functions_for_bigquery_table_providers`]).
+///
+/// The idiom that only asks "does it match at all" —
+/// `regexp_match(…) IS [NOT] NULL` — is rewritten into `regexp_like` by
+/// [`crate::optimizer_rule::RegexpMatchNullCheckRewrite`], and `regexp_like`
+/// the `DuckDB` dialect does render natively (`regexp_matches`), so that shape
+/// keeps a boolean instead of a list either way.
+///
+/// `regexp_instr` is here for the plainer reason that `DuckDB` has no function
+/// of that name and the dialect renders none, so a federated call failed
+/// remotely with `Catalog Error: Scalar Function with name regexp_instr does not
+/// exist!` — the unknown-function failure the deny-list exists to prevent
+/// (issue #10703).
+///
+/// `regexp_count` is here because its translation is not value-preserving
+/// either, on a narrower input: the dialect renders it
+/// `len(regexp_extract_all(x, p))`, and `regexp_extract_all(NULL, p)` is NULL in
+/// `DuckDB`, so `len(NULL)` is NULL where `DataFusion` counts zero matches and
+/// answers `0`. A count that is NULL rather than `0` propagates differently
+/// through `SUM`, through `= 0`, and through a `WHERE` built on it, so an
+/// accelerated dataset gained or lost rows against an unaccelerated one
+/// (issue #13870). The dialect keeps its handler — the rewrite is right for
+/// non-NULL input and #13870 is about making it NULL-preserving so the pushdown
+/// can come back — but a denied name is never advertised as native, which
+/// [`crate::dialect::duckdb_native_function_names`] enforces.
+///
+/// `regexp_like` and `regexp_replace` are the two `DataFusion` regexp built-ins
+/// left, and both agreed with local evaluation on every input measured,
+/// including a NULL one.
+pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
+    crate::dialect::REGEXP_MATCH_NAME,
+    crate::dialect::REGEXP_INSTR_NAME,
+    crate::dialect::REGEXP_COUNT_NAME,
+];
+
+/// The deny-list for a consumer that installs the `DuckDB` dialect but wants
+/// the **plain** Spice deny-list rather than the `DuckDB` carve-out — today the
+/// `DuckLake` catalog connector, which withholds the vector UDFs because the
+/// dialect's `cosine_distance` rewrite is not value-preserving (issue #13728).
+///
+/// It still needs [`DUCKDB_DENIED_BUILTINS`]. Those are `DataFusion` built-ins,
+/// so the plain deny-list does not withhold them, and the dialect is the
+/// `DuckDB` one — which no longer renders `regexp_match` at all, so without this
+/// the call would be unparsed under its `DataFusion` name and fail remotely as
+/// an unknown function.
+#[must_use]
+pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSupport {
+    FunctionSupportBuilder::new()
+        .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
+        .build()
+}
+
+/// The one `DuckDB` policy both public accessors return, so the connector and
+/// the accelerator cannot be given different pushdown rules.
+fn duckdb_function_support() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
+        .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .build()
 }
 
