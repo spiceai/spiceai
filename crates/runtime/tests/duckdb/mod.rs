@@ -1372,8 +1372,9 @@ async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
         .await
 }
 
-/// A federated `inner_product` must answer what the kernel answers, including
-/// for a row whose dot product is not a finite number.
+/// A federated `inner_product` must answer what the kernel answers for a row
+/// whose dot product is not a finite number. (Finite results are a separate,
+/// unclosed question — #13893 — so this asserts only the non-finite contract.)
 ///
 /// `array_inner_product` hands back the `inf` or `nan` it computed, where
 /// Spice's kernel calls an undefined dot product NULL — and `DuckDB` sorts
@@ -1478,9 +1479,10 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
                 .collect();
             assert_eq!(
                 scores, expected,
-                "a federated inner_product must answer what the kernel answers: \
-                 NULL for the overflow (id 2), the NaN element (id 3) and the \
-                 infinite element (id 4), and the real value otherwise"
+                "a federated inner_product must match the kernel wherever the result \
+                 is not a finite number: NULL for the overflow (id 2), the NaN \
+                 element (id 3) and the infinite element (id 4). Finite results are \
+                 not claimed to agree exactly — see #13893"
             );
 
             let explain: Vec<RecordBatch> = rt
