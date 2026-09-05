@@ -503,8 +503,9 @@ mod tests {
         );
     }
 
-    /// Every test below drives the plan cache `Runtime::builder().build()` installs
-    /// unconditionally (`init/caching.rs`), so no cache configuration is needed to reach it.
+    /// Plans and caches one query, so a following diff has something to invalidate. The plan
+    /// cache these drive is the one `Runtime::builder().build()` installs unconditionally
+    /// (`init/caching.rs`), so no cache configuration is needed to reach it.
     async fn cache_one_plan(runtime: &Runtime) {
         const SQL: &str = "SELECT 1";
         let session = runtime.df.ctx.state();
