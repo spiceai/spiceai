@@ -333,7 +333,6 @@ mod tests {
     use crate::component::access::AccessMode;
     use crate::component::catalog::CatalogSpec;
     use crate::dataconnector::ConnectorComponent;
-    use cache::key::CacheKey;
     use std::collections::HashMap;
 
     fn catalog_component() -> ConnectorComponent {
@@ -503,29 +502,6 @@ mod tests {
         );
     }
 
-    /// Plans and caches one query, so a following diff has something to invalidate. The plan
-    /// cache these drive is the one `Runtime::builder().build()` installs unconditionally
-    /// (`init/caching.rs`), so no cache configuration is needed to reach it.
-    async fn cache_one_plan(runtime: &Runtime) {
-        const SQL: &str = "SELECT 1";
-        let session = runtime.df.ctx.state();
-        let key = CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
-        runtime
-            .df
-            .get_or_create_logical_plan(&session, Some(&key), SQL)
-            .await
-            .expect("SELECT 1 should plan");
-    }
-
-    async fn cached_plan_count(runtime: &Runtime) -> u64 {
-        let provider = runtime
-            .df
-            .plans_cache_provider()
-            .expect("the plans cache is installed unconditionally");
-        provider.checkpoint().await;
-        provider.item_count().await
-    }
-
     fn app_with_catalog(from: &str) -> Arc<App> {
         Arc::new(
             app::AppBuilder::new("catalog_reload")
@@ -548,8 +524,12 @@ mod tests {
     #[tokio::test]
     async fn replacing_a_catalog_discards_cached_plans() {
         let runtime = Arc::new(Runtime::builder().build().await);
-        cache_one_plan(&runtime).await;
-        assert_eq!(cached_plan_count(&runtime).await, 1);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
 
         Arc::clone(&runtime)
             .apply_catalog_diff(
@@ -559,8 +539,8 @@ mod tests {
             .await;
 
         assert_eq!(
-            cached_plan_count(&runtime).await,
-            0,
+            runtime.df.cached_plan_count().await,
+            Some(0),
             "a catalog whose declaration changed is re-registered with a fresh provider, so every cached plan holding the old one is stale"
         );
     }
@@ -570,7 +550,11 @@ mod tests {
     #[tokio::test]
     async fn a_reload_that_changes_no_catalog_keeps_cached_plans() {
         let runtime = Arc::new(Runtime::builder().build().await);
-        cache_one_plan(&runtime).await;
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
 
         Arc::clone(&runtime)
             .apply_catalog_diff(
@@ -579,7 +563,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(cached_plan_count(&runtime).await, 1);
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
     }
 
     /// Registering a catalog that did not exist before invalidates nothing: no cached plan can
@@ -587,7 +571,11 @@ mod tests {
     #[tokio::test]
     async fn adding_a_catalog_keeps_cached_plans() {
         let runtime = Arc::new(Runtime::builder().build().await);
-        cache_one_plan(&runtime).await;
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
 
         Arc::clone(&runtime)
             .apply_catalog_diff(
@@ -596,6 +584,6 @@ mod tests {
             )
             .await;
 
-        assert_eq!(cached_plan_count(&runtime).await, 1);
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
     }
 }

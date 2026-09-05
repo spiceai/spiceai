@@ -737,7 +737,6 @@ mod deny_list_registration_tests {
 
 #[cfg(test)]
 mod tests {
-    use cache::{CacheProvider, key::CacheKey};
     use datafusion::arrow::array::AsArray;
     use datafusion::arrow::datatypes::{DataType, Float64Type};
     use datafusion::execution::SessionStateBuilder;
@@ -1327,29 +1326,6 @@ mod tests {
         }
     }
 
-    /// Plans and caches one query, so a following diff has something to invalidate. The plan
-    /// cache these drive is the one `crate::Runtime::builder().build()` installs
-    /// unconditionally (`init/caching.rs`), so no cache configuration is needed to reach it.
-    async fn cache_one_plan(runtime: &crate::Runtime) {
-        const SQL: &str = "SELECT 1";
-        let session = runtime.df.ctx.state();
-        let key = CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
-        runtime
-            .df
-            .get_or_create_logical_plan(&session, Some(&key), SQL)
-            .await
-            .expect("SELECT 1 should plan");
-    }
-
-    async fn cached_plan_count(runtime: &crate::Runtime) -> u64 {
-        let provider = runtime
-            .df
-            .plans_cache_provider()
-            .expect("the plans cache is installed unconditionally");
-        provider.checkpoint().await;
-        provider.item_count().await
-    }
-
     fn app_with_user_functions(bodies: &[(&str, &str)]) -> Arc<app::App> {
         let mut builder = app::AppBuilder::new("function_reload").with_runtime(
             spicepod::component::runtime::Runtime {
@@ -1371,8 +1347,12 @@ mod tests {
     #[tokio::test]
     async fn redefining_a_user_function_discards_cached_plans() {
         let runtime = crate::Runtime::builder().build().await;
-        cache_one_plan(&runtime).await;
-        assert_eq!(cached_plan_count(&runtime).await, 1);
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
 
         apply_function_diff(
             &runtime,
@@ -1382,8 +1362,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            cached_plan_count(&runtime).await,
-            0,
+            runtime.df.cached_plan_count().await,
+            Some(0),
             "a redefined function is deregistered and re-registered, so a plan holding the previous one is stale"
         );
     }
@@ -1394,7 +1374,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_last_user_function_discards_cached_plans() {
         let runtime = crate::Runtime::builder().build().await;
-        cache_one_plan(&runtime).await;
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
 
         apply_function_diff(
             &runtime,
@@ -1403,14 +1387,18 @@ mod tests {
         )
         .await;
 
-        assert_eq!(cached_plan_count(&runtime).await, 0);
+        assert_eq!(runtime.df.cached_plan_count().await, Some(0));
     }
 
     /// A reload that leaves every function exactly as it was must not throw the plan cache away.
     #[tokio::test]
     async fn a_reload_that_changes_no_function_keeps_cached_plans() {
         let runtime = crate::Runtime::builder().build().await;
-        cache_one_plan(&runtime).await;
+        runtime
+            .df
+            .cache_one_plan("SELECT 1")
+            .await
+            .expect("SELECT 1 should plan");
 
         apply_function_diff(
             &runtime,
@@ -1419,6 +1407,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(cached_plan_count(&runtime).await, 1);
+        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
     }
 }

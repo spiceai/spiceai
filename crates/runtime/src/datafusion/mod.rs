@@ -5158,6 +5158,30 @@ impl DataFusion {
         }
     }
 
+    /// Plans `sql` and caches the result, so a test can then assert what invalidates the entry.
+    ///
+    /// Lives here rather than in each test module because the plan cache's own traits do, and
+    /// two modules on opposite sides of the crate assert against it.
+    #[cfg(test)]
+    pub(crate) async fn cache_one_plan(&self, sql: &str) -> Result<(), DataFusionError> {
+        let key = cache::key::CacheKey::Query(sql, None)
+            .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        let session = self.ctx.state();
+        self.get_or_create_logical_plan(&session, Some(&key), sql)
+            .await?;
+        Ok(())
+    }
+
+    /// How many logical plans the cache is holding — the counterpart to
+    /// [`Self::clear_cached_plans`]. `None` when no plans cache is installed, which a test
+    /// asserting on the count wants to fail on rather than read as an empty cache.
+    #[cfg(test)]
+    pub(crate) async fn cached_plan_count(&self) -> Option<u64> {
+        let provider = self.plans_cache_provider()?;
+        provider.checkpoint().await;
+        Some(provider.item_count().await)
+    }
+
     fn resolve_catalog_provider(
         &self,
         table_reference: &TableReference,
