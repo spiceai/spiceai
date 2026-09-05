@@ -28,9 +28,11 @@ limitations under the License.
 //! - String cells are compared after trimming `CHAR` pad / loader whitespace.
 //! - Quoted-empty `""` in a golden cell is NULL/empty (IBM TPC-H README).
 //! - Numerics: `integer`/`bigint` cells compare exactly. Floats/decimals
-//!   match when `|Δ| < 1e-8`, or when `|Δ|` is under one unit in the last
+//!   match when `|Δ| < 1e-8`, when `|Δ|` is under one unit in the last
 //!   place of the coarser printed fractional scale (scale ≥ 2; q01 `AVG`
-//!   scale 6, q06). IBM README is absolute `1e-9` only.
+//!   scale 6, q06), or when the relative error is `< 1e-14` (q01
+//!   `sum_charge` `DataFusion`/`DuckDB` conversion). IBM README is
+//!   absolute `1e-9` only.
 //!
 //! Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 
@@ -41,6 +43,11 @@ const NUMERIC_ABS_EPSILON: f64 = 1e-8;
 /// Minimum printed fractional length treated as a decimal scale. A single
 /// digit (`.0`, `.1`) is float formatting, not `decimal(p, 1)`.
 const MIN_DECIMAL_SCALE: i32 = 2;
+
+/// Relative cap for large `DECIMAL` vs float64 conversion (q01 `sum_charge`
+/// `|Δ| ≈ 1.4e-6` on ~`5.3e8` is ~`3e-15`). `1e-14` of a `1e9` magnitude
+/// is `1e-5`, so an off-by-one `COUNT` and a `0.50` money error still miss.
+const NUMERIC_REL_EPSILON: f64 = 1e-14;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnSpec {
@@ -172,6 +179,7 @@ pub fn types_compatible(actual: &str, expected: &str) -> bool {
 }
 
 #[must_use]
+#[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
 pub fn values_match(actual: &str, expected: &str) -> bool {
     cells_match(actual, expected, None)
 }
@@ -185,7 +193,7 @@ fn cells_match(actual: &str, expected: &str, type_token: Option<&str>) -> bool {
     }
 
     let kind = type_token.map(normalize_type);
-    if matches!(kind, Some("integer") | Some("bigint")) {
+    if matches!(kind, Some("integer" | "bigint")) {
         return integers_equal(actual, expected);
     }
     if kind == Some("string") {
@@ -240,7 +248,11 @@ fn numerics_close(actual: f64, expected: f64, actual_s: &str, expected_s: &str) 
     if abs_diff < NUMERIC_ABS_EPSILON {
         return true;
     }
-    same_at_decimal_scale(abs_diff, actual_s, expected_s)
+    if same_at_decimal_scale(abs_diff, actual_s, expected_s) {
+        return true;
+    }
+    let magnitude = actual.abs().max(expected.abs());
+    abs_diff < NUMERIC_REL_EPSILON * magnitude
 }
 
 /// `DataFusion` prints `decimal` at its scale (q01 `AVG_*` is 6 places);
@@ -469,9 +481,11 @@ mod tests {
     }
 
     #[test]
-    fn decimal_scale_covers_q01_sum_without_relative_epsilon() {
+    fn decimal_scale_covers_q01_sum_without_loose_relative_epsilon() {
         // `|Δ| ≈ 1.2e-6` at printed scale 2 is under one cent (`0.01`).
         assert!(values_match("532348211.65", "532348211.6499988"));
+        // q01 `sum_charge`: DF decimal vs DuckDB float64 (`|Δ| ≈ 1.4e-6`).
+        assert!(values_match("526165934.000839", "526165934.0008404"));
         assert!(!values_match("14876", "14877"));
     }
 

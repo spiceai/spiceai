@@ -31,7 +31,7 @@ time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
 Before compare lifts (same pin): **PASS 5 | FAIL 14 | SKIP 0 | ERROR 3**.
 After value-preserving compare lifts: **PASS 15 | FAIL 4**. Quoted-empty
-`""` decode then flips q17 → **PASS 16 | FAIL 3**. Isthmus `VarChar`
+`""` decode then flips q17 (measured) → **PASS 16 | FAIL 3**. Isthmus `VarChar`
 literals no longer ERROR after DF #215. Remaining ERRORs are non-Value
 function arguments (q07, q08, q09). Per-query notes and known-fail
 flips: [`RESULTS.md`](RESULTS.md).
@@ -75,10 +75,11 @@ cosmetics — values must still match:
 - column names are not compared (plan alias vs `DuckDB` name; IBM Rust SDK
   also skips names)
 - string cells are trimmed (`CHAR` padding)
-- numeric ε is absolute `1e-8`, or one unit in the last place of the
-  coarser printed fractional scale when that scale is at least 2
-  (`decimal` vs `DuckDB` float; IBM documents absolute `1e-9`).
-  `integer`/`bigint` cells compare exactly. Quoted-empty `""` is NULL.
+- numeric ε is absolute `1e-8`, one unit in the last place of the
+  coarser printed fractional scale when that scale is at least 2, or
+  relative `1e-14` (`decimal` vs `DuckDB` float; IBM documents absolute
+  `1e-9`). `integer`/`bigint` cells compare exactly. Quoted-empty `""`
+  is NULL.
 
 Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
 

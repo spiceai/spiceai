@@ -18,7 +18,7 @@ Re-run the command below to regenerate `results/mode-a-tpch.json`
 | spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-04T23:36:44Z → 23:36:48Z (PASS 15 / FAIL 4); q17 decode expected PASS 16 / FAIL 3 |
+| Run | 2026-09-05T04:25:41Z → 04:25:45Z |
 
 ## Counts
 
@@ -44,15 +44,31 @@ cargo run -p spice-substrait-compliance -- \
   --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
 
 DataFusion fork rev: 6006901cb602d845ee1441269d6eaa142c2580a6
-15/4/3  pass/fail/skip+error  total=22  pass_rate=68.2%
-  passed=15 failed=4 skipped=0 errored=3
+  FAIL  q01  (cell (2,2) '742308.00' != '742802.0')
+  PASS  q02
+  PASS  q03
+  PASS  q04
+  PASS  q05
+  PASS  q06
+  ERROR q07  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
+  ERROR q08  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
+  ERROR q09  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
+  PASS  q10
+  PASS  q11
+  PASS  q12
+  PASS  q13
+  PASS  q14
+  PASS  q15
+  PASS  q16
+  PASS  q17
+  PASS  q18
+  PASS  q19
+  PASS  q20
+  FAIL  q21  (row count 0 != 1)
+  FAIL  q22  (column 0 type 'string' != 'integer')
+16/3/3  pass/fail/skip+error  total=22  pass_rate=72.7%
+  passed=16 failed=3 skipped=0 errored=3
 ```
-
-Measured 2026-09-04 against the looser numeric compare (q17 still FAIL on
-`""`). This revision keeps those 15 PASSes and decodes golden `""` as
-NULL, so the expected headline is **PASS 16 | FAIL 3 | SKIP 0 | ERROR 3**
-(q17 flips; q01 / q21 / q22 unchanged). Re-run the command to replace
-this block with a new measurement.
 
 Pre-#215 baseline on the same harness (same IBM tag, older DF pin
 `f9a635e6b580d5fe6ed0a70975e36014ea86c476`): **PASS 1 | FAIL 7 | SKIP 0 | ERROR 14 | Total 22**.
@@ -65,7 +81,8 @@ Harness compare in `src/compare.rs` now:
 - does not compare column names (plan alias vs DuckDB; IBM Rust SDK skips names)
 - trims `CHAR` padding on string cells
 - numerics: `integer`/`bigint` exactly; floats/decimals use absolute ε
-  `1e-8` or one unit at the coarser printed scale (scale ≥ 2)
+  `1e-8`, one unit at the coarser printed scale (scale ≥ 2), or relative
+  `1e-14`
 - quoted-empty `""` is NULL/empty (IBM TPC-H README)
 
 IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These
