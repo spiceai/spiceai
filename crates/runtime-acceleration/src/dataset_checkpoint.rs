@@ -26,6 +26,26 @@ pub trait DatasetCheckpointer: Send + Sync {
     async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
     async fn get_refresh_sql(&self) -> Result<Option<String>>;
 
+    /// Rewrites the recorded schema without recording a refresh.
+    ///
+    /// `checkpoint` writes the schema and the refresh timestamp together, so a caller
+    /// that only needs to correct a stored schema — a repair on the snapshot restore
+    /// path, say — would also tell the refresh scheduler the data was just refreshed.
+    /// `RefreshTask::startup_next_refresh` reads that timestamp under
+    /// [`RefreshMode::Full`], so an overdue dataset would be deferred by up to a full
+    /// `refresh_check_interval`. This writes `schema_json` alone, leaving the refresh
+    /// timestamp, the stored refresh SQL, and the creation time as they were.
+    ///
+    /// A dataset with no checkpoint row is left without one: creating a row here would
+    /// stamp it with a fresh timestamp, which is the deferral this exists to avoid.
+    ///
+    /// Deliberately has no default implementation. This trait reaches its call sites as
+    /// `Arc<dyn DatasetCheckpointer>`, and a defaulted method that implementations
+    /// silently inherit compiles and then does nothing at runtime.
+    ///
+    /// [`RefreshMode::Full`]: https://spiceai.org/docs/components/data-accelerators#refresh-mode
+    async fn set_schema(&self, schema: &SchemaRef) -> Result<()>;
+
     /// Discards this dataset's checkpoint, so the next refresh treats the accelerated
     /// table as fresh.
     ///

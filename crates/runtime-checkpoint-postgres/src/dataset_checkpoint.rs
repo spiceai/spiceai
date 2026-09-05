@@ -140,6 +140,23 @@ impl PostgresDatasetCheckpointer {
         Ok(())
     }
 
+    async fn set_schema_inner(&self, schema: &SchemaRef) -> Result<(), CheckpointError> {
+        let pool = &self.pool;
+        let conn = pool.connect_direct().await.map_err(store_error)?;
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+
+        // No upsert: an absent row must stay absent rather than gain a fresh
+        // `updated_at`, and `refresh_sql`/`created_at`/`updated_at` are untouched.
+        let update =
+            format!("UPDATE {CHECKPOINT_TABLE_NAME} SET schema_json = $2 WHERE dataset_name = $1");
+        conn.conn
+            .execute(&update, &[&self.dataset_name, &schema_json])
+            .await
+            .map_err(store_error)?;
+
+        Ok(())
+    }
+
     async fn migrate_postgres(pool: &PostgresConnectionPool) -> Result<(), CheckpointError> {
         let conn = pool.connect_direct().await.map_err(store_error)?;
         conn.conn
@@ -221,6 +238,13 @@ impl DatasetCheckpointer for PostgresDatasetCheckpointer {
         self.checkpoint_inner(schema, refresh_sql)
             .await
             .map_err(Into::into)
+    }
+
+    async fn set_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        self.set_schema_inner(schema).await.map_err(Into::into)
     }
 
     async fn get_schema(

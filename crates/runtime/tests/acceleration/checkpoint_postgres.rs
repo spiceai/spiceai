@@ -18,6 +18,7 @@ use crate::acceleration::wait_for_checkpoints;
 use anyhow::anyhow;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
 use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
@@ -26,6 +27,9 @@ use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use std::{collections::HashMap, sync::Arc};
+
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_checkpoint_postgres::PostgresDatasetCheckpointer;
 
 use crate::utils::test_request_context;
 use crate::{
@@ -147,4 +151,116 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+/// A schema repair must correct the recorded schema without telling the refresh scheduler
+/// the data was just refreshed. Regression test for #13817.
+///
+/// Drives the real `PostgresDatasetCheckpointer` against a `PostgreSQL` container: the
+/// checkpoint crate itself has no test harness, and a container-dependent unit test there
+/// would run under `make nextest`, which has no database.
+#[tokio::test]
+async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let port: usize = get_random_port()?;
+    let running_container = common::start_postgres_docker_container(port).await?;
+
+    let pool = Arc::new(common::get_postgres_connection_pool(port, None).await?);
+    let checkpointer =
+        PostgresDatasetCheckpointer::try_new(Arc::clone(&pool), "ds_13817".to_string())
+            .await
+            .map_err(|e| anyhow!("Failed to open the checkpoint table: {e}"))?;
+
+    let original = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    // What a repair writes back: the same columns, `name` no longer nullable.
+    let repaired = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+
+    checkpointer
+        .checkpoint(&original, Some("SELECT 1"))
+        .await
+        .map_err(|e| anyhow!("Failed to seed the checkpoint: {e}"))?;
+
+    // Backdate the recorded refresh by seven days, as a dataset bootstrapping from a
+    // legacy snapshot would be.
+    pool.connect_direct()
+        .await
+        .map_err(|e| anyhow!("Failed to connect to PostgreSQL: {e}"))?
+        .conn
+        .execute(
+            "UPDATE spice_sys_dataset_checkpoint SET updated_at = CURRENT_TIMESTAMP - INTERVAL '7 days' WHERE dataset_name = 'ds_13817'",
+            &[],
+        )
+        .await?;
+
+    let before = checkpointer
+        .last_checkpoint_time()
+        .await
+        .map_err(|e| anyhow!("Failed to read the checkpoint time: {e}"))?
+        .ok_or_else(|| anyhow!("Expected a checkpoint time"))?;
+
+    checkpointer
+        .set_schema(&repaired)
+        .await
+        .map_err(|e| anyhow!("Failed to write the schema: {e}"))?;
+
+    // Read back through a fresh checkpointer over the same store: acceptance is what the
+    // row holds, not what the call returned.
+    let reader = PostgresDatasetCheckpointer::try_new(Arc::clone(&pool), "ds_13817".to_string())
+        .await
+        .map_err(|e| anyhow!("Failed to reopen the checkpoint table: {e}"))?;
+
+    let after = reader
+        .last_checkpoint_time()
+        .await
+        .map_err(|e| anyhow!("Failed to read the checkpoint time: {e}"))?
+        .ok_or_else(|| anyhow!("Expected a checkpoint time"))?;
+    assert_eq!(
+        after, before,
+        "a schema-only write must leave the freshness clock alone"
+    );
+
+    assert_eq!(
+        reader
+            .get_schema()
+            .await
+            .map_err(|e| anyhow!("Failed to read the schema: {e}"))?
+            .ok_or_else(|| anyhow!("Expected a stored schema"))?,
+        repaired,
+        "the repaired schema must be the one stored"
+    );
+
+    assert_eq!(
+        reader
+            .get_refresh_sql()
+            .await
+            .map_err(|e| anyhow!("Failed to read the refresh SQL: {e}"))?,
+        Some("SELECT 1".to_string()),
+        "a schema-only write must preserve the stored refresh SQL"
+    );
+
+    // A dataset with no checkpoint must not gain one: a row created here would carry a
+    // fresh `updated_at`, which is the deferral the schema-only write exists to avoid.
+    let absent = PostgresDatasetCheckpointer::try_new(Arc::clone(&pool), "ds_13817_absent".into())
+        .await
+        .map_err(|e| anyhow!("Failed to open the checkpoint table: {e}"))?;
+    absent
+        .set_schema(&repaired)
+        .await
+        .map_err(|e| anyhow!("Failed to write the schema: {e}"))?;
+    assert!(
+        !absent.exists().await,
+        "a schema-only write must not create a checkpoint row"
+    );
+
+    running_container.remove().await?;
+
+    Ok(())
 }
