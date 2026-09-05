@@ -551,13 +551,14 @@ async fn apply_function_diff_inner(
             }
         }
     }
-    let registered_any = !registered_function_names.is_empty();
+    // Computed before `registered_function_names` is moved into the deny list.
+    let changed = !registered_function_names.is_empty() || !functions_to_drop.is_empty();
     add_user_functions_to_deny_list(registered_function_names);
     for next in functions_to_expose_as_tools {
         maybe_register_function_as_tool(runtime, &next).await;
     }
 
-    registered_any || !functions_to_drop.is_empty()
+    changed
 }
 
 /// Names of UDFs whose invocation can execute external code or make RPC/API
@@ -1338,8 +1339,6 @@ mod tests {
     /// answer.
     #[tokio::test]
     async fn function_diff_discards_cached_plans_so_a_redefined_body_answers() {
-        use cache::CacheProvider;
-
         /// One `functions:`-declared SQL scalar function, `myscale(x)`, with
         /// the given body — parsed from YAML so the declaration is the same
         /// shape a spicepod produces.
