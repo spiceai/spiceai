@@ -404,8 +404,9 @@ fn parse_typed_header_field(field: &str) -> Option<ColumnSpec> {
 }
 
 /// IBM TPC-H README type vocabulary, plus the aliases [`normalize_type`]
-/// already accepts. Parameterised `decimal(p,s)` / `numeric(p,s)` /
-/// `varchar(n)` / `char(n)` are valid; empty or unknown tokens are not.
+/// already accepts. Parameterised `decimal(p,s)` / `numeric(p,s)` require
+/// precision `1..=38` and scale `0..=precision`; `varchar(n)` / `char(n)`
+/// take a length. Empty, out-of-range, or unknown tokens are not valid.
 fn is_supported_type_token(token: &str) -> bool {
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -480,16 +481,28 @@ fn parameterized_type_params_ok(base: &str, inner: &str) -> bool {
 }
 
 fn decimal_type_params_ok(inner: &str) -> bool {
+    // Arrow `Decimal128` / IBM TPC-H money columns: precision 1..=38.
+    const MIN_PRECISION: u32 = 1;
+    const MAX_PRECISION: u32 = 38;
+
     let mut parts = inner.split(',').map(str::trim);
-    let Some(precision) = parts.next().filter(|part| !part.is_empty()) else {
+    let Some(precision_str) = parts.next().filter(|part| !part.is_empty()) else {
         return false;
     };
-    if precision.parse::<i32>().is_err() {
+    let Ok(precision) = precision_str.parse::<u32>() else {
+        return false;
+    };
+    if !(MIN_PRECISION..=MAX_PRECISION).contains(&precision) {
         return false;
     }
     match parts.next() {
         None => true,
-        Some(scale) => scale.parse::<i32>().is_ok() && parts.next().is_none(),
+        Some(scale_str) => {
+            let Ok(scale) = scale_str.parse::<u32>() else {
+                return false;
+            };
+            scale <= precision && parts.next().is_none()
+        }
     }
 }
 
@@ -883,6 +896,46 @@ mod tests {
         assert_eq!(table.columns[0].name, "avg_qty");
         assert_eq!(table.columns[0].type_token, "decimal(15,6)");
         assert!(table.rows.is_empty());
+    }
+
+    #[test]
+    fn invalid_decimal_params_are_parse_errors() {
+        // Precision 1..=38 and scale 0..=precision; invalid params are not a
+        // typed header and must not type-check as `double`.
+        assert_eq!(
+            parse_typed_csv("n:decimal(-1,2)\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv("n:decimal(0,2)\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv("n:decimal(5,6)\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv("n:decimal()\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+        assert_eq!(
+            parse_typed_csv("n:numeric(0,2)\n"),
+            Err(ParseTypedCsvError::MissingTypedHeader)
+        );
+    }
+
+    #[test]
+    fn header_only_decimal_golden_passes_empty_actual() {
+        let expected =
+            parse_typed_csv("n:decimal(15,2)\n").expect("header-only decimal golden");
+        assert_eq!(expected.columns[0].type_token, "decimal(15,2)");
+        assert!(expected.rows.is_empty());
+
+        let actual = TableData {
+            columns: expected.columns.clone(),
+            rows: Vec::new(),
+        };
+        assert_eq!(compare(&actual, &expected), None);
     }
 
     #[test]
