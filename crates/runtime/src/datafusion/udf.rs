@@ -1093,7 +1093,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                support.supports(&make_named_expr("btrim")),
+                support.supports(&make_named_expr("btrim"), None),
                 !denied,
                 "btrim pushdown for {backend} is wrong: expected denied={denied}"
             );
@@ -1114,16 +1114,16 @@ mod tests {
         ] {
             for name in &builtin_denied_names() {
                 assert!(
-                    !support.supports(&make_named_expr(name)),
+                    !support.supports(&make_named_expr(name), None),
                     "{name} must stay denied for {backend}"
                 );
             }
             assert!(
-                !support.supports(&make_named_expr(json_name.as_str())),
+                !support.supports(&make_named_expr(json_name.as_str()), None),
                 "{json_name} must stay denied for {backend}"
             );
             assert!(
-                support.supports(&make_named_expr("upper")),
+                support.supports(&make_named_expr("upper"), None),
                 "an ordinary function must still federate to {backend}"
             );
         }

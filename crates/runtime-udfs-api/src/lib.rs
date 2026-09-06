@@ -420,7 +420,7 @@ mod tests {
         let support = FunctionSupportBuilder::new().build();
 
         assert!(
-            !support.supports(&call("early_user_fn_udfs_api", 1)),
+            !support.supports(&call("early_user_fn_udfs_api", 1), None),
             "a user function in the deny-list snapshot must not federate"
         );
     }
@@ -433,7 +433,7 @@ mod tests {
         let _registered = Registered::new("late_user_fn_udfs_api");
 
         assert!(
-            !support.supports(&call("late_user_fn_udfs_api", 1)),
+            !support.supports(&call("late_user_fn_udfs_api", 1), None),
             "a user function registered after the support was built must not federate"
         );
     }
@@ -446,7 +446,7 @@ mod tests {
         drop(Registered::new("transient_user_fn_udfs_api"));
 
         assert!(
-            support.supports(&call("transient_user_fn_udfs_api", 1)),
+            support.supports(&call("transient_user_fn_udfs_api", 1), None),
             "an unregistered name is not a user function and has nothing to refuse it"
         );
     }
@@ -456,7 +456,7 @@ mod tests {
         let support = FunctionSupportBuilder::new().build();
 
         assert!(
-            support.supports(&call("some_remote_fn_udfs_api", 1)),
+            support.supports(&call("some_remote_fn_udfs_api", 1), None),
             "the deny-list must not refuse a name it has no reason to"
         );
     }
@@ -467,23 +467,28 @@ mod tests {
     /// than by `with_scalar_call_support` afterwards.
     #[test]
     fn a_backend_per_call_check_composes_with_the_live_user_function_check() {
-        let one_argument_only: ScalarCallSupport =
-            Arc::new(|call: &ScalarFunction| call.args.len() == 1);
+        let one_argument_only: ScalarCallSupport = Arc::new(
+            // The scope is the backend's to read; this check answers by arity
+            // alone, which is what makes it a clean probe of composition.
+            |call: &ScalarFunction, _scope: Option<&datafusion::common::DFSchema>| {
+                call.args.len() == 1
+            },
+        );
         let support = FunctionSupportBuilder::new()
             .scalar_call(Arc::clone(&one_argument_only))
             .build();
         let _registered = Registered::new("composed_user_fn_udfs_api");
 
         assert!(
-            support.supports(&call("translatable_fn_udfs_api", 1)),
+            support.supports(&call("translatable_fn_udfs_api", 1), None),
             "a call shape the backend declared it can translate must still federate"
         );
         assert!(
-            !support.supports(&call("translatable_fn_udfs_api", 2)),
+            !support.supports(&call("translatable_fn_udfs_api", 2), None),
             "the backend's own per-call check must survive the one `build` installs"
         );
         assert!(
-            !support.supports(&call("composed_user_fn_udfs_api", 1)),
+            !support.supports(&call("composed_user_fn_udfs_api", 1), None),
             "a late-registered user function must be refused even in a shape the backend accepts"
         );
     }
