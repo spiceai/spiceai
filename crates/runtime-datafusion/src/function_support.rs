@@ -83,6 +83,10 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .build()
+        // The builder carries the scalar hook; the aggregate and window hooks
+        // have no builder method yet, so they are installed on the built value.
+        .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
+        .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
 }
 
 /// `SQLite`-flavored deny-list as a value, for

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
@@ -214,6 +214,27 @@ pub fn bigquery_native_function_names() -> Vec<&'static str> {
 #[must_use]
 pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
     bigquery::can_translate(call)
+}
+
+/// Whether the `BigQuery` dialect can translate this particular aggregate call.
+///
+/// An aggregate call carries its `FILTER`, `ORDER BY` and `DISTINCT`, and the
+/// dialect can rewrite some of those shapes and not others. The deny-list
+/// installs this so a shape it cannot rewrite faithfully is left to evaluate
+/// locally instead of being unparsed into a different answer.
+#[must_use]
+pub fn bigquery_can_translate_aggregate(call: &AggregateFunction) -> bool {
+    bigquery::can_translate_aggregate(call)
+}
+
+/// Whether the `BigQuery` dialect can translate this particular window call.
+///
+/// A `FILTER` on a window call reaches no rewriting at all, so it renders
+/// verbatim into SQL `BigQuery` refuses. The deny-list installs this so the window
+/// evaluates locally instead.
+#[must_use]
+pub fn bigquery_can_translate_window(call: &WindowFunction) -> bool {
+    bigquery::can_translate_window(call)
 }
 
 /// Creates a `BigQuery` dialect that also rewrites the Spice JSON functions
