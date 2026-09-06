@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slot: [1, 2, 3, 4]
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     runs-on: spiceai-macos
     timeout-minutes: 30
     steps:
@@ -29,6 +29,7 @@ jobs:
           ps -axo pid,ppid,etime,comm | awk 'NR == 1 || /Runner.Worker|Runner.Listener|cargo|rustc|clang|ld$/'
           du -x -k -d 1 "$root" 2>/dev/null || true
           du -x -k -d 2 "$RUNNER_WORKSPACE" 2>/dev/null || true
+          du -x -k -d 2 "$root/_tool" 2>/dev/null || true
           python3 - <<'PYTHON'
           import os, time, collections
           from pathlib import Path
@@ -47,7 +48,7 @@ jobs:
                           f = Path(sub, name)
                           s = f.lstat()
                           age = (time.time() - s.st_mtime) / 86400
-                          bucket = 'older_than_8d' if age >= 8 else 'within_8d'
+                          bucket = 'older_than_8d' if age >= 8 else '1d_to_8d' if age >= 1 else 'within_1d'
                           profile = f.relative_to(path).parts[0]
                           totals[(profile, bucket)][0] += 1
                           totals[(profile, bucket)][1] += s.st_blocks * 512
