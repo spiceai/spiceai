@@ -289,16 +289,32 @@ pub fn can_translate_aggregate(call: &AggregateFunction) -> bool {
 
 /// Whether the `BigQuery` dialect can translate this particular *window* call.
 ///
-/// A `FILTER` on a window call has no rewriting at all — the dialect's
-/// aggregate handling is not reached for one — so it renders verbatim and
-/// `BigQuery` refuses the statement. Measured through the runtime:
-/// `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federates and
-/// comes back `Syntax error: Expected ")" but got "("`.
+/// Nothing in the dialect's *aggregate* handling is reached for a window call,
+/// so anything that handling exists to rewrite renders verbatim here and
+/// `BigQuery` refuses the statement. Two of those, both measured through the
+/// runtime against a real project:
 ///
-/// Refusing it here leaves the window for the local engine, which answers it.
+/// * a `FILTER`, which has no window rewriting at all —
+///   `SELECT COUNT(id) FILTER (WHERE id > 1) OVER () FROM advances` federates and
+///   comes back `Syntax error: Expected ")" but got "("`.
+/// * a [`PERCENTILE_REWRITES`] name. `MEDIAN(x)` reaches `BigQuery` as
+///   `PERCENTILE_CONT` *only* through the aggregate override, so in window
+///   position the `DataFusion` name goes out as written:
+///   `SELECT MEDIAN(requested_amount) OVER (PARTITION BY type) FROM payments_stream`
+///   answers `Function not found: median`, and the `approx_percentile_cont`
+///   spelling answers the same for its own name. The aggregate form of the same
+///   call is rewritten and works, which is what makes the gap easy to miss.
+///
+/// Refusing them here leaves the window for the local engine, which answers it.
 #[must_use]
 pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
-    call.params.filter.is_none()
+    if call.params.filter.is_some() {
+        return false;
+    }
+    let name = call.fun.name();
+    !PERCENTILE_REWRITES
+        .iter()
+        .any(|rewritten| name.eq_ignore_ascii_case(rewritten))
 }
 
 /// Whether the `BigQuery` dialect can translate this call, for the pushdown
