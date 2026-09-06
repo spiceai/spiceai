@@ -82,12 +82,17 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     let mut excluded = 0usize;
     let mut fail = 0usize;
     let mut engine_err = 0usize;
+    let mut order_unchecked = 0usize;
 
     for r in results {
         let (status, detail) = match &r.outcome {
             ParityOutcome::Pass => {
                 pass += 1;
                 ("PASS", String::new())
+            }
+            ParityOutcome::OrderUnchecked { reasons } => {
+                order_unchecked += 1;
+                ("ORDER_UNCHECKED", reasons.join("; "))
             }
             ParityOutcome::Excluded { reason } => {
                 excluded += 1;
@@ -116,12 +121,17 @@ pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Res
     writeln!(md).ok();
     writeln!(md, "- pass: {pass}").ok();
     writeln!(md, "- excluded (justified): {excluded}").ok();
+    writeln!(
+        md,
+        "- order unchecked (content compared, sort not): {order_unchecked}"
+    )
+    .ok();
     writeln!(md, "- fail: {fail}").ok();
     writeln!(md, "- engine_error: {engine_err}").ok();
     writeln!(
         md,
         "- total reported: {}",
-        pass + excluded + fail + engine_err
+        pass + excluded + order_unchecked + fail + engine_err
     )
     .ok();
     writeln!(md, "- inventory size: {}", inventory.len()).ok();
@@ -167,6 +177,10 @@ pub fn summary_line(results: &[RunResult]) -> String {
         .iter()
         .filter(|r| matches!(r.outcome, ParityOutcome::Excluded { .. }))
         .count();
+    let order_unchecked = results
+        .iter()
+        .filter(|r| matches!(r.outcome, ParityOutcome::OrderUnchecked { .. }))
+        .count();
     let fail = results
         .iter()
         .filter(|r| {
@@ -177,7 +191,8 @@ pub fn summary_line(results: &[RunResult]) -> String {
         })
         .count();
     format!(
-        "correctness summary: pass={pass} excluded={excluded} fail={fail} total={}",
+        "correctness summary: pass={pass} excluded={excluded} \
+         order_unchecked={order_unchecked} fail={fail} total={}",
         results.len()
     )
 }
