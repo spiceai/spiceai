@@ -915,7 +915,7 @@ mod tests {
             let name = udf.name().to_string();
             let expr = make_json_expr(udf);
             assert!(
-                !support.supports(&expr),
+                !support.supports(&expr, None),
                 "{name} should be denied by deny_spice_specific_functions"
             );
         }
@@ -939,7 +939,7 @@ mod tests {
             let name = udf.name().to_string();
             let expr = make_json_expr(udf);
             assert!(
-                !support.supports(&expr),
+                !support.supports(&expr, None),
                 "{name} should be denied by deny_spice_specific_functions"
             );
         }
@@ -964,12 +964,12 @@ mod tests {
         let json_name = json_get_str_udf().name().to_string();
         for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is a Spice-only function and must be denied"
             );
         }
         assert!(
-            support.supports(&make_named_expr("upper")),
+            support.supports(&make_named_expr("upper"), None),
             "non-Spice functions must not be denied"
         );
     }
@@ -995,14 +995,14 @@ mod tests {
             "flatten",
         ] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is incompatible with PostgreSQL and must be denied"
             );
         }
         // The exact PostgreSQL function names keep pushing down.
         for &name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
             assert!(
-                support.supports(&make_named_expr(name)),
+                support.supports(&make_named_expr(name), None),
                 "{name} matches PostgreSQL exactly and should still federate"
             );
         }
@@ -1015,24 +1015,25 @@ mod tests {
             "list_position",
         ] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} is a DataFusion-only alias with no PostgreSQL equivalent and must be denied"
             );
         }
         // Spice-only functions stay denied too.
         assert!(
-            !support.supports(&make_named_expr(EMBED_UDF_NAME)),
+            !support.supports(&make_named_expr(EMBED_UDF_NAME), None),
             "Spice-only functions must remain denied for Postgres"
         );
         // Ordinary scalar functions still federate.
         assert!(
-            support.supports(&make_named_expr("upper")),
+            support.supports(&make_named_expr("upper"), None),
             "non-array, non-Spice functions must not be denied for Postgres"
         );
         // The generic table-providers deny-list does NOT touch array functions,
         // confirming this carve-out is Postgres-specific.
         assert!(
-            deny_spice_functions_for_table_providers().supports(&make_named_expr("array_has")),
+            deny_spice_functions_for_table_providers()
+                .supports(&make_named_expr("array_has"), None),
             "the generic deny-list must not deny array functions"
         );
     }
@@ -1064,7 +1065,7 @@ mod tests {
         let support = deny_spice_functions_for_duckdb();
         for name in [COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"] {
             assert!(
-                support.supports(&make_named_expr(name)),
+                support.supports(&make_named_expr(name), None),
                 "{name} has a native DuckDB equivalent and should be pushed down"
             );
         }
@@ -1072,7 +1073,7 @@ mod tests {
         let json_name = json_get_str_udf().name().to_string();
         for name in [EMBED_UDF_NAME, json_name.as_str()] {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} has no native DuckDB equivalent and must stay denied"
             );
         }
@@ -1087,7 +1088,7 @@ mod tests {
         let support = deny_spice_specific_functions();
         for name in &builtin_denied_names() {
             assert!(
-                !support.supports(&make_named_expr(name)),
+                !support.supports(&make_named_expr(name), None),
                 "{name} must be denied by the default (backend-agnostic) deny-list"
             );
         }
@@ -1097,16 +1098,16 @@ mod tests {
     fn excluding_subtracts_only_listed_native_functions() {
         let support = deny_spice_specific_functions_excluding(&[COSINE_DISTANCE_UDF_NAME]);
         assert!(
-            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)),
+            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None),
             "explicitly-excluded cosine_distance should be allowed"
         );
         assert!(
-            !support.supports(&make_named_expr("rand")),
+            !support.supports(&make_named_expr("rand"), None),
             "rand was not excluded and must stay denied"
         );
         // An empty exclusion behaves exactly like the default deny-list.
         let default_support = deny_spice_specific_functions_excluding(&[]);
-        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)));
+        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None));
     }
 
     #[test]
@@ -1121,7 +1122,7 @@ mod tests {
         for denied in &builtin_denied_names() {
             let expected_allowed = native.contains(denied.as_str());
             assert_eq!(
-                support.supports(&make_named_expr(denied)),
+                support.supports(&make_named_expr(denied), None),
                 expected_allowed,
                 "{denied}: DuckDB allow-state must match dialect native support"
             );
@@ -1144,7 +1145,7 @@ mod tests {
         let denied_names = builtin_denied_names();
         let pushable: BTreeSet<&str> = denied_names
             .iter()
-            .filter(|name| support.supports(&make_named_expr(name)))
+            .filter(|name| support.supports(&make_named_expr(name), None))
             .map(String::as_str)
             .collect();
         assert_eq!(

@@ -221,6 +221,21 @@ ORDER BY tok""",
 FROM union_values u
 WHERE u.value = 3
 ORDER BY u.value""",
+    # A recursive CTE that generates a series and joins it to a BigQuery table.
+    # BigQuery accepts `WITH RECURSIVE` only at the top level of a statement, so
+    # every layer between the plan and the driver has to leave it there: the
+    # unparser hoists it out of the derived table it plans into, and the ADBC
+    # schema fetch must not wrap the statement it is about to describe.
+    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT steps.n, COUNT(union_values.value) AS matches
+FROM steps
+LEFT JOIN union_values ON union_values.value = steps.n
+GROUP BY steps.n
+ORDER BY steps.n""",
 }
 
 EXPECTED_ROWS = {
@@ -359,6 +374,13 @@ EXPECTED_ROWS = {
         {"tok": "b", "running": 2},
         {"tok": "c", "running": 3},
         {"tok": "d", "running": 4},
+    ],
+    # `union_values` holds [1, 1, 2, 2, 3], so the generated series meets two
+    # rows at 1, two at 2 and one at 3.
+    "recursive-cte-joined-to-a-table": [
+        {"n": 1, "matches": 2},
+        {"n": 2, "matches": 2},
+        {"n": 3, "matches": 1},
     ],
 }
 
@@ -728,6 +750,17 @@ def assert_generated_sql(name: str, sql: str) -> None:
         if "FROM (SELECT" in sql:
             raise HarnessError(
                 f"{name} binds as one SELECT for BigQuery, so it must not be scoped: {sql}"
+            )
+    if name == "recursive-cte-joined-to-a-table":
+        if not sql.lstrip().upper().startswith("WITH RECURSIVE"):
+            raise HarnessError(
+                f"the recursive CTE is not at the top level of the pushed statement, "
+                f"which is the only place BigQuery accepts one: {sql}"
+            )
+        if sql.upper().count("WITH RECURSIVE") != 1:
+            raise HarnessError(
+                f"the recursive CTE was hoisted more than once, so BigQuery is asked "
+                f"to define the same name twice: {sql}"
             )
 
 

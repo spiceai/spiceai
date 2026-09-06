@@ -312,6 +312,12 @@ pub fn can_translate_window(call: &datafusion::logical_expr::expr::WindowFunctio
 #[must_use]
 pub fn can_translate(call: &ScalarFunction, scope: Option<&datafusion::common::DFSchema>) -> bool {
     let name = call.func.name();
+    // `date_part` is rendered by the *inner* dialect, so it has no entry here —
+    // an entry would install its handler too, and a placeholder handler
+    // short-circuits the real rewrite. Only the call check belongs to us.
+    if name == "date_part" {
+        return date_part_field_is_renderable(&call.args);
+    }
     SCALAR_OVERRIDES
         .iter()
         .chain(BUILTIN_SCALAR_OVERRIDES)
@@ -414,6 +420,42 @@ pub(crate) const BUILTIN_SCALAR_OVERRIDES: &[ScalarOverride] = &[
         can_translate: array_index_is_renderable,
     },
 ];
+
+/// Whether the `date_part` field is one the dialect can name.
+///
+/// A field that is not a constant string is refused: the inner dialect cannot
+/// render it, and it would reach `BigQuery` as `date_part(…)`, which has no such
+/// function.
+///
+/// `dow` is deliberately absent, and its absence is what keeps a weekday off
+/// `BigQuery` rather than sending a wrong one. Two spellings of a weekday arrive
+/// as the *same* call — a `ScalarFunction` named `date_part` — carrying
+/// different functions: `date_part('dow', c)` resolves through the registry to
+/// `datafusion_spark`'s, which counts Sunday as 1, while `EXTRACT(DOW FROM c)` is
+/// planned straight onto `DataFusion`'s, which counts Sunday as 0. Measured on a
+/// Wednesday: `4` and `3`. The name cannot separate them, so any single rendering
+/// answers one of the two a day short. Refusing the call here leaves it above the
+/// federated scan, where each spelling keeps the value it has today — see
+/// [#13920](https://github.com/spiceai/spiceai/issues/13920), which tracks making
+/// the two agree. `doy`, `week` and `quarter` were measured to agree between the
+/// spellings and federate.
+fn date_part_field_is_renderable(args: &[Expr]) -> bool {
+    let [Expr::Literal(field, _), _operand] = args else {
+        // Not a constant field: the inner dialect cannot render it either, and
+        // it reaches `BigQuery` as `date_part(…)`, which has no such function.
+        return false;
+    };
+    let field = match field {
+        ScalarValue::Utf8(Some(field))
+        | ScalarValue::LargeUtf8(Some(field))
+        | ScalarValue::Utf8View(Some(field)) => field.to_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        field.as_str(),
+        "year" | "month" | "day" | "hour" | "minute" | "second" | "doy" | "week" | "quarter"
+    )
+}
 
 /// `array_element` is 1-based and counts from the end for a negative index.
 /// `BigQuery` has no end-relative subscript, so the fork's dialect renders only
@@ -1824,6 +1866,39 @@ mod tests {
         assert!(
             joined_directly.starts_with("WITH RECURSIVE"),
             "a directly joined generator still opens the statement: {joined_directly}"
+        );
+    }
+
+    /// Every nameable date field federates, except `dow`; a computed field does
+    /// not.
+    ///
+    /// `dow` is the exception because the two spellings of a weekday carry
+    /// different functions behind the same name — Spark's `date_part` counts
+    /// Sunday as 1, `DataFusion`'s 0, measured on a Wednesday as 4 and 3 — so no
+    /// single rendering serves both and the call has to stay local.
+    #[test]
+    fn every_nameable_date_field_federates_and_a_computed_one_does_not() {
+        let field = |name: &str| call("date_part", vec![lit(name), col("d")]);
+        for pushed in ["doy", "week", "quarter", "year", "month", "day"] {
+            assert!(
+                translates(&field(pushed)),
+                "{pushed} renders through the dialect, so it federates"
+            );
+        }
+        // `dow` is the one field the dialect will not render, because the two
+        // spellings that reach it disagree by a day (see the doc comment on
+        // `date_part_field_is_renderable`). It has to be refused *here* too: a
+        // rendering the dialect declines but federation allows is not a local
+        // fallback, it is a failed query.
+        assert!(
+            !translates(&field("dow")),
+            "dow must not federate: no single rendering serves both spellings"
+        );
+        // A field the dialect cannot name reaches BigQuery as `date_part(…)`,
+        // which it has no function for.
+        assert!(
+            !translates(&call("date_part", vec![col("part"), col("d")])),
+            "a non-constant field cannot be rendered at all"
         );
     }
 
@@ -3299,7 +3374,8 @@ mod tests {
 
         // The `date_part` fields BigQuery names differently. Without the
         // rendering these reach it as the DataFusion name and it answers
-        // `Function not found: date_part`.
+        // `Function not found: date_part` — which is why `dow`, the field that
+        // cannot be rendered, is refused federation rather than left to render.
         let day_of_week = date_scan()
             .project(vec![datafusion::functions::expr_fn::date_part(
                 lit("dow"),
@@ -3706,10 +3782,16 @@ mod tests {
                 "FILTER",
             ),
             (
-                "a day-of-week extraction is spelled DAYOFWEEK (fork PR #219)",
+                // `dow` is the one field the dialect declines. Both spellings of
+                // a weekday arrive under the name `date_part` carrying different
+                // functions — Spark's counts Sunday as 1, DataFusion's 0 — so no
+                // single rendering serves both. The verbatim `date_part` this
+                // leaves behind never reaches BigQuery: `can_translate` refuses
+                // the call, and it stays above the federated scan.
+                "a day-of-week extraction is declined, not rendered (fork PR #219)",
                 &day_of_week,
-                "EXTRACT(DAYOFWEEK FROM",
                 "date_part",
+                "DAYOFWEEK",
             ),
             (
                 // Measured: BigQuery's bare WEEK disagrees with DataFusion's ISO

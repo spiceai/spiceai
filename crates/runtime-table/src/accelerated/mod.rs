@@ -2033,7 +2033,10 @@ impl TableLayer for AcceleratedTable {
                 let function_support = deny_spice_specific_functions();
                 for (i, filter) in filters.iter().enumerate() {
                     if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
-                        && !function_support.supports(filter)
+                        // No scope: this policy is name-based only
+                        // (`deny_spice_specific_functions` installs no per-call
+                        // check), so nothing here reads an operand's type.
+                        && !function_support.supports(filter, None)
                     {
                         results[i] = TableProviderFilterPushDown::Unsupported;
                     }
@@ -2333,7 +2336,9 @@ fn filters_for_accelerator_scan(
     let mut accelerator_filters = Vec::with_capacity(filters.len());
 
     for (filter, support) in filters.iter().zip(pushdown_support.iter()) {
-        let function_supported = function_support.supports(filter);
+        // No scope, for the reason given in `supports_filters_pushdown`: this
+        // policy answers by name and never consults an operand's type.
+        let function_supported = function_support.supports(filter, None);
         let can_run_in_accelerator =
             function_supported && !matches!(support, TableProviderFilterPushDown::Unsupported);
         if can_run_in_accelerator {
