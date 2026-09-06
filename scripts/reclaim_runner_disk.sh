@@ -365,17 +365,19 @@ reclaim_stale_build_output() {
 
     if [[ "$DRY_RUN" == "1" ]]; then
       local count
-      count=$(find "$target_dir" -type f -mtime "+${days}" 2>/dev/null | wc -l | tr -d ' ')
+      count=$(find "$target_dir" -type f ! -name CACHEDIR.TAG -mtime "+${days}" 2>/dev/null | wc -l | tr -d ' ')
       info "would prune ${count} file(s) older than ${days}d from: ${target_dir}"
       pruned+=1
       continue
     fi
 
+    # Keep discovery markers, including those of nested targets, so later
+    # sweeps can still identify build output after its artifacts age out.
     info "pruning files older than ${days}d from: ${target_dir}"
     # stderr is dropped -- a walk this wide reports every unreadable entry and
     # the log is for an operator, not a debugger -- so the exit status is the
     # only signal that the prune did not do what the line above just announced.
-    if ! find "$target_dir" -type f -mtime "+${days}" -delete 2>/dev/null; then
+    if ! find "$target_dir" -type f ! -name CACHEDIR.TAG -mtime "+${days}" -delete 2>/dev/null; then
       info "failed to prune some files from: ${target_dir}"
       SWEEP_FAILURES=$((SWEEP_FAILURES + 1))
     fi
