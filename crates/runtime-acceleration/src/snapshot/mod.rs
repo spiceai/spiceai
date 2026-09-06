@@ -6740,6 +6740,14 @@ mod tests {
             Ok(None)
         }
 
+        /// The restore path this recorder serves reaches the checkpoint through
+        /// `checkpoint`, never through `set_schema`, so there is nothing for a schema
+        /// rewrite to record here and `checkpointed` stays the sink for what
+        /// `checkpoint` was handed.
+        async fn set_schema(&self, _schema: &SchemaRef) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
+
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
