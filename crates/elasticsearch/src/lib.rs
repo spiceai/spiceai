@@ -134,12 +134,11 @@ impl FieldMapping {
     #[must_use]
     pub fn is_indexed(&self) -> bool {
         match &self.index {
-            None => true,
             Some(serde_json::Value::Bool(indexed)) => *indexed,
             Some(serde_json::Value::String(indexed)) => indexed != "false",
-            // Anything else is not a value Elasticsearch produces here; read it the safe way,
-            // which is the default rather than a guess that the field is unsearchable.
-            Some(_) => true,
+            // An absent `index`, or anything else — which is not a value Elasticsearch produces
+            // here — reads as the default rather than as a guess that the field is unsearchable.
+            None | Some(_) => true,
         }
     }
 }
