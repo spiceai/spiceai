@@ -1680,7 +1680,10 @@ jobs:
     needs:
       - build
       - setup-matrix
-    timeout-minutes: 5
+    timeout-minutes: 15
+    concurrency:
+      group: github-connector-live-api
+      queue: max
 
     strategy:
       matrix:
@@ -1704,112 +1707,47 @@ jobs:
         with:
           build-path: ./build
 
-      - name: Init spice app
+      - name: Test GitHub against a local API fixture
         run: |
-          spice init test_app
+          python3 test/github/test_connector.py --spiced "$(command -v spiced)" \
+            --artifacts github-fixture-results --repeat 3
 
-      - name: Spice configure
-        working-directory: test_app
+      - name: Configure live GitHub smoke test
         run: |
+          mkdir -p test_app
+          cp test/github/github-arrow-smoke.yaml test_app/spicepod.yaml
 
-          echo "datasets:" >> spicepod.yaml
-          echo "  - from: github:github.com/spiceai/spiceai/files/trunk" >> spicepod.yaml
-          echo "    name: spiceai.files" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "      include: \"**/*.md\"" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.files LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/issues" >> spicepod.yaml
-          echo "    name: spiceai.issues" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.issues LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/pulls" >> spicepod.yaml
-          echo "    name: spiceai.pulls" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.pulls LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/commits" >> spicepod.yaml
-          echo "    name: spiceai.commits" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.commits LIMIT 20'" >> spicepod.yaml
-
-          echo "  - from: github:github.com/spiceai/spiceai/stargazers" >> spicepod.yaml
-          echo "    name: spiceai.stargazers" >> spicepod.yaml
-          echo "    params:" >> spicepod.yaml
-          echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
-          echo "    acceleration:" >> spicepod.yaml
-          echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.stargazers LIMIT 20'" >> spicepod.yaml
-
-          cat spicepod.yaml
+      - name: Allocate runtime ports
+        uses: ./.github/actions/allocate-spice-ports
 
       - name: Start spice runtime
         working-directory: test_app
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          spice run &> spice.log &
-          # time to accelerate added datasets
-          sleep 20
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
-      - name: Wait for dataset to be ready
+      - name: Wait for all accelerated datasets
         uses: ./.github/actions/wait-for-spice-ready
         with:
           working-directory: test_app
-          timeout: '60'
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '240'
 
-      - name: Run test query (issues)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;'
+      - name: Verify live GitHub rows and file content
+        run: |
+          python3 test/github/check_live.py --endpoint "${SPICE_HTTP_ENDPOINT}" \
+            --artifacts github-live-results
 
-      - name: Run test query (pulls)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
+      - name: Upload GitHub test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          fail-on-error: true
-          query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
-
-      - name: Run test query (commits)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;'
-
-      - name: Run test query (files)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select name, path, download_url, content from spiceai.files limit 1;'
-
-      - name: Run test query (stargazers)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        uses: ./.github/actions/run-query
-        with:
-          fail-on-error: true
-          query: 'select * from spiceai.stargazers limit 10;'
+          name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
+          path: |
+            github-fixture-results/
+            github-live-results/
+            test_app/spice.log
 
       - name: Stop spice and check logs
         if: always()

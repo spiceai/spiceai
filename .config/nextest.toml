@@ -46,10 +46,9 @@ result-correctness = { max-threads = 1 }
 # dataset load with no deadline (`crates/runtime/src/lib.rs`), and the test's own
 # readiness timeout is what finally fires.
 #
-# Serializing them makes each test's pacing meaningful again, because it is then
-# pacing the only caller. This bounds concurrency within a partition; the three
-# `Integration Tests (part N)` jobs still run as separate processes, so the ceiling
-# is one GitHub test per partition rather than one overall.
+# The dedicated GitHub integration job selects all of these tests without a
+# partition; its workflow concurrency group is shared with the live E2E job.
+# Keep this group for local nextest runs too.
 github-api-tests = { max-threads = 1 }
 
 # Correctness/convergence property tests: the accelerated table MUST converge to
@@ -154,6 +153,9 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 [[profile.default.overrides]]
 filter = 'test(/^github::/)'
 test-group = 'github-api-tests'
+# Transport retries belong to the connector. A failed row assertion must not
+# be retried into a pass against changing live data.
+retries = 0
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
 [[profile.default.overrides]]
