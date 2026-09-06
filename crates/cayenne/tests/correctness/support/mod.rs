@@ -47,11 +47,12 @@ pub mod sqlite_engine;
 pub mod sqllancer;
 pub mod ssb_data;
 pub mod standalone_engines;
+pub mod tpch_data;
 
 #[expect(unused_imports)] // re-exported for integration test crates
 pub use harness::{
     assert_all_pass_or_excluded, assert_modes_agree_on_actual_results, compare_actual_results,
-    execute_and_compare_cayenne_to_batches, execute_cayenne,
+    compare_actual_results_detailed, execute_and_compare_cayenne_to_batches, execute_cayenne,
 };
 
 use std::collections::BTreeMap;
@@ -68,7 +69,9 @@ use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
 use test_framework::queries::validation::{
-    QueryValidationResult, RowOrder, compare_query_result_batches, row_order_from_sql,
+    QueryValidationFailReason, QueryValidationResult, RowOrder,
+    compare_query_result_batches_with_sort_check, has_top_level_limit, has_top_level_order_by,
+    row_order_from_sql,
 };
 use test_framework::queries::{
     Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
@@ -80,15 +83,33 @@ use test_framework::queries::{
 #[derive(Debug, Clone)]
 pub enum ParityOutcome {
     Pass,
-    Fail { detail: String },
-    Excluded { reason: String },
-    EngineError { side: &'static str, detail: String },
+    /// Content matched, but the query's `ORDER BY` was not fully verified —
+    /// a term that maps to no output column, an unparseable statement, or a key
+    /// type with no comparator. Not a failure, and deliberately not a `Pass`:
+    /// the whole point of the sort check is that unverified order must not read
+    /// as verified.
+    OrderUnchecked {
+        reasons: Vec<String>,
+    },
+    Fail {
+        detail: String,
+    },
+    Excluded {
+        reason: String,
+    },
+    EngineError {
+        side: &'static str,
+        detail: String,
+    },
 }
 
 impl ParityOutcome {
     #[must_use]
     pub fn is_pass_or_excluded(&self) -> bool {
-        matches!(self, Self::Pass | Self::Excluded { .. })
+        matches!(
+            self,
+            Self::Pass | Self::Excluded { .. } | Self::OrderUnchecked { .. }
+        )
     }
 }
 
@@ -515,23 +536,100 @@ pub fn compare_results(
     cayenne: &[RecordBatch],
     reference: &[RecordBatch],
 ) -> ParityOutcome {
-    let sql_upper = query.sql.to_ascii_uppercase();
-    let has_order = sql_upper.contains("ORDER BY");
-    let has_limit = sql_upper.contains("LIMIT") || sql_upper.contains("OFFSET");
-    let order = if has_order && has_limit {
+    compare_results_detailed(query, cayenne, reference).outcome
+}
+
+/// A comparison together with what it could not establish.
+///
+/// Two callers need more than the outcome. `reason` tells one kind of failure
+/// from another — `Fail::detail` renders it for a human, and branching on that
+/// string would make control flow depend on a `Debug` format. `unchecked`
+/// carries the order the sort check could not verify, and is populated even when
+/// the content comparison failed: a caller that recovers from that failure would
+/// otherwise report an order nothing verified as a clean pass.
+pub struct ComparedResults {
+    pub outcome: ParityOutcome,
+    pub reason: Option<QueryValidationFailReason>,
+    pub unchecked: Vec<String>,
+}
+
+/// Downgrade a content-only recovery that passed, when the sort check had
+/// already declined to verify the order.
+///
+/// A lane that recovers from a failed comparison by comparing content another
+/// way — the chDB lane retries a schema mismatch as sorted string rows —
+/// establishes the rows and nothing about the order they came back in. Returning
+/// its `Pass` unqualified would report an unverified order as verified, which is
+/// the outcome the sort check exists to make impossible.
+#[must_use]
+pub fn keep_unverified_order(recovered: ParityOutcome, unchecked: Vec<String>) -> ParityOutcome {
+    match recovered {
+        ParityOutcome::Pass if !unchecked.is_empty() => {
+            ParityOutcome::OrderUnchecked { reasons: unchecked }
+        }
+        settled => settled,
+    }
+}
+
+/// [`compare_results`] with the reason and the coverage holes kept.
+pub fn compare_results_detailed(
+    query: &Query,
+    cayenne: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> ComparedResults {
+    // Positional equality only where the row set itself depends on order. Elsewhere
+    // multiset, so an `ORDER BY` on a non-unique key does not fail on the
+    // engine-dependent order of tied rows. `compare_query_result_batches_with_sort_check`
+    // then verifies each side against its own `ORDER BY`, which ties never violate —
+    // so absorbing tie order here no longer costs the sort check with it.
+    //
+    // Both predicates are parser-backed: a `LIMIT` or `ORDER BY` inside a subquery
+    // does not make the outer result order-dependent, and a substring search cannot
+    // tell that apart from a top-level one.
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
         RowOrder::Preserved
     } else {
-        // Full result or unordered: multiset (handles non-unique ORDER BY ties).
         RowOrder::Multiset
     };
-    let _ = row_order_from_sql; // still used by sql_has_order_by
-    match compare_query_result_batches(&query.name, cayenne, reference, order) {
-        Ok(QueryValidationResult::Pass) => ParityOutcome::Pass,
-        Ok(QueryValidationResult::Fail(reason)) => ParityOutcome::Fail {
-            detail: format!("{reason:?}"),
-        },
-        Err(e) => ParityOutcome::Fail {
-            detail: format!("compare error: {e}"),
+    match compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        cayenne,
+        reference,
+        order,
+    ) {
+        Ok(comparison) => {
+            let unchecked = comparison.unchecked;
+            match comparison.result {
+                QueryValidationResult::Pass if unchecked.is_empty() => ComparedResults {
+                    outcome: ParityOutcome::Pass,
+                    reason: None,
+                    unchecked,
+                },
+                // Rows matched, but part of the ORDER BY went unverified. That is
+                // a coverage hole, reported as one rather than as a clean pass.
+                QueryValidationResult::Pass => ComparedResults {
+                    outcome: ParityOutcome::OrderUnchecked {
+                        reasons: unchecked.clone(),
+                    },
+                    reason: None,
+                    unchecked,
+                },
+                QueryValidationResult::Fail(reason) => ComparedResults {
+                    outcome: ParityOutcome::Fail {
+                        detail: format!("{reason:?}"),
+                    },
+                    reason: Some(reason),
+                    unchecked,
+                },
+            }
+        }
+        Err(e) => ComparedResults {
+            outcome: ParityOutcome::Fail {
+                detail: format!("compare error: {e}"),
+            },
+            reason: None,
+            unchecked: Vec::new(),
         },
     }
 }
