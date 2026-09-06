@@ -628,12 +628,15 @@ mod tests {
             "nodes": [{"id": 1}, {"id": 2, "later_field": "present"}],
             "pageInfo": {"hasNextPage": false, "endCursor": null}
         }}});
+        for page_size in [2, 100] {
+            Mock::given(method("POST"))
+                .and(body_string_contains(format!("first: {page_size})")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(rows.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(rows))
-            .with_priority(2)
-            .mount(&server)
-            .await;
-        let probe = Mock::given(method("POST"))
             .and(body_string_contains("first: 1)"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"data": {"items": {
@@ -641,9 +644,8 @@ mod tests {
                     "pageInfo": {"hasNextPage": true, "endCursor": "1"}
                 }}})),
             )
-            .with_priority(1)
             .expect(1)
-            .mount_as_scoped(&server)
+            .mount(&server)
             .await;
 
         let query =
@@ -664,7 +666,6 @@ mod tests {
             .await
             .expect("bounded validation");
         assert_eq!(provider.schema(), schema);
-        drop(probe);
 
         let ctx = SessionContext::new();
         ctx.register_table("items", Arc::new(provider))
@@ -697,6 +698,7 @@ mod tests {
             &DataType::Utf8
         );
         let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 3);
         let query_for = |index: usize| {
             requests[index]
                 .body_json::<serde_json::Value>()
