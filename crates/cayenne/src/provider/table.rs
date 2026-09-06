@@ -30366,6 +30366,47 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Materialize the in-memory CDC tier before a scanning delete, the way
+    /// [`Self::checkpoint_inlined_data_if_present_for_delete`] materializes the
+    /// inline corpus: the deletion-vector sink scans durable tiers only, and it
+    /// scans its `ListingTable`s directly rather than under `listing_fence`, so it
+    /// carries no barrier of its own against a checkpoint still in flight.
+    ///
+    /// There is deliberately no empty-tier fast path. An empty tier does not imply
+    /// nothing is in flight: [`Self::purge_mem_tier_all`] clears a captured but
+    /// not-yet-published prefix while holding only `write_lock`, so a checkpoint
+    /// that captured those rows and is still encoding off-lock leaves the tier
+    /// reading empty with its snapshot unpublished. Awaiting `mem_checkpoint_lock`
+    /// unconditionally is what makes that checkpoint's snapshot visible before the
+    /// caller captures its scan sources.
+    ///
+    /// The caller holds `write_lock`; the checkpoint takes `mem_checkpoint_lock`
+    /// itself — the `write -> mem` order every other holder settles on, and the one
+    /// [`Self::acquire_capture_locks_blocking`] yields to rather than invert. On an
+    /// empty tier the checkpoint is a storage no-op that re-fires the last durable
+    /// slot advancer and returns; in memory-resident mode it returns immediately,
+    /// since there the tier is the permanent store.
+    ///
+    /// It deliberately does NOT drain in-flight pipelined publishes the way schema
+    /// evolution and warm-to-cold promotion do before their checkpoints. Those
+    /// drain while holding `write_lock`, and a current-snapshot staged append
+    /// releases that lock after Stage A while staying registered as in flight until
+    /// `finish` — its Stage B re-acquires the lock in
+    /// `lock_current_snapshot_for_apply`. Waiting for that registration to clear
+    /// under the held lock therefore blocks the publish being waited for, and a
+    /// DELETE that raced one could only end in the drain's timeout.
+    async fn checkpoint_mem_tier_for_delete(&self) -> datafusion_common::Result<()> {
+        self.checkpoint_mem_tier_holding_write_lock()
+            .await
+            .map(|_rows| ())
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to delete from dataset '{}': could not make its in-memory CDC rows durable before the delete, so the delete was not applied and the rows are unchanged. Cause: {e}",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
     /// Flush inlined rows to Vortex files when pending inline data exists.
     ///
     /// Callers must hold `write_lock` while calling this helper.
@@ -33488,9 +33529,36 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-            .await?;
+        // Key-based deletion-vector path. The sink scans main, the protected
+        // snapshots and the cold tier — every durable tier — and never the
+        // in-memory CDC tier, and its liveness probe reads the durable deletion
+        // index alone. A predicate that matches only a RAM-resident row would
+        // leave it alive, and one that matches the durable version an
+        // un-checkpointed upsert has superseded would tombstone the KEY and take
+        // the live RAM replacement with it — the shape #13574 closed for protected
+        // snapshots, one tier over. Materialize the tier, exactly as the two
+        // branches above materialize inline rows; once durable, the rows are
+        // subject to the sink's own tier-aware liveness rule.
+        //
+        // The checkpoint and the scan-source capture share ONE `write_lock` hold,
+        // so no CDC apply can land between them. They are not separable: a
+        // checkpoint publishes its rows as a PROTECTED snapshot, and
+        // `build_deletion_vector_sink` freezes the protected set the sink will scan
+        // (the sink re-reads only the main listing at execution), so a checkpoint
+        // that lands after the capture is invisible to this delete. Nothing under
+        // the sink builder takes `write_lock`, so holding it across the build
+        // cannot deadlock.
+        //
+        // This lock is released before `DeletionExec` runs the sink, which takes
+        // `write_lock` again; a CDC apply between the two is still invisible to the
+        // scan sources frozen here (#13828). Closing that window means building the
+        // sink inside the execution-time critical section, not here.
+        let file_sink = {
+            let _guard = self.write_lock.lock().await;
+            self.checkpoint_mem_tier_for_delete().await?;
+            self.build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
+                .await?
+        };
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
@@ -55514,6 +55582,83 @@ mod tests {
              per-snapshot sequence numbers (matching load_protected_snapshots), or \
              scans return different rows before vs after a reload"
         );
+    }
+
+    /// A key-based user `DELETE` must finish planning while a pipelined CDC
+    /// append sits between its stages.
+    ///
+    /// A current-snapshot append releases `write_lock` after Stage A
+    /// (`prepare` drops the guard for that target kind) and stays registered in
+    /// `inflight_staging_appends` until `finish`, while its Stage B RE-ACQUIRES
+    /// `write_lock` in `lock_current_snapshot_for_apply`. So a delete that holds
+    /// `write_lock` and waits for that set to drain blocks the very publish it is
+    /// waiting for, and can only end in the drain's timeout.
+    #[tokio::test]
+    async fn key_delete_does_not_wait_for_an_inflight_current_snapshot_append() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "key_delete_vs_inflight_append",
+            ctx.runtime_env(),
+            VortexConfig {
+                compaction_background_interval_ms: 0,
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed CDC batch should prepare")
+            .finish()
+            .await
+            .expect("finalize seed CDC batch");
+
+        // A NEW key, so the batch carries no on-conflict deletions and stages
+        // into the CURRENT snapshot — the target kind whose Stage B needs the lock.
+        let pending = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second CDC batch should prepare");
+        assert!(
+            pending.has_pending_finalize(),
+            "precondition: the append must still be mid-flight"
+        );
+        assert!(
+            provider.has_inflight_staging_appends(),
+            "precondition: Stage B has not run yet"
+        );
+        assert!(
+            provider.write_lock.try_lock().is_ok(),
+            "precondition: a current-snapshot append leaves write_lock free between its stages, so a DELETE can take it"
+        );
+
+        let planned = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.delete_from(
+                &ctx.state(),
+                vec![col("value").eq(datafusion_expr::lit(10_i64))],
+            ),
+        )
+        .await;
+        assert!(
+            planned.is_ok(),
+            "the DELETE did not finish planning within 5s while a staged append was in flight"
+        );
+        planned
+            .expect("delete planning completed")
+            .expect("delete plan builds");
+
+        pending.finish().await.expect("finalize pending append");
     }
 
     #[tokio::test]

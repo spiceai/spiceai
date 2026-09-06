@@ -434,10 +434,13 @@ async fn overwrite(table: &Arc<CayenneTableProvider>, rows: &[(i64, i64)]) -> Te
 
 /// Delete rows whose non-PK `value` is in `[lo, hi)`.
 ///
-/// File only: a filtered client DELETE does not remove un-checkpointed mem-tier
-/// rows (spiceai/spiceai#12008; delete-all was fixed in #11987), so
-/// `delete_predicate` is weighted 0 in memory configs. Once #12008 is fixed,
-/// weighting it there turns this into the regression test.
+/// Weighted into the memory configs as well as the file ones, because a filtered
+/// client DELETE materializes the mem-tier before it captures its scan sources:
+/// a row that is still RAM-resident is matched and removed like a durable one.
+/// Those walks are the randomized coverage for that path — take the checkpoint
+/// away and every memory workload fails with rows the model deleted still served
+/// (regression coverage for spiceai/spiceai#12008 under `cdc_durability: memory`;
+/// `mode: memory`, which never checkpoints, is still uncovered).
 async fn delete_predicate(table: &Arc<CayenneTableProvider>, lo: i64, hi: i64) -> TestResult<()> {
     delete_filter(
         table,
@@ -1155,9 +1158,7 @@ const MEMORY_MIXED: OpWeights = OpWeights {
     upsert: 45,
     delete: 25,
     delete_all: 0,
-    // 0 until spiceai/spiceai#12008: a filtered DELETE leaves un-checkpointed
-    // mem-tier rows live.
-    delete_predicate: 0,
+    delete_predicate: 10,
     overwrite: 0,
     compact: 25,
     restart: 5,
