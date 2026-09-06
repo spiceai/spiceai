@@ -629,7 +629,7 @@ mod tests {
     }
 
     /// #13910, second gap: a declaration that stops validating does not deregister the
-    /// provider an earlier reload put in DataFusion — the removal branch can only warn. So a
+    /// provider an earlier reload put in `DataFusion` — the removal branch can only warn. So a
     /// name absent from `existing_catalogs` because its *declaration* was rejected still has a
     /// live provider with cached plans resolved through it, and the reload that corrects the
     /// declaration overwrites that provider. That is a replacement, not an addition.
