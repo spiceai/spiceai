@@ -74,7 +74,7 @@ cosmetics — values must still match:
 - `integer` / `bigint` are type-compatible (`COUNT` width)
 - column names are not compared (plan alias vs `DuckDB` name; IBM Rust SDK
   also skips names)
-- string cells are trimmed (`CHAR` padding)
+- string / `CHAR` cells trim trailing pad only (leading spaces stay significant)
 - numeric ε is absolute `1e-8` or relative `1e-14` for floats/`double`
   (`decimal` vs `DuckDB` float; IBM documents absolute `1e-9`). Printed
   fractional length is not a tolerance. One ULP at a declared decimal
@@ -84,7 +84,8 @@ cosmetics — values must still match:
   string is NULL. Incomplete CSV rows (field count ≠ header width)
   mismatch.
 
-Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
+Not lifted: row-count misses (q21). `string` ↔ numeric type labels
+(q22 country codes) go through to value compare.
 
 A test with no expected CSV is `SKIPPED`, never `PASSED`.
 
@@ -107,9 +108,10 @@ Isthmus names; `spiced` bring-up in this harness; auth.
 ## Nightly CI
 
 `.github/workflows/substrait_compliance.yml` — `schedule` +
-`workflow_dispatch` only. `continue-on-error: true`. Uploads the JSON
-report as an artifact. Do not gate merge on pass rate until a threshold
-is set from this baseline.
+`workflow_dispatch` only. Per-query FAIL/ERROR already exit 0; a
+harness/build crash fails the job (no `continue-on-error`). Uploads
+the JSON report as an artifact. Do not gate merge on pass rate until
+a threshold is set from this baseline.
 
 ## License
 

@@ -334,6 +334,17 @@ fn format_date32(days: i32) -> String {
 mod tests {
     use super::*;
     use arrow::datatypes::{Field, Schema};
+    use datafusion_substrait::substrait::proto::{
+        NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type,
+        expression::{
+            Literal,
+            literal::{LiteralType, VarChar},
+        },
+        plan_rel,
+        read_rel::{ReadType, VirtualTable},
+        rel,
+        r#type::{self, Nullability},
+    };
 
     #[test]
     fn empty_batches_preserve_execution_schema() {
@@ -348,5 +359,68 @@ mod tests {
         assert_eq!(table.columns[1].name, "n");
         assert_eq!(table.columns[1].type_token, "integer");
         assert!(table.rows.is_empty());
+    }
+
+    /// Isthmus TPC-H emits `LiteralType::VarChar`. Without spiceai/datafusion#215
+    /// `from_substrait_plan` errors and Mode A reports ERROR (13/22 queries).
+    #[tokio::test]
+    async fn varchar_literal_lowers_to_utf8() {
+        let varchar = Type {
+            kind: Some(r#type::Kind::Varchar(r#type::VarChar {
+                length: 25,
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Nullable),
+            })),
+        };
+        let proto = Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(Rel {
+                        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                            base_schema: Some(NamedStruct {
+                                names: vec!["r_name".to_string()],
+                                r#struct: Some(r#type::Struct {
+                                    types: vec![varchar],
+                                    type_variation_reference: 0,
+                                    nullability: i32::from(Nullability::Nullable),
+                                }),
+                            }),
+                            read_type: Some(ReadType::VirtualTable(VirtualTable {
+                                values: vec![
+                                    datafusion_substrait::substrait::proto::expression::literal::Struct {
+                                        fields: vec![Literal {
+                                            nullable: false,
+                                            type_variation_reference: 0,
+                                            literal_type: Some(LiteralType::VarChar(VarChar {
+                                                value: "EUROPE".to_string(),
+                                                length: 25,
+                                            })),
+                                        }],
+                                    },
+                                ],
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }))),
+                        ..Default::default()
+                    }),
+                    names: vec!["r_name".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+
+        let ctx = SessionContext::new();
+        let plan = from_substrait_plan(&ctx.state(), &proto)
+            .await
+            .expect("VarChar literal must lower (spiceai/datafusion#215)");
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute varchar literal plan");
+        let schema = df.schema().as_arrow().clone();
+        let batches = df.collect().await.expect("collect varchar literal plan");
+        let table = batches_to_table(&batches, &schema);
+        assert_eq!(table.rows, vec![vec!["EUROPE".to_string()]]);
     }
 }

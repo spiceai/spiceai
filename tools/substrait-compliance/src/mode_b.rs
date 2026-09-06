@@ -36,6 +36,7 @@ limitations under the License.
 
 use arrow_flight::sql::{CommandStatementSubstraitPlan, ProstMessageExt, SubstraitPlan};
 use bytes::Bytes;
+use datafusion_substrait::substrait::proto::{Plan, Version};
 use prost::Message;
 
 use crate::error::{self, Result};
@@ -45,8 +46,33 @@ use crate::suite::LoadedCase;
 pub const ENGINE_NAME: &str = "Spice FlightSQL";
 pub const ENGINE_VERSION: &str = "stub";
 
-/// Substrait version string the existing `FlightSQL` integration tests send.
-pub const SUBSTRAIT_VERSION: &str = "0.62.0";
+/// IBM v0.1.1 q01/q22 plans declare this Substrait release. Used when the
+/// plan bytes do not decode to a `Plan.version` (or decode as `0.0.0`).
+pub const SUITE_SUBSTRAIT_VERSION: &str = "0.81.0";
+
+/// `FlightSQL` `SubstraitPlan.version` is the Substrait release so a
+/// consumer can accept or reject the payload. Prefer the version embedded
+/// in the decoded plan; fall back to the pinned suite's declared release.
+#[must_use]
+pub fn substrait_version_from_plan(plan_bytes: &[u8]) -> String {
+    match Plan::decode(plan_bytes) {
+        Ok(plan) => plan
+            .version
+            .as_ref()
+            .map(format_substrait_version)
+            .filter(|version| version != "0.0.0")
+            .unwrap_or_else(|| SUITE_SUBSTRAIT_VERSION.to_string()),
+        Err(_) => SUITE_SUBSTRAIT_VERSION.to_string(),
+    }
+}
+
+#[must_use]
+pub fn format_substrait_version(version: &Version) -> String {
+    format!(
+        "{}.{}.{}",
+        version.major_number, version.minor_number, version.patch_number
+    )
+}
 
 /// Build the exact `FlightSQL` command `spiced` decodes in
 /// `statement_substrait_plan`.
@@ -55,7 +81,7 @@ pub fn command_statement_substrait_plan(plan_bytes: &[u8]) -> CommandStatementSu
     CommandStatementSubstraitPlan {
         plan: Some(SubstraitPlan {
             plan: Bytes::copy_from_slice(plan_bytes),
-            version: SUBSTRAIT_VERSION.to_string(),
+            version: substrait_version_from_plan(plan_bytes),
         }),
         transaction_id: None,
     }
@@ -123,7 +149,35 @@ mod tests {
         let cmd = command_statement_substrait_plan(&[0x0a, 0x00]);
         let plan = cmd.plan.expect("plan must be present");
         assert_eq!(plan.plan.as_ref(), &[0x0a, 0x00]);
-        assert_eq!(plan.version, SUBSTRAIT_VERSION);
+        // `[0x0a, 0x00]` is not a versioned Plan; use the pinned suite release.
+        assert_eq!(plan.version, SUITE_SUBSTRAIT_VERSION);
+    }
+
+    #[test]
+    fn flight_sql_version_comes_from_the_decoded_plan() {
+        let proto = Plan {
+            version: Some(Version {
+                major_number: 0,
+                minor_number: 81,
+                patch_number: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = proto.encode_to_vec();
+        let cmd = command_statement_substrait_plan(&bytes);
+        let plan = cmd.plan.expect("plan must be present");
+        assert_eq!(plan.version, "0.81.0");
+        assert_eq!(substrait_version_from_plan(&bytes), "0.81.0");
+    }
+
+    #[test]
+    fn undecodable_plan_uses_the_pinned_suite_version() {
+        assert_eq!(
+            substrait_version_from_plan(&[0xff, 0x00]),
+            SUITE_SUBSTRAIT_VERSION
+        );
+        assert_eq!(SUITE_SUBSTRAIT_VERSION, "0.81.0");
     }
 
     #[test]

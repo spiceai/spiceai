@@ -25,7 +25,8 @@ limitations under the License.
 //!   `DataFusion`; `DuckDB` goldens label it `integer`).
 //! - Column names are not compared (plan alias `TOTAL_VALUE` vs `DuckDB`
 //!   `value`; Isthmus `L_RETURNFLAG` vs golden `l_returnflag`).
-//! - String cells are compared after trimming `CHAR` pad / loader whitespace.
+//! - String / `CHAR` cells compare after trailing-pad trim only
+//!   (leading spaces are significant — q02 `s_comment`).
 //! - Quoted-empty `""` in a golden CSV cell decodes to empty/NULL
 //!   (IBM TPC-H README). After decode, only the empty string is NULL;
 //!   a literal `""` (two quote characters) is a nonempty string.
@@ -38,7 +39,8 @@ limitations under the License.
 //!   the same scale ≥ 2 (q01 `AVG` scale 6). IBM README is absolute
 //!   `1e-9` only.
 //!
-//! Not lifted: row-count misses, `string` vs `integer` (q21 / q22).
+//! Not lifted: row-count misses (q21). `string` ↔ numeric type labels
+//! (q22 country codes) are compatible; `values_match` decides PASS/FAIL.
 
 /// Absolute numeric floor. IBM documents `1e-9`; `1e-8` covers q06's
 /// `DuckDB`-vs-`DataFusion` rounding (Δ ≈ 1.16e-9).
@@ -212,12 +214,24 @@ pub fn normalize_type(token: &str) -> &'static str {
 }
 
 /// `integer` and `bigint` are the same TPC-H `COUNT` width under two labels.
-/// `string` vs `integer` is not compatible (q22 stays FAIL).
+/// IBM v0.1.1 also requires numeric/string cross-type values to reach
+/// value compare (q22 country codes: engine `string` vs golden `integer`).
 #[must_use]
 pub fn types_compatible(actual: &str, expected: &str) -> bool {
     let a = normalize_type(actual);
     let e = normalize_type(expected);
-    a == e || matches!((a, e), ("integer", "bigint") | ("bigint", "integer"))
+    a == e
+        || matches!((a, e), ("integer", "bigint") | ("bigint", "integer"))
+        || string_numeric_pair(a, e)
+}
+
+fn is_numeric_kind(kind: &str) -> bool {
+    matches!(kind, "integer" | "bigint" | "double" | "float")
+}
+
+fn string_numeric_pair(actual: &str, expected: &str) -> bool {
+    (actual == "string" && is_numeric_kind(expected))
+        || (expected == "string" && is_numeric_kind(actual))
 }
 
 #[must_use]
@@ -244,7 +258,7 @@ fn cells_match(
         return integers_equal(actual, expected);
     }
     if kind == Some("string") {
-        return actual.trim() == expected.trim();
+        return trim_trailing_char_pad(actual) == trim_trailing_char_pad(expected);
     }
 
     if integers_equal(actual, expected) {
@@ -262,8 +276,14 @@ fn cells_match(
     {
         return a_lower == e_lower;
     }
-    // Isthmus `CHAR` / fixed-char padding vs trimmed `DuckDB` goldens (q02, q10, q15).
-    actual.trim() == expected.trim()
+    // Isthmus `CHAR` / fixed-char padding is trailing-only (q15 `s_address`).
+    trim_trailing_char_pad(actual) == trim_trailing_char_pad(expected)
+}
+
+/// `CHAR` pad and DuckDB loader whitespace sit on the right. Leading
+/// spaces are significant (q02 `s_comment` `' foxes boost'`).
+fn trim_trailing_char_pad(value: &str) -> &str {
+    value.trim_end()
 }
 
 fn is_null_cell(value: &str) -> bool {
@@ -627,7 +647,8 @@ mod tests {
     }
 
     #[test]
-    fn string_versus_integer_type_is_not_compatible() {
+    fn string_versus_integer_type_compares_values() {
+        // q22 country codes: IBM allows number-vs-string; values decide.
         let actual = TableData {
             columns: vec![ColumnSpec {
                 name: "cntrycode".to_string(),
@@ -642,9 +663,19 @@ mod tests {
             }],
             rows: vec![vec!["13".to_string()]],
         };
+        assert_eq!(compare(&actual, &expected), None);
+
+        let wrong = TableData {
+            columns: actual.columns.clone(),
+            rows: vec![vec!["99".to_string()]],
+        };
         assert!(matches!(
-            compare(&actual, &expected),
-            Some(CompareMismatch::ColumnType { index: 0, .. })
+            compare(&wrong, &expected),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
         ));
     }
 
@@ -668,10 +699,37 @@ mod tests {
     }
 
     #[test]
-    fn char_padding_is_trimmed_for_string_cells() {
-        assert!(values_match(" foxes boost", "foxes boost"));
+    fn char_padding_is_trailing_only_for_string_cells() {
+        // q02 `s_comment` leading space is significant; both-end trim false-PASSed.
+        assert!(!values_match(" foxes boost", "foxes boost"));
+        assert!(!values_match("foxes boost", " foxes boost"));
+        // q15 `s_address` CHAR / DuckDB trailing pad.
         assert!(values_match("TZoQwNFFO ", "TZoQwNFFO"));
+        assert!(values_match("TZoQwNFFO", "TZoQwNFFO "));
         assert!(!values_match("alpha", "beta"));
+    }
+
+    #[test]
+    fn typed_string_preserves_leading_space() {
+        let actual = TableData {
+            columns: vec![ColumnSpec {
+                name: "s_comment".to_string(),
+                type_token: "string".to_string(),
+            }],
+            rows: vec![vec!["foxes boost".to_string()]],
+        };
+        let expected = TableData {
+            columns: actual.columns.clone(),
+            rows: vec![vec![" foxes boost".to_string()]],
+        };
+        assert!(matches!(
+            compare(&actual, &expected),
+            Some(CompareMismatch::Value {
+                row: 0,
+                column: 0,
+                ..
+            })
+        ));
     }
 
     #[test]

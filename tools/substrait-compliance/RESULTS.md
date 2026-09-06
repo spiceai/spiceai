@@ -81,7 +81,7 @@ Harness compare in `src/compare.rs` now:
 
 - treats `integer` / `bigint` as type-compatible (`COUNT` width)
 - does not compare column names (plan alias vs DuckDB; IBM Rust SDK skips names)
-- trims `CHAR` padding on string cells
+- trims trailing `CHAR` padding on string cells (leading spaces stay significant)
 - numerics: `integer`/`bigint` exactly; floats/`double` use absolute ε
   `1e-8` or relative `1e-14`. Printed fractional length is not a
   tolerance. One ULP at a declared decimal scale only when both headers
@@ -94,15 +94,16 @@ Harness compare in `src/compare.rs` now:
 
 IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These
 lifts apply only when **values** still match. They do not ignore
-row-count misses and do not treat `string` as `integer`.
+row-count misses. `string` ↔ numeric type labels reach value compare
+(q22 country codes).
 
 | Query | Before | After | Notes |
 |-------|--------|-------|-------|
 | q01 | FAIL (`COUNT` `bigint` vs `integer`) | **FAIL** (stayed) | Type lift applied; values do **not** match. First mismatch is now cell `(0,6)` `AVG_QTY` `25.575154` vs golden `25.575154611454693` (IBM types the column `double`; printed-scale ULP no longer applies). A prior run with printed-scale on reported cell `(2,2)` `SUM_QTY` `742308.00` vs `742802.0` (N/O group, Δ = 494) — also a real miss, not re-observed here because compare stops at the first cell. |
-| q02 | FAIL (`CHAR` pad) | **PASS** | Leading-space trim |
+| q02 | FAIL (`CHAR` pad) | **PASS** | Trailing `CHAR` pad. Leading spaces are now significant (not remasured after that change) |
 | q04 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
 | q06 | FAIL (ε 1.16e-9) | **PASS** | abs ε `1e-8` |
-| q10 | FAIL (`CHAR` pad) | **PASS** | Leading-space trim |
+| q10 | FAIL (`CHAR` pad) | **PASS** | Trailing `CHAR` pad |
 | q11 | FAIL (alias `TOTAL_VALUE` vs `value`) | **PASS** | names not compared |
 | q12 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
 | q13 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
@@ -122,7 +123,7 @@ Investigated; left FAIL (no Spice/DF bug fix in this PR; no looser compare).
 | Query | Symptom (measured) | Investigation |
 |-------|--------------------|----------------|
 | q21 | row count `0` != `1` | Plan executes. Filter is `N_NAME` vs `VarChar` `"SAUDI ARABIA"` (length 25). Cardinality miss after VarChar unblocked — likely EXISTS / `CHAR` equality, not oracle cosmetics. Left FAIL. |
-| q22 | column 0 type `string` != `integer` | Plan uses `substring:fchar_i32_i32` (string). Golden types `cntrycode` as `integer` (`13`, `17`, …). IBM README allows number-vs-string cross-compare; **not** applied here. Left FAIL. |
+| q22 | column 0 type `string` != `integer` (pre-lift) | Plan uses `substring:fchar_i32_i32` (string). Golden types `cntrycode` as `integer` (`13`, `17`, …). IBM README allows number-vs-string cross-compare; type labels now pass through to `values_match`. Mode A not remasured after this lift. |
 
 ## ERROR (3) — not in this PR
 
@@ -159,7 +160,7 @@ Leave for a separate DataFusion fork fix. Do not fake PASS.
 | q19 | **PASS** | unchanged |
 | q20 | **PASS** | unchanged |
 | q21 | FAIL | 0 rows vs 1 (must-fix) |
-| q22 | FAIL | `string` vs `integer` (must-fix) |
+| q22 | FAIL | was `string` vs `integer` type labels; now value-compared (not remasured) |
 
 ## Newly PASSing queries (11)
 
@@ -174,7 +175,7 @@ Previously PASS and still PASS (5): q03, q05, q14, q19, q20.
 | Non-value function argument | 3 | q07, q08, q09 | Consumer gap (`from_substrait_plan`); plan never executes |
 | `AVG_QTY` scale-6 vs `double` | 1 | q01 | First cell `(0,6)` after printed-scale removal; prior run also had `SUM_QTY` 742308 vs 742802 |
 | Empty result | 1 | q21 | Plan executes; 0 rows vs 1 golden row |
-| Type mismatch (`string` vs `integer`) | 1 | q22 | `substring:fchar` vs golden `integer` |
+| Type mismatch (`string` vs `integer`) | 1 | q22 | `substring:fchar` vs golden `integer` — type labels now compatible; values decide (not remasured) |
 | Pass | 16 | q02–q06, q10–q20 | Values match after documented compare lifts |
 
 Do not treat these counts as a merge gate. Nightly CI is report-only until a

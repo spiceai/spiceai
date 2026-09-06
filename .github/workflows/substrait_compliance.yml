@@ -1,8 +1,9 @@
 name: Substrait compliance (report-only)
 
 # Nightly + manual only. Not on pull_request or merge_group — this is a
-# DataFusion consumer baseline, not a merge gate. Do not fail the repository
-# on pass rate until a threshold is set from the Mode A numbers.
+# DataFusion consumer baseline, not a merge gate. Per-query FAIL/ERROR
+# exit 0; do not fail the repository on pass rate until a threshold is
+# set from the Mode A numbers. A harness/build crash must still fail.
 
 on:
   schedule:
@@ -53,9 +54,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Run Mode A TPC-H
-        # Report-only: a harness crash must not fail required repo checks
-        # (this workflow is not a merge gate). Pass rate is never a threshold.
-        continue-on-error: true
+        # Per-query FAIL/ERROR already exit 0 (report-only pass rate).
+        # A nonzero exit is a harness/build/IO failure and must fail the job.
         run: |
           cargo run -p spice-substrait-compliance -- \
             --mode mode-a \
