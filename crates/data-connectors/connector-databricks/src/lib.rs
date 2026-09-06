@@ -686,7 +686,7 @@ impl Databricks {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         message: format!(
-                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, and MATERIALIZED_VIEW tables can be queried.",
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, VIEW, MATERIALIZED_VIEW, and STREAMING_TABLE tables can be queried.",
                             uc_table.table_type, full_name
                         ),
                     });
@@ -2062,6 +2062,48 @@ mod tests {
         );
     }
 
+    /// Streaming tables and views are plain `SELECT` targets on a SQL
+    /// warehouse, so the read must proceed to the permission check and the
+    /// warehouse instead of being rejected up front.
+    #[tokio::test]
+    async fn test_read_provider_accepts_streaming_tables_and_views() {
+        for table_type in ["STREAMING_TABLE", "VIEW"] {
+            let (result, read_call_count, request_count, captured_requests) =
+                run_read_provider_with_uc_responses(
+                    "databricks:workspace.tpch_sf400.part",
+                    vec![
+                        MockHttpResponse::json(
+                            "200 OK",
+                            format!(
+                                r#"{{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"{table_type}","data_source_format":"DELTA","columns":[],"storage_location":null}}"#
+                            ),
+                        ),
+                        MockHttpResponse::json(
+                            "200 OK",
+                            r#"{"privilege_assignments":[{"principal":"analytics-team","privileges":[{"privilege":"SELECT"}]}]}"#,
+                        ),
+                    ],
+                )
+                .await;
+
+            if let Err(err) = &result {
+                panic!("{table_type} should be queryable through a SQL warehouse: {err}");
+            }
+            assert_eq!(
+                read_call_count, 1,
+                "{table_type}: expected the Databricks read to be attempted"
+            );
+            assert_eq!(
+                request_count, 2,
+                "{table_type}: expected table metadata and permission requests"
+            );
+            assert_request_seen(
+                &captured_requests,
+                "/api/2.1/unity-catalog/effective-permissions/table/",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_read_provider_fails_for_unsupported_uc_table_types() {
         let (result, read_call_count, request_count, captured_requests) =
@@ -2069,7 +2111,7 @@ mod tests {
                 "databricks:workspace.tpch_sf400.part",
                 vec![MockHttpResponse::json(
                     "200 OK",
-                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"METRIC_VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
                 )],
             )
             .await;
@@ -2078,7 +2120,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("Unsupported Unity Catalog table type 'VIEW'"),
+                .contains("Unsupported Unity Catalog table type 'METRIC_VIEW'"),
             "unexpected error: {err}"
         );
         assert_eq!(
