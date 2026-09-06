@@ -1,0 +1,45 @@
+version: v1
+kind: Spicepod
+name: github-live-smoke
+
+datasets:
+  - from: github:github.com/spiceai/spiceai/files/v1.0.0
+    name: spiceai.files
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+      include: README.md
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT * FROM spiceai.files LIMIT 1
+
+  - from: github:github.com/spiceai/spiceai/issues
+    name: spiceai.issues
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT number, title, state, labels, updated_at FROM spiceai.issues LIMIT 5
+
+  - from: github:github.com/spiceai/spiceai/pulls
+    name: spiceai.pulls
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT number, title, state, merged_at FROM spiceai.pulls LIMIT 5
+
+  - from: github:github.com/spiceai/spiceai/commits
+    name: spiceai.commits
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT message_head_line, author_name, sha FROM spiceai.commits LIMIT 5
+
+  - from: github:github.com/spiceai/spiceai/stargazers
+    name: spiceai.stargazers
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT login, starred_at FROM spiceai.stargazers LIMIT 5
