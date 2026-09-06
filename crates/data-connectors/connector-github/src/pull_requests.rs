@@ -329,9 +329,12 @@ impl PullRequestTableArgs {
 
     /// Returns the outer `first:` page size for the pull request connection.
     ///
-    /// When comments are included (review, discussion, or both), the page size
-    /// is reduced to keep total node count well under GitHub's 500,000 node
-    /// hard limit on a single GraphQL query.
+    /// Every comment mode requests the same number of pull requests per page:
+    /// `DEFAULT_PAGE_SIZE` and `COMMENTS_PAGE_SIZE` are both 25. They stay
+    /// separate constants because different limits hold them there — the
+    /// comment-free page is bounded by GitHub's per-request compute budget,
+    /// the commented one by the 500,000 node hard limit on a single GraphQL
+    /// query — so either may move without the other.
     fn outer_page_size(&self) -> u32 {
         match self.include_comments {
             PullRequestCommentType::None => Self::DEFAULT_PAGE_SIZE,
