@@ -244,7 +244,22 @@ impl PullRequestTableArgs {
 
     /// Default outer `first:` value for the pull request connection when
     /// `include_comments` is not enabled.
-    const DEFAULT_PAGE_SIZE: u32 = 100;
+    ///
+    /// GitHub enforces a per-request compute budget that is separate from, and
+    /// reached long before, the `GITHUB_NODE_LIMIT` above: a page of 100 pull
+    /// requests on a large repository is rejected outright with `Resource
+    /// limits for this query exceeded`, leaving every node in the page `null`.
+    /// `estimated_node_count` cannot see this — the same page is only ~26,000
+    /// nodes, about 5% of the node limit — so the page size has to be chosen
+    /// against the compute budget rather than validated against the node one.
+    ///
+    /// Measured against `spiceai/spiceai` (13,700+ pull requests): `first: 100`
+    /// fails on the very first page, deterministically, while `first: 25`
+    /// returns a full page. 25 also matches `COMMENTS_PAGE_SIZE`, so both
+    /// paths now request the same number of pull requests per page.
+    ///
+    /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api>
+    const DEFAULT_PAGE_SIZE: u32 = 25;
 
     /// Reduced outer `first:` value when `include_comments` is enabled.
     ///
@@ -809,12 +824,17 @@ mod tests {
     #[test]
     fn outer_page_size_uses_default_when_no_comments() {
         let a = args(PullRequestCommentType::None, 25);
-        assert_eq!(a.outer_page_size(), 100);
+        assert_eq!(a.outer_page_size(), 25);
     }
 
     #[test]
-    fn outer_page_size_shrinks_when_comments_enabled() {
+    fn outer_page_size_stays_within_the_compute_budget() {
+        // Every comment mode requests the same number of pull requests per
+        // page. The bound is GitHub's per-request compute budget, which a page
+        // of 100 exceeds on a large repository regardless of whether comments
+        // are attached, so no mode may exceed DEFAULT_PAGE_SIZE.
         for include in [
+            PullRequestCommentType::None,
             PullRequestCommentType::Review,
             PullRequestCommentType::Discussion,
             PullRequestCommentType::All,
