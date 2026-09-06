@@ -6,7 +6,7 @@ concurrency:
   group: macos-runner-recovery-diagnostic
   cancel-in-progress: false
 jobs:
-  recover:
+  diagnose:
     strategy:
       fail-fast: false
       matrix:
@@ -14,62 +14,45 @@ jobs:
     runs-on: spiceai-macos
     timeout-minutes: 30
     steps:
-      - name: Recover confirmed Cargo lint output on the affected instance
+      - name: Inspect runner disk without checkout or cleanup
         shell: bash
         run: |
           set -euo pipefail
-          printf 'runner=%s\nworkspace=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE"
+          printf 'runner=%s\nworkspace=%s\ntemp=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE" "$RUNNER_TEMP"
           hostname
           df -Pk "$RUNNER_WORKSPACE"
-          if [ "$RUNNER_NAME" != spiceai-macos-mbp-runner-01-01 ]; then
-            echo 'Outside the authorized cleanup instance; no mutation'
-            exit 0
-          fi
+          case "$RUNNER_NAME" in
+            spiceai-macos-mbp-runner-01-*) ;;
+            *) echo 'Outside the affected physical host; no further inspection'; exit 0 ;;
+          esac
+          root="$(dirname "$RUNNER_WORKSPACE")"
+          ps -axo pid,ppid,etime,comm | awk 'NR == 1 || /Runner.Worker|Runner.Listener|cargo|rustc|clang|ld$/'
+          du -x -k -d 1 "$root" 2>/dev/null || true
+          du -x -k -d 2 "$RUNNER_WORKSPACE" 2>/dev/null || true
+          du -x -k -d 2 "$root/_tool" 2>/dev/null || true
           python3 - <<'PYTHON'
-          import json, os, shutil, subprocess
+          import os, time, collections
           from pathlib import Path
-          expected = Path('/opt/github-runner-01/_work/spiceai')
-          assert os.environ['RUNNER_WORKSPACE'] == str(expected)
-          assert expected.resolve() == expected
-          assert subprocess.check_output(['hostname'], text=True).strip() == 'spiceai-macos-mbp-runner-01'
-          target = expected / 'spiceai/target'
-          lint = target / 'lint'
-          assert target.resolve() == target and lint.resolve() == lint
-          if not lint.exists():
-              print('Confirmed lint output is absent; no cleanup needed')
-              raise SystemExit(0)
-          assert (lint / '.fingerprint').is_dir() and (lint / 'deps').is_dir()
-          assert (lint / '.cargo-lock').is_file()
-          json.loads((target / '.rustc_info.json').read_text())
-          processes = subprocess.check_output(['ps', '-axo', 'pid,ppid,etime,comm'], text=True)
-          for line in processes.splitlines():
-              if 'Runner.Worker' in line or 'Runner.Listener' in line:
-                  print('RUNNER_PROCESS', line)
-              name = line.rsplit('/', 1)[-1].strip()
-              if name in ('cargo', 'rustc', 'rustdoc', 'cargo-clippy', 'clippy-driver', 'clang', 'clang++', 'ld'):
-                  raise RuntimeError('Compiler process present; defer cleanup: ' + line)
-          opened = subprocess.run(['lsof', '-nP', '+D', str(lint), '-F', 'pn'], capture_output=True, text=True)
-          assert opened.returncode == 1 and not opened.stdout.strip() and not opened.stderr.strip(), (opened.returncode, opened.stdout, opened.stderr)
-          print('OPEN_FILES: none beneath the confirmed lint directory')
-          count = allocated = 0
-          for base, dirs, files in os.walk(lint, followlinks=False):
-              assert all(not Path(base, d).is_symlink() for d in dirs), 'Symlinked build directory; defer cleanup'
-              for name in files:
-                  count += 1
-                  allocated += Path(base, name).lstat().st_blocks * 512
-          print('CLEANUP_SCOPE', lint, 'files', count, 'allocated_bytes', allocated)
-          assert 80 * 1024**3 < allocated < 160 * 1024**3, 'Build output changed materially; diagnose again'
-          before = shutil.disk_usage(expected).free
-          print('FREE_BYTES_BEFORE', before, flush=True)
-          shutil.rmtree(lint)
-          tag = target / 'CACHEDIR.TAG'
-          if not tag.exists():
-              with tag.open('x') as f:
-                  f.write('Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n')
-              print('Restored discovery marker on the confirmed Cargo target', tag)
-          after = shutil.disk_usage(expected).free
-          print('FREE_BYTES_AFTER', after, 'RECLAIMED_BYTES', after - before)
-          assert not lint.exists()
-          assert after >= 130 * 1024**3, 'Cleanup completed but capacity remains below the recovery target'
+          root = Path(os.environ['RUNNER_WORKSPACE']).parent
+          for base, dirs, files in os.walk(root, followlinks=False):
+              dirs[:] = [d for d in dirs if not Path(base, d).is_symlink() and d not in ('.git', '_actions', '_tool')]
+              if 'CACHEDIR.TAG' in files or Path(base).name == 'target':
+                  path = Path(base)
+                  print('BUILD_CANDIDATE', path)
+                  tag = path / 'CACHEDIR.TAG'
+                  print('TAG', repr(tag.read_text(errors='replace')[:1024]) if tag.is_file() else 'MISSING')
+                  totals = collections.defaultdict(lambda: [0, 0])
+                  for sub, sd, sf in os.walk(path, followlinks=False):
+                      sd[:] = [d for d in sd if not Path(sub, d).is_symlink()]
+                      for name in sf:
+                          f = Path(sub, name)
+                          s = f.lstat()
+                          age = (time.time() - s.st_mtime) / 86400
+                          bucket = 'older_than_8d' if age >= 8 else '1d_to_8d' if age >= 1 else 'within_1d'
+                          profile = f.relative_to(path).parts[0]
+                          totals[(profile, bucket)][0] += 1
+                          totals[(profile, bucket)][1] += s.st_blocks * 512
+                  for key, value in sorted(totals.items()):
+                      print('ALLOCATED_BYTES', key, value)
+                  dirs[:] = []
           PYTHON
-          df -Pk "$RUNNER_WORKSPACE"
