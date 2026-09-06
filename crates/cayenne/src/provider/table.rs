@@ -2249,18 +2249,21 @@ pub struct CayenneTableProvider {
     /// is empty, so the same WALs are treated as crash-recovery input.
     ///
     /// The value carries the primary keys that append validated while its rows
-    /// were still private, for the arm that records them BEFORE publishing
-    /// (`AppendMutationWriter`'s pipelined `stage_on_conflict` path). Those keys
-    /// exist nowhere a keyset rebuild can read them — the staged files are not
-    /// yet discoverable and the read filter skips the unpublished tombstone — so
-    /// [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the same
-    /// way [`Self::fold_mem_tier_keys_into_keyset`] folds the un-checkpointed RAM
-    /// tier. Holding them HERE rather than only in the PK cache is what makes
-    /// that sound: [`Self::clear_cached_pk_keyset`] and the index-discard paths
-    /// empty the cache, and their stated premise — the next rebuild reads this
-    /// commit from the table — does not hold while the commit is still staged.
-    /// Empty for every other append (they record after publishing, so the scan
-    /// sees their rows).
+    /// were still private. `AppendMutationWriter`'s pipelined staged append is
+    /// the one path that records BEFORE publishing, and it does so on BOTH of
+    /// its arms: `stage_on_conflict`, and the `!stage_on_conflict` arm that
+    /// takes purely-new keys into a table holding no tombstones (#13642). Those
+    /// keys exist nowhere a keyset rebuild can read them — the staged files are
+    /// not yet discoverable and the read filter skips the unpublished tombstone
+    /// — so [`Self::fold_inflight_staged_keys_into_keyset`] folds them in, the
+    /// same way [`Self::fold_mem_tier_keys_into_keyset`] folds the
+    /// un-checkpointed RAM tier. Holding them HERE rather than only in the PK
+    /// cache is what makes that sound: [`Self::clear_cached_pk_keyset`] and the
+    /// index-discard paths empty the cache, and their stated premise — the next
+    /// rebuild reads this commit from the table — does not hold while the
+    /// commit is still staged.
+    /// Empty for an inline append, which records after publishing, so the scan
+    /// sees its rows.
     inflight_staging_appends: Arc<ParkingMutex<HashMap<String, Arc<PkDigestSet>>>>,
     /// Snapshot dirs the catalog no longer references (merged away by a
     /// protected-snapshot subset compaction), awaiting physical deletion:
@@ -53988,6 +53991,142 @@ mod tests {
             provider.snapshot_inflight_staged_pk_keys().is_empty(),
             "retiring the registration must release the staged keys"
         );
+    }
+
+    /// Two pipelined appends of the same new primary key resolve to ONE live row
+    /// under `on_conflict: do_nothing`, even when the second begins its Stage A
+    /// before the first has published.
+    ///
+    /// That overlap is the pipeline's steady state rather than a race to provoke:
+    /// the next Stage A is deliberately allowed to start before the previous
+    /// Stage B publishes. A `DoNothingAll` table whose keys are all new takes the
+    /// `!stage_on_conflict` arm, so this pins that arm's Stage-A key record — the
+    /// only thing that carries the first batch's key into the second batch's
+    /// validation while the staged rows are still undiscoverable.
+    ///
+    /// Regression test for #13642.
+    #[tokio::test]
+    async fn overlapping_pipelined_appends_of_one_new_do_nothing_key_leave_one_row() {
+        let ctx = SessionContext::new();
+        let table = "staged_do_nothing_overlap";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Stage A of the first append. No tombstones exist, so `stage_on_conflict`
+        // is false and this takes the arm under test.
+        let first = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[1])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first staged write should prepare");
+        assert!(
+            first.has_pending_finalize(),
+            "the first append must still be staged when the second runs, or the window under \
+             test never opens"
+        );
+
+        // Stage A of the second append begins inside that window, carrying the SAME
+        // new key. Whether it stages is an OUTCOME, not a precondition: once the
+        // first append's key is visible to validation the row is dropped as a
+        // conflict and there is nothing left to stage, so asserting
+        // `has_pending_finalize` here would demand the duplicate this test refuses.
+        let second = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[77], &[2])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second staged write should prepare while the first finalize is pending");
+
+        first
+            .finish()
+            .await
+            .expect("finalize the first staged write");
+        second
+            .finish()
+            .await
+            .expect("finalize the second staged write");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table).await,
+            vec![(77, 1)],
+            "`on_conflict: do_nothing` must keep exactly the first row for key 77; two live rows \
+             mean the second batch could not see the first's staged key"
+        );
+    }
+
+    /// Pins the mechanism the test above exercises end-to-end: the key reaches the
+    /// PK cache while the staged rows are still private, which is what a second
+    /// pipelined batch probes.
+    ///
+    /// Worth its own test because the row-count assertion cannot distinguish "the
+    /// key was recorded at Stage A" from "the second batch happened to run after
+    /// the publish" — a change that moved the record back to Stage B would keep
+    /// that test green under a fast enough publish and fail here every time.
+    #[tokio::test]
+    async fn a_staged_append_records_its_keys_before_the_publish() {
+        let ctx = SessionContext::new();
+        let table = "staged_record_before_publish";
+        let (provider, _catalog, _tmp) = create_cdc_table_with_on_conflict(
+            table,
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+            OnConflict::DoNothingAll,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[5], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("staged write should prepare");
+        assert!(
+            staged.has_pending_finalize(),
+            "the append must still be staged, or the record under test is just an ordinary \
+             post-publish one"
+        );
+
+        assert!(
+            matches!(
+                &*provider.pk_keyset_cache.lock(),
+                Some(CachedPkIndex::Exact(keyset))
+                    if keyset.location_by_digest(int64_pk_digest(5)).is_some()
+            ),
+            "the staged append must record its key BEFORE the publish, or a second pipelined \
+             batch carrying the same key cannot see it (#13642)"
+        );
+
+        staged.finish().await.expect("finalize the staged write");
+    }
+
+    /// The `u128` PK digest for a single-column `Int64` primary key, as the
+    /// keyset stores it.
+    fn int64_pk_digest(id: i64) -> u128 {
+        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)])
+            .expect("row converter for the Int64 primary key");
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![id])) as ArrayRef])
+            .expect("convert the primary key column");
+        pk_digest(&rows.row(0).owned())
     }
 
     /// Concurrent SAME-PK append seq-ordering guard (the `mem_tier_publish_lock`).
