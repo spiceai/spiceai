@@ -515,6 +515,20 @@ mod tests {
             "array_length(a, 1) must match array_length(a)"
         );
 
+        // `list_length` is the registered SQL alias of `array_length`. Executing it
+        // (not only `array_length`) is what fails if `register_all` drops the alias.
+        let alias_result = ctx
+            .session
+            .sql("SELECT id, list_length(a) AS len_a, list_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&alias_result)?.to_string(),
+            "list_length must match array_length"
+        );
+
         // Filter: `array_length(a) >= 4` must push into the scan and drop the empty
         // and null lists (NULL comparisons are not kept).
         let filter_query = "SELECT id FROM list_test WHERE array_length(a) >= 4 ORDER BY id";
