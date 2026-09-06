@@ -258,15 +258,28 @@ impl PullRequestTableArgs {
     /// returns a full page. 25 also matches `COMMENTS_PAGE_SIZE`, so both
     /// paths now request the same number of pull requests per page.
     ///
+    /// The trade-off is the maximum scannable repository. `execute_paginated`
+    /// stops a scan at `MAX_PAGINATION_ITERATIONS` (1000) pages and returns an
+    /// error rather than truncating, so the ceiling is `page_size x 1001`:
+    /// 25,025 pull requests here, down from 100,100. That ceiling is only
+    /// reachable where the wider page worked at all — on a repository large
+    /// enough for this to matter, `first: 100` currently returns zero rows, so
+    /// the effective ceiling goes up rather than down. Sizing the page per
+    /// repository instead of by a constant is tracked in #13937.
+    ///
     /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api>
     const DEFAULT_PAGE_SIZE: u32 = 25;
 
-    /// Reduced outer `first:` value when `include_comments` is enabled.
+    /// Outer `first:` value when `include_comments` is enabled.
     ///
     /// With comments enabled, each PR can expand to up to `20 * max_comments_fetched`
     /// review-thread comments plus `max_comments_fetched` discussion comments.
     /// Keeping the outer page at 25 keeps the total node count safely under
     /// GitHub's 500,000 node hard limit and within secondary rate limits.
+    ///
+    /// This equals `DEFAULT_PAGE_SIZE`: the comment-free page is bounded by the
+    /// per-request compute budget at the same width that the node limit bounds
+    /// the commented one, so the two arrive at 25 for different reasons.
     ///
     /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
     const COMMENTS_PAGE_SIZE: u32 = 25;
