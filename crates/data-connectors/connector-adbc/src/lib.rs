@@ -3002,10 +3002,11 @@ mod function_support_tests {
             "a sum ignores its ordering, so an ordered filtered sum still federates"
         );
 
-        // A *descending* ordering is refused whatever the aggregate, because the
-        // dialect tests it before either rewrite. Measured against a real
-        // project before this refusal existed, both of these federated as
-        // written and failed:
+        // A *descending* ordering is refused only for the percentile rewrites,
+        // which are rendered by ordering the group. Everything on the FILTER
+        // allowlist ignores input order, so it keeps its pushdown either way.
+        // Measured against a real project before spiceai/datafusion#219 scoped
+        // the dialect's check, both of these federated as written and failed:
         //   sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
         //     -> Syntax error: Expected ")" but got "("
         //   median(id ORDER BY id DESC)
@@ -3016,9 +3017,9 @@ mod function_support_tests {
             .build()
             .expect("descending filtered sum");
         assert!(
-            !federates_aggregate("bigquery", descending_filtered_sum).await,
-            "a descending filtered sum falls back to a generic FILTER clause, \
-             which BigQuery has no syntax for"
+            federates_aggregate("bigquery", descending_filtered_sum).await,
+            "a sum ignores its ordering in either direction, so the dialect \
+             still moves the predicate inside and the pushdown is kept"
         );
 
         let descending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
@@ -3097,6 +3098,80 @@ mod function_support_tests {
         assert!(
             federates_aggregate("bigquery", windowed(None)).await,
             "an unfiltered window call is unaffected"
+        );
+    }
+
+    /// A percentile in *window* position reaches `BigQuery` under its
+    /// `DataFusion` name, because the rewrite that turns it into
+    /// `PERCENTILE_CONT` lives in the dialect's aggregate handling and a window
+    /// call never reaches it.
+    ///
+    /// Measured against a real `BigQuery` project, on the build before this
+    /// check existed:
+    ///
+    /// ```text
+    /// SELECT MEDIAN(requested_amount) OVER (PARTITION BY type) FROM payments_stream
+    ///   -> Function not found: median
+    /// SELECT APPROX_PERCENTILE_CONT(requested_amount, 0.5) OVER (PARTITION BY type) …
+    ///   -> Function not found: approx_percentile_cont
+    /// SELECT type, MEDIAN(requested_amount) FROM payments_stream GROUP BY type
+    ///   -> works; the aggregate form is rewritten
+    /// ```
+    ///
+    /// The aggregate form working is what makes this easy to miss, and why the
+    /// window slot needs its own refusal rather than inheriting the aggregate's.
+    #[tokio::test]
+    async fn bigquery_refuses_a_percentile_in_window_position() {
+        let windowed = |udaf: Arc<datafusion::logical_expr::AggregateUDF>, args: Vec<Expr>| {
+            Expr::from(datafusion::logical_expr::expr::WindowFunction {
+                fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(udaf),
+                params: datafusion::logical_expr::expr::WindowFunctionParams {
+                    args,
+                    partition_by: vec![col("val")],
+                    order_by: vec![],
+                    window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                    null_treatment: None,
+                    filter: None,
+                    distinct: false,
+                },
+            })
+        };
+
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::median::median_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "a windowed median renders as `median`, which BigQuery has no function for, \
+             so it must stay local"
+        );
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf(),
+                    vec![col("id"), datafusion::prelude::lit(0.5)]
+                )
+            )
+            .await,
+            "the approx_percentile_cont spelling reaches BigQuery under its own name too"
+        );
+        // The control: a window function BigQuery does have keeps its pushdown,
+        // so this refuses the percentiles rather than windows in general.
+        assert!(
+            federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::count::count_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "an ordinary windowed aggregate is unaffected"
         );
     }
 

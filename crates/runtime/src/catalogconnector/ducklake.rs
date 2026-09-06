@@ -418,11 +418,11 @@ mod federation_tests {
     fn the_catalog_denies_the_spice_functions_duckdb_cannot_run() {
         let support = ducklake_federation().function_support;
         assert!(
-            !support.supports(&stub_udf("json_get_str", 2)),
+            !support.supports(&stub_udf("json_get_str", 2), None),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            support.supports(&stub_udf("upper", 1)),
+            support.supports(&stub_udf("upper", 1), None),
             "a non-Spice function like upper() must still federate"
         );
     }
@@ -443,7 +443,7 @@ mod federation_tests {
         // rewrite is value-preserving.
         for name in ["cosine_distance", "inner_product"] {
             assert!(
-                !support.supports(&stub_udf(name, 2)),
+                !support.supports(&stub_udf(name, 2), None),
                 "{name} must be evaluated locally: its DuckDB equivalent is not established to \
                  be value-preserving, so it is denied pending that parity check rather than \
                  carved out. Verified for cosine_distance; unverified for inner_product (#13728)"

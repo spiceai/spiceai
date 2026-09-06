@@ -122,6 +122,10 @@ pub fn deny_spice_functions_for_mysql_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also([crate::dialect::BTRIM_NAME.to_string()])
         .build()
+        // The builder carries the scalar hook; the aggregate and window hooks
+        // have no builder method yet, so they are installed on the built value.
+        .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
+        .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
 }
 
 /// `DataFusion`'s nested array/list/map functions that `PostgreSQL` cannot

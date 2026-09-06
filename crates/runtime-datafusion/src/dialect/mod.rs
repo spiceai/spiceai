@@ -212,8 +212,11 @@ pub fn bigquery_native_function_names() -> Vec<&'static str> {
 /// this so an untranslatable call is left to evaluate locally instead of being
 /// unparsed.
 #[must_use]
-pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
-    bigquery::can_translate(call)
+pub fn bigquery_can_translate(
+    call: &ScalarFunction,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    bigquery::can_translate(call, scope)
 }
 
 /// Whether the `BigQuery` dialect can translate this particular aggregate call.
