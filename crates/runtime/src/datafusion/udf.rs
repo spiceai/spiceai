@@ -403,23 +403,24 @@ fn info_from_decl(decl: &Function) -> UserFunctionInfo {
 
 /// Rebuild + re-register user functions against `new_app`, removing any
 /// that are no longer declared. Called on spicepod hot-reload.
+///
+/// Discards the cached logical plans when the registered set changes: a
+/// cached plan embeds the `Arc<ScalarUDF>` it was planned against, so it
+/// keeps evaluating a dropped or redefined function's own body no matter
+/// what the session context now holds for that name. Dataset and view
+/// registration already discard them for the same reason.
 pub async fn apply_function_diff(
     runtime: &crate::Runtime,
     current_app: &Arc<app::App>,
     new_app: &Arc<app::App>,
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
-        // A cached logical plan embeds the `ScalarUDF` it was planned against, so it keeps
-        // calling the function this diff just deregistered or redefined — answering from the
-        // previous body, or federating a call the deny-list no longer covers. Discard the
-        // cached plans so the next query replans against the registry as it now stands, the
-        // same reason dataset and view registration discard them.
         runtime.df.clear_cached_plans().await;
     }
 }
 
-/// The body of [`apply_function_diff`], reporting whether it deregistered or
-/// registered anything — a diff that changed no function leaves cached plans valid.
+/// The body of [`apply_function_diff`]. Returns whether the registered set
+/// changed, which is what makes a cached plan over a user function stale.
 async fn apply_function_diff_inner(
     runtime: &crate::Runtime,
     current_app: &Arc<app::App>,
@@ -473,16 +474,14 @@ async fn apply_function_diff_inner(
         }
     }
 
-    let dropped_a_function = !functions_to_drop.is_empty();
-
     if new_app.functions.is_empty() {
-        return dropped_a_function;
+        return !functions_to_drop.is_empty();
     }
     if !new_enabled {
         tracing::error!(
             "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
         );
-        return dropped_a_function;
+        return !functions_to_drop.is_empty();
     }
 
     let functions_to_register = new_app
@@ -552,13 +551,14 @@ async fn apply_function_diff_inner(
             }
         }
     }
-    let registered_a_function = !registered_function_names.is_empty();
+    // Computed before `registered_function_names` is moved into the deny list.
+    let changed = !registered_function_names.is_empty() || !functions_to_drop.is_empty();
     add_user_functions_to_deny_list(registered_function_names);
     for next in functions_to_expose_as_tools {
         maybe_register_function_as_tool(runtime, &next).await;
     }
 
-    dropped_a_function || registered_a_function
+    changed
 }
 
 /// Names of UDFs whose invocation can execute external code or make RPC/API
@@ -1326,87 +1326,203 @@ mod tests {
         }
     }
 
-    fn app_with_user_functions(bodies: &[(&str, &str)]) -> Arc<app::App> {
-        let mut builder = app::AppBuilder::new("function_reload").with_runtime(
-            spicepod::component::runtime::Runtime {
-                functions: spicepod::component::runtime::Functions::enabled(),
-                ..Default::default()
-            },
-        );
-        for (name, body) in bodies {
-            let mut function = test_user_function(name, true);
-            function.body = Some((*body).to_string());
-            builder = builder.with_function(function);
-        }
-        Arc::new(builder.build())
+    /// A one-function app: `myscale(x)` as a `from: sql` scalar with the given
+    /// body, parsed from YAML so the declaration is the shape a spicepod
+    /// produces. `functions:` is enabled, since registration is opt-in.
+    fn app_with_body(body: &str) -> Arc<app::App> {
+        let function: Function = yaml::from_str(&format!(
+            "
+name: myscale
+from: sql
+kind: scalar
+volatility: immutable
+signature:
+  args: [{{ name: x, type: int64 }}]
+  returns: int64
+body: \"{body}\"
+"
+        ))
+        .expect("the function declaration should parse");
+
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_function(function)
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
+        )
     }
 
-    /// #13873: a cached logical plan embeds the `ScalarUDF` it was planned against, so a hot
-    /// reload that redefines a `functions:` entry leaves the next query answering from the
-    /// previous body — for the whole hour the plan cache holds an entry.
-    #[tokio::test]
-    async fn redefining_a_user_function_discards_cached_plans() {
-        let runtime = crate::Runtime::builder().build().await;
-        runtime
-            .df
-            .cache_one_plan("SELECT 1")
-            .await
-            .expect("SELECT 1 should plan");
-        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
-
-        apply_function_diff(
-            &runtime,
-            &app_with_user_functions(&[("bump", "x + 1")]),
-            &app_with_user_functions(&[("bump", "x + 100")]),
+    /// The same app with no `functions:` at all — what a hot reload that
+    /// removes the declaration produces.
+    fn app_with_no_functions() -> Arc<app::App> {
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
         )
-        .await;
+    }
 
+    /// A runtime built from `app`, with the plans cache `Runtime::init_caching`
+    /// installs unconditionally, plus a cached plan for `sql` and the key it
+    /// was cached under.
+    async fn runtime_with_cached_plan(
+        app: &Arc<app::App>,
+        sql: &'static str,
+    ) -> (
+        crate::Runtime,
+        Arc<crate::datafusion::DataFusion>,
+        Arc<dyn cache::TabledCacheProvider<datafusion::logical_expr::LogicalPlan> + Send + Sync>,
+        cache::key::RawCacheKey,
+    ) {
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::clone(app)))
+            .build()
+            .await;
+        let df = Arc::clone(&runtime.df);
+        let plans = df
+            .plans_cache_provider()
+            .expect("the plans cache is installed unconditionally");
+
+        // Any hasher works — the key only has to be the same on every lookup.
+        let key = cache::key::CacheKey::Query(sql, None)
+            .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql)
+            .await
+            .expect("the query over myscale should plan");
+        plans.checkpoint().await;
         assert_eq!(
-            runtime.df.cached_plan_count().await,
-            Some(0),
-            "a redefined function is deregistered and re-registered, so a plan holding the previous one is stale"
+            plans.item_count().await,
+            1,
+            "precondition: the plan must be cached, or the test cannot observe staleness"
+        );
+
+        (runtime, df, plans, key)
+    }
+
+    /// A cached logical plan embeds the `Arc<ScalarUDF>` it was planned
+    /// against, so it keeps evaluating that UDF's own body regardless of what
+    /// the session context now holds for the name. The plan cache is installed
+    /// unconditionally with a one-hour TTL, so a hot reload that redefines a
+    /// `functions:` body must discard the cached plans or the old body keeps
+    /// answering the same SQL for up to an hour.
+    ///
+    /// Regression test for #13873.
+    #[tokio::test]
+    async fn function_diff_discards_cached_plans_so_a_redefined_body_answers() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let tripling = app_with_body("x * 3");
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        let cached = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .await
+            .expect("the cached plan should come back");
+        assert_eq!(
+            eval_i64(&df.ctx, cached).await,
+            42,
+            "precondition: the first body must be the one that answers"
+        );
+
+        // The hot reload: `myscale` is redefined, which takes the same drop
+        // path as a removal (`next != current`) and then re-registers.
+        apply_function_diff(&runtime, &doubling, &tripling).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "a function diff must discard the cached plans; a plan left in the cache still holds \
+             the pre-reload ScalarUDF"
+        );
+
+        let replanned = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .await
+            .expect("the same SQL should re-plan after the reload");
+        assert_eq!(
+            eval_i64(&df.ctx, replanned).await,
+            63,
+            "the redefined body must answer; 42 means the cached plan's old ScalarUDF answered"
         );
     }
 
-    /// The drop-everything path returns before the registration half, so it needs its own
-    /// guard: removing the last declared function must still discard the cached plans, or the
-    /// removed function keeps being called.
+    /// The removal path has its own exit from the diff: a reload that drops
+    /// every `functions:` entry returns through `new_app.functions.is_empty()`
+    /// before any registration runs, so that arm has to report the drop on its
+    /// own. A plan surviving it still holds the removed function and keeps
+    /// answering for a name the user has taken away.
+    ///
+    /// Regression test for #13873.
     #[tokio::test]
-    async fn dropping_the_last_user_function_discards_cached_plans() {
-        let runtime = crate::Runtime::builder().build().await;
-        runtime
-            .df
-            .cache_one_plan("SELECT 1")
+    async fn function_diff_discards_cached_plans_when_a_reload_removes_every_function() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let removed = app_with_no_functions();
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        // Exits through the `new_app.functions.is_empty()` arm, not the tail.
+        apply_function_diff(&runtime, &doubling, &removed).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "removing every function must discard the cached plans; a plan left in the cache \
+             still holds the removed ScalarUDF"
+        );
+
+        // Re-planning now fails to resolve the name, which is the correct
+        // outcome: the user removed the function. The point is that the query
+        // no longer silently answers from the copy the cached plan held.
+        let err = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
             .await
-            .expect("SELECT 1 should plan");
-
-        apply_function_diff(
-            &runtime,
-            &app_with_user_functions(&[("bump", "x + 1")]),
-            &app_with_user_functions(&[]),
-        )
-        .await;
-
-        assert_eq!(runtime.df.cached_plan_count().await, Some(0));
+            .expect_err("the removed function must not resolve after the reload");
+        assert!(
+            err.to_string().contains("myscale"),
+            "the planning error should name the removed function, got: {err}"
+        );
     }
 
-    /// A reload that leaves every function exactly as it was must not throw the plan cache away.
+    /// The signal is "the registered set changed", not "a reload happened":
+    /// a reload that leaves `functions:` untouched must keep the cached plans,
+    /// or every unrelated spicepod edit throws away the whole plan cache.
     #[tokio::test]
-    async fn a_reload_that_changes_no_function_keeps_cached_plans() {
-        let runtime = crate::Runtime::builder().build().await;
-        runtime
-            .df
-            .cache_one_plan("SELECT 1")
+    async fn function_diff_keeps_cached_plans_when_the_function_set_is_unchanged() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let same = app_with_body("x * 2");
+        let (runtime, _df, plans, _key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        apply_function_diff(&runtime, &doubling, &same).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "an unchanged function set must not discard cached plans"
+        );
+    }
+
+    /// Execute a planned query expected to yield a single `Int64` value.
+    async fn eval_i64(ctx: &SessionContext, plan: datafusion::logical_expr::LogicalPlan) -> i64 {
+        let batches = datafusion::dataframe::DataFrame::new(ctx.state(), plan)
+            .collect()
             .await
-            .expect("SELECT 1 should plan");
-
-        apply_function_diff(
-            &runtime,
-            &app_with_user_functions(&[("bump", "x + 1")]),
-            &app_with_user_functions(&[("bump", "x + 1")]),
-        )
-        .await;
-
-        assert_eq!(runtime.df.cached_plan_count().await, Some(1));
+            .expect("the plan should execute");
+        batches[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+            .value(0)
     }
 }

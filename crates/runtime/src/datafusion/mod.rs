@@ -5160,8 +5160,8 @@ impl DataFusion {
 
     /// Plans `sql` and caches the result, so a test can then assert what invalidates the entry.
     ///
-    /// Lives here rather than in each test module because the plan cache's own traits do, and
-    /// two modules on opposite sides of the crate assert against it.
+    /// Lives here rather than in the test module that uses it because the plan cache's own
+    /// traits do, and reaching them from `init::catalog` would mean re-importing the lot.
     #[cfg(test)]
     pub(crate) async fn cache_one_plan(&self, sql: &str) -> Result<(), DataFusionError> {
         let key = cache::key::CacheKey::Query(sql, None)

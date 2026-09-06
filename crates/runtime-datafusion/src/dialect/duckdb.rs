@@ -18,6 +18,7 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
 };
@@ -42,6 +43,19 @@ const TO_HEX_NAME: &str = "to_hex";
 /// `DuckDB`'s lower-casing function, applied over [`TO_HEX_NAME`] to match
 /// `DataFusion`'s lower-case hex digits.
 const LOWER_NAME: &str = "lower";
+
+/// `DuckDB`'s finite-number test, applied over `array_inner_product` to adopt
+/// the kernel's NULL-for-undefined rule — see [`inner_product_to_sql`].
+const IS_FINITE_NAME: &str = "isfinite";
+
+/// `DuckDB`'s list-mapping and element-access functions. [`finite_or_null`]
+/// screens a value through a one-element list so the value is written — and so
+/// evaluated — exactly once.
+const LIST_TRANSFORM_NAME: &str = "list_transform";
+const LIST_EXTRACT_NAME: &str = "list_extract";
+
+/// The lambda parameter [`finite_or_null`] binds the screened value to.
+const SCREENED_VALUE_PARAM: &str = "v";
 
 /// The name both engines give the SHA-256 function. They disagree on what it
 /// returns — see [`sha256_to_digest_bytes`].
@@ -128,15 +142,20 @@ pub(crate) fn btrim_to_trim(
     }
 }
 
-/// Renders `inner` as the sole argument of a call to `function_name`.
-fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
+/// Renders `args` as a call to `function_name`, taking the arguments already
+/// as SQL. [`renamed_fn_to_sql`] is the equivalent for arguments that still
+/// need unparsing.
+fn call_ast_fn(function_name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     ast::Expr::Function(Function {
         name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
             function_name,
         ))]),
         args: ast::FunctionArguments::List(ast::FunctionArgumentList {
             duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))],
+            args: args
+                .into_iter()
+                .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                .collect(),
             clauses: vec![],
         }),
         filter: None,
@@ -146,6 +165,11 @@ fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
         parameters: ast::FunctionArguments::None,
         uses_odbc_syntax: false,
     })
+}
+
+/// Renders `inner` as the sole argument of a call to `function_name`.
+fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
+    call_ast_fn(function_name, vec![inner])
 }
 
 /// Lower-cases `DuckDB`'s `to_hex`, which upper-cases the digits `DataFusion`
@@ -322,14 +346,115 @@ pub(crate) fn cosine_distance_to_sql(
 }
 
 /// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
-/// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
-/// call to `DuckDB` (>= 1.5.3) is exact.
+/// product, `sum(a[i] * b[i])`), screened so a result that is not a finite
+/// number comes back NULL.
 /// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
+///
+/// The screen makes the two sides agree about a result that is *not a finite
+/// number*, which is the whole of what it claims. Spice's kernel treats an
+/// undefined dot product as NULL — `compute_fsl_f32` appends a null whenever
+/// the result is not finite — because `_score` is derived from it and a
+/// fabricated score outranks every real match. `array_inner_product` has no
+/// such rule and hands back the `inf` or `nan` it computed, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// instead (issue #13787). Measured on the pinned `DuckDB` 1.4.4 for a dot
+/// product that overflows `FLOAT` and for a vector carrying `nan` or an
+/// infinity; a null operand is already NULL on both sides.
+///
+/// **Finite results still differ, and this does not address that.** Both sides
+/// accumulate in `f32` but in different summation orders, so 149 of 269
+/// measured rows disagree — most by one ULP, and a cancelling case by `2.8e30`.
+/// No rewrite of the emitted SQL reconciles a summation order; issue #13893
+/// holds that question.
+///
+/// Screening the *result* rather than the inputs is what the kernel does, and
+/// for this kernel the two coincide: a non-finite element always reaches the
+/// sum (`inf * 0` is `nan`, `inf + -inf` is `nan`), so there is no input that
+/// produces a finite dot product. `Kernel::hides_non_finite_input` records the
+/// same reasoning on the Rust side, where only `Cosine` needs the input screen.
 pub(crate) fn inner_product_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_inner_product")
+    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(finite_or_null))
+}
+
+/// Wraps `value` so that a non-finite result renders as NULL, binding it to a
+/// lambda parameter so it is evaluated once:
+/// `list_extract(list_transform([<value>], v -> CASE WHEN isfinite(v) THEN v END), 1)`.
+///
+/// **The one-element list is what makes the screen sound, not decoration.** The
+/// direct spelling — `CASE WHEN isfinite(<value>) THEN <value> END` — writes
+/// `value` twice, and `DuckDB` evaluates the two occurrences independently. A
+/// volatile argument therefore draws a different number in the test than in the
+/// result, and a row whose test drew a finite value returns its non-finite one:
+/// the screen passes through exactly what it exists to stop. `rand` is in
+/// [`crate::dialect::duckdb_scalar_overrides`] and renders as `random()`, so
+/// `inner_product(make_array(rand(), …), col)` is a call this handler can be
+/// given; nothing on the unparse path gates on volatility. Raised by Copilot on
+/// PR #13895.
+///
+/// Measured on the pinned `DuckDB` 1.4.4, over 400 rows whose array argument
+/// draws `1.0` or `3e38` per evaluation against a `[3e38]` column, so every
+/// product either is finite or overflows `FLOAT`:
+///
+/// | screen | non-finite values that survived |
+/// |---|---|
+/// | `CASE WHEN isfinite(x) THEN x END` | **94 of 400** |
+/// | this one | **0 of 400** |
+///
+/// Both screens NULL all 400 when the same product is written non-volatile, so
+/// the difference is the double evaluation and nothing else.
+///
+/// The list costs little where it matters. Same engine, `ORDER BY … DESC LIMIT
+/// 10` over `array_inner_product` against the unscreened call: 1.91x on
+/// 8-element vectors (2M rows), **1.03x** on 384-element ones (200k rows). The
+/// margin collapses as the per-row vector work grows, because what the screen
+/// adds is per-row list machinery rather than a second dot product — which is
+/// also the measurement that rules out the list being materialised per element.
+fn finite_or_null(value: ast::Expr) -> ast::Expr {
+    let param = ast::Expr::Identifier(Ident::new(SCREENED_VALUE_PARAM));
+    let screen = ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![ast::CaseWhen {
+            condition: wrap_in_call(param.clone(), IS_FINITE_NAME),
+            result: param,
+        }],
+        // No ELSE: a CASE with no matching WHEN is NULL, which is the answer
+        // the kernel gives for a result that is not a finite number.
+        else_result: None,
+    };
+
+    let screened = call_ast_fn(
+        LIST_TRANSFORM_NAME,
+        vec![
+            ast::Expr::Array(Array {
+                elem: vec![value],
+                named: false,
+            }),
+            ast::Expr::Lambda(ast::LambdaFunction {
+                params: ast::OneOrManyWithParens::One(ast::LambdaFunctionParameter {
+                    name: Ident::new(SCREENED_VALUE_PARAM),
+                    data_type: None,
+                }),
+                body: Box::new(screen),
+                syntax: ast::LambdaSyntax::Arrow,
+            }),
+        ],
+    );
+
+    call_ast_fn(
+        LIST_EXTRACT_NAME,
+        vec![
+            screened,
+            ast::Expr::Value(ValueWithSpan {
+                value: sqlparser::ast::Value::Number("1".to_string(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            }),
+        ],
+    )
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -685,7 +810,15 @@ mod tests {
     #[test]
     fn test_inner_product_to_sql_column_and_scalar() {
         // inner_product(column, [4,5,6]) must unparse to DuckDB's native
-        // array_inner_product with the ::FLOAT[N] casts the array functions need.
+        // array_inner_product with the ::FLOAT[N] casts the array functions
+        // need, wrapped in the `isfinite` screen that gives a non-finite
+        // result the NULL the kernel gives it (issue #13787).
+        //
+        // The call appears ONCE, inside a one-element list. That is what makes
+        // the screen sound against a volatile argument, which DuckDB would
+        // otherwise draw independently for the test and for the result — so a
+        // rewrite back to `CASE WHEN isfinite(<call>) THEN <call> END` must
+        // fail here rather than pass on a shorter string.
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         let args = vec![
@@ -707,9 +840,15 @@ mod tests {
         let result = inner_product_to_sql(&unparser, &args)
             .expect("should execute successfully")
             .expect("should return expression");
-        let expected =
-            r#"array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])"#;
-        assert_eq!(result.to_string(), expected);
+        let expected = r#"list_extract(list_transform([array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])], v -> CASE WHEN isfinite(v) THEN v END), 1)"#;
+        let rendered = result.to_string();
+        assert_eq!(rendered, expected);
+        assert_eq!(
+            rendered.matches("array_inner_product").count(),
+            1,
+            "the screened call must be written once, or a volatile argument is \
+             drawn twice and a non-finite result survives the screen: {rendered}"
+        );
     }
 
     #[test]
