@@ -37,7 +37,7 @@ use qdrant::QdrantStore;
 use qdrant::SearchResult;
 use qdrant::proto::PointId;
 
-static QDRANT_SCORE_COLUMN_NAME: &str = "_score";
+pub(crate) static QDRANT_SCORE_COLUMN_NAME: &str = "_score";
 
 /// How raw Qdrant similarity scores map onto Spice `_score` semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,17 +232,23 @@ impl TableProvider for QdrantQueryTable {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if super::filter::supports_pushdown(&self.schema, &self.embedding_column, f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let effective_k = limit.unwrap_or(self.k);
@@ -253,6 +259,8 @@ impl TableProvider for QdrantQueryTable {
             )));
         }
         let projected_schema = project_schema(&self.schema, projection)?;
+        let filter =
+            super::filter::convert_filters_to_qdrant(&self.schema, &self.embedding_column, filters);
         Ok(Arc::new(QdrantQueryExec {
             client: Arc::clone(&self.client),
             collection: self.collection.clone(),
@@ -263,7 +271,7 @@ impl TableProvider for QdrantQueryTable {
             dims: self.dims,
             projected_schema: Arc::clone(&projected_schema),
             projection: projection.cloned(),
-            filter: None,
+            filter,
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
             score_semantics: self.score_semantics,

@@ -34,6 +34,16 @@ pub enum Error {
         or exclude it from the index payload."
     ))]
     UnsupportedPayloadType { arrow_type: String },
+
+    #[snafu(display(
+        "Qdrant collection '{collection}' already exists with {actual}, but the index requires {expected}. \
+        Use a different `qdrant_collection` or recreate the collection with matching vector parameters."
+    ))]
+    CollectionMismatch {
+        collection: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

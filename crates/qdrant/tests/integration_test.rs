@@ -123,6 +123,28 @@ async fn collection_lifecycle_upsert_search_scroll_delete() {
         .await
         .expect("create payload field index");
 
+    store
+        .ensure_collection(&collection, 4, Distance::Cosine)
+        .await
+        .expect("re-ensure with identical parameters");
+
+    let err = store
+        .ensure_collection(&collection, 3, Distance::Cosine)
+        .await
+        .expect_err("dimension mismatch must fail");
+    assert!(
+        matches!(err, qdrant::Error::CollectionMismatch { .. }),
+        "expected a CollectionMismatch error, got {err}"
+    );
+    let err = store
+        .ensure_collection(&collection, 4, Distance::Euclid)
+        .await
+        .expect_err("distance mismatch must fail");
+    assert!(
+        matches!(err, qdrant::Error::CollectionMismatch { .. }),
+        "expected a CollectionMismatch error, got {err}"
+    );
+
     let results = store
         .search(&collection, vec![1.0, 0.0, 0.0, 0.0], 3, None)
         .await

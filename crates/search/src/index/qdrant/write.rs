@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -23,9 +23,9 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use super::QdrantIndex;
-use crate::index::embedding_col;
 use crate::index::write_util::{
-    self, embed_column, extract_and_format_primary_key, update_embedding_column_in_batch,
+    self, embed_column, extract_and_format_primary_key, keys_to_evict,
+    update_embedding_column_in_batch,
 };
 
 #[derive(Debug, Snafu)]
@@ -78,6 +78,14 @@ pub enum Error {
         column: String,
         source: qdrant::Error,
     },
+
+    #[snafu(display(
+        "Failed to update the search index '{collection}' (qdrant): the vectors stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Cause: {source}"
+    ))]
+    CannotEvictRejectedRecords {
+        collection: String,
+        source: qdrant::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -114,7 +122,19 @@ pub async fn write(index: &QdrantIndex, record: RecordBatch) -> Result<RecordBat
     let primary_keys = extract_and_format_primary_key(index.name(), &index.primary_key, &record)
         .map_err(|e| Error::from(*e))?;
 
-    let points = build_points(index, &record, &embedding_vectors, &primary_keys)?;
+    let (points, evicted) = build_points(index, &record, &embedding_vectors, &primary_keys)?;
+
+    if !evicted.is_empty() {
+        let ids: Vec<qdrant::proto::PointId> = evicted
+            .into_iter()
+            .map(|key| point_id_from_values(&[key]))
+            .collect();
+        index.client.delete_by_ids(collection, ids).await.context(
+            CannotEvictRejectedRecordsSnafu {
+                collection: index.collection.clone(),
+            },
+        )?;
+    }
 
     if !points.is_empty() {
         index
@@ -140,13 +160,42 @@ fn build_points(
     record: &RecordBatch,
     embedding_vectors: &[Option<Vec<f32>>],
     primary_keys: &[Option<String>],
-) -> Result<Vec<PointData>> {
+) -> Result<(Vec<PointData>, Vec<String>)> {
     const SAMPLE_LIMIT: usize = 5;
 
     let schema = record.schema();
     let collection = index.collection.as_str();
-    let embedding_name = embedding_col(&index.embedded_column);
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
+
+    let mut payload_names: HashSet<&str> = HashSet::with_capacity(
+        index.primary_key.len() + index.metadata_columns.all_names().len() + 1,
+    );
+    for field in &index.primary_key {
+        payload_names.insert(field.name().as_str());
+    }
+    let metadata_names = index.metadata_columns.all_names();
+    for name in &metadata_names {
+        payload_names.insert(name.as_str());
+    }
+    if let Some(partition_key) = index.partition_key.as_deref() {
+        payload_names.insert(partition_key);
+    }
+    let column_index: HashMap<&str, usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+    let mut payload_columns: Vec<(&str, usize)> = payload_names
+        .into_iter()
+        .filter_map(|name| {
+            if Some(name) == index.partition_key.as_deref() {
+                return None;
+            }
+            column_index.get(name).map(|&idx| (name, idx))
+        })
+        .collect();
+    payload_columns.sort_unstable_by_key(|(name, _)| *name);
 
     let mut null_pk_skips: usize = 0;
     let mut null_pk_samples: Vec<usize> = Vec::new();
@@ -157,10 +206,15 @@ fn build_points(
     let mut missing_embedding_skips: usize = 0;
 
     let mut points: Vec<PointData> = Vec::with_capacity(record.num_rows());
+    let mut rejected: Vec<String> = Vec::new();
+    let mut indexed: Vec<&str> = Vec::new();
 
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
+            if let Some(key) = primary_keys[row].as_ref() {
+                rejected.push(key.clone());
+            }
             continue;
         };
 
@@ -186,6 +240,9 @@ fn build_points(
             if zero_or_nan_samples.len() < SAMPLE_LIMIT {
                 zero_or_nan_samples.push(row);
             }
+            if let Some(key) = primary_keys[row].as_ref() {
+                rejected.push(key.clone());
+            }
             continue;
         }
 
@@ -194,22 +251,22 @@ fn build_points(
             if non_finite_samples.len() < SAMPLE_LIMIT {
                 non_finite_samples.push(row);
             }
+            if let Some(key) = primary_keys[row].as_ref() {
+                rejected.push(key.clone());
+            }
             continue;
         }
 
         let mut payload: HashMap<String, qdrant::proto::Value> =
-            HashMap::with_capacity(schema.fields().len());
-        for (i, field) in schema.fields().iter().enumerate() {
-            if field.name() == &embedding_name {
-                continue;
-            }
-            let value = arrow_value_to_qdrant(record.column(i).as_ref(), row).context(
+            HashMap::with_capacity(payload_columns.len() + 1);
+        for (name, idx) in &payload_columns {
+            let value = arrow_value_to_qdrant(record.column(*idx).as_ref(), row).context(
                 PayloadConversionSnafu {
                     collection: collection.to_string(),
-                    column: field.name().clone(),
+                    column: (*name).to_string(),
                 },
             )?;
-            payload.insert(field.name().clone(), value);
+            payload.insert((*name).to_string(), value);
         }
 
         if let (Some(partition_key), Some(partition_col)) =
@@ -238,6 +295,9 @@ fn build_points(
                 .unwrap_or_default()]))
         };
 
+        if let Some(key) = primary_keys[row].as_ref() {
+            indexed.push(key.as_str());
+        }
         points.push(PointData {
             id,
             payload,
@@ -252,21 +312,21 @@ fn build_points(
     }
     if zero_or_nan_skips > 0 {
         tracing::warn!(
-            "Skipped {zero_or_nan_skips} record(s) for Qdrant collection '{collection}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+            "Skipped {zero_or_nan_skips} record(s) for Qdrant collection '{collection}': embedding vector is all zeros or NaN. Any vector already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {zero_or_nan_samples:?}"
         );
     }
     if non_finite_skips > 0 {
         tracing::warn!(
-            "Skipped {non_finite_skips} record(s) for Qdrant collection '{collection}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
+            "Skipped {non_finite_skips} record(s) for Qdrant collection '{collection}': embedding vector contains non-finite values (NaN or infinity). Any vector already stored for those records is removed, so a search does not return them at their previous value. Sample row indices: {non_finite_samples:?}"
         );
     }
     if missing_embedding_skips > 0 {
         tracing::debug!(
-            "Skipped {missing_embedding_skips} record(s) for Qdrant collection '{collection}': no embedding generated."
+            "Skipped {missing_embedding_skips} record(s) for Qdrant collection '{collection}': no embedding generated (expected when embedded column is NULL). Any vector already stored for those records is removed."
         );
     }
 
-    Ok(points)
+    Ok((points, keys_to_evict(rejected, indexed)))
 }
 
 pub async fn delete_by_keys(index: &QdrantIndex, keys: &RecordBatch) -> Result<()> {

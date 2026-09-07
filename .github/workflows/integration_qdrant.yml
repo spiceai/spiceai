@@ -10,6 +10,9 @@ on:
       - 'crates/data_components/src/qdrant/**'
       - 'crates/search/src/index/qdrant/**'
       - 'crates/runtime/src/embeddings/index/qdrant.rs'
+      - 'crates/runtime/src/embeddings/index/table.rs'
+      - 'crates/runtime/src/embeddings/udtf.rs'
+      - 'crates/runtime-search/src/search_engine.rs'
       - 'crates/runtime-search/src/store_params/qdrant.rs'
       - 'crates/runtime-datafusion-udfs/**'
       - 'bin/spiced/Cargo.toml'
@@ -53,6 +56,9 @@ jobs:
               - 'crates/data_components/src/qdrant/**'
               - 'crates/search/src/index/qdrant/**'
               - 'crates/runtime/src/embeddings/index/qdrant.rs'
+              - 'crates/runtime/src/embeddings/index/table.rs'
+              - 'crates/runtime/src/embeddings/udtf.rs'
+              - 'crates/runtime-search/src/search_engine.rs'
               - 'crates/runtime-search/src/store_params/qdrant.rs'
               - 'crates/runtime-datafusion-udfs/**'
               - 'bin/spiced/Cargo.toml'
@@ -104,3 +110,14 @@ jobs:
           QDRANT_ENDPOINT: http://127.0.0.1:6334
         run: |
           RUSTC_WRAPPER="" cargo test -p qdrant --test integration_test -- --nocapture
+
+      - name: Run qdrant engine unit tests (no server)
+        run: |
+          RUSTC_WRAPPER="" cargo test -p qdrant --lib -- --nocapture
+          RUSTC_WRAPPER="" cargo test -p data_components --features qdrant --lib qdrant -- --nocapture
+          RUSTC_WRAPPER="" cargo test -p search --features qdrant --lib index::qdrant -- --nocapture
+          RUSTC_WRAPPER="" cargo test -p runtime-search --features qdrant --lib -- --nocapture
+
+      - name: Check qdrant runtime path compiles
+        run: |
+          RUSTC_WRAPPER="" cargo check -p runtime --features qdrant

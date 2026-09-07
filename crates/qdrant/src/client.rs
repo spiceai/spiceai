@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::error::Error::{ClientBuild, Qdrant as QdrantErr};
+use crate::error::Error::{ClientBuild, CollectionMismatch, Qdrant as QdrantErr};
 use crate::error::Result;
 
 use crate::payload::{PointData, SearchResult};
@@ -120,6 +120,71 @@ impl Qdrant {
         })?;
         Ok(Self { client })
     }
+
+    async fn validate_collection(
+        &self,
+        collection: &str,
+        dimension: u64,
+        distance: qdrant_client::qdrant::Distance,
+    ) -> Result<()> {
+        let info = self
+            .client
+            .collection_info(collection)
+            .await
+            .map_err(|source| QdrantErr { source })?;
+        let Some(result) = info.result else {
+            return Err(CollectionMismatch {
+                collection: collection.to_string(),
+                expected: format!(
+                    "vector size {dimension} and distance '{}'",
+                    distance.as_str_name()
+                ),
+                actual: "no readable collection info".to_string(),
+            });
+        };
+        let vectors_config = result
+            .config
+            .as_ref()
+            .and_then(|c| c.params.as_ref())
+            .and_then(|p| p.vectors_config.as_ref());
+        let expected = format!(
+            "vector size {dimension} and distance '{}'",
+            distance.as_str_name()
+        );
+        let actual = match actual_vector_params(vectors_config) {
+            Ok((size, actual_distance)) if size == dimension && actual_distance == distance => {
+                return Ok(());
+            }
+            Ok((size, actual_distance)) => format!(
+                "vector size {size} and distance '{}'",
+                actual_distance.as_str_name()
+            ),
+            Err(detail) => detail,
+        };
+        Err(CollectionMismatch {
+            collection: collection.to_string(),
+            expected,
+            actual,
+        })
+    }
+}
+
+fn actual_vector_params(
+    vectors_config: Option<&qdrant_client::qdrant::VectorsConfig>,
+) -> std::result::Result<(u64, qdrant_client::qdrant::Distance), String> {
+    use qdrant_client::qdrant::vectors_config::Config;
+    let Some(vectors_config) = vectors_config else {
+        return Err("no vector configuration".to_string());
+    };
+    match &vectors_config.config {
+        Some(Config::Params(params)) => {
+            let distance = qdrant_client::qdrant::Distance::try_from(params.distance)
+                .map_err(|_| format!("unknown distance {}", params.distance))?;
+            Ok((params.size, distance))
+        }
+        Some(Config::ParamsMap(_)) => Err("named vectors".to_string()),
+        None => Err("no vector configuration".to_string()),
+    }
 }
 
 #[async_trait]
@@ -138,6 +203,8 @@ impl QdrantStore for Qdrant {
         distance: qdrant_client::qdrant::Distance,
     ) -> Result<()> {
         if self.collection_exists(collection).await? {
+            self.validate_collection(collection, dimension, distance)
+                .await?;
             return Ok(());
         }
 
@@ -274,5 +341,60 @@ impl QdrantStore for Qdrant {
             .await
             .map(|_| ())
             .map_err(|source| QdrantErr { source })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use qdrant_client::qdrant::{Distance, VectorParams, VectorsConfig, vectors_config::Config};
+    use std::collections::HashMap;
+
+    use super::actual_vector_params;
+
+    fn single_vector_config(size: u64, distance: Distance) -> VectorsConfig {
+        VectorsConfig {
+            config: Some(Config::Params(VectorParams {
+                size,
+                distance: distance as i32,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn single_vector_params_round_trip() {
+        let config = single_vector_config(4, Distance::Cosine);
+        assert_eq!(
+            actual_vector_params(Some(&config)).expect("params"),
+            (4, Distance::Cosine)
+        );
+    }
+
+    #[test]
+    fn named_vectors_and_missing_config_are_reported_not_matched() {
+        let named = VectorsConfig {
+            config: Some(Config::ParamsMap(qdrant_client::qdrant::VectorParamsMap {
+                map: HashMap::from([(
+                    "image".to_string(),
+                    VectorParams {
+                        size: 4,
+                        distance: Distance::Cosine as i32,
+                        ..Default::default()
+                    },
+                )]),
+            })),
+        };
+        assert_eq!(
+            actual_vector_params(Some(&named)).expect_err("named vectors"),
+            "named vectors".to_string()
+        );
+        assert_eq!(
+            actual_vector_params(None).expect_err("missing config"),
+            "no vector configuration".to_string()
+        );
+        assert_eq!(
+            actual_vector_params(Some(&VectorsConfig { config: None })).expect_err("empty config"),
+            "no vector configuration".to_string()
+        );
     }
 }
