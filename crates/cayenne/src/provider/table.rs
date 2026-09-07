@@ -54105,6 +54105,19 @@ mod tests {
              test never opens"
         );
 
+        // Drop every cached keyset before the second append, so the first append's
+        // key can only reach the second's validation through the in-flight staged
+        // registration and the rebuild that folds it in. Without this the second
+        // append reads the PK cache that `record_file_pk_keys` just filled, and
+        // that call alone satisfies the row-count assertion below — leaving the
+        // `!stage_on_conflict` arm's `attach_inflight_staged_pk_keys` with no
+        // reachable consumer in this test. `clear_cached_pk_keyset` empties the
+        // cache on the premise that a rebuild re-reads the commit from the table,
+        // which is exactly the premise that does not hold while the staged rows
+        // are still undiscoverable, so it is also the operation this arm has to
+        // survive in production.
+        provider.clear_cached_pk_keyset();
+
         // Stage A of the second append begins inside that window, carrying the SAME
         // new key. Whether it stages is an OUTCOME, not a precondition: once the
         // first append's key is visible to validation the row is dropped as a
