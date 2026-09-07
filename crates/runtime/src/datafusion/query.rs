@@ -79,7 +79,7 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use super::{
     SPICE_RUNTIME_SCHEMA,
@@ -2802,6 +2802,38 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
                 .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
     )
+}
+
+/// Runs `sql` and collects the whole result into memory.
+///
+/// Collecting defeats streaming, so this is for callers that need the complete
+/// result set in hand and know it is small — not for serving query responses.
+pub(crate) async fn run_sql(
+    df: Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    run_sql_with_read_only(df, sql, parameters, false).await
+}
+
+/// [`run_sql`], enforcing read-only mode when `read_only` is set.
+pub(crate) async fn run_sql_with_read_only(
+    df: Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    let query_res = QueryBuilder::new(sql, df)
+        .parameters(parameters)
+        .read_only(read_only)
+        .build()
+        .run()
+        .await?;
+
+    Ok((
+        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
+        query_res.cache_status,
+    ))
 }
 
 /// Returns whether a Flight SQL session may be used by the current principal.

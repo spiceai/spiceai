@@ -227,7 +227,7 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
-        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let read_only = runtime_request_context::current_principal_requires_read_only().await;
         let query = QueryBuilder::new(sql, datafusion)
             .read_only(read_only)
             .build();

@@ -36,7 +36,6 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
-runtime-auth = { path = "../runtime-auth" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
 runtime-request-context = { path = "../runtime-request-context" }

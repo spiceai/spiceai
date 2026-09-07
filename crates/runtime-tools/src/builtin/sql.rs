@@ -17,11 +17,11 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
-use crate::builtin::function_tool::current_principal_requires_read_only;
 use crate::utils::{parameters, write_to_json_string};
 use futures::TryStreamExt;
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
+use runtime_request_context::current_principal_requires_read_only;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

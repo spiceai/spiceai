@@ -45,6 +45,22 @@ pub trait AuthPrincipal {
         None
     }
 }
+
+/// Whether `principal` is permitted to perform writes.
+///
+/// A principal has write access when its group memberships include `write` or
+/// `read_write`; see `AuthPrincipal::groups`. Callers that need the read-only
+/// posture of the *current request* should use
+/// `runtime_request_context::current_principal_requires_read_only`, which
+/// resolves the principal from the request context first.
+#[must_use]
+pub fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+}
+
 pub trait AuthRequestContext {
     /// Sets the current authentication principal for the request context.
     ///
@@ -138,4 +154,60 @@ pub trait GrpcAuth {
     ///
     /// This function will return an error if the validator can't validate the request.
     fn grpc_verify(&self, req: &tonic::Request<()>) -> Result<AuthVerdict, Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthPrincipal, AuthPrincipalRef, principal_has_write_access};
+    use app::spicepod::component::runtime::ApiKey;
+    use std::sync::Arc;
+
+    struct TestPrincipal(Vec<&'static str>);
+
+    impl AuthPrincipal for TestPrincipal {
+        fn username(&self) -> &'static str {
+            "test"
+        }
+
+        fn groups(&self) -> &[&str] {
+            &self.0
+        }
+    }
+
+    fn principal(groups: Vec<&'static str>) -> AuthPrincipalRef {
+        Arc::new(TestPrincipal(groups))
+    }
+
+    #[test]
+    fn write_access_requires_a_write_group() {
+        assert!(principal_has_write_access(&principal(vec!["write"])));
+        assert!(principal_has_write_access(&principal(vec!["read_write"])));
+        // Present alongside others, in any position.
+        assert!(principal_has_write_access(&principal(vec![
+            "read",
+            "read_write"
+        ])));
+
+        assert!(!principal_has_write_access(&principal(vec!["read"])));
+        assert!(!principal_has_write_access(&principal(vec![])));
+        // Not a prefix or substring match: only the exact group names grant write.
+        assert!(!principal_has_write_access(&principal(vec![
+            "writer",
+            "readwrite",
+            "write_read"
+        ])));
+    }
+
+    #[test]
+    fn api_key_variants_map_to_write_access() {
+        let read_only: AuthPrincipalRef = Arc::new(ApiKey::ReadOnly {
+            key: "k".to_string(),
+        });
+        let read_write: AuthPrincipalRef = Arc::new(ApiKey::ReadWrite {
+            key: "k".to_string(),
+        });
+
+        assert!(!principal_has_write_access(&read_only));
+        assert!(principal_has_write_access(&read_write));
+    }
 }

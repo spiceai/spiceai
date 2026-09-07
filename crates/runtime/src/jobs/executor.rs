@@ -28,8 +28,8 @@ use runtime_request_context::RequestContext;
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
-use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
+use runtime_api_types::v1::queries::SubmitQueryRequest;
 
 use super::Result;
 use super::state::{JobState, JobStatus};
