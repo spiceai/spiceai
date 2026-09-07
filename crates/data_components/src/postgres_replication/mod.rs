@@ -404,11 +404,17 @@ pub fn rebuild_cause(
 ///
 /// The causes are genuinely different situations calling for different
 /// responses — a restored source, a repointed endpoint, a broken sidecar, a slot
-/// lifecycle problem — so they are reported separately rather than as one
-/// "rebuilt" event, in the log line and on the member's metrics alike.
+/// lifecycle problem — so the log line names which one fired rather than
+/// reporting an undifferentiated "rebuilt". They are deliberately NOT a metric
+/// label: a rebuild is an *event*, read one at a time, not a rate, so a
+/// per-cause series would carry a single point per dataset and there would be no
+/// proportion to watch. The values are already reported without them — a rebuild
+/// runs as a full refresh of the dataset, so
+/// `dataset_acceleration_refresh_duration_ms{mode="full"}` carries how long the
+/// re-read took, which is the part no log line can reconstruct.
 ///
-/// Two accessors, deliberately: [`Self::label`] is an identifier that dashboards
-/// and log queries match on and must stay stable, while [`Self::reason`] is prose
+/// Two accessors, deliberately: [`Self::label`] is an identifier that log
+/// queries match on and must stay stable, while [`Self::reason`] is prose
 /// written for whoever reads the warning and is free to be reworded. One string
 /// cannot be both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,7 +429,7 @@ pub enum RebuildCause {
     /// The record names a position the source's history no longer contains,
     /// because it was restored or rewound afterwards.
     ///
-    /// Worth alerting on rather than only counting, because one rewind escapes
+    /// Worth chasing rather than only noting, because one rewind escapes
     /// detection entirely: a slot that survived it still valid and at a
     /// pre-rewind position (a block-level snapshot of `PGDATA` restored as crash
     /// recovery), once the WAL has grown back past the recorded position.
@@ -464,13 +470,13 @@ pub enum RebuildCause {
 }
 
 impl RebuildCause {
-    /// Stable identifier for metrics and log queries. Never reworded — renaming
-    /// one breaks every dashboard and saved search that selects on it.
+    /// Stable identifier for log queries. Never reworded — renaming one breaks
+    /// every saved search that selects on it.
     ///
     /// A new variant lands here and in [`Self::reason`] by exhaustiveness; also
     /// add it to `causes` in
-    /// `every_rebuild_cause_is_distinguishable_to_a_query_and_to_a_person`, which
-    /// cannot notice one it was not given.
+    /// `every_source_read_cause_is_distinguishable_to_a_query_and_to_a_person`,
+    /// which cannot notice one it was not given.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -485,8 +491,8 @@ impl RebuildCause {
         }
     }
 
-    /// The operator-facing clause, phrased to complete "this acceleration will be
-    /// rebuilt from the source before changes are applied: ...".
+    /// The operator-facing clause, phrased to complete the sentence
+    /// [`rebuild_log_message`] builds.
     #[must_use]
     pub fn reason(self) -> &'static str {
         match self {
@@ -513,6 +519,169 @@ impl RebuildCause {
             }
             Self::UnprovenContentsWithUsablePosition => {
                 "it could not be read to check whether it still holds rows while recording changes as already applied up to a position, so if it is empty the changes below that position would never be resent and would stay missing here"
+            }
+        }
+    }
+}
+
+/// The inputs [`creation_cause`] decides on, named rather than positional so a
+/// caller cannot silently transpose two of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreationInputs {
+    /// When the dataset re-reads its source — see [`SourceReadPolicy`].
+    pub source_read_policy: SourceReadPolicy,
+    /// This attach added the dataset's table to the replication publication.
+    pub table_added: bool,
+    /// The replication slot was created in this process rather than resumed, and
+    /// this member is not rejoining one it already held a floor on.
+    pub slot_created_this_process: bool,
+}
+
+/// When a dataset re-reads its source table, and — for the two policies that do
+/// it unconditionally — why.
+///
+/// One enum rather than an `ephemeral` / `on_every_start` pair of flags, because
+/// the pair can express a state that does not exist (an acceleration that is
+/// ephemeral yet resumes) and the reason for the re-read is exactly what the
+/// operator is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceReadPolicy {
+    /// Read the source only when the slot cannot supply the acceleration's
+    /// contents.
+    WhenHistoryIsMissing,
+    /// Read it on every start, because the acceleration does not survive one and
+    /// so boots with nothing for the slot's history to be applied to.
+    EveryStartEphemeral,
+    /// Read it on every start, because `pg_replication_initial_snapshot: always`
+    /// asks for it on an acceleration that does persist.
+    EveryStartConfigured,
+}
+
+/// Why an acceleration is being created by reading the source on this attach, or
+/// `None` when the slot's own history can supply its contents.
+///
+/// The companion to [`rebuild_cause`], and the same reason for existing: the
+/// condition that decides whether the source is read *and* the sentence that
+/// explains it to an operator are one function, so the two cannot drift apart.
+/// The disjunction here is exactly the one the caller uses to decide whether to
+/// snapshot.
+///
+/// Ordered by which answer an operator can act on, most enduring first: an
+/// acceleration that does not persist re-reads the source on every start no
+/// matter what the slot or publication does, so reporting one of those instead
+/// would send them after a one-off that is really a permanent property of the
+/// dataset's configuration.
+#[must_use]
+pub fn creation_cause(inputs: CreationInputs) -> Option<CreationCause> {
+    match inputs.source_read_policy {
+        SourceReadPolicy::EveryStartEphemeral => {
+            return Some(CreationCause::EphemeralAcceleration);
+        }
+        SourceReadPolicy::EveryStartConfigured => return Some(CreationCause::SnapshotAlways),
+        SourceReadPolicy::WhenHistoryIsMissing => {}
+    }
+    if inputs.table_added {
+        return Some(CreationCause::TableAdded);
+    }
+    inputs
+        .slot_created_this_process
+        .then_some(CreationCause::SlotCreated)
+}
+
+/// The connector page an operator is sent to when the source is read into an
+/// acceleration. One constant, so the created and rebuilt lines cannot drift
+/// onto different pages.
+const CONNECTOR_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/postgres";
+
+/// The line an operator reads when an acceleration is about to be created by
+/// reading the source.
+///
+/// A pure function so the composition can be asserted: the dataset it happened
+/// to, which of the conditions asked for it, and where to read about changing
+/// that — a reword must not quietly drop one (see
+/// `a_source_read_message_names_the_dataset_the_cause_and_where_to_read_more`).
+#[must_use]
+pub fn creation_log_message(dataset: &str, cause: CreationCause) -> String {
+    format!(
+        "Dataset '{dataset}' will have its acceleration created by reading the source: {}. See: {CONNECTOR_DOCS}",
+        cause.reason()
+    )
+}
+
+/// The line an operator reads when an acceleration's contents are about to be
+/// replaced by a fresh read of the source.
+///
+/// Built the same way as [`creation_log_message`] and asserted by the same test.
+/// It names the cost as well as the cause: unlike a creation, this re-reads a
+/// table the dataset was already serving, and that is the part an operator is
+/// being asked to account for.
+#[must_use]
+pub fn rebuild_log_message(dataset: &str, cause: RebuildCause) -> String {
+    format!(
+        "Dataset '{dataset}' will have its acceleration rebuilt from the source before changes are applied, which re-reads the whole table: {}. See: {CONNECTOR_DOCS}",
+        cause.reason()
+    )
+}
+
+/// Why an acceleration was created by reading the source rather than built from
+/// the slot's change history.
+///
+/// Reported in the log and not as a metric label, for the reason spelled out on
+/// [`RebuildCause`]: creating an acceleration is an event rather than a rate, so
+/// the cause belongs in the sentence an operator reads.
+///
+/// Note the metrics are thinner here than on the rebuild path. A creation is read
+/// by the connector as the slot's initial snapshot, which reports its progress
+/// (`bootstrap_rows_total`, `bootstrap_rows_expected`, `bootstrap_complete`) but
+/// is never timed: only a rebuild runs through `RefreshTask::run` and lands on
+/// `dataset_acceleration_refresh_duration_ms`. So for a creation this log line is
+/// the whole account of why it happened, and there is no duration beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreationCause {
+    /// The acceleration does not survive a restart, so it starts empty and only
+    /// the source can fill it.
+    EphemeralAcceleration,
+    /// `pg_replication_initial_snapshot: always` on an acceleration that does
+    /// persist — the re-read was asked for.
+    SnapshotAlways,
+    /// This attach added the table to the publication, so the slot carries no
+    /// change history for it.
+    TableAdded,
+    /// The slot was created in this process, so it retains nothing from before
+    /// now.
+    SlotCreated,
+}
+
+impl CreationCause {
+    /// Stable identifier for log queries — see [`RebuildCause::label`], which it
+    /// shares a namespace with: no cause of a source read, created or rebuilt,
+    /// may collide with another.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EphemeralAcceleration => "ephemeral_acceleration",
+            Self::SnapshotAlways => "snapshot_always",
+            Self::TableAdded => "table_added",
+            Self::SlotCreated => "slot_created",
+        }
+    }
+
+    /// The operator-facing clause, phrased to complete "this acceleration will be
+    /// created by reading the source: ...".
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::EphemeralAcceleration => {
+                "its acceleration does not persist across restarts, so it starts empty on every start and the source is the only thing that can fill it"
+            }
+            Self::SnapshotAlways => {
+                "`pg_replication_initial_snapshot: always` asks for the source to be re-read on every start, including one that resumes an existing replication slot"
+            }
+            Self::TableAdded => {
+                "its table was only just added to the replication publication, so the source's change stream carries no history it could be built from"
+            }
+            Self::SlotCreated => {
+                "its replication slot was created in this process, so the source retains no change history from before now"
             }
         }
     }
@@ -774,8 +943,10 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccelerationContents, AppliedLsn, RebuildCause, RecordedPosition, UnusableReason,
-        rebuild_cause, recorded_position_is_ahead_of_source,
+        AccelerationContents, AppliedLsn, CONNECTOR_DOCS, CreationCause, CreationInputs,
+        RebuildCause, RecordedPosition, SourceReadPolicy, UnusableReason, creation_cause,
+        creation_log_message, rebuild_cause, rebuild_log_message,
+        recorded_position_is_ahead_of_source,
     };
 
     /// A slot that reaches everything, so a case varies only what it is about.
@@ -1058,18 +1229,21 @@ mod tests {
         );
     }
 
-    /// `label` is matched on by dashboards and log queries, so two causes sharing
-    /// one would silently merge unrelated incidents; `reason` is all an operator
-    /// reads, so two sharing one sends them after the wrong problem. Neither may
-    /// collide, and neither may be empty.
+    /// `label` is matched on by log queries, so two causes sharing one would
+    /// silently merge unrelated incidents; `reason` is all an operator reads, so
+    /// two sharing one sends them after the wrong problem. Neither may collide,
+    /// and neither may be empty.
     ///
     /// A new variant must be added to `causes` below. `label`/`reason` are
     /// exhaustive matches, so adding one forces a visit to both — and this list
     /// is named in the comment there for the same reason: an unlisted variant
     /// would leave this test passing while asserting nothing about it.
     #[test]
-    fn every_rebuild_cause_is_distinguishable_to_a_query_and_to_a_person() {
-        let causes = [
+    fn every_source_read_cause_is_distinguishable_to_a_query_and_to_a_person() {
+        // Both enums answer one question — why was the source read into this
+        // acceleration — and both are written into the same log field, so they
+        // are checked as one namespace rather than two.
+        let causes: Vec<(&str, &str, String)> = [
             RebuildCause::NoRecord,
             RebuildCause::ForeignSource,
             RebuildCause::Unreadable,
@@ -1078,33 +1252,153 @@ mod tests {
             RebuildCause::RetentionLost,
             RebuildCause::EmptyWithUsablePosition,
             RebuildCause::UnprovenContentsWithUsablePosition,
-        ];
-        for (i, cause) in causes.iter().enumerate() {
-            assert!(!cause.label().is_empty(), "{cause:?} has no label");
-            assert!(!cause.reason().is_empty(), "{cause:?} has no reason");
+        ]
+        .into_iter()
+        .map(|cause| (cause.label(), cause.reason(), format!("{cause:?}")))
+        .chain(
+            [
+                CreationCause::EphemeralAcceleration,
+                CreationCause::SnapshotAlways,
+                CreationCause::TableAdded,
+                CreationCause::SlotCreated,
+            ]
+            .into_iter()
+            .map(|cause| (cause.label(), cause.reason(), format!("{cause:?}"))),
+        )
+        .collect();
+
+        for (i, (label, reason, name)) in causes.iter().enumerate() {
+            assert!(!label.is_empty(), "{name} has no label");
+            assert!(!reason.is_empty(), "{name} has no reason");
             // Labels are identifiers, not prose: whitespace means someone reworded
             // one into a sentence and broke every query selecting on it.
             assert!(
-                cause
-                    .label()
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '_'),
-                "{cause:?} label is not a stable identifier: {}",
-                cause.label()
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{name} label is not a stable identifier: {label}"
             );
-            for other in &causes[i + 1..] {
+            for (other_label, other_reason, other_name) in &causes[i + 1..] {
                 assert_ne!(
-                    cause.label(),
-                    other.label(),
-                    "{cause:?} and {other:?} share a label, so a query cannot separate them"
+                    label, other_label,
+                    "{name} and {other_name} share a label, so a query cannot separate them"
                 );
                 assert_ne!(
-                    cause.reason(),
-                    other.reason(),
-                    "{cause:?} and {other:?} read identically to an operator"
+                    reason, other_reason,
+                    "{name} and {other_name} read identically to an operator"
                 );
             }
         }
+    }
+
+    /// These lines are the only explanation an operator gets for a full read of
+    /// their source, so each must carry all three of the things they would act
+    /// on. Asserted on the composed string, not on `reason()` alone, because
+    /// dropping the dataset or the link is a reword of the wrapper — which is
+    /// exactly how the rebuild line came to have neither.
+    #[test]
+    fn a_source_read_message_names_the_dataset_the_cause_and_where_to_read_more() {
+        let messages: Vec<(String, &str, String)> = [
+            CreationCause::EphemeralAcceleration,
+            CreationCause::SnapshotAlways,
+            CreationCause::TableAdded,
+            CreationCause::SlotCreated,
+        ]
+        .into_iter()
+        .map(|cause| {
+            (
+                creation_log_message("sales.orders", cause),
+                cause.reason(),
+                format!("{cause:?}"),
+            )
+        })
+        .chain(
+            [
+                RebuildCause::NoRecord,
+                RebuildCause::ForeignSource,
+                RebuildCause::Unreadable,
+                RebuildCause::RewoundSource,
+                RebuildCause::AcknowledgedPast,
+                RebuildCause::RetentionLost,
+                RebuildCause::EmptyWithUsablePosition,
+                RebuildCause::UnprovenContentsWithUsablePosition,
+            ]
+            .into_iter()
+            .map(|cause| {
+                (
+                    rebuild_log_message("sales.orders", cause),
+                    cause.reason(),
+                    format!("{cause:?}"),
+                )
+            }),
+        )
+        .collect();
+
+        for (message, reason, name) in &messages {
+            assert!(
+                message.contains("'sales.orders'"),
+                "{name} message does not name the dataset it happened to: {message}"
+            );
+            assert!(
+                message.contains(reason),
+                "{name} message does not say which condition asked for the read: {message}"
+            );
+            assert!(
+                message.contains(CONNECTOR_DOCS),
+                "{name} message does not say where to read about changing it: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "{name} message spans more than one line: {message}"
+            );
+        }
+    }
+
+    /// `creation_cause` must fire on exactly the conditions its caller snapshots
+    /// on: a `Some` where the caller would not snapshot leaves a log line for a
+    /// read that never happens, and a `None` where it would leaves the read
+    /// unexplained.
+    #[test]
+    fn creation_cause_answers_for_every_condition_that_asks_for_a_snapshot() {
+        let inputs = |policy, added, slot_created| CreationInputs {
+            source_read_policy: policy,
+            table_added: added,
+            slot_created_this_process: slot_created,
+        };
+        for policy in [
+            SourceReadPolicy::WhenHistoryIsMissing,
+            SourceReadPolicy::EveryStartEphemeral,
+            SourceReadPolicy::EveryStartConfigured,
+        ] {
+            for added in [false, true] {
+                for slot_created in [false, true] {
+                    let i = inputs(policy, added, slot_created);
+                    assert_eq!(
+                        creation_cause(i).is_some(),
+                        policy != SourceReadPolicy::WhenHistoryIsMissing || added || slot_created,
+                        "{i:?} disagrees with the caller's snapshot condition"
+                    );
+                }
+            }
+        }
+        // A non-persistent acceleration re-reads the source on every start, so it
+        // outranks the slot-lifecycle answers that are true on the same start.
+        assert_eq!(
+            creation_cause(inputs(SourceReadPolicy::EveryStartEphemeral, true, true)),
+            Some(CreationCause::EphemeralAcceleration)
+        );
+        // The same forced re-read on an acceleration that DOES persist was asked
+        // for by configuration, and must not be reported as non-persistence.
+        assert_eq!(
+            creation_cause(inputs(SourceReadPolicy::EveryStartConfigured, true, true)),
+            Some(CreationCause::SnapshotAlways)
+        );
+        assert_eq!(
+            creation_cause(inputs(SourceReadPolicy::WhenHistoryIsMissing, true, true)),
+            Some(CreationCause::TableAdded)
+        );
+        assert_eq!(
+            creation_cause(inputs(SourceReadPolicy::WhenHistoryIsMissing, false, true)),
+            Some(CreationCause::SlotCreated)
+        );
     }
 
     /// A recorded position ahead of the source's current WAL position identifies
