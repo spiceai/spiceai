@@ -507,15 +507,18 @@ fn array_element_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast
 /// alternative — `Ok(None)` — makes the unparser emit the function verbatim into
 /// `BigQuery` SQL, which is the wrong answer dressed as a remote error.
 fn unrenderable_json_call(function: &str) -> DataFusionError {
+    let document_requirement = if function == JSON_CONTAINS_NAME {
+        " The document must also be a column whose JSON or STRING type is declared by the source."
+    } else {
+        ""
+    };
     DataFusionError::Plan(format!(
         "Failed to run this query against BigQuery: '{function}' was called in a form BigQuery \
          cannot express, so the query cannot be completed. BigQuery needs a constant JSON path \
-         built only from plain keys, and for a JSON document whose column type the source \
-         declares: every path argument must be a literal, there must be at least one, a key \
-         cannot contain a quote, a backslash or a control character, and the document must be a \
-         column rather than a computed expression. Rewrite the call to a constant path of plain \
-         keys over a column, or set 'query_federation: disabled' on the dataset to evaluate it \
-         locally instead. \
+         where every path argument must be a literal, there must be at least one, and a key \
+         cannot contain a quote, a backslash or a control character.{document_requirement} \
+         Rewrite the call to meet these requirements, or set 'query_federation: disabled' on \
+         the dataset to evaluate it locally instead. \
          See: https://spiceai.org/docs/components/data-connectors/adbc"
     ))
 }
@@ -1605,9 +1608,10 @@ mod tests {
     use datafusion::sql::unparser::Unparser;
 
     use super::{
-        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_GET_BOOL_NAME, JSON_GET_FLOAT_NAME,
-        JSON_GET_INT_NAME, JSON_GET_STR_NAME, JSON_KEYS_NAME, JSON_LEN_NAME, JSON_LENGTH_NAME,
-        JSON_OBJECT_KEYS_NAME, JsonPath, SpiceBigQueryDialect, can_translate, json_path,
+        FLOAT64_FROM_STR, INT64_FROM_STR, JSON_CONTAINS_NAME, JSON_GET_BOOL_NAME,
+        JSON_GET_FLOAT_NAME, JSON_GET_INT_NAME, JSON_GET_STR_NAME, JSON_KEYS_NAME, JSON_LEN_NAME,
+        JSON_LENGTH_NAME, JSON_OBJECT_KEYS_NAME, JsonPath, SpiceBigQueryDialect, can_translate,
+        json_path,
     };
     use crate::dialect::{REGEXP_LIKE_NAME, new_bigquery_dialect};
     use datafusion::common::ScalarValue;
@@ -2567,33 +2571,43 @@ mod tests {
     #[test]
     fn an_untranslatable_call_fails_rather_than_unparsing_verbatim() {
         // Unreachable with the deny-list installed. If the dialect is used
-        // without it, the alternative is emitting `json_get_int(...)` into
+        // without it, the alternative is emitting a JSON function call into
         // BigQuery SQL, so this fails where a reader can see it instead.
         let dialect = new_bigquery_dialect();
-        let error = Unparser::new(dialect.as_ref())
-            .expr_to_sql(&Expr::ScalarFunction(call(
-                JSON_GET_INT_NAME,
-                vec![col("doc"), col("key")],
-            )))
-            .expect_err("a dynamic path has no BigQuery translation");
-        let message = error.to_string();
-        for expected in [
-            // The call shape that failed, not the policy that should have
-            // caught it: an internal cause is no help to whoever ran the query.
-            "must be a literal",
-            // The way out, and where to read about it.
-            "query_federation",
-            "https://spiceai.org/docs/components/data-connectors/adbc",
+        for name in [
+            JSON_GET_INT_NAME,
+            JSON_LENGTH_NAME,
+            JSON_OBJECT_KEYS_NAME,
+            JSON_CONTAINS_NAME,
         ] {
+            let error = Unparser::new(dialect.as_ref())
+                .expr_to_sql(&Expr::ScalarFunction(call(
+                    name,
+                    vec![col("doc"), col("key")],
+                )))
+                .expect_err("a dynamic path has no BigQuery translation");
+            let message = error.to_string();
+            for expected in [
+                name,
+                "must be a literal",
+                "query_federation",
+                "https://spiceai.org/docs/components/data-connectors/adbc",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "the error must carry {expected:?}: {message}"
+                );
+            }
+            assert_eq!(
+                message.contains("column"),
+                name == JSON_CONTAINS_NAME,
+                "only json_contains requires a source-declared document column: {message}"
+            );
             assert!(
-                message.contains(expected),
-                "the error must carry {expected:?}: {message}"
+                !message.contains("policy"),
+                "the error must not name an internal mechanism: {message}"
             );
         }
-        assert!(
-            !message.contains("policy"),
-            "the error must not name an internal mechanism: {message}"
-        );
     }
 
     #[test]
