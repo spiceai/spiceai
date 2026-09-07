@@ -52,6 +52,7 @@ pub(crate) const JSON_GET_STR_NAME: &str = "json_get_str";
 pub(crate) const JSON_GET_BOOL_NAME: &str = "json_get_bool";
 pub(crate) const JSON_GET_FLOAT_NAME: &str = "json_get_float";
 pub(crate) const JSON_CONTAINS_NAME: &str = "json_contains";
+pub(crate) const JSON_AS_TEXT_NAME: &str = "json_as_text";
 pub(crate) const JSON_LENGTH_NAME: &str = "json_length";
 /// `json_length`'s alias. `ScalarUDF::name` returns the canonical name, so a
 /// plan never carries this one — but the federation deny-list is built from
@@ -369,6 +370,16 @@ pub(crate) struct ScalarOverride {
 /// carve-out, and the per-call check from this one table.
 pub(crate) const SCALAR_OVERRIDES: &[ScalarOverride] = &[
     ScalarOverride {
+        name: JSON_AS_TEXT_NAME,
+        handler: json_as_text_to_sql,
+        can_translate: json_text_is_renderable,
+    },
+    ScalarOverride {
+        name: crate::optimizer_rule::JSON_GET_IS_NULL_NAME,
+        handler: json_get_is_null_to_sql,
+        can_translate: json_text_is_renderable,
+    },
+    ScalarOverride {
         name: JSON_GET_INT_NAME,
         handler: json_get_int_to_sql,
         can_translate: json_path_is_renderable,
@@ -538,18 +549,49 @@ pub(crate) enum JsonDocument {
 
 /// What the source said the document column is, or `None` if it did not say.
 ///
-/// `None` is the answer for anything that is not a column the driver described —
-/// a computed expression such as `COALESCE(a, b)` resolves to bare `Utf8` and
-/// carries neither marker. That case must **refuse**, not guess: the two
-/// renderings below are not interchangeable, and picking wrong is a wrong answer
-/// on one type and a hard type error on the other.
+/// Computed expressions without source metadata do not establish the remote
+/// JSON representation from their Arrow string type alone.
 pub(crate) fn json_document_kind(
     document: &Expr,
     scope: Option<&datafusion::common::DFSchema>,
 ) -> Option<JsonDocument> {
     use datafusion::logical_expr::ExprSchemable as _;
-    let field = document.to_field(scope?).ok().map(|(_, field)| field)?;
+    let (_, field) = document.to_field(scope?).ok()?;
     json_document_kind_of(&field)
+}
+
+fn json_document_kind_with(
+    document: &Expr,
+    resolve: &impl Fn(&Expr) -> Option<JsonDocument>,
+) -> Option<JsonDocument> {
+    match document {
+        Expr::Alias(alias) => json_document_kind_with(&alias.expr, resolve),
+        Expr::ScalarFunction(call)
+            if call
+                .func
+                .inner()
+                .downcast_ref::<datafusion::functions::core::coalesce::CoalesceFunc>()
+                .is_some() =>
+        {
+            let mut kinds = call
+                .args
+                .iter()
+                .map(|arg| json_document_kind_with(arg, resolve));
+            let first = kinds.next()??;
+            kinds.all(|kind| kind == Some(first)).then_some(first)
+        }
+        Expr::Column(_) => resolve(document),
+        _ => None,
+    }
+}
+
+fn unparsed_json_document_kind(unparser: &Unparser, document: &Expr) -> Option<JsonDocument> {
+    json_document_kind_with(document, &|expr| {
+        unparser
+            .resolved_field(expr)
+            .as_deref()
+            .and_then(json_document_kind_of)
+    })
 }
 
 /// [`json_document_kind`] once the field is in hand.
@@ -641,6 +683,161 @@ pub(crate) fn json_contains_to_sql(
         "JSON_QUERY",
         vec![document, ast::Expr::Value(raw_string(&path).into())],
     )))))
+}
+
+/// Extracts scalar text without parsing a JSON-formatted STRING. Parsing would
+/// change numeric tokens such as `1.50` and `1e+00`. Containers fail explicitly
+/// because `JSON_QUERY` changes whitespace in the matched source text.
+fn json_as_text_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let (document, path) = text_json_arguments(unparser, args, JSON_AS_TEXT_NAME)?;
+    let Some(path) = path else {
+        return Ok(Some(cast_null_to(ast::DataType::String(None))));
+    };
+    let value = call_function("JSON_VALUE", vec![document.clone(), path.clone()]);
+    let query = call_function("JSON_QUERY", vec![document.clone(), path]);
+    let container = call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            query.clone(),
+            ast::Expr::Value(raw_string(r"^[\[{]").into()),
+        ],
+    );
+    Ok(Some(guard_json_text_escapes(
+        document,
+        query,
+        Some(container),
+        value,
+    )))
+}
+
+/// Null checks preserve `json_get`'s integer range without returning its
+/// Arrow union across the remote boundary. A quoted integer is a string and
+/// must not be range checked; only an unquoted integer token uses INT64.
+fn json_get_is_null_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<ast::Expr>> {
+    let (document, path) =
+        text_json_arguments(unparser, args, crate::optimizer_rule::JSON_GET_IS_NULL_NAME)?;
+    let Some(path) = path else {
+        return Ok(Some(ast::Expr::Value(ast::Value::Boolean(true).into())));
+    };
+    let token = call_function("JSON_QUERY", vec![document.clone(), path]);
+    let integer = call_function(
+        "REGEXP_CONTAINS",
+        vec![
+            token.clone(),
+            ast::Expr::Value(raw_string(r"^-?[0-9]+$").into()),
+        ],
+    );
+    let integer_is_null = ast::Expr::IsNull(Box::new(ast::Expr::Cast {
+        kind: ast::CastKind::SafeCast,
+        expr: Box::new(token.clone()),
+        data_type: ast::DataType::Int64,
+        array: false,
+        format: None,
+    }));
+    let token_is_null = call_function(
+        "COALESCE",
+        vec![
+            ast::Expr::BinaryOp {
+                left: Box::new(token.clone()),
+                op: BinaryOperator::Eq,
+                right: Box::new(sql_string("null")),
+            },
+            ast::Expr::Value(ast::Value::Boolean(true).into()),
+        ],
+    );
+    Ok(Some(guard_json_text_escapes(
+        document,
+        token,
+        None,
+        case_when(integer, integer_is_null, Some(token_is_null)),
+    )))
+}
+
+/// JSON extraction from STRING can replace UTF-16 surrogate escapes with
+/// replacement characters. Text extraction also rejects containers because
+/// their original serialization is not preserved.
+fn guard_json_text_escapes(
+    document: ast::Expr,
+    token: ast::Expr,
+    container: Option<ast::Expr>,
+    result: ast::Expr,
+) -> ast::Expr {
+    let unicode_escape = ast::Expr::BinaryOp {
+        left: Box::new(call_function(
+            "REGEXP_CONTAINS",
+            vec![document, ast::Expr::Value(raw_string(r"\\u").into())],
+        )),
+        op: BinaryOperator::And,
+        right: Box::new(call_function(
+            "CONTAINS_SUBSTR",
+            vec![token, sql_string("\u{fffd}")],
+        )),
+    };
+    let unsupported = if let Some(container) = container {
+        ast::Expr::BinaryOp {
+            left: Box::new(unicode_escape),
+            op: BinaryOperator::Or,
+            right: Box::new(container),
+        }
+    } else {
+        unicode_escape
+    };
+    case_when(
+        unsupported,
+        call_function(
+            "ERROR",
+            vec![sql_string(
+                "Failed to evaluate JSON in BigQuery: this JSON value cannot be evaluated without changing the result. Set query_federation to disabled on the dataset to evaluate this query locally. See https://spiceai.org/docs/components/data-connectors/adbc",
+            )],
+        ),
+        Some(result),
+    )
+}
+
+// Native JSON numeric tokens need not retain their input spelling. Only a
+// declared STRING source preserves the token spelling both engines read.
+fn json_text_is_renderable(args: &[Expr], scope: Option<&datafusion::common::DFSchema>) -> bool {
+    use datafusion::logical_expr::ExprSchemable as _;
+    let (Some(document), Some(scope)) = (args.first(), scope) else {
+        return false;
+    };
+    json_path(args).is_some()
+        && json_document_kind_with(document, &|expr| {
+            let (_, field) = expr.to_field(scope).ok()?;
+            json_document_kind_of(&field)
+        }) == Some(JsonDocument::Text)
+}
+
+fn text_json_arguments(
+    unparser: &Unparser,
+    args: &[Expr],
+    function: &str,
+) -> Result<(ast::Expr, Option<ast::Expr>)> {
+    let (Some(document), Some(path)) = (args.first(), json_path(args)) else {
+        return Err(unrenderable_json_call(function));
+    };
+    if unparsed_json_document_kind(unparser, document) != Some(JsonDocument::Text) {
+        return Err(unrenderable_json_call(function));
+    }
+    let path = match path {
+        JsonPath::Path(path) => Some(ast::Expr::Value(raw_string(&path).into())),
+        JsonPath::NeverResolves => None,
+    };
+    Ok((unparser.expr_to_sql(document)?, path))
+}
+
+fn sql_string(value: &str) -> ast::Expr {
+    ast::Expr::Value(ast::Value::SingleQuotedString(value.to_string()).into())
+}
+
+fn case_when(condition: ast::Expr, result: ast::Expr, else_result: Option<ast::Expr>) -> ast::Expr {
+    ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen { condition, result }],
+        else_result: else_result.map(Box::new),
+    }
 }
 
 /// Renders one `json_get_*` call: pulls out the document and the JSON path,
@@ -2019,6 +2216,72 @@ mod tests {
                 ),
                 "{document} has a declared type, so it federates"
             );
+        }
+    }
+
+    #[test]
+    fn json_text_and_null_checks_preserve_source_types() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::DFSchema;
+        use datafusion::functions::core::expr_fn::coalesce;
+
+        let field = |name: &str, kind: &str| {
+            Field::new(name, DataType::Utf8, true)
+                .with_metadata([("BIGQUERY:type".to_string(), kind.to_string())].into())
+        };
+        let scope = Arc::new(
+            DFSchema::try_from(Schema::new(vec![
+                field("text", "STRING"),
+                field("native", "JSON"),
+                Field::new("unknown", DataType::Utf8, true),
+            ]))
+            .expect("source schema"),
+        );
+        let dialect = new_bigquery_dialect();
+        let unparser = Unparser::new(dialect.as_ref()).with_schema(Arc::clone(&scope));
+        for name in [
+            super::JSON_AS_TEXT_NAME,
+            crate::optimizer_rule::JSON_GET_IS_NULL_NAME,
+        ] {
+            for document in [
+                col("text"),
+                coalesce(vec![col("text"), col("text")]).alias("document"),
+            ] {
+                let args = vec![document, lit("context"), lit("iteration")];
+                assert!(can_translate(&call(name, args.clone()), Some(&scope)));
+                let sql = dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args)
+                    .expect("typed JSON rendering")
+                    .expect("SQL expression")
+                    .to_string();
+                assert!(
+                    !sql.contains("PARSE_JSON") && !sql.contains("TO_JSON_STRING"),
+                    "{sql}"
+                );
+                assert!(
+                    sql.contains("ERROR("),
+                    "unsupported escapes must not return changed data: {sql}"
+                );
+                if name == super::JSON_AS_TEXT_NAME {
+                    assert!(sql.contains("JSON_VALUE"), "{sql}");
+                } else {
+                    assert!(sql.contains("SAFE_CAST"), "{sql}");
+                }
+            }
+            for document in [
+                col("unknown"),
+                col("native"),
+                coalesce(vec![col("native"), col("native")]),
+                coalesce(vec![col("text"), col("native")]),
+            ] {
+                let args = vec![document, lit("value")];
+                assert!(!can_translate(&call(name, args.clone()), Some(&scope)));
+                dialect
+                    .scalar_function_to_sql_overrides(&unparser, name, &args)
+                    .expect_err("unsupported source types must not render");
+            }
+            let args = vec![col("text"), col("unknown")];
+            assert!(!can_translate(&call(name, args), Some(&scope)));
         }
     }
 
