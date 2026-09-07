@@ -1490,6 +1490,14 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.supports_recursive_cte()
     }
 
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        self.inner.supports_distinct_recursive_cte()
+    }
+
+    fn integer_division_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        self.inner.integer_division_to_sql(lhs, rhs)
+    }
+
     fn requires_explicit_comparison_coercion(&self) -> bool {
         self.inner.requires_explicit_comparison_coercion()
     }
@@ -2927,6 +2935,23 @@ mod tests {
         );
 
         let wrapper = unparse_plan(new_bigquery_dialect().as_ref(), &plan);
+        let dialect = new_bigquery_dialect();
+        let reusable = Unparser::new(dialect.as_ref());
+        assert!(
+            reusable
+                .expr_to_sql(&datafusion::logical_expr::expr_fn::scalar_subquery(
+                    Arc::new(plan.clone())
+                ))
+                .is_err(),
+            "a standalone expression has no statement to hold a recursive CTE"
+        );
+        assert_eq!(
+            reusable
+                .expr_to_sql(&lit(1_i64))
+                .expect("reuse after refusal")
+                .to_string(),
+            "1"
+        );
         assert!(
             wrapper.contains("WITH RECURSIVE"),
             "a recursive CTE has to keep its RECURSIVE keyword: {wrapper}"
@@ -3005,6 +3030,27 @@ mod tests {
                 .is_err(),
             "a dialect that does not support recursive CTEs must still refuse"
         );
+    }
+
+    #[tokio::test]
+    async fn filtered_recursive_join_inputs_keep_their_qualified_columns()
+    -> datafusion::common::Result<()> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let query = "WITH RECURSIVE g AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) \
+                     SELECT a.n, b.n FROM (SELECT n FROM g WHERE n > 1) a \
+                     JOIN (SELECT n FROM g WHERE n < 3) b ON a.n = b.n";
+        let expected = ctx.sql(query).await?.collect().await?;
+        let plan = ctx.sql(query).await?.into_optimized_plan()?;
+        let dialect = new_bigquery_dialect();
+        let sql = Unparser::new(dialect.as_ref())
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        let actual = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(actual, expected, "{sql}");
+        Ok(())
     }
 
     /// Every `BigQuery`-specific rendering the fork's dialect fixes produce has to
@@ -3580,7 +3626,22 @@ mod tests {
             );
         }
 
+        let integer_hours = windowed_scan()
+            .project(vec![datafusion::logical_expr::cast(
+                col("t.v") / lit(3600_i64),
+                DataType::Int64,
+            )])
+            .expect("integer hour projection")
+            .build()
+            .expect("build");
+
         for (property, plan, must_contain, must_not_contain) in [
+            (
+                "integer cohort hours",
+                &integer_hours,
+                "DIV(`t`.`v`, 3600)",
+                " / 3600",
+            ),
             (
                 "timestamp literal offset (fork PR #144)",
                 &timestamp_literal,

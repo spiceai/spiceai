@@ -191,9 +191,7 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
 /// The rest stay denied, each for something `BigQuery` cannot be talked out of.
 /// `json_get_json` and `json_as_text` return the matched node's own bytes,
 /// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
-/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
-/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
-/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// document holding `{"b": -1}` comes back as `{"b":-1}`.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
 #[must_use]

@@ -2466,8 +2466,8 @@ mod function_support_tests {
     use datafusion::datasource::{TableProvider, provider_as_source};
     use datafusion::functions::expr_fn;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
-        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, Volatility, create_udf,
+        expr::ScalarFunction,
     };
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::prelude::{col, lit};
@@ -2718,9 +2718,8 @@ mod function_support_tests {
 
     /// A projection over a scan of the stub table, so a plan can carry an
     /// arbitrary expression through the federation `can_execute_plan` check.
-    fn scan_project(expr: Expr) -> LogicalPlan {
-        let source =
-            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+    fn scan_project(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan the stub table")
             .project(vec![expr])
@@ -2761,7 +2760,7 @@ mod function_support_tests {
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -2770,7 +2769,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to the remote ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),
@@ -2805,7 +2804,7 @@ mod function_support_tests {
             adaptor
                 .source
                 .federation_provider()
-                .analyzer(&scan_project(expr)),
+                .analyzer(&scan_project(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
     }
@@ -2886,9 +2885,8 @@ mod function_support_tests {
 
     /// `scan_project`'s aggregate twin: an aggregate belongs in an `Aggregate`
     /// node, not a projection.
-    fn scan_aggregate(expr: Expr) -> LogicalPlan {
-        let source =
-            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+    fn scan_aggregate(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan the stub table")
             .aggregate(Vec::<Expr>::new(), vec![expr])
@@ -2906,7 +2904,7 @@ mod function_support_tests {
             adaptor
                 .source
                 .federation_provider()
-                .analyzer(&scan_aggregate(expr)),
+                .analyzer(&scan_aggregate(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
     }
@@ -3176,20 +3174,20 @@ mod function_support_tests {
     }
 
     #[tokio::test]
-    async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
+    async fn bigquery_keeps_json_calls_local_without_a_proven_translation() {
         for name in [
             // Returns a union of every JSON scalar type, which has no SQL type
             // to unparse into.
             "json_get",
             // Returns the matched node's own bytes; JSON_QUERY re-renders it.
             "json_as_text",
-            // A JSON `null` and a missing key are indistinguishable in
-            // BigQuery, and json_contains tells them apart.
+            // The stub's bare Utf8 field does not identify native JSON versus
+            // JSON-formatted STRING, which the presence check must distinguish.
             "json_contains",
         ] {
             assert!(
                 !federates("bigquery", json_call(name, vec![lit("a")])).await,
-                "{name} has no BigQuery translation and must stay denied"
+                "{name} has no proven translation for this input and must stay local"
             );
         }
     }
@@ -3233,6 +3231,41 @@ mod function_support_tests {
 
     async fn federated_plan(predicate: Expr) -> LogicalPlan {
         federated_plan_for_driver("bigquery", predicate).await
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_a_recursive_cte_and_its_remote_join() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", stub_table_provider(true, "bigquery").await)
+            .expect("register the BigQuery table");
+        let plan = ctx
+            .sql(
+                "WITH RECURSIVE steps AS (\
+                 SELECT 1 AS n UNION ALL SELECT n + 1 FROM steps WHERE n < 3) \
+                 SELECT steps.n, t.val FROM steps JOIN t ON steps.n = t.id",
+            )
+            .await
+            .expect("plan the recursive join")
+            .into_optimized_plan()
+            .expect("optimize the recursive join");
+        let analyzed = federation_analyzer_rule()
+            .analyze(plan, &ConfigOptions::default())
+            .expect("federate the recursive join");
+        let LogicalPlan::Extension(extension) = &analyzed else {
+            panic!("expected the entire recursive join to federate: {analyzed:?}");
+        };
+        let federated = extension
+            .node
+            .as_any()
+            .downcast_ref::<FederatedPlanNode>()
+            .expect("a federated root");
+        let dialect = dialect_for_driver("bigquery").expect("BigQuery dialect");
+        let sql = datafusion::sql::unparser::Unparser::new(dialect.as_ref())
+            .plan_to_sql(federated.plan())
+            .expect("render the whole recursive join")
+            .to_string();
+        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
     }
 
     #[tokio::test]
@@ -3448,7 +3481,7 @@ mod function_support_tests {
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -3457,7 +3490,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to a catalog-registered ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),
