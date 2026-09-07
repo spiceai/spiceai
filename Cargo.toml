@@ -131,7 +131,7 @@ homepage = "https://spice.ai"
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.96.1"
+rust-version = "1.97.1"
 version = "2.3.0-unstable"
 
 # Clippy lint levels for the workspace. Each member crate opts in with
