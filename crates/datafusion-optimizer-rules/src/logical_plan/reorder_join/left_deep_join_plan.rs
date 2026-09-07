@@ -21,7 +21,8 @@ use std::{
 };
 
 use datafusion_common::{
-    DataFusionError, Result, plan_datafusion_err, plan_err, tree_node::Transformed,
+    DataFusionError, Result, plan_datafusion_err, plan_err,
+    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::{
     Expr, Filter, JoinConstraint, JoinType, LogicalPlan, utils::split_conjunction,
@@ -31,6 +32,19 @@ use super::{
     cost::JoinCostEstimator,
     join_graph::{JoinGraph, NodeId, plan_head},
 };
+
+/// Relation-count cap for Ibaraki–Kameda enumeration.
+///
+/// IK84 is polynomial, but on a wide inner-join island the per-root tree work
+/// plus reconstructing and comparing `LogicalPlan`s is not interactive.
+/// `TPC-DS` Q64 `cross_sales` is ~18 relations; with CTE materialization that
+/// island is exposed (on trunk it sits inside an `Aggregate` and is sealed as
+/// two opaque leaves). Planning then exceeds the 30s `EXPLAIN` timeout and
+/// never finishes a 900s warmup.
+///
+/// `PostgreSQL` switches from DP to GEQO at `geqo_threshold` (default 12).
+/// CH-benCH queries stay under this cap and keep the exact IK84 order.
+pub(crate) const IK84_MAX_RELATIONS: usize = 12;
 
 /// Outcome of [`optimal_left_deep_join_plan`]
 pub enum ReorderOutcome {
@@ -115,7 +129,9 @@ pub fn optimal_left_deep_join_plan(
 
     // Deterministic enumeration can reproduce the input order (e.g. an
     // already-optimal plan); report that as a no-op so the optimizer converges.
-    if reordered == original {
+    // Skip the deep `LogicalPlan` equality on wide islands — comparing two
+    // 18-way join trees is itself a planning-time sink (`TPC-DS` Q64).
+    if join_operator_count(&original) <= IK84_MAX_RELATIONS && reordered == original {
         return ReorderOutcome::Completed(Transformed::no(original));
     }
 
@@ -311,6 +327,17 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
     // per-root costs traced below — a no-op unless trace is enabled.
     query_graph.trace_costs(cost_estimator);
 
+    let n = query_graph.node_count();
+    if n > IK84_MAX_RELATIONS {
+        tracing::debug!(
+            nodes = n,
+            cap = IK84_MAX_RELATIONS,
+            "join reorder using greedy left-deep (IK84 capped)"
+        );
+        let chain = greedy_left_deep_chain(query_graph, cost_estimator)?;
+        return join_chain_to_logical_plan(query_graph, &chain);
+    }
+
     let mut best_graph: Option<PrecedenceTreeNode> = None;
 
     // Per-candidate-root IK84 cost + chain head, accumulated into one block so all roots
@@ -367,6 +394,99 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
         );
     }
     best.into_logical_plan(query_graph)
+}
+
+fn join_operator_count(plan: &LogicalPlan) -> usize {
+    let mut count = 0;
+    let _ = plan.apply(|node| {
+        if matches!(node, LogicalPlan::Join(_)) {
+            count += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    count
+}
+
+fn node_cardinality(
+    query_graph: &JoinGraph,
+    node_id: NodeId,
+    cost_estimator: &dyn JoinCostEstimator,
+) -> f64 {
+    query_graph
+        .get_node(node_id)
+        .and_then(|node| cost_estimator.cardinality(&node.plan, None))
+        .filter(|card| card.is_finite() && *card > 0.0)
+        .unwrap_or(f64::MAX)
+}
+
+/// Greedy left-deep chain for islands above [`IK84_MAX_RELATIONS`].
+///
+/// Seed with the smallest-cardinality relation, then repeatedly append the
+/// unused neighbour whose estimated join cost onto the already-placed set is
+/// lowest. The graph is connected (`build_reordered_plan` already bailed if
+/// not), so every step finds a neighbour. Result-preserving: reconstruction
+/// still uses the original equi-edges.
+fn greedy_left_deep_chain(
+    query_graph: &JoinGraph,
+    cost_estimator: &dyn JoinCostEstimator,
+) -> Result<Vec<NodeId>> {
+    let mut unused: HashSet<NodeId> = query_graph.nodes().map(|(id, _)| id).collect();
+    let Some(start) = unused.iter().copied().min_by(|a, b| {
+        node_cardinality(query_graph, *a, cost_estimator)
+            .total_cmp(&node_cardinality(query_graph, *b, cost_estimator))
+            .then_with(|| a.cmp(b))
+    }) else {
+        return plan_err!("greedy join reorder: empty join graph");
+    };
+    unused.remove(&start);
+
+    let mut chain = Vec::with_capacity(unused.len() + 1);
+    chain.push(start);
+
+    while !unused.is_empty() {
+        let mut best: Option<(NodeId, f64)> = None;
+        for &candidate in &unused {
+            let Some(node) = query_graph.get_node(candidate) else {
+                continue;
+            };
+            let mut step_cost = f64::MAX;
+            for &placed in &chain {
+                let Some(edge) = node.connection_with(placed, query_graph) else {
+                    continue;
+                };
+                let Some(placed_node) = query_graph.get_node(placed) else {
+                    continue;
+                };
+                let sel = cost_estimator.selectivity(edge, &node.plan, &placed_node.plan);
+                let card = cost_estimator.cardinality(&node.plan, None).unwrap_or(1.0);
+                step_cost = step_cost.min(cost_estimator.cost(sel, card));
+            }
+            if step_cost < f64::MAX {
+                let take = match best {
+                    None => true,
+                    Some((id, cost)) => match step_cost.total_cmp(&cost) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => candidate < id,
+                        std::cmp::Ordering::Greater => false,
+                    },
+                };
+                if take {
+                    best = Some((candidate, step_cost));
+                }
+            }
+        }
+        let next = if let Some((node_id, _)) = best {
+            node_id
+        } else {
+            // Disconnected remainder — should not happen after `is_connected`.
+            unused.iter().copied().min().ok_or_else(|| {
+                plan_datafusion_err!("greedy join reorder: unused set empty mid-loop")
+            })?
+        };
+        unused.remove(&next);
+        chain.push(next);
+    }
+    Ok(chain)
 }
 
 #[derive(Debug)]
@@ -667,190 +787,7 @@ impl<'graph> PrecedenceTreeNode<'graph> {
                 None => break,
             }
         }
-
-        let first_node_id = chain[0];
-        let mut current_plan = query_graph
-            .get_node(first_node_id)
-            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", first_node_id))?
-            .plan
-            .as_ref()
-            .clone();
-
-        let mut processed_nodes = vec![first_node_id];
-        let mut remaining: Vec<NodeId> = chain.split_off(1);
-
-        while !remaining.is_empty() {
-            // Consume in a connectivity-respecting order: take the EARLIEST
-            // remaining chain node that has an edge to the already-processed
-            // set. IK84's normalize/denormalize can interleave a path's nodes
-            // non-contiguously (the rank order is scrambled when no-NDV computed
-            // keys inflate costs); walking the chain in strict order would then
-            // bridge a non-adjacent step with a bare cross join and the rule
-            // would bail. Picking the earliest *connected* node is byte-identical
-            // to the chain order when IK84 already produced a contiguous order,
-            // and otherwise repairs connectivity so a connected graph never emits
-            // a cross join. The `unwrap_or(0)` fallback keeps the cross-join path
-            // only for a genuinely disconnected graph (its predicate is reapplied
-            // via the side-channel).
-            let pick = remaining
-                .iter()
-                .position(|&n| {
-                    query_graph.get_node(n).is_some_and(|node| {
-                        processed_nodes
-                            .iter()
-                            .any(|&p| node.connection_with(p, query_graph).is_some())
-                    })
-                })
-                .unwrap_or(0);
-            let next_node_id = remaining.remove(pick);
-
-            let next_plan = query_graph
-                .get_node(next_node_id)
-                .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", next_node_id))?
-                .plan
-                .as_ref()
-                .clone();
-
-            let next_node = query_graph
-                .get_node(next_node_id)
-                .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", next_node_id))?;
-
-            // Collect ALL edges connecting `next_node` to the already-processed
-            // set. A relation can equi-join several processed relations at once
-            // (e.g. a fact table joining two dimensions on different keys).
-            // Keeping only one edge silently drops the others' keys, yielding an
-            // under-selective join that explodes at runtime or a dangling column
-            // reference that fails a later rule. We merge every connecting edge's
-            // keys into this single join.
-            let connecting: Vec<_> = processed_nodes
-                .iter()
-                .rev()
-                .filter_map(|&processed_id| next_node.connection_with(processed_id, query_graph))
-                .collect();
-
-            // No connecting edge: the denormalize fallback pulled a node that
-            // is not a graph-neighbour of the processed set (cycle-broken /
-            // non-contiguous chain). Build an Inner cross join so the left-deep
-            // reconstruction can finish; the missing equi-predicate is reapplied
-            // at the top level via the side-channel `filters`.
-            let Some(&primary) = connecting.first() else {
-                // Reached only for a genuinely disconnected graph (greedy
-                // consumption avoids this for connected graphs). This emits an
-                // empty-`on` cross join that the guard in `rule.rs` counts, and
-                // is the usual precursor to a "falling back to native" bail — so
-                // surface it.
-                tracing::debug!(
-                    node = next_node_id,
-                    processed = processed_nodes.len(),
-                    "reconstruction emitted a cross join (node has no edge to the processed set — disconnected graph)"
-                );
-                let join = datafusion_expr::Join::try_new(
-                    Arc::new(current_plan),
-                    Arc::new(next_plan),
-                    vec![],
-                    None,
-                    JoinType::Inner,
-                    JoinConstraint::On,
-                    datafusion_common::NullEquality::NullEqualsNothing,
-                    false,
-                )?;
-                current_plan = LogicalPlan::Join(join);
-                processed_nodes.push(next_node_id);
-                continue;
-            };
-
-            let next_schema = next_plan.schema();
-            let column_in_schema =
-                |col: &datafusion_common::Column, schema: &datafusion_common::DFSchema| -> bool {
-                    if let Some(relation) = &col.relation {
-                        schema.iter().any(|(qualifier, field)| {
-                            qualifier == Some(relation) && field.name() == col.name()
-                        })
-                    } else {
-                        schema.field_with_unqualified_name(&col.name).is_ok()
-                    }
-                };
-            let is_semi_anti = |jt: JoinType| {
-                matches!(
-                    jt,
-                    JoinType::LeftSemi
-                        | JoinType::LeftAnti
-                        | JoinType::RightSemi
-                        | JoinType::RightAnti
-                )
-            };
-
-            let (on, join_type, null_equality) =
-                if connecting.iter().all(|e| !is_semi_anti(e.join_type)) {
-                    // All-inner: merge every connecting edge's equi-keys,
-                    // orienting each pair so the current-plan column is the LEFT
-                    // input and the next-node column is the RIGHT input
-                    // (independent of which edge it came from).
-                    let mut on: Vec<(Expr, Expr)> = Vec::new();
-                    for e in &connecting {
-                        for (a, b) in &e.on {
-                            let a_refs = a.column_refs();
-                            let a_is_next = !a_refs.is_empty()
-                                && a_refs
-                                    .iter()
-                                    .all(|c| column_in_schema(c, next_schema.as_ref()));
-                            if a_is_next {
-                                on.push((b.clone(), a.clone()));
-                            } else {
-                                on.push((a.clone(), b.clone()));
-                            }
-                        }
-                    }
-                    (on, JoinType::Inner, primary.null_equality)
-                } else {
-                    // Semi/anti (or a mix): keep the single-primary-edge
-                    // behavior, oriented by the `nodes[0] = preserved-LHS`
-                    // invariant set up by `flatten_joins_recursive` — the
-                    // preserved side must be the physical LEFT of the join.
-                    let join_order_swapped = next_node_id == primary.nodes[0];
-                    if join_order_swapped {
-                        let swapped_on = primary
-                            .on
-                            .iter()
-                            .map(|(left, right)| (right.clone(), left.clone()))
-                            .collect();
-                        (swapped_on, primary.join_type.swap(), primary.null_equality)
-                    } else {
-                        (primary.on.clone(), primary.join_type, primary.null_equality)
-                    }
-                };
-
-            // Build the join (schema is auto-derived). All non-equi predicates
-            // were hoisted into the side-channel and are reapplied at the top
-            // level by `optimal_left_deep_join_plan`, so the join carries no
-            // `filter` here.
-            let join = datafusion_expr::Join::try_new(
-                Arc::new(current_plan),
-                Arc::new(next_plan),
-                on,
-                None,
-                join_type,
-                JoinConstraint::On,
-                null_equality,
-                false,
-            )?;
-            current_plan = LogicalPlan::Join(join);
-
-            processed_nodes.push(next_node_id);
-        }
-
-        // Defensive: every relation in the graph must be placed. If the chain
-        // didn't cover them all, erroring here makes the rule fall back to the
-        // native plan rather than silently emit a plan missing relations.
-        if processed_nodes.len() != query_graph.node_count() {
-            return plan_err!(
-                "reorder reconstruction placed {} of {} relations (disconnected join graph?)",
-                processed_nodes.len(),
-                query_graph.node_count()
-            );
-        }
-
-        Ok(current_plan)
+        join_chain_to_logical_plan(query_graph, &chain)
     }
 
     fn cost(&self) -> Result<f64> {
@@ -870,4 +807,192 @@ impl<'graph> PrecedenceTreeNode<'graph> {
         };
         Ok(cost)
     }
+}
+
+/// Rebuild a left-deep join plan from an ordered relation chain. Walks the
+/// chain in a connectivity-respecting order so a non-contiguous IK84 (or
+/// greedy) sequence still emits equi-joins rather than cross products.
+fn join_chain_to_logical_plan(query_graph: &JoinGraph, chain: &[NodeId]) -> Result<LogicalPlan> {
+    let Some(&first_node_id) = chain.first() else {
+        return plan_err!("join reconstruction: empty chain");
+    };
+    let mut current_plan = query_graph
+        .get_node(first_node_id)
+        .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", first_node_id))?
+        .plan
+        .as_ref()
+        .clone();
+
+    let mut processed_nodes = vec![first_node_id];
+    let mut remaining: Vec<NodeId> = chain[1..].to_vec();
+
+    while !remaining.is_empty() {
+        // Consume in a connectivity-respecting order: take the EARLIEST
+        // remaining chain node that has an edge to the already-processed
+        // set. IK84's normalize/denormalize can interleave a path's nodes
+        // non-contiguously (the rank order is scrambled when no-NDV computed
+        // keys inflate costs); walking the chain in strict order would then
+        // bridge a non-adjacent step with a bare cross join and the rule
+        // would bail. Picking the earliest *connected* node is byte-identical
+        // to the chain order when IK84 already produced a contiguous order,
+        // and otherwise repairs connectivity so a connected graph never emits
+        // a cross join. The `unwrap_or(0)` fallback keeps the cross-join path
+        // only for a genuinely disconnected graph (its predicate is reapplied
+        // via the side-channel).
+        let pick = remaining
+            .iter()
+            .position(|&n| {
+                query_graph.get_node(n).is_some_and(|node| {
+                    processed_nodes
+                        .iter()
+                        .any(|&p| node.connection_with(p, query_graph).is_some())
+                })
+            })
+            .unwrap_or(0);
+        let next_node_id = remaining.remove(pick);
+
+        let next_plan = query_graph
+            .get_node(next_node_id)
+            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", next_node_id))?
+            .plan
+            .as_ref()
+            .clone();
+
+        let next_node = query_graph
+            .get_node(next_node_id)
+            .ok_or_else(|| plan_datafusion_err!("Node {:?} not found", next_node_id))?;
+
+        // Collect ALL edges connecting `next_node` to the already-processed
+        // set. A relation can equi-join several processed relations at once
+        // (e.g. a fact table joining two dimensions on different keys).
+        // Keeping only one edge silently drops the others' keys, yielding an
+        // under-selective join that explodes at runtime or a dangling column
+        // reference that fails a later rule. We merge every connecting edge's
+        // keys into this single join.
+        let connecting: Vec<_> = processed_nodes
+            .iter()
+            .rev()
+            .filter_map(|&processed_id| next_node.connection_with(processed_id, query_graph))
+            .collect();
+
+        // No connecting edge: the denormalize fallback pulled a node that
+        // is not a graph-neighbour of the processed set (cycle-broken /
+        // non-contiguous chain). Build an Inner cross join so the left-deep
+        // reconstruction can finish; the missing equi-predicate is reapplied
+        // at the top level via the side-channel `filters`.
+        let Some(&primary) = connecting.first() else {
+            // Reached only for a genuinely disconnected graph (greedy
+            // consumption avoids this for connected graphs). This emits an
+            // empty-`on` cross join that the guard in `rule.rs` counts, and
+            // is the usual precursor to a "falling back to native" bail — so
+            // surface it.
+            tracing::debug!(
+                node = next_node_id,
+                processed = processed_nodes.len(),
+                "reconstruction emitted a cross join (node has no edge to the processed set — disconnected graph)"
+            );
+            let join = datafusion_expr::Join::try_new(
+                Arc::new(current_plan),
+                Arc::new(next_plan),
+                vec![],
+                None,
+                JoinType::Inner,
+                JoinConstraint::On,
+                datafusion_common::NullEquality::NullEqualsNothing,
+                false,
+            )?;
+            current_plan = LogicalPlan::Join(join);
+            processed_nodes.push(next_node_id);
+            continue;
+        };
+
+        let next_schema = next_plan.schema();
+        let column_in_schema =
+            |col: &datafusion_common::Column, schema: &datafusion_common::DFSchema| -> bool {
+                if let Some(relation) = &col.relation {
+                    schema.iter().any(|(qualifier, field)| {
+                        qualifier == Some(relation) && field.name() == col.name()
+                    })
+                } else {
+                    schema.field_with_unqualified_name(&col.name).is_ok()
+                }
+            };
+        let is_semi_anti = |jt: JoinType| {
+            matches!(
+                jt,
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+            )
+        };
+
+        let (on, join_type, null_equality) =
+            if connecting.iter().all(|e| !is_semi_anti(e.join_type)) {
+                // All-inner: merge every connecting edge's equi-keys,
+                // orienting each pair so the current-plan column is the LEFT
+                // input and the next-node column is the RIGHT input
+                // (independent of which edge it came from).
+                let mut on: Vec<(Expr, Expr)> = Vec::new();
+                for e in &connecting {
+                    for (a, b) in &e.on {
+                        let a_refs = a.column_refs();
+                        let a_is_next = !a_refs.is_empty()
+                            && a_refs
+                                .iter()
+                                .all(|c| column_in_schema(c, next_schema.as_ref()));
+                        if a_is_next {
+                            on.push((b.clone(), a.clone()));
+                        } else {
+                            on.push((a.clone(), b.clone()));
+                        }
+                    }
+                }
+                (on, JoinType::Inner, primary.null_equality)
+            } else {
+                // Semi/anti (or a mix): keep the single-primary-edge
+                // behavior, oriented by the `nodes[0] = preserved-LHS`
+                // invariant set up by `flatten_joins_recursive` — the
+                // preserved side must be the physical LEFT of the join.
+                let join_order_swapped = next_node_id == primary.nodes[0];
+                if join_order_swapped {
+                    let swapped_on = primary
+                        .on
+                        .iter()
+                        .map(|(left, right)| (right.clone(), left.clone()))
+                        .collect();
+                    (swapped_on, primary.join_type.swap(), primary.null_equality)
+                } else {
+                    (primary.on.clone(), primary.join_type, primary.null_equality)
+                }
+            };
+
+        // Build the join (schema is auto-derived). All non-equi predicates
+        // were hoisted into the side-channel and are reapplied at the top
+        // level by `optimal_left_deep_join_plan`, so the join carries no
+        // `filter` here.
+        let join = datafusion_expr::Join::try_new(
+            Arc::new(current_plan),
+            Arc::new(next_plan),
+            on,
+            None,
+            join_type,
+            JoinConstraint::On,
+            null_equality,
+            false,
+        )?;
+        current_plan = LogicalPlan::Join(join);
+
+        processed_nodes.push(next_node_id);
+    }
+
+    // Defensive: every relation in the graph must be placed. If the chain
+    // didn't cover them all, erroring here makes the rule fall back to the
+    // native plan rather than silently emit a plan missing relations.
+    if processed_nodes.len() != query_graph.node_count() {
+        return plan_err!(
+            "reorder reconstruction placed {} of {} relations (disconnected join graph?)",
+            processed_nodes.len(),
+            query_graph.node_count()
+        );
+    }
+
+    Ok(current_plan)
 }

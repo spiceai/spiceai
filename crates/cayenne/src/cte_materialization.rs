@@ -17,10 +17,38 @@ limitations under the License.
 //! Materialize multi-reference CTEs once on the Cayenne query path.
 //!
 //! `DataFusion` inlines `WITH` bodies, so a CTE used twice is planned and
-//! executed twice. This rule finds `SubqueryAlias` copies that share a name and
-//! an equivalent body, require real work (aggregation, join, window, distinct,
-//! sort, unnest, or union), and scan a Cayenne-accelerated table. It rewrites
-//! them to a producer/consumer pair:
+//! executed twice. This rule finds `SubqueryAlias` copies that share a name
+//! and an equivalent body, scan a Cayenne-accelerated table, and would stay
+//! materialized under `DuckDB`'s `CTEInlining` optimizer
+//! (`src/optimizer/cte_inlining.cpp`):
+//!
+//! * One reference is always inlined.
+//! * A volatile function keeps the CTE materialized.
+//! * A body that ends in aggregate, distinct, or window (peeling
+//!   single-child operators) stays materialized.
+//! * A cheap body (`EmptyRelation`, `Values`, or an already-materialized
+//!   `CteScan`) is inlined even with multiple references.
+//! * Otherwise a CTE with more than two base-table scans and
+//!   `scans * references > 10` stays materialized.
+//! * A consumer `LIMIT` / `Sort` with `fetch` (`DuckDB` `TOP_N`) inlines a
+//!   CTE that did not hit the rules above, so the limit can abort work.
+//! * Any other multi-reference CTE is materialized (`DuckDB`'s default).
+//!
+//! `DataFusion` has already inlined nested `WITH`, so an inner CTE such as
+//! TPC-DS Q2 `wscs` appears once per outer copy. `DuckDB` never sees that:
+//! each `WITH` is its own `LogicalMaterializedCTE` and a single-reference
+//! inner body is inlined into the outer producer. When several candidates
+//! would stay materialized, this rule therefore rewrites the largest body
+//! first; the next optimizer pass then sees the inner CTE as a single
+//! reference and leaves it inlined.
+//!
+//! Consumer filters are OR-ed onto the producer the way `DuckDB`'s
+//! `CTEFilterPusher` does: only when every reference has a predicate that
+//! mentions only the CTE. A copy that needs the full result (TPC-H Q15
+//! `max()`) skips the wrap. Recursive CTEs already have `RecursiveQuery` /
+//! `WorkTableExec` and are left alone.
+//!
+//! The rewrite is:
 //!
 //! ```text
 //! MaterializedCte: name=expensive
@@ -29,10 +57,6 @@ limitations under the License.
 //!     CteScan: name=expensive           -- reads the buffer
 //!     CteScan: name=expensive
 //! ```
-//!
-//! Simple pass-through CTEs (`SELECT * FROM t`) are left inlined so projection
-//! pushdown can still prune columns. Recursive CTEs already have
-//! `RecursiveQuery` / `WorkTableExec` and are left alone.
 //!
 //! The buffer is charged to the query memory pool. The first operator to run
 //! (`MaterializedCteExec` or a `CteScanExec`) computes the CTE; later scans
@@ -52,27 +76,30 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchemaRef, Result, exec_err, internal_err, plan_err};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, Result, exec_err, internal_err, plan_err};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::{
-    Extension, LogicalPlan, TableSource, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+    Extension, Filter, LogicalPlan, TableSource, UserDefinedLogicalNode,
+    UserDefinedLogicalNodeCore, Volatility,
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     RecordBatchStream, SendableRecordBatchStream,
 };
-use parking_lot::RwLock;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::Expr;
+use datafusion_expr::utils::{conjunction, disjunction, split_conjunction_owned};
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt};
+use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 
 use crate::logical_optimizer::PROPAGATED_FILTER_ALIAS_PREFIX;
@@ -165,6 +192,10 @@ struct CteCandidate {
     name: String,
     body: LogicalPlan,
     schema: DFSchemaRef,
+    /// Extra plan nodes that would re-execute if this CTE stayed inlined:
+    /// `(references - 1) * body_node_count`.
+    work_saved: usize,
+    copy_count: usize,
 }
 
 impl CayenneCteMaterialization {
@@ -191,7 +222,7 @@ impl CayenneCteMaterialization {
             Ok(TreeNodeRecursion::Continue)
         })?;
 
-        let mut chosen: Option<CteCandidate> = None;
+        let mut candidates = Vec::new();
         for (name, copies) in by_name {
             if copies.len() < 2 {
                 continue;
@@ -205,22 +236,33 @@ impl CayenneCteMaterialization {
             if contains_recursive(body)? || contains_cte_scan(body)? {
                 continue;
             }
-            if !is_expensive(body)? {
-                continue;
-            }
             if !self.contains_cayenne(body)? {
                 continue;
             }
-            let candidate = CteCandidate {
+            if !should_materialize(body, copies.len(), contains_limit(plan)) {
+                continue;
+            }
+            candidates.push(CteCandidate {
                 name,
                 body: body.clone(),
                 schema: Arc::clone(schema),
-            };
-            // Prefer an inner CTE (smaller body) so nested WITH clauses
-            // materialize from the inside out across optimizer passes.
-            let take = chosen.as_ref().is_none_or(|current| {
-                plan_node_count(&candidate.body) < plan_node_count(&current.body)
+                work_saved: work_saved(copies.len(), body),
+                copy_count: copies.len(),
             });
+        }
+
+        // DataFusion has already inlined nested WITH, so an inner CTE appears
+        // once per outer copy. `DuckDB` treats each WITH as its own node and
+        // inlines a single-reference inner body into the outer producer
+        // (TPC-DS Q2 `wscs` inside `wswscs`). Rewriting the largest body
+        // first restores that: the next pass sees the inner CTE once.
+        let mut chosen: Option<CteCandidate> = None;
+        for candidate in candidates {
+            let take = match &chosen {
+                None => true,
+                Some(current) if candidate.work_saved > current.work_saved => true,
+                Some(_) => false,
+            };
             if take {
                 chosen = Some(candidate);
             }
@@ -243,19 +285,96 @@ fn should_skip_alias(name: &str) -> bool {
     name.starts_with("__") || name.starts_with(PROPAGATED_FILTER_ALIAS_PREFIX)
 }
 
-fn is_expensive(plan: &LogicalPlan) -> Result<bool> {
-    plan.exists(|node| {
-        Ok(matches!(
-            node,
-            LogicalPlan::Aggregate(_)
-                | LogicalPlan::Join(_)
-                | LogicalPlan::Window(_)
-                | LogicalPlan::Distinct(_)
-                | LogicalPlan::Sort(_)
-                | LogicalPlan::Unnest(_)
-                | LogicalPlan::Union(_)
-        ))
-    })
+/// `DuckDB` `CTEInlining::TryInlining` for a CTE with `ref_count > 1` and no
+/// explicit `AS [NOT] MATERIALIZED` hint: `true` means keep it materialized.
+fn should_materialize(body: &LogicalPlan, copy_count: usize, consumer_has_limit: bool) -> bool {
+    if copy_count < 2 {
+        return false;
+    }
+    if contains_volatile(body) {
+        return true;
+    }
+    if ends_in_aggregate_or_distinct(body) {
+        return true;
+    }
+    let cheap = is_cheap_to_inline(body);
+    let scans = count_base_table_scans(body);
+    if !cheap && scans > 2 && scans.saturating_mul(copy_count) > 10 {
+        return true;
+    }
+    if cheap || consumer_has_limit {
+        return false;
+    }
+    true
+}
+
+/// `DuckDB` `EndsInAggregateOrDistinct`: aggregate, distinct, or window,
+/// peeling single-child operators.
+fn ends_in_aggregate_or_distinct(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) | LogicalPlan::Window(_) => true,
+        other if other.inputs().len() == 1 => ends_in_aggregate_or_distinct(other.inputs()[0]),
+        _ => false,
+    }
+}
+
+/// `DuckDB` `is_cheap_to_inline` / `EndsInDummyScan`: empty result, `Values`,
+/// or a scan of an already-materialized CTE.
+fn is_cheap_to_inline(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => true,
+        LogicalPlan::Extension(extension)
+            if extension
+                .node
+                .as_any()
+                .downcast_ref::<CteScanNode>()
+                .is_some() =>
+        {
+            true
+        }
+        other if other.inputs().len() == 1 => is_cheap_to_inline(other.inputs()[0]),
+        _ => false,
+    }
+}
+
+/// `DuckDB` `ContainsLimit`: `LIMIT` or `TOP_N` on a single-child chain from
+/// the consumer root (not buried under a join).
+fn contains_limit(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Limit(_) => true,
+        LogicalPlan::Sort(sort) if sort.fetch.is_some() => true,
+        other if other.inputs().len() == 1 => contains_limit(other.inputs()[0]),
+        _ => false,
+    }
+}
+
+fn count_base_table_scans(plan: &LogicalPlan) -> usize {
+    let mut count = 0;
+    let _ = plan.apply(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            count += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    count
+}
+
+fn contains_volatile(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        for expr in node.expressions() {
+            let _ = expr.apply(|e| {
+                if let Expr::ScalarFunction(func) = e
+                    && func.func.signature().volatility == Volatility::Volatile
+                {
+                    found = true;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 fn contains_recursive(plan: &LogicalPlan) -> Result<bool> {
@@ -285,7 +404,15 @@ fn plan_node_count(plan: &LogicalPlan) -> usize {
     count
 }
 
+fn work_saved(copy_count: usize, body: &LogicalPlan) -> usize {
+    copy_count
+        .saturating_sub(1)
+        .saturating_mul(plan_node_count(body))
+}
+
 fn materialize_candidate(plan: LogicalPlan, candidate: CteCandidate) -> Result<LogicalPlan> {
+    let producer =
+        absorb_consumer_filters(&plan, &candidate).unwrap_or_else(|| candidate.body.clone());
     let slot = Arc::new(MaterializedCteSlot::new(candidate.name.clone()));
     let scan_node = CteScanNode {
         name: candidate.name.clone(),
@@ -313,13 +440,237 @@ fn materialize_candidate(plan: LogicalPlan, candidate: CteCandidate) -> Result<L
 
     let materialized = MaterializedCteNode {
         name: candidate.name,
-        producer: candidate.body,
+        producer,
         consumer,
         slot,
     };
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(materialized),
     }))
+}
+
+/// Wrap the CTE body in `Filter(OR of per-copy predicates)` — `DuckDB`
+/// `CTEFilterPusher`. The rule runs before pushdown, so `cs1.syear = 2001` /
+/// `cs2.syear = 2002` still sit on a parent `Filter`. A copy that needs the
+/// full CTE (TPC-H Q15 `max()`) skips the wrap.
+fn absorb_consumer_filters(plan: &LogicalPlan, candidate: &CteCandidate) -> Option<LogicalPlan> {
+    let mut copy_filters = Vec::new();
+    collect_copy_filters(
+        plan,
+        &candidate.name,
+        &candidate.body,
+        candidate.schema.as_ref(),
+        &[],
+        &[],
+        &mut copy_filters,
+    );
+    // `find_candidate` walks with `apply_with_subqueries`. If this walk
+    // missed a copy (or found extras), OR-ing the filters we did see can
+    // drop rows a missed `max()` / unfiltered reference still needs.
+    if copy_filters.len() != candidate.copy_count
+        || copy_filters.is_empty()
+        || copy_filters.iter().any(Option::is_none)
+    {
+        return None;
+    }
+
+    let mut rewritten = Vec::with_capacity(copy_filters.len());
+    for filter in copy_filters.into_iter().flatten() {
+        rewritten.push(strip_column_qualifiers(filter));
+    }
+    let predicate = disjunction(rewritten)?;
+    Filter::try_new(predicate, Arc::new(candidate.body.clone()))
+        .ok()
+        .map(LogicalPlan::Filter)
+}
+
+fn collect_copy_filters(
+    plan: &LogicalPlan,
+    cte_name: &str,
+    body: &LogicalPlan,
+    schema: &DFSchema,
+    path_aliases: &[String],
+    inherited: &[Expr],
+    out: &mut Vec<Option<Expr>>,
+) {
+    if matches!(plan, LogicalPlan::RecursiveQuery(_)) {
+        return;
+    }
+
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            let mut inherited = inherited.to_vec();
+            inherited.extend(split_conjunction_owned(filter.predicate.clone()));
+            collect_copy_filters(
+                filter.input.as_ref(),
+                cte_name,
+                body,
+                schema,
+                path_aliases,
+                &inherited,
+                out,
+            );
+        }
+        LogicalPlan::Join(join) => {
+            let mut inherited = inherited.to_vec();
+            if let Some(join_filter) = join.filter.clone() {
+                inherited.extend(split_conjunction_owned(join_filter));
+            }
+            collect_copy_filters(
+                join.left.as_ref(),
+                cte_name,
+                body,
+                schema,
+                path_aliases,
+                &inherited,
+                out,
+            );
+            collect_copy_filters(
+                join.right.as_ref(),
+                cte_name,
+                body,
+                schema,
+                path_aliases,
+                &inherited,
+                out,
+            );
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let mut path_aliases = path_aliases.to_vec();
+            path_aliases.push(alias.alias.table().to_string());
+            if alias.alias.table() == cte_name && alias.input.as_ref() == body {
+                let local: Vec<Expr> = inherited
+                    .iter()
+                    .filter(|expr| is_local_predicate(expr, schema, &path_aliases))
+                    .cloned()
+                    .collect();
+                out.push(conjunction(local));
+                return;
+            }
+            collect_copy_filters(
+                alias.input.as_ref(),
+                cte_name,
+                body,
+                schema,
+                &path_aliases,
+                inherited,
+                out,
+            );
+        }
+        other => {
+            for input in other.inputs() {
+                collect_copy_filters(input, cte_name, body, schema, path_aliases, inherited, out);
+            }
+        }
+    }
+
+    for expr in plan.expressions() {
+        collect_expr_subquery_filters(&expr, cte_name, body, schema, out);
+    }
+}
+
+fn collect_expr_subquery_filters(
+    expr: &Expr,
+    cte_name: &str,
+    body: &LogicalPlan,
+    schema: &DFSchema,
+    out: &mut Vec<Option<Expr>>,
+) {
+    let _ = expr.apply(|node| {
+        match node {
+            Expr::ScalarSubquery(subquery) => {
+                collect_copy_filters(
+                    subquery.subquery.as_ref(),
+                    cte_name,
+                    body,
+                    schema,
+                    &[],
+                    &[],
+                    out,
+                );
+            }
+            Expr::InSubquery(in_subquery) => {
+                collect_copy_filters(
+                    in_subquery.subquery.subquery.as_ref(),
+                    cte_name,
+                    body,
+                    schema,
+                    &[],
+                    &[],
+                    out,
+                );
+            }
+            Expr::Exists(exists) => {
+                collect_copy_filters(
+                    exists.subquery.subquery.as_ref(),
+                    cte_name,
+                    body,
+                    schema,
+                    &[],
+                    &[],
+                    out,
+                );
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+}
+
+fn is_local_predicate(expr: &Expr, schema: &DFSchema, path_aliases: &[String]) -> bool {
+    if expr_contains_subquery(expr) {
+        return false;
+    }
+    let mut columns = Vec::new();
+    collect_columns_from_expr(expr, &mut columns);
+    columns.iter().all(|column| {
+        schema_has_unqualified_field(schema, &column.name)
+            && column.relation.as_ref().is_none_or(|relation| {
+                path_aliases
+                    .iter()
+                    .any(|alias| alias.as_str() == relation.table())
+            })
+    })
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|node| {
+        if matches!(
+            node,
+            Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+        ) {
+            found = true;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn collect_columns_from_expr(expr: &Expr, columns: &mut Vec<Column>) {
+    let _ = expr.apply(|node| {
+        if let Expr::Column(column) = node {
+            columns.push(column.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+}
+
+fn schema_has_unqualified_field(schema: &DFSchema, name: &str) -> bool {
+    schema.iter().any(|(_, field)| field.name() == name)
+}
+
+fn strip_column_qualifiers(expr: Expr) -> Expr {
+    let Ok(transformed) = expr.clone().transform(|node| {
+        Ok(if let Expr::Column(column) = node {
+            Transformed::yes(Expr::Column(Column::new_unqualified(column.name)))
+        } else {
+            Transformed::no(node)
+        })
+    }) else {
+        return expr;
+    };
+    transformed.data
 }
 
 /// Shared buffer filled on first execution of a [`MaterializedCteExec`].
@@ -703,9 +1054,7 @@ async fn ensure_materialized(
             let producer = slot.producer.read().as_ref().map(Arc::clone);
             async move {
                 let Some(producer) = producer else {
-                    return exec_err!(
-                        "CTE '{name}' was scanned before its producer was planned"
-                    );
+                    return exec_err!("CTE '{name}' was scanned before its producer was planned");
                 };
                 collect_producer(producer, context, name).await
             }
@@ -722,16 +1071,23 @@ async fn collect_producer(
     let reservation =
         MemoryConsumer::new(format!("MaterializedCte:{name}")).register(context.memory_pool());
     let schema = producer.schema();
-    let partition_count = producer.output_partitioning().partition_count();
+    // Drive every producer partition concurrently. Sequential `execute(0),
+    // drain, execute(1), …` deadlocks on `RepartitionExec`: that operator
+    // starts a background task that writes every input row onto N output
+    // channels, and a bounded unread channel stalls the producer (TPC-DS Q95
+    // `ws_wh` self-join hung for hours at <1% CPU).
+    let collect_plan: Arc<dyn ExecutionPlan> =
+        if producer.output_partitioning().partition_count() <= 1 {
+            producer
+        } else {
+            Arc::new(CoalescePartitionsExec::new(producer))
+        };
+    let mut stream = collect_plan.execute(0, Arc::clone(&context))?;
     let mut batches = Vec::new();
-
-    for partition in 0..partition_count {
-        let mut stream = producer.execute(partition, Arc::clone(&context))?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            reservation.try_grow(batch.get_array_memory_size())?;
-            batches.push(batch);
-        }
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        reservation.try_grow(batch.get_array_memory_size())?;
+        batches.push(batch);
     }
 
     tracing::debug!(
@@ -884,7 +1240,7 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::optimizer::Optimizer;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 
     fn rule() -> CayenneCteMaterialization {
@@ -908,7 +1264,7 @@ mod tests {
         Ok(vec![batch])
     }
 
-    async fn ctx_with_table() -> Result<SessionContext> {
+    fn ctx_with_table() -> Result<SessionContext> {
         let ctx = SessionContext::new();
         let rows = batches()?;
         let schema = rows[0].schema();
@@ -922,6 +1278,38 @@ mod tests {
 
     fn apply_rule(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         rule().rewrite(plan, &datafusion::optimizer::OptimizerContext::new())
+    }
+
+    fn materialized_cte_names(plan: &LogicalPlan) -> Vec<String> {
+        let mut names = Vec::new();
+        let _ = plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && let Some(materialized) = extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<MaterializedCteNode>()
+            {
+                names.push(materialized.name.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        names
+    }
+
+    fn materialized_producer(plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let mut producer = None;
+        let _ = plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && let Some(materialized) = extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<MaterializedCteNode>()
+            {
+                producer = Some(materialized.producer.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        producer
     }
 
     fn plan_contains_node(plan: &LogicalPlan, name: &str) -> bool {
@@ -951,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_ref_aggregate_cte_is_materialized() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
@@ -985,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_ref_scalar_subquery_cte_is_materialized() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
@@ -1014,7 +1402,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_ref_cte_is_not_materialized() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
@@ -1031,8 +1419,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pass_through_cte_is_not_materialized() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+    async fn pass_through_multi_ref_cte_is_materialized() -> Result<()> {
+        // `DuckDB` keeps a multi-reference CTE materialized unless it is cheap
+        // or the consumer has LIMIT / TOP_N.
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH base AS (SELECT * FROM t) \
@@ -1041,16 +1431,55 @@ mod tests {
         .await?;
         let rewritten = apply_rule(plan)?;
         assert!(
-            !rewritten.transformed,
-            "pass-through CTE should stay inlined so projection pushdown can prune columns:\n{}",
+            rewritten.transformed,
+            "`DuckDB` materializes a multi-reference pass-through CTE:\n{}",
             rewritten.data
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn pass_through_scalar_subquery_cte_is_not_materialized() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+    async fn pass_through_cte_with_limit_is_inlined() -> Result<()> {
+        // `DuckDB` `ContainsLimit`: inlining lets LIMIT abort the CTE body.
+        let ctx = ctx_with_table()?;
+        let plan = unoptimized(
+            &ctx,
+            "WITH base AS (SELECT * FROM t) \
+             SELECT a.x FROM base a JOIN base b ON a.x = b.x \
+             LIMIT 10",
+        )
+        .await?;
+        let rewritten = apply_rule(plan)?;
+        assert!(
+            !rewritten.transformed,
+            "`DuckDB` inlines a non-aggregate CTE under LIMIT:\n{}",
+            rewritten.data
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_cte_with_limit_stays_materialized() -> Result<()> {
+        let ctx = ctx_with_table()?;
+        let plan = unoptimized(
+            &ctx,
+            "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
+             SELECT a.x FROM expensive a JOIN expensive b ON a.x = b.x \
+             LIMIT 10",
+        )
+        .await?;
+        let rewritten = apply_rule(plan)?;
+        assert!(
+            rewritten.transformed,
+            "`DuckDB` still materializes an aggregate CTE under LIMIT:\n{}",
+            rewritten.data
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pass_through_scalar_subquery_cte_is_materialized() -> Result<()> {
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH base AS (SELECT * FROM t) \
@@ -1059,16 +1488,187 @@ mod tests {
         .await?;
         let rewritten = apply_rule(plan)?;
         assert!(
-            !rewritten.transformed,
-            "pass-through CTE used in a scalar subquery should stay inlined:\n{}",
+            rewritten.transformed,
+            "`DuckDB` materializes a pass-through CTE used in FROM and in a scalar subquery:\n{}",
             rewritten.data
         );
         Ok(())
     }
 
     #[tokio::test]
+    async fn prefers_outer_aggregate_cte_over_inner_union() -> Result<()> {
+        // TPC-DS Q2: `wscs` is a union of scans, `wswscs` aggregates it and is
+        // read twice. Materializing `wscs` buffers the unfiltered fact union
+        // and still runs the weekly aggregate twice.
+        let ctx = session_with_rule();
+        register_i64(&ctx, "web", "x", &[1, 2])?;
+        register_i64(&ctx, "cat", "x", &[3, 4])?;
+        let sql = "WITH wscs AS ( \
+                     SELECT x FROM (SELECT x FROM web UNION ALL SELECT x FROM cat) \
+                   ), \
+                   wswscs AS ( \
+                     SELECT x, count(*) AS n FROM wscs GROUP BY x \
+                   ) \
+                   SELECT a.x FROM wswscs a JOIN wswscs b ON a.x = b.x \
+                   ORDER BY a.x";
+        let plan = optimized_plan(&ctx, sql).await?;
+        let names = materialized_cte_names(&plan);
+        assert!(
+            names.iter().any(|name| name == "wswscs"),
+            "expected MaterializedCte wswscs, got {names:?}:\n{plan}"
+        );
+        assert!(
+            names.iter().all(|name| name != "wscs"),
+            "inner union must stay inlined, got {names:?}:\n{plan}"
+        );
+        let batches = collect_sql(&ctx, sql).await?;
+        assert_eq!(
+            i64_col(&batches, 0),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefers_outer_join_aggregate_over_inner_aggregate() -> Result<()> {
+        // TPC-DS Q64: `cs_ui` is a small inner aggregate; `cross_sales` is the
+        // large join+aggregate used twice. Materializing `cs_ui` still runs
+        // the big join twice.
+        let ctx = session_with_rule();
+        register_i64(&ctx, "t", "x", &[1, 1, 2, 2])?;
+        let sql = "WITH cs_ui AS ( \
+                     SELECT x, count(*) AS n FROM t GROUP BY x \
+                   ), \
+                   cross_sales AS ( \
+                     SELECT c.x, sum(c.n) AS s FROM cs_ui c JOIN t u ON c.x = u.x GROUP BY c.x \
+                   ) \
+                   SELECT a.x FROM cross_sales a JOIN cross_sales b ON a.x = b.x \
+                   ORDER BY a.x";
+        let plan = optimized_plan(&ctx, sql).await?;
+        let names = materialized_cte_names(&plan);
+        assert!(
+            names.iter().any(|name| name == "cross_sales"),
+            "expected MaterializedCte cross_sales, got {names:?}:\n{plan}"
+        );
+        assert!(
+            names.iter().all(|name| name != "cs_ui"),
+            "inner aggregate must stay inside the outer producer, got {names:?}:\n{plan}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absorbs_distinct_literal_filters_into_producer() -> Result<()> {
+        // TPC-DS Q64 / Q75: each reference of the aggregate CTE is filtered
+        // to a different year. OR those literals onto the producer so the
+        // buffered body is not every year.
+        let ctx = ctx_with_table()?;
+        let sql = "WITH sales AS ( \
+                     SELECT x, y, sum(y) AS s FROM t GROUP BY x, y \
+                   ) \
+                   SELECT a.x FROM sales a, sales b \
+                   WHERE a.y = 10 AND b.y = 20 AND a.x = b.x \
+                   ORDER BY a.x";
+        let plan = unoptimized(&ctx, sql).await?;
+        let rewritten = apply_rule(plan)?;
+        assert!(
+            rewritten.transformed,
+            "expected to materialize sales:\n{}",
+            rewritten.data
+        );
+        let names = materialized_cte_names(&rewritten.data);
+        assert!(
+            names.iter().any(|name| name == "sales"),
+            "expected MaterializedCte sales, got {names:?}:\n{}",
+            rewritten.data
+        );
+        let producer =
+            materialized_producer(&rewritten.data).expect("materialized CTE must have a producer");
+        let display = format!("{producer}");
+        assert!(
+            display.contains("y = Int64(10)") && display.contains("y = Int64(20)"),
+            "producer should OR the consumer literal filters:\n{display}"
+        );
+        assert!(
+            display.contains(" OR "),
+            "expected a disjunction on the producer:\n{display}"
+        );
+
+        let exec_ctx = session_with_rule();
+        let rows = batches()?;
+        let schema = rows[0].schema();
+        exec_ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![rows])?))?;
+        let result = collect_sql(&exec_ctx, sql).await?;
+        assert_eq!(i64_col(&result, 0), vec![Some(1)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn does_not_restrict_producer_when_a_copy_needs_all_rows() -> Result<()> {
+        // TPC-H / CH-benCH Q15: one reference is `max()` over the whole CTE.
+        let ctx = ctx_with_table()?;
+        let plan = unoptimized(
+            &ctx,
+            "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
+             SELECT x, s FROM expensive \
+             WHERE x = 1 AND s = (SELECT max(s) FROM expensive)",
+        )
+        .await?;
+        let rewritten = apply_rule(plan)?;
+        assert!(
+            rewritten.transformed,
+            "expected to materialize expensive:\n{}",
+            rewritten.data
+        );
+        let producer =
+            materialized_producer(&rewritten.data).expect("materialized CTE must have a producer");
+        let display = format!("{producer}");
+        assert!(
+            !display.contains("x = Int64(1)"),
+            "a max() copy needs the full CTE, so the producer must stay unfiltered:\n{display}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn does_not_absorb_joined_dimension_filter() -> Result<()> {
+        // TPC-DS Q2: year is a filter on `date_dim` joined to `wswscs`, not a
+        // predicate on the CTE itself. Absorbing it would drop weeks.
+        let ctx = session_with_rule();
+        register_i64(&ctx, "web", "x", &[1, 2])?;
+        register_i64(&ctx, "cat", "x", &[3, 4])?;
+        register_i64(&ctx, "dim", "week", &[1, 2])?;
+        let sql = "WITH wscs AS ( \
+                     SELECT x FROM (SELECT x FROM web UNION ALL SELECT x FROM cat) \
+                   ), \
+                   wswscs AS ( \
+                     SELECT x, count(*) AS n FROM wscs GROUP BY x \
+                   ) \
+                   SELECT a.x FROM wswscs a, dim d1, wswscs b, dim d2 \
+                   WHERE d1.week = a.x AND d1.week = 1 \
+                     AND d2.week = b.x AND d2.week = 2 \
+                     AND a.x = b.x";
+        let plan = unoptimized(&ctx, sql).await?;
+        let rewritten = apply_rule(plan)?;
+        let names = materialized_cte_names(&rewritten.data);
+        assert!(
+            names.iter().any(|name| name == "wswscs"),
+            "expected MaterializedCte wswscs, got {names:?}:\n{}",
+            rewritten.data
+        );
+        let producer =
+            materialized_producer(&rewritten.data).expect("materialized CTE must have a producer");
+        let display = format!("{producer}");
+        assert!(
+            !display.contains("week = Int64(1)") && !display.contains("week = Int64(2)"),
+            "Q2 year filter lives on date_dim, not on wswscs:\n{display}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn non_cayenne_scans_are_skipped() -> Result<()> {
-        let ctx = ctx_with_table().await?;
+        let ctx = ctx_with_table()?;
         let plan = unoptimized(
             &ctx,
             "WITH expensive AS (SELECT x, sum(y) AS s FROM t GROUP BY x) \
@@ -1086,11 +1686,17 @@ mod tests {
         Ok(())
     }
 
-    fn session_with_rule() -> Result<SessionContext> {
+    fn session_with_rule() -> SessionContext {
+        session_with_rule_and_partitions(4)
+    }
+
+    fn session_with_rule_and_partitions(target_partitions: usize) -> SessionContext {
         let mut rules = Optimizer::new().rules;
         rules.insert(0, Arc::new(rule()));
+        let config = SessionConfig::new().with_target_partitions(target_partitions);
         let state = SessionStateBuilder::new()
             .with_default_features()
+            .with_config(config)
             .with_optimizer_rules(rules)
             .with_query_planner(Arc::new(
                 ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(
@@ -1098,7 +1704,26 @@ mod tests {
                 )]),
             ))
             .build();
-        Ok(SessionContext::new_with_state(state))
+        SessionContext::new_with_state(state)
+    }
+
+    fn register_i64_partitioned(
+        ctx: &SessionContext,
+        table: &str,
+        col: &str,
+        partitions: &[&[i64]],
+    ) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(col, DataType::Int64, false)]));
+        let mut parts = Vec::with_capacity(partitions.len());
+        for values in partitions {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )?;
+            parts.push(vec![batch]);
+        }
+        ctx.register_table(table, Arc::new(MemTable::try_new(schema, parts)?))?;
+        Ok(())
     }
 
     fn register_i64(ctx: &SessionContext, table: &str, col: &str, values: &[i64]) -> Result<()> {
@@ -1107,7 +1732,10 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(values.to_vec()))],
         )?;
-        ctx.register_table(table, Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
+        ctx.register_table(
+            table,
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
         Ok(())
     }
 
@@ -1122,16 +1750,19 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(values.to_vec()))],
         )?;
-        ctx.register_table(table, Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
+        ctx.register_table(
+            table,
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
         Ok(())
     }
 
     async fn collect_sql(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>> {
-        Ok(ctx.sql(sql).await?.collect().await?)
+        ctx.sql(sql).await?.collect().await
     }
 
     async fn optimized_plan(ctx: &SessionContext, sql: &str) -> Result<LogicalPlan> {
-        Ok(ctx.sql(sql).await?.into_optimized_plan()?)
+        ctx.sql(sql).await?.into_optimized_plan()
     }
 
     fn assert_materialized(plan: &LogicalPlan, sql: &str) {
@@ -1178,10 +1809,7 @@ mod tests {
         out
     }
 
-    async fn materialized_sql(
-        ctx: &SessionContext,
-        sql: &str,
-    ) -> Result<Vec<RecordBatch>> {
+    async fn materialized_sql(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>> {
         let plan = optimized_plan(ctx, sql).await?;
         assert_materialized(&plan, sql);
         collect_sql(ctx, sql).await
@@ -1195,7 +1823,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_cte_join_returns_correct_rows() -> Result<()> {
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let rows = batches()?;
         let schema = rows[0].schema();
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![rows])?))?;
@@ -1245,16 +1873,16 @@ mod tests {
         Ok(())
     }
 
-    // Cases adapted from DuckDB `test/sql/cte/materialized/` (v2.0-cyanoptera).
-    // DuckDB's `AS MATERIALIZED` is not SQL here; each query uses a
+    // Cases adapted from `DuckDB` `test/sql/cte/materialized/` (v2.0-cyanoptera).
+    // `DuckDB`'s `AS MATERIALIZED` is not SQL here; each query uses a
     // multi-reference expensive CTE so auto-materialize rewrites, then checks
-    // DuckDB's expected values. Recursive CTEs, DML, EXPLAIN REGEX, `range()`,
+    // `DuckDB`'s expected values. Recursive CTEs, DML, EXPLAIN REGEX, `range()`,
     // and `AS [NOT] MATERIALIZED` syntax are not ported.
 
     #[tokio::test]
     async fn duckdb_multi_use_same_cte_cartesian() -> Result<()> {
         // test_cte_materialized.test: multiple uses of same CTE → 42, 42
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i) \
                    SELECT cte11.j AS j1, cte12.j AS j2 FROM cte1 cte11, cte1 cte12";
@@ -1267,7 +1895,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_cte_referenced_in_subquery() -> Result<()> {
         // test_cte_materialized.test: `j = (select max(j) from cte1)`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i) \
                    SELECT j FROM cte1 WHERE j = (SELECT max(j) FROM cte1)";
@@ -1279,7 +1907,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_chained_ctes_cross_join() -> Result<()> {
         // test_cte_materialized.test: cte1/cte2/cte3 → 42, 43
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i), \
                         cte2 AS (SELECT j AS k FROM cte1), \
@@ -1294,7 +1922,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_chained_ctes_union_all() -> Result<()> {
         // test_cte_materialized.test: cte2 UNION ALL cte3 → 42, 43
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i), \
                         cte2 AS (SELECT j AS k FROM cte1), \
@@ -1308,7 +1936,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_cte_column_aliases() -> Result<()> {
         // test_cte_materialized.test: `WITH cte1(xxx) AS ... SELECT xxx`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1(xxx, n) AS (SELECT i, count(*) FROM a GROUP BY i) \
                    SELECT t1.xxx FROM cte1 t1 JOIN cte1 t2 ON t1.xxx = t2.xxx";
@@ -1320,7 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_union_all_two_refs() -> Result<()> {
         // test_cte_materialized.test: two reads of the same materialized CTE
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i) \
                    SELECT j FROM cte1 UNION ALL SELECT j FROM cte1";
@@ -1332,7 +1960,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_nested_with_inner_materialized() -> Result<()> {
         // test_cte_in_cte_materialized.test: WITH inside a CTE, inner used twice
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS ( \
                      WITH b AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i) \
@@ -1346,7 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_cte_in_subquery_tableref() -> Result<()> {
         // test_cte_in_cte_materialized.test: CTE in a subquery FROM, plus outer ref
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j, count(*) AS n FROM a GROUP BY i) \
                    SELECT f.j FROM ( \
@@ -1359,9 +1987,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materializing_a_repartitioned_join_cte_does_not_deadlock() -> Result<()> {
+        // Producer is a join over a multi-partition table, so physical planning
+        // inserts `RepartitionExec`. Sequential collect of that producer
+        // deadlocks; `CoalescePartitionsExec` drives every partition at once.
+        let ctx = session_with_rule_and_partitions(4);
+        register_i64_partitioned(&ctx, "t", "x", &[&[1, 2], &[3, 4], &[5, 6], &[7, 8]])?;
+        let sql = "WITH expensive AS ( \
+                     SELECT a.x FROM t a JOIN t b ON a.x = b.x \
+                   ) \
+                   SELECT e1.x FROM expensive e1 JOIN expensive e2 ON e1.x = e2.x \
+                   ORDER BY e1.x";
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            materialized_sql(&ctx, sql),
+        )
+        .await
+        .expect("materializing a hash-repartitioned CTE must not deadlock")?;
+        assert_eq!(
+            i64_col(&batches, 0),
+            vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8)
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn duckdb_generate_series_self_join_cartesian() -> Result<()> {
         // test_materialized_cte.test: generate_series(1,3) self-join → 9 rows
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "series", "i", &[1, 2, 3])?;
         let sql = "WITH t AS (SELECT i, count(*) AS n FROM series GROUP BY i) \
                    SELECT t1.i AS x, t2.i AS y FROM t t1, t t2 ORDER BY t1.i, t2.i";
@@ -1400,7 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_generate_series_self_join_sum() -> Result<()> {
         // test_materialized_cte.test: `sum(a.i + b.i)` over range(3) → 18
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "series", "i", &[0, 1, 2])?;
         let sql = "WITH t AS (SELECT i, count(*) AS n FROM series GROUP BY i) \
                    SELECT CAST(sum(a.i + b.i) AS BIGINT) AS s FROM t a, t b";
@@ -1412,7 +2074,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_nested_cte_wraps_inner() -> Result<()> {
         // test_materialized_cte.test: t wrapping u → 42
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH t AS ( \
                      WITH u AS (SELECT i AS x, count(*) AS n FROM a GROUP BY i) \
@@ -1426,7 +2088,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_union_all_derived_and_base() -> Result<()> {
         // test_materialized_cte.test: `TABLE u UNION ALL TABLE t` → 2, 1
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[1])?;
         let sql = "WITH t AS (SELECT i AS x, count(*) AS n FROM a GROUP BY i), \
                         u AS (SELECT x + 1 AS x FROM t) \
@@ -1440,7 +2102,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_full_outer_join_two_ctes() -> Result<()> {
         // test_materialized_cte.test: FULL OUTER JOIN of two CTEs → 2, 1
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[1])?;
         let sql = "WITH t AS (SELECT i AS x, count(*) AS n FROM a GROUP BY i), \
                         u AS (SELECT i + 1 AS x, count(*) AS n FROM a GROUP BY i) \
@@ -1456,7 +2118,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_null_sum_and_count_scalars() -> Result<()> {
         // test_materialized_cte.test: four scalar refs of `d` over range(16)
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let series: Vec<i64> = (0..16).collect();
         register_i64(&ctx, "series", "i", &series)?;
         let sql = "WITH d AS ( \
@@ -1480,7 +2142,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_correlated_subquery_two_refs() -> Result<()> {
         // test_materialized_cte.test: lhs vs rhs on the same CTE → 256
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let series: Vec<i64> = (0..16).collect();
         register_i64(&ctx, "series", "i", &series)?;
         let sql = "WITH d AS (SELECT DISTINCT i, i AS q FROM series) \
@@ -1496,7 +2158,7 @@ mod tests {
     async fn duckdb_tpch_q15_revenue_cte() -> Result<()> {
         // automatic_cte_materialization.test_slow: TPC-H Q15 revenue CTE used
         // in FROM and in a max() subquery.
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let rows = batches()?;
         let schema = rows[0].schema();
         ctx.register_table("lineitem", Arc::new(MemTable::try_new(schema, vec![rows])?))?;
@@ -1518,10 +2180,13 @@ mod tests {
     async fn duckdb_tpcds_q57_triple_self_join() -> Result<()> {
         // automatic_cte_materialization.test_slow: TPC-DS Q57 `v1` self-joined
         // three times after a window aggregate.
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let rows = batches()?;
         let schema = rows[0].schema();
-        ctx.register_table("catalog_sales", Arc::new(MemTable::try_new(schema, vec![rows])?))?;
+        ctx.register_table(
+            "catalog_sales",
+            Arc::new(MemTable::try_new(schema, vec![rows])?),
+        )?;
         let sql = "WITH v1 AS ( \
                      SELECT x AS i_category, sum(y) AS sum_sales, \
                             rank() OVER (PARTITION BY x ORDER BY x) AS rn \
@@ -1544,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_filter_on_materialized_cte() -> Result<()> {
         // cte_filter_pusher.test: generate_series(1,10), x < 8, x % 3 = 1 → 1,4,7
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let series: Vec<i64> = (1..=10).collect();
         register_i64(&ctx, "series", "i", &series)?;
         let sql = "WITH a AS (SELECT DISTINCT i AS x FROM series) \
@@ -1560,7 +2225,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_filter_cross_join_or_predicate() -> Result<()> {
         // cte_filter_pusher.test: `v IN (1..6) OR s.x > 100` → 180
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let series: Vec<i64> = (0..100).collect();
         register_i64(&ctx, "series", "i", &series)?;
         register_nullable_i64(&ctx, "filter_ctx", "x", &[Some(10), Some(20), None])?;
@@ -1577,7 +2242,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_nulls_and_duplicates_projection() -> Result<()> {
         // cte_filter_pusher.test: NULLs and duplicate keys in a computed projection
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int64, true),
             Field::new("payload", DataType::Utf8, true),
@@ -1594,7 +2259,10 @@ mod tests {
                 ])),
             ],
         )?;
-        ctx.register_table("src", Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
+        ctx.register_table(
+            "src",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
         let sql = "WITH cte AS ( \
                      SELECT DISTINCT i + 1 AS x, upper(payload) AS payload FROM src \
                    ) \
@@ -1619,7 +2287,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_issue_10260_join_cte() -> Result<()> {
         // test_issue_10260.test: JOIN inside a CTE that is then materialized
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "t0", "c1", &[1])?;
         register_i64(&ctx, "t1", "c1", &[1])?;
         let sql = "WITH cte AS ( \
@@ -1638,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_empty_cte_two_refs() -> Result<()> {
         // materialized_cte_order_preservation.test: empty producer, two consumers
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH d AS (SELECT i FROM a WHERE i < 0 GROUP BY i) \
                    SELECT CAST((SELECT count(*) FROM d) AS BIGINT) AS c1, \
@@ -1652,7 +2320,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_sorted_limit_on_materialized_cte() -> Result<()> {
         // test_materialized_cte.test: DISTINCT + ORDER + LIMIT on generate_series
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let series: Vec<i64> = (1..=10).collect();
         register_i64(&ctx, "series", "i", &series)?;
         let sql = "WITH t AS (SELECT i FROM series WHERE i <= 4 GROUP BY i) \
@@ -1663,16 +2331,15 @@ mod tests {
         Ok(())
     }
 
-    // Cases adapted from DuckDB `test/sql/cte/` (v2.0-cyanoptera), the
-    // inlined (non-`MATERIALIZED`) counterparts. Bodies are pass-through or
-    // single-ref so auto-materialize must not fire; results still match
-    // DuckDB. Recursive CTEs, DML, DESCRIBE/SUMMARIZE, storage back-compat,
-    // and unused-CTE lazy bind are not ported.
+    // Cases adapted from `DuckDB` `test/sql/cte/` (v2.0-cyanoptera).
+    // Materialize vs inline follows `DuckDB` `CTEInlining`; result values
+    // still match `DuckDB`. Recursive CTEs, DML, DESCRIBE/SUMMARIZE, storage
+    // back-compat, and unused-CTE lazy bind are not ported.
 
     #[tokio::test]
     async fn duckdb_inlined_single_ref() -> Result<()> {
         // test_cte.test: `with cte1 as (Select i as j from a) select * from cte1`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) SELECT j FROM cte1";
         let batches = inlined_sql(&ctx, sql).await?;
@@ -1683,7 +2350,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_column_alias() -> Result<()> {
         // test_cte.test: `with cte1(xxx) as (Select i as j from a) select xxx`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1(xxx) AS (SELECT i AS j FROM a) SELECT xxx FROM cte1";
         let batches = inlined_sql(&ctx, sql).await?;
@@ -1694,13 +2361,13 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_chained_ctes_cross_join() -> Result<()> {
         // test_cte.test: cte1/cte2/cte3 without MATERIALIZED → 42, 43
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a), \
                         cte2 AS (SELECT j AS k FROM cte1), \
                         cte3 AS (SELECT j + 1 AS i FROM cte1) \
                    SELECT k, i FROM cte2, cte3";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42)]);
         assert_eq!(i64_col(&batches, 1), vec![Some(43)]);
         Ok(())
@@ -1709,13 +2376,13 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_chained_ctes_union_all() -> Result<()> {
         // test_cte.test: cte2 UNION ALL cte3 → 42, 43
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a), \
                         cte2 AS (SELECT j AS k FROM cte1), \
                         cte3 AS (SELECT j + 1 AS i FROM cte1) \
                    SELECT k FROM cte2 UNION ALL SELECT i FROM cte3";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42), Some(43)]);
         Ok(())
     }
@@ -1723,11 +2390,11 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_multi_use_same_cte_cartesian() -> Result<()> {
         // test_cte.test: multiple uses of a pass-through CTE → 42, 42
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) \
                    SELECT cte11.j AS j1, cte12.j AS j2 FROM cte1 cte11, cte1 cte12";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42)]);
         assert_eq!(i64_col(&batches, 1), vec![Some(42)]);
         Ok(())
@@ -1736,11 +2403,11 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_cte_referenced_in_subquery() -> Result<()> {
         // test_cte.test: `j = (select max(j) from cte1)` on a pass-through CTE
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) \
                    SELECT j FROM cte1 WHERE j = (SELECT max(j) FROM cte1)";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42)]);
         Ok(())
     }
@@ -1748,11 +2415,11 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_union_all_two_refs() -> Result<()> {
         // test_cte.test: two reads of the same inlined CTE
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) \
                    SELECT j FROM cte1 UNION ALL SELECT j FROM cte1";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42), Some(42)]);
         Ok(())
     }
@@ -1760,7 +2427,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_cte_in_union_all_branch() -> Result<()> {
         // test_cte.test: `SELECT 1 UNION ALL (WITH cte AS (SELECT 42) SELECT * FROM cte)`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "SELECT CAST(1 AS BIGINT) AS j \
                    UNION ALL (WITH cte AS (SELECT i AS j FROM a) SELECT j FROM cte)";
@@ -1772,13 +2439,13 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_cte_in_nested_set_operation() -> Result<()> {
         // test_cte.test: CTE used twice inside a UNION ALL branch → 1, 42, 42
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "SELECT CAST(1 AS BIGINT) AS j UNION ALL ( \
                      WITH cte AS (SELECT i AS j FROM a) \
                      SELECT j FROM cte UNION ALL SELECT j FROM cte \
                    )";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(1), Some(42), Some(42)]);
         Ok(())
     }
@@ -1786,7 +2453,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_multi_column_alias() -> Result<()> {
         // test_cte.test: `with cte1(x, y) as (select 42 a, 84 b)`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let sql = "WITH cte1(x, y) AS (SELECT CAST(42 AS BIGINT) AS a, CAST(84 AS BIGINT) AS b) \
                    SELECT x, y FROM cte1";
         let batches = inlined_sql(&ctx, sql).await?;
@@ -1798,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_nested_with() -> Result<()> {
         // test_cte_in_cte.test: WITH inside a CTE
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS ( \
                      WITH b AS (SELECT i AS j FROM a) \
@@ -1812,7 +2479,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_nested_with_column_aliases() -> Result<()> {
         // test_cte_in_cte.test: `with cte1(xxx) as (with ncte(yyy) as ...)`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1(xxx) AS ( \
                      WITH ncte(yyy) AS (SELECT i AS j FROM a) \
@@ -1826,14 +2493,14 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_nested_with_cross_join() -> Result<()> {
         // test_cte_in_cte.test: nested WITH producing cte1 × cte2 → 42, 43
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS ( \
                      WITH b AS (SELECT i AS j FROM a) SELECT j FROM b \
                    ), cte2 AS ( \
                      WITH c AS (SELECT j + 1 AS k FROM cte1) SELECT k FROM c \
                    ) SELECT j, k FROM cte1, cte2";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42)]);
         assert_eq!(i64_col(&batches, 1), vec![Some(43)]);
         Ok(())
@@ -1842,7 +2509,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_cte_in_subquery_tableref() -> Result<()> {
         // test_cte_in_cte.test: CTE in a subquery FROM
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) \
                    SELECT j FROM ( \
@@ -1857,12 +2524,12 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_cte_in_subquery_expression() -> Result<()> {
         // test_cte_in_cte.test: `j = (with cte2 as (select max(j) from cte1) ...)`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "a", "i", &[42])?;
         let sql = "WITH cte1 AS (SELECT i AS j FROM a) \
                    SELECT j FROM cte1 \
                    WHERE j = (WITH cte2 AS (SELECT max(j) AS j FROM cte1) SELECT j FROM cte2)";
-        let batches = inlined_sql(&ctx, sql).await?;
+        let batches = materialized_sql(&ctx, sql).await?;
         assert_eq!(i64_col(&batches, 0), vec![Some(42)]);
         Ok(())
     }
@@ -1870,7 +2537,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_bug_922_empty() -> Result<()> {
         // test_bug_922.test: VALUES + LIMIT 0 OFFSET 1 → no rows
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let sql = "WITH my_list(value) AS ( \
                      SELECT * FROM (VALUES \
                        (CAST(1 AS BIGINT)), \
@@ -1886,7 +2553,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_null_filter() -> Result<()> {
         // cte_null_values.test: NULL in a CTE, then a predicate that rejects it
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let sql = "WITH cte1 AS (SELECT CAST(NULL AS TIMESTAMP) AS y), \
                         cte1_filter AS ( \
                           SELECT y FROM cte1 \
@@ -1904,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_issue_5673_name_shadow() -> Result<()> {
         // test_issue_5673.test: CTE named `orders` shadows the table of the same name
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         register_i64(&ctx, "orders", "ordered_at", &[1])?;
         register_i64(&ctx, "stg_orders", "ordered_at", &[1])?;
         let sql = "WITH orders AS ( \
@@ -1922,7 +2589,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_issue_10074_column_name() -> Result<()> {
         // cte_colname_issue_10074.test: join of two CTEs keeps `id`
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         let sql = "WITH q AS (SELECT CAST(1 AS BIGINT) AS id, CAST(42 AS BIGINT) AS s), \
                         a AS (SELECT CAST(42 AS BIGINT) AS s) \
                    SELECT id FROM q JOIN a ON q.s = a.s";
@@ -1934,7 +2601,7 @@ mod tests {
     #[tokio::test]
     async fn duckdb_inlined_schema_vs_cte_name() -> Result<()> {
         // cte_schema.test: table `s1.tbl` vs CTE `tbl` → hello, world
-        let ctx = session_with_rule()?;
+        let ctx = session_with_rule();
         ctx.sql("CREATE SCHEMA s1").await?.collect().await?;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(

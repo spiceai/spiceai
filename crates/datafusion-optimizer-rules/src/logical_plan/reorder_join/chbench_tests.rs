@@ -31,6 +31,10 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::optimizer::Optimizer;
+use datafusion::optimizer::OptimizerRule;
+use datafusion::optimizer::eliminate_cross_join::EliminateCrossJoin;
+use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
+use datafusion::optimizer::push_down_filter::PushDownFilter;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 
@@ -342,3 +346,112 @@ chbench_reorder_snapshot!(reorder_q10, "q10.sql");
 chbench_reorder_snapshot!(reorder_q11, "q11.sql");
 chbench_reorder_snapshot!(reorder_q18, "q18.sql");
 chbench_reorder_snapshot!(reorder_q21, "q21.sql");
+
+fn register_q64_shaped_tables(ctx: &SessionContext) {
+    for &table in TABLES {
+        let (schema, ndv, num_rows) = chbench_table(table);
+        ctx.register_table(
+            table,
+            Arc::new(StatTable {
+                schema: Arc::new(schema),
+                num_rows,
+                ndv,
+            }),
+        )
+        .expect("register chbench stat table");
+    }
+    for (name, pk, rows, ndv) in [
+        ("store", "s_store_sk", 1_000_usize, 1_000_usize),
+        ("promotion", "p_promo_sk", 1_000, 1_000),
+        ("customer_demographics", "cd_demo_sk", 1_000_000, 1_000_000),
+        ("household_demographics", "hd_demo_sk", 7_200, 7_200),
+        ("customer_address", "ca_address_sk", 50_000, 50_000),
+        ("income_band", "ib_income_band_sk", 20, 20),
+        ("date_dim", "d_date_sk", 73_049, 73_049),
+        ("store_returns", "sr_item_sk", 2_800_000, 100_000),
+    ] {
+        let schema = Schema::new(vec![
+            Field::new(pk, int64(), true),
+            Field::new("payload", utf8(), true),
+        ]);
+        ctx.register_table(
+            name,
+            Arc::new(StatTable {
+                schema: Arc::new(schema),
+                num_rows: rows,
+                ndv: vec![ndv, rows.min(10_000)],
+            }),
+        )
+        .expect("register q64-shaped table");
+    }
+}
+
+/// `TPC-DS` Q64-shaped snowflake: one fact plus ~17 dimensions (including
+/// repeated aliases). CTE materialization exposes this island to join
+/// reorder; IK84 is capped and greedy left-deep must finish in bounded time.
+#[tokio::test]
+async fn reorder_q64_shaped_snowflake_plans_in_bounded_time() {
+    // Only the join-reorder prerequisites — the default optimizer's later
+    // rules (`optimize_projections`, invariant checks in debug) are out of
+    // scope. The lab hang was this island sitting under `MaterializedCte`.
+    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+        Arc::new(EliminateCrossJoin::new()),
+        Arc::new(ExtractEquijoinPredicate::new()),
+        Arc::new(PushDownFilter::new()),
+        Arc::new(ReorderJoinRule::default()),
+    ];
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register_q64_shaped_tables(&ctx);
+
+    // Snowflake matching Q64 `cross_sales`: fact + returns + 3 date_dim +
+    // store + customer + 2 demographics + promotion + 2 household + 2
+    // addresses + 2 income_band + item. `order_line` stands in for
+    // `store_sales` so we reuse the existing chbench fact stats.
+    let sql = "\
+SELECT ol.ol_i_id, count(*) AS cnt
+FROM order_line ol, store_returns sr, date_dim d1, date_dim d2, date_dim d3,
+     store s, customer c, customer_demographics cd1, customer_demographics cd2,
+     promotion p, household_demographics hd1, household_demographics hd2,
+     customer_address ad1, customer_address ad2, income_band ib1, income_band ib2,
+     item i
+WHERE ol.ol_i_id = sr.sr_item_sk
+  AND ol.ol_o_id = d1.d_date_sk
+  AND ol.ol_w_id = s.s_store_sk
+  AND ol.ol_o_id = c.c_id
+  AND ol.ol_d_id = cd1.cd_demo_sk
+  AND ol.ol_i_id = i.i_id
+  AND c.c_d_id = cd2.cd_demo_sk
+  AND c.c_w_id = hd2.hd_demo_sk
+  AND c.c_id = ad2.ca_address_sk
+  AND c.c_id = d2.d_date_sk
+  AND c.c_id = d3.d_date_sk
+  AND ol.ol_i_id = p.p_promo_sk
+  AND ol.ol_d_id = hd1.hd_demo_sk
+  AND ol.ol_w_id = ad1.ca_address_sk
+  AND hd1.hd_demo_sk = ib1.ib_income_band_sk
+  AND hd2.hd_demo_sk = ib2.ib_income_band_sk
+  AND i.i_data LIKE '%b%'
+GROUP BY ol.ol_i_id";
+
+    let start = std::time::Instant::now();
+    let plan = reordered_plan(&ctx, sql).await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "Q64-shaped 17-way join reorder took {elapsed:?}; plan:\n{plan}"
+    );
+    assert!(
+        !plan.starts_with("[plan error]") && !plan.starts_with("[optimize error]"),
+        "Q64-shaped reorder failed: {plan}"
+    );
+    for table in ["order_line", "item", "store", "customer", "date_dim"] {
+        assert!(
+            plan.contains(table),
+            "Q64-shaped reorder dropped `{table}` in {elapsed:?}; plan:\n{plan}"
+        );
+    }
+}

@@ -26,7 +26,9 @@ limitations under the License.
 //! chain (see `left_deep_join_plan`). The lowest-cost root wins. Cardinalities
 //! and selectivities come from `TableProvider` statistics through `cost`. The
 //! algorithm is polynomial (it does not enumerate all orders) and only finds
-//! left-deep plans — it never produces bushy trees.
+//! left-deep plans — it never produces bushy trees. Islands larger than 12
+//! relations (`TPC-DS` Q64 `cross_sales`) use a greedy left-deep chain instead,
+//! so planning stays bounded.
 //!
 //! # Pipeline position
 //!
@@ -111,12 +113,24 @@ impl OptimizerRule for ReorderJoinRule {
         None
     }
 
+    #[expect(
+        clippy::only_used_in_recursion,
+        reason = "OptimizerConfig is forwarded into Union/MaterializedCte children; the join enumerator does not read it"
+    )]
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         let start = std::time::Instant::now();
+
+        // Multi-input non-join roots (`Union`, `MaterializedCte`, …) are not a
+        // single join tree. Recurse into each input so each side still
+        // reorders; failing the whole plan leaves a 20-way join inside a
+        // materialized CTE in SQL `FROM` order (TPC-DS Q64).
+        if !matches!(plan, LogicalPlan::Join(_)) && plan.inputs().len() > 1 {
+            return plan.map_children(|child| self.rewrite(child, config));
+        }
 
         // No joins anywhere in the plan: nothing to reorder. Returning the input unchanged.
         if !plan.exists(|p| Ok(matches!(p, LogicalPlan::Join(_))))? {
