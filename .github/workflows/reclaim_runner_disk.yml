@@ -27,7 +27,7 @@ jobs:
             *) echo 'Outside the model-readiness investigation host; no further inspection'; exit 0 ;;
           esac
           python3 - <<'PYTHON'
-          import datetime, json, os, re, subprocess
+          import datetime, json, os, re, subprocess, tempfile
           from pathlib import Path
           assert subprocess.check_output(['hostname'], text=True).strip() == 'spiceai-macos-mbp-runner-02'
           def run(args, timeout=30):
@@ -49,16 +49,48 @@ jobs:
           rows = [line.split(None, 7) for line in processes.splitlines()]
           rows = [r for r in rows if len(r) == 8]
           top = sorted(rows, key=lambda r: float(r[2]), reverse=True)[:20]
-          selected = {r[0]: r for r in top}
+          top_rss = sorted(rows, key=lambda r: int(r[4]), reverse=True)[:20]
+          selected = {r[0]: r for r in top + top_rss}
           for r in rows:
-              if any(name in r[7] for name in ('Runner.Worker', 'Runner.Listener', 'spiced', 'spiceio', 'cargo', 'rustc', 'clippy')):
+              if any(name in r[7] for name in ('Runner.Worker', 'Runner.Listener', 'spiced', 'spiceio', 'integration_models-', 'cargo', 'rustc', 'clippy')):
                   selected[r[0]] = r
           print('PROCESS_FIELDS pid ppid cpu_percent mem_percent rss_KiB vsz_KiB elapsed executable')
           for row in selected.values():
               print('PROCESS', json.dumps(row))
-          workers = [r[0] for r in rows if any(name in r[7] for name in ('Runner.Worker', 'spiced', 'cargo', 'rustc', 'clippy'))]
+          workers = [r[0] for r in rows if any(name in r[7] for name in ('Runner.Worker', 'spiced', 'integration_models-', 'cargo', 'rustc', 'clippy'))]
           if workers:
               run(['lsof', '-nP', '-a', '-p', ','.join(workers[:50]), '-d', 'cwd', '-F', 'pn'])
+          # The matrix can revisit a host. Permit at most two samples per workflow run.
+          run_id = os.environ['GITHUB_RUN_ID']
+          attempt = os.environ['GITHUB_RUN_ATTEMPT']
+          assert run_id.isdecimal() and attempt.isdecimal()
+          claim = Path(tempfile.gettempdir()) / f'spiceai-model-sample-{run_id}-{attempt}'
+          try:
+              claim.mkdir(mode=0o700)
+          except FileExistsError:
+              print('STACK_SAMPLE_ALREADY_CLAIMED_FOR_RUN')
+          else:
+              candidates = sorted(
+                  [r for r in rows if re.fullmatch(r'integration_models-[0-9a-f]+', Path(r[7]).name)],
+                  key=lambda r: int(r[4]), reverse=True,
+              )[:2]
+              print('STACK_SAMPLE_CANDIDATES', [r[0] for r in candidates])
+              for row in candidates:
+                  pid = row[0]
+                  current = subprocess.run(['ps', '-p', pid, '-o', 'uid=,comm='], capture_output=True, text=True)
+                  identity = current.stdout.strip().split(None, 1)
+                  if current.returncode or len(identity) != 2 or identity != [str(os.getuid()), row[7]]:
+                      print('STACK_SAMPLE_IDENTITY_CHANGED_OR_UNOWNED', pid)
+                      continue
+                  with tempfile.TemporaryDirectory(prefix='model-stack-', dir=os.environ['RUNNER_TEMP']) as scratch:
+                      report = Path(scratch) / 'sample.txt'
+                      print('STACK_SAMPLE_BEGIN', pid, datetime.datetime.now(datetime.timezone.utc).isoformat(), flush=True)
+                      run(['/usr/bin/sample', pid, '3', '10', '-mayDie', '-file', str(report)], timeout=20)
+                      if report.is_file():
+                          for line in report.read_text(errors='replace').splitlines():
+                              if not re.match(r'\s*(Arguments|Command [Ll]ine):', line):
+                                  print(line)
+                      print('STACK_SAMPLE_END', pid, datetime.datetime.now(datetime.timezone.utc).isoformat(), flush=True)
           home = Path.home()
           cache = home / '.cache/huggingface/hub'
           print('CACHE_ENV_OVERRIDES', {k: bool(os.environ.get(k)) for k in ('HF_HOME', 'HF_HUB_CACHE', 'HF_TOKEN_PATH')})
