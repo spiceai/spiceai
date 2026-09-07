@@ -77,6 +77,7 @@ pub(super) fn responses_request_from_chat_completion_request(
             .map(|effort| Reasoning {
                 effort: Some(effort),
                 summary: None,
+                context: None,
             }),
         metadata: req
             .metadata
@@ -242,6 +243,7 @@ fn input_items_from_assistant_message(
     if let Some(function_call) = msg.function_call.take() {
         items.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
             call_id: function_call.name.clone(),
+            namespace: None,
             name: function_call.name,
             arguments: function_call.arguments,
             id: None,
@@ -259,6 +261,7 @@ fn input_item_from_chat_tool_call(
         ChatCompletionMessageToolCalls::Function(function_call) => {
             Ok(InputItem::Item(Item::FunctionCall(FunctionToolCall {
                 call_id: function_call.id,
+                namespace: None,
                 name: function_call.function.name,
                 arguments: function_call.function.arguments,
                 id: None,
@@ -318,6 +321,7 @@ fn easy_message(role: ResponsesRole, content: EasyInputContent) -> InputItem {
         r#type: MessageType::Message,
         role,
         content,
+        phase: None,
     })
 }
 
@@ -453,11 +457,13 @@ fn response_tool_from_chat_tool(tool: ChatCompletionTools) -> Result<ResponsesTo
             parameters: function_tool.function.parameters,
             strict: function_tool.function.strict,
             description: function_tool.function.description,
+            defer_loading: None,
         })),
         ChatCompletionTools::Custom(custom_tool) => Ok(ResponsesTool::Custom(CustomToolParam {
             name: custom_tool.custom.name,
             description: custom_tool.custom.description,
             format: convert_json(custom_tool.custom.format, "custom tool format")?,
+            defer_loading: None,
         })),
     }
 }

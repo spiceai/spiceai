@@ -624,14 +624,23 @@ fn openai(
     raw_params: &HashMap<String, SecretString>,
     params: &OpenAiModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    validate_temperature(raw_params, "openai")?;
+
+    if params.auth.is_codex() {
+        validate_codex_params(params)?;
+        return Ok(Arc::new(llms::openai::new_codex_client(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            params.endpoint.clone(),
+            Some(params.usage_tier),
+        )) as Arc<dyn Chat>);
+    }
+
     let api_base = Some(params.endpoint.as_str());
-    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    let api_key = params.auth.api_key().map(ExposeSecret::expose_secret);
     let org_id = params.org_id.as_deref();
     let project_id = params.project_id.as_deref();
     let usage_tier = Some(params.usage_tier);
     let chat_backend = params.responses_api;
-
-    validate_temperature(raw_params, "openai")?;
 
     Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
@@ -644,11 +653,21 @@ fn openai(
     )) as Arc<dyn Chat>)
 }
 
+pub(super) fn validate_codex_params(params: &OpenAiModelParams) -> Result<(), LlmError> {
+    if params.responses_api != llms::openai::ChatBackend::Responses {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Codex authentication requires `responses_api: enabled` so chat-completions requests use the Responses API.".into(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Rejects a negative or unparseable `temperature` override at load time rather
 /// than deferring to a request-time provider error. The value is read from the
 /// raw params map because overrides are passthrough (see [`super::params::common`]),
 /// accepting the unprefixed, `{prefix}_`-prefixed, and legacy `openai_` forms.
-fn validate_temperature(
+pub(super) fn validate_temperature(
     raw_params: &HashMap<String, SecretString>,
     prefix: &str,
 ) -> Result<(), LlmError> {

@@ -74,6 +74,7 @@ use axum::{
 use runtime_auth::{AuthRequestContext, layer::http::AuthLayer};
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
@@ -494,6 +495,10 @@ pub(crate) fn routes(
     authenticated_router =
         authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
 
+    // Decode request bodies before applying the existing size limit so clients can use standard
+    // HTTP compression without allowing an expanded body to exceed the request limit.
+    authenticated_router = authenticated_router.route_layer(RequestDecompressionLayer::new());
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
         tracing::info!("Enabled API key authentication on HTTP routes");
@@ -750,4 +755,54 @@ async fn require_auth_configured(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use http::header::CONTENT_ENCODING;
+    use tower::ServiceExt;
+
+    fn compressed_body_router(limit: usize) -> Router {
+        Router::new()
+            .route(
+                "/",
+                post(|body: Bytes| async move { body.len().to_string() }),
+            )
+            .route_layer(RequestBodyLimitLayer::new(limit))
+            .route_layer(RequestDecompressionLayer::new())
+    }
+
+    #[tokio::test]
+    async fn request_decompression_enforces_the_expanded_body_limit() {
+        // gzip-compressed 128-byte `x` payload.
+        let compressed = STANDARD
+            .decode("H4sIAAAAAAAAE6uoGFgAADeK4KyAAAAA")
+            .expect("embedded gzip fixture should decode");
+        assert!(compressed.len() < 64, "test payload should compress well");
+
+        let accepted = compressed_body_router(256)
+            .oneshot(
+                Request::post("/")
+                    .header(CONTENT_ENCODING, "gzip")
+                    .body(Body::from(compressed.clone()))
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(accepted.status(), http::StatusCode::OK);
+
+        let rejected = compressed_body_router(64)
+            .oneshot(
+                Request::post("/")
+                    .header(CONTENT_ENCODING, "gzip")
+                    .body(Body::from(compressed))
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(rejected.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
