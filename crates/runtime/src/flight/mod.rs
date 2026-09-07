@@ -515,9 +515,8 @@ fn flight_data_size(flight_data: &FlightData) -> usize {
 ///   2. dropping the response stream (client disconnect) aborts the encode task,
 ///      which in turn drops the upstream execution stream.
 ///
-/// Uses the same join-handle-backed approach as `RuntimeDriverStream` (execution
-/// offload); unlike that stream it polls drain-first (point 1 above) rather than
-/// observing the handle first.
+/// Uses the same join-handle-backed, drain-first approach as `RuntimeDriverStream`
+/// (execution offload).
 struct FlightEncodeStream {
     receiver: ReceiverStream<Result<FlightData, Status>>,
     encode_handle: Option<JoinHandle<()>>,

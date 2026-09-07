@@ -29,6 +29,37 @@ pub struct RunResult {
     pub outcome: ParityOutcome,
 }
 
+/// The results a lane must not accept.
+///
+/// A `Pass` needs no explanation and an `Excluded` carries its own. An
+/// `OrderUnchecked` is accepted only where the inventory names why that query's
+/// `ORDER BY` cannot be verified against its own result columns — otherwise it
+/// lands here, because an order nothing verified and nobody reviewed is exactly
+/// what the sort check was added to stop passing quietly.
+///
+/// A reviewed name does not blanket the query: it accepts an unverified order,
+/// not a violation or a content mismatch, both of which stay failures.
+#[must_use]
+pub fn unexplained<'a>(
+    results: &'a [RunResult],
+    inventory: &[InventoryEntry],
+) -> Vec<&'a RunResult> {
+    results
+        .iter()
+        .filter(|r| {
+            if r.outcome.is_pass_or_excluded() {
+                return false;
+            }
+            if !matches!(r.outcome, ParityOutcome::OrderUnchecked { .. }) {
+                return true;
+            }
+            !inventory.iter().any(|e| {
+                e.suite == r.suite && e.name == r.name && e.order_unchecked_review.is_some()
+            })
+        })
+        .collect()
+}
+
 /// Write a machine-readable + human coverage report.
 pub fn write_coverage_report(path: &Path, results: &[RunResult]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {

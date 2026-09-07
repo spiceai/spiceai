@@ -85,7 +85,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `34a465e97fb529075f953adf40bc2e02de755bec` | `spiceai` |
-| [arrow-rs](#arrow-rs) | `ccb268d61bd49a0a42ba229a2af397d78bce7beb` | `spiceai-58` |
+| [arrow-rs](#arrow-rs) | `471a7c5aebf76f8f127076d78d9d3661ebe065af` | `spiceai-58` |
 | [async-openai](#async-openai) | `6bda5533dd118afcf80aa6f5ef59ad35277627a7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -222,14 +222,16 @@ catch.
 
 Upstream [apache/arrow-rs](https://github.com/apache/arrow-rs), branch
 `spiceai-58`. The pin lives in the object-store Parquet reader
-(`parquet/src/arrow/async_reader/store.rs`) and in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers).
+(`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
+path (`parquet/src/util/push_buffers.rs` and its callers), and in
+`arrow-buffer/src/buffer/immutable.rs`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
+| `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564) | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | **GAP** — the listing/overwrite harness 412s a pinned `If-Match` before a short successful range body reaches `PushBuffers`, so that test stays green if only this patch is dropped |
 
 ## datafusion-ballista
@@ -289,7 +291,7 @@ silently disabled optimization rather than a build failure:
 |---|---|---|---|
 | DuckDB timestamp literal rendered through microseconds, not a `DOUBLE`, with DuckDB's two infinity sentinels declined (fork PR #57) | `TO_TIMESTAMP` takes a `DOUBLE`, so a timestamp count past 2^53 µs (≈ year 2255, and symmetrically before ≈ 1684) could not be represented exactly: a pushed-down filter names a neighbouring microsecond and keeps or drops the wrong row. Separately, a `TimestampMicrosecond` holding ±`i64::MAX` rendered fine, was reported pushdown-capable, and then failed the statement built from it | silent (wrong rows) | `crates/search/src/index/duckdb/sql.rs::a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation` and `::a_microsecond_count_past_the_double_bound_is_rendered_exactly`, `query_exec.rs::scan_renders_filters_against_the_whole_table_schema`, and `sql.rs::a_timestamp_duckdb_cannot_hold_is_declined_by_both_the_probe_and_the_statement`. The first and third pin the rendered microsecond count, so a revert to the `DOUBLE` form fails them; the second names a count above 2^53, which is the precision the patch exists for; the fourth names the two sentinel counts, so a revert that renders them instead of declining them fails there rather than inside a generated statement |
 | Cancel an abandoned ADBC query and release its pooled connection (fork PR #65) | Dropping the record-batch stream only detaches the `spawn_blocking` task; it stays inside `Statement::execute` until the remote query finishes on its own, and owns the pooled connection for that whole time. Repeated cancellations then exhaust the pool ([#13781](https://github.com/spiceai/spiceai/issues/13781)) | silent | `crates/data-connectors/connector-adbc/tests/adbc_cancellation.rs::dropping_the_stream_cancels_the_query_and_frees_the_pool_connection`, which fails if either this patch or the `arrow-adbc` one is missing |
-| Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | **GAP** |
+| Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | `crates/search/src/index/duckdb/sql.rs::a_date32_literal_outside_the_i32_second_range_names_the_day_it_holds` and `::a_date64_literal_is_read_as_milliseconds_not_as_days`, with `::a_date32_literal_inside_the_i32_second_range_renders_unchanged` as the control against a renderer that declines or shifts every date. The scaling the patch fixes is shared by every engine arm — only the call it is formatted into differs — so a revert fails those three whichever engine renders; `::the_sqlite_arm_renders_a_date_from_the_same_count` pins the sibling arm directly, because this repository renders through that function for DuckDB alone |
 | `DuckDBTable` carries its index list onto the `DuckSqlExec` it builds (fork PR #69) | `DuckDBIntermediateIndexMaterialization` reads that list off the exec node and returns the plan untouched when it is empty, so a DuckDB accelerator declaring `indexes` stops materializing the indexed filters into a CTE and every such query goes back to scanning the whole table. The field has twice survived a refactor that defaulted it to empty, which is why it has a row | silent (perf) | `crates/datafusion-optimizer-rules/src/physical_plan/duckdb/intermediate_index_cte.rs::tests::a_tables_indexes_reach_the_rule_through_the_exec_node`, which plans a filtered scan off a `DuckDBTable` built with an index and asserts the rule rewrites it. Needs `--features duckdb`. The neighbouring `test_rewrite_statement` passes either way — it hands `rewrite_statement` its indexes directly and never crosses the table/exec boundary the patch restores |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
 | Analyzer: recursive work tables are neutral, with dialect renderability checked before selecting a remote plan (federation PR #84) | Recursive joins split at the work table, or an unsupported dialect receives a plan it cannot execute | silent (query failure / perf) | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_federates_a_recursive_cte_and_its_remote_join`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table`. The fork also guards unsupported-dialect fallback |
@@ -522,7 +524,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -544,30 +546,28 @@ They are not equal in consequence; this is the order to close them in.
    PRs #39, #53) — a reset partition's stale status corrupts the execution graph.
 6. `snowflake-rs` chunked JSON responses and record-batch ordering.
 7. `clickhouse-rs` `Date32` range.
-8. `datafusion-table-providers` date-literal rendering (fork PR #60) — a
-   federated date filter matches the wrong rows.
-9. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
+8. `text-splitter` special-character sizing, and `docx-rs` newline placement — both
    change the text that gets embedded.
-10. `mistral.rs` `tool_calls` chat-template handling.
-11. `text-embeddings-inference` pooling and model-loading fixes — embeddings
+9. `mistral.rs` `tool_calls` chat-template handling.
+10. `text-embeddings-inference` pooling and model-loading fixes — embeddings
     differ from the reference implementation.
 
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-13. `datafusion` bloom-filter replacement readers sharing the listed object
+11. `datafusion` bloom-filter replacement readers sharing the listed object
     version — a predicate scan whose bloom-filter reader is built separately
     falls back to stale `If-Match`, so a replaced object 412s; the query retries
     or fails rather than mixing generations. The overwrite harness has no
     bloom data.
-14. `vortex` session lock re-entry in writer init (fork PR #29).
-15. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+12. `vortex` session lock re-entry in writer init (fork PR #29).
+13. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
     resilience (fork PRs #61–#63).
-16. `async-openai` null-suppression in requests.
-17. `spark-connect-rs` `http` scheme when `use_ssl` is false.
-18. `model2vec-rs` optional `config.json`.
-19. `snowflake-rs` async query response support — long-running queries time out.
-20. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
+14. `async-openai` null-suppression in requests.
+15. `spark-connect-rs` `http` scheme when `use_ssl` is false.
+16. `model2vec-rs` optional `config.json`.
+17. `snowflake-rs` async query response support — long-running queries time out.
+18. `arrow-rs` `PushBuffers::push_range` asserts instead of returning an error
     on a short read — a footer prefetch racing an in-place shrink panics the
     reader thread rather than surfacing a retriable decode error. The
     listing/overwrite harness 412s before a short successful range body
@@ -576,22 +576,22 @@ They are not equal in consequence; this is the order to close them in.
 **Wrong shape, but bounded.** Neither wrong rows nor an outage; a knob that stops
 being honoured:
 
-21. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
+19. `vortex` target file size in the sink (fork PR #33) — the plumbing is guarded,
     the sink's own honouring of `target_file_size_mb` is not, so the writer can emit
     one file per flush regardless of size.
-22. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
+20. `iceberg-rust` single-node limit application (fork PR #19) — the distributed path
     cannot silently drop the limit, the single-node scan can.
-23. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
+21. `snowflake-rs` invalid warehouse/account errors surfaced correctly — a
     misconfigured warehouse produces an opaque error instead of an actionable one.
-24. `model2vec-rs` HF cache directory read from the environment — models are
+22. `model2vec-rs` HF cache directory read from the environment — models are
     re-downloaded instead of reusing the shared cache.
-25. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
+23. `mistral.rs` `tracing_subscriber.init()` removed from the loaders — the loader
     installs a global subscriber and hijacks `spiced`'s logging.
 
 **Security posture.** No correctness effect, but a silent downgrade:
 
-26. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
-27. `graph-rs-sdk` tower middleware application.
+24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
+25. `graph-rs-sdk` tower middleware application.
 
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
@@ -599,7 +599,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-28. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
