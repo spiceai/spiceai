@@ -754,18 +754,22 @@ fn json_get_is_null_to_sql(unparser: &Unparser, args: &[Expr]) -> Result<Option<
 }
 
 /// JSON extraction from STRING can replace UTF-16 surrogate escapes with
-/// replacement characters. Text extraction also rejects containers because
-/// their original serialization is not preserved.
+/// replacement characters. An escaped U+FFFD scalar is preserved by both engines
+/// and does not imply substitution. Text extraction also rejects containers
+/// because their original serialization is not preserved.
 fn guard_json_text_escapes(
     document: ast::Expr,
     token: ast::Expr,
     container: Option<ast::Expr>,
     result: ast::Expr,
 ) -> ast::Expr {
-    let unicode_escape = ast::Expr::BinaryOp {
+    let surrogate_escape = ast::Expr::BinaryOp {
         left: Box::new(call_function(
             "REGEXP_CONTAINS",
-            vec![document, ast::Expr::Value(raw_string(r"\\u").into())],
+            vec![
+                document,
+                ast::Expr::Value(raw_string(r"\\u[dD][89a-fA-F][0-9a-fA-F]{2}").into()),
+            ],
         )),
         op: BinaryOperator::And,
         right: Box::new(call_function(
@@ -775,12 +779,12 @@ fn guard_json_text_escapes(
     };
     let unsupported = if let Some(container) = container {
         ast::Expr::BinaryOp {
-            left: Box::new(unicode_escape),
+            left: Box::new(surrogate_escape),
             op: BinaryOperator::Or,
             right: Box::new(container),
         }
     } else {
-        unicode_escape
+        surrogate_escape
     };
     case_when(
         unsupported,
