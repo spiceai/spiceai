@@ -24,6 +24,10 @@ runtime:
   task_history:
     enabled: true
     captured_context: redacted
+  query:
+    # Materialize multi-reference CTEs once on the Cayenne query path.
+    # disabled (default) | auto
+    cte_materialization: auto
   cpu:
     # How many CPUs the runtime behaves as though it has. Accepts 4, 3.5, 3500m,
     # or `auto` (the default) to detect it. Also settable via --cpu-cores or

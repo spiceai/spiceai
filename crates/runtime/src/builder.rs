@@ -749,6 +749,7 @@ impl RuntimeBuilder {
         .eager_aggregation(query.eager_aggregation)
         .eager_aggregation_min_reduction_factor(query.eager_aggregation_min_reduction_factor)
         .eager_aggregation_max_pushed_groups(query.eager_aggregation_max_pushed_groups)
+        .cte_materialization(query.cte_materialization)
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
