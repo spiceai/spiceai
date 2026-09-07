@@ -1,0 +1,7 @@
+# IBM/substrait-compliance clone (fetched at run time; not vendored).
+.ibm/
+
+# Local run output (CI uploads these as artifacts).
+results/*.json
+results/*.csv
+!results/.gitkeep

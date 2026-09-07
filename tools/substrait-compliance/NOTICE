@@ -1,0 +1,20 @@
+Apache License 2.0 — third-party notices
+========================================
+
+This harness consumes the IBM Substrait Compliance Framework
+(https://github.com/IBM/substrait-compliance) at tag v0.1.1 as an
+external test-suite source. The IBM repository is cloned at run time
+(and in CI) and is not vendored into this tree.
+
+IBM/substrait-compliance is licensed under the Apache License,
+Version 2.0. Copyright notices from that project remain with IBM and
+the Substrait Compliance contributors; see their LICENSE and NOTICE:
+
+  https://github.com/IBM/substrait-compliance/blob/v0.1.1/LICENSE
+  https://github.com/IBM/substrait-compliance/blob/v0.1.1/NOTICE
+
+The DataFusion Mode A engine in this crate is adapted from the
+examples/datafusion-rust layout on the IBM repository's `main` branch
+(which pins datafusion / datafusion-substrait 54.1). The v0.1.1 tag's
+copy of that example still pins DataFusion 35 and is not used as
+source. No IBM SDK or example source is copied into this repository.
