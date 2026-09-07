@@ -144,10 +144,10 @@ mod tests {
         );
     }
 
+    /// Regression test for #13932: `hf_token` is the documented key, shared with
+    /// the embeddings and reranker components.
     #[tokio::test]
     async fn huggingface_accepts_hf_token_and_runtime_model_type() {
-        // `hf_token` is the documented key, shared with the embeddings and
-        // reranker components. Regression test for #13932.
         let typed = huggingface::HuggingFaceModelParams::try_from_params(
             "model huggingface",
             params(&[("hf_token", "hf_abc"), ("model_type", "llama")]),
@@ -193,46 +193,41 @@ mod tests {
         assert_eq!(token.r#type, ParameterType::Runtime);
         assert!(
             specs.iter().all(|s| s.name != "token"),
-            "a component `token` spec would render as `{{prefix}}_token` in the schema"
+            "only one spec may render to the `hf_token` key"
         );
     }
 
+    /// `construct_model` and the responses API read the prefixed passthrough
+    /// overrides (`{prefix}_temperature`, `{prefix}_tools`, …) through
+    /// `get_openai_request_overrides(component, source.short_name())`, while
+    /// `try_from_params` consumes them under the struct's `prefix`. When the two
+    /// disagree, an override spelled the documented way is warned about as unknown
+    /// and one spelled the struct's way is consumed but never applied (#13932).
     #[test]
     fn model_param_prefixes_match_the_source_short_name() {
-        // `construct_model` reads the prefixed passthrough overrides
-        // (`{prefix}_temperature`, `{prefix}_tools`, …) through
-        // `get_openai_request_overrides(component, source.short_name())`, while
-        // `try_from_params` consumes them under the struct's `prefix`. When the two
-        // disagree, an override spelled the documented way is warned about as unknown
-        // and one spelled the struct's way is consumed but never applied.
-        fn struct_prefix(source: &ModelSource) -> &'static str {
-            match source {
-                ModelSource::OpenAi => openai::OpenAiModelParams::PREFIX,
-                ModelSource::Azure => azure::AzureModelParams::PREFIX,
-                ModelSource::File => file::FileModelParams::PREFIX,
-                ModelSource::Databricks => databricks::DatabricksModelParams::PREFIX,
-                ModelSource::HuggingFace => huggingface::HuggingFaceModelParams::PREFIX,
-                ModelSource::Anthropic => anthropic::AnthropicModelParams::PREFIX,
-                ModelSource::Xai => xai::XaiModelParams::PREFIX,
-                ModelSource::Bedrock => bedrock::BedrockModelParams::PREFIX,
-                ModelSource::SpiceAI => spiceai::SpiceAiModelParams::PREFIX,
-                ModelSource::Google => google::GoogleModelParams::PREFIX,
-            }
-        }
-        for source in [
-            ModelSource::OpenAi,
-            ModelSource::Azure,
-            ModelSource::File,
-            ModelSource::Databricks,
-            ModelSource::HuggingFace,
-            ModelSource::Anthropic,
-            ModelSource::Xai,
-            ModelSource::Bedrock,
-            ModelSource::SpiceAI,
-            ModelSource::Google,
+        for (source, prefix) in [
+            (ModelSource::OpenAi, openai::OpenAiModelParams::PREFIX),
+            (ModelSource::Azure, azure::AzureModelParams::PREFIX),
+            (ModelSource::File, file::FileModelParams::PREFIX),
+            (
+                ModelSource::Databricks,
+                databricks::DatabricksModelParams::PREFIX,
+            ),
+            (
+                ModelSource::HuggingFace,
+                huggingface::HuggingFaceModelParams::PREFIX,
+            ),
+            (
+                ModelSource::Anthropic,
+                anthropic::AnthropicModelParams::PREFIX,
+            ),
+            (ModelSource::Xai, xai::XaiModelParams::PREFIX),
+            (ModelSource::Bedrock, bedrock::BedrockModelParams::PREFIX),
+            (ModelSource::SpiceAI, spiceai::SpiceAiModelParams::PREFIX),
+            (ModelSource::Google, google::GoogleModelParams::PREFIX),
         ] {
             assert_eq!(
-                struct_prefix(&source),
+                prefix,
                 source.short_name(),
                 "params struct prefix for {source:?} must match the source short name"
             );

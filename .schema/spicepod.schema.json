@@ -454,7 +454,7 @@
       },
       {
         "name": "huggingface",
-        "prefix": "huggingface",
+        "prefix": "hf",
         "paramsRef": "#/$defs/HuggingfaceModelParams",
         "schemaRef": "#/$defs/HuggingfaceModel"
       },
