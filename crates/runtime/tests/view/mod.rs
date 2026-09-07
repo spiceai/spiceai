@@ -943,7 +943,7 @@ async fn accelerated_view_append_refresh_pass_through() -> Result<(), anyhow::Er
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?
                 .ok_or_else(|| anyhow::anyhow!("Failed to trigger view refresh"))?;
-            notifier.notified().await;
+            notifier.wait().await;
 
             let after_append = rt
                 .datafusion()
