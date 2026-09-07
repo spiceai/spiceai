@@ -4248,6 +4248,47 @@ impl std::fmt::Debug for CayenneTableProvider {
     }
 }
 
+/// The two resident-byte components of a table's PK caches and the slot they are
+/// published into as a sum. Every publish goes through here so the sum is read
+/// and written under one lock (see [`Self::publish_total`]); the provider hands one
+/// to each [`PkCheckoutGuard`] it opens so an abandoned window can restate the
+/// cache's true residency from wherever the guard is dropped.
+struct PkKeysetBytesPublisher {
+    single: Arc<AtomicUsize>,
+    sharded: Arc<AtomicUsize>,
+    publish_lock: Arc<ParkingMutex<()>>,
+    table_memory: Arc<CayenneMemoryAccount>,
+}
+
+impl PkKeysetBytesPublisher {
+    /// Publish the table-wide PK cache's resident bytes and refresh the sum.
+    fn publish_single(&self, bytes: usize) {
+        self.single.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    /// Publish the sharded PK cache's resident bytes and refresh the sum.
+    fn publish_sharded(&self, bytes: usize) {
+        self.sharded.store(bytes, Ordering::Relaxed);
+        self.publish_total();
+    }
+
+    fn publish_total(&self) {
+        // Read both components AND publish under one lock. The components are
+        // stored before this point, so whichever publisher holds the lock last
+        // reads every completed store and publishes the true sum; splitting the
+        // read from the publish lets a stale total land last and under-report.
+        let _guard = self.publish_lock.lock();
+        let total = self
+            .single
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sharded.load(Ordering::Relaxed));
+        // `set_keyset_bytes` also restates this table's share of the fleet
+        // ceiling, and releases it on drop.
+        self.table_memory.set_keyset_bytes(total);
+    }
+}
+
 impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
         &self.catalog
@@ -10425,7 +10466,14 @@ impl CayenneTableProvider {
     /// table and every key committed after it must still reach the restored index.
     fn take_cached_pk_index(&self) -> (Option<CachedPkIndex>, PkCheckoutGuard) {
         let mut guard = self.pk_keyset_cache.lock();
-        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending);
+        let checkout = PkCheckoutGuard::open(&self.pk_keyset_pending, {
+            let cache = Arc::clone(&self.pk_keyset_cache);
+            let publisher = self.pk_keyset_bytes_publisher();
+            move || {
+                publisher
+                    .publish_single(cache.lock().as_ref().map_or(0, CachedPkIndex::approx_bytes));
+            }
+        });
         (guard.take(), checkout)
     }
 
@@ -10491,29 +10539,28 @@ impl CayenneTableProvider {
 
     /// Publish the table-wide PK cache's resident bytes and refresh the sum.
     fn publish_single_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_single.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_single(bytes);
     }
 
     /// Publish the sharded PK cache's resident bytes and refresh the sum.
     fn publish_sharded_keyset_bytes(&self, bytes: usize) {
-        self.pk_keyset_bytes_sharded.store(bytes, Ordering::Relaxed);
-        self.publish_keyset_bytes_total();
+        self.pk_keyset_bytes_publisher().publish_sharded(bytes);
     }
 
     fn publish_keyset_bytes_total(&self) {
-        // Read both components AND publish under one lock. The components are
-        // stored before this point, so whichever publisher holds the lock last
-        // reads every completed store and publishes the true sum; splitting the
-        // read from the publish lets a stale total land last and under-report.
-        let _guard = self.pk_keyset_publish_lock.lock();
-        let total = self
-            .pk_keyset_bytes_single
-            .load(Ordering::Relaxed)
-            .saturating_add(self.pk_keyset_bytes_sharded.load(Ordering::Relaxed));
-        // `set_keyset_bytes` also restates this table's share of the fleet
-        // ceiling, and releases it on drop.
-        self.table_memory.set_keyset_bytes(total);
+        self.pk_keyset_bytes_publisher().publish_total();
+    }
+
+    /// The PK-cache byte accounting, detached from the provider so a
+    /// [`PkCheckoutGuard`] can carry it to wherever the checked-out index ends up
+    /// and republish on the abandon path (see `take_cached_pk_index`).
+    fn pk_keyset_bytes_publisher(&self) -> PkKeysetBytesPublisher {
+        PkKeysetBytesPublisher {
+            single: Arc::clone(&self.pk_keyset_bytes_single),
+            sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
+            publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
+            table_memory: Arc::clone(&self.table_memory),
+        }
     }
 
     /// Deferred cross-partition appends carry their on-conflict metadata and
@@ -12871,7 +12918,18 @@ impl CayenneTableProvider {
         // exit between here and `store_sharded_pk_index` — close it.
         let (cached, checkout) = {
             let mut guard = self.sharded_pk_keyset_cache.lock();
-            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending);
+            let checkout = PkCheckoutGuard::open(&self.sharded_pk_keyset_pending, {
+                let cache = Arc::clone(&self.sharded_pk_keyset_cache);
+                let publisher = self.pk_keyset_bytes_publisher();
+                move || {
+                    publisher.publish_sharded(
+                        cache
+                            .lock()
+                            .as_ref()
+                            .map_or(0, ShardedPkIndex::approx_bytes),
+                    );
+                }
+            });
             (guard.take(), checkout)
         };
         if let Some(cached) = cached {
@@ -59724,6 +59782,111 @@ mod tests {
                 other.is_some()
             ),
         }
+    }
+
+    /// An abandoned checkout must release the resident-byte accounting its window
+    /// grew — regression test for #13668. Keys committed while the keyset is checked
+    /// out are accounted against the published residency as they land, and only a
+    /// restore overwrites that figure; a validation that is dropped or cancelled
+    /// restores nothing, so the bytes of keys that were just discarded stayed
+    /// reserved against the table's memory account and narrowed every sibling's
+    /// keyset budget.
+    #[tokio::test]
+    async fn an_abandoned_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // A validation checks the (cold) keyset out; while its window is open a
+        // concurrent commit lands three keys, which the log holds for the replay.
+        let (cached, checkout) = provider.take_cached_pk_index();
+        assert!(cached.is_none(), "a fresh table has no cached keyset");
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+
+        let held = provider.pk_keyset_bytes_single.load(Ordering::Relaxed);
+        assert!(
+            held > 0,
+            "keys held for the replay are accounted while the window is open"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            held,
+            "the held bytes reach the table's memory account"
+        );
+
+        // The validation is dropped without storing an index back.
+        drop(checkout);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            0,
+            "an abandoned window releases the bytes of the keys it discarded"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            0,
+            "the memory account no longer carries the phantom reservation"
+        );
+    }
+
+    /// The per-shard index has the same window and the same accounting — the
+    /// sharded twin of the test above (#13668).
+    #[tokio::test]
+    async fn an_abandoned_sharded_checkout_releases_the_keyset_bytes_its_window_grew() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_sharded_checkout_abandoned_bytes",
+            ctx.runtime_env(),
+            4,
+            0,
+        )
+        .await;
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        provider.maybe_install_warm_pk_caches().await;
+
+        // An apply checks the per-shard index out; a concurrent commit lands while
+        // the window is open and is held for the replay.
+        let checked_out = provider
+            .build_sharded_pk_index(&pk_indices, &converter, 4)
+            .await
+            .expect("the warm per-shard index is checked out");
+        let before = provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed);
+        provider.record_file_pk_keys(&pk_digest_set_for_ids(&converter, &[7, 8, 9]), 11);
+        assert!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed) > before,
+            "keys held for the replay are accounted while the per-shard window is open"
+        );
+
+        // The apply is abandoned without restoring the index.
+        drop(checked_out);
+
+        assert_eq!(
+            provider.pk_keyset_bytes_sharded.load(Ordering::Relaxed),
+            0,
+            "the per-shard cell is empty after the abandon, so its published residency is zero"
+        );
+        assert_eq!(
+            provider.table_memory.snapshot().keyset,
+            provider.pk_keyset_bytes_single.load(Ordering::Relaxed),
+            "the memory account carries only the table-wide keyset's bytes"
+        );
     }
 
     /// The table-wide keyset has the same window and the same latch — regression
