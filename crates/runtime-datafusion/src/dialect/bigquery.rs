@@ -1825,22 +1825,12 @@ mod tests {
         }
     }
 
-    /// A recursive CTE behind a derived table opens the statement, on the plan
-    /// the runtime actually unparses.
+    /// An optimized recursive CTE behind a derived table opens the statement.
     ///
-    /// `BigQuery` accepts `WITH RECURSIVE` only at the top of a statement. Six
-    /// corpus statements join a literal generator through a derived table, and
-    /// once the CTE started federating they failed with "WITH RECURSIVE is only
-    /// allowed at the top level of the SELECT".
-    ///
-    /// This builds the plan through a `SessionContext` — from SQL, **optimized**
-    /// — rather than assembling one, and that is the whole point. The failing
-    /// arrangement (`SubqueryAlias` over a `Projection` over the
-    /// `RecursiveQuery`) is produced by the optimizer, and it routes through the
-    /// *top-level* renderer rather than the nested one. Three hand-built plans
-    /// that looked like the failing shape routed elsewhere and passed with the
-    /// fix reverted; the fork's own test cannot run the optimizer, so this is
-    /// the guard that covers it.
+    /// This covers the unparser shape produced by an optimized `SessionContext`
+    /// plan. The federation analyzer produces a different arrangement; the
+    /// real-engine harness in `test/scripts/bigquery-pushdown.sh` guards that
+    /// execution path.
     #[tokio::test]
     async fn a_recursive_cte_behind_a_derived_table_opens_the_statement() {
         use datafusion::prelude::SessionContext;
@@ -1872,7 +1862,7 @@ mod tests {
             }
         };
 
-        // The shape that failed: the generator behind a derived table.
+        // The generator is nested behind a derived table.
         let behind_derived = rendered(format!(
             "{generator}SELECT t.id FROM t JOIN (SELECT n FROM g) gg ON t.id = gg.n"
         ))

@@ -272,7 +272,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "3a9277c18631df442f1c82739180ce7226bc9422" } # branch: fix/recursive-subquery-federation-pin
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ae32853c9b122ac3e48d6fa87c740113379c0aa3" } # branch: spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
