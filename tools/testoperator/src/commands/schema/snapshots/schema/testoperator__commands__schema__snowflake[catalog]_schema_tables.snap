@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for snowflake[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| snowflake     | TPCH_SF1           | CUSTOMER     | BASE TABLE |
+| snowflake     | TPCH_SF1           | LINEITEM     | BASE TABLE |
+| snowflake     | TPCH_SF1           | NATION       | BASE TABLE |
+| snowflake     | TPCH_SF1           | ORDERS       | BASE TABLE |
+| snowflake     | TPCH_SF1           | PART         | BASE TABLE |
+| snowflake     | TPCH_SF1           | PARTSUPP     | BASE TABLE |
+| snowflake     | TPCH_SF1           | REGION       | BASE TABLE |
+| snowflake     | TPCH_SF1           | SUPPLIER     | BASE TABLE |
+| snowflake     | information_schema | columns      | VIEW       |
+| snowflake     | information_schema | df_settings  | VIEW       |
+| snowflake     | information_schema | parameters   | VIEW       |
+| snowflake     | information_schema | routines     | VIEW       |
+| snowflake     | information_schema | schemata     | VIEW       |
+| snowflake     | information_schema | tables       | VIEW       |
+| snowflake     | information_schema | views        | VIEW       |
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
++---------------+--------------------+--------------+------------+
