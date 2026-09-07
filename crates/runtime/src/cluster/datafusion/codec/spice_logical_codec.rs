@@ -110,6 +110,8 @@ impl SpiceLogicalCodec {
                     column: text_args.column,
                     limit: text_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: text_args.include_score,
+                    global_stats: text_args.global_stats,
+                    expected_generation: text_args.expected_generation,
                 }
                 .to_expr();
                 udtf.call(&exprs)
@@ -167,6 +169,10 @@ impl SpiceLogicalCodec {
                         column: args.column.clone(),
                         limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
+                        // RRF nests independent per-node searches; global BM25
+                        // statistics do not apply to its fused ranking.
+                        global_stats: None,
+                        expected_generation: None,
                     }
                     .to_expr();
                     (text_exprs, ts.rank_weight)
@@ -355,12 +361,16 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
                     column,
                     limit,
                     include_score,
+                    global_stats,
+                    expected_generation,
                 } => UdtfArgs::text_search(TextSearchArgs {
                     table: table.clone(),
                     query: query.clone(),
                     column: column.clone(),
                     limit: limit.map(|l| l as u64),
                     include_score: *include_score,
+                    global_stats: global_stats.clone(),
+                    expected_generation: *expected_generation,
                 }),
                 UdtfSource::VectorSearch {
                     table,

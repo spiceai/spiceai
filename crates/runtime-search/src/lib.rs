@@ -18,6 +18,7 @@ pub mod candidate;
 pub mod embeddings;
 pub mod error;
 pub mod full_text;
+pub mod full_text_stats_udtf;
 pub mod full_text_udtf;
 pub mod request;
 pub mod rerank;

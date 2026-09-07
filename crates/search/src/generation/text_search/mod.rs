@@ -40,9 +40,12 @@ use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    DocAddress, Score, Searcher, TantivyError,
+    DocAddress, Score, Searcher, TantivyError, Term,
     collector::TopDocs,
-    query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
+    query::{
+        Bm25StatisticsProvider, BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser,
+        QueryParserError,
+    },
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
@@ -57,10 +60,13 @@ pub static DEFAULT_BATCH_SIZE: usize = 100;
 /// Maximum number of results to return for a given full-text search.
 pub static DEFAULT_LIMIT_MAXIMUM: usize = 1000;
 
+pub mod bm25_stats;
 pub mod exec;
 pub mod index;
 pub mod query;
 mod util;
+
+pub use bm25_stats::{GlobalBm25Provider, GlobalBm25Stats};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -171,6 +177,12 @@ pub enum Error {
         persisted: String,
         configured: String,
     },
+
+    #[snafu(display(
+        "This partition's full text index changed while a distributed search was gathering \
+        collection statistics (generation {expected} then, {actual} now). Retry the search."
+    ))]
+    IndexGenerationChanged { expected: u64, actual: u64 },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -219,6 +231,13 @@ pub struct FullTextSearchFieldIndex {
     /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`], so source-schema type hints preserve the original Arrow types.
     /// For columns present, use the associated [`arrow::datatypes::Field`].
     type_hints: HashMap<String, Arc<arrow::datatypes::Field>>,
+
+    /// Global BM25 collection statistics to score against, gathered across the
+    /// partitions of a distributed index. When `Some`, scoring uses these
+    /// statistics instead of the local segments' statistics, so scores are
+    /// comparable across executors. When `None`, scoring uses the local
+    /// statistics (single-node, or the opt-in `scoring = local` mode).
+    global_stats: Option<Arc<GlobalBm25Stats>>,
 }
 
 impl FullTextSearchFieldIndex {
@@ -247,6 +266,7 @@ impl FullTextSearchFieldIndex {
                     false,
                 )),
             )]),
+            global_stats: None,
         };
 
         // Ensure that the index has the required primary key columns.
@@ -349,6 +369,102 @@ impl FullTextSearchFieldIndex {
         )
     }
 
+    /// The Tantivy [`Field`] of the search column, if it exists in the schema.
+    fn search_field(&self) -> Option<tantivy::schema::Field> {
+        self.reader
+            .schema()
+            .find_field(self.field.as_str())
+            .map(|(f, _)| f)
+    }
+
+    /// Score against the given global BM25 collection statistics instead of the
+    /// local segments' statistics. Used on an executor to score its partition
+    /// with statistics summed across every partition, so scores are comparable
+    /// across executors.
+    #[must_use]
+    pub fn with_global_stats(mut self, global_stats: Option<Arc<GlobalBm25Stats>>) -> Self {
+        self.global_stats = global_stats;
+        self
+    }
+
+    /// This partition's Tantivy reader generation at the moment this index was
+    /// opened (each call that opens a fresh searcher — e.g. one `text_search` or
+    /// `text_search_stats` UDTF invocation — observes the reader's current
+    /// generation; a `reload()` between two calls bumps it). A distributed
+    /// search compares this against the generation observed while gathering
+    /// statistics, to detect a commit landing between the two rounds.
+    #[must_use]
+    pub fn generation_id(&self) -> u64 {
+        self.reader.generation().generation_id()
+    }
+
+    /// Parse `query` with this index's analyzer and gather the local BM25
+    /// collection statistics for its terms: the document count `N`, the total
+    /// number of tokens in the search field, and the per-term document
+    /// frequency. The scheduler sums these across partitions into the global
+    /// statistics used for scoring.
+    ///
+    /// The terms are extracted from the parsed query, so they are tokenized and
+    /// stemmed exactly as the scored query's terms are.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query cannot be parsed or the index cannot be
+    /// read for a term's document frequency.
+    pub fn local_bm25_stats(&self, query: &str) -> Result<GlobalBm25Stats> {
+        let parser = self.query_parser();
+        let parsed = match parser.parse_query(query) {
+            Ok(parsed) => parsed,
+            Err(_) => parser
+                .build_query_from_user_input_ast(parse_query_literal(query))
+                .context(InvalidTextSearchQuerySnafu {
+                    query: query.to_string(),
+                })?,
+        };
+
+        // `query_terms` borrows from the parsed query and cannot fail or read
+        // the index, so collect the terms first, then compute each frequency.
+        let mut terms: Vec<Term> = Vec::new();
+        parsed.query_terms(&mut |term, _need_position| terms.push(term.clone()));
+
+        let search_field = self.search_field();
+        let mut doc_freq: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for term in terms {
+            // Only terms on the search field contribute to the gathered
+            // statistics; a term on another field is scored locally on the
+            // executor (its statistics are not summed).
+            if Some(term.field()) != search_field {
+                continue;
+            }
+            // Bind the term value: `as_str` borrows from it, so it must outlive
+            // the lookup below (a temporary would be dropped too early).
+            let value = term.value();
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            if doc_freq.contains_key(text) {
+                continue;
+            }
+            let df = self.reader.doc_freq(&term).context(TextSearchSnafu)?;
+            doc_freq.insert(text.to_string(), df);
+        }
+
+        let total_num_docs =
+            Bm25StatisticsProvider::total_num_docs(&self.reader).context(TextSearchSnafu)?;
+        let total_num_tokens = match search_field {
+            Some(field) => Bm25StatisticsProvider::total_num_tokens(&self.reader, field)
+                .context(TextSearchSnafu)?,
+            None => 0,
+        };
+
+        Ok(GlobalBm25Stats {
+            total_num_docs,
+            total_num_tokens,
+            doc_freq,
+        })
+    }
+
     /// Classify each pushed-down filter for [`TableProvider::supports_filters_pushdown`].
     ///
     /// Every column is classified against the underlying tantivy schema and field types, so the
@@ -439,9 +555,24 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        self.reader
-            .search(&q, &TopDocs::with_limit(limit).order_by_score())
-            .context(TextSearchSnafu)
+        let collector = TopDocs::with_limit(limit).order_by_score();
+
+        // When global statistics are present, score against them instead of the
+        // local segments' statistics, so scores are comparable across the
+        // partitions of a distributed index. The search still runs over the
+        // local segments; only the BM25 collection statistics change.
+        match self.global_stats.as_ref() {
+            Some(stats) => {
+                let field = self.search_field().ok_or_else(|| Error::TextSearchError {
+                    source: TantivyError::FieldNotFound(self.field.clone()),
+                })?;
+                let provider = GlobalBm25Provider::new(stats.as_ref(), field, &self.reader);
+                self.reader
+                    .search_with_statistics_provider(&q, &collector, &provider)
+                    .context(TextSearchSnafu)
+            }
+            None => self.reader.search(&q, &collector).context(TextSearchSnafu),
+        }
     }
 
     /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
