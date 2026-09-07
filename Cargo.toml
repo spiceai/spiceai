@@ -472,7 +472,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "3c52468
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "3c5246867e627158211e8eafab7be55b0dc559f8" } # branch: spiceai-54 (vortex 0.79.0)
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "93b75c3c7d1a812b23d00b45adf537d7a2415496" } # spiceai/spice-rs#77
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76" } # spiceai/spice-rs#85: same-origin redirect policy on the credentialed client
 
 [profile.release-lto]
 inherits = "release"
