@@ -22,17 +22,21 @@ limitations under the License.
 //! widening in place, and appends added columns at the end — accelerator engines can only
 //! `ADD COLUMN`, so the canonical order must never interleave new columns mid-schema.
 //!
-//! Both input schemas are dictionary-normalized (`Dictionary(_, v)` → `v`, recursively, via
-//! [`crate::type_rewrite::normalize_dictionary_types`]) before comparison, matching how the
-//! runtime normalizes schemas before registration; the returned
-//! [`WideningPlan::evolved_schema`] is therefore dictionary-free.
+//! Both input schemas go through [`crate::type_rewrite::normalize_for_comparison`] first, so a
+//! representation carrying no difference of its own cannot read as one: dictionary encoding is
+//! unwrapped (`Dictionary(_, v)` → `v`, recursively), matching how the runtime normalizes
+//! schemas before registration, and a `Map` declaring its `entries` field nullable — which the
+//! Arrow layout forbids and `MapArray::try_new` refuses — is brought into line. The returned
+//! [`WideningPlan::evolved_schema`] is built from those, so it is dictionary-free and carries
+//! no forbidden map declaration: what persists or installs a plan inherits both guarantees
+//! rather than re-deriving them.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 
-use crate::type_rewrite::normalize_dictionary_types;
+use crate::type_rewrite::normalize_for_comparison;
 
 /// The result of classifying an incoming schema against the current stored schema.
 #[derive(Debug)]
@@ -138,6 +142,42 @@ impl WideningPlan {
     }
 }
 
+/// `incoming` with every column of `current` that it does not name added back.
+///
+/// [`classify`] reads `incoming` as a full replacement schema, so a column it omits is a
+/// removal — and a removal is [`SchemaEvolution::Incompatible`]. A writer that builds its
+/// schema from the columns its own batch carries omits every column added since it read the
+/// schema, and would have its perfectly compatible addition refused. Restoring the current
+/// columns leaves only that writer's own additions to classify, so it evolves in one step no
+/// matter how many other writers are in flight.
+///
+/// Keeps `current`'s column order, and for a column in both keeps `incoming`'s field, so a
+/// type or nullability change is still classified.
+#[must_use]
+pub fn retain_current_columns(current: &Schema, incoming: &Schema) -> SchemaRef {
+    let mut fields: Vec<FieldRef> =
+        Vec::with_capacity(current.fields().len() + incoming.fields().len());
+    for current_field in current.fields() {
+        let field = incoming
+            .fields()
+            .iter()
+            .find(|incoming_field| incoming_field.name() == current_field.name())
+            .unwrap_or(current_field);
+        fields.push(Arc::clone(field));
+    }
+    fields.extend(
+        incoming
+            .fields()
+            .iter()
+            .filter(|incoming_field| current.field_with_name(incoming_field.name()).is_err())
+            .map(Arc::clone),
+    );
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        incoming.metadata().clone(),
+    ))
+}
+
 /// Classifies `incoming` against `current` using name-based field matching.
 ///
 /// Rules:
@@ -152,8 +192,8 @@ impl WideningPlan {
 ///   [`EvolutionContext::constraint_columns`] is [`SchemaEvolution::Incompatible`].
 #[must_use]
 pub fn classify(current: &Schema, incoming: &Schema, ctx: &EvolutionContext) -> SchemaEvolution {
-    let current = normalize_dictionary_types(current);
-    let incoming = normalize_dictionary_types(incoming);
+    let current = normalize_for_comparison(current);
+    let incoming = normalize_for_comparison(incoming);
 
     let mut incompatibilities: Vec<String> = Vec::new();
     let mut evolved_fields: Vec<FieldRef> = Vec::with_capacity(incoming.fields().len());
@@ -531,6 +571,57 @@ mod tests {
             SchemaEvolution::Incompatible { reason } => reason,
             other => panic!("expected Incompatible, got {other:?}"),
         }
+    }
+
+    /// A writer that never saw a column another writer just added must still be judged on
+    /// what it adds. Without restoring the current columns, its schema reads as removing
+    /// that column, which classifies as incompatible and refuses the addition.
+    #[test]
+    fn retain_current_columns_restores_columns_the_incoming_schema_never_saw() {
+        let current = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // Added by a concurrent writer, after the incoming schema was built.
+            Field::new("tier", DataType::Utf8, true),
+        ]);
+        let incoming = Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("region", DataType::Utf8, true),
+            // This writer's own addition.
+            Field::new("zone", DataType::Utf8, true),
+        ]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        assert_eq!(
+            merged
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["value", "region", "tier", "zone"],
+            "the current columns keep their order, and the addition goes last"
+        );
+
+        // Classifying that against the current schema is a plain addition, not a removal.
+        let evolution = classify(&current, &merged, &NO_CONSTRAINTS);
+        assert!(
+            matches!(evolution, SchemaEvolution::Widening(_)),
+            "restoring the current columns must leave only the addition, got {evolution:?}"
+        );
+    }
+
+    /// A column both schemas name keeps the incoming field, so a type change is still seen.
+    #[test]
+    fn retain_current_columns_keeps_the_incoming_field_for_a_shared_column() {
+        let current = Schema::new(vec![Field::new("n", DataType::Int32, false)]);
+        let incoming = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+
+        let merged = retain_current_columns(&current, &incoming);
+
+        let field = merged.field_with_name("n").expect("column is present");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(field.is_nullable());
     }
 
     fn assert_identical(evolution: &SchemaEvolution) {
@@ -1485,6 +1576,115 @@ mod tests {
                 plan.describe(),
                 "1 added column (c), 1 nullability relaxed (b)"
             );
+        }
+    }
+
+    /// Covers the `Map` rule of [`normalize_for_comparison`], which explains why the
+    /// declaration is normalized rather than reported. Regression tests for #13549.
+    mod map_entries {
+        use super::*;
+
+        fn map_of(entries_nullable: bool) -> DataType {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        }
+
+        fn schema_with(entries_nullable: bool) -> Schema {
+            Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("m", map_of(entries_nullable), true),
+            ])
+        }
+
+        fn entries_nullability(schema: &Schema, column: &str) -> bool {
+            match schema.field_with_name(column).expect("column").data_type() {
+                DataType::Map(entries, _) => entries.is_nullable(),
+                other => panic!("expected a Map, got {other:?}"),
+            }
+        }
+
+        /// The declaration the layout forbids is not a schema change, whichever side carries
+        /// it: a stored schema conformed on the way in is compared against a source that still
+        /// declares it the old way, and a checkpoint written before the conformance is compared
+        /// against a source that now declares it correctly.
+        #[test]
+        fn an_entries_nullability_difference_is_not_a_change() {
+            assert_identical(&classify(
+                &schema_with(false),
+                &schema_with(true),
+                &NO_CONSTRAINTS,
+            ));
+            assert_identical(&classify(
+                &schema_with(true),
+                &schema_with(false),
+                &NO_CONSTRAINTS,
+            ));
+        }
+
+        /// Whatever the plan is handed to — a metastore write, a live schema swap — must not be
+        /// able to reintroduce the forbidden declaration, so it cannot survive into the evolved
+        /// schema on either the added-column or the carried-over-column path.
+        #[test]
+        fn an_evolved_schema_never_carries_the_forbidden_declaration() {
+            let current = schema_with(true);
+            let incoming = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("m", map_of(true), true),
+                Field::new("added", map_of(true), true),
+            ]);
+            let plan = expect_widening(classify(&current, &incoming, &NO_CONSTRAINTS));
+            assert_eq!(plan.describe(), "1 added column (added)");
+            assert!(
+                !entries_nullability(&plan.evolved_schema, "added"),
+                "an added Map column must be conformed"
+            );
+            assert!(
+                !entries_nullability(&plan.evolved_schema, "m"),
+                "a carried-over Map column must be conformed too"
+            );
+        }
+
+        /// The normalization is one bit of one type node, so every real difference still
+        /// reaches the classifier: a renamed entries child is a genuine type change and must
+        /// stay `Incompatible` rather than being flattened into the pair above.
+        #[test]
+        fn a_real_difference_inside_the_entries_struct_still_refuses() {
+            let renamed = Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "m",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    Field::new("keys", DataType::Utf8, false),
+                                    Field::new("payload", DataType::Utf8, true),
+                                ]
+                                .into(),
+                            ),
+                            true,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+            ]);
+            let reason =
+                expect_incompatible(classify(&schema_with(false), &renamed, &NO_CONSTRAINTS));
+            assert!(reason.contains("`m`"), "unexpected reason: {reason}");
         }
     }
 }

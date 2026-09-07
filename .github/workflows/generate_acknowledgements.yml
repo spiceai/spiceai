@@ -41,10 +41,17 @@ jobs:
           if [[ $(git diff --exit-code acknowledgements.md) ]]; then
             git add acknowledgements.md
             git commit -m "Update acknowledgements"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
+            # Non-interactive: a credential helper on the runner can otherwise intercept
+            # this push and block on a prompt forever. See
+            # scripts/check_ci_git_push_noninteractive.py.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:acknowledgements/${GITHUB_RUN_ID}
             gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

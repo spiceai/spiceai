@@ -110,6 +110,49 @@ mod test {
         assert_eq!(both_agree("postgres:public.orders"), RefreshMode::Full);
     }
 
+    /// A `runtime.params` setting must reach the engine the registry actually holds.
+    ///
+    /// This is the whole path — the builder resolves the parameter, `register_all` hands it
+    /// to each constructor, and the engine keeps it — so it is what a defect anywhere along
+    /// it would break. Building the engine directly cannot show any of that: passing a
+    /// default config from the builder would leave every engine-side test green while
+    /// silently dropping the operator's setting.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_runtime_param_reaches_the_registered_engine() {
+        use accelerator_cayenne::CayenneAccelerator;
+        use spicepod::component::runtime::Runtime as SpicepodRuntime;
+
+        let mut spicepod_runtime = SpicepodRuntime::default();
+        spicepod_runtime
+            .params
+            .insert("cayenne_footer_cache_mb".to_string(), "777".to_string());
+
+        let rt = crate::Runtime::builder()
+            .with_runtime_config(crate::config::Config {
+                runtime: Some(spicepod_runtime),
+                ..Default::default()
+            })
+            .build()
+            .await;
+
+        let engine = rt
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::Cayenne)
+            .await
+            .expect("this build links the Cayenne engine");
+        let cayenne = engine
+            .as_any()
+            .downcast_ref::<CayenneAccelerator>()
+            .expect("the Cayenne engine is a CayenneAccelerator");
+
+        assert_eq!(
+            cayenne.footer_cache_mb(),
+            Some(777),
+            "`runtime.params.cayenne_footer_cache_mb` must reach the registered engine"
+        );
+    }
+
     /// Pins what `DataAccelerator::spicepod_write_profile` answers, because the memory and
     /// compaction budgets are computed from it: a wrong mapping would budget a pod as one
     /// shape while the table is configured as another, and both sides would still look

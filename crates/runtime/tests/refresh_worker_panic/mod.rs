@@ -38,6 +38,13 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
 
+/// Distinct, non-sequential request ids: a completion is reported under the id
+/// of the request that produced it (#13544), so a runner that echoed a
+/// constant, or the wrong one of the two in flight, would still pass with 1
+/// and 2.
+const PANICKING_REQUEST: u64 = 7;
+const SUCCEEDING_REQUEST: u64 = 11;
+
 #[derive(Debug)]
 struct PanickingOnceTableProvider {
     inner: Arc<MemTable>,
@@ -166,12 +173,20 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
     let (start_refresh, mut on_refresh_complete) =
         runner.start().expect("Should start refresh task");
 
-    start_refresh.send(None).await.map_err(|e| e.to_string())?;
+    start_refresh
+        .send((PANICKING_REQUEST, None))
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let first_result = timeout(Duration::from_secs(10), on_refresh_complete.recv())
+    let (first_id, first_result) = timeout(Duration::from_secs(10), on_refresh_complete.recv())
         .await
         .map_err(|_| "timed out waiting for panic result".to_string())?
         .ok_or_else(|| "refresh worker channel closed unexpectedly".to_string())?;
+
+    assert_eq!(
+        first_id, PANICKING_REQUEST,
+        "a panicking refresh must still be reported under the request that started it"
+    );
 
     match first_result {
         Ok(()) => return Err("expected panic error from first refresh".to_string()),
@@ -188,12 +203,20 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
         Err(other) => return Err(format!("unexpected error from first refresh: {other}")),
     }
 
-    start_refresh.send(None).await.map_err(|e| e.to_string())?;
+    start_refresh
+        .send((SUCCEEDING_REQUEST, None))
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let second_result = timeout(Duration::from_secs(10), on_refresh_complete.recv())
+    let (second_id, second_result) = timeout(Duration::from_secs(10), on_refresh_complete.recv())
         .await
         .map_err(|_| "timed out waiting for successful refresh".to_string())?
         .ok_or_else(|| "refresh worker channel closed unexpectedly".to_string())?;
+
+    assert_eq!(
+        second_id, SUCCEEDING_REQUEST,
+        "the second completion must be reported under the second request, not the first"
+    );
 
     second_result.map_err(|e| format!("second refresh returned error: {e}"))?;
 

@@ -17,8 +17,9 @@ limitations under the License.
 use data_connector_api::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
+use crate::identity::{identity_unnest, push_identity_fields};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use connector_graphql::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use connector_graphql::graphql::{ErrorChecker, GraphQLContext};
 use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::sync::Arc;
@@ -200,14 +201,14 @@ impl GitHubTableArgs for ProjectsTableArgs {
         GitHubTableGraphQLParams::new(
             query.into(),
             None,
-            UnnestBehavior::Depth(2),
-            Some(gql_schema()),
+            identity_unnest(2, self.owner.clone(), self.repo.clone()),
+            Some(gql_schema(self.repo.is_some())),
         )
     }
 }
 
-fn gql_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
+fn gql_schema(repo_scoped: bool) -> SchemaRef {
+    let mut fields = vec![
         Field::new("id", DataType::Utf8, true),
         Field::new("number", DataType::Int64, true),
         Field::new("title", DataType::Utf8, true),
@@ -232,15 +233,23 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
         Field::new("creator", DataType::Utf8, true),
-    ]))
+    ];
+
+    // A repository-scoped projects dataset carries `repo`; an organization-scoped
+    // one carries only `owner`.
+    push_identity_fields(&mut fields, repo_scoped);
+
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use app::AppBuilder;
+    use connector_graphql::graphql::client::UnnestBehavior;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
+    use serde_json::json;
 
     fn create_mock_component(name: &str) -> ConnectorComponent {
         let app = AppBuilder::new("test").build();
@@ -258,10 +267,18 @@ mod tests {
 
     #[test]
     fn test_projects_schema() {
-        let schema = gql_schema();
+        let schema = gql_schema(true);
 
-        // Verify all expected fields are present with correct types
-        assert_eq!(schema.fields().len(), 12);
+        // Verify all expected fields are present with correct types, plus the
+        // `owner` / `repo` identity columns.
+        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.field(12).name(), "owner");
+        assert_eq!(schema.field(13).name(), "repo");
+
+        // An organization-scoped projects dataset has no repository to name.
+        let org_schema = gql_schema(false);
+        assert_eq!(org_schema.fields().len(), 13);
+        assert_eq!(org_schema.field(12).name(), "owner");
 
         // Check critical fields
         assert_eq!(schema.field(0).name(), "id");
@@ -366,14 +383,44 @@ mod tests {
 
         // Verify GraphQL parameters are set correctly
         assert!(graphql_params.json_pointer.is_none());
-        assert!(matches!(
-            graphql_params.unnest_behavior,
-            UnnestBehavior::Depth(2)
-        ));
         assert!(graphql_params.schema.is_some());
 
-        // Verify the schema matches what we expect
+        // Verify the schema matches what we expect, including the `owner` /
+        // `repo` identity columns the custom unnest stamps onto each row.
         let schema = graphql_params.schema.expect("schema should be present");
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 14);
+
+        let UnnestBehavior::Custom(unnest) = &graphql_params.unnest_behavior else {
+            panic!("projects must stamp identity with a custom unnest");
+        };
+        let rows = unnest(&json!({
+            "id": "PVT_1",
+            "title": "Roadmap",
+            "creator": {"creator": "lukekim"}
+        }))
+        .expect("unnest to succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["creator"], json!("lukekim"));
+        assert_eq!(rows[0]["owner"], json!("spiceai"));
+        assert_eq!(rows[0]["repo"], json!("spiceai"));
+    }
+
+    #[test]
+    fn test_projects_org_scope_carries_only_owner() {
+        let args = ProjectsTableArgs {
+            owner: "spiceai".to_string(),
+            repo: None,
+            component: create_mock_component("github.com/spiceai/projects"),
+        };
+
+        let graphql_params = args.get_graphql_values();
+        let UnnestBehavior::Custom(unnest) = &graphql_params.unnest_behavior else {
+            panic!("projects must stamp identity with a custom unnest");
+        };
+        let rows = unnest(&json!({"id": "PVT_1", "title": "Roadmap"})).expect("unnest to succeed");
+
+        assert_eq!(rows[0]["owner"], json!("spiceai"));
+        assert!(rows[0].get("repo").is_none());
     }
 }

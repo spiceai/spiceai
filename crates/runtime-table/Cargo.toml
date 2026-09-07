@@ -78,6 +78,7 @@ insta.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
 prometheus.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

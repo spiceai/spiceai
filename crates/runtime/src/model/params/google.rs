@@ -17,7 +17,8 @@ limitations under the License.
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
-/// Parameters for `from: google` chat models.
+/// Parameters for `from: google` chat models. Authenticates via Vertex AI (GCP
+/// project/region-scoped, service-account auth).
 #[derive(TypedParams)]
 #[params(
     prefix = "google",
@@ -25,6 +26,17 @@ use secrecy::SecretString;
     emit_specs
 )]
 pub struct GoogleModelParams {
-    /// The Google Generative AI API key.
-    pub api_key: Option<SecretString>,
+    /// The GCP project ID.
+    pub project: Option<String>,
+    /// The GCP region, e.g. `us-central1`, or `global`.
+    pub location: Option<String>,
+    /// Path to a GCP service account JSON key file. One of `google_service_account_path`,
+    /// `google_service_account_key`, or `google_application_default_credentials` is required.
+    pub service_account_path: Option<String>,
+    /// GCP service account JSON key as a string.
+    #[param(autoload_secret)]
+    pub service_account_key: Option<SecretString>,
+    /// Use Google Application Default Credentials for authentication. If the
+    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, uses that path.
+    pub application_default_credentials: Option<bool>,
 }

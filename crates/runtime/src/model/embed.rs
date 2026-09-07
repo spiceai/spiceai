@@ -176,7 +176,7 @@ pub async fn try_to_embedding(
             )
             .await
             .map_err(params_err)?;
-            google(model_id, &typed, embeddings_cache.clone())
+            google(model_id, &typed, embeddings_cache.clone()).await
         }
         EmbeddingPrefix::Databricks => {
             let typed = embedding_params::databricks::DatabricksEmbeddingParams::try_from_params(
@@ -281,7 +281,7 @@ fn model2vec(
     })
 }
 
-fn google(
+async fn google(
     model_id: Option<String>,
     params: &embedding_params::google::GoogleEmbeddingParams,
     embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -291,17 +291,26 @@ fn google(
             model_source: "google".to_string(),
         });
     };
-    let google = llms::google::Google::new_embeddings(
-        &params.api_key,
-        &model_id,
-        params.dimensions,
-        embeddings_cache,
+
+    let client = llms::google::auth::build_client(
+        llms::google::auth::VertexAuthParams {
+            project: params.project.as_deref(),
+            location: params.location.as_deref(),
+            service_account_path: params.service_account_path.as_deref(),
+            service_account_key: params.service_account_key.as_ref(),
+            application_default_credentials: params
+                .application_default_credentials
+                .unwrap_or(false),
+        },
+        "embeddings.params",
     )
+    .await
     .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
-        source: Box::new(std::io::Error::other(format!(
-            "Failed to create Google embeddings client: {e}"
-        ))),
+        source: Box::new(std::io::Error::other(e.to_string())),
     })?;
+
+    let google = llms::google::Google::from_client(client, model_id)
+        .into_embeddings(params.dimensions, embeddings_cache);
 
     Ok(Arc::new(google) as Arc<dyn Embed>)
 }

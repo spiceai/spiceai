@@ -16,14 +16,17 @@
 //! actual returned batches with the shipped validation path.
 //!
 //! Callers (integration tests) must not re-implement comparison or eyeball
-//! logs. The only content check is
-//! [`test_framework::queries::validation::compare_query_result_batches`] via
-//! [`super::compare_results`].
+//! logs. The only check is
+//! [`test_framework::queries::validation::compare_query_result_batches_with_sort_check`]
+//! via [`super::compare_results`], which compares content *and* verifies each
+//! side honors the query's own `ORDER BY`.
 
 use arrow::array::RecordBatch;
 use test_framework::queries::Query;
 
-use super::{CayenneHarness, ParityOutcome, compare_results};
+use super::{
+    CayenneHarness, ComparedResults, ParityOutcome, compare_results, compare_results_detailed,
+};
 
 /// Execute `sql` on Cayenne and return the collected result batches.
 pub async fn execute_cayenne(
@@ -43,6 +46,17 @@ pub fn compare_actual_results(
     right: &[RecordBatch],
 ) -> ParityOutcome {
     compare_results(query, left, right)
+}
+
+/// [`compare_actual_results`] keeping the typed reason and the coverage holes,
+/// so a caller can branch on the kind of failure without parsing its rendered
+/// detail, and cannot lose an unverified order while recovering from one.
+pub fn compare_actual_results_detailed(
+    query: &Query,
+    left: &[RecordBatch],
+    right: &[RecordBatch],
+) -> ComparedResults {
+    compare_results_detailed(query, left, right)
 }
 
 /// Run `sql` on Cayenne and on a reference batch producer, then compare.

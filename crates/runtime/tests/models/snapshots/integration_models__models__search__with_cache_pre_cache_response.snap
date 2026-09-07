@@ -6,7 +6,7 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.94",
+      "_score": "0.63",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -18,79 +18,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.93",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Close customers might struggle away different memb"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 15
-      }
-    },
-    {
-      "_score": "0.93",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Earlier different differences get just to a methods; masses includ"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 3
-      }
-    },
-    {
-      "_score": "0.92",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Years must understand. Well fat thousands take. Good police l"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 7
-      }
-    },
-    {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Human, successive tears highlight also as radical produ"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 10
-      }
-    },
-    {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Even democratic stairs would know happy investigations. Histo"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 2
-      }
-    },
-    {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Practical schools might put twice interested, strong organizations. Regulatory,"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 17
-      }
-    },
-    {
-      "_score": "0.90",
+      "_score": "0.62",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -102,55 +30,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Good questions borrow only base children. Remarkably present e"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 19
-      }
-    },
-    {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Necessary, major terms give still now joint thoughts. Only considerable women"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 14
-      }
-    },
-    {
-      "_score": "0.89",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Absolute, early papers spare. Independent services need. About extreme women u"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 18
-      }
-    },
-    {
-      "_score": "0.89",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 11
-      }
-    },
-    {
-      "_score": "0.89",
+      "_score": "0.60",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -162,19 +42,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.88",
-      "dataset": "spice.public.cached_search",
-      "matches": {
-        "cp_description": [
-          "Times could not address disabled indians. Effectively public ports c"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 12
-      }
-    },
-    {
-      "_score": "0.87",
+      "_score": "0.60",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -186,31 +54,103 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.87",
+      "_score": "0.59",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Narrowly great dogs carry only by the events. Successful, able legs would not"
+          "Absolute, early papers spare. Independent services need. About extreme women u"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 5
+        "cp_catalog_page_sk": 18
       }
     },
     {
-      "_score": "0.86",
+      "_score": "0.58",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "So appropriate hopes cannot constitute with a shapes. Investors know therefor"
+          "Necessary, major terms give still now joint thoughts. Only considerable women"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 9
+        "cp_catalog_page_sk": 14
       }
     },
     {
-      "_score": "0.84",
+      "_score": "0.57",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Earlier different differences get just to a methods; masses includ"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 3
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Good questions borrow only base children. Remarkably present e"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 19
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Human, successive tears highlight also as radical produ"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 10
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Close customers might struggle away different memb"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 15
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Years must understand. Well fat thousands take. Good police l"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 7
+      }
+    },
+    {
+      "_score": "0.53",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 6
+      }
+    },
+    {
+      "_score": "0.52",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -222,15 +162,75 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.82",
+      "_score": "0.52",
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
-          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+          "Narrowly great dogs carry only by the events. Successful, able legs would not"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 6
+        "cp_catalog_page_sk": 5
+      }
+    },
+    {
+      "_score": "0.51",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Programmes receive just likely, key homes. Relevant,"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 11
+      }
+    },
+    {
+      "_score": "0.51",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Even democratic stairs would know happy investigations. Histo"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      }
+    },
+    {
+      "_score": "0.51",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Practical schools might put twice interested, strong organizations. Regulatory,"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 17
+      }
+    },
+    {
+      "_score": "0.50",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "So appropriate hopes cannot constitute with a shapes. Investors know therefor"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 9
+      }
+    },
+    {
+      "_score": "0.49",
+      "dataset": "spice.public.cached_search",
+      "matches": {
+        "cp_description": [
+          "Times could not address disabled indians. Effectively public ports c"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 12
       }
     }
   ]

@@ -2,19 +2,25 @@ name: testoperator dispatch htap
 
 on:
   schedule:
-    # htap-sf1000-adaptive, every 6 hours (0000, 0600, 1200, 1800) — the high-value SF1000 adaptive
-    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners).
-    - cron: '0 */6 * * *'
-    # htap-sf1000 (other configs), once daily (0100) — the remaining SF1000 configs
-    # (adaptive-turso, duckdb baseline) on the xlarge pool.
-    - cron: '0 1 * * *'
+    # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
+    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners). 8h is the tightest
+    # cadence that still fits the serialized SF1000 xlarge queue in a day at a 30-minute HTAP
+    # window (16 runs/day across adaptive + daily + cold batches, ~20h occupancy with slack
+    # for slow/cold/mysql arms).
+    - cron: '0 */8 * * *'
+    # htap-sf1000 (other configs), once daily (0400) — the remaining SF1000 configs
+    # (adaptive-turso, duckdb baseline) on the xlarge pool. 0400 sits after the 0000 adaptive
+    # batch (~4h) so it usually starts on an idle slot rather than queueing immediately.
+    - cron: '0 4 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners),
     # including adaptive-ivm (lower rate so IVM contribution indexes stay under the safety cap).
+    # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
+    # with the SF1000 xlarge queue.
     - cron: '0 6,18 * * *'
-    # htap-sf1000-cold, once daily (0800) — HTAP CH-benCHmark SF1000 adaptive cold-object-store tier
-    # (spiceai-dev-xlarge-runners). Lighter once-a-day cadence; it shares the SF1000 serialized run
-    # concurrency group, so it queues, never contends.
-    - cron: '0 8 * * *'
+    # htap-sf1000-cold, once daily (1200) — HTAP CH-benCHmark SF1000 adaptive cold-object-store
+    # tier (spiceai-dev-xlarge-runners). 1200 is between the 0800 and 1600 adaptive slots; it
+    # shares the SF1000 serialized run concurrency group, so it queues, never contends.
+    - cron: '0 12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -107,10 +113,10 @@ jobs:
           SF="${{ github.event.inputs.scale_factor }}"
           if [ -z "$SF" ]; then
             case "${{ github.event.schedule }}" in
-              '0 */6 * * *')                  SF=sf1000-adaptive ;;
-              '0 1 * * *')                    SF=sf1000 ;;
+              '0 */8 * * *')                  SF=sf1000-adaptive ;;
+              '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
-              '0 8 * * *')                    SF=sf1000-cold ;;
+              '0 12 * * *')                   SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
           fi

@@ -40,9 +40,18 @@ impl ScheduledTask for ViewRefreshTask {
             let runtime = Arc::clone(&view.runtime);
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    if let Some(completion) = completion
+                        && completion.wait().await.is_abandoned()
+                    {
+                        // The view was removed while its scheduled refresh was
+                        // in flight. As for datasets, the task acts on nothing
+                        // after the wait, so this is recorded rather than
+                        // raised.
+                        let view_name = &view.name;
+                        tracing::debug!(
+                            "{view_name} was removed before its scheduled refresh completed."
+                        );
                     }
                     Ok(())
                 }

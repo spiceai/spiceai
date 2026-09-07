@@ -22,7 +22,7 @@ use std::{
 
 use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
-    candle::util::link_files_into_tmp_dir, encode_embedding,
+    candle::util::link_files_into_tmp_dir_blocking, encode_embedding,
 };
 use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
@@ -41,7 +41,9 @@ use tei_core::{
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
+use super::util::{
+    LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
+};
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -85,7 +87,7 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files)?;
+        let model_root = link_files_into_tmp_dir_blocking(files).await?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root
@@ -149,7 +151,13 @@ impl TeiEmbed {
         max_seq_length_overwrite: Option<usize>,
         truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite)?;
+        // Reads config.json / the sentence-transformers config and parses
+        // tokenizer.json on a blocking thread (see `load_tokenization`).
+        let LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization: token,
+        } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174

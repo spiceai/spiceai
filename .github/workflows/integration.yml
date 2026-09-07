@@ -377,6 +377,7 @@ jobs:
           # new dbc instance
           NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
           NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
           NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
           NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
           NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
@@ -480,6 +481,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: steps.download_snapshots.outcome == 'success'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -794,6 +796,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always'
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

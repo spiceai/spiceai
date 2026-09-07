@@ -49,6 +49,7 @@ duckdb.workspace = true
 itertools.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
+util = { path = "../../util" }
 
 [dev-dependencies]
 # Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal

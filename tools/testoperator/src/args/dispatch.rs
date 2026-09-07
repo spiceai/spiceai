@@ -250,6 +250,10 @@ pub struct AppendArgs {
     pub with_conflict_data: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_retention_data: Option<bool>,
+    /// Verify the query results against their expected answers once the loads
+    /// finish. Defaults to on in the workflow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validate_results: Option<bool>,
 }
 
 /// Search benchmark workflow arguments, defined in the test files. Should match inputs in

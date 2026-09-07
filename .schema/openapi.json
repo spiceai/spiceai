@@ -6,7 +6,7 @@
     "license": {
       "name": ""
     },
-    "version": "2.2.0-unstable"
+    "version": "2.3.0-unstable"
   },
   "servers": [
     {
@@ -423,6 +423,89 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/datasets/{name}/cdc": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest Debezium CDC changes",
+        "description": "Push Debezium change events (JSON or Avro) directly into an accelerated\ndataset configured with `from: cdc:…` and `refresh_mode: changes`. No Kafka\nis required — use this as a Debezium Server / Embedded Engine sink.",
+        "operationId": "post_dataset_cdc",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Dataset name (must match a `from: cdc:…` dataset)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Debezium change event(s) as JSON or Avro",
+          "content": {
+            "application/avro": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            },
+            "application/json": {
+              "schema": {}
+            },
+            "application/vnd.debezium+avro": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            },
+            "application/vnd.debezium+json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changes applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CdcIngestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body or format"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "404": {
+            "description": "Dataset not registered for CDC ingest"
+          },
+          "501": {
+            "description": "CDC ingest requires the debezium feature in this build"
+          },
+          "503": {
+            "description": "Change stream stopped (dataset unloaded or reloading)"
+          },
+          "504": {
+            "description": "Timed out waiting for capacity or apply"
           }
         }
       }
@@ -2972,6 +3055,24 @@
           "name": {
             "type": "string",
             "description": "The name of the catalog"
+          }
+        }
+      },
+      "CdcIngestResponse": {
+        "type": "object",
+        "required": [
+          "applied",
+          "dataset"
+        ],
+        "properties": {
+          "applied": {
+            "type": "integer",
+            "description": "Number of change rows applied.",
+            "minimum": 0
+          },
+          "dataset": {
+            "type": "string",
+            "description": "Dataset that received the changes."
           }
         }
       },

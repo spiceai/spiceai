@@ -43,6 +43,7 @@ This section describes the guidelines for contributing code / docs to Spice.ai.
 - [Style Guide](/docs/dev/style_guide.md)
 - [Error Handling](/docs/dev/error_handling.md)
 - [Metrics Naming](/docs/dev/metrics.md)
+- [Fork Patches and Their Guards](/docs/dev/fork_patches.md) — read before moving a `spiceai/*` fork pin
 
 ### Pull Requests
 

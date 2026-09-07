@@ -29,9 +29,6 @@ pub enum Error {
     #[snafu(display("API error: {message}"))]
     ApiError { message: String, status_code: u16 },
 
-    #[snafu(display("Invalid API key"))]
-    InvalidApiKey,
-
     #[snafu(display("Model not found: {model}"))]
     ModelNotFound { model: String },
 

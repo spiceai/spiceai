@@ -846,15 +846,17 @@ pub(crate) async fn run_search(
                         });
 
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
-                        // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
+                        // Do not return error, but snapshot the real error so a future change is tracked.
                         let mut disp =
-                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
-                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                            match client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                Ok(stream) => match stream
+                                    .try_collect::<Vec<arrow::record_batch::RecordBatch>>()
+                                    .await
+                                {
                                     Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
-                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
-                                }
-                            } else {
-                                format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}"),
+                                },
+                                Err(e) => format!("Could not prepare EXPLAIN plan: {e}"),
                             };
                         disp = sanitize_cayenne_file_paths(&disp);
                         disp = replace_s3_vector_index_names(&disp);

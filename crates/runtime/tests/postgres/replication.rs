@@ -222,6 +222,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     let mut stream = start_replication_stream(input);
@@ -334,6 +335,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
     let envelope = next_envelope(&mut stream, "forced resume snapshot").await?;
@@ -397,6 +399,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
 
@@ -528,6 +531,7 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     let mut stream_a = start_replication_stream(build_input(params_a));
@@ -704,6 +708,7 @@ async fn run_wide_types_scenario(
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
     let mut stream = start_replication_stream(input);
 
@@ -933,6 +938,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
         applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
     };
 
     // Cold bootstrap, then let the caught-up source reach Ready. Committing the

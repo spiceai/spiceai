@@ -26,6 +26,7 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{Any, Command},
 };
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::dml::InsertOp;
@@ -121,6 +122,7 @@ fn resolve_table_path(path: &[String]) -> datafusion::sql::TableReference {
 }
 
 async fn decode_flight_batches(
+    table: &datafusion::sql::TableReference,
     streaming: Peekable<Streaming<FlightData>>,
 ) -> Result<
     (
@@ -166,7 +168,36 @@ async fn decode_flight_batches(
         Status::invalid_argument("DoPut stream must include at least one schema message")
     })?;
 
-    Ok((schema, batches))
+    normalize_map_entries(table, &schema, batches)
+}
+
+/// Brings a decoded `DoPut` stream in line with the Arrow map layout.
+///
+/// A client is free to declare a `MAP`'s `entries` field nullable, which the layout forbids. Such
+/// a batch decodes cleanly and then fails in whichever kernel first rebuilds the column, so it is
+/// corrected at the boundary rather than carried into the insert plan. One stream carries one
+/// schema, so what its batches need is resolved once, and the corrected schema is returned with
+/// them — it is the one they now carry.
+fn normalize_map_entries(
+    table: &datafusion::sql::TableReference,
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+    let normalizer = MapEntriesNormalizer::for_schema(schema);
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            normalizer.normalize(batch).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "Failed to read the Arrow data sent to table '{table}' ({e}), so no rows were written. \
+                     Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+                     See: https://spiceai.org/docs/api/arrow-flight-sql"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok((Arc::clone(normalizer.schema()), batches))
 }
 
 /// Cast columns in `batches` to match `target_schema` where the types differ
@@ -231,12 +262,13 @@ async fn do_put_raw(
         return Err(Status::invalid_argument("no path provided"));
     }
 
+    let table = resolve_table_path(path);
     let table_provider = ctx
-        .table_provider(resolve_table_path(path))
+        .table_provider(table.clone())
         .await
         .map_err(handle_datafusion_error)?;
 
-    let (schema, batches) = decode_flight_batches(streaming).await?;
+    let (schema, batches) = decode_flight_batches(&table, streaming).await?;
 
     // Cast batches to the table's schema for compatible type differences
     // (e.g. Timestamp(µs) incoming vs Timestamp(ns) in the table).
@@ -261,4 +293,133 @@ async fn do_put_raw(
         Box::pin(futures::stream::iter(vec![Ok(PutResult::default())]))
             as <FlightSqlService as FlightService>::DoPutStream,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_map_entries;
+
+    /// The table a `DoPut` resolved to, as `do_put_raw` would have resolved it.
+    fn test_table() -> datafusion::sql::TableReference {
+        datafusion::sql::TableReference::partial("sales", "orders")
+    }
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Schema};
+    use std::sync::Arc;
+
+    /// Builds a `MapArray` the way the Flight decoder does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a client's non-conforming
+    /// declaration survives the decode.
+    fn map_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
+        use arrow::array::{Array, ArrayData, ArrayRef, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let rows = entry_nulls
+            .as_ref()
+            .map_or(1, arrow::buffer::NullBuffer::len);
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let keys: Vec<String> = (0..rows).map(|i| format!("k{i}")).collect();
+        let values: Vec<String> = (0..rows).map(|i| format!("v{i}")).collect();
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
+        let data = ArrayData::builder(data_type.clone())
+            .len(rows)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP`'s `entries` nullable — which the
+    /// Arrow map layout forbids — is corrected before the batches reach the insert plan, and the
+    /// schema returned alongside them is the corrected one they now carry.
+    #[test]
+    fn a_nullable_entries_map_written_by_a_client_is_corrected_before_the_insert() {
+        let batch = map_batch(None);
+        let declared = batch.schema();
+
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        match schema.field(0).data_type() {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "the schema handed to the insert plan still declares nullable entries"
+            ),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+        let [normalized] = batches.as_slice() else {
+            panic!("one batch in, one batch out");
+        };
+        assert_eq!(&normalized.schema(), &schema);
+        assert_eq!(normalized.num_rows(), 1);
+    }
+
+    /// The one shape relabelling cannot fix is refused where the column can still be named, and
+    /// the refusal reaches the client as an argument error rather than an internal one.
+    #[test]
+    fn a_map_whose_entries_carry_nulls_is_refused_by_name() {
+        let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
+        let declared = batch.schema();
+
+        let status = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'m'")
+                && status.message().contains("'sales.orders'")
+                && status.message().contains("arrow-flight-sql"),
+            "the refusal must name the column and the table it was written to, and point at the docs: {}",
+            status.message()
+        );
+    }
+
+    /// A stream holding no `Map` at all is handed on untouched, under its own schema.
+    #[test]
+    fn a_stream_holding_no_map_is_handed_on_untouched() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "n",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef],
+        )
+        .expect("int batch");
+        let declared = batch.schema();
+
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect("nothing to normalize");
+        assert!(Arc::ptr_eq(&schema, &declared));
+        assert_eq!(batches.len(), 1);
+    }
 }

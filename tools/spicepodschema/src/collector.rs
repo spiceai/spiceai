@@ -152,14 +152,16 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
-        .map(|reg| {
-            let accelerator = (reg.constructor)();
-            ConnectorSchema {
+        .filter_map(|reg| {
+            // An engine that cannot be prepared has already logged why; leaving it out of
+            // the schema is better than emitting an entry with no parameters.
+            let accelerator = reg.build_with_defaults()?;
+            Some(ConnectorSchema {
                 // Use Display trait to get the string representation
                 name: reg.engine.to_string(),
                 prefix: accelerator.prefix(),
                 parameters: accelerator.parameters(),
-            }
+            })
         })
         .collect();
     accelerators.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));

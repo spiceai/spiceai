@@ -269,6 +269,33 @@ pub async fn poll_inlined_data_count_zero(
     }
 }
 
+/// Poll `catalog.get_inlined_data_stats(table_id).tombstone_entry_count` until it
+/// is at or below `limit`, or the timeout elapses; returns the last count seen.
+///
+/// The tombstone sibling of [`poll_inlined_data_count_zero`], and it races the
+/// same background task: the reclamation that drains `cayenne_inlined_delete`
+/// runs in a `tokio::spawn` scheduled from the write path.
+pub async fn poll_inlined_delete_count_at_most(
+    catalog: &Arc<CayenneCatalog>,
+    table_id: &str,
+    limit: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use cayenne::MetadataCatalog;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        let count = catalog
+            .get_inlined_data_stats(table_id)
+            .await?
+            .tombstone_entry_count;
+        if count <= limit || started.elapsed() >= TIMEOUT {
+            return Ok(count);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Read `var` as a positive scale multiplier for fuzz/stress-test depth
 /// (iteration counts, attempt counts, deadlines). Accepts fractions below 1
 /// (e.g. `0.25` for a lighter per-PR pass); a missing, non-positive, or

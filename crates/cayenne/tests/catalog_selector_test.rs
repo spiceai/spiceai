@@ -60,6 +60,7 @@ fn config_in(temp_dir: &TempDir) -> CayenneCatalogProviderConfig {
         data_dir: Some(format!("{base}/data")),
         metadata_dir: Some(format!("{base}/metadata")),
         spice_data_base_path: base,
+        catalog_name: None,
         footer_cache_mb: None,
         segment_cache_mb: None,
         target_file_size_mb: None,

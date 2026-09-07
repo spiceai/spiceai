@@ -34,7 +34,9 @@ datafusion-table-providers = { workspace = true, features = ["adbc-federation"] 
 futures.workspace = true
 parking_lot.workspace = true
 runtime-component = { path = "../../runtime-component" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 secrecy.workspace = true
 sha2.workspace = true
 snafu.workspace = true
@@ -42,8 +44,12 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-runtime = { path = "../../runtime" }
+# The cancellation guard builds an ADBC driver in-process, so it needs the raw
+# C-ABI types the driver manager dispatches through.
+adbc_ffi.workspace = true
+runtime = { path = "../../runtime", features = ["adbc"] }
 app = { path = "../../app" }
+datafusion-federation = { workspace = true }
 
 [features]
 default = []

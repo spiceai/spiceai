@@ -18,6 +18,7 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::helpers::attached_token::AttachedToken;
 use datafusion::sql::sqlparser::ast::{
     self, Array, Function, FunctionArg, FunctionArgExpr, Ident, ObjectName, ValueWithSpan,
 };
@@ -27,6 +28,225 @@ pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_matches";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
+
+/// `DuckDB`'s name for the both-ends trim `DataFusion` calls `btrim`.
+pub(crate) const TRIM_NAME: &str = "trim";
+
+/// The trim set `btrim` uses when called with one argument — see
+/// [`btrim_to_trim`] for why it has to be passed to `DuckDB` explicitly.
+const ASCII_SPACE: &str = " ";
+
+/// The name both engines give the integer-to-hex function. They disagree only
+/// on the case of the digits — see [`to_hex_to_lowercase_hex`].
+const TO_HEX_NAME: &str = "to_hex";
+
+/// `DuckDB`'s lower-casing function, applied over [`TO_HEX_NAME`] to match
+/// `DataFusion`'s lower-case hex digits.
+const LOWER_NAME: &str = "lower";
+
+/// `DuckDB`'s finite-number test, applied over `array_inner_product` to adopt
+/// the kernel's NULL-for-undefined rule — see [`inner_product_to_sql`].
+const IS_FINITE_NAME: &str = "isfinite";
+
+/// `DuckDB`'s list-mapping and element-access functions. [`finite_or_null`]
+/// screens a value through a one-element list so the value is written — and so
+/// evaluated — exactly once.
+const LIST_TRANSFORM_NAME: &str = "list_transform";
+const LIST_EXTRACT_NAME: &str = "list_extract";
+
+/// The lambda parameter [`finite_or_null`] binds the screened value to.
+const SCREENED_VALUE_PARAM: &str = "v";
+
+/// The name both engines give the SHA-256 function. They disagree on what it
+/// returns — see [`sha256_to_digest_bytes`].
+const SHA256_NAME: &str = "sha256";
+
+/// `DuckDB`'s hex-text-to-`BLOB` decoder, applied over [`SHA256_NAME`] so a
+/// federated digest comes back as the same bytes the kernel produces.
+const UNHEX_NAME: &str = "unhex";
+
+/// Renders `args` as a call to `duckdb_fn`, in the order given.
+///
+/// The caller is responsible for having already put `args` into the shape
+/// `duckdb_fn` expects — see [`btrim_to_trim`], which has to supply a trim set
+/// the `DataFusion` call left implicit. A function needing per-argument
+/// inspection or rejection wants
+/// [`DuckDBRegexpFunction::to_datafusion_function`]'s shape instead.
+fn renamed_fn_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+    duckdb_fn: &str,
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let ast_args: Vec<FunctionArg> = args
+        .iter()
+        .map(|arg| {
+            Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .try_collect()?;
+
+    Ok(Some(ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: ast_args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
+/// Converts `DataFusion`'s `btrim` into `DuckDB`'s [`TRIM_NAME`].
+///
+/// `trim` is only an alias in `DataFusion`: the function's own name is `btrim`,
+/// so that is what the unparser emits, and `DuckDB` has no function of that
+/// name. `SELECT trim(name) FROM <a DuckDB-accelerated dataset>` therefore
+/// fails with `Catalog Error: Scalar Function with name btrim does not exist!`
+/// (issue #13794).
+///
+/// **The one-argument form is not a bare rename.** `btrim(str)` strips ASCII
+/// `U+0020` and nothing else — `general_trim` calls `trim_ascii_char(s, b' ')` —
+/// whereas `DuckDB`'s one-argument `trim(str)` strips every Unicode `Zs`
+/// separator. On `U+00A0 'x' U+00A0` `DataFusion` returns the string unchanged
+/// and `DuckDB` returns `x`, so renaming it would turn a remote error into a
+/// silently different answer, which is worse. Passing the trim set explicitly
+/// as `trim(str, ' ')` puts `DuckDB` on the character-set path, where it strips
+/// exactly the characters given.
+///
+/// The two-argument form *is* a rename: both engines strip any character of the
+/// set from both ends.
+pub(crate) fn btrim_to_trim(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [input] => renamed_fn_to_sql(
+            unparser,
+            &[input.clone(), datafusion::prelude::lit(ASCII_SPACE)],
+            TRIM_NAME,
+        ),
+        [_, _] => renamed_fn_to_sql(unparser, args, TRIM_NAME),
+        // `btrim`'s signature admits one or two arguments, so the planner
+        // cannot build this. Fail rather than fall through to `Ok(None)`,
+        // which would put `btrim` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "btrim takes one or two arguments, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Renders `args` as a call to `function_name`, taking the arguments already
+/// as SQL. [`renamed_fn_to_sql`] is the equivalent for arguments that still
+/// need unparsing.
+fn call_ast_fn(function_name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            function_name,
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|arg| FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// Renders `inner` as the sole argument of a call to `function_name`.
+fn wrap_in_call(inner: ast::Expr, function_name: &str) -> ast::Expr {
+    call_ast_fn(function_name, vec![inner])
+}
+
+/// Lower-cases `DuckDB`'s `to_hex`, which upper-cases the digits `DataFusion`
+/// renders in lower case.
+///
+/// Both engines have a `to_hex`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim and came back
+/// with different characters. `to_hex(255)` is `ff` from the kernel and `FF`
+/// from `DuckDB`, so the same query over the same rows answered differently
+/// depending on whether the dataset happened to be accelerated, with no error
+/// and no warning (issue #13818). A predicate such as
+/// `WHERE to_hex(h) = 'deadbeef'` simply matched nothing.
+///
+/// Case is the *only* divergence: measured across `Int16`, `Int32` and `Int64`
+/// inputs, negative values, zero and NULL, both engines widen to 64 bits and
+/// produce the same digits in the same order, so wrapping the call in
+/// [`LOWER_NAME`] makes the two answers identical rather than merely closer.
+pub(crate) fn to_hex_to_lowercase_hex(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, TO_HEX_NAME)?
+            .map(|hex| wrap_in_call(hex, LOWER_NAME))),
+        // `to_hex` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the un-lowered `to_hex` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "to_hex takes one argument, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
+
+/// Decodes `DuckDB`'s `sha256`, which returns the digest's hex *text*, back
+/// into the 32 raw bytes `DataFusion` returns.
+///
+/// Both engines have a `sha256`, so nothing denied the call and nothing
+/// rewrote it: it was pushed into the accelerated store verbatim, and the two
+/// return different things. `DataFusion`'s `sha256` returns the 32-byte digest
+/// as `Binary`; `DuckDB`'s returns its 64-character hex rendering as
+/// `VARCHAR`. The scan then casts that text into the plan's `Binary` column,
+/// so the federated column held the *ASCII bytes of the hex string* — 64 bytes
+/// that are not the digest of anything — with no error and no warning (issue
+/// #13850). Every non-NULL row differed, in length as well as content, so
+/// anything comparing a stored digest against `sha256(col)`, deduplicating on
+/// it, or joining on it changed behaviour the moment a dataset was
+/// accelerated.
+///
+/// `unhex` reverses exactly that rendering: measured on `DuckDB` v1.4.4,
+/// `unhex(sha256(x))` is a 32-byte `BLOB` holding the same digest the kernel
+/// computes, for an ASCII string, the empty string, a non-ASCII one, and NULL
+/// (which stays NULL). It also holds for a `BLOB` argument, which is what an
+/// Arrow `Binary` column becomes: `DuckDB` hashes a `BLOB`'s raw bytes rather
+/// than a text rendering of them, so a column carrying bytes that are not
+/// valid UTF-8 hashes the same on both sides.
+///
+/// The sibling digests need no handler for the same reason they cannot produce
+/// wrong data: `md5` agrees with the kernel (both render lower-case hex text),
+/// and `DuckDB` has no `sha224`, `sha384` or `sha512` at all, so those fail
+/// loudly rather than silently — the unknown-function class tracked by #10583.
+pub(crate) fn sha256_to_digest_bytes(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    match args {
+        [_] => Ok(renamed_fn_to_sql(unparser, args, SHA256_NAME)?
+            .map(|hex_text| wrap_in_call(hex_text, UNHEX_NAME))),
+        // `sha256` is a single-argument function, so the planner cannot build
+        // this. Fail rather than fall through to `Ok(None)`, which would put
+        // the undecoded `sha256` back into the DuckDB SQL.
+        _ => Err(DataFusionError::Plan(format!(
+            "sha256 takes one argument, got {}; cannot render it as DuckDB SQL.",
+            args.len()
+        ))),
+    }
+}
 
 /// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
 /// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
@@ -126,14 +346,115 @@ pub(crate) fn cosine_distance_to_sql(
 }
 
 /// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
-/// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
-/// call to `DuckDB` (>= 1.5.3) is exact.
+/// product, `sum(a[i] * b[i])`), screened so a result that is not a finite
+/// number comes back NULL.
 /// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
+///
+/// The screen makes the two sides agree about a result that is *not a finite
+/// number*, which is the whole of what it claims. Spice's kernel treats an
+/// undefined dot product as NULL — `compute_fsl_f32` appends a null whenever
+/// the result is not finite — because `_score` is derived from it and a
+/// fabricated score outranks every real match. `array_inner_product` has no
+/// such rule and hands back the `inf` or `nan` it computed, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// instead (issue #13787). Measured on the pinned `DuckDB` 1.4.4 for a dot
+/// product that overflows `FLOAT` and for a vector carrying `nan` or an
+/// infinity; a null operand is already NULL on both sides.
+///
+/// **Finite results still differ, and this does not address that.** Both sides
+/// accumulate in `f32` but in different summation orders, so 149 of 269
+/// measured rows disagree — most by one ULP, and a cancelling case by `2.8e30`.
+/// No rewrite of the emitted SQL reconciles a summation order; issue #13893
+/// holds that question.
+///
+/// Screening the *result* rather than the inputs is what the kernel does, and
+/// for this kernel the two coincide: a non-finite element always reaches the
+/// sum (`inf * 0` is `nan`, `inf + -inf` is `nan`), so there is no input that
+/// produces a finite dot product. `Kernel::hides_non_finite_input` records the
+/// same reasoning on the Rust side, where only `Cosine` needs the input screen.
 pub(crate) fn inner_product_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_inner_product")
+    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(finite_or_null))
+}
+
+/// Wraps `value` so that a non-finite result renders as NULL, binding it to a
+/// lambda parameter so it is evaluated once:
+/// `list_extract(list_transform([<value>], v -> CASE WHEN isfinite(v) THEN v END), 1)`.
+///
+/// **The one-element list is what makes the screen sound, not decoration.** The
+/// direct spelling — `CASE WHEN isfinite(<value>) THEN <value> END` — writes
+/// `value` twice, and `DuckDB` evaluates the two occurrences independently. A
+/// volatile argument therefore draws a different number in the test than in the
+/// result, and a row whose test drew a finite value returns its non-finite one:
+/// the screen passes through exactly what it exists to stop. `rand` is in
+/// [`crate::dialect::duckdb_scalar_overrides`] and renders as `random()`, so
+/// `inner_product(make_array(rand(), …), col)` is a call this handler can be
+/// given; nothing on the unparse path gates on volatility. Raised by Copilot on
+/// PR #13895.
+///
+/// Measured on the pinned `DuckDB` 1.4.4, over 400 rows whose array argument
+/// draws `1.0` or `3e38` per evaluation against a `[3e38]` column, so every
+/// product either is finite or overflows `FLOAT`:
+///
+/// | screen | non-finite values that survived |
+/// |---|---|
+/// | `CASE WHEN isfinite(x) THEN x END` | **94 of 400** |
+/// | this one | **0 of 400** |
+///
+/// Both screens NULL all 400 when the same product is written non-volatile, so
+/// the difference is the double evaluation and nothing else.
+///
+/// The list costs little where it matters. Same engine, `ORDER BY … DESC LIMIT
+/// 10` over `array_inner_product` against the unscreened call: 1.91x on
+/// 8-element vectors (2M rows), **1.03x** on 384-element ones (200k rows). The
+/// margin collapses as the per-row vector work grows, because what the screen
+/// adds is per-row list machinery rather than a second dot product — which is
+/// also the measurement that rules out the list being materialised per element.
+fn finite_or_null(value: ast::Expr) -> ast::Expr {
+    let param = ast::Expr::Identifier(Ident::new(SCREENED_VALUE_PARAM));
+    let screen = ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![ast::CaseWhen {
+            condition: wrap_in_call(param.clone(), IS_FINITE_NAME),
+            result: param,
+        }],
+        // No ELSE: a CASE with no matching WHEN is NULL, which is the answer
+        // the kernel gives for a result that is not a finite number.
+        else_result: None,
+    };
+
+    let screened = call_ast_fn(
+        LIST_TRANSFORM_NAME,
+        vec![
+            ast::Expr::Array(Array {
+                elem: vec![value],
+                named: false,
+            }),
+            ast::Expr::Lambda(ast::LambdaFunction {
+                params: ast::OneOrManyWithParens::One(ast::LambdaFunctionParameter {
+                    name: Ident::new(SCREENED_VALUE_PARAM),
+                    data_type: None,
+                }),
+                body: Box::new(screen),
+                syntax: ast::LambdaSyntax::Arrow,
+            }),
+        ],
+    );
+
+    call_ast_fn(
+        LIST_EXTRACT_NAME,
+        vec![
+            screened,
+            ast::Expr::Value(ValueWithSpan {
+                value: sqlparser::ast::Value::Number("1".to_string(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            }),
+        ],
+    )
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -306,25 +627,6 @@ impl DuckDBRegexpFunction {
         Ok(())
     }
 
-    fn wrap_function(ast_fn: ast::Expr, function_name: &str) -> ast::Expr {
-        ast::Expr::Function(Function {
-            name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
-                function_name,
-            ))]),
-            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(ast_fn))],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: ast::FunctionArguments::None,
-            uses_odbc_syntax: false,
-        })
-    }
-
     fn postprocess_function(&self, mut ast_fn: ast::Expr) -> ast::Expr {
         match self {
             DuckDBRegexpFunction::Match => {
@@ -340,7 +642,7 @@ impl DuckDBRegexpFunction {
             }
             DuckDBRegexpFunction::Count => {
                 // Wrap the extract array in a ``len()``
-                ast_fn = Self::wrap_function(ast_fn, "len");
+                ast_fn = wrap_in_call(ast_fn, "len");
             }
             _ => {}
         }
@@ -508,7 +810,15 @@ mod tests {
     #[test]
     fn test_inner_product_to_sql_column_and_scalar() {
         // inner_product(column, [4,5,6]) must unparse to DuckDB's native
-        // array_inner_product with the ::FLOAT[N] casts the array functions need.
+        // array_inner_product with the ::FLOAT[N] casts the array functions
+        // need, wrapped in the `isfinite` screen that gives a non-finite
+        // result the NULL the kernel gives it (issue #13787).
+        //
+        // The call appears ONCE, inside a one-element list. That is what makes
+        // the screen sound against a volatile argument, which DuckDB would
+        // otherwise draw independently for the test and for the result — so a
+        // rewrite back to `CASE WHEN isfinite(<call>) THEN <call> END` must
+        // fail here rather than pass on a shorter string.
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         let args = vec![
@@ -530,9 +840,15 @@ mod tests {
         let result = inner_product_to_sql(&unparser, &args)
             .expect("should execute successfully")
             .expect("should return expression");
-        let expected =
-            r#"array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])"#;
-        assert_eq!(result.to_string(), expected);
+        let expected = r#"list_extract(list_transform([array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])], v -> CASE WHEN isfinite(v) THEN v END), 1)"#;
+        let rendered = result.to_string();
+        assert_eq!(rendered, expected);
+        assert_eq!(
+            rendered.matches("array_inner_product").count(),
+            1,
+            "the screened call must be written once, or a volatile argument is \
+             drawn twice and a non-finite result survives the screen: {rendered}"
+        );
     }
 
     #[test]
@@ -586,6 +902,175 @@ mod tests {
             .expect("should execute successfully")
             .expect("should return expression");
         assert_eq!(result.to_string(), "random()");
+    }
+
+    /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
+    /// `trim(x)` to a `btrim` call and the unparser emits the function's own
+    /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
+    ///
+    /// The one-argument call must carry the trim set: a bare `trim(x)` puts
+    /// `DuckDB` on its Unicode-`Zs` path, which `btrim` is not.
+    #[test]
+    fn btrim_unparses_to_duckdb_trim() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        for (args, expected) in [
+            (vec![column.clone()], r#"trim("t"."name", ' ')"#),
+            (vec![column, lit("xy")], r#"trim("t"."name", 'xy')"#),
+        ] {
+            let rendered = btrim_to_trim(&unparser, &args)
+                .expect("should execute successfully")
+                .expect("should return expression");
+            assert_eq!(rendered.to_string(), expected);
+        }
+    }
+
+    /// `btrim`'s own signature admits only one or two arguments, so this is a
+    /// defensive arm — but it must be an error, not `Ok(None)`, which would
+    /// hand `btrim` straight back to `DuckDB`.
+    #[test]
+    fn btrim_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = btrim_to_trim(&unparser, &[lit("a"), lit("b"), lit("c")])
+            .expect_err("three arguments cannot be rendered");
+        assert!(
+            error
+                .to_string()
+                .contains("btrim takes one or two arguments"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `btrim` call, planned from SQL and unparsed through the
+    /// dialect, so a handler that is written but never installed fails here.
+    #[test]
+    fn duckdb_dialect_installs_the_btrim_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::btrim(),
+            vec![lit("  hi  ")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("btrim unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "trim('  hi  ', ' ')");
+    }
+
+    /// Both engines have a `to_hex`, so the call federated verbatim and came
+    /// back with upper-case digits where the kernel produces lower-case ones —
+    /// a silently different answer, not an error (regression test for #13818).
+    #[test]
+    fn to_hex_unparses_to_a_lowercased_duckdb_to_hex() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "h".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = to_hex_to_lowercase_hex(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"lower(to_hex("t"."h"))"#);
+    }
+
+    /// `to_hex` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the un-lowered
+    /// `to_hex` straight back to `DuckDB`.
+    #[test]
+    fn to_hex_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = to_hex_to_lowercase_hex(&unparser, &[lit(1_i64), lit(2_i64)])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("to_hex takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `to_hex` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_to_hex_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::string::to_hex(),
+            vec![lit(255_i64)],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("to_hex unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "lower(to_hex(255))");
+    }
+
+    /// Both engines have a `sha256`, so the call federated verbatim and came
+    /// back as the digest's hex *text* where the kernel returns the digest's
+    /// 32 bytes — a silently different column, not an error (regression test
+    /// for #13850).
+    #[test]
+    fn sha256_unparses_to_a_duckdb_sha256_decoded_back_to_bytes() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let column = Expr::Column(Column {
+            relation: Some(TableReference::bare("t")),
+            name: "name".to_string(),
+            spans: Spans::new(),
+        });
+
+        let rendered = sha256_to_digest_bytes(&unparser, &[column])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(rendered.to_string(), r#"unhex(sha256("t"."name"))"#);
+    }
+
+    /// `sha256` takes exactly one argument, so this is a defensive arm — but it
+    /// must be an error, not `Ok(None)`, which would hand the undecoded
+    /// `sha256` straight back to `DuckDB`.
+    #[test]
+    fn sha256_with_an_impossible_arity_is_an_error_not_a_passthrough() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+
+        let error = sha256_to_digest_bytes(&unparser, &[lit("a"), lit("b")])
+            .expect_err("two arguments cannot be rendered");
+        assert!(
+            error.to_string().contains("sha256 takes one argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The whole `sha256` call, planned from the `DataFusion` UDF and unparsed
+    /// through the dialect, so a handler that is written but never installed
+    /// fails here rather than in a federated query.
+    #[test]
+    fn duckdb_dialect_installs_the_sha256_override() {
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+            datafusion::functions::crypto::sha256(),
+            vec![lit("alpha")],
+        ));
+
+        let rendered = unparser
+            .expr_to_sql(&call)
+            .expect("sha256 unparses for DuckDB");
+        assert_eq!(rendered.to_string(), "unhex(sha256('alpha'))");
     }
 
     #[test]

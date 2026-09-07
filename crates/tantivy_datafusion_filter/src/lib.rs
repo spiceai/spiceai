@@ -26,8 +26,9 @@ limitations under the License.
 //!
 //! It also re-exports the generic tantivy/Arrow helpers the translation relies on:
 //! [`array_to_terms`] (Arrow-array → tantivy [`tantivy::Term`] encoding, so literal encoding
-//! matches index-write encoding) and [`is_tokenized`]/[`text_tokenizer`] (tantivy text-field
-//! analysis inspection).
+//! matches index-write encoding), [`set_document_values`] (the same encoding applied directly to
+//! an inserted document, so index writes can't diverge from their own delete terms — #12235), and
+//! [`is_tokenized`]/[`text_tokenizer`] (tantivy text-field analysis inspection).
 
 mod filter;
 mod schema;
@@ -35,4 +36,4 @@ mod terms;
 
 pub use filter::{classify_filter, translate_filter};
 pub use schema::{is_tokenized, text_tokenizer};
-pub use terms::array_to_terms;
+pub use terms::{array_to_terms, set_document_values};

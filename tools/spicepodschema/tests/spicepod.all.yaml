@@ -1282,7 +1282,9 @@ models:
   - name: google_model
     from: google:gemini-1.5-pro
     params:
-      google_api_key: google-api-key
+      google_project: my-gcp-project
+      google_location: us-central1
+      google_service_account_key: '{"client_email": "spice@my-gcp-project.iam.gserviceaccount.com"}'
       tools: auto
       system_prompt: You are Gemini.
       google_temperature: '0.7'

@@ -62,6 +62,8 @@ ALLOWED: dict[str, str] = {
     "SlowProvider": "test double",
     "WriteOrderRecordingProvider": "test double",
     "DelayedNativeTableProvider": "test double",
+    "CountingAccelerator": "test double",
+    "GatedSource": "test double",
 }
 
 STRUCT = re.compile(r"(?:pub(?:\([^)]*\))? )?struct (\w+)\s*\{([^}]*)\}")
