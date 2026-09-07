@@ -3238,34 +3238,38 @@ mod function_support_tests {
         let ctx = datafusion::prelude::SessionContext::new();
         ctx.register_table("t", stub_table_provider(true, "bigquery").await)
             .expect("register the BigQuery table");
-        let plan = ctx
-            .sql(
-                "WITH RECURSIVE steps AS (\
-                 SELECT 1 AS n UNION ALL SELECT n + 1 FROM steps WHERE n < 3) \
-                 SELECT steps.n, t.val FROM steps JOIN t ON steps.n = t.id",
-            )
-            .await
-            .expect("plan the recursive join")
-            .into_optimized_plan()
-            .expect("optimize the recursive join");
-        let analyzed = federation_analyzer_rule()
-            .analyze(plan, &ConfigOptions::default())
-            .expect("federate the recursive join");
-        let LogicalPlan::Extension(extension) = &analyzed else {
-            panic!("expected the entire recursive join to federate: {analyzed:?}");
-        };
-        let federated = extension
-            .node
-            .as_any()
-            .downcast_ref::<FederatedPlanNode>()
-            .expect("a federated root");
-        let dialect = dialect_for_driver("bigquery").expect("BigQuery dialect");
-        let sql = datafusion::sql::unparser::Unparser::new(dialect.as_ref())
-            .plan_to_sql(federated.plan())
-            .expect("render the whole recursive join")
-            .to_string();
-        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
-        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        let query = "WITH RECURSIVE steps AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM steps WHERE n < 3) \
+                     SELECT steps.n, t.val FROM steps JOIN t ON steps.n = t.id";
+        for query in [
+            query.to_owned(),
+            query.replace("n < 3", "n < (SELECT MAX(id) FROM t)"),
+        ] {
+            let plan = ctx
+                .sql(&query)
+                .await
+                .expect("plan the recursive join")
+                .into_optimized_plan()
+                .expect("optimize the recursive join");
+            let analyzed = federation_analyzer_rule()
+                .analyze(plan, &ConfigOptions::default())
+                .expect("federate the recursive join");
+            let LogicalPlan::Extension(extension) = &analyzed else {
+                panic!("expected the entire recursive join to federate: {analyzed:?}");
+            };
+            let federated = extension
+                .node
+                .as_any()
+                .downcast_ref::<FederatedPlanNode>()
+                .expect("a federated root");
+            let dialect = dialect_for_driver("bigquery").expect("BigQuery dialect");
+            let sql = datafusion::sql::unparser::Unparser::new(dialect.as_ref())
+                .plan_to_sql(federated.plan())
+                .expect("render the whole recursive join")
+                .to_string();
+            assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+            assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        }
     }
 
     #[tokio::test]

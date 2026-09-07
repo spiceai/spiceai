@@ -3034,12 +3034,22 @@ mod tests {
 
     #[tokio::test]
     async fn recursive_column_list_survives_a_join_alias() -> datafusion::common::Result<()> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::record_batch::RecordBatch;
+
         let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch(
+            "join_values",
+            RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            )])?,
+        )?;
         let query = "WITH RECURSIVE day_grid(hours) AS (\
                      SELECT CAST(0 AS BIGINT) AS hours UNION ALL \
                      SELECT hours + 24 FROM day_grid WHERE hours < 72) \
                      SELECT g.hours FROM day_grid g \
-                     JOIN (VALUES (1), (2), (3)) v(value) ON g.hours = v.value * 24 \
+                     JOIN join_values v ON g.hours = v.value * 24 \
                      ORDER BY g.hours";
         let expected = ctx.sql(query).await?.collect().await?;
         let plan = ctx.sql(query).await?.into_optimized_plan()?;
