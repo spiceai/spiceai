@@ -40,6 +40,7 @@ pub(crate) mod sizing;
 pub mod utils;
 
 pub mod encoding;
+pub mod intern;
 pub mod key;
 pub mod result;
 
@@ -59,6 +60,7 @@ pub use metrics::StaleRejectionReason;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::RESPONSE_STATUS_COLUMN;
+pub use utils::batches_boundable;
 pub use utils::batches_cacheable;
 pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
@@ -449,6 +451,14 @@ impl Caching {
     /// expired entries on a cache with no `get`/`insert` traffic are only
     /// reclaimed when this runs.
     pub async fn run_pending_maintenance(&self) {
+        // The interner pools are reclaimed here rather than by the runtime,
+        // because this crate is the only thing that populates them: every value
+        // they share is held by a cache entry. A pool only reclaims a shard
+        // that interning happens to touch, so a shard that goes quiet after a
+        // burst of one-off query shapes would otherwise hold its dead rows and
+        // their capacity for the process lifetime.
+        crate::intern::sweep_all();
+
         if let Some(results) = &self.results {
             results.run_pending_tasks().await;
             // The size and item-count gauges are otherwise only refreshed when

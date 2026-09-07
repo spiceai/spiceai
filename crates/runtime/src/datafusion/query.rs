@@ -827,7 +827,7 @@ impl Query {
                         );
                         let stream = ::cache::result::query::CachedStream::new(
                             records,
-                            cached_result.schema,
+                            cached_result.schema.arc(),
                         );
                         return Ok(QueryHandle::new_with_cached_result(
                             job_id.to_string(),

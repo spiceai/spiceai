@@ -459,12 +459,12 @@ impl Query {
                 plan,
                 raw_key,
                 request_context.cache_namespace(),
-                Arc::clone(&cached_result.input_tables),
+                cached_result.input_tables.arc(),
             );
         }
 
         tracker = tracker.map(|t| {
-            t.datasets(Arc::clone(&cached_result.input_tables))
+            t.datasets(cached_result.input_tables.arc())
                 .results_cache_hit(true)
         });
 
@@ -488,7 +488,7 @@ impl Query {
             cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
         }
 
-        let record_batch_stream = CachedStream::new(records, Arc::clone(&cached_result.schema));
+        let record_batch_stream = CachedStream::new(records, cached_result.schema.arc());
 
         Ok(CacheResponse::from(
             CacheResult::Hit(QueryResult::new(
@@ -636,12 +636,40 @@ impl Query {
                 return;
             }
 
+            let cached_at = std::time::Instant::now();
+            let encoder = cache_provider.encoder();
+
+            // A separate question from the one above: the origin answered fine,
+            // but the result may hold a column the copy could not decouple from
+            // the memory its producer owns, so an entry over it could not be
+            // billed for what it keeps alive. Only a raw entry can: an encoded
+            // one keeps the serialized bytes and drops the arrays, so it pins
+            // nothing whatever they rested on. Compacting first is what lets
+            // `batches_boundable` report what the copy achieved rather than
+            // guess from the column types, and it repeats the copy the entry
+            // will store, which leaves an already-compact batch untouched.
+            let batches = if encoder.is_some() {
+                batches
+            } else {
+                let compacted: Vec<arrow::array::RecordBatch> = batches
+                    .iter()
+                    .map(arrow_tools::record_batch::compact_retained_buffers)
+                    .collect();
+                if !cache::batches_boundable(&compacted) {
+                    tracing::debug!(
+                        cache_key = cache_key_u64,
+                        "Background revalidation returned a result the cache cannot bound, preserving stale cache"
+                    );
+                    record_revalidation_outcome(RevalidationOutcome::Unboundable);
+                    return;
+                }
+                compacted
+            };
+
             // Empty (0-row) revalidation results are cached too. The schema is
             // preserved separately in `CachedQueryResult`, so an empty result
             // refreshes the entry correctly rather than leaving the previous
             // (now stale) value in place.
-            let cached_at = std::time::Instant::now();
-            let encoder = cache_provider.encoder();
 
             match cache::result::query::CachedQueryResult::from_batches(
                 batches,

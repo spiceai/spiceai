@@ -1160,6 +1160,7 @@ impl Runtime {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+
             caching.run_pending_maintenance().await;
         }
     }
@@ -1366,6 +1367,12 @@ impl Runtime {
         }
         if caching.embeddings.is_some() {
             CachedEmbeddingResult::init();
+        }
+
+        // Every value these pools share is held by a cache entry, so a runtime
+        // with no cache configured has nothing to report.
+        if caching.results.is_some() || caching.search.is_some() {
+            cache::metrics::init_interner_metrics();
         }
     }
 

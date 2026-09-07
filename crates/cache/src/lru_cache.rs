@@ -657,6 +657,12 @@ mod tests {
         .expect("Failed to create cached result")
     }
 
+    fn cache_intern_schema(
+        schema: arrow::datatypes::SchemaRef,
+    ) -> crate::intern::Interned<arrow::datatypes::Schema> {
+        crate::intern::schema::intern(schema)
+    }
+
     fn create_test_cached_search_result() -> CachedSearchResult {
         let mut results = HashMap::new();
         let record_batch = create_test_record_batch();
@@ -666,7 +672,7 @@ mod tests {
             primary_keys: Vec::new(),
             data_columns: Vec::new(),
             matches: HashMap::new(),
-            schema,
+            schema: cache_intern_schema(schema),
         };
 
         results.insert(
@@ -676,12 +682,12 @@ mod tests {
             cached_aggregation_result,
         );
 
-        CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(HashSet::from([TableReference::Bare {
+        CachedSearchResult::new(
+            Arc::new(results),
+            Arc::new(HashSet::from([TableReference::Bare {
                 table: Arc::from("test_table"),
             }])),
-        }
+        )
     }
 
     #[rstest]

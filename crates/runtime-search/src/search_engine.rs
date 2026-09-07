@@ -540,7 +540,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                         let result = AggregationResult {
                             data: Box::pin(CachedStream::new(
                                 Arc::clone(&cached_aggregation_result.records),
-                                Arc::clone(&cached_aggregation_result.schema),
+                                cached_aggregation_result.schema.arc(),
                             )),
                             primary_key: cached_aggregation_result.primary_keys.clone(),
                             data_columns: cached_aggregation_result.data_columns.clone(),
@@ -807,7 +807,12 @@ fn wrap_cache_to_result(
                 yield batch_result;
             }
 
-            if records_size < cache_max_size {
+            // The compaction above cannot decouple every shape: a dictionary
+            // below the top level has no copy at all, so an entry over it would
+            // pin the producer's allocation while being billed only for the
+            // buffers it declares. The SQL results cache declines such a result
+            // at its own admission; this one has the same budget to keep.
+            if records_size < cache_max_size && cache::batches_boundable(&records) {
                 let cached_result = CachedAggregationResult::new(
                     records,
                     cloned_primary_key,
@@ -857,10 +862,7 @@ fn wrap_cache_to_result(
 
         tracing::trace!("Caching search results for key: {}", key.as_u64());
 
-        let result = CachedSearchResult {
-            results: Arc::new(results),
-            input_tables: Arc::new(expected_keys),
-        };
+        let result = CachedSearchResult::new(Arc::new(results), Arc::new(expected_keys));
 
         if result.get_memory_size() > cache_provider.max_size() {
             tracing::trace!("Search results exceed cache size, not caching");
