@@ -36,7 +36,7 @@ use data_components::ducklake::{
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime_datafusion::dialect::{duckdb_can_translate, new_duckdb_dialect};
+use runtime_datafusion::dialect::new_duckdb_dialect;
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
 use snafu::prelude::*;
 use std::any::Any;
@@ -377,18 +377,24 @@ impl CatalogConnector for DuckLakeCatalog {
 /// functions, and `regexp_count` would be pushed down at a rendering that answers
 /// NULL where `DataFusion` answers `0` (issues #13809, #13870).
 ///
-/// The per-call gate is a separate layer from those name denials, so it composes
-/// with them rather than replacing them: those names are denied, *and* of the
-/// names that are allowed, only the calls the dialect can actually render may be
-/// federated. Without it this route keeps the defect #13900 reports — the
-/// dialect refuses a call it has no rendering for (`regexp_replace(s, p, r, 'U')`),
-/// and because federation has already committed by then, the refusal fails the
-/// whole query instead of leaving the call for `DataFusion`.
+/// The accessor also carries the per-call gate, which is a separate layer from
+/// those name denials and composes with them rather than replacing them: those
+/// names are denied, *and* of the names that are allowed, only the calls the
+/// dialect can actually render may be federated. Without it this route keeps the
+/// defect #13900 reports — the dialect refuses a call it has no rendering for
+/// (`regexp_replace(s, p, r, 'U')`), and because federation has already
+/// committed by then, the refusal fails the whole query instead of leaving the
+/// call for `DataFusion`.
+///
+/// The gate has to arrive from inside the accessor rather than being applied to
+/// its result here: `FunctionSupport::with_scalar_call_support` replaces the live
+/// user-function check that `FunctionSupportBuilder::build` installs, so a gate
+/// set at this call site would federate a function registered after this
+/// federation was built (#13726, #13868).
 fn ducklake_federation() -> DuckLakeFederation {
     DuckLakeFederation {
         dialect: new_duckdb_dialect(),
-        function_support: deny_spice_functions_for_duckdb_dialect_without_carve_out()
-            .with_scalar_call_support(Arc::new(duckdb_can_translate)),
+        function_support: deny_spice_functions_for_duckdb_dialect_without_carve_out(),
     }
 }
 

@@ -116,10 +116,18 @@ pub const DUCKDB_DENIED_BUILTINS: &[&str] = &[
 /// `DuckDB` one — which no longer renders `regexp_match` at all, so without this
 /// the call would be unparsed under its `DataFusion` name and fail remotely as
 /// an unknown function.
+///
+/// It also carries the same per-call gate [`duckdb_function_support`] does, for
+/// the same reason and by the same route: the gate belongs in
+/// [`FunctionSupportBuilder::scalar_call`] so `build` composes it with the live
+/// user-function check, because `FunctionSupport::with_scalar_call_support`
+/// would replace that check instead. Applying it after `build` at the call site
+/// is what regressed #13726/#13868 on this route.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
 }
 
@@ -244,7 +252,10 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 
 #[cfg(test)]
 mod tests {
-    use super::deny_spice_functions_for_duckdb_table_providers;
+    use super::{
+        deny_spice_functions_for_duckdb_dialect_without_carve_out,
+        deny_spice_functions_for_duckdb_table_providers,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
@@ -372,6 +383,44 @@ mod tests {
         assert!(
             !federates,
             "a user function registered after the provider was built must not be pushed into DuckDB"
+        );
+    }
+
+    /// The `DuckLake` catalog route's accessor must carry the per-call gate
+    /// itself, because its one consumer must not add one: applying a gate to
+    /// this value with `FunctionSupport::with_scalar_call_support` would replace
+    /// the live user-function check `build` installs, which is the #13726/#13868
+    /// regression. Asserting the gate is already here is what makes that call
+    /// site's setter unnecessary rather than merely discouraged.
+    ///
+    /// `regexp_replace` is the probe because no name-based layer withholds it —
+    /// it is neither a Spice function nor one of [`DUCKDB_DENIED_BUILTINS`] — so
+    /// only a per-call gate can refuse the `U` flag, which `DuckDB` has no
+    /// rendering for (#13900).
+    #[test]
+    fn the_ducklake_accessor_carries_the_per_call_gate() {
+        let support = deny_spice_functions_for_duckdb_dialect_without_carve_out();
+
+        // `contains_unsupported_functions` is true exactly when the plan holds a
+        // call the backend must not be given, so refusing is the true case.
+        assert!(
+            contains_unsupported_functions(
+                &plan_projecting(regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("U")))),
+                &support,
+            )
+            .expect("the support check must not error"),
+            "the DuckLake accessor must refuse a call the DuckDB dialect cannot render, so its \
+             call site does not have to install a gate that would discard the live \
+             user-function check"
+        );
+
+        assert!(
+            !contains_unsupported_functions(
+                &plan_projecting(regexp_replace(col("s"), lit("a"), lit("X"), None)),
+                &support,
+            )
+            .expect("the support check must not error"),
+            "the gate must not cost a pushdown DuckDB can render"
         );
     }
 }
