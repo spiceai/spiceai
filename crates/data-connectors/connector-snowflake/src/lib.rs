@@ -473,15 +473,15 @@ mod tests {
             .expect("connector-snowflake must install the Spice deny-list");
 
         assert!(
-            !function_support.supports(&stub_udf("json_get_str")),
+            !function_support.supports(&stub_udf("json_get_str"), None),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            !function_support.supports(&stub_udf("cosine_distance")),
+            !function_support.supports(&stub_udf("cosine_distance"), None),
             "cosine_distance must be denied (Snowflake does not have an exact equivalent)"
         );
         assert!(
-            function_support.supports(&stub_udf("upper")),
+            function_support.supports(&stub_udf("upper"), None),
             "non-Spice functions like upper() must still federate to Snowflake"
         );
     }
