@@ -372,7 +372,7 @@ fn ducklake_federation() -> DuckLakeFederation {
     DuckLakeFederation {
         dialect: new_duckdb_dialect(),
         function_support: deny_spice_functions_for_table_providers()
-            .with_scalar_call_support(Arc::new(duckdb_can_translate)),
+            .with_scalar_call_support(Arc::new(|call, _| duckdb_can_translate(call))),
     }
 }
 
@@ -508,17 +508,23 @@ mod federation_tests {
         let support = ducklake_federation().function_support;
 
         assert!(
-            !support.supports(&stub_udf_called_with(
-                "regexp_replace",
-                vec![col("s"), lit("a"), lit("X"), lit("U")],
-            )),
+            !support.supports(
+                &stub_udf_called_with(
+                    "regexp_replace",
+                    vec![col("s"), lit("a"), lit("X"), lit("U")],
+                ),
+                None,
+            ),
             "the `U` flag has no DuckDB rendering, so this call must stay local"
         );
         assert!(
-            support.supports(&stub_udf_called_with(
-                "regexp_replace",
-                vec![col("s"), lit("a"), lit("X"), lit("g")],
-            )),
+            support.supports(
+                &stub_udf_called_with(
+                    "regexp_replace",
+                    vec![col("s"), lit("a"), lit("X"), lit("g")],
+                ),
+                None,
+            ),
             "a renderable call must keep its pushdown"
         );
     }
