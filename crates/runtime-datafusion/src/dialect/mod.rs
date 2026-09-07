@@ -34,6 +34,7 @@ const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argum
 
 pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
+const CONCAT_NAME: &str = "concat";
 const SHA256_NAME: &str = "sha256";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
@@ -115,9 +116,11 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// would do nothing. What a built-in needs is the handler — without one the
 /// unparser emits the `DataFusion` call verbatim, and `DuckDB` either rejects
 /// the name (`btrim`) or accepts it and answers differently (`to_hex`, whose
-/// digits come back upper-case; `sha256`, which returns the digest's hex text
-/// where the kernel returns its bytes). The second is the worse of the two: it
-/// is a silently different result rather than a query error.
+/// digits come back upper-case; `concat`, which skips a NULL argument where
+/// the kernel returns NULL for the whole call; `sha256`, which returns the
+/// digest's hex text where the kernel returns its bytes). The second is the
+/// worse of the two: it is a silently different result rather than a query
+/// error.
 fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
         (
@@ -131,6 +134,14 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
             // DataFusion dialect: to_hex(int) — lower-case digits
             TO_HEX_NAME,
             Box::new(duckdb::to_hex_to_lowercase_hex) as ScalarFnToSqlHandler,
+        ),
+        (
+            // DuckDB dialect: a || b || … — NULL propagates
+            // Spice: `concat` resolves to datafusion-spark's SparkConcat,
+            // which returns NULL if any argument is NULL — unlike DuckDB's
+            // function of the same name, which skips it
+            CONCAT_NAME,
+            Box::new(duckdb::concat_to_string_concat) as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: sha256(x) — the digest's hex text, as VARCHAR
