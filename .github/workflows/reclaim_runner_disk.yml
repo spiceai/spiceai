@@ -1,113 +1,114 @@
----
 name: Reclaim Runner Disk
-
-# Takes stale build output and dead workspaces off the self-hosted runners.
-#
-# The pool's hosts are long-lived and nothing ever removed anything from them,
-# so free space only moved one way. #12794 is where that ends: two volumes below
-# the 25 GiB sign-off floor at the same time while two other hosts in the same
-# pool sat at 163 and 536 GiB, every merge-queue candidate failing its build,
-# and an operator deleting files by hand to get the queue moving again.
-#
-# The preflight checks added since (`scripts/preflight_build_disk.sh` for the
-# build path, `scripts/signoff` for the sign-off path) report a full volume at
-# the point it is detectable rather than minutes later from inside the compiler.
-# Neither reclaims anything. This is the other half.
-#
-# What it does not do is bound a single run — one host went 26 GiB to 1 GiB in
-# 6.2 hours of building, which no periodic sweep prevents. See #12800.
+run-name: PR 13905 runner disk diagnostic
 
 on:
-  schedule:
-    # Off the hour, where scheduled runs are least likely to be delayed behind
-    # the on-the-hour crowd. Six-hourly rather than daily because each run
-    # sweeps whichever instances happen to be idle, so the pool is covered by
-    # repetition rather than by any one run (see `slot` below).
-    - cron: '41 */6 * * *'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Report what would be removed without removing it'
-        type: boolean
-        default: false
-      max_age_days:
-        description: 'Leave anything modified within this many days'
-        type: string
-        default: '7'
-      free_gib:
-        description: 'Leave build output alone on a host with at least this many GiB free'
-        type: string
-        default: '100'
-
-concurrency:
-  group: ${{ github.workflow }}
-  # Queued rather than cancelled: a sweep interrupted mid-`rm` leaves a
-  # half-removed tree, and there is no hurry that would justify it.
-  cancel-in-progress: false
 
 permissions: {}
 
+concurrency:
+  group: bigquery-13905-runner01-recovery
+  cancel-in-progress: false
+
 jobs:
-  reclaim:
-    name: Reclaim (${{ matrix.pool }} slot ${{ matrix.slot }})
+  diagnose:
     strategy:
       fail-fast: false
       matrix:
-        # Both self-hosted pools. `spiceai-macos` is the one #12794 names, but
-        # `spiceai-dev-runners` hosts are equally long-lived and accumulate the
-        # same way.
-        pool: [spiceai-macos, spiceai-dev-runners]
-        # A runner instance runs one job at a time, so N concurrent jobs on one
-        # label occupy N distinct instances — which is the only way to address
-        # individual instances behind a shared label. It is coverage by
-        # repetition, not a guarantee: a busier instance is idle less often and
-        # is swept on a later run instead.
-        slot: [1, 2, 3, 4]
-    runs-on: ${{ matrix.pool }}
-    # The sweep is a bounded directory walk and some deletes. Anything past this
-    # is wedged, and a wedged job on a self-hosted pool holds a slot until
-    # GitHub's 6-hour default expires it (#12717).
-    timeout-minutes: 30
-    permissions:
-      # Reads the repository to get the script, and nothing else.
-      contents: read
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: spiceai-macos
+    timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          # `clean` defaults to true, which runs `git clean -ffdx` in this
-          # workspace before the sweep starts -- and `-x` takes the ignored
-          # `target/` with it. That is the one directory the free-space gate
-          # below exists to protect: on a host above the floor the script keeps
-          # every cache, then the checkout deletes this workspace's anyway, and
-          # the before/after report never sees it because it happened first.
-          # The script decides what comes off this volume, and nothing else.
-          clean: false
-
-      - name: Reclaim stale space
+      - name: Inspect the affected runner without checkout or cleanup
         shell: bash
-        env:
-          # Through the environment rather than interpolated into the script
-          # body, so a value carrying shell syntax cannot become shell syntax.
-          DRY_RUN_INPUT: ${{ inputs.dry_run }}
-          MAX_AGE_DAYS_INPUT: ${{ inputs.max_age_days }}
-          FREE_GIB_INPUT: ${{ inputs.free_gib }}
         run: |
-          # On a scheduled run every input is empty, so each flag is omitted and
-          # the script's own defaults apply -- including "not a dry run", which
-          # is what a sweep that reclaims nothing would quietly become.
-          args=()
-          if [ "$DRY_RUN_INPUT" = "true" ]; then
-            args+=(--dry-run)
-          fi
-          if [ -n "$MAX_AGE_DAYS_INPUT" ]; then
-            args+=(--max-age-days "$MAX_AGE_DAYS_INPUT")
-          fi
-          if [ -n "$FREE_GIB_INPUT" ]; then
-            args+=(--free-gib "$FREE_GIB_INPUT")
-          fi
+          set -euo pipefail
+          case "$RUNNER_NAME" in
+            spiceai-macos-mbp-runner-01-01|spiceai-macos-mbp-runner-01-02|spiceai-macos-mbp-runner-01-03) ;;
+            *) echo 'Outside the affected physical host; no inspection or cleanup'; exit 0 ;;
+          esac
+          python3 - <<'PYTHON'
+          import fcntl
+          import hashlib
+          import json
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
 
-          # Invoked through `bash` rather than as `./…` so the job does not
-          # depend on the executable bit surviving a checkout.
-          bash scripts/reclaim_runner_disk.sh ${args[@]+"${args[@]}"}
+          runner = os.environ['RUNNER_NAME']
+          slot = runner.rsplit('-', 1)[1]
+          instance = Path(f'/opt/github-runner-{slot}')
+          workspace = instance / '_work/spiceai'
+          repo = workspace / 'spiceai'
+          target = repo / 'target'
+          assert slot in ('01', '02', '03')
+          assert runner == f'spiceai-macos-mbp-runner-01-{slot}'
+          assert os.environ['RUNNER_WORKSPACE'] == str(workspace)
+          assert subprocess.check_output(['hostname'], text=True).strip() == 'spiceai-macos-mbp-runner-01'
+          for path in (instance, workspace, repo):
+              assert path.resolve(strict=True) == path, f'Unexpected canonical path: {path}'
+          print('IDENTITY', json.dumps({'runner': runner, 'pid': os.getpid(), 'workspace': str(workspace)}), flush=True)
+          print('DISK', json.dumps(shutil.disk_usage(workspace)._asdict()), flush=True)
+
+          listing = subprocess.check_output(['ps', '-axo', 'pid=,ppid=,etime=,comm='], text=True)
+          processes = {}
+          for line in listing.splitlines():
+              pid, parent, elapsed, command = line.strip().split(None, 3)
+              processes[int(pid)] = {'pid': int(pid), 'ppid': int(parent), 'elapsed': elapsed, 'command': command}
+              if Path(command).name in ('Runner.Worker', 'Runner.Listener', 'cargo', 'rustc', 'clippy-driver', 'clang', 'ld'):
+                  print('PROCESS', json.dumps(processes[int(pid)]), flush=True)
+          ancestor = os.getpid()
+          owner = None
+          while ancestor in processes:
+              process = processes[ancestor]
+              if Path(process['command']).name == 'Runner.Worker':
+                  owner = process
+                  break
+              ancestor = process['ppid']
+          owner_verified = bool(owner and Path(owner['command']).resolve() == (instance / 'bin/Runner.Worker').resolve())
+          print('OWNER', json.dumps({'process': owner, 'verified': owner_verified}), flush=True)
+          for name in ('Cargo.toml', 'Cargo.lock'):
+              print('SOURCE_HASH', name, hashlib.sha256((repo / name).read_bytes()).hexdigest(), flush=True)
+          if not target.exists():
+              print('TARGET_ABSENT', str(target), flush=True)
+              raise SystemExit(0)
+          assert target.resolve(strict=True) == target
+          tag = target / 'CACHEDIR.TAG'
+          print('CARGO_MARKER', tag.is_file() and 'Signature: 8a477f597d28d172789f06886806bc55' in tag.read_text(), flush=True)
+
+          for profile_name in ('debug', 'release', 'lint'):
+              profile = target / profile_name
+              if not profile.is_dir():
+                  continue
+              assert profile.resolve(strict=True) == profile
+              files = allocated = 0
+              locks = []
+              symlinks = 0
+              for base, dirs, names in os.walk(profile, followlinks=False):
+                  symlinks += sum(Path(base, name).is_symlink() for name in dirs)
+                  dirs[:] = [name for name in dirs if not Path(base, name).is_symlink()]
+                  for name in names:
+                      path = Path(base, name)
+                      metadata = path.lstat()
+                      files += 1
+                      allocated += metadata.st_blocks * 512
+                      symlinks += path.is_symlink()
+                      if name == '.cargo-lock':
+                          locks.append(path)
+              print('PROFILE', json.dumps({'path': str(profile), 'files': files, 'allocated_bytes': allocated, 'symlinks': symlinks, 'device': profile.stat().st_dev, 'inode': profile.stat().st_ino}), flush=True)
+              for lock in locks:
+                  assert not lock.is_symlink()
+                  with lock.open('rb') as handle:
+                      try:
+                          fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      except BlockingIOError:
+                          print('CARGO_LOCK_BUSY', str(lock), flush=True)
+                      else:
+                          print('CARGO_LOCK_FREE', str(lock), flush=True)
+                          fcntl.flock(handle, fcntl.LOCK_UN)
+          opened = subprocess.run(['lsof', '-nP', '+D', str(target), '-Fpcfn'], capture_output=True, text=True, timeout=90)
+          print('TARGET_OPEN_FILES', json.dumps({'returncode': opened.returncode, 'stdout': opened.stdout, 'stderr': opened.stderr}), flush=True)
+          print('DISK_AFTER_DIAGNOSTIC', json.dumps(shutil.disk_usage(workspace)._asdict()), flush=True)
+          print('READ_ONLY_DIAGNOSTIC_COMPLETE', flush=True)
+          PYTHON
