@@ -2466,8 +2466,8 @@ mod function_support_tests {
     use datafusion::datasource::{TableProvider, provider_as_source};
     use datafusion::functions::expr_fn;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, Volatility,
-        builder::LogicalTableSource, create_udf, expr::ScalarFunction,
+        ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, Volatility, create_udf,
+        expr::ScalarFunction,
     };
     use datafusion::optimizer::AnalyzerRule;
     use datafusion::prelude::{col, lit};
@@ -2718,9 +2718,8 @@ mod function_support_tests {
 
     /// A projection over a scan of the stub table, so a plan can carry an
     /// arbitrary expression through the federation `can_execute_plan` check.
-    fn scan_project(expr: Expr) -> LogicalPlan {
-        let source =
-            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+    fn scan_project(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan the stub table")
             .project(vec![expr])
@@ -2761,7 +2760,7 @@ mod function_support_tests {
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -2770,7 +2769,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to the remote ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),
@@ -2805,7 +2804,7 @@ mod function_support_tests {
             adaptor
                 .source
                 .federation_provider()
-                .analyzer(&scan_project(expr)),
+                .analyzer(&scan_project(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
     }
@@ -2886,9 +2885,8 @@ mod function_support_tests {
 
     /// `scan_project`'s aggregate twin: an aggregate belongs in an `Aggregate`
     /// node, not a projection.
-    fn scan_aggregate(expr: Expr) -> LogicalPlan {
-        let source =
-            Arc::new(LogicalTableSource::new(Arc::new(table_schema()))) as Arc<dyn TableSource>;
+    fn scan_aggregate(provider: &Arc<dyn TableProvider>, expr: Expr) -> LogicalPlan {
+        let source = provider_as_source(Arc::clone(provider));
         LogicalPlanBuilder::scan("t", source, None)
             .expect("scan the stub table")
             .aggregate(Vec::<Expr>::new(), vec![expr])
@@ -2906,7 +2904,7 @@ mod function_support_tests {
             adaptor
                 .source
                 .federation_provider()
-                .analyzer(&scan_aggregate(expr)),
+                .analyzer(&scan_aggregate(&provider, expr)),
             Some(FederationAnalyzerForLogicalPlan::With(_))
         )
     }
@@ -3002,10 +3000,11 @@ mod function_support_tests {
             "a sum ignores its ordering, so an ordered filtered sum still federates"
         );
 
-        // A *descending* ordering is refused whatever the aggregate, because the
-        // dialect tests it before either rewrite. Measured against a real
-        // project before this refusal existed, both of these federated as
-        // written and failed:
+        // A *descending* ordering is refused only for the percentile rewrites,
+        // which are rendered by ordering the group. Everything on the FILTER
+        // allowlist ignores input order, so it keeps its pushdown either way.
+        // Measured against a real project before spiceai/datafusion#219 scoped
+        // the dialect's check, both of these federated as written and failed:
         //   sum(id ORDER BY id DESC) FILTER (WHERE id > 1)
         //     -> Syntax error: Expected ")" but got "("
         //   median(id ORDER BY id DESC)
@@ -3016,9 +3015,9 @@ mod function_support_tests {
             .build()
             .expect("descending filtered sum");
         assert!(
-            !federates_aggregate("bigquery", descending_filtered_sum).await,
-            "a descending filtered sum falls back to a generic FILTER clause, \
-             which BigQuery has no syntax for"
+            federates_aggregate("bigquery", descending_filtered_sum).await,
+            "a sum ignores its ordering in either direction, so the dialect \
+             still moves the predicate inside and the pushdown is kept"
         );
 
         let descending_median = datafusion::functions_aggregate::expr_fn::median(col("id"))
@@ -3100,21 +3099,95 @@ mod function_support_tests {
         );
     }
 
+    /// A percentile in *window* position reaches `BigQuery` under its
+    /// `DataFusion` name, because the rewrite that turns it into
+    /// `PERCENTILE_CONT` lives in the dialect's aggregate handling and a window
+    /// call never reaches it.
+    ///
+    /// Measured against a real `BigQuery` project, on the build before this
+    /// check existed:
+    ///
+    /// ```text
+    /// SELECT MEDIAN(requested_amount) OVER (PARTITION BY type) FROM payments_stream
+    ///   -> Function not found: median
+    /// SELECT APPROX_PERCENTILE_CONT(requested_amount, 0.5) OVER (PARTITION BY type) …
+    ///   -> Function not found: approx_percentile_cont
+    /// SELECT type, MEDIAN(requested_amount) FROM payments_stream GROUP BY type
+    ///   -> works; the aggregate form is rewritten
+    /// ```
+    ///
+    /// The aggregate form working is what makes this easy to miss, and why the
+    /// window slot needs its own refusal rather than inheriting the aggregate's.
     #[tokio::test]
-    async fn bigquery_still_denies_the_json_functions_it_has_no_translation_for() {
+    async fn bigquery_refuses_a_percentile_in_window_position() {
+        let windowed = |udaf: Arc<datafusion::logical_expr::AggregateUDF>, args: Vec<Expr>| {
+            Expr::from(datafusion::logical_expr::expr::WindowFunction {
+                fun: datafusion::logical_expr::WindowFunctionDefinition::AggregateUDF(udaf),
+                params: datafusion::logical_expr::expr::WindowFunctionParams {
+                    args,
+                    partition_by: vec![col("val")],
+                    order_by: vec![],
+                    window_frame: datafusion::logical_expr::WindowFrame::new(None),
+                    null_treatment: None,
+                    filter: None,
+                    distinct: false,
+                },
+            })
+        };
+
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::median::median_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "a windowed median renders as `median`, which BigQuery has no function for, \
+             so it must stay local"
+        );
+        assert!(
+            !federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf(),
+                    vec![col("id"), datafusion::prelude::lit(0.5)]
+                )
+            )
+            .await,
+            "the approx_percentile_cont spelling reaches BigQuery under its own name too"
+        );
+        // The control: a window function BigQuery does have keeps its pushdown,
+        // so this refuses the percentiles rather than windows in general.
+        assert!(
+            federates_aggregate(
+                "bigquery",
+                windowed(
+                    datafusion::functions_aggregate::count::count_udaf(),
+                    vec![col("id")]
+                )
+            )
+            .await,
+            "an ordinary windowed aggregate is unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn bigquery_keeps_json_calls_local_without_a_proven_translation() {
         for name in [
             // Returns a union of every JSON scalar type, which has no SQL type
             // to unparse into.
             "json_get",
             // Returns the matched node's own bytes; JSON_QUERY re-renders it.
             "json_as_text",
-            // A JSON `null` and a missing key are indistinguishable in
-            // BigQuery, and json_contains tells them apart.
+            // The stub's bare Utf8 field does not identify native JSON versus
+            // JSON-formatted STRING, which the presence check must distinguish.
             "json_contains",
         ] {
             assert!(
                 !federates("bigquery", json_call(name, vec![lit("a")])).await,
-                "{name} has no BigQuery translation and must stay denied"
+                "{name} has no proven translation for this input and must stay local"
             );
         }
     }
@@ -3158,6 +3231,45 @@ mod function_support_tests {
 
     async fn federated_plan(predicate: Expr) -> LogicalPlan {
         federated_plan_for_driver("bigquery", predicate).await
+    }
+
+    #[tokio::test]
+    async fn bigquery_federates_a_recursive_cte_and_its_remote_join() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("t", stub_table_provider(true, "bigquery").await)
+            .expect("register the BigQuery table");
+        let query = "WITH RECURSIVE steps AS (\
+                     SELECT 1 AS n UNION ALL SELECT n + 1 FROM steps WHERE n < 3) \
+                     SELECT steps.n, t.val FROM steps JOIN t ON steps.n = t.id";
+        for query in [
+            query.to_owned(),
+            query.replace("n < 3", "n < (SELECT MAX(id) FROM t)"),
+        ] {
+            let plan = ctx
+                .sql(&query)
+                .await
+                .expect("plan the recursive join")
+                .into_optimized_plan()
+                .expect("optimize the recursive join");
+            let analyzed = federation_analyzer_rule()
+                .analyze(plan, &ConfigOptions::default())
+                .expect("federate the recursive join");
+            let LogicalPlan::Extension(extension) = &analyzed else {
+                panic!("expected the entire recursive join to federate: {analyzed:?}");
+            };
+            let federated = extension
+                .node
+                .as_any()
+                .downcast_ref::<FederatedPlanNode>()
+                .expect("a federated root");
+            let dialect = dialect_for_driver("bigquery").expect("BigQuery dialect");
+            let sql = datafusion::sql::unparser::Unparser::new(dialect.as_ref())
+                .plan_to_sql(federated.plan())
+                .expect("render the whole recursive join")
+                .to_string();
+            assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+            assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        }
     }
 
     #[tokio::test]
@@ -3373,7 +3485,7 @@ mod function_support_tests {
             .expect("a federation-enabled factory must produce a federated provider");
         let federation = adaptor.source.federation_provider();
 
-        let denied = scan_project(udf_expr("json_get_str"));
+        let denied = scan_project(&provider, udf_expr("json_get_str"));
         assert!(
             matches!(
                 federation.analyzer(&denied),
@@ -3382,7 +3494,7 @@ mod function_support_tests {
             "a plan using a Spice-only UDF must not federate to a catalog-registered ADBC database"
         );
 
-        let allowed = scan_project(col("id"));
+        let allowed = scan_project(&provider, col("id"));
         assert!(
             matches!(
                 federation.analyzer(&allowed),

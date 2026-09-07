@@ -55,7 +55,9 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
         .build()
-        .with_scalar_call_support(Arc::new(crate::dialect::duckdb_can_translate))
+        .with_scalar_call_support(Arc::new(|call, _| {
+            crate::dialect::duckdb_can_translate(call)
+        }))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for

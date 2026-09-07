@@ -2581,6 +2581,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn the_built_session_concatenates_an_untyped_null() {
+        use arrow::array::{ArrayRef, RecordBatch, StringArray};
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("alpha"), None, Some("beta")]));
+        df.ctx
+            .register_batch(
+                "names",
+                RecordBatch::try_from_iter([("name", names)]).expect("name batch"),
+            )
+            .expect("register names");
+
+        let batches = df
+            .ctx
+            .sql("SELECT concat(name, NULL) AS combined FROM names")
+            .await
+            .expect("plan concat with an untyped NULL")
+            .collect()
+            .await
+            .expect("execute concat with an untyped NULL");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        for batch in batches {
+            assert_eq!(batch.column(0).null_count(), batch.num_rows());
+        }
+    }
+
     #[test]
     #[cfg(not(windows))]
     fn test_built_datafusion_registers_cayenne_optimizer_config() {

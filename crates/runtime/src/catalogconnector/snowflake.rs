@@ -259,15 +259,15 @@ mod tests {
             .clone();
 
         assert!(
-            !function_support.supports(&stub_udf("json_get_str", 2)),
+            !function_support.supports(&stub_udf("json_get_str", 2), None),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            !function_support.supports(&stub_udf("cosine_distance", 2)),
+            !function_support.supports(&stub_udf("cosine_distance", 2), None),
             "cosine_distance must be denied (Snowflake has no exact equivalent)"
         );
         assert!(
-            function_support.supports(&stub_udf("upper", 1)),
+            function_support.supports(&stub_udf("upper", 1), None),
             "a non-Spice function like upper() must still federate to Snowflake"
         );
     }

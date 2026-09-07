@@ -229,9 +229,7 @@ pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
 /// The rest stay denied, each for something `BigQuery` cannot be talked out of.
 /// `json_get_json` and `json_as_text` return the matched node's own bytes,
 /// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
-/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
-/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
-/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// document holding `{"b": -1}` comes back as `{"b":-1}`.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
 #[must_use]
@@ -250,8 +248,11 @@ pub fn bigquery_native_function_names() -> Vec<&'static str> {
 /// this so an untranslatable call is left to evaluate locally instead of being
 /// unparsed.
 #[must_use]
-pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
-    bigquery::can_translate(call)
+pub fn bigquery_can_translate(
+    call: &ScalarFunction,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    bigquery::can_translate(call, scope)
 }
 
 /// Whether the `BigQuery` dialect can translate this particular aggregate call.
