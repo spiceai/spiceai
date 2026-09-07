@@ -13947,26 +13947,27 @@ impl CayenneTableProvider {
                 // result inline and skips the spawn/join. One entry per shard in
                 // order, so the index alignment steps 3/4 rely on is preserved.
                 std::thread::scope(|scope| {
-                    let handles: Vec<Option<_>> = per_shard_batches
-                        .into_iter()
-                        .enumerate()
-                        .map(|(s, shard_batches)| {
-                            if shard_batches.is_empty() {
-                                None
-                            } else {
-                                Some(scope.spawn(move || {
-                                    self.validate_one_shard(
-                                        s,
-                                        shard_batches,
-                                        index_ref,
-                                        pk_indices,
-                                        converter,
-                                        on_conflict,
-                                    )
-                                }))
-                            }
-                        })
-                        .collect();
+                    // Every shard's thread is spawned before any of them is joined:
+                    // a lazy spawn-then-join iterator chain would start each thread
+                    // only as the join step pulled it, validating the shards one at a
+                    // time instead of together.
+                    let mut handles: Vec<Option<_>> = Vec::with_capacity(n);
+                    for (s, shard_batches) in per_shard_batches.into_iter().enumerate() {
+                        if shard_batches.is_empty() {
+                            handles.push(None);
+                        } else {
+                            handles.push(Some(scope.spawn(move || {
+                                self.validate_one_shard(
+                                    s,
+                                    shard_batches,
+                                    index_ref,
+                                    pk_indices,
+                                    converter,
+                                    on_conflict,
+                                )
+                            })));
+                        }
+                    }
                     handles
                         .into_iter()
                         .map(|handle| match handle {
