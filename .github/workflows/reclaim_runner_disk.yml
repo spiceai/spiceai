@@ -1,7 +1,6 @@
 name: Reclaim Runner Disk
 
-# One-time recovery for the disk-full failure in PR #13939. The diagnostic run
-# 34143728738 measured 134 GiB in this instance's Cargo debug directory.
+# Manual disk diagnostics for PR #13939.
 on:
   workflow_dispatch:
 
@@ -12,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  recover:
+  diagnose:
     strategy:
       fail-fast: false
       matrix:
@@ -20,70 +19,10 @@ jobs:
     runs-on: spiceai-macos
     timeout-minutes: 10
     steps:
-      - name: Reclaim the confirmed idle Cargo debug directory
+      - name: Inspect runner disk
         shell: bash
         run: |
           set -euo pipefail
           printf 'runner=%s\nworkspace=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE"
-          df -Pk "$RUNNER_WORKSPACE"
-          if [ "$RUNNER_NAME" != spiceai-macos-mbp-runner-01-03 ]; then
-            echo 'Outside the affected runner instance; no cleanup'
-            exit 0
-          fi
-          python3 - <<'PYTHON'
-          import os
-          import shutil
-          import subprocess
-          from pathlib import Path
-
-          expected = Path('/opt/github-runner-03/_work/spiceai')
-          assert os.environ['RUNNER_WORKSPACE'] == str(expected)
-          assert expected.resolve() == expected
-          assert subprocess.check_output(['hostname'], text=True).strip() == 'spiceai-macos-mbp-runner-01'
-          target = expected / 'spiceai/target'
-          debug = target / 'debug'
-          assert target.resolve() == target and debug.resolve() == debug
-          if not debug.exists():
-              print('The diagnosed Cargo debug directory is absent; no cleanup')
-              raise SystemExit(0)
-
-          before = shutil.disk_usage(expected).free
-          print('FREE_BYTES_BEFORE', before, flush=True)
-          if before >= 100 * 1024**3:
-              print('At least 100 GiB is free; preserving build output')
-              raise SystemExit(0)
-
-          tag = (target / 'CACHEDIR.TAG').read_text()
-          assert 'Signature: 8a477f597d28d172789f06886806bc55' in tag
-          assert '# This file is a cache directory tag created by cargo.' in tag
-          assert (debug / '.fingerprint').is_dir() and (debug / 'deps').is_dir()
-          assert (debug / '.cargo-lock').is_file()
-
-          # The job owns this runner instance. Refuse lingering readers or
-          # background compilers before touching its generated build output.
-          opened = subprocess.run(
-              ['lsof', '-nP', '+D', str(debug), '-F', 'pn'],
-              capture_output=True, text=True, timeout=90,
-          )
-          assert opened.returncode == 1 and not opened.stdout.strip() and not opened.stderr.strip(), (
-              opened.returncode, opened.stdout, opened.stderr,
-          )
-          print('OPEN_FILES: none beneath the confirmed Cargo debug directory')
-
-          count = allocated = 0
-          for base, dirs, files in os.walk(debug, followlinks=False):
-              assert all(not Path(base, name).is_symlink() for name in dirs)
-              for name in files:
-                  count += 1
-                  allocated += Path(base, name).lstat().st_blocks * 512
-          print('CLEANUP_SCOPE', debug, 'files', count, 'allocated_bytes', allocated, flush=True)
-          assert 100 * 1024**3 < allocated < 160 * 1024**3, 'Build output changed; inspect again'
-
-          shutil.rmtree(debug)
-          after = shutil.disk_usage(expected).free
-          print('FREE_BYTES_AFTER', after, 'RECLAIMED_BYTES', after - before, flush=True)
-          assert not debug.exists()
-          assert (target / 'CACHEDIR.TAG').is_file()
-          assert after >= 130 * 1024**3, 'Cleanup completed but the host still needs capacity'
-          PYTHON
+          hostname
           df -Pk "$RUNNER_WORKSPACE"
