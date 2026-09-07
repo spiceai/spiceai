@@ -205,15 +205,14 @@ fn build_points(
     let mut non_finite_samples: Vec<usize> = Vec::new();
     let mut missing_embedding_skips: usize = 0;
 
-    let mut points: Vec<PointData> = Vec::with_capacity(record.num_rows());
-    let mut rejected: Vec<String> = Vec::new();
-    let mut indexed: Vec<&str> = Vec::new();
+    let mut points: Vec<(Option<String>, PointData)> = Vec::with_capacity(record.num_rows());
+    let mut outcomes: Vec<(&str, write_util::RowOutcome)> = Vec::with_capacity(record.num_rows());
 
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             missing_embedding_skips += 1;
             if let Some(key) = primary_keys[row].as_ref() {
-                rejected.push(key.clone());
+                outcomes.push((key.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         };
@@ -241,7 +240,7 @@ fn build_points(
                 zero_or_nan_samples.push(row);
             }
             if let Some(key) = primary_keys[row].as_ref() {
-                rejected.push(key.clone());
+                outcomes.push((key.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -252,7 +251,7 @@ fn build_points(
                 non_finite_samples.push(row);
             }
             if let Some(key) = primary_keys[row].as_ref() {
-                rejected.push(key.clone());
+                outcomes.push((key.as_str(), write_util::RowOutcome::Rejected));
             }
             continue;
         }
@@ -296,13 +295,16 @@ fn build_points(
         };
 
         if let Some(key) = primary_keys[row].as_ref() {
-            indexed.push(key.as_str());
+            outcomes.push((key.as_str(), write_util::RowOutcome::Indexed));
         }
-        points.push(PointData {
-            id,
-            payload,
-            vector: embedding.clone(),
-        });
+        points.push((
+            primary_keys[row].clone(),
+            PointData {
+                id,
+                payload,
+                vector: embedding.clone(),
+            },
+        ));
     }
 
     if null_pk_skips > 0 {
@@ -326,7 +328,15 @@ fn build_points(
         );
     }
 
-    Ok((points, keys_to_evict(rejected, indexed)))
+    let evicted = keys_to_evict(outcomes);
+    if !evicted.is_empty() {
+        let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+        points.retain(|(key, _)| !key.as_deref().is_some_and(|key| evicted_keys.contains(key)));
+    }
+    Ok((
+        points.into_iter().map(|(_, point)| point).collect(),
+        evicted,
+    ))
 }
 
 pub async fn delete_by_keys(index: &QdrantIndex, keys: &RecordBatch) -> Result<()> {
