@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 permissions: {}
 concurrency:
-  group: macos-runner-recovery-diagnostic
+  group: macos-model-runner-diagnostic
   cancel-in-progress: false
 jobs:
   diagnose:
@@ -12,47 +12,80 @@ jobs:
       matrix:
         slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     runs-on: spiceai-macos
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Inspect runner disk without checkout or cleanup
+      - name: Read host pressure and model cache metadata
         shell: bash
         run: |
           set -euo pipefail
-          printf 'runner=%s\nworkspace=%s\ntemp=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE" "$RUNNER_TEMP"
+          printf 'runner=%s\nworkspace=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE"
           hostname
+          date -u
           df -Pk "$RUNNER_WORKSPACE"
           case "$RUNNER_NAME" in
-            spiceai-macos-mbp-runner-01-*) ;;
-            *) echo 'Outside the affected physical host; no further inspection'; exit 0 ;;
+            spiceai-macos-mbp-runner-02-*) ;;
+            *) echo 'Outside the model-readiness investigation host; no further inspection'; exit 0 ;;
           esac
-          root="$(dirname "$RUNNER_WORKSPACE")"
-          ps -axo pid,ppid,etime,comm | awk 'NR == 1 || /Runner.Worker|Runner.Listener|cargo|rustc|clang|ld$/'
-          du -x -k -d 1 "$root" 2>/dev/null || true
-          du -x -k -d 2 "$RUNNER_WORKSPACE" 2>/dev/null || true
-          du -x -k -d 2 "$root/_tool" 2>/dev/null || true
           python3 - <<'PYTHON'
-          import os, time, collections
+          import datetime, json, os, re, subprocess
           from pathlib import Path
-          root = Path(os.environ['RUNNER_WORKSPACE']).parent
-          for base, dirs, files in os.walk(root, followlinks=False):
-              dirs[:] = [d for d in dirs if not Path(base, d).is_symlink() and d not in ('.git', '_actions', '_tool')]
-              if 'CACHEDIR.TAG' in files or Path(base).name == 'target':
-                  path = Path(base)
-                  print('BUILD_CANDIDATE', path)
-                  tag = path / 'CACHEDIR.TAG'
-                  print('TAG', repr(tag.read_text(errors='replace')[:1024]) if tag.is_file() else 'MISSING')
-                  totals = collections.defaultdict(lambda: [0, 0])
-                  for sub, sd, sf in os.walk(path, followlinks=False):
-                      sd[:] = [d for d in sd if not Path(sub, d).is_symlink()]
-                      for name in sf:
-                          f = Path(sub, name)
-                          s = f.lstat()
-                          age = (time.time() - s.st_mtime) / 86400
-                          bucket = 'older_than_8d' if age >= 8 else '1d_to_8d' if age >= 1 else 'within_1d'
-                          profile = f.relative_to(path).parts[0]
-                          totals[(profile, bucket)][0] += 1
-                          totals[(profile, bucket)][1] += s.st_blocks * 512
-                  for key, value in sorted(totals.items()):
-                      print('ALLOCATED_BYTES', key, value)
-                  dirs[:] = []
+          assert subprocess.check_output(['hostname'], text=True).strip() == 'spiceai-macos-mbp-runner-02'
+          def run(args, timeout=30):
+              print('COMMAND', args, flush=True)
+              try:
+                  p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+                  print('EXIT', p.returncode)
+                  print(p.stdout)
+                  print(p.stderr)
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  print('DIAGNOSTIC_UNAVAILABLE', type(error).__name__)
+          run(['sysctl', 'hw.memsize', 'hw.logicalcpu', 'hw.physicalcpu', 'kern.boottime', 'vm.swapusage'])
+          run(['vm_stat'])
+          run(['memory_pressure', '-Q'])
+          run(['pmset', '-g', 'therm'])
+          run(['top', '-l', '2', '-s', '2', '-n', '0'])
+          run(['iostat', '-d', '-w', '2', '-c', '3'])
+          processes = subprocess.check_output(['ps', '-axo', 'pid=,ppid=,%cpu=,%mem=,rss=,vsz=,etime=,comm='], text=True)
+          rows = [line.split(None, 7) for line in processes.splitlines()]
+          rows = [r for r in rows if len(r) == 8]
+          top = sorted(rows, key=lambda r: float(r[2]), reverse=True)[:20]
+          selected = {r[0]: r for r in top}
+          for r in rows:
+              if any(name in r[7] for name in ('Runner.Worker', 'Runner.Listener', 'spiced', 'spiceio', 'cargo', 'rustc', 'clippy')):
+                  selected[r[0]] = r
+          print('PROCESS_FIELDS pid ppid cpu_percent mem_percent rss_KiB vsz_KiB elapsed executable')
+          for row in selected.values():
+              print('PROCESS', json.dumps(row))
+          workers = [r[0] for r in rows if any(name in r[7] for name in ('Runner.Worker', 'spiced', 'cargo', 'rustc', 'clippy'))]
+          if workers:
+              run(['lsof', '-nP', '-a', '-p', ','.join(workers[:50]), '-d', 'cwd', '-F', 'pn'])
+          home = Path.home()
+          cache = home / '.cache/huggingface/hub'
+          print('CACHE_ENV_OVERRIDES', {k: bool(os.environ.get(k)) for k in ('HF_HOME', 'HF_HUB_CACHE', 'HF_TOKEN_PATH')})
+          for repo in ('models--BAAI--bge-base-en-v1.5', 'models--Qwen--Qwen2.5-3B-Instruct'):
+              root = cache / repo
+              print('MODEL_CACHE', str(root), 'exists', root.is_dir())
+              if not root.is_dir():
+                  continue
+              count = total = 0
+              for base, dirs, files in os.walk(root, followlinks=False):
+                  dirs[:] = [d for d in dirs if not Path(base, d).is_symlink()]
+                  for name in files:
+                      path = Path(base, name)
+                      try:
+                          s = path.lstat()
+                      except FileNotFoundError:
+                          print('CACHE_ENTRY_CHANGED', str(path.relative_to(root)))
+                          continue
+                      count += 1
+                      total += s.st_blocks * 512
+                      if count <= 100:
+                          print('CACHE_STAT', json.dumps({'path': str(path.relative_to(root)), 'bytes': s.st_size, 'allocated_bytes': s.st_blocks * 512, 'mtime_utc': datetime.datetime.fromtimestamp(s.st_mtime, datetime.timezone.utc).isoformat(), 'ctime_utc': datetime.datetime.fromtimestamp(s.st_ctime, datetime.timezone.utc).isoformat(), 'birthtime': getattr(s, 'st_birthtime', None), 'symlink': path.is_symlink()}))
+              print('CACHE_TOTAL', repo, count, total)
+              ref = root / 'refs/main'
+              if ref.is_file() and not ref.is_symlink():
+                  value = ref.read_text()[:100].strip()
+                  print('CACHE_MAIN_REVISION', repo, value if re.fullmatch('[0-9a-f]{40}', value) else 'unrecognized')
+          run(['vm_stat'])
+          run(['sysctl', 'vm.swapusage'])
           PYTHON
