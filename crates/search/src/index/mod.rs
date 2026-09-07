@@ -34,6 +34,8 @@ pub mod elasticsearch;
 #[cfg(feature = "llms")]
 pub mod memory;
 pub mod native_vector;
+#[cfg(feature = "qdrant")]
+pub mod qdrant;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
@@ -64,6 +66,8 @@ use crate::generation::text_search::index::FullTextDatabaseIndex;
 use crate::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "elasticsearch")]
 use crate::index::elasticsearch::{ElasticsearchIndex, ElasticsearchTextIndex};
+#[cfg(feature = "qdrant")]
+use crate::index::qdrant::QdrantIndex;
 #[cfg(feature = "s3_vectors")]
 use crate::index::s3_vectors::S3Vector;
 
@@ -122,6 +126,10 @@ pub fn derived_columns_from_vector_index(
     if let Some(vec) = index.as_any().downcast_ref::<MemoryVectorIndex>() {
         return Some(vec.derived_columns());
     }
+    #[cfg(feature = "qdrant")]
+    if let Some(vec) = index.as_any().downcast_ref::<QdrantIndex>() {
+        return Some(vec.derived_columns());
+    }
     if let Some(vec) = index.as_any().downcast_ref::<ChunkedVectorIndex>() {
         return Some(vec.derived_columns());
     }
@@ -177,6 +185,10 @@ pub fn as_search_index(index: &Arc<dyn Index + Send + Sync>) -> Option<&dyn Sear
     }
     #[cfg(feature = "elasticsearch")]
     if let Some(idx) = index.as_any().downcast_ref::<ElasticsearchTextIndex>() {
+        return Some(idx as &dyn SearchIndex);
+    }
+    #[cfg(feature = "qdrant")]
+    if let Some(idx) = index.as_any().downcast_ref::<QdrantIndex>() {
         return Some(idx as &dyn SearchIndex);
     }
     None

@@ -284,7 +284,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifneq ($(strip $(PACKAGES)),)
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,qdrant,http-functions,wasm-functions,rate-control,spicebench
 endif
 
 ## The guard scripts below need Python 3.11+ (stdlib `tomllib`). The sign-off
