@@ -453,6 +453,143 @@ mod tests {
         Ok(())
     }
 
+    /// `array_length` / `array_length(_, 1)` / `list_length` over a list column is rewritten
+    /// to Vortex `list_length` and pushed into the scan. Port of spiraldb/vortex#8600.
+    ///
+    /// Semantics that must hold: `UInt64` length, `0` for a non-null empty list, `NULL` for
+    /// a null list. The two-argument form with `dim > 1` must stay above the scan.
+    #[tokio::test]
+    async fn test_array_length_pushes_down_and_handles_empty_and_null() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::with_nested_functions(true);
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE list_test (id INT NOT NULL, a INT[], b INT[]) \
+                STORED AS vortex LOCATION '/list_test/'",
+            )
+            .await?;
+        ctx.session
+            .sql(
+                "INSERT INTO list_test VALUES \
+                    (1, [10, 20, 30], [1]), \
+                    (2, [40, 50, 60, 70], [2, 3]), \
+                    (3, [80], [4, 5, 6]), \
+                    (4, [90, 100, 110, 120, 130], [7, 8, 9, 10]), \
+                    (5, [140, 150], []), \
+                    (6, NULL, [1, 2])",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        // Projection: `array_length` on both list columns must be handed to the Vortex
+        // scan (on the DataSourceExec line, not a ProjectionExec above it) and return
+        // exact lengths — including 0 for the empty `b` on row 5 and NULL for the
+        // null `a` on row 6.
+        let proj_query = "SELECT id, array_length(a) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id";
+        let proj_plan = physical_plan_display(&ctx.session, proj_query).await?;
+        let scan_line = proj_plan
+            .lines()
+            .find(|line| line.contains("DataSourceExec") && line.contains("file_type=vortex"));
+        assert!(
+            scan_line.is_some_and(|line| line.contains("array_length("))
+                && !proj_plan.contains("ProjectionExec"),
+            "array_length must appear on the Vortex scan itself, with no ProjectionExec above it, got plan:\n{proj_plan}"
+        );
+        let proj_result = ctx.session.sql(proj_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_pushdown_result",
+            pretty_format_batches(&proj_result)?
+        );
+
+        // `array_length(a, 1)` is equivalent and must return the same `a` lengths.
+        let dim1_result = ctx
+            .session
+            .sql("SELECT id, array_length(a, 1) AS len_a, array_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&dim1_result)?.to_string(),
+            "array_length(a, 1) must match array_length(a)"
+        );
+
+        // `list_length` is the registered SQL alias of `array_length`. Executing it
+        // (not only `array_length`) is what fails if `register_all` drops the alias.
+        let alias_result = ctx
+            .session
+            .sql("SELECT id, list_length(a) AS len_a, list_length(b) AS len_b FROM list_test ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            pretty_format_batches(&proj_result)?.to_string(),
+            pretty_format_batches(&alias_result)?.to_string(),
+            "list_length must match array_length"
+        );
+
+        // Filter: `array_length(a) >= 4` must push into the scan and drop the empty
+        // and null lists (NULL comparisons are not kept).
+        let filter_query = "SELECT id FROM list_test WHERE array_length(a) >= 4 ORDER BY id";
+        let filter_plan = physical_plan_display(&ctx.session, filter_query).await?;
+        assert!(
+            filter_plan.contains("predicate:") && !filter_plan.contains("FilterExec"),
+            "array_length filter should push into the Vortex scan, got plan:\n{filter_plan}"
+        );
+        let filter_result = ctx.session.sql(filter_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_filter_pushdown_result",
+            pretty_format_batches(&filter_result)?
+        );
+
+        // A CASE whose branches are list literals is list-typed, but those literals
+        // cannot convert to Vortex scalars. The query must still plan and run by
+        // keeping `array_length` above the scan rather than failing at convert time.
+        let case_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN id = 1 THEN [10, 20] ELSE a END) >= 2 \
+            ORDER BY id";
+        let case_plan = physical_plan_display(&ctx.session, case_query).await?;
+        assert!(
+            case_plan.contains("FilterExec"),
+            "array_length(CASE of list literals) must stay above the scan, got plan:\n{case_plan}"
+        );
+        let case_result = ctx.session.sql(case_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_list_literals_result",
+            pretty_format_batches(&case_result)?
+        );
+
+        // A CASE whose WHEN uses `~` (RegexMatch) is list-typed when both branches
+        // are lists, but convert() rejects RegexMatch. Use a pattern DataFusion
+        // does not fold to `id = …`, so the physical plan still carries RegexMatch.
+        // The query must still plan and run by keeping `array_length` above the scan.
+        let regex_query = "SELECT id FROM list_test \
+            WHERE array_length(CASE WHEN CAST(id AS VARCHAR) ~ '^[0-9]+$' THEN a ELSE b END) >= 2 \
+            ORDER BY id";
+        let regex_plan = physical_plan_display(&ctx.session, regex_query).await?;
+        assert!(
+            regex_plan.contains("FilterExec"),
+            "array_length(CASE with RegexMatch WHEN) must stay above the scan, got plan:\n{regex_plan}"
+        );
+        let regex_result = ctx.session.sql(regex_query).await?.collect().await?;
+        assert_snapshot!(
+            "array_length_case_regex_when_result",
+            pretty_format_batches(&regex_result)?
+        );
+
+        // `array_length(a, 2)` has multidimensional semantics that `list_length` does
+        // not model, so it must stay in a FilterExec above the scan.
+        let dim2_query = "SELECT id FROM list_test WHERE array_length(a, 2) >= 4 ORDER BY id";
+        let dim2_plan = physical_plan_display(&ctx.session, dim2_query).await?;
+        assert!(
+            dim2_plan.contains("FilterExec") && !dim2_plan.contains("predicate:"),
+            "array_length(arr, 2) must stay in a FilterExec above the scan, got plan:\n{dim2_plan}"
+        );
+
+        Ok(())
+    }
+
     /// Doc example: demonstrates creating, writing, reading, and filtering a Vortex table.
     #[tokio::test]
     async fn doc_example() -> anyhow::Result<()> {
