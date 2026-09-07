@@ -93,7 +93,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `b2806e8a34f20d66eaeab0b372aef3292736afe6` | `spiceai-54` |
+| [datafusion](#datafusion) | `b51bf531610c30cca3c1623ebbca20580552a2de` | `fix/bigquery-recursive-column-list` |
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `99391738a84c6e1dcde8e3f4fb57eabb2ec3d9a1` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
@@ -214,6 +214,7 @@ catch.
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal` |
 | BigQuery renders integer-typed division with `DIV` (fork PR #222) | Fractional division followed by an integer cast rounds cohort cutoff hours instead of preserving the logical plan's integer quotient | silent (wrong data) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the integer cohort hours arm) |
 | Unparser isolates standalone expression state and qualifies filtered recursive join inputs (fork PR #219) | A refused recursive expression poisons a reused unparser, or a filtered recursive self-join renders ambiguous columns | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::filtered_recursive_join_inputs_keep_their_qualified_columns` and `::a_recursive_cte_renders_through_the_wrapper_only_where_it_is_supported`; real-engine control: `test/scripts/bigquery_pushdown.py::filtered-recursive-self-join` |
+| Unparser preserves a recursive CTE column-list projection through a join alias | A recursive hour generator with an explicit column list fails SQL generation when joined to a remote table | silent (query failure) | `crates/runtime-datafusion/src/dialect/bigquery.rs::recursive_column_list_survives_a_join_alias`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table` |
 | Eager-aggregation physical optimizer rule (`datafusion/physical-optimizer/src/eager_aggregation.rs`, ~3000 lines, Spice-only) | Aggregations stop being pushed below joins — a large planned regression, not a correctness one | silent (perf) | **GAP** |
 | Pluggable `CollectLeftAccumulator` seam on `HashJoinExec` | Cayenne's custom left-side accumulator cannot be installed | build | compile-guarded by `crates/cayenne` |
 

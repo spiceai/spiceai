@@ -226,7 +226,7 @@ ORDER BY u.value""",
     # every layer between the plan and the driver has to leave it there: the
     # unparser hoists it out of the derived table it plans into, and the ADBC
     # schema fetch must not wrap the statement it is about to describe.
-    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps AS (
+    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps(n) AS (
   SELECT 1 AS n
   UNION ALL
   SELECT n + 1 FROM steps WHERE n < 3
