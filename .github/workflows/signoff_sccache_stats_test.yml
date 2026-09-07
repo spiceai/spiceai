@@ -1,0 +1,53 @@
+---
+name: Sign-off Compiler-Cache Stats Tests
+
+# `signoff.yml`'s `Show sccache stats` step is the only report of whether the
+# gate compiled with the compiler cache. Collapsing `SCCACHE_SETUP` unset into
+# `false` annotates an early job failure as a cache outage. This extracts the
+# real `run:` block so a regression fails here instead of on a 6-hour run.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_sccache_stats.sh'
+      - '.github/workflows/signoff_sccache_stats_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/workflows/signoff.yml'
+      - 'scripts/test_signoff_sccache_stats.sh'
+      - '.github/workflows/signoff_sccache_stats_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-signoff-sccache-stats:
+    name: Unit tests for the sign-off compiler-cache stats step
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install pyyaml
+
+      - name: Run tests
+        run: bash scripts/test_signoff_sccache_stats.sh

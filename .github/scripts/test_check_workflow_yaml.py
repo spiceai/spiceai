@@ -159,6 +159,31 @@ class CheckStepBudgetTest(unittest.TestCase):
             ],
         )
 
+    def test_a_step_budget_above_githubs_step_maximum_is_reported(self):
+        """A step caps at 360 whatever the job allows, so a larger value never lands."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("720", "690")),
+            [
+                "job `gate` gives `Run the checks` a 690-minute budget, above the "
+                "360-minute maximum GitHub enforces on a step for both hosted and "
+                "self-hosted runners, so the step cannot receive it. Enforce a longer "
+                "budget inside the step (`timeout`), and leave the job's own "
+                "`timeout-minutes` — which caps at 360 only by default — as the outer wall"
+            ],
+        )
+
+    def test_the_step_maximum_itself_is_accepted(self):
+        """360 is the documented maximum, not one past it."""
+        self.assertEqual(
+            check_workflow_yaml.check_workflow(_workflow_with_budgets("720", "360")), []
+        )
+
+    def test_an_over_maximum_step_budget_is_reported_without_a_job_budget(self):
+        """The cap is the platform's, so it does not depend on the job declaring one."""
+        self.assertEqual(
+            len(check_workflow_yaml.check_workflow(_workflow_with_budgets("", "690"))), 1
+        )
+
     def test_a_step_budget_without_a_job_budget_is_left_alone(self):
         """Common and legitimate: a short probe inside an otherwise unbounded job."""
         self.assertEqual(

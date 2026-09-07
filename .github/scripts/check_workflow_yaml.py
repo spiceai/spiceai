@@ -297,8 +297,18 @@ def check_action_conditions(runs: object) -> list[str]:
     return problems
 
 
+# GitHub's workflow-syntax reference for `jobs.<job_id>.steps[*].timeout-minutes`:
+# "Maximum: 360 for both GitHub-hosted and self-hosted runners." The job-level
+# attribute of the same name documents 360 as a *default* instead, which is why
+# the two are easy to conflate.
+STEP_BUDGET_MAX = 360
+
+
 def check_step_budgets(jobs: dict) -> list[str]:
-    """Report step budgets that the job's own budget pre-empts.
+    """Report step budgets a step can never actually receive.
+
+    Two ways that happens, both of them dead config rather than a budget merely
+    set too tight:
 
     A step whose `timeout-minutes` is not below its job's can never fire: the job
     is terminated first, which reports as `cancelled` with no failed step and
@@ -306,17 +316,24 @@ def check_step_budgets(jobs: dict) -> list[str]:
     the whole sign-off job reached the runner pool's wall and its `if: always()`
     cleanup never got to resolve the status the run had posted.
 
-    This catches dead config, not a budget that is merely too tight: whether the
-    gap between the two also covers the job's setup and cleanup steps depends on
-    how long those take, which is not in the definition.
+    A step budget above STEP_BUDGET_MAX cannot be delivered at all: GitHub caps a
+    step at "Maximum: 360 for both GitHub-hosted and self-hosted runners", while
+    the *job* attribute of the same name treats 360 only as a default and yields
+    to the runner's execution limit (5 days on self-hosted). The two read alike
+    and behave differently, so a long job budget invites a matching step budget
+    that silently cannot hold — enforce anything longer inside the step instead.
+
+    Whether the gap between step and job also covers the job's setup and cleanup
+    steps depends on how long those take, which is not in the definition.
     """
     problems = []
     for name, job in jobs.items():
         if not isinstance(job, dict):
             continue
+        # Not `continue`d on: the platform cap below applies to a step whether or
+        # not its job declares a budget of its own. Only the pre-emption check
+        # needs one.
         job_budget = job.get("timeout-minutes")
-        if not isinstance(job_budget, int):
-            continue
         steps = job.get("steps")
         if not isinstance(steps, list):
             continue
@@ -326,9 +343,18 @@ def check_step_budgets(jobs: dict) -> list[str]:
             step_budget = step.get("timeout-minutes")
             if not isinstance(step_budget, int):
                 continue
-            if step_budget < job_budget:
-                continue
             label = step.get("name") or f"step {position}"
+            if step_budget > STEP_BUDGET_MAX:
+                problems.append(
+                    f"job `{name}` gives `{label}` a {step_budget}-minute budget, above the "
+                    f"{STEP_BUDGET_MAX}-minute maximum GitHub enforces on a step for both "
+                    "hosted and self-hosted runners, so the step cannot receive it. Enforce a "
+                    "longer budget inside the step (`timeout`), and leave the job's own "
+                    "`timeout-minutes` — which caps at 360 only by default — as the outer wall"
+                )
+                continue
+            if not isinstance(job_budget, int) or step_budget < job_budget:
+                continue
             problems.append(
                 f"job `{name}` gives `{label}` a {step_budget}-minute budget that its "
                 f"own {job_budget}-minute budget pre-empts"

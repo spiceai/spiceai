@@ -288,6 +288,12 @@ runner. It deliberately never SSHes into ad-hoc hosts — the LAN lab boxes
 double as benchmark machines, and a workspace build there mid-run silently
 corrupts the measurement.
 
+The remote job runs on the Linux self-hosted pool (`spiceai-dev-runners`), not
+on `spiceai-macos`, which `pr.yml`'s merge-queue jobs occupy. That makes the
+platform under test Linux, so a remote sign-off and a local `make signoff` on a
+Mac clear the same branch on different targets: a lint or build failure that
+only appears under one `cfg(target_os)` is caught by only one of them.
+
 The Actions workflow:
 
 0. Resolves the dispatch input to a commit, in a small GitHub-hosted `resolve`
@@ -300,10 +306,23 @@ The Actions workflow:
 4. Posts pending → success/failure `signoff` statuses (skipping the pending when
    the commit is already signed off), then re-runs **Attestation** if needed
 
-The checks run under a 353-minute budget, inside a 358-minute job budget, so a
-run that overruns fails as a failed step rather than being terminated at the
-runner pool's ~360-minute wall (which reports as `cancelled`, with no failed
-step and no chance to clean up). A run that ends without a verdict leaves the
+The checks run under a budget enforced inside the sign-off step, nested in the
+job's own `timeout-minutes` (both in `.github/workflows/signoff.yml`), so a run
+that overruns fails as a failed step rather than being terminated at the job wall
+(which reports as `cancelled`, with no failed step and no chance to clean up).
+That inner budget is a `timeout` rather than the step's own `timeout-minutes`
+because GitHub caps a *step* at 360 minutes on every runner type, while the job
+attribute of the same name treats 360 as a default and yields to the runner's
+execution limit — 5 days on self-hosted, 6 hours on GitHub-hosted. The two read
+alike and behave differently; `check_workflow_yaml.py` fails the build on a step
+budget above 360 so the conflation cannot ship. The budgets are therefore sized
+for the work rather than against an external limit — a gate that has not yet
+been measured to completion on this pool gets headroom, not a tight fit. The gap
+between them is sized for the handlers below, not for the seconds a status post
+looks like it should take: a run whose step used its whole budget has been seen
+spending over 11 minutes in `clear-pending`, and a job killed at the wall
+uploads no log at all, so too narrow a gap costs the run both its status
+resolution and its diagnostics. A run that ends without a verdict leaves the
 commit at `pending` either way, and never at a failure. Where the two endings
 differ is only which status the handler finds:
 
