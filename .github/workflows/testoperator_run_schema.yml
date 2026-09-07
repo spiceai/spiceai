@@ -327,8 +327,12 @@ jobs:
           git commit -m "fix: Update schema snapshots for: ${{ github.event.inputs.spicepod_path }}"
           # The checkout persists no credentials, so authenticate the push
           # itself rather than leaving a token in the local git config for the
-          # rest of the job.
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
+          # rest of the job. Disable any credential helper configured on the
+          # (self-hosted) runner as well, so git uses the URL-embedded token only:
+          # otherwise a helper (osxkeychain / git-credential-manager) can intercept
+          # the push and block on an interactive credential prompt, hanging the job.
+          git -c credential.helper='' -c credential.interactive=false \
+            push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" "HEAD:${BRANCH_NAME}"
 
           PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
           if [[ -n "${PR_URL}" ]]; then
@@ -345,3 +349,6 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'

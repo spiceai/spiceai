@@ -18,7 +18,6 @@ use std::{sync::Arc, time::Duration};
 
 use cache::{Caching, QueryResultsCacheProvider, SimpleCache, get_hash_builder, lru_cache};
 use spicepod::component::caching::{CacheConfig, Caching as CachingConfig, SQLResultsCacheConfig};
-use util::in_tracing_context;
 
 use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
@@ -52,15 +51,11 @@ impl Runtime {
                 Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
             ) {
                 Ok(cache_provider) => {
-                    in_tracing_context(|| {
-                        tracing::info!("Initialized sql results cache; {cache_provider}");
-                    });
+                    tracing::info!("Initialized sql results cache; {cache_provider}");
                     caching = caching.with_results_cache(Arc::new(cache_provider));
                 }
                 Err(e) => {
-                    in_tracing_context(|| {
-                        tracing::error!("Failed to initialize sql results cache: {e}");
-                    });
+                    tracing::error!("Failed to initialize sql results cache: {e}");
                 }
             }
         }
@@ -76,24 +71,18 @@ impl Runtime {
                 caching = caching.with_plans_cache(plans_cache_provider);
             }
             Err(e) => {
-                in_tracing_context(|| {
-                    tracing::error!("Failed to initialize plans cache: {e}");
-                });
+                tracing::error!("Failed to initialize plans cache: {e}");
             }
         }
 
         if search_results_config.enabled {
             match lru_cache::build_from_config(&search_results_config) {
                 Ok(cache_provider) => {
-                    in_tracing_context(|| {
-                        tracing::info!("Initialized search results cache; {cache_provider}");
-                    });
+                    tracing::info!("Initialized search results cache; {cache_provider}");
                     caching = caching.with_search_cache(cache_provider.as_tabled_provider());
                 }
                 Err(e) => {
-                    in_tracing_context(|| {
-                        tracing::error!("Failed to initialize search results cache: {e}");
-                    });
+                    tracing::error!("Failed to initialize search results cache: {e}");
                 }
             }
         }
@@ -101,15 +90,11 @@ impl Runtime {
         if embeddings_config.enabled {
             match lru_cache::build_from_config(&embeddings_config) {
                 Ok(cache_provider) => {
-                    in_tracing_context(|| {
-                        tracing::info!("Initialized embeddings cache; {cache_provider}");
-                    });
+                    tracing::info!("Initialized embeddings cache; {cache_provider}");
                     caching = caching.with_embeddings_cache(cache_provider);
                 }
                 Err(e) => {
-                    in_tracing_context(|| {
-                        tracing::error!("Failed to initialize embeddings cache: {e}");
-                    });
+                    tracing::error!("Failed to initialize embeddings cache: {e}");
                 }
             }
         }

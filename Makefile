@@ -149,7 +149,30 @@ endif
 # command surface. `cloud_integration` needs live credentials and remains in
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
-NEXTEST_SELECTION := --all --exclude libnfs
+# `--features` here, not a per-crate default, because the result-correctness
+# lanes are the only reason the gate links an engine at all. Cargo skips a test
+# target whose `required-features` are unmet *without saying so*, so before this
+# the filterset below selected `result_correctness_vs_duckdb_test` and cargo
+# silently never built it — selection looked complete while three lanes never
+# ran. See `crates/cayenne/tests/correctness/README.md`.
+#
+# Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
+# unlock runtime's accelerator-parity binary, but the feature flows through the
+# whole `--all --tests` build: every one of runtime's integration test binaries
+# relinks with them, and those link at hundreds of megabytes each. That is a
+# large, permanent cost on every sign-off and merge-queue run to gain two
+# micro-shape comparisons — the thinnest of the five lanes. It belongs in the
+# integration workflow, which already builds with `duckdb,sqlite`.
+#
+# The chDB lane is deliberately not here. `chdb-rust` needs libchdb, which its
+# build script fetches over the network, so folding it into the gate would make
+# every sign-off depend on that fetch and on a machine that can link it. CI runs
+# it instead (`.github/workflows/correctness_chdb.yml`). Because cargo drops a
+# target whose required-features are unmet *without saying so* — the very way
+# three lanes once went unbuilt — the `nextest` target says out loud that this
+# one did not run.
+NEXTEST_SELECTION := --all --exclude libnfs \
+	--features cayenne/result-correctness-duckdb
 NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
@@ -167,6 +190,8 @@ $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_E
 endif
 .PHONY: nextest
 nextest:
+	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
+	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
 	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
@@ -197,7 +222,7 @@ verify-cli:
 	mkdir -p "$(TARGET_DIR)"; \
 	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
 	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
-	python3 scripts/verify_cli_build.py "$$out" version.txt
+	$(PYTHON) scripts/verify_cli_build.py "$$out" version.txt
 
 .PHONY: nextest-packages
 nextest-packages:
@@ -262,6 +287,22 @@ else
 _FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,qdrant,http-functions,wasm-functions,rate-control,spicebench
 endif
 
+## The guard scripts below need Python 3.11+ (stdlib `tomllib`). The sign-off
+## runners carry more than one interpreter and bare `python3` does not resolve to
+## the same one on every run: github-runner-02 passed this recipe at 03:36 and
+## failed it at 06:58 the same morning on `found 3.9`, which fails the whole
+## sign-off in ~9s with nothing wrong in the branch. Resolve an interpreter that
+## is actually new enough instead of trusting PATH order. Falls back to plain
+## `python3` so a host with nothing newer still gets check_crate_layers.py's own
+## "needs Python 3.11+" message rather than a missing-command error.
+## Override with `make lint-rust PYTHON=python3.12` to pin a specific one.
+ifeq ($(strip $(PYTHON)),)
+PYTHON := $(shell for p in python3.14 python3.13 python3.12 python3.11 python3; do \
+		command -v $$p >/dev/null 2>&1 || continue; \
+		$$p -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null && { echo $$p; exit 0; }; \
+	done; echo python3)
+endif
+
 .PHONY: lint lint-rust
 lint: lint-rust
 
@@ -269,17 +310,21 @@ lint: lint-rust
 lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
-	python3 scripts/check_crate_layers.py
+	$(PYTHON) scripts/check_crate_layers.py
 	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
-	python3 scripts/check_table_layers.py
+	$(PYTHON) scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
 	## Its derivation is exercised first: the live-tree scan only covers the paths today's workspace happens to contain, so a derivation that stopped working would pass unnoticed on a clean tree
-	python3 scripts/test_check_rust_gate_paths.py
-	python3 scripts/check_rust_gate_paths.py
+	$(PYTHON) scripts/test_check_rust_gate_paths.py
+	$(PYTHON) scripts/check_rust_gate_paths.py
 	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
-	python3 scripts/test_check_module_reachability.py
-	python3 scripts/check_module_reachability.py
+	$(PYTHON) scripts/test_check_module_reachability.py
+	$(PYTHON) scripts/check_module_reachability.py
+	## Fork-pin guard (fast, no compile): a moved fork pin must come with a re-audit of that fork's patches. See docs/dev/fork_patches.md
+	## Its parsers are exercised first: with both sides empty the guard would report agreement, so a regex regression would pass unnoticed
+	$(PYTHON) scripts/test_check_fork_patches.py
+	$(PYTHON) scripts/check_fork_patches.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
@@ -415,9 +460,21 @@ display-deps:
 TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 
 # Default install includes models. Use -data suffix variants to build without models.
-# Data-only features (default features minus models)
+#
+# The feature set the -data variants build with. It is NOT derived from bin/spiced's `default`,
+# and it is not `default` minus `models`: it is an independent list maintained by hand right here,
+# so a feature added to `default` does not reach `make install-data-only` until it is added below
+# too, and no check reports the omission. The two currently differ in both directions, which is why
+# reading this list as "default, less the model bits" is wrong: -data is also an ADBC-less build
+# without any of the three feature-gated secret stores `default` turns on (aws-secrets-manager,
+# azure-keyvault and keyring-secret-store) — the env and Kubernetes stores are not feature-gated
+# at all, so a -data build still reads secrets from both of those — and it carries the PostgreSQL
+# accelerator and acceleration snapshots, which `default` does not. Recompute the difference
+# before relying on it rather than trusting a comment, from this list and the
+# `default = [...]` array in bin/spiced/Cargo.toml.
+#
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb
 
 .PHONY: install
 install: build
@@ -475,6 +532,11 @@ install-odbc:
 .PHONY: install-nfs
 install-nfs:
 	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# ScyllaDB variants
+.PHONY: install-scylladb
+install-scylladb:
+	make install SPICED_NON_DEFAULT_FEATURES="scylladb"
 
 # Install from a CI build artifact (branch or commit SHA)
 # Usage:

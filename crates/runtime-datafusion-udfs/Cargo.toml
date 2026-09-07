@@ -15,6 +15,7 @@ ahash.workspace = true
 arrow.workspace = true
 arrow-ipc = { workspace = true, optional = true }
 arrow-json.workspace = true
+arrow_tools = { path = "../arrow_tools", optional = true }
 arrow-schema.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true
@@ -60,7 +61,7 @@ harness = false
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
 models = ["dep:llms"]
-wasm-functions = ["dep:arrow-ipc", "dep:wasmtime"]
+wasm-functions = ["dep:arrow-ipc", "dep:arrow_tools", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]
 
 [lints]

@@ -28,6 +28,9 @@
 #   scripts/signoff clear-pending   Restate a left-behind pending status as incomplete
 #   scripts/signoff preflight-disk  Check the work volume's free space (CI: run
 #                                   before the toolchain setup steps)
+#   scripts/signoff preflight-lockfile
+#                                   Check Cargo.lock against the manifests (CI:
+#                                   run after the toolchain setup, before any build)
 #   scripts/signoff check           Show whether trunk requires sign-off
 #   scripts/signoff install         Configure the trunk ruleset (maintainers)
 #   scripts/signoff install --yes   Apply the ruleset change (default is a dry-run)
@@ -88,6 +91,17 @@ readonly LINT_EXCLUDED_PACKAGES="libnfs lopdf ttf-parser pdf-extract"
 # statuses, "via remote" descriptions, and the GitHub Actions step summary.
 # GITHUB_ACTIONS alone is not enough — other workflows must not inherit this.
 is_remote_run() { [[ -n "${SIGNOFF_REMOTE_RUN:-}" ]]; }
+
+# True when running inside any GitHub Actions job, remote sign-off or not.
+#
+# Kept separate from is_remote_run because they answer different questions.
+# is_remote_run means "this is the Remote Sign-off workflow", which is what
+# licenses posting statuses and calling a stop fatal. This one means only "the
+# `::error::` and step-summary channels exist here", and the lockfile preflight
+# needs that weaker fact: `pr.yml` invokes it as `scripts/signoff
+# preflight-lockfile` from a job that is not a sign-off run at all, and its
+# failure still has to reach the run summary rather than only the log body.
+in_actions() { [[ -n "${GITHUB_ACTIONS:-}" ]]; }
 
 # The single source of truth for the checks required to merge. `install` writes
 # exactly this list into the trunk ruleset's required status checks. Every name
@@ -730,7 +744,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)'
+RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches)\.py$|^docs/dev/fork_patches\.md$|^Makefile$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
@@ -793,6 +807,18 @@ readonly EXIT_DISK_EXHAUSTED=70
 # the gate invokes, so the checks could not be run at all — see
 # preflight_make_targets.
 readonly EXIT_MAKE_TARGET_MISSING=71
+# run_checks returns this when Cargo.lock no longer describes the workspace
+# manifests, so cargo would have to rewrite it before anything could be built —
+# see preflight_lockfile.
+readonly EXIT_LOCKFILE_STALE=72
+# run_checks returns this when the checks themselves rewrote Cargo.lock, so the
+# committed lockfile does not describe the tree they passed on — see
+# postcheck_lockfile. Deliberately *not* EXIT_LOCKFILE_STALE: that status means
+# the gate refused before compiling anything, and describe_check_failure says so
+# in as many words. This one is the opposite shape — the checks ran and passed,
+# and only the attestation is refused — so it needs its own kind to avoid
+# publishing "the checks did not run" about a run whose whole suite is green.
+readonly EXIT_LOCKFILE_REWRITTEN=73
 # Bash reports a foreground child killed by signal N as 128+N, and run_make_step
 # returns make's own status untouched. So a status at or above this means `make`
 # never reached a verdict of its own — the process tree was signalled. That is
@@ -854,6 +880,21 @@ readonly DISK_FULL_PATTERN='No space left on device|errno=28'
 # an optional `e` while reading as though it were deliberate.
 readonly CACHE_UNUSABLE_PATTERN='sccache: error: Server startup failed|sccache: error: cache storage failed|sccache: error: Timed out waiting for server startup'
 
+# The loader's refusal to execute a test binary, in the two spellings the pool's
+# runners produce: EBADMACHO (88) on the macOS boxes, ENOEXEC on the Linux ones.
+# Both mean the file `nextest` was handed is not a loadable executable — a
+# truncated or clobbered artifact on the shared `target/` volume, which is a
+# statement about the runner and not about the branch.
+readonly CORRUPT_ARTIFACT_PATTERN='Malformed Mach-o file|Exec format error'
+
+# The line that says the loader error above came from `nextest` trying to run a
+# build artifact, rather than from a test asserting on that wording. Both are
+# required, because this repo's own suites do assert error strings, and excusing
+# a genuine test failure as infrastructure is the more expensive mistake of the
+# two. `nextest` prints this when a binary fails to execute during enumeration,
+# which is where a corrupt artifact is met first (#13518).
+readonly TEST_LIST_FAILURE_PATTERN='error: creating test list failed'
+
 # Set to 1 on remote runs, where run_make_step watches build output for the
 # out-of-disk and unusable-cache signatures. Separates "watched, and it was
 # neither" from "nothing watched at all", which failure_kind answers differently.
@@ -880,6 +921,12 @@ SIGNOFF_DISK_HIT="${SIGNOFF_DISK_HIT:-}"
 # test can set up a classification without running a build.
 SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 
+# Set to 1 by run_make_step when the step it ran could not execute a test binary
+# it built. Same mechanism and the same reason for being a variable rather than
+# a file as the two above, and likewise seeded from the environment so a test
+# can set up a classification without running a build.
+SIGNOFF_ARTIFACT_HIT="${SIGNOFF_ARTIFACT_HIT:-}"
+
 # The statuses the watcher exits with to report each signature. Deliberately
 # not 1 or 2: awk uses those for its own errors, and a watcher that itself died
 # must not be read as a volume that filled. Reserving distinct statuses is also
@@ -887,6 +934,7 @@ SIGNOFF_CACHE_HIT="${SIGNOFF_CACHE_HIT:-}"
 # verdict" (anything else), which it must not conflate — see run_make_step.
 readonly DISK_WATCH_HIT_STATUS=3
 readonly CACHE_WATCH_HIT_STATUS=4
+readonly ARTIFACT_WATCH_HIT_STATUS=5
 
 # The watcher itself, held in one place so the probe below runs exactly the
 # program that will read the build output — a probe of anything else predicts
@@ -904,10 +952,13 @@ readonly CACHE_WATCH_HIT_STATUS=4
 readonly DISK_WATCH_PROGRAM='
     $0 ~ pat { hit = 1 }
     $0 ~ cache_pat { cache_hit = 1 }
+    $0 ~ artifact_pat { artifact_hit = 1 }
+    $0 ~ list_pat { list_failed = 1 }
     { print; fflush() }
     END {
       if (hit) exit (hit_status + 0)
       if (cache_hit) exit (cache_status + 0)
+      if (artifact_hit && list_failed) exit (artifact_status + 0)
     }
   '
 
@@ -918,6 +969,8 @@ readonly DISK_WATCH_PROGRAM='
 disk_watch_probe() {
   awk -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
     -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+    -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
+    -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
     "$DISK_WATCH_PROGRAM" </dev/null >/dev/null 2>&1
 }
 
@@ -946,6 +999,7 @@ run_make_step() {
   # steps later.
   SIGNOFF_DISK_HIT=""
   SIGNOFF_CACHE_HIT=""
+  SIGNOFF_ARTIFACT_HIT=""
   # Ask whether the watcher runs before make writes a byte to it, because the
   # only other place to find out is downstream of make — where a watcher that
   # exits at once closes the pipe under a still-writing make, make dies of
@@ -963,6 +1017,8 @@ run_make_step() {
   make "$@" 2>&1 | awk \
       -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
       -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
+      -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
+      -v artifact_status="$ARTIFACT_WATCH_HIT_STATUS" \
       "$DISK_WATCH_PROGRAM"
   # Copy the whole array in one statement: reading PIPESTATUS is itself a command,
   # so a second `x="${PIPESTATUS[1]}"` would be reading the *assignment's* status
@@ -974,6 +1030,8 @@ run_make_step() {
     SIGNOFF_DISK_HIT=1
   elif [[ "$watch_status" -eq "$CACHE_WATCH_HIT_STATUS" ]]; then
     SIGNOFF_CACHE_HIT=1
+  elif [[ "$watch_status" -eq "$ARTIFACT_WATCH_HIT_STATUS" ]]; then
+    SIGNOFF_ARTIFACT_HIT=1
   elif [[ "$watch_status" -ne 0 ]]; then
     # The watcher started, so the probe cleared it, and then died part-way
     # through: killed for memory, or a signal that reached the whole group. Its
@@ -1019,6 +1077,12 @@ build_hit_disk_full() {
 # mislabelling that matters most to avoid.
 build_hit_cache_unusable() {
   [[ -n "$SIGNOFF_CACHE_HIT" ]]
+}
+
+# True when the step that failed could not execute a test binary it built. Read
+# in the same shell that ran the step, for the same reason as its two siblings.
+build_hit_corrupt_artifact() {
+  [[ -n "$SIGNOFF_ARTIFACT_HIT" ]]
 }
 
 # Free space in GiB on the volume holding "$1" (default: the working tree).
@@ -1092,7 +1156,8 @@ watch_for_signals() {
 # Names what broke in a check run that did not pass, given run_checks' exit
 # status: "signalled" when nothing judged the branch at all, "disk" when the work
 # volume is the cause, "cache" when sccache could not reach its storage and so
-# nothing was compiled, "checks" for everything else, which is the branch. Three
+# nothing was compiled, "missing-target" and "stale-lockfile" when a preflight
+# refused to start, "checks" for everything else, which is the branch. Three
 # ways to reach "disk", in falling order of authority: the preflight refused to
 # start, the build said so itself, or the volume is at ~0 now. The last is a
 # backstop for a build whose output we did not record — a local run, or a remote
@@ -1133,6 +1198,22 @@ failure_kind() {
     return
   fi
 
+  # And the third preflight, for the same reason: this run stopped before it
+  # compiled anything, so nothing a later reading could offer describes it better.
+  if [[ "$check_status" -eq "$EXIT_LOCKFILE_STALE" ]]; then
+    echo "stale-lockfile"
+    return
+  fi
+
+  # Not a preflight at all, and the one kind here that follows a *passing* suite:
+  # the post-check found that lint and nextest rewrote Cargo.lock on their way
+  # past. Same absolute authority as the preflights above — the post-check read
+  # the file itself — but the opposite story, so it must not share their status.
+  if [[ "$check_status" -eq "$EXIT_LOCKFILE_REWRITTEN" ]]; then
+    echo "rewritten-lockfile"
+    return
+  fi
+
   # If we watched the build, the watch decides — both ways. No ENOSPC line means
   # the build ran out of many things but not disk, and a free-space reading must
   # not overrule that: on a shared pool another run can drag the volume under any
@@ -1144,6 +1225,14 @@ failure_kind() {
       echo "disk"
     elif build_hit_cache_unusable; then
       echo "cache"
+    elif build_hit_corrupt_artifact; then
+      # Last of the three, because the other two are upstream of this one: a
+      # volume that fills mid-link and a cache that cannot be reached both
+      # produce short or missing artifacts, and naming the cause is what tells
+      # the reader which remedy applies. Reached only when neither of those
+      # signatures went past, i.e. the artifact is unloadable for a reason this
+      # run cannot see.
+      echo "corrupt-artifact"
     else
       echo "checks"
     fi
@@ -1205,6 +1294,22 @@ describe_check_failure() {
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`sccache\` could not reach its storage endpoint on this runner, so every \`rustc\` invocation failed before compiling anything and **the checks did not complete**. Nothing here is a statement about the branch. Re-dispatch once the runner's cache endpoint is answering; if it stays down, the pool's \`sccache\` service is what needs attention (see \`.github/actions/setup-sccache\`)."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off aborted: sccache could not reach its storage (the checks did not complete)"
       ;;
+    corrupt-artifact)
+      # Neither a verdict on the code nor a threshold anyone can act on: the
+      # runner handed `nextest` a file the loader will not execute, so
+      # enumeration failed and no test ran. Worded like the other kinds that
+      # reached no verdict, because the alternative — the generic "checks
+      # failed" — sends the author to look for a defect in a diff nothing
+      # judged (#13518, and #12813 before it).
+      #
+      # Hedged rather than asserted: this cannot tell whether the crate whose
+      # binary would not load is one the branch touches. A recurrence on this
+      # branch alone, or one naming a crate whose build script it changes, is
+      # worth suspecting the diff for.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not complete after ${elapsed}s — a test binary on the runner would not load; re-dispatch (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Infrastructure failure** after ${elapsed}s — \`nextest\` could not execute a test binary while listing tests, because the runner's copy is not a loadable executable, so **the checks did not complete**. That is a truncated or clobbered artifact on the shared \`target/\` volume rather than a statement about the branch. Re-dispatch the sign-off. If it recurs on this branch alone, or names a crate whose build script this branch changes, the diff is worth suspecting."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off aborted: a test binary on the runner would not load, so nextest never ran the suite (the checks did not complete) — re-dispatch"
+      ;;
     missing-target)
       # Neither of the two readings above: the runner is fine and the code was
       # never judged. Distinguishing that here is the point — a verdict worded
@@ -1214,6 +1319,31 @@ describe_check_failure() {
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — branch predates a make target the gate needs; merge ${LINT_BASE_BRANCH} in (triggered by ${user})"
       SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — this branch's \`Makefile\` has no rule for a target the gate invokes, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Merge \`${LINT_BASE_BRANCH}\` into the branch and sign off again."$'\n'
       SIGNOFF_FAILURE_MESSAGE="sign-off could not run: this branch's Makefile has no rule for a target the gate invokes (the checks did not run) — merge ${LINT_BASE_BRANCH} in and sign off again"
+      ;;
+    stale-lockfile)
+      # Same shape as missing-target: the runner is fine, the code was never
+      # judged, and the remedy is one command. Without its own case this reads as
+      # "Sign-off checks failed", which sends the author looking for a lint denial
+      # in a log that contains no compilation at all.
+      #
+      # "missing or out of date" because the preflight returns this kind for both:
+      # an absent Cargo.lock is a `--locked` violation in cargo's own terms, not an
+      # absence of one, and the two share a remedy.
+      SIGNOFF_FAILURE_STATUS_DESC="Sign-off could not run after ${elapsed}s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Could not run** after ${elapsed}s — \`Cargo.lock\` is missing, or cargo would have to rewrite it to build this branch, so **the checks did not run and the branch was not evaluated**. Nothing here is a statement about the code. Run \`cargo update --workspace\` on the branch, commit the regenerated \`Cargo.lock\`, and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off could not run: Cargo.lock is missing or does not match the workspace manifests (the checks did not run) — run 'cargo update --workspace', commit it, then sign off again"
+      ;;
+    rewritten-lockfile)
+      # The inverse of every case above: the checks *did* run, and they passed.
+      # What is refused is the attestation, because cargo brought Cargo.lock up to
+      # date while they ran, so the tree they passed on is not the tree the commit
+      # describes. Saying "the checks did not run" here — which sharing
+      # stale-lockfile's status would do — sends the author to look for a lint
+      # denial in a log full of green, and understates the remedy: there is
+      # nothing in the diff to fix, only a regenerated lockfile to commit.
+      SIGNOFF_FAILURE_STATUS_DESC="Checks passed in ${elapsed}s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by ${user})"
+      SIGNOFF_FAILURE_SUMMARY="### Sign-off"$'\n'"**Cannot attest** after ${elapsed}s — **the checks ran and passed**, but cargo brought \`Cargo.lock\` up to date while they ran, so the committed lockfile does not describe the tree they passed on and the merge queue would reject it. Nothing here is a statement about the code, and there is nothing in the diff to fix. Commit the regenerated \`Cargo.lock\` and sign off again."$'\n'
+      SIGNOFF_FAILURE_MESSAGE="sign-off cannot attest this branch: the checks passed, but they rewrote Cargo.lock — commit the regenerated Cargo.lock and sign off again"
       ;;
     *)
       SIGNOFF_FAILURE_STATUS_DESC="Sign-off checks failed after ${elapsed}s (triggered by ${user})"
@@ -1376,6 +1506,196 @@ preflight_disk() {
   return "$EXIT_DISK_EXHAUSTED"
 }
 
+# Stop before the Rust checks when Cargo.lock does not describe the manifests —
+# including when it is not there at all.
+#
+# `pr.yml` asks this question twice now: once early in `Build and Test` (cheap and
+# named) and once at the bottom of that job as a backstop. Neither runs on a pull
+# request, though — there `Attestation` is the only job — so the merge queue is
+# where a stale lockfile is first seen, and the queue is also where this shape is
+# born: one PR changes a manifest version while another adds or renames a member,
+# git merges both cleanly because they touch different regions, and nothing
+# regenerates the lock for the combination. On 2026-08-26 that ejected 13 queue
+# branches, each after the better part of an hour (#13598).
+#
+# The sign-off gate is therefore the first place the *author* can be told, and
+# asking cargo to resolve without permission to rewrite the lock answers it in
+# seconds.
+#
+# `--locked` rather than a hand-rolled version comparison, because the comparison
+# is cargo's resolution: members inherit versions from `[workspace.package]`,
+# dependencies resolve through `[patch]` tables, and reimplementing that would be
+# a second resolver to keep in step with the first. It also means a *missing*
+# lockfile is covered without a special case — cargo calls that a `--locked`
+# violation too, in the same words ("cannot create the lock file … because
+# --locked was passed"), which matters because the pr.yml backstop cannot see one:
+# `git diff` ignores untracked files, so a branch that deletes Cargo.lock and lets
+# the first cargo command recreate it would otherwise pass everything.
+#
+# Fatal on local runs too, for preflight_make_targets' reason: this is not a
+# threshold someone may reasonably run under, it is a step certain to fail later.
+preflight_lockfile() {
+  local out rc=0
+
+  # No manifest here means nothing to resolve. Not keyed on Cargo.lock: its
+  # absence is the condition above, not an exemption from it. Running from a
+  # member directory is fine — cargo walks up to the workspace root and reads the
+  # root lockfile, so this asks the same question wherever it is invoked.
+  [[ -f Cargo.toml ]] || { debug "no Cargo.toml here — nothing to check"; return 0; }
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    info "cargo not found — skipping the Cargo.lock check"
+    return 0
+  fi
+
+  # Captured with `|| rc=$?` rather than read from $? on the next line: this
+  # script runs under `set -e`, and a bare failing assignment would abort the
+  # run on cargo's status before the guard could decide what it meant.
+  # `--color never` so escape sequences cannot land inside the phrase matched
+  # below.
+  out="$(cargo metadata --locked --color never --format-version 1 2>&1 >/dev/null)" || rc=$?
+  if (( rc == 0 )); then
+    debug "Cargo.lock still describes the workspace manifests"
+    return 0
+  fi
+
+  # Only cargo's own refusal to write the lock is a verdict about the branch.
+  # Every other failure — an unreachable registry, a manifest cargo cannot read
+  # at all, a missing rustc — is either infrastructure or something the gate
+  # itself reports with far better context a few minutes later, and calling it a
+  # lockfile problem here would send the reader to the wrong fix.
+  #
+  # The wording has changed across cargo releases, and differs between the stale
+  # and missing cases ("cannot update the lock file … because --locked was
+  # passed", "cannot create the lock file … because --locked was passed", "the
+  # lock file … needs to be updated but --locked was passed"); all of them name
+  # the flag, so match on that rather than on a whole phrase. If it changes again
+  # this guard stops guarding rather than misfiring — and
+  # scripts/test_signoff_disk_guard.sh drives the *installed* cargo against real
+  # stale and missing fixtures, so drift surfaces as a failing test instead of as
+  # a check that quietly stopped working.
+  if [[ "$out" != *"--locked was passed"* ]]; then
+    info "warning: could not check whether Cargo.lock is current (cargo metadata exited ${rc} for another reason) — skipping that check"
+    debug "cargo metadata --locked said: ${out}"
+    return 0
+  fi
+
+  # Caller-neutral wording on purpose: this function now runs from two places
+  # with different stakes — the sign-off gate, where it decides whether a branch
+  # is evaluated at all, and pr.yml's `Build and Test`, where it is the first step
+  # of a merge-queue build. Saying "the branch was not evaluated" or "sign off
+  # again" would be false in one of them. The sign-off-specific framing lives
+  # where it belongs, in describe_check_failure's `stale-lockfile` case.
+  #
+  # Not "run any cargo command" either: `cargo fmt` and `cargo --version` resolve
+  # nothing, and anything run under `--locked` is refused for this very reason.
+  # Name one that regenerates the lockfile.
+  local remedy="Run 'cargo update --workspace', commit the regenerated Cargo.lock, and push."
+  info "${NO} Cargo.lock does not describe the workspace manifests. Cargo says:"
+  printf '%s\n' "$out" | bullet "    " >&2
+  info "  Cargo has to write the lockfile before anything here can build, so every job that"
+  info "  checks it fails — in the merge queue, only after the whole suite has run."
+  info "  ${remedy}"
+  if is_remote_run || in_actions; then
+    # Same reasoning as the other two preflights': a failed step does not show
+    # its summary on the run page, so the annotation is what an operator reads.
+    echo "::error title=Cargo.lock does not match the manifests::Cargo has to write Cargo.lock before this branch can build. ${remedy}"
+  fi
+  append_step_summary "### Cargo.lock does not match the manifests"$'\n'"Cargo has to write \`Cargo.lock\` before this branch can build — it is missing, or it no longer describes these manifests. Nothing here is a statement about the code. ${remedy}"$'\n'
+  return "$EXIT_LOCKFILE_STALE"
+}
+
+# What `git` says about Cargo.lock right now, or the empty string when git cannot
+# answer (a JJ workspace, no repository, no git). `--untracked-files=all` because
+# the state a reader most needs named is one `git diff` cannot see: a lockfile
+# deleted in the commit and recreated by cargo is *untracked*, not modified.
+#
+# Diagnostic only. postcheck_lockfile decides on a lockfile_fingerprint, so an
+# empty answer here costs the operator a sentence, not the guard its verdict.
+lockfile_status() {
+  # Asked of git directly rather than through $VCS: this runs before detect_vcs on
+  # some paths, and an uninitialised $VCS would answer "no lockfile news" for a tree
+  # that has some. A colocated JJ workspace has a .git and is answered correctly; a
+  # non-colocated one has none and skips.
+  command -v git >/dev/null 2>&1 || return 0
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+  git status --porcelain --untracked-files=all -- Cargo.lock 2>/dev/null || true
+}
+
+# What Cargo.lock *is* right now: `absent`, or a digest of its bytes. Read off the
+# filesystem rather than out of `git status`, for two reasons the post-check below
+# depends on:
+#
+#   - Git cannot always answer. In a non-colocated JJ workspace there is no `.git`,
+#     so lockfile_status is empty both before and after the checks, and comparing
+#     two empty strings retires the guard silently in exactly the setup that has no
+#     other backstop.
+#   - Porcelain state is coarser than content. Under `scripts/signoff -f` a tree
+#     already carrying lockfile edits reads ` M Cargo.lock`, and it still reads
+#     ` M Cargo.lock` after cargo has rewritten it further — the same string for two
+#     different files. A digest separates "the run inherited this edit" from "the
+#     run made another one", which is the distinction the post-check is for.
+lockfile_fingerprint() {
+  [[ -f Cargo.lock ]] || { printf 'absent\n'; return 0; }
+
+  local digest=""
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256 Cargo.lock 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  if [[ -z "$digest" ]] && command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum Cargo.lock 2>/dev/null | awk 'NR==1{print $1}')"
+  fi
+  if [[ -z "$digest" ]]; then
+    # POSIX, so this is the floor rather than another maybe. CRC and size both, to
+    # keep it a content check and not a length check.
+    digest="$(cksum Cargo.lock 2>/dev/null | awk 'NR==1{print $1 "-" $2}')"
+  fi
+
+  # Never answer with the empty string. Two of those compare equal, so an empty
+  # answer does not degrade the guard, it retires it — the same failure mode as
+  # the git-less case above. Size alone is weaker, and says so.
+  printf '%s\n' "${digest:-size-$(wc -c <Cargo.lock 2>/dev/null | tr -d ' ')}"
+}
+
+# Refuse a sign-off whose own checks rewrote Cargo.lock.
+#
+# preflight_lockfile fails open on a cargo error it does not recognise — an
+# unreachable registry, or a reworded `--locked` diagnostic after a toolchain bump
+# — because reporting infrastructure as a stale lockfile sends the reader to the
+# wrong fix. But failing open means the gate then runs `lint-rust` and `nextest`,
+# which invoke cargo *without* `--locked`, and cargo will quietly bring the
+# lockfile up to date on its way past. Without this the run would pass and post
+# `signoff=success` for a HEAD whose committed lockfile does not describe it, and
+# the merge queue would be the first to notice — which is the whole failure this
+# change exists to move earlier.
+#
+# Compared against a snapshot taken before the checks rather than against "clean",
+# so `scripts/signoff -f` on a tree that was already carrying lockfile edits is
+# judged on what *this run* changed. The snapshot is a lockfile_fingerprint, not a
+# `git status` line — see that function for why the porcelain state cannot carry
+# this comparison.
+postcheck_lockfile() {
+  local before="$1" after
+  after="$(lockfile_fingerprint)"
+  [[ "$after" != "$before" ]] || return 0
+
+  # Git for the diagnostic only, never for the verdict: it names the state a reader
+  # can go look at, and it is allowed to have nothing to say.
+  local git_state
+  git_state="$(lockfile_status)"
+  local remedy="Commit the regenerated Cargo.lock and sign off again."
+  info "${NO} The checks rewrote Cargo.lock${git_state:+ (git status: ${git_state})}."
+  info "  Cargo brought the lockfile up to date while the gate ran, so the committed one does not"
+  info "  describe the tree these checks passed on, and the merge queue would reject it."
+  info "  ${remedy}"
+  if is_remote_run || in_actions; then
+    echo "::error title=Sign-off cannot attest this branch::The checks rewrote Cargo.lock, so the committed lockfile does not describe the tree they passed on. ${remedy}"
+  fi
+  append_step_summary "### Cargo.lock was rewritten by the checks"$'\n'"Cargo brought \`Cargo.lock\` up to date while the gate ran, so the committed one does not describe the tree these checks passed on and **the merge queue would reject it**. ${remedy}"$'\n'
+  # Not EXIT_LOCKFILE_STALE: these checks completed and passed. See that constant.
+  return "$EXIT_LOCKFILE_REWRITTEN"
+}
+
 # Unit tests for the packages a branch touched, run before the full workspace
 # lint. A broken test in the crate you just edited is the likeliest failure, and
 # it would otherwise surface only after the longest step in the gate.
@@ -1451,7 +1771,7 @@ run_checks() {
     return 0
   fi
 
-  # Both preflights sit after the Rust-changes skip for the same reason: a
+  # The preflights all sit after the Rust-changes skip for the same reason: a
   # docs-only sign-off invokes no make target and compiles nothing, so neither a
   # full volume nor a Makefile predating one of them is a reason to refuse it.
   #
@@ -1459,6 +1779,14 @@ run_checks() {
   # the disk floor cannot: whether this branch can run the gate at all.
   preflight_make_targets || return $?
   preflight_disk || return $?
+  # Last of the three: it is the only one that costs a cargo resolution pass
+  # (~10s warm), so the two that answer in milliseconds get to refuse first.
+  preflight_lockfile || return $?
+  # Snapshot the lockfile now, while the preflight has just vouched for it, so the
+  # post-check below can tell what the checks changed from what the tree already
+  # carried under a forced run.
+  local lock_before
+  lock_before="$(lockfile_fingerprint)"
 
   if [[ -z "${SIGNOFF_SKIP_TARGETED_LINT:-}" && -n "$revision" ]]; then
     packages=$(changed_workspace_packages "$revision" || true)
@@ -1510,6 +1838,11 @@ run_checks() {
   # knobs default to 1.0 (full depth) when unset, so this only affects this gate.
   CAYENNE_PROPTEST_SCALE=0.25 CAYENNE_PROPTEST_OPS_SCALE=0.25 \
     run_make_step nextest verify-cli || return $?
+
+  # The other half of the preflight: it fails open on a cargo error it cannot
+  # read, and the make steps above run cargo unlocked, so this is what stops a
+  # rewritten lockfile from being attested as if it were the committed one.
+  postcheck_lockfile "$lock_before" || return $?
 
   SIGNOFF_CHECK_SUMMARY="lint+test passed"
 }
@@ -1787,6 +2120,15 @@ combined_status_state() {
 # the in-run preflight, because it is the same function.
 cmd_preflight_disk() {
   preflight_disk
+}
+
+# The lockfile preflight as a subcommand, so pr.yml can run the same code the
+# sign-off gate runs instead of carrying a second copy of it in YAML. Two copies
+# of a guard drift, and the one that drifts is the one nobody notices has stopped
+# guarding. Called from the Build and Test job right after the toolchain setup —
+# see .github/workflows/pr.yml.
+cmd_preflight_lockfile() {
+  preflight_lockfile
 }
 
 cmd_status() {
@@ -2417,6 +2759,11 @@ CI (.github/workflows/signoff.yml):
                                before the toolchain setup steps run; fatal only
                                on a remote run (override: SIGNOFF_MIN_FREE_GIB)
 
+  scripts/signoff preflight-lockfile
+                               Ask cargo whether Cargo.lock still describes the
+                               manifests, before anything is built. Also run by
+                               pr.yml Build and Test, so both gates use one copy
+
 Maintainers:
   scripts/signoff check        Show whether '${TARGET_BRANCH}' requires sign-off
   scripts/signoff install      Preview the required-checks change (dry run)
@@ -2468,6 +2815,7 @@ main() {
     correct-cancelled) shift; cmd_correct_cancelled "$@" ;;
     clear-pending) shift; cmd_clear_pending "$@" ;;
     preflight-disk) shift; cmd_preflight_disk "$@" ;;
+    preflight-lockfile) shift; cmd_preflight_lockfile "$@" ;;
     check)    shift; cmd_check "$@" ;;
     install)  shift; cmd_install "$@" ;;
     version|--version) echo "signoff ${VERSION}" ;;

@@ -46,6 +46,7 @@ use std::{any::Any, sync::Arc};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use super::ConnectorComponent;
+use crate::identity::push_identity_fields;
 
 #[derive(Debug)]
 pub struct WorkflowsTableProvider {
@@ -62,7 +63,7 @@ impl WorkflowsTableProvider {
         repo: &str,
         dataset: &DatasetSpec,
     ) -> data_connector_api::DataConnectorResult<Self> {
-        let fields = vec![
+        let mut fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
@@ -79,6 +80,8 @@ impl WorkflowsTableProvider {
             ),
             Field::new("badge_url", DataType::Utf8, false),
         ];
+
+        push_identity_fields(&mut fields, true);
 
         let schema = Arc::new(Schema::new(fields));
         let component = ConnectorComponent::from(dataset);

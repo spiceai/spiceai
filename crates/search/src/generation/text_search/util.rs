@@ -19,6 +19,7 @@ use std::sync::Arc;
 use arrow::{
     array::{ArrayRef, RecordBatch, StringArray},
     datatypes::DataType,
+    error::ArrowError,
 };
 use arrow_schema::{Field as ArrowField, Schema, SchemaRef};
 
@@ -65,6 +66,15 @@ pub fn with_json_subset_column(
     new_columns.push(json_array);
 
     RecordBatch::try_new(new_schema, new_columns).boxed()
+}
+
+/// Returns `batch` with every column named in `exclude` removed. Column order is otherwise
+/// preserved.
+pub fn without_columns(batch: &RecordBatch, exclude: &[String]) -> Result<RecordBatch, ArrowError> {
+    let keep: Vec<usize> = (0..batch.num_columns())
+        .filter(|&i| !exclude.iter().any(|e| e == batch.schema().field(i).name()))
+        .collect();
+    batch.project(&keep)
 }
 
 #[cfg(test)]

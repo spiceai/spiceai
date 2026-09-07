@@ -78,43 +78,68 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Result of [`load_tokenization`]: the parsed tokenizer, the model config, and
+/// the derived [`Tokenization`] settings needed to build a TEI `Infer` pipeline.
+pub(crate) struct LoadedTokenization {
+    pub tokenizer: Tokenizer,
+    pub config: ModelConfig,
+    pub tokenization: Tokenization,
+}
+
 /// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
 /// `Infer` pipeline from a directory of model artifacts. Shared by
 /// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
 /// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
 /// otherwise duplicate this setup.
-pub(crate) fn load_tokenization(
+///
+/// Runs the synchronous load — reading `config.json`, the sentence-transformers
+/// config, and parsing `tokenizer.json` — on a blocking thread. For a large
+/// tokenizer the parse alone can exceed the runtime's per-task latency budget,
+/// so keeping it off the Tokio worker thread prevents it from stalling other
+/// tasks (and `/health`) during model registration.
+pub(crate) async fn load_tokenization(
     root: &Path,
     max_seq_length_overwrite: Option<usize>,
-) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
-    let tokenizer = load_tokenizer(root)?;
-    let config = load_config(root)?;
-    let position_offset = position_offset(&config);
+) -> Result<LoadedTokenization> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let tokenizer = load_tokenizer(&root)?;
+        let config = load_config(&root)?;
+        let position_offset = position_offset(&config);
 
-    let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
-        max_seq_length
-    } else {
-        match max_seq_length_from_st_config(root) {
-            Ok(max_seq_length_opt) => {
-                max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+            max_seq_length
+        } else {
+            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+            match max_seq_length_from_st_config(&root) {
+                Ok(max_seq_length_opt) => {
+                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                    config.max_position_embeddings - position_offset
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
-                config.max_position_embeddings - position_offset
-            }
-        }
-    };
+        };
 
-    let token = Tokenization::new(
-        1,
-        tokenizer.clone(),
-        max_input_length,
-        position_offset,
-        None,
-        None,
-    );
+        let tokenization = Tokenization::new(
+            1,
+            tokenizer.clone(),
+            max_input_length,
+            position_offset,
+            None,
+            None,
+        );
 
-    Ok((tokenizer, config, token))
+        Ok(LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization,
+        })
+    })
+    .await
+    .boxed()
+    .context(FailedToInstantiateEmbeddingModelSnafu)?
 }
 
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
@@ -309,6 +334,16 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
     }
 
     Ok(temp_dir)
+}
+
+/// Async wrapper around [`link_files_into_tmp_dir`] that runs the synchronous
+/// hard-linking filesystem I/O on a blocking thread, so it never stalls a Tokio
+/// worker thread (and `/health`) during model registration.
+pub async fn link_files_into_tmp_dir_blocking(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
+    tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
+        .await
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -43,6 +43,7 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
@@ -234,6 +235,16 @@ pub enum WasmBuildError {
 
     #[snafu(display("failed to decode Arrow IPC stream returned by WASM function: {source}"))]
     DecodeArrow { source: arrow::error::ArrowError },
+
+    #[snafu(display(
+        "failed to read the Arrow IPC stream returned by WASM function '{function_name}' ({source}), so the function cannot return rows. \
+        Return the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+        See: https://spiceai.org/docs/features/functions"
+    ))]
+    MapEntriesNotNormalizable {
+        function_name: String,
+        source: arrow_tools::map_entries::Error,
+    },
 
     #[snafu(display(
         "WASM table function output schema does not match declared return schema: {details}"
@@ -582,7 +593,7 @@ impl TableProvider for WasmTableProvider {
             .await
             .map_err(|source| DataFusionError::Execution(source.to_string()))?
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        let mut batches = decode_ipc(&output_ipc, Arc::clone(&self.output_schema))
+        let mut batches = decode_ipc(&self.name, &output_ipc, Arc::clone(&self.output_schema))
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         for batch in &batches {
             validate_schema(
@@ -1126,14 +1137,28 @@ fn encode_ipc(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn decode_ipc(bytes: &[u8], empty_schema: SchemaRef) -> Result<Vec<RecordBatch>> {
+fn decode_ipc(
+    function_name: &str,
+    bytes: &[u8],
+    empty_schema: SchemaRef,
+) -> Result<Vec<RecordBatch>> {
     if bytes.is_empty() {
         return Ok(vec![RecordBatch::new_empty(empty_schema)]);
     }
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(DecodeArrowSnafu)?;
+    // A WASM module is free to declare a MAP's `entries` field nullable, which the Arrow map
+    // layout forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds
+    // the column — and `validate_schema` below would reject it first, naming the nullability
+    // rather than the layout rule it breaks. One stream carries one schema, so what its batches
+    // need is resolved once.
+    let normalizer = MapEntriesNormalizer::for_schema(&reader.schema());
     reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context(DecodeArrowSnafu)
+        .map(|batch| {
+            normalizer
+                .normalize(batch.context(DecodeArrowSnafu)?)
+                .context(MapEntriesNotNormalizableSnafu { function_name })
+        })
+        .collect()
 }
 
 fn validate_schema(function_name: &str, actual: &Schema, expected: &Schema) -> Result<()> {
@@ -1900,5 +1925,80 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
         assert_eq!(values.values(), &[1_i64, 2, 3]);
+    }
+
+    /// Builds a `MapArray` the way the Arrow IPC reader does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a module's non-conforming
+    /// declaration survives the decode.
+    fn nullable_entries_map_batch() -> RecordBatch {
+        use arrow::array::{Array, ArrayData, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::Fields;
+
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("v0")])) as ArrayRef,
+            ],
+            None,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(data_type.clone())
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    fn ipc_stream(batch: &RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).expect("ipc writer");
+            writer.write(batch).expect("write batch");
+            writer.finish().expect("finish stream");
+        }
+        buf
+    }
+
+    /// Regression test for #13495: a WASM module declaring a `MAP`'s `entries` nullable — which
+    /// the Arrow map layout forbids — is brought into line at the decode point. Left as declared,
+    /// `validate_schema` rejects the batch for a nullability difference it never explains, and
+    /// any kernel that rebuilds the column fails reporting nulls the column does not hold.
+    #[test]
+    fn a_nullable_entries_map_returned_by_a_module_is_decoded_and_accepted() {
+        let batch = nullable_entries_map_batch();
+        let declared = arrow_tools::map_entries::conforming_schema(batch.schema());
+
+        let decoded = decode_ipc("m_fn", &ipc_stream(&batch), Arc::clone(&declared))
+            .expect("a nullable entries declaration is relabelled, not refused");
+        let [decoded] = decoded.as_slice() else {
+            panic!("one batch in, one batch out");
+        };
+        assert_eq!(&decoded.schema(), &declared);
+        validate_schema("m_fn", decoded.schema().as_ref(), declared.as_ref())
+            .expect("the corrected batch matches the function's declared return schema");
     }
 }

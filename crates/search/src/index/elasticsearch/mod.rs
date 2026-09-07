@@ -122,6 +122,100 @@ pub struct ElasticsearchIndex {
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
 }
 
+/// A client whose every call is a test failure.
+///
+/// Some write-path helpers take the whole [`ElasticsearchIndex`] but touch neither the
+/// cluster nor the embedder — they are handed the embeddings and the `_id`s. Those tests
+/// still have to populate the struct's fields, and this makes an accidental call loud
+/// rather than letting a stub quietly answer one.
+#[cfg(test)]
+pub(super) mod unused_client {
+    use elasticsearch::{
+        Elasticsearch, Error, MappingResponse, Result, SearchRequest, SearchResponse,
+    };
+
+    #[derive(Debug)]
+    pub(crate) struct UnusedClient;
+
+    impl UnusedClient {
+        fn refuse<T>(method: &str) -> Result<T> {
+            Err(Error::ElasticsearchError {
+                status: 500,
+                message: format!("unexpected call to {method}"),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Elasticsearch for UnusedClient {
+        async fn get_mapping(&self, _: &str) -> Result<MappingResponse> {
+            Self::refuse("get_mapping")
+        }
+        async fn search(&self, _: &str, _: &SearchRequest) -> Result<SearchResponse> {
+            Self::refuse("search")
+        }
+        async fn search_raw(&self, _: &str, _: &serde_json::Value) -> Result<SearchResponse> {
+            Self::refuse("search_raw")
+        }
+        async fn open_point_in_time(&self, _: &str, _: &str) -> Result<String> {
+            Self::refuse("open_point_in_time")
+        }
+        async fn search_point_in_time(&self, _: &serde_json::Value) -> Result<SearchResponse> {
+            Self::refuse("search_point_in_time")
+        }
+        async fn close_point_in_time(&self, _: &str) -> Result<()> {
+            Self::refuse("close_point_in_time")
+        }
+        async fn index_exists(&self, _: &str) -> Result<bool> {
+            Self::refuse("index_exists")
+        }
+        async fn create_index(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value> {
+            Self::refuse("create_index")
+        }
+        async fn put_mapping(&self, _: &str, _: &serde_json::Value) -> Result<serde_json::Value> {
+            Self::refuse("put_mapping")
+        }
+        async fn get_index_refresh_interval(&self, _: &str) -> Result<Option<String>> {
+            Self::refuse("get_index_refresh_interval")
+        }
+        async fn put_index_settings(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("put_index_settings")
+        }
+        async fn refresh_index(&self, _: &str) -> Result<serde_json::Value> {
+            Self::refuse("refresh_index")
+        }
+        async fn force_merge(&self, _: &str, _: u32) -> Result<serde_json::Value> {
+            Self::refuse("force_merge")
+        }
+        async fn index_document(
+            &self,
+            _: &str,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("index_document")
+        }
+        async fn bulk_index(
+            &self,
+            _: &str,
+            _: &[(Option<String>, serde_json::Value)],
+        ) -> Result<serde_json::Value> {
+            Self::refuse("bulk_index")
+        }
+        async fn delete_by_query(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Self::refuse("delete_by_query")
+        }
+    }
+}
+
 /// Optional Elasticsearch maintenance to run around full/append table-sink writes.
 #[derive(Debug, Clone, Default)]
 pub struct ElasticsearchIndexWriteOptions {

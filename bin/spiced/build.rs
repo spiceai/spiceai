@@ -71,13 +71,16 @@ fn build_features() -> String {
         "nfs",
         "smb",
         "alloc-jemalloc",
+        "alloc-jemalloc-profiling",
         "alloc-mimalloc",
         "alloc-system",
     ];
     let enabled: Vec<&str> = distinguishing
         .into_iter()
         .filter(|feature| {
-            std::env::var_os(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_some()
+            // Cargo uppercases the feature name and maps `-` to `_`.
+            let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+            std::env::var_os(var).is_some()
         })
         .collect();
 

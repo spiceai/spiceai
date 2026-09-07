@@ -254,6 +254,35 @@ impl PreparedOverwrite {
             )
             .await?;
 
+        // Arm retention the moment the flip commits, the same way an append does (see
+        // `AppendMutationWriter::write_prepared_stream`). An overwrite reloads every
+        // source row, so a `retention_sql` predicate has to run again over the new
+        // snapshot — otherwise the rows it deletes come straight back on each full
+        // refresh and the acceleration keeps data the user asked to be deleted.
+        // `retention_period` is untouched by this: it is a scan-time keep filter, so a
+        // reloaded expired row is hidden from every read without anything deleting it,
+        // and the gate below (`has_retention_delete_filters`) matches that split.
+        //
+        // Scheduled HERE and not at the end: every step below this awaits, so a refresh
+        // cancelled part-way through them would drop this future after the new rows were
+        // already visible and leave the matching ones queryable until some later refresh
+        // happened to arm a pass. Only the flip has to have succeeded for the request to
+        // be owed. Arming is a synchronous flag plus a debounced task, and that task
+        // takes `write_lock` itself, so it simply waits out the guard still held here.
+        if self.table.has_retention_delete_filters() {
+            // Arming only: the flip re-baselines `num_rows` itself, so this call carries
+            // no live-row delta and the claim it must supply is released rather than
+            // queued. Reserving one anyway is how a caller with nothing to persist
+            // satisfies the gate that stops a real delta being claimed after its publish.
+            self.table.schedule_post_write_maintenance(
+                None,
+                false,
+                true,
+                0,
+                self.table.reserve_live_rows_delta().published(),
+            );
+        }
+
         // Drain the metastore WAL on the debounced maintenance tick. An inlined
         // overwrite's whole payload is an Arrow IPC BLOB written straight into
         // the metastore, and with the inline auto-checkpoint disabled by default
@@ -285,9 +314,7 @@ impl PreparedOverwrite {
             );
         }
 
-        self.table
-            .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
-            .await;
+        self.table.schedule_old_snapshot_cleanup();
 
         // Invalidate the in-memory optimizer cache so a zero-row overwrite
         // leaves the cache empty rather than stale; `persist_table_stats`
@@ -297,9 +324,10 @@ impl PreparedOverwrite {
             .reset_table_stats_after_overwrite(&self.write_stats_acc)
             .await;
 
-        // Drop the write guard last so all visibility-related updates happen
-        // under exclusive table access.
+        // All visibility-related updates above happen under exclusive table access; the
+        // retention pass takes this same lock, so it can only proceed once this drops.
         let _ = self.write_guard;
+
         Ok(self.row_count)
     }
 

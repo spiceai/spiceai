@@ -28,6 +28,13 @@ use serde_json::Value;
 use std::borrow::Cow;
 
 /// Tools that implement the [`SpiceModelTool`] trait can automatically be used by LLMs in the runtime.
+///
+/// **A method added here has to be forwarded in `rename::RenamedTool`.** That wrapper
+/// re-exposes a tool under a catalog-qualified name and must answer for the tool it wraps on
+/// everything but `name`. A method carrying a default impl is inherited there silently — it
+/// compiles, and the wrapper then answers with the trait's fallback rather than the wrapped
+/// tool's real value (spiceai/spiceai#13443). Its `assert_answers_for_inner` test asserts the
+/// methods below as they stand and cannot fail for one that is added, so extend that too.
 #[async_trait]
 pub trait SpiceModelTool: Sync + Send {
     fn name(&self) -> Cow<'_, str>;
