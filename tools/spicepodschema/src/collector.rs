@@ -234,7 +234,7 @@ pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
         },
         ModelSourceSchema {
             name: "huggingface",
-            prefix: "huggingface",
+            prefix: "hf",
             parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
