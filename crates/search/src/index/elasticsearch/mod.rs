@@ -49,6 +49,7 @@ use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
+use elasticsearch_datafusion_filter::EsFilterSchema;
 
 /// Default kNN candidate-pool size used when a `LIMIT` cannot be pushed down to the
 /// Elasticsearch index scan. Matches the DuckDB vector backend's default
@@ -120,6 +121,13 @@ pub struct ElasticsearchIndex {
 
     /// External index maintenance to run around full/append writes.
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
+
+    /// The filter-pushdown schema, derived from the real Elasticsearch mapping (not the Arrow
+    /// schema) once, when the index is constructed. Fetching the real mapping requires an async
+    /// ES call, which `query_table_provider` (synchronous) cannot make — so this is populated
+    /// eagerly at construction time instead of lazily inside `query_table_provider`. See
+    /// `runtime::embeddings::index::elasticsearch::try_from_table`.
+    pub filter_schema: EsFilterSchema,
 }
 
 /// A client whose every call is a test failure.
@@ -395,6 +403,31 @@ impl ElasticsearchIndexWriteMaintenance {
     }
 }
 
+/// Primary-key column names safe to add to a filter schema's `filterable` set.
+///
+/// A primary key is filterable by default, but a user can also declare it a `NonFilterable`
+/// metadata column (e.g. via `metadata: { vectors: non-filterable }` on the column in the
+/// Spicepod config); that explicit opt-out must be honored even though the column is also the
+/// primary key.
+///
+/// Production code now gets `filter_schema` pre-built from the real Elasticsearch mapping (see
+/// `filter_schema` on [`ElasticsearchIndex`]/[`ElasticsearchTextIndex`]) instead of deriving it
+/// from the Arrow schema here, so this is only exercised by tests that reconstruct the
+/// mapping-free schema `query_table_provider` used to build inline, to keep asserting the same
+/// filterable/non-filterable semantics.
+#[cfg(test)]
+fn filterable_primary_key_names(
+    primary_key: &[Field],
+    metadata_columns: &MetadataColumns,
+) -> Vec<String> {
+    let non_filterable = metadata_columns.non_filterable_names();
+    primary_key
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|name| !non_filterable.contains(name))
+        .collect()
+}
+
 #[async_trait]
 impl SearchIndex for ElasticsearchIndex {
     fn search_column(&self) -> String {
@@ -426,6 +459,7 @@ impl SearchIndex for ElasticsearchIndex {
             source_schema: Arc::clone(&self.source_schema),
             query_text: Some(query.to_string()),
             embedder: Some(Arc::new(EmbedQueryAdapter(Arc::clone(&self.compute_query)))),
+            filter_schema: self.filter_schema.clone(),
         });
 
         Ok(
@@ -698,14 +732,39 @@ pub struct ElasticsearchTextIndex {
     /// Full source schema for extracting fields.
     pub source_schema: SchemaRef,
 
+    /// Filterable / non-filterable metadata columns as declared by the user.
+    /// These influence the ES mapping (index: true vs index: false) but are
+    /// otherwise written into `_source` like any other source column.
+    pub metadata_columns: MetadataColumns,
+
     /// Maximum number of rows to send per Elasticsearch `_bulk` request.
     pub batch_write_rows: usize,
 
     /// External index maintenance to run around full/append writes.
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
+
+    /// The filter-pushdown schema, derived from the real Elasticsearch mapping (not the Arrow
+    /// schema) once, when the index is constructed — the same reasoning as
+    /// [`ElasticsearchIndex`]'s field of the same name: fetching the real mapping requires an
+    /// async ES call that `query_table_provider` (synchronous) cannot make.
+    pub filter_schema: EsFilterSchema,
 }
 
 impl ElasticsearchTextIndex {
+    /// Metadata fields returned by the search plan, excluding primary-key duplicates.
+    fn metadata_fields(&self) -> Vec<Field> {
+        self.metadata_columns
+            .iter()
+            .filter(|column| {
+                !self
+                    .primary_key
+                    .iter()
+                    .any(|field| field.name() == column.name())
+            })
+            .map(|column| Arc::unwrap_or_clone(column.field()))
+            .collect()
+    }
+
     /// Wrap a [`TableProvider`] so that its schema matches the normalized source schema
     /// used by the ES text index: type-cast where needed and mark all fields nullable.
     /// ES text search results never include dense_vector columns, so the base table
@@ -770,6 +829,7 @@ impl SearchIndex for ElasticsearchTextIndex {
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let mut result_fields: Vec<Field> = self.primary_key.clone();
+        result_fields.extend(self.metadata_fields());
         result_fields.push(Field::new(
             SEARCH_SCORE_COLUMN_NAME,
             DataType::Float64,
@@ -785,6 +845,7 @@ impl SearchIndex for ElasticsearchTextIndex {
             limit: 10_000,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
+            filter_schema: self.filter_schema.clone(),
         });
 
         Ok(
@@ -810,6 +871,13 @@ impl Index for ElasticsearchTextIndex {
         for field in &self.search_fields {
             if !cols.contains(field) {
                 cols.push(field.clone());
+            }
+        }
+        // Include user-declared metadata columns (`vectors: filterable | non-filterable`)
+        // so they survive projection pruning and reach `_source` on refresh/CDC indexing.
+        for name in self.metadata_columns.all_names() {
+            if !cols.contains(&name) {
+                cols.push(name);
             }
         }
         cols
@@ -1013,6 +1081,21 @@ mod write_maintenance_tests {
         opts: ElasticsearchIndexWriteOptions,
     ) -> ElasticsearchIndexWriteMaintenance {
         ElasticsearchIndexWriteMaintenance::new(opts)
+    }
+
+    /// Reconstructs the mapping-free filter schema `query_table_provider` used to build inline
+    /// before `filter_schema` became a pre-built field sourced from the real Elasticsearch
+    /// mapping. Used only by tests that have no real mapping to fetch, so they can keep asserting
+    /// the same filterable/non-filterable semantics against a schema that mirrors the old
+    /// production logic.
+    fn spice_managed_filter_schema(
+        primary_key: &[Field],
+        metadata_columns: &MetadataColumns,
+        source_schema: &Schema,
+    ) -> EsFilterSchema {
+        let mut filterable = filterable_primary_key_names(primary_key, metadata_columns);
+        filterable.extend(metadata_columns.filterable_names());
+        EsFilterSchema::from_spice_managed(source_schema, &filterable)
     }
 
     /// `on_write_start` with no options configured is a pure no-op: no ES calls.
@@ -1222,6 +1305,135 @@ mod write_maintenance_tests {
         assert_eq!(client.put_settings_calls.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn text_index_exposes_and_filters_metadata() {
+        use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown, col, lit};
+
+        let metadata_columns: MetadataColumns = vec![
+            MetadataColumn::Filterable(Arc::new(Field::new("category", DataType::Int64, true))),
+            MetadataColumn::NonFilterable(Arc::new(Field::new(
+                "description",
+                DataType::Utf8,
+                true,
+            ))),
+        ]
+        .into();
+        let primary_key = vec![Field::new("id", DataType::Int64, false)];
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new("category", DataType::Int64, true),
+            Field::new("description", DataType::Utf8, true),
+        ]));
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
+        let index = ElasticsearchTextIndex {
+            client: Arc::new(MockElasticsearch::default()),
+            es_index: "test-index".to_string(),
+            search_column_name: "body".to_string(),
+            search_fields: vec!["body".to_string()],
+            primary_key,
+            source_schema,
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            filter_schema,
+        };
+
+        let plan = index
+            .query_table_provider("query")
+            .expect("text search plan should build");
+        plan.schema()
+            .field_with_name(None, "category")
+            .expect("filterable metadata should be returned");
+        plan.schema()
+            .field_with_name(None, "description")
+            .expect("non-filterable metadata should be returned");
+
+        let LogicalPlan::TableScan(scan) = plan.as_ref() else {
+            panic!("expected a table scan");
+        };
+        let source = scan
+            .source
+            .downcast_ref::<DefaultTableSource>()
+            .expect("expected the default table source");
+        let table = source
+            .table_provider
+            .downcast_ref::<ElasticsearchTextSearchTable>()
+            .expect("expected an Elasticsearch text search table");
+        let filter = col("category").eq(lit(7_i64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Exact]
+        );
+        let non_filterable = col("description").eq(lit("internal"));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&non_filterable])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+
+        let required = index.required_columns();
+        assert!(required.contains(&"category".to_string()));
+        assert!(required.contains(&"description".to_string()));
+    }
+
+    #[test]
+    fn primary_key_honors_explicit_non_filterable_declaration() {
+        use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown, col, lit};
+
+        // "id" is both the primary key and explicitly declared non-filterable; the opt-out must
+        // win over the primary key's usual default-filterable status.
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            Field::new("id", DataType::Int64, false),
+        ))]
+        .into();
+        let primary_key = vec![Field::new("id", DataType::Int64, false)];
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
+        let index = ElasticsearchTextIndex {
+            client: Arc::new(MockElasticsearch::default()),
+            es_index: "test-index".to_string(),
+            search_column_name: "body".to_string(),
+            search_fields: vec!["body".to_string()],
+            primary_key,
+            source_schema,
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            filter_schema,
+        };
+
+        let plan = index
+            .query_table_provider("query")
+            .expect("text search plan should build");
+        let LogicalPlan::TableScan(scan) = plan.as_ref() else {
+            panic!("expected a table scan");
+        };
+        let source = scan
+            .source
+            .downcast_ref::<DefaultTableSource>()
+            .expect("expected the default table source");
+        let table = source
+            .table_provider
+            .downcast_ref::<ElasticsearchTextSearchTable>()
+            .expect("expected an Elasticsearch text search table");
+        let filter = col("id").eq(lit(1_i64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+    }
+
     // ── Chunked warm-index fallback contract ─────────────────────────────────────
 
     use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
@@ -1287,6 +1499,9 @@ mod write_maintenance_tests {
             ),
         ]));
 
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
+
         ElasticsearchIndex {
             client: Arc::new(MockElasticsearch::default()),
             es_index: "test-index".to_string(),
@@ -1300,6 +1515,7 @@ mod write_maintenance_tests {
             source_schema,
             metadata_columns,
             batch_write_rows: 1000,
+            filter_schema,
             write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
         }
     }

@@ -60,9 +60,9 @@ pub(crate) fn dataset_attaches_stream(
 /// Builds (but does not register) a [`FullTextDatabaseIndex`] over `inner_table_provider`.
 ///
 /// `store_fields_override` replaces the store-fields set derived from the columns' vector
-/// metadata: the compound warm-tier caller passes `Some(&[])` so the index's query schema is
-/// exactly `[primary key…, _score]` (matching the Elasticsearch secondary tier); the
-/// plain full-text caller passes `None` to keep the metadata-derived set.
+/// metadata. The compound warm-tier caller supplies the Elasticsearch tier's metadata fields so
+/// both query plans have identical schemas; the plain full-text caller passes `None` to keep the
+/// metadata-derived set.
 ///
 /// Expects at least one [`Column`] to have a full text search column configured.
 pub(crate) fn build_full_text_database_index(
@@ -275,14 +275,18 @@ pub(crate) async fn add_compound_fts_to_table(
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
 
-    // Warm Tantivy tier over the raw base provider with `store_fields = []`, so its query schema
-    // is exactly `[primary key…, _score]` — the same column set the Elasticsearch tier
-    // emits, which is what the compound's empty-result fallback requires.
+    // Store the same metadata fields in the warm Tantivy tier so both sides of the empty-result
+    // fallback expose identical `[primary key…, metadata…, _score]` schemas.
+    let metadata_fields: Vec<String> = es_index
+        .metadata_columns
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
     let warm_index = match build_full_text_database_index(
         Arc::clone(&inner_table_provider),
         columns,
         tbl,
-        Some(&[] as &[String]),
+        Some(&metadata_fields),
         stream_attached,
     ) {
         Ok(index) => index,
@@ -346,7 +350,8 @@ pub(crate) async fn build_elasticsearch_text_index(
     use crate::component::column::full_text_search_config;
     use crate::component::dataset::FullTextSearchDatasetConfig;
     use crate::embeddings::index::elasticsearch::{
-        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, normalize_es_data_type,
+        ElasticsearchIndexWriteMaintenance, ensure_index_with_text_mapping, es_metadata_columns,
+        normalize_es_data_type,
     };
     use arrow_schema::Field;
     use runtime_search::store_params::elasticsearch::{
@@ -458,12 +463,31 @@ pub(crate) async fn build_elasticsearch_text_index(
     )?;
     let write_maintenance = Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options));
 
+    // Resolve spicepod `vectors: filterable | non-filterable` hints into metadata columns,
+    // mirroring the vector-index path: filterable columns get `index: true` (usable in query
+    // filters), non-filterable columns are stored in `_source` only.
+    let search_field_names: Vec<&str> = search_fields.iter().map(String::as_str).collect();
+    let metadata_columns = es_metadata_columns(columns, &source_schema, &search_field_names);
+
     // Ensure the ES index exists with text mappings for all search fields.
     ensure_index_with_text_mapping(
         client.as_ref(),
         &fts_params.es_index,
         &search_fields,
+        &metadata_columns,
         index_settings.as_ref(),
+    )
+    .await?;
+
+    // `ensure_index_with_text_mapping` is best-effort for a pre-existing incompatible index (it
+    // logs a warning and continues on a `put_mapping` failure), so the mapping it just applied
+    // may not match what Spice asked for. Read the real mapping back so the filter-pushdown
+    // schema reflects what Elasticsearch actually indexed, not what Spice assumed — the index was
+    // just confirmed to exist, so a `get_mapping` failure here is a real error worth surfacing,
+    // not one to mask with a fallback.
+    let filter_schema = crate::embeddings::index::elasticsearch::fetch_filter_schema(
+        client.as_ref(),
+        &fts_params.es_index,
     )
     .await?;
 
@@ -485,8 +509,10 @@ pub(crate) async fn build_elasticsearch_text_index(
         search_fields,
         primary_key: pk_fields,
         source_schema: Arc::clone(&source_schema),
+        metadata_columns,
         batch_write_rows: fts_params.params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
+        filter_schema,
     }))
 }
 
@@ -546,17 +572,16 @@ mod tests {
         );
     }
 
-    /// The warm Tantivy tier of the compound is built with `store_fields = []` so its query
-    /// schema is exactly `[primary key…, _score]` — the same column set the Elasticsearch tier
-    /// emits. This is the one non-obvious correctness constraint that lets the compound's
-    /// empty-result fallback project one tier's plan onto the other; guard it directly.
+    /// The compound's warm tier must expose the same metadata fields as Elasticsearch so its
+    /// empty-result fallback has one stable schema.
     #[tokio::test]
-    async fn empty_store_fields_expose_only_primary_key_and_score() {
+    async fn metadata_store_fields_are_exposed_with_primary_key_and_score() {
         use search::index::SearchIndex;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("body", DataType::Utf8, true),
+            Field::new("category", DataType::Utf8, true),
         ]));
         let table =
             Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
@@ -564,14 +589,19 @@ mod tests {
         let columns = vec![
             Column::new("body")
                 .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+            Column::new("category").with_metadata(HashMap::from([(
+                "vectors".to_string(),
+                serde_json::json!("filterable"),
+            )])),
         ];
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
+        let metadata_fields = vec!["category".to_string()];
 
         let index = build_full_text_database_index(
             table,
             &columns,
             &table_ref,
-            Some(&[] as &[String]),
+            Some(&metadata_fields),
             false,
         )
         .expect("warm index builds");
@@ -597,8 +627,8 @@ mod tests {
             "the score column must be exposed: {field_names:?}"
         );
         assert!(
-            !field_names.iter().any(|f| f == "body"),
-            "an empty store_fields set must not expose the searched content column: {field_names:?}"
+            field_names.iter().any(|f| f == "category"),
+            "filterable metadata must be exposed: {field_names:?}"
         );
     }
 }

@@ -27,6 +27,7 @@ use datafusion::common::project_schema;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -35,8 +36,35 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use elasticsearch::{Elasticsearch, KnnQuery, SearchRequest};
+use elasticsearch_datafusion_filter::{EsFilterSchema, classify_filter, translate_filter};
 
 use super::query_table::hits_to_record_batch;
+
+/// Translate the pushable filters into a single non-scoring `bool.filter` clause, or `None` when
+/// nothing pushes. Every filter reaching this point was reported pushable by
+/// `supports_filters_pushdown`, so a translation miss is an internal inconsistency. Surface it
+/// instead of silently dropping a predicate that `DataFusion` may no longer re-check.
+fn build_search_filter(
+    schema: &EsFilterSchema,
+    filters: &[Expr],
+) -> datafusion::error::Result<Option<serde_json::Value>> {
+    let mut clauses = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let clause = translate_filter(schema, filter).ok_or_else(|| {
+            DataFusionError::External(Box::new(
+                elasticsearch_datafusion_filter::Error::PushableFilterNotTranslated {
+                    column: filter.to_string(),
+                },
+            ))
+        })?;
+        clauses.push(clause);
+    }
+    if clauses.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::json!({ "bool": { "filter": clauses } })))
+    }
+}
 
 /// The column name for the search relevance score.
 pub static ES_SCORE_COLUMN_NAME: &str = "_score";
@@ -78,6 +106,8 @@ pub struct ElasticsearchKnnTable {
     pub query_text: Option<String>,
     /// Embedder for computing query vectors from text at execution time.
     pub embedder: Option<Arc<dyn QueryEmbedder>>,
+    /// Which columns can be pre-filtered inside Elasticsearch (indexed metadata / primary keys).
+    pub filter_schema: EsFilterSchema,
 }
 
 #[async_trait]
@@ -90,11 +120,21 @@ impl TableProvider for ElasticsearchKnnTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| classify_filter(&self.filter_schema, filter))
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let effective_k = limit.unwrap_or(self.k);
@@ -117,6 +157,7 @@ impl TableProvider for ElasticsearchKnnTable {
             projection: projection.cloned(),
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
+            filter: build_search_filter(&self.filter_schema, filters)?,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
@@ -140,6 +181,8 @@ struct ElasticsearchKnnExec {
     projection: Option<Vec<usize>>,
     query_text: Option<String>,
     embedder: Option<Arc<dyn QueryEmbedder>>,
+    /// Non-scoring pre-filter applied by Elasticsearch before selecting the top-`k` neighbours.
+    filter: Option<serde_json::Value>,
     properties: Arc<PlanProperties>,
 }
 
@@ -149,7 +192,11 @@ impl DisplayAs for ElasticsearchKnnExec {
             f,
             "ElasticsearchKnnExec: index={}, field={}, k={}",
             self.index, self.vector_field, self.k
-        )
+        )?;
+        if let Some(filter) = &self.filter {
+            write!(f, ", filter={filter}")?;
+        }
+        Ok(())
     }
 }
 
@@ -189,6 +236,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
         let projection = self.projection.clone();
         let query_text = self.query_text.clone();
         let embedder = self.embedder.clone();
+        let filter = self.filter.clone();
 
         let stream = futures::stream::once(async move {
             // Compute the query vector: use embedder if available, otherwise use pre-set vector.
@@ -212,6 +260,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
                     query_vector,
                     k,
                     num_candidates: k.saturating_mul(2),
+                    filter,
                 }),
                 size: Some(k),
                 ..Default::default()
@@ -315,6 +364,8 @@ pub struct ElasticsearchTextSearchTable {
     pub schema: SchemaRef,
     /// Schema of the full source document.
     pub source_schema: SchemaRef,
+    /// Which columns can be pre-filtered inside Elasticsearch (indexed metadata / primary keys).
+    pub filter_schema: EsFilterSchema,
 }
 
 #[async_trait]
@@ -327,11 +378,21 @@ impl TableProvider for ElasticsearchTextSearchTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| classify_filter(&self.filter_schema, filter))
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let effective_limit = limit.unwrap_or(self.limit);
@@ -352,6 +413,7 @@ impl TableProvider for ElasticsearchTextSearchTable {
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
             projection: projection.cloned(),
+            filter: build_search_filter(&self.filter_schema, filters)?,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
@@ -373,6 +435,8 @@ struct ElasticsearchTextSearchExec {
     source_schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    /// Non-scoring metadata pre-filter applied alongside the full-text query.
+    filter: Option<serde_json::Value>,
     properties: Arc<PlanProperties>,
 }
 
@@ -382,7 +446,11 @@ impl DisplayAs for ElasticsearchTextSearchExec {
             f,
             "ElasticsearchTextSearchExec: index={}, fields={:?}, limit={}",
             self.index, self.search_fields, self.limit
-        )
+        )?;
+        if let Some(filter) = &self.filter {
+            write!(f, ", filter={filter}")?;
+        }
+        Ok(())
     }
 }
 
@@ -420,6 +488,7 @@ impl ExecutionPlan for ElasticsearchTextSearchExec {
         let source_schema = Arc::clone(&self.source_schema);
         let projected_schema = Arc::clone(&self.projected_schema);
         let projection = self.projection.clone();
+        let filter = self.filter.clone();
 
         let stream = futures::stream::once(async move {
             let query = if search_fields.len() == 1 {
@@ -429,8 +498,13 @@ impl ExecutionPlan for ElasticsearchTextSearchExec {
                 elasticsearch::multi_match_query(&fields, &query_text)
             };
 
+            // Combine the scoring full-text query with the non-scoring metadata pre-filter so
+            // Elasticsearch applies the predicate before selecting the top-`limit` hits.
+            let filter_clauses = filter.into_iter().collect::<Vec<_>>();
+            let query = elasticsearch::query_with_filters(Some(query), filter_clauses);
+
             let req = SearchRequest {
-                query: Some(query),
+                query,
                 size: Some(limit),
                 ..Default::default()
             };

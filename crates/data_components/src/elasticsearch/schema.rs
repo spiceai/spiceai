@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use elasticsearch::FieldMapping;
+use elasticsearch_datafusion_filter::{EsFilterSchema, EsMappingField};
 
 /// Convert an Elasticsearch index mapping to an Arrow [`Schema`].
 ///
@@ -32,6 +33,105 @@ pub fn mapping_to_schema(properties: &HashMap<String, FieldMapping>) -> SchemaRe
     let mut fields = Vec::new();
     collect_fields(properties, "", &mut fields);
     Arc::new(Schema::new(fields))
+}
+
+/// Convert an Elasticsearch index mapping to an [`EsFilterSchema`], using the real per-field
+/// `type` (and any `keyword`-typed multi-field sibling) rather than the derived Arrow schema —
+/// so `keyword` fields and `text` fields with a `keyword` sibling are filterable, not just
+/// numeric/boolean columns. Field names are flattened the same way as [`mapping_to_schema`] so
+/// they line up with the Arrow schema the filters are expressed against.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn mapping_to_filter_schema(properties: &HashMap<String, FieldMapping>) -> EsFilterSchema {
+    let mut fields = HashMap::new();
+    collect_mapping_fields(properties, "", &mut fields);
+    EsFilterSchema::from_mapping(fields.iter().map(|(name, info)| (name.as_str(), info)))
+}
+
+fn collect_mapping_fields(
+    properties: &HashMap<String, FieldMapping>,
+    prefix: &str,
+    fields: &mut HashMap<String, EsMappingField>,
+) {
+    for (name, mapping) in properties {
+        let full_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+
+        // Recurse into nested objects, mirroring `collect_fields`; a `nested` object is treated
+        // as an opaque JSON string by `mapping_to_schema` and is not filterable here either.
+        // `enabled: false` means Elasticsearch never parses or indexes this subtree at all, even
+        // though its children still appear under `properties` — skip it entirely rather than
+        // registering fields a filter can never actually match.
+        if let Some(sub_props) = &mapping.properties {
+            if mapping.enabled != Some(false) && mapping.field_type.as_deref() != Some("nested") {
+                collect_mapping_fields(sub_props, &full_name, fields);
+            }
+            continue;
+        }
+
+        let Some(field_type) = &mapping.field_type else {
+            continue;
+        };
+        let keyword_sibling = mapping.fields.as_ref().and_then(|subfields| {
+            subfields.iter().find(|(_, sub_mapping)| {
+                matches!(
+                    sub_mapping.field_type.as_deref(),
+                    Some("keyword" | "constant_keyword" | "wildcard")
+                )
+            })
+        });
+        let keyword_subfield = keyword_sibling.map(|(sub_name, _)| sub_name.clone());
+        // Whichever field the pushdown will actually query for an exact-value predicate — the
+        // `keyword` sibling for `text`, or the field itself for `keyword`/`wildcard`/
+        // `constant_keyword` — carries the `ignore_above` that truncates it.
+        let is_keyword_family = matches!(
+            field_type.as_str(),
+            "keyword" | "wildcard" | "constant_keyword"
+        );
+        let keyword_ignore_above = if is_keyword_family {
+            mapping.ignore_above
+        } else {
+            keyword_sibling.and_then(|(_, sub_mapping)| sub_mapping.ignore_above)
+        }
+        .map(|n| n as usize);
+        // A `null_value` on either the field itself or its keyword sibling makes an `exists`
+        // pre-filter unsafe for IS [NOT] NULL (see `EsFilterSchema::from_mapping`).
+        let has_null_value = mapping.null_value.is_some()
+            || keyword_sibling.is_some_and(|(_, sub_mapping)| sub_mapping.null_value.is_some());
+        // `index`/`doc_values` are read from whichever field the pushdown will actually query —
+        // the keyword sibling for `text`, or the field itself otherwise — same target as
+        // `keyword_ignore_above` above. Elasticsearch defaults both to `true` when absent.
+        let (indexed, has_doc_values) = if is_keyword_family {
+            (mapping.index, mapping.doc_values)
+        } else if let Some((_, sub_mapping)) = keyword_sibling {
+            (sub_mapping.index, sub_mapping.doc_values)
+        } else {
+            (mapping.index, mapping.doc_values)
+        };
+        // `normalizer` is read from the same target field as `keyword_ignore_above` above — the
+        // keyword sibling for `text`, or the field itself for `keyword`/`wildcard`/
+        // `constant_keyword` — since that is the field the pushdown will actually query.
+        let has_normalizer = if is_keyword_family {
+            mapping.normalizer.is_some()
+        } else {
+            keyword_sibling.is_some_and(|(_, sub_mapping)| sub_mapping.normalizer.is_some())
+        };
+        fields.insert(
+            full_name,
+            EsMappingField {
+                field_type: field_type.clone(),
+                keyword_subfield,
+                keyword_ignore_above,
+                has_null_value,
+                indexed: indexed.unwrap_or(true),
+                has_doc_values: has_doc_values.unwrap_or(true),
+                has_normalizer,
+            },
+        );
+    }
 }
 
 fn collect_fields(
@@ -116,27 +216,23 @@ mod tests {
             "title".to_string(),
             FieldMapping {
                 field_type: Some("text".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "count".to_string(),
             FieldMapping {
                 field_type: Some("integer".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
         properties.insert(
             "embedding".to_string(),
             FieldMapping {
                 field_type: Some("dense_vector".to_string()),
-                properties: None,
                 dims: Some(384),
                 similarity: Some("cosine".to_string()),
+                ..Default::default()
             },
         );
 
@@ -162,14 +258,213 @@ mod tests {
             "big".to_string(),
             FieldMapping {
                 field_type: Some("unsigned_long".to_string()),
-                properties: None,
-                dims: None,
-                similarity: None,
+                ..Default::default()
             },
         );
 
         let schema = mapping_to_schema(&properties);
         let big = schema.field_with_name("big").expect("big field");
         assert_eq!(big.data_type(), &DataType::UInt64);
+    }
+
+    #[test]
+    fn filter_schema_carries_keyword_ignore_above_and_null_value() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        let mut title_fields = HashMap::new();
+        title_fields.insert(
+            "keyword".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                ignore_above: Some(64),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: Some("text".to_string()),
+                fields: Some(title_fields),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "code".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                null_value: Some(serde_json::json!("UNKNOWN")),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        // A literal past the real `ignore_above: 64` must not be pushed as a superset — the
+        // matching row could be entirely absent from the `.keyword` sub-field.
+        let long_literal = "x".repeat(65);
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit(long_literal))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit("short"))),
+            TableProviderFilterPushDown::Inexact
+        );
+
+        // `null_value` makes `exists` untrustworthy for IS [NOT] NULL. Equality is unaffected by
+        // `null_value`, but a mapping-derived field's cardinality is never confirmed scalar (see
+        // `EsFilterSchema::is_confirmed_scalar`), so it is capped to `Inexact` regardless.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").is_null()),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").eq(lit("open"))),
+            TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn filter_schema_honors_index_and_doc_values() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "internal".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                index: Some(false),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "unsorted".to_string(),
+            FieldMapping {
+                field_type: Some("long".to_string()),
+                doc_values: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        // `index: false` means Elasticsearch cannot search the field at all.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("internal").eq(lit("x"))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        // `doc_values: false` rules out a range clause, but not equality (`term` doesn't need
+        // doc values).
+        assert_eq!(
+            classify_filter(&filter_schema, &col("unsorted").gt(lit(5_i64))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("unsorted").eq(lit(5_i64))),
+            TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn disabled_object_subtree_is_excluded_from_filter_schema() {
+        // `enabled: false` means Elasticsearch never parses or indexes this subtree at all, even
+        // though its children still appear under `properties` and remain retrievable via
+        // `_source` — a filter against them must not be classified as pushable.
+        let mut sub_props = HashMap::new();
+        sub_props.insert(
+            "internal_id".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "metadata".to_string(),
+            FieldMapping {
+                properties: Some(sub_props),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+        assert!(filter_schema.is_empty());
+        assert!(filter_schema.get("metadata.internal_id").is_none());
+    }
+
+    #[test]
+    fn filter_schema_disables_range_on_normalized_keyword_but_not_equality() {
+        use datafusion::logical_expr::{TableProviderFilterPushDown, expr::Between};
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        // A lowercase normalizer indexes "Z" before "a" even though the raw `_source` values
+        // compare the other way, so a range boundary against this field is not a safe superset.
+        let mut title_fields = HashMap::new();
+        title_fields.insert(
+            "keyword".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                normalizer: Some("lowercase".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "code".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                normalizer: Some("lowercase".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: Some("text".to_string()),
+                fields: Some(title_fields),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        for column in ["code", "title"] {
+            assert_eq!(
+                classify_filter(&filter_schema, &col(column).gt(lit("a"))),
+                TableProviderFilterPushDown::Unsupported,
+                "range on a normalized {column} field must be unsupported"
+            );
+            assert_eq!(
+                classify_filter(
+                    &filter_schema,
+                    &datafusion::logical_expr::Expr::Between(Between::new(
+                        Box::new(col(column)),
+                        false,
+                        Box::new(lit("a")),
+                        Box::new(lit("z")),
+                    ))
+                ),
+                TableProviderFilterPushDown::Unsupported,
+                "BETWEEN on a normalized {column} field must be unsupported"
+            );
+        }
+
+        // Equality is unaffected by a normalizer: applied identically to the indexed value and
+        // the query term, it preserves membership even though it doesn't preserve ordering.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").eq(lit("abc"))),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit("abc"))),
+            TableProviderFilterPushDown::Inexact
+        );
     }
 }
