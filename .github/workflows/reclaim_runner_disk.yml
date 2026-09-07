@@ -1,28 +1,83 @@
 name: Reclaim Runner Disk
+run-name: Retry PR 13939 Build and Test after runner recovery
 
-# Manual disk diagnostics for PR #13939.
 on:
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: pr-13939-runner-recovery
+  group: pr-13939-build-test-retry
   cancel-in-progress: false
 
 jobs:
-  diagnose:
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    runs-on: spiceai-macos
-    timeout-minutes: 10
+  retry:
+    name: Wait for active checks and retry Build and Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    permissions:
+      actions: write
+      pull-requests: read
     steps:
-      - name: Inspect runner disk
+      - name: Retry the failed job when GitHub allows it
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          printf 'runner=%s\nworkspace=%s\n' "$RUNNER_NAME" "$RUNNER_WORKSPACE"
-          hostname
-          df -Pk "$RUNNER_WORKSPACE"
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          repo = 'spiceai/spiceai'
+          run_id = 34141152078
+          expected_head = '8aecb8657ecb52c55cf1c5e6fb434f2c68faacb2'
+          deadline = time.monotonic() + 315 * 60
+
+          def api(path):
+              result = subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}'], text=True, timeout=60)
+              return json.loads(result)
+
+          def current_pr():
+              pr = api('pulls/13939')
+              return pr['state'] == 'open' and pr['head']['sha'] == expected_head
+
+          last_status = None
+          while time.monotonic() < deadline:
+              if not current_pr():
+                  print('PR #13939 changed or closed; leaving the superseded run alone', flush=True)
+                  raise SystemExit(0)
+              run = api(f'actions/runs/{run_id}')
+              state = (run['run_attempt'], run['status'], run['conclusion'])
+              if state != last_status:
+                  print('ORIGINAL_RUN', state, flush=True)
+                  last_status = state
+              if run['status'] == 'completed':
+                  break
+              time.sleep(30)
+          else:
+              raise RuntimeError(f'Timed out waiting for run {run_id}: last state {last_status}')
+
+          jobs = api(f'actions/runs/{run_id}/jobs?filter=latest&per_page=100')['jobs']
+          job = next(job for job in jobs if job['name'] == 'Build and Test')
+          print('BUILD_AND_TEST', job['id'], job['status'], job['conclusion'], flush=True)
+          if job['conclusion'] == 'success':
+              print('Build and Test already passed; no retry needed', flush=True)
+              raise SystemExit(0)
+          if job['conclusion'] != 'failure':
+              raise RuntimeError(f'Build and Test ended as {job["conclusion"]}; inspect before retrying')
+          if not current_pr():
+              raise RuntimeError('PR head changed before retry; leaving the superseded run alone')
+
+          subprocess.run(
+              ['gh', 'api', '--method', 'POST', f'repos/{repo}/actions/jobs/{job["id"]}/rerun'],
+              check=True, timeout=60,
+          )
+          url = f'https://github.com/{repo}/actions/runs/{run_id}'
+          print('RETRY_REQUESTED', url, flush=True)
+          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(
+              f'Retried [Build and Test]({url}) after runner recovery reclaimed 131.7 GiB.\n'
+          )
+          PYTHON
