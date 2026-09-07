@@ -2,15 +2,17 @@
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                    |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                               |
-|               |  Projection: regexp_count(csv_test.region, Utf8("AMERICA"))                                                                                             |
-|               |   TableScan: csv_test projection=[region]                                                                                                               |
-| physical_plan | SchemaCastScanExec                                                                                                                                      |
-|               |   CooperativeExec                                                                                                                                       |
-|               |     BytesProcessedExec                                                                                                                                  |
-|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT len(regexp_extract_all("csv_test"."region", 'AMERICA')) FROM "csv_test" |
-|               |                                                                                                                                                         |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                  |
++---------------+-----------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: regexp_count(csv_test.region, Utf8("AMERICA"))                                                            |
+|               |   Federated                                                                                                           |
+|               |  Projection: csv_test.region                                                                                          |
+|               |   TableScan: csv_test projection=[region]                                                                             |
+| physical_plan | ProjectionExec: expr=[regexp_count(region@0, AMERICA) as regexp_count(csv_test.region,Utf8("AMERICA"))]               |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                |
+|               |     SchemaCastScanExec                                                                                                |
+|               |       BytesProcessedExec                                                                                              |
+|               |         VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "csv_test"."region" FROM "csv_test" |
+|               |                                                                                                                       |
++---------------+-----------------------------------------------------------------------------------------------------------------------+
