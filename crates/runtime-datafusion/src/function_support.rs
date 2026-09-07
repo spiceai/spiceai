@@ -129,8 +129,8 @@ fn duckdb_function_support() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::duckdb_native_function_names())
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
+        .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
-        .with_scalar_call_support(Arc::new(crate::dialect::duckdb_can_translate))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
@@ -249,7 +249,9 @@ mod tests {
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
     use datafusion::logical_expr::{LogicalPlan, table_scan};
     use datafusion::prelude::{Expr, col, lit};
+    use datafusion::scalar::ScalarValue;
     use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+    use runtime_udfs_api::{add_user_function, remove_user_function};
 
     /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
     /// is asked to decide about.
@@ -314,6 +316,62 @@ mod tests {
         assert!(
             !federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
             "regexp_count is denied by name, so no call of it may federate"
+        );
+    }
+
+    /// A one-argument call of `name`, standing in for a user-registered scalar
+    /// function reaching the deny-list.
+    fn user_call(name: &str) -> Expr {
+        Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            std::sync::Arc::new(datafusion::logical_expr::create_udf(
+                name,
+                vec![DataType::Utf8],
+                DataType::Utf8,
+                datafusion::logical_expr::Volatility::Immutable,
+                std::sync::Arc::new(|_| {
+                    Ok(datafusion::logical_expr::ColumnarValue::Scalar(
+                        ScalarValue::Utf8(None),
+                    ))
+                }),
+            )),
+            vec![col("s")],
+        ))
+    }
+
+    /// Regression guard for #13726/#13868 on the `DuckDB` route.
+    ///
+    /// The denied *names* `build` freezes are a snapshot, and providers are
+    /// built before the spicepod's `functions:` entries register — so a
+    /// function registered afterwards (a hot reload, a tool-backed SQL UDF) is
+    /// absent from it. `build` therefore also installs a check that reads the
+    /// registry live, and that check is the only thing standing between a
+    /// late-registered function and a remote asked to evaluate a function it
+    /// does not have.
+    ///
+    /// `FunctionSupport::with_scalar_call_support` **replaces** that check
+    /// rather than composing with it, so supplying a backend's per-call gate
+    /// after `build` silently discards it. The gate must go through
+    /// [`FunctionSupportBuilder::scalar_call`] instead, which `build` composes
+    /// with its own. This test registers the function *after* taking the
+    /// support, which is the only ordering that can tell the two apart.
+    #[test]
+    fn a_late_registered_user_function_does_not_federate_to_duckdb() {
+        let support = deny_spice_functions_for_duckdb_table_providers();
+
+        // Registered after the snapshot was frozen, so only the live check can
+        // refuse it.
+        let name = "late_user_fn_duckdb_function_support";
+        add_user_function(name);
+
+        let federates =
+            !contains_unsupported_functions(&plan_projecting(user_call(name)), &support)
+                .expect("the support check must not error");
+
+        remove_user_function(name);
+
+        assert!(
+            !federates,
+            "a user function registered after the provider was built must not be pushed into DuckDB"
         );
     }
 }
