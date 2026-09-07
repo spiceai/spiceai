@@ -77,6 +77,8 @@ mod single_instance_duckdb;
 mod snapshot_lock_contention;
 #[cfg(feature = "snapshots")]
 mod snapshot_mutex;
+#[cfg(feature = "sqlite")]
+mod user_function_pushdown;
 
 /// Queue a refresh of `table`. Callers poll for the result rather than waiting on the
 /// returned notifier: completion signals with `notify_waiters`, which stores no permit,

@@ -28,6 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::duckdb::with_utc_session_timezone;
 use data_components::ducklake::provider::{DuckLakeCatalogProvider, DuckLakeFederation};
 use data_components::ducklake::{
     DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
@@ -35,7 +36,7 @@ use data_components::ducklake::{
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::dialect::{duckdb_can_translate, new_duckdb_dialect};
 use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_dialect_without_carve_out;
 use snafu::prelude::*;
 use std::any::Any;
@@ -228,7 +229,7 @@ impl CatalogConnector for DuckLakeCatalog {
         let pool =
             tokio::task::spawn_blocking(move || -> super::Result<Arc<DuckDbConnectionPool>> {
                 let pool = if let Some(path) = open_path.as_deref() {
-                    Arc::new(
+                    Arc::new(with_utc_session_timezone(
                         DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
                             super::Error::UnableToGetCatalogProvider {
                                 connector: PREFIX.to_string(),
@@ -236,15 +237,17 @@ impl CatalogConnector for DuckLakeCatalog {
                                 source: e,
                             }
                         })?,
-                    )
+                    ))
                 } else {
-                    Arc::new(DuckDbConnectionPool::new_memory().map_err(|e| {
-                        super::Error::UnableToGetCatalogProvider {
-                            connector: PREFIX.to_string(),
-                            connector_component: connector_component_for_pool.clone(),
-                            source: e,
-                        }
-                    })?)
+                    Arc::new(with_utc_session_timezone(
+                        DuckDbConnectionPool::new_memory().map_err(|e| {
+                            super::Error::UnableToGetCatalogProvider {
+                                connector: PREFIX.to_string(),
+                                connector_component: connector_component_for_pool.clone(),
+                                source: e,
+                            }
+                        })?,
+                    ))
                 };
 
                 let conn = Arc::clone(&pool).connect_sync().map_err(|e| {
@@ -373,10 +376,19 @@ impl CatalogConnector for DuckLakeCatalog {
 /// would be unparsed under their `DataFusion` names and fail remotely as unknown
 /// functions, and `regexp_count` would be pushed down at a rendering that answers
 /// NULL where `DataFusion` answers `0` (issues #13809, #13870).
+///
+/// The per-call gate is a separate layer from those name denials, so it composes
+/// with them rather than replacing them: those names are denied, *and* of the
+/// names that are allowed, only the calls the dialect can actually render may be
+/// federated. Without it this route keeps the defect #13900 reports — the
+/// dialect refuses a call it has no rendering for (`regexp_replace(s, p, r, 'U')`),
+/// and because federation has already committed by then, the refusal fails the
+/// whole query instead of leaving the call for `DataFusion`.
 fn ducklake_federation() -> DuckLakeFederation {
     DuckLakeFederation {
         dialect: new_duckdb_dialect(),
-        function_support: deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+        function_support: deny_spice_functions_for_duckdb_dialect_without_carve_out()
+            .with_scalar_call_support(Arc::new(duckdb_can_translate)),
     }
 }
 
@@ -420,8 +432,8 @@ mod tests {
 #[cfg(test)]
 mod federation_tests {
     use super::*;
-    use crate::catalogconnector::stub_udf;
-    use datafusion::prelude::col;
+    use crate::catalogconnector::{stub_udf, stub_udf_called_with};
+    use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
     use runtime_datafusion::function_support::DUCKDB_DENIED_BUILTINS;
 
@@ -534,5 +546,34 @@ mod federation_tests {
                 "{name} must be denied so the plan is left for DataFusion to evaluate locally"
             );
         }
+    }
+
+    /// Regression guard for #13900 on the *catalog* route. Translating a name is
+    /// not the same as translating a call: `regexp_replace` is handled, but the
+    /// handler has no rendering for the `U` flag and refuses. Federation asks for
+    /// the SQL only after it has committed, so an ungated route turns that refusal
+    /// into a planning error for a query `DataFusion` can answer.
+    ///
+    /// This route pairs the `DuckDB` dialect with the *plain* deny-list, which
+    /// carries no per-call gate of its own -- so it has to be attached here, and
+    /// nothing else in this file would notice if it went missing.
+    #[test]
+    fn an_untranslatable_call_is_not_federated_by_the_catalog_route() {
+        let support = ducklake_federation().function_support;
+
+        assert!(
+            !support.supports(&stub_udf_called_with(
+                "regexp_replace",
+                vec![col("s"), lit("a"), lit("X"), lit("U")],
+            )),
+            "the `U` flag has no DuckDB rendering, so this call must stay local"
+        );
+        assert!(
+            support.supports(&stub_udf_called_with(
+                "regexp_replace",
+                vec![col("s"), lit("a"), lit("X"), lit("g")],
+            )),
+            "a renderable call must keep its pushdown"
+        );
     }
 }

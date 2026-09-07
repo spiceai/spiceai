@@ -35,11 +35,24 @@ use runtime_udfs_api::{FunctionSupportBuilder, datafusion_nested_function_names}
 /// denied outright — see there for which, and why.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    Arc::new(duckdb_function_support())
+    Arc::new(deny_spice_functions_for_duckdb_table_providers())
 }
 
 /// `DuckDB` deny-list as a value, for
 /// `DuckDBTableFactory::with_function_support`. See issue #10703.
+///
+/// Two layers, both derived from [`crate::dialect`] so they cannot drift from
+/// what the dialect can actually render:
+///
+/// 1. the name carve-out, so the Spice functions the `DuckDB` dialect rewrites
+///    into native SQL federate instead of being denied;
+/// 2. a per-call check, because a *name* the dialect handles is not a *call*
+///    the dialect can render. `regexp_replace(s, p, r, 'U')` has no `DuckDB`
+///    rendering — `DuckDB` has no `U` flag — and without this check the
+///    refusal reaches the user as a planning error for a query `DataFusion`
+///    can answer locally (issue #13900). The check also gates the
+///    `DataFusion` built-ins the dialect rewrites, whose untranslatable shapes
+///    must stay local the same way.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
     duckdb_function_support()
@@ -117,6 +130,7 @@ fn duckdb_function_support() -> FunctionSupport {
         .native(&crate::dialect::duckdb_native_function_names())
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .build()
+        .with_scalar_call_support(Arc::new(crate::dialect::duckdb_can_translate))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
@@ -153,8 +167,8 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .native(&crate::dialect::bigquery_native_function_names())
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
+        .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
         .build()
-        .with_scalar_call_support(Arc::new(crate::dialect::bigquery_can_translate))
 }
 
 /// `SQLite`-flavored deny-list as a value, for
@@ -226,4 +240,80 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(unsupported_arrays)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deny_spice_functions_for_duckdb_table_providers;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions::regex::expr_fn::{regexp_count, regexp_replace};
+    use datafusion::logical_expr::{LogicalPlan, table_scan};
+    use datafusion::prelude::{Expr, col, lit};
+    use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+    /// A scan of `t(s, start)` projecting `expr`, which is the shape federation
+    /// is asked to decide about.
+    fn plan_projecting(expr: Expr) -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("start", DataType::Int64, true),
+        ]);
+        table_scan(Some("t"), &schema, None)
+            .expect("scan t")
+            .project(vec![expr])
+            .expect("project")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Whether federation would push this plan into `DuckDB`, which is what
+    /// `SqlTable::can_execute_plan` asks of the deny-list.
+    fn federates(expr: Expr) -> bool {
+        let support = deny_spice_functions_for_duckdb_table_providers();
+        !contains_unsupported_functions(&plan_projecting(expr), &support)
+            .expect("the support check must not error")
+    }
+
+    /// Regression test for #13900. Federation is an optimization: a call the
+    /// `DuckDB` dialect cannot render must not be federated, so `DataFusion`
+    /// evaluates it locally instead of the query failing at planning.
+    #[test]
+    fn a_duckdb_untranslatable_call_is_not_federated() {
+        assert!(
+            !federates(regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("U")),)),
+            "the `U` flag has no DuckDB rendering, so this plan must stay local"
+        );
+        assert!(
+            !federates(regexp_count(col("s"), lit("a"), Some(col("start")), None)),
+            "a column start position has no DuckDB rendering, so this plan must stay local"
+        );
+    }
+
+    /// The complement: the per-call check must not cost a pushdown that works.
+    #[test]
+    fn a_duckdb_renderable_call_still_federates() {
+        assert!(federates(regexp_replace(
+            col("s"),
+            lit("a"),
+            lit("X"),
+            Some(lit("g")),
+        )));
+        assert!(federates(col("s")));
+    }
+
+    /// The two layers rank: a name in [`DUCKDB_DENIED_BUILTINS`] does not
+    /// federate even where the per-call check can render it. `regexp_count`
+    /// with an integer start is renderable — `duckdb_can_translate` says so,
+    /// and `dialect::tests::duckdb_declines_a_regexp_count_start_it_cannot_turn_into_an_offset`
+    /// asserts it — but the rendering answers NULL where `DataFusion` answers
+    /// `0` for a NULL input, so the name is denied and the call evaluates
+    /// locally (issue #13870). Renderability is not faithfulness, and only the
+    /// deny-list encodes the difference.
+    #[test]
+    fn a_denied_builtin_does_not_federate_even_when_the_dialect_renders_it() {
+        assert!(
+            !federates(regexp_count(col("s"), lit("a"), Some(lit(1)), None)),
+            "regexp_count is denied by name, so no call of it may federate"
+        );
+    }
 }
