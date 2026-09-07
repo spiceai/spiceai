@@ -416,7 +416,7 @@ jobs:
             echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --test-threads 1 --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
 
       - name: Run Beta functionality embedding tests
         if: ${{ !cancelled() && env.HAS_HF_SECRET == 'true' }}
