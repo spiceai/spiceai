@@ -43,9 +43,9 @@ use async_openai::types::chat::{
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::configure_ring_distributed;
-#[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
+#[cfg(feature = "local_llm")]
+use crate::chat::distributed::{clear_distributed_env, configure_distributed};
 #[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
 #[cfg(feature = "local_llm")]
@@ -365,17 +365,17 @@ pub async fn create_hf_model(
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
-    // Configure multi-node distributed (ring) inference before loading: the
-    // loader reads `RING_CONFIG` from the environment while building the
-    // pipeline. The returned guard keeps the temp file alive for the model.
+    // Configure multi-node distributed inference before loading: the loader reads the
+    // topology (`RING_CONFIG`, or the `MISTRALRS_MN_*` set for NCCL) from the environment
+    // while building the pipeline. Any returned guard keeps the temp file alive for the
+    // model.
     let ring_config = if let Some(cfg) = distributed {
-        Some(configure_ring_distributed(&cfg)?)
+        configure_distributed(&cfg)?
     } else {
-        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-        // load in this process, so this single-node load can't accidentally
-        // run distributed.
-        // SAFETY: touched only during model init, before mistral.rs reads it.
-        unsafe { std::env::remove_var("RING_CONFIG") };
+        // Clear any topology left by a prior distributed load in this process, so this
+        // single-node load cannot inherit a rank and world size and try to join a
+        // communicator that is not there.
+        clear_distributed_env();
         None
     };
     mistral::MistralLlama::from_hf(
@@ -420,13 +420,12 @@ pub async fn create_local_model(
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
     let ring_config = if let Some(cfg) = distributed {
-        Some(configure_ring_distributed(&cfg)?)
+        configure_distributed(&cfg)?
     } else {
-        // Defensive: clear any `RING_CONFIG` left set by a prior distributed
-        // load in this process, so this single-node load can't accidentally
-        // run distributed.
-        // SAFETY: touched only during model init, before mistral.rs reads it.
-        unsafe { std::env::remove_var("RING_CONFIG") };
+        // Clear any topology left by a prior distributed load in this process, so this
+        // single-node load cannot inherit a rank and world size and try to join a
+        // communicator that is not there.
+        clear_distributed_env();
         None
     };
     mistral::MistralLlama::from(

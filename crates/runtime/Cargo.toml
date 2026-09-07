@@ -355,6 +355,8 @@ keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
 distributed = ["llms/distributed", "models"]
+# On-device NCCL collectives. Mutually exclusive with `distributed` (see `llms/nccl`).
+nccl = ["llms/nccl", "models"]
 models = [
     "bedrock",
     "mcp",
