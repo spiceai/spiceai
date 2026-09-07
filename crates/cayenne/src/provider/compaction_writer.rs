@@ -854,6 +854,7 @@ fn maybe_set_nocache(file: &std::fs::File, direct_io: bool) {
 fn maybe_set_nocache(_file: &std::fs::File, _direct_io: bool) {}
 
 /// `pwrite` the whole buffer at `offset`, looping over partial writes / `EINTR`.
+#[cfg(unix)]
 fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     while !buf.is_empty() {
@@ -873,6 +874,16 @@ fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::i
         }
     }
     Ok(())
+}
+
+/// Non-unix: positioned write via `seek` + `write_all`. The dedicated writer
+/// thread is the only user of this fd, so mutating the file offset is safe.
+#[cfg(not(unix))]
+fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
 }
 
 #[cfg(target_os = "linux")]
@@ -1009,9 +1020,17 @@ fn truncate(file: &std::fs::File, len: u64) -> std::io::Result<()> {
 }
 
 /// fsync a directory so a rename (dirent change) is persisted.
+#[cfg(unix)]
 fn fsync_dir(dir: &FsPath) -> std::io::Result<()> {
     let handle = std::fs::File::open(dir)?;
     robust_fsync(&handle)
+}
+
+/// Directory fsync has no Windows analogue (`CreateFile` on a directory fails),
+/// and NTFS rename is already durable without it. No-op.
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &FsPath) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// fsync `file`, tolerating filesystems that do not support the strongest sync.
@@ -1043,13 +1062,20 @@ fn robust_fsync(file: &std::fs::File) -> std::io::Result<()> {
 /// a genuine I/O failure). `==` comparisons (not an or-pattern) because on Linux
 /// `ENOTSUP` and `EOPNOTSUPP` are the same value — an or-pattern would be an
 /// unreachable-pattern warning there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_fsync_unsupported(e: &std::io::Error) -> bool {
     let code = e.raw_os_error();
     code == Some(libc::ENOTSUP) || code == Some(libc::EOPNOTSUPP) || code == Some(libc::ENOSYS)
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_fsync_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+}
+
 /// A plain `fsync(2)` — weaker than macOS `F_FULLFSYNC`, which some network
-/// filesystems reject.
+/// filesystems reject. `libc` is a linux/macos-only dependency.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: valid fd for the borrow.
@@ -1058,6 +1084,13 @@ fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Portable fallback: `sync_data` is std's `fdatasync` / `FlushFileBuffers`.
+/// `robust_fsync` already tried `sync_all`; this is the weaker retry.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn plain_fsync(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
 }
 
 /// Best-effort etag mirroring `LocalFileSystem`'s shape (changes when the file
@@ -1100,6 +1133,19 @@ mod tests {
             bytes_per_sync: 1 << 16, // exercise the rate-smoothing branch
             final_fsync: true,
         }
+    }
+
+    /// Compile + smoke the cfg-selected fsync fallbacks. Regression for #13936:
+    /// these helpers used `libc` / `AsRawFd` on every target, so Windows failed
+    /// to compile `cayenne`.
+    #[test]
+    fn fsync_helpers_compile_and_run_on_host() {
+        let _ = is_fsync_unsupported(&std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let dir = tempfile::tempdir().expect("tempdir");
+        fsync_dir(dir.path()).expect("fsync_dir");
+        let file = std::fs::File::create(dir.path().join("part")).expect("create");
+        plain_fsync(&file).expect("plain_fsync");
+        write_all_at(&file, b"abc", 0).expect("write_all_at");
     }
 
     /// The storage-tier gate installs the `O_DIRECT` writer ONLY on the
