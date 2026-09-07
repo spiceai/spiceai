@@ -40,7 +40,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use snafu::Snafu;
 
-use crate::cdc::{ChangesStream, StreamError};
+use crate::cdc::{AccelerationContents, ChangesStream, StreamError};
 
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
@@ -225,6 +225,22 @@ pub struct AppliedLsn {
 ///   process did not load), a position could have been recorded (so absence is
 ///   informative rather than permanent), and the acceleration is not known to be
 ///   empty (see below).
+/// * `contents_implying_gap` — what the acceleration was found to hold, when
+///   nothing else is going to load it; `None` when a snapshot is, which is what
+///   makes the contents tell against nothing. An emptied acceleration and a
+///   recorded position are individually ordinary and jointly a gap: the position
+///   asserts every change below it is already applied, so no reachable WAL will
+///   ever re-supply the rows that are gone. See "Why an empty acceleration with a
+///   usable position is a gap" below.
+///
+///   Passed as the observed state rather than as a precomputed "is it empty"
+///   flag, because two of the three states reach a rebuild here and they are not
+///   the same event: [`AccelerationContents::Empty`] was observed to hold no rows,
+///   while [`AccelerationContents::Unknown`] means the probe failed and emptiness
+///   was never ruled out. Both rebuild — an unanswered probe cannot license a
+///   resume onto a table that may have been recreated — but they report different
+///   causes, so the log line and the metric say which of the two actually
+///   happened instead of claiming an observation nobody made.
 ///
 /// This is also where an ordinary backup or point-in-time restore is caught, in
 /// two halves depending on when the process comes back. Reconnect before the
@@ -261,6 +277,53 @@ pub struct AppliedLsn {
 /// would, and skipping it resumes from the slot's position with every earlier
 /// row missing for good.
 ///
+/// # Why an empty acceleration with a usable position is a gap
+///
+/// The two halves of `absence_implies_gap` above read emptiness in the direction
+/// that *licenses a resume*: an acceleration holding no rows has nothing stale
+/// and no missing deletion, so a missing watermark tells against nothing. The
+/// same observation against a watermark that *is* present says the opposite, and
+/// only this arm reads it that way. A recorded position asserts that every change
+/// below it has already been applied here, so the slot will never resend those
+/// changes — however much WAL it retains. An acceleration that is nonetheless
+/// empty is therefore missing every row committed before that position, with no
+/// event left anywhere to supply them. Resuming completes without error and the
+/// table stays permanently short of the source.
+///
+/// This is reachable without anything being broken. `mode: file_update` recreates
+/// the acceleration when the source schema changes incompatibly
+/// (`recreates_on_schema_mismatch`), which drops the accelerated table while the
+/// watermark sidecar lives in the same accelerator and survives — so the next
+/// start finds an empty table and a perfectly usable position. Restoring an older
+/// accelerator file, or clearing the table by hand, lands in the same state.
+///
+/// Emptiness alone is not the gap — `contents_implying_gap` is `None` whenever a
+/// snapshot is going to populate the table, which is the ordinary first load and
+/// every re-snapshot after it. What makes it one is nothing else loading the
+/// table, exactly as for a missing watermark.
+///
+/// A legitimately empty acceleration — every source row deleted, or retention
+/// having aged them all out — is rebuilt too, and that is the intended trade
+/// rather than an accepted false positive: the two states are indistinguishable
+/// from here, the rebuild of a genuinely empty source reads nothing, and this
+/// path already prefers a needless re-read to an unproven resume everywhere else.
+///
+/// For the same reason, only a positive
+/// [`AccelerationContents::NonEmpty`](crate::cdc::AccelerationContents::NonEmpty)
+/// licenses the resume: a probe that could not answer rebuilds as well, under
+/// [`RebuildCause::UnprovenContentsWithUsablePosition`] rather than
+/// [`RebuildCause::EmptyWithUsablePosition`]. Against a *missing* watermark the
+/// cautious answer to an unanswered probe is the opposite one — there,
+/// `absence_implies_gap` treats "not provably empty" as reason to rebuild — and
+/// carrying that direction across to a watermark that is present would resume on
+/// the strength of a question nobody managed to ask. The two causes stay separate
+/// because the follow-up differs: one names an acceleration someone can go and
+/// look at, the other names a probe worth fixing.
+///
+/// The slot-health causes keep their precedence over this one: a rebuild that
+/// fires today keeps reporting the cause it reports today, and this arm only ever
+/// names a rebuild where the position was otherwise about to be resumed.
+///
 /// # Why an unreachable watermark rebuilds even with snapshots disabled
 ///
 /// `pg_replication_initial_snapshot: disabled` says "do not read the source table
@@ -285,6 +348,7 @@ pub fn rebuild_cause(
     slot_restart_lsn: Option<u64>,
     slot_acknowledged_lsn: u64,
     absence_implies_gap: bool,
+    contents_implying_gap: Option<AccelerationContents>,
 ) -> Option<RebuildCause> {
     match position {
         // Nothing recorded: a gap only when absence is informative — see
@@ -314,7 +378,25 @@ pub fn rebuild_cause(
         {
             Some(RebuildCause::RetentionLost)
         }
-        RecordedPosition::At(_) => None,
+        // The slot can serve the resume, but there may be nothing here to resume
+        // onto: the position says every change below it is applied, so any row
+        // that predates it will never be resent. Placed last of the `At` arms so
+        // a rebuild that fires today keeps the cause it reports today — this only
+        // names one the code was otherwise about to resume.
+        //
+        // Matched on the contents rather than on a precomputed bool so the two
+        // states that reach a rebuild stay distinguishable in what is reported,
+        // and so a future edit cannot quietly drop `Unknown` back onto the resume
+        // path without the compiler asking about this arm.
+        RecordedPosition::At(_) => match contents_implying_gap {
+            Some(AccelerationContents::Empty) => Some(RebuildCause::EmptyWithUsablePosition),
+            Some(AccelerationContents::Unknown) => {
+                Some(RebuildCause::UnprovenContentsWithUsablePosition)
+            }
+            // Rows are present, or a snapshot is going to load them: either way
+            // nothing here says the table is short of the source.
+            Some(AccelerationContents::NonEmpty) | None => None,
+        },
     }
 }
 
@@ -357,11 +439,38 @@ pub enum RebuildCause {
     AcknowledgedPast,
     /// The slot no longer retains the WAL following the recorded position.
     RetentionLost,
+    /// The acceleration was observed to hold no rows while recording a position
+    /// the slot can still stream from, and nothing else is going to load it.
+    ///
+    /// Not a slot problem: the changes are still reachable, but the position
+    /// asserts they were already applied, so they will never be resent. Reached
+    /// by a `mode: file_update` recreate (which drops the table and leaves the
+    /// watermark sidecar beside it), by a restored or hand-cleared accelerator
+    /// file, and by a source whose rows were all legitimately deleted — the last
+    /// of which rebuilds by reading nothing. See [`rebuild_cause`].
+    EmptyWithUsablePosition,
+    /// The acceleration could not be read while it recorded a position the slot
+    /// can still stream from, so it was rebuilt without ever being observed empty.
+    ///
+    /// The same gap as [`Self::EmptyWithUsablePosition`] and the same response,
+    /// reported separately because the evidence is not the same: there the table
+    /// was seen to hold no rows, here the probe failed and emptiness was never
+    /// ruled out. Reporting both as "empty" would attribute a rebuild to an
+    /// observation nobody made, and would hide the probe failure that is the
+    /// actual thing to look into — the accelerator being unreadable is its own
+    /// problem, and it is worth knowing that it, rather than a recreate, is what
+    /// forced the re-read.
+    UnprovenContentsWithUsablePosition,
 }
 
 impl RebuildCause {
     /// Stable identifier for metrics and log queries. Never reworded — renaming
     /// one breaks every dashboard and saved search that selects on it.
+    ///
+    /// A new variant lands here and in [`Self::reason`] by exhaustiveness; also
+    /// add it to `causes` in
+    /// `every_rebuild_cause_is_distinguishable_to_a_query_and_to_a_person`, which
+    /// cannot notice one it was not given.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -371,6 +480,8 @@ impl RebuildCause {
             Self::RewoundSource => "rewound_source",
             Self::AcknowledgedPast => "acknowledged_past",
             Self::RetentionLost => "retention_lost",
+            Self::EmptyWithUsablePosition => "empty_with_usable_position",
+            Self::UnprovenContentsWithUsablePosition => "unproven_contents_with_usable_position",
         }
     }
 
@@ -396,6 +507,12 @@ impl RebuildCause {
             }
             Self::RetentionLost => {
                 "the slot no longer retains the changes following the position it recorded as applied"
+            }
+            Self::EmptyWithUsablePosition => {
+                "it holds no rows while recording changes as already applied up to a position, so the changes below that position will never be resent and would stay missing here"
+            }
+            Self::UnprovenContentsWithUsablePosition => {
+                "it could not be read to check whether it still holds rows while recording changes as already applied up to a position, so if it is empty the changes below that position would never be resent and would stay missing here"
             }
         }
     }
@@ -657,11 +774,17 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedLsn, RebuildCause, RecordedPosition, UnusableReason, rebuild_cause,
-        recorded_position_is_ahead_of_source,
+        AccelerationContents, AppliedLsn, RebuildCause, RecordedPosition, UnusableReason,
+        rebuild_cause, recorded_position_is_ahead_of_source,
     };
 
     /// A slot that reaches everything, so a case varies only what it is about.
+    ///
+    /// `contents_implying_gap` is held `None` here: these cases are about what the
+    /// *record* proves, and an acceleration whose contents could not be placed is
+    /// the state every one of them describes. The emptiness dimension is varied
+    /// on its own in
+    /// `an_empty_acceleration_holding_a_usable_position_is_a_gap_nothing_will_fill`.
     fn needs_rebuild(
         position: &RecordedPosition,
         slot_earliest_streamable_lsn: Option<u64>,
@@ -672,6 +795,7 @@ mod tests {
             slot_earliest_streamable_lsn,
             0,
             absence_implies_gap,
+            None,
         )
         .is_some()
     }
@@ -719,7 +843,7 @@ mod tests {
             assert!(needs_rebuild(&unusable, Some(0), false), "{reason:?}");
             assert!(needs_rebuild(&unusable, None, false), "{reason:?}");
             assert_eq!(
-                rebuild_cause(&unusable, Some(0), 0, true),
+                rebuild_cause(&unusable, Some(0), 0, true, None),
                 Some(expected),
                 "{reason:?} must not be reported as another cause"
             );
@@ -789,14 +913,148 @@ mod tests {
         let restart_lsn: u64 = 40;
         let confirmed_flush_lsn: u64 = 200;
         assert_eq!(
-            rebuild_cause(&at(100), Some(restart_lsn), confirmed_flush_lsn, true),
+            rebuild_cause(&at(100), Some(restart_lsn), confirmed_flush_lsn, true, None),
             Some(RebuildCause::AcknowledgedPast),
             "the acknowledged limit must not be reported as lost retention"
         );
         assert_eq!(
-            rebuild_cause(&at(100), Some(restart_lsn), 0, true),
+            rebuild_cause(&at(100), Some(restart_lsn), 0, true, None),
             None,
             "control: comparing against retention alone calls the same gap resumable"
+        );
+    }
+
+    /// An acceleration observed to hold no rows, against a position the slot can
+    /// still stream from. Every arm here is a resume the slot would happily serve
+    /// — that is the point: the gap is not in the WAL, it is that the position
+    /// asserts the rows were already applied, so no reachable change will ever
+    /// re-supply them.
+    ///
+    /// A slot reaching everything (`Some(0)` retained, nothing acknowledged) is
+    /// held fixed so only the emptiness dimension varies. Without the fix, every
+    /// `Some(...)` assertion below returns `None` and the acceleration resumes
+    /// permanently short of the source (#13546).
+    #[test]
+    fn an_empty_acceleration_holding_a_usable_position_is_a_gap_nothing_will_fill() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+        // A reachable position on a durable acceleration: today's resume, and the
+        // control the case below is measured against.
+        let reachable = |contents_implying_gap| {
+            rebuild_cause(&at(100), Some(0), 0, true, contents_implying_gap)
+        };
+
+        assert_eq!(
+            reachable(None),
+            None,
+            "control: a snapshot is going to load the table, so the contents tell against \
+             nothing and the new arm cannot be firing on the position alone"
+        );
+        assert_eq!(
+            reachable(Some(AccelerationContents::NonEmpty)),
+            None,
+            "control: an acceleration observed to hold rows still resumes — only a positive \
+             observation of rows licenses that, and this is it"
+        );
+        assert_eq!(
+            reachable(Some(AccelerationContents::Empty)),
+            Some(RebuildCause::EmptyWithUsablePosition),
+            "an empty acceleration recording changes as applied is missing every row below that \
+             position, and no reachable WAL will resend them"
+        );
+        // The correctness hinge of the `Unknown` path, and the one an accessor
+        // returning `false` here would silently undo: a probe that failed after
+        // the table was recreated must not resume on the surviving watermark. It
+        // rebuilds like `Empty`, but says so as its own cause, because nothing
+        // ever observed this table to be empty.
+        assert_eq!(
+            reachable(Some(AccelerationContents::Unknown)),
+            Some(RebuildCause::UnprovenContentsWithUsablePosition),
+            "an unread acceleration cannot license a resume: if it was recreated, every row \
+             below the surviving position would stay missing for good"
+        );
+        assert_eq!(
+            reachable(Some(AccelerationContents::default())),
+            Some(RebuildCause::UnprovenContentsWithUsablePosition),
+            "the default must be the conservative answer, so a caller that never probes cannot \
+             accidentally opt out of the rebuild"
+        );
+
+        // Position 0 is read like any other position, which is what this pins: an
+        // empty acceleration holding it is still missing every row below it, so
+        // the cause fires here too rather than being waived for a zero LSN. What
+        // decides whether another load is actually coming is the caller's
+        // `snapshotting` gate, not the LSN's value.
+        assert_eq!(
+            rebuild_cause(&at(0), Some(0), 0, true, Some(AccelerationContents::Empty)),
+            Some(RebuildCause::EmptyWithUsablePosition),
+            "a recorded position of 0 is treated no differently — it is the caller's \
+             `snapshotting` gate, not the LSN's value, that says whether a load is coming"
+        );
+
+        // The slot-health causes are strictly more specific about what to go and
+        // look at, and they fire today. Emptiness must not relabel them, or an
+        // operator with a retention problem is sent to look at their accelerator.
+        assert_eq!(
+            rebuild_cause(
+                &at(100),
+                Some(40),
+                200,
+                true,
+                Some(AccelerationContents::Empty)
+            ),
+            Some(RebuildCause::AcknowledgedPast),
+            "an acknowledged-past slot keeps its cause when the acceleration is also empty"
+        );
+        assert_eq!(
+            rebuild_cause(
+                &at(100),
+                Some(140),
+                0,
+                true,
+                Some(AccelerationContents::Empty)
+            ),
+            Some(RebuildCause::RetentionLost),
+            "a slot that lost the following WAL keeps its cause when the acceleration is also empty"
+        );
+        assert_eq!(
+            rebuild_cause(&at(100), None, 0, true, Some(AccelerationContents::Empty)),
+            Some(RebuildCause::RetentionLost),
+            "no slot at all keeps its cause when the acceleration is also empty"
+        );
+        for reason in [
+            UnusableReason::ForeignSource,
+            UnusableReason::Unreadable,
+            UnusableReason::RewoundSource,
+        ] {
+            let unusable = RecordedPosition::Unusable(reason);
+            assert_ne!(
+                rebuild_cause(
+                    &unusable,
+                    Some(0),
+                    0,
+                    true,
+                    Some(AccelerationContents::Empty)
+                ),
+                Some(RebuildCause::EmptyWithUsablePosition),
+                "{reason:?} describes an unusable record, not a usable position, so emptiness must \
+                 not take over its cause"
+            );
+        }
+
+        // Absence is the other half of the rule and is governed by its own flag:
+        // emptiness alone must not manufacture a cause for a record that is not
+        // there, or a genuine first load with snapshots pending would rebuild.
+        assert_eq!(
+            rebuild_cause(
+                &RecordedPosition::Absent,
+                Some(0),
+                0,
+                false,
+                Some(AccelerationContents::Empty)
+            ),
+            None,
+            "a missing record stays the `absence_implies_gap` decision — an empty acceleration \
+             with nothing recorded is a first load"
         );
     }
 
@@ -804,6 +1062,11 @@ mod tests {
     /// one would silently merge unrelated incidents; `reason` is all an operator
     /// reads, so two sharing one sends them after the wrong problem. Neither may
     /// collide, and neither may be empty.
+    ///
+    /// A new variant must be added to `causes` below. `label`/`reason` are
+    /// exhaustive matches, so adding one forces a visit to both — and this list
+    /// is named in the comment there for the same reason: an unlisted variant
+    /// would leave this test passing while asserting nothing about it.
     #[test]
     fn every_rebuild_cause_is_distinguishable_to_a_query_and_to_a_person() {
         let causes = [
@@ -813,6 +1076,8 @@ mod tests {
             RebuildCause::RewoundSource,
             RebuildCause::AcknowledgedPast,
             RebuildCause::RetentionLost,
+            RebuildCause::EmptyWithUsablePosition,
+            RebuildCause::UnprovenContentsWithUsablePosition,
         ];
         for (i, cause) in causes.iter().enumerate() {
             assert!(!cause.label().is_empty(), "{cause:?} has no label");
