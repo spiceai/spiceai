@@ -378,6 +378,42 @@ pub(crate) fn transform_schema_for_vortex(
 /// of them runs the initialization.
 type CatalogCell = Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>;
 
+/// The warning a metastore that could not be flushed on shutdown reports.
+///
+/// Built here, and asserted in `a_failed_shutdown_flush_names_the_datasets_and_the_impact`,
+/// so a reword cannot quietly drop the datasets, the consequence, or the recovery: the
+/// operator reading this line knows their dataset names, not the path a metastore
+/// resolved to, and needs to know whether they have lost anything (they have not).
+fn metastore_shutdown_flush_warning(
+    metastore_path: &str,
+    datasets: &std::collections::BTreeSet<String>,
+    cause: &str,
+) -> String {
+    let names = datasets
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let datasets = if names.is_empty() {
+        String::from("no dataset")
+    } else {
+        names
+    };
+    format!(
+        "Failed to flush the Cayenne acceleration metadata at '{metastore_path}' for dataset {datasets} while shutting down, so its write-ahead log was left un-truncated. No accelerated data is lost and the next start replays the log automatically; until then the metadata files stay larger than usual and that start is slower. If this repeats, give the runtime longer to shut down and check that nothing else is holding the file open. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: {cause}"
+    )
+}
+
+/// One metastore in the shutdown registry, and the datasets accelerating into it.
+///
+/// The names are carried because a failure to flush is reported to an operator, who
+/// knows their datasets and not the path a metastore happened to resolve to — and a
+/// shared metastore backs several of them at once.
+struct ShutdownEntry {
+    catalog: Arc<dyn cayenne::MetadataCatalog>,
+    datasets: std::collections::BTreeSet<String>,
+}
+
 pub struct CayenneAccelerator {
     /// One catalog per metastore path, keyed by the connection string
     /// `get_or_create_catalog` derives from the dataset's `cayenne_metadata_dir`.
@@ -404,7 +440,7 @@ pub struct CayenneAccelerator {
     /// Keyed by connection string rather than per catalog object: `shutdown` truncates
     /// the WAL of the file the DSN names, so one flush per metastore is both sufficient
     /// and all that can usefully run.
-    shutdown_registry: Arc<parking_lot::Mutex<HashMap<String, Arc<dyn cayenne::MetadataCatalog>>>>,
+    shutdown_registry: Arc<parking_lot::Mutex<HashMap<String, ShutdownEntry>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -2489,6 +2525,7 @@ impl CayenneAccelerator {
 
     async fn get_or_create_catalog(
         &self,
+        dataset_name: &str,
         metadata_dir: &str,
         metastore_type: &str,
     ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
@@ -2508,30 +2545,42 @@ impl CayenneAccelerator {
             )
         };
         let catalog = Self::init_cayenne_catalog(&cell, connection_string.clone()).await?;
-        self.register_for_shutdown(connection_string, &catalog);
+        self.register_for_shutdown(connection_string, dataset_name, &catalog);
         Ok(catalog)
     }
 
-    /// Record a catalog so `shutdown` flushes the metastore it names.
+    /// Record a catalog so `shutdown` flushes the metastore it names, and note which
+    /// dataset accelerates into it.
     ///
-    /// First registration for a connection string wins: later catalogs on the same DSN
-    /// address the same file, and flushing it once is all `shutdown` can usefully do.
+    /// The first catalog registered for a connection string is the one kept: later
+    /// catalogs on the same DSN address the same file, and flushing it once is all
+    /// `shutdown` can usefully do. Every dataset name is accumulated, though — a shared
+    /// metastore backs several, and a failure to flush affects all of them.
     fn register_for_shutdown(
         &self,
         connection_string: String,
+        dataset_name: &str,
         catalog: &Arc<dyn cayenne::MetadataCatalog>,
     ) {
         self.shutdown_registry
             .lock()
             .entry(connection_string)
-            .or_insert_with(|| Arc::clone(catalog));
+            .or_insert_with(|| ShutdownEntry {
+                catalog: Arc::clone(catalog),
+                datasets: std::collections::BTreeSet::new(),
+            })
+            .datasets
+            .insert(dataset_name.to_string());
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
     /// tables. The DSN uses `SQLite`'s `memdb` VFS keyed by this accelerator's
     /// instance id, so the metastore lives entirely in RAM (nothing on disk) and
     /// distinct accelerator instances stay isolated.
-    async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+    async fn get_or_create_memory_catalog(
+        &self,
+        dataset_name: &str,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string =
             format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
         let catalog =
@@ -2539,7 +2588,7 @@ impl CayenneAccelerator {
         // Registered like any other: the memdb has nothing to checkpoint, but keeping the
         // registry the single record of what this accelerator opened is what stops the next
         // catalog path from being the one nobody remembers to flush.
-        self.register_for_shutdown(connection_string, &catalog);
+        self.register_for_shutdown(connection_string, dataset_name, &catalog);
         Ok(catalog)
     }
 
@@ -2667,14 +2716,14 @@ impl CayenneAccelerator {
         // the metadata dir and uses the shared on-disk catalog as before.
         let memory_mode = !source.is_file_accelerated();
         let catalog = if memory_mode {
-            self.get_or_create_memory_catalog().await?
+            self.get_or_create_memory_catalog(table_name).await?
         } else {
             // Ensure metadata directory exists
             std::fs::create_dir_all(&metadata_dir)
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
             // Get or create the shared catalog (lazy initialization)
-            self.get_or_create_catalog(&metadata_dir, &metastore_type)
+            self.get_or_create_catalog(table_name, &metadata_dir, &metastore_type)
                 .await?
         };
 
@@ -3754,7 +3803,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_name = source.name().to_string();
             let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .get_or_create_catalog(&table_name, &metadata_dir, metastore_type)
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
@@ -3807,7 +3856,11 @@ impl DataAccelerator for CayenneAccelerator {
                 .map_or("sqlite", String::as_str)
                 .to_string();
             let snapshot_engine = match self
-                .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+                .get_or_create_catalog(
+                    &source.name().to_string(),
+                    &metadata_dir.to_string_lossy(),
+                    &metastore_type,
+                )
                 .await
             {
                 Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
@@ -4057,7 +4110,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             // This catalog is built here rather than through `get_or_create_catalog`, so it
             // is not in the `catalogs` cache and shutdown would never see it.
-            self.register_for_shutdown(catalog_connection_string, &catalog);
+            self.register_for_shutdown(catalog_connection_string, &table_name, &catalog);
 
             // Get or create table_id from catalog
             let table_metadata = catalog
@@ -4228,7 +4281,11 @@ impl DataAccelerator for CayenneAccelerator {
             .map_or("sqlite", String::as_str)
             .to_string();
         let catalog = match self
-            .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
+            .get_or_create_catalog(
+                &source.name().to_string(),
+                &metadata_dir.to_string_lossy(),
+                &metastore_type,
+            )
             .await
         {
             Ok(catalog) => catalog,
@@ -4313,7 +4370,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
             let catalog = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .get_or_create_catalog(table_name, &metadata_dir, metastore_type)
                 .await?;
             catalog.drop_table(table_name).await.boxed()?;
         }
@@ -4385,7 +4442,7 @@ impl DataAccelerator for CayenneAccelerator {
             .get("cayenne_metastore")
             .map_or("sqlite", String::as_str);
         let catalog = self
-            .get_or_create_catalog(&metadata_dir, metastore_type)
+            .get_or_create_catalog(table_name, &metadata_dir, metastore_type)
             .await?;
         let table = catalog.get_table(table_name).await.boxed()?;
 
@@ -4438,11 +4495,21 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Every metastore this accelerator opened, not just one: each has its own WAL
         // to flush, and skipping the others would leave their last writes unconsolidated.
-        let catalogs: Vec<(String, Arc<dyn cayenne::MetadataCatalog>)> = {
+        let catalogs: Vec<(
+            String,
+            std::collections::BTreeSet<String>,
+            Arc<dyn cayenne::MetadataCatalog>,
+        )> = {
             let registry = self.shutdown_registry.lock();
             registry
                 .iter()
-                .map(|(dsn, catalog)| (dsn.clone(), Arc::clone(catalog)))
+                .map(|(dsn, entry)| {
+                    (
+                        dsn.clone(),
+                        entry.datasets.clone(),
+                        Arc::clone(&entry.catalog),
+                    )
+                })
                 .collect()
         };
 
@@ -4454,9 +4521,18 @@ impl DataAccelerator for CayenneAccelerator {
         // Shut every one down before reporting a failure, so one bad metastore cannot
         // leave the others' WALs unflushed. The first error is returned.
         let mut first_error = None;
-        for (dsn, catalog) in catalogs {
+        for (dsn, datasets, catalog) in catalogs {
             if let Err(e) = catalog.shutdown().await {
-                tracing::warn!("Failed to shutdown Cayenne catalog '{dsn}': {e}");
+                // The scheme is this crate's own encoding of the path, not something the
+                // operator wrote; report the path they configured.
+                let path = dsn
+                    .strip_prefix("sqlite://")
+                    .or_else(|| dsn.strip_prefix("libsql://"))
+                    .unwrap_or(&dsn);
+                tracing::warn!(
+                    "{}",
+                    metastore_shutdown_flush_warning(path, &datasets, &e.to_string())
+                );
                 first_error.get_or_insert(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
         }
@@ -5841,11 +5917,11 @@ mod tests {
 
         let accelerator = CayenneAccelerator::new();
         let catalog_a = accelerator
-            .get_or_create_catalog(&a, "sqlite")
+            .get_or_create_catalog("ds_a", &a, "sqlite")
             .await
             .expect("failed to open catalog a");
         let catalog_b = accelerator
-            .get_or_create_catalog(&b, "sqlite")
+            .get_or_create_catalog("ds_b", &b, "sqlite")
             .await
             .expect("failed to open catalog b");
         assert!(
@@ -5855,7 +5931,7 @@ mod tests {
 
         // The same directory keeps returning the same catalog — the cache still caches.
         let catalog_a_again = accelerator
-            .get_or_create_catalog(&a, "sqlite")
+            .get_or_create_catalog("ds_a", &a, "sqlite")
             .await
             .expect("failed to reopen catalog a");
         assert!(
@@ -5899,6 +5975,52 @@ mod tests {
         );
     }
 
+    /// The shutdown warning is the only account an operator gets of a metastore that
+    /// could not be flushed, so it has to name the datasets it affects, say what the
+    /// consequence is, and say what to do — a path and a cause alone leave them unable
+    /// to tell a cosmetic failure from a lost write.
+    #[test]
+    fn a_failed_shutdown_flush_names_the_datasets_and_the_impact() {
+        let datasets = ["orders", "customers"]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<String>>();
+        let message = metastore_shutdown_flush_warning(
+            "/var/lib/spice/metadata/cayenne.db",
+            &datasets,
+            "database is locked",
+        );
+
+        assert!(
+            message.contains("'/var/lib/spice/metadata/cayenne.db'"),
+            "the metastore path must be named: {message}"
+        );
+        assert!(
+            message.contains("'customers'") && message.contains("'orders'"),
+            "every dataset backed by the metastore must be named: {message}"
+        );
+        assert!(
+            message.contains("No accelerated data is lost"),
+            "the message must say whether anything was lost: {message}"
+        );
+        assert!(
+            message.contains("write-ahead log was left un-truncated"),
+            "the message must state what actually happened: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs"),
+            "the message must link the docs: {message}"
+        );
+        assert!(
+            message.contains("database is locked"),
+            "the cause must survive into the message: {message}"
+        );
+        assert!(
+            !message.contains("sqlite://") && !message.contains("catalog"),
+            "the message must not leak internal vocabulary: {message}"
+        );
+    }
+
     /// `shutdown` flushes what the shutdown registry holds, so every path that opens a
     /// metastore has to register it. A catalog built outside `get_or_create_catalog` —
     /// the partitioned path does exactly that — would otherwise never have its WAL
@@ -5920,15 +6042,15 @@ mod tests {
         );
 
         accelerator
-            .get_or_create_catalog(&a, "sqlite")
+            .get_or_create_catalog("ds_a", &a, "sqlite")
             .await
             .expect("failed to open catalog a");
         accelerator
-            .get_or_create_catalog(&b, "sqlite")
+            .get_or_create_catalog("ds_b", &b, "sqlite")
             .await
             .expect("failed to open catalog b");
         accelerator
-            .get_or_create_memory_catalog()
+            .get_or_create_memory_catalog("ds_mem")
             .await
             .expect("failed to open the memory catalog");
 
@@ -5959,7 +6081,7 @@ mod tests {
         // Reopening the same metastore must not add a second entry: shutdown truncates the
         // WAL of the file the DSN names, so one flush per metastore is all that can run.
         accelerator
-            .get_or_create_catalog(&a, "sqlite")
+            .get_or_create_catalog("ds_a", &a, "sqlite")
             .await
             .expect("failed to reopen catalog a");
         assert_eq!(
