@@ -1457,6 +1457,31 @@ impl DataFusion {
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                     notifier
+                } else if crate::dataconnector::sink::registers_from_acceleration(
+                    dataset.acceleration.as_ref(),
+                    source.as_ref(),
+                ) {
+                    // The acceleration already holds this dataset's rows and the schema they
+                    // were written under, so there is a table to build now. Register it,
+                    // rather than leaving the stored rows unqueryable until the next write.
+                    let notifier = self
+                        .register_accelerated_table(
+                            dataset,
+                            source,
+                            federated_read_table,
+                            secrets,
+                            bootstrap_status,
+                            initial_partition_filters,
+                        )
+                        .await?;
+                    // A sink has nothing to load from: its rows arrive by write, so being
+                    // registered is the whole of its readiness — the same point the parked
+                    // path below reports ready at. Say so here too, or a sink whose
+                    // `refresh_mode` resolves to `disabled` (its default) starts no refresh
+                    // and so never leaves `Refreshing`.
+                    self.runtime_status
+                        .update_dataset(&dataset_table_ref, status::ComponentStatus::Ready);
+                    notifier
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
                     self.runtime_status
