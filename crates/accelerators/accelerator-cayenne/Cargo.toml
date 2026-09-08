@@ -73,6 +73,7 @@ turso-shared.workspace = true
 itertools.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
+parking_lot.workspace = true
 
 [dev-dependencies]
 # Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal

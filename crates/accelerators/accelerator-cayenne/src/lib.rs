@@ -373,12 +373,27 @@ pub(crate) fn transform_schema_for_vortex(
     }
 }
 
+/// A lazily-initialized handle to one metastore's catalog. Shared (`Arc`) because the
+/// same cell is handed to every dataset resolving to that metastore, and only the first
+/// of them runs the initialization.
+type CatalogCell = Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>;
+
 pub struct CayenneAccelerator {
-    catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// One catalog per metastore path, keyed by the connection string
+    /// `get_or_create_catalog` derives from the dataset's `cayenne_metadata_dir`.
+    ///
+    /// Keyed, not a single cell: `cayenne_metadata_dir` is per-dataset, so a pod can
+    /// legitimately run several Cayenne datasets against several metastores. A single
+    /// shared cell would bind every dataset to whichever one initialized first — the
+    /// rest would silently write their tables into a database their own configuration
+    /// never names, and on the next start a different dataset could win the race,
+    /// find none of its table names there, and mint a fresh `table_id` over data it
+    /// can no longer reach.
+    catalogs: Arc<parking_lot::Mutex<HashMap<String, CatalogCell>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
-    memory_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    memory_catalog: CatalogCell,
     /// Process-unique id for this accelerator instance, used to name the in-memory
     /// `memdb` metastore so separate instances (e.g. per-test runtimes) never share
     /// one in-memory database.
@@ -1217,7 +1232,7 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
-            catalog: Arc::new(OnceCell::new()),
+            catalogs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2465,7 +2480,18 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
-        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+        // Resolve this metastore's own cell before initializing, so the connection
+        // string actually selects the catalog rather than being discarded by a cell
+        // some other dataset already filled. The guard is dropped before the await.
+        let cell = {
+            let mut catalogs = self.catalogs.lock();
+            Arc::clone(
+                catalogs
+                    .entry(connection_string.clone())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        Self::init_cayenne_catalog(&cell, connection_string).await
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -4367,19 +4393,34 @@ impl DataAccelerator for CayenneAccelerator {
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::debug!("Cayenne accelerator shutdown: starting catalog shutdown");
 
-        // Get the catalog if it was initialized
-        let catalog = self.catalog.get().map(Arc::clone);
+        // Every metastore this accelerator opened, not just one: each has its own WAL
+        // to flush, and skipping the others would leave their last writes unconsolidated.
+        let catalogs: Vec<(String, Arc<dyn cayenne::MetadataCatalog>)> = {
+            let catalogs = self.catalogs.lock();
+            catalogs
+                .iter()
+                .filter_map(|(dsn, cell)| cell.get().map(|c| (dsn.clone(), Arc::clone(c))))
+                .collect()
+        };
 
-        if let Some(catalog) = catalog {
-            // Run shutdown on the catalog to flush WAL and optimize
-            catalog.shutdown().await.map_err(|e| {
-                tracing::warn!("Failed to shutdown Cayenne catalog: {e}");
-                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-            tracing::debug!("Cayenne accelerator shutdown: complete");
-        } else {
+        if catalogs.is_empty() {
             tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
+            return Ok(());
         }
+
+        // Shut every one down before reporting a failure, so one bad metastore cannot
+        // leave the others' WALs unflushed. The first error is returned.
+        let mut first_error = None;
+        for (dsn, catalog) in catalogs {
+            if let Err(e) = catalog.shutdown().await {
+                tracing::warn!("Failed to shutdown Cayenne catalog '{dsn}': {e}");
+                first_error.get_or_insert(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        tracing::debug!("Cayenne accelerator shutdown: complete");
 
         Ok(())
     }
@@ -5737,6 +5778,81 @@ mod tests {
                 .is_some(),
             "`://` inside a metadata path does not put it on object storage, and the \
              delete still reaches it"
+        );
+    }
+
+    /// `cayenne_metadata_dir` is per-dataset, so two datasets pointed at two
+    /// metastores must get two catalogs. Under a single shared cell the connection
+    /// string was discarded after the first initialization: every later dataset wrote
+    /// its tables into a database its own configuration never named, and a restart
+    /// that resolved a different winner found none of its table names there and minted
+    /// a fresh `table_id` over data it could no longer reach.
+    #[tokio::test]
+    async fn each_metadata_dir_gets_its_own_catalog() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("failed to create dir a");
+        std::fs::create_dir_all(&dir_b).expect("failed to create dir b");
+        let (a, b) = (dir_a.to_string_lossy(), dir_b.to_string_lossy());
+
+        let accelerator = CayenneAccelerator::new();
+        let catalog_a = accelerator
+            .get_or_create_catalog(&a, "sqlite")
+            .await
+            .expect("failed to open catalog a");
+        let catalog_b = accelerator
+            .get_or_create_catalog(&b, "sqlite")
+            .await
+            .expect("failed to open catalog b");
+        assert!(
+            !Arc::ptr_eq(&catalog_a, &catalog_b),
+            "two metastore directories must not share one catalog"
+        );
+
+        // The same directory keeps returning the same catalog — the cache still caches.
+        let catalog_a_again = accelerator
+            .get_or_create_catalog(&a, "sqlite")
+            .await
+            .expect("failed to reopen catalog a");
+        assert!(
+            Arc::ptr_eq(&catalog_a, &catalog_a_again),
+            "one metastore directory must resolve to one catalog"
+        );
+
+        // Isolation is what actually matters: a table created against A must not be
+        // visible in B, or a restart resolving B mints a new table over A's data.
+        catalog_a
+            .create_table(cayenne::metadata::CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: tmp.path().join("data").to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("failed to create table in catalog a");
+
+        assert_eq!(
+            catalog_a
+                .list_table_names()
+                .await
+                .expect("failed to list catalog a"),
+            vec!["orders".to_string()],
+        );
+        assert!(
+            catalog_b
+                .list_table_names()
+                .await
+                .expect("failed to list catalog b")
+                .is_empty(),
+            "a table created against one metastore must not appear in another"
         );
     }
 

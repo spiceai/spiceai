@@ -2273,3 +2273,155 @@ async fn datalake_e2e_inner(
     }
     Ok(())
 }
+
+/// A Cayenne-accelerated dataset backed by a `sink` (no source rows), so the only data it
+/// holds is what was written into its acceleration — a refresh cannot repopulate it and
+/// mask a metastore that came back empty.
+#[cfg(not(target_os = "windows"))]
+fn make_sink_accelerated_dataset(name: &str, data_dir: &str, metadata_dir: &str) -> Dataset {
+    let mut dataset = Dataset::new(format!("sink:{name}"), name.to_string());
+    dataset.access = AccessMode::ReadWrite;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        params: Some(Params::from_string_map(
+            vec![
+                ("cayenne_file_path".to_string(), data_dir.to_string()),
+                ("cayenne_metadata_dir".to_string(), metadata_dir.to_string()),
+            ]
+            .into_iter()
+            .collect::<HashMap<String, String>>(),
+        )),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// Append one row to a sink dataset, building the batch from a fixed schema rather than
+/// from the catalog: a sink that has not been written to yet has no registered provider to
+/// read a schema from, and the write itself is what registers it.
+#[cfg(not(target_os = "windows"))]
+async fn append_id_to_sink(rt: &Runtime, table_name: &str, id: i64) -> Result<(), String> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![id])) as arrow::array::ArrayRef],
+    )
+    .map_err(|e| format!("failed to build batch for {table_name}: {e}"))?;
+
+    rt.datafusion()
+        .write_data(
+            &TableReference::bare(table_name.to_string()),
+            DataUpdate {
+                schema,
+                data: vec![batch],
+                update_type: UpdateType::Append,
+            },
+        )
+        .await
+        .map_err(|e| format!("write to {table_name} failed: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn start_runtime_with_datasets(datasets: &[Dataset]) -> Result<Runtime, String> {
+    let mut builder = AppBuilder::new("cayenne_metastore_isolation");
+    for dataset in datasets {
+        builder = builder.with_dataset(dataset.clone());
+    }
+    let app = builder.build();
+
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
+    let cloned_rt = Arc::new(rt.clone());
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
+            return Err("timed out waiting for datasets to load".to_string());
+        }
+        () = cloned_rt.load_components() => {}
+    }
+    runtime_ready_check_with_timeout(&rt, Duration::from_mins(2)).await;
+    Ok(rt)
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn count_rows(rt: &Runtime, table_name: &str) -> Result<i64, String> {
+    let batches = run_query(rt, &format!("SELECT count(*) FROM {table_name}")).await?;
+    first_i64_cell(&batches)
+}
+
+/// Each dataset must accelerate into the metastore its own `cayenne_metadata_dir` names.
+///
+/// The accelerator cached one catalog for the whole process, so the connection string
+/// derived from a dataset's `cayenne_metadata_dir` was discarded after the first dataset
+/// initialized: every later dataset wrote its tables into a metastore its own configuration
+/// never named. Which dataset initializes first is a startup race, so a later start could
+/// resolve a different metastore, find none of its table names there, and mint a fresh
+/// `table_id` — leaving every previously accelerated row on disk but unreachable, with
+/// nothing in the logs to say so.
+///
+/// Reopening each dataset ALONE is what makes the assertion deterministic rather than
+/// dependent on which one wins the race: exactly one metastore ends up holding both tables,
+/// so whichever dataset lost cannot find its rows when it is the only one opening.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn each_dataset_accelerates_into_its_own_metadata_dir() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+    let path = |name: &str| temp_dir.path().join(name).to_string_lossy().to_string();
+
+    // Distinct metadata directories are the whole point: a shared one cannot show the bug.
+    let ds_a = make_sink_accelerated_dataset("iso_metric_a", &path("data_a"), &path("metadata_a"));
+    let ds_b = make_sink_accelerated_dataset("iso_metric_b", &path("data_b"), &path("metadata_b"));
+
+    // Phase 1: both datasets loaded together, so they race to initialize a catalog.
+    {
+        let rt = start_runtime_with_datasets(&[ds_a.clone(), ds_b.clone()]).await?;
+        append_id_to_sink(&rt, "iso_metric_a", 1).await?;
+        append_id_to_sink(&rt, "iso_metric_a", 2).await?;
+        append_id_to_sink(&rt, "iso_metric_b", 3).await?;
+        assert_eq!(
+            count_rows(&rt, "iso_metric_a").await?,
+            2,
+            "phase 1: dataset A"
+        );
+        assert_eq!(
+            count_rows(&rt, "iso_metric_b").await?,
+            1,
+            "phase 1: dataset B"
+        );
+        rt.shutdown().await;
+    }
+
+    // Phase 2: dataset A alone must still find the two rows it accelerated.
+    {
+        let rt = start_runtime_with_datasets(std::slice::from_ref(&ds_a)).await?;
+        // The write is what registers a sink dataset that has not been written to since
+        // startup; it must append to the stored rows rather than open an empty table.
+        append_id_to_sink(&rt, "iso_metric_a", 4).await?;
+        assert_eq!(
+            count_rows(&rt, "iso_metric_a").await?,
+            3,
+            "dataset A must reopen the metastore its own cayenne_metadata_dir names; \
+             one row means a fresh table was minted over the two it had accelerated"
+        );
+        rt.shutdown().await;
+    }
+
+    // Phase 3: and the same for dataset B, which is the one that loses under the bug
+    // whenever A won the phase 1 race.
+    {
+        let rt = start_runtime_with_datasets(std::slice::from_ref(&ds_b)).await?;
+        append_id_to_sink(&rt, "iso_metric_b", 5).await?;
+        assert_eq!(
+            count_rows(&rt, "iso_metric_b").await?,
+            2,
+            "dataset B must reopen the metastore its own cayenne_metadata_dir names; \
+             one row means a fresh table was minted over the one it had accelerated"
+        );
+        rt.shutdown().await;
+    }
+
+    Ok(())
+}

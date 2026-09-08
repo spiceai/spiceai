@@ -1200,7 +1200,8 @@ impl CayenneCatalog {
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
-                != new_vc.cold_tier_background_interval_ms;
+                != new_vc.cold_tier_background_interval_ms
+            || stored_vc.cold_tier_gc_interval_ms != new_vc.cold_tier_gc_interval_ms;
         if !runtime_fields_differ {
             return Ok(());
         }
@@ -1221,6 +1222,7 @@ impl CayenneCatalog {
         stored.vortex_config.cold_tier_warm_max_files = new_vc.cold_tier_warm_max_files;
         stored.vortex_config.cold_tier_background_interval_ms =
             new_vc.cold_tier_background_interval_ms;
+        stored.vortex_config.cold_tier_gc_interval_ms = new_vc.cold_tier_gc_interval_ms;
 
         let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
@@ -2335,6 +2337,21 @@ impl MetadataCatalog for CayenneCatalog {
         // The initial snapshot directory was already created (with parent
         // sync) before the metastore INSERT, so the catalog row now points
         // at a durable directory. Nothing more to do here for local FS.
+
+        // Minting a table is the one outcome of this function that starts the
+        // dataset from zero rows, and it is otherwise indistinguishable in the
+        // logs from reopening the existing one. An accelerated dataset that has
+        // run before is expected to REOPEN; if it mints instead, every row it
+        // previously accelerated is still on disk under the old table_id but no
+        // longer reachable, and the only visible symptom is a dataset that
+        // silently starts empty. Say so at the moment it happens, with the ids
+        // needed to find the orphaned directory.
+        tracing::info!(
+            table_name = table_name.as_str(),
+            table_id = table_id.as_str(),
+            path = base_path.as_str(),
+            "Created a new Cayenne acceleration for table '{table_name}' (table_id {table_id}): the metastore held no table under this name. If this dataset has been accelerated before, its previous data is still under '{base_path}' but is no longer reachable, and the dataset now starts empty."
+        );
 
         Ok(table_id)
     }
@@ -5814,6 +5831,67 @@ mod tests {
         assert_eq!(table_metadata.table_id, table_ids[0]);
 
         // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Every datalake field the operator can retune must actually take effect on
+    /// reopen. `reconcile_runtime_only_config` persists the ones it compares, so a
+    /// field missing from that comparison is inert on every table that already
+    /// exists — which is exactly when an operator reaches for it.
+    #[tokio::test]
+    async fn reopening_a_table_persists_retuned_datalake_intervals() {
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_reconcile_gc_{}.db", uuid::Uuid::now_v7());
+        let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = |gc_ms: u64, bg_ms: u64| CreateTableOptions {
+            table_name: "retuned".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig {
+                cold_tier_location: Some("s3://bucket/prefix".to_string()),
+                cold_tier_gc_interval_ms: gc_ms,
+                cold_tier_background_interval_ms: bg_ms,
+                ..crate::metadata::VortexConfig::default()
+            },
+        };
+
+        catalog
+            .create_table(options(600_000, 60_000))
+            .await
+            .expect("Failed to create table");
+
+        // Reopen with both intervals retuned, the way a restart after a spicepod edit does.
+        catalog
+            .create_table(options(7_000, 3_000))
+            .await
+            .expect("Failed to reopen table");
+
+        let stored = catalog
+            .get_table("retuned")
+            .await
+            .expect("Failed to read back table");
+        assert_eq!(
+            stored.vortex_config.cold_tier_background_interval_ms, 3_000,
+            "cayenne_datalake_tiering_check_interval_ms must take effect on reopen"
+        );
+        assert_eq!(
+            stored.vortex_config.cold_tier_gc_interval_ms, 7_000,
+            "cayenne_datalake_gc_interval_ms must take effect on reopen"
+        );
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
