@@ -1234,7 +1234,6 @@ impl RecordBatchStream for CteScanStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::MemTable;
@@ -1243,6 +1242,8 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
+
+    use super::*;
 
     fn rule() -> CayenneCteMaterialization {
         CayenneCteMaterialization::new_with_table_source_predicate(|_| true)
@@ -1684,6 +1685,309 @@ mod tests {
             "default Cayenne predicate must not rewrite MemTable scans:\n{}",
             rewritten.data
         );
+        Ok(())
+    }
+
+    /// TPC-DS Q64 `cross_sales` is an 18-way join referenced twice. Materializing
+    /// it must not send that island through join reorder: EXPLAIN on the lab
+    /// timed out at 30s and warmup hung at 200% CPU.
+    #[tokio::test]
+    async fn q64_shaped_materialized_cross_sales_plans_in_bounded_time() -> Result<()> {
+        use std::time::{Duration, Instant};
+
+        let ctx = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_optimizer_rules(q64_optimizer_rules())
+                .with_query_planner(Arc::new(
+                    ExtensionPlanQueryPlanner::from_extension_planners(vec![Arc::new(
+                        CayenneCteMaterializationPlanner,
+                    )]),
+                ))
+                .build(),
+        );
+        register_q64_tpcds_tables(&ctx)?;
+
+        let sql = include_str!("../../test-framework/src/queries/tpcds/q64.sql");
+        let start = Instant::now();
+        let plan_fut = async {
+            let df = ctx.sql(sql).await?;
+            let plan = df.into_optimized_plan()?;
+            let physical = ctx.state().create_physical_plan(&plan).await?;
+            Ok::<_, datafusion::common::DataFusionError>((plan, physical))
+        };
+        let (plan, physical) = tokio::time::timeout(Duration::from_secs(5), plan_fut)
+            .await
+            .expect("TPC-DS Q64 with CTE auto timed out after 5s")?;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "TPC-DS Q64 with CTE auto + join reorder took {elapsed:?}"
+        );
+        assert!(
+            plan_contains_node(&plan, MATERIALIZED_CTE_NODE_NAME),
+            "expected to materialize cross_sales:\n{plan}"
+        );
+        let physical_display = displayable(physical.as_ref()).indent(true).to_string();
+        assert!(
+            physical_display.contains("MaterializedCte") || physical_display.contains("CteScan"),
+            "expected materialized CTE physical plan:\n{physical_display}"
+        );
+        Ok(())
+    }
+
+    fn q64_optimizer_rules() -> Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> {
+        use datafusion_optimizer_rules::logical_plan::ReorderJoinRule;
+
+        use crate::logical_optimizer::{
+            CayennePropagateFilterAcrossEquiJoinKeys, CayennePushDownSemiJoin,
+            CayenneReassociateCrossJoin,
+        };
+
+        let mut rules = Optimizer::new().rules;
+        rules.insert(0, Arc::new(rule()));
+        let insert_at = rules
+            .iter()
+            .position(|r| r.name() == "decorrelate_predicate_subquery")
+            .unwrap_or(rules.len());
+        rules.insert(
+            insert_at,
+            Arc::new(
+                CayennePropagateFilterAcrossEquiJoinKeys::new_with_table_source_predicate(|_| true),
+            ),
+        );
+        let insert_at = rules
+            .iter()
+            .position(|r| r.name() == "decorrelate_predicate_subquery")
+            .map_or(rules.len(), |i| i + 1);
+        rules.insert(
+            insert_at,
+            Arc::new(CayennePushDownSemiJoin::new_with_table_source_predicate(
+                |_| true,
+            )),
+        );
+        let insert_at = rules
+            .iter()
+            .position(|r| r.name() == "eliminate_cross_join")
+            .map_or(rules.len(), |i| i + 1);
+        rules.insert(
+            insert_at,
+            Arc::new(CayenneReassociateCrossJoin::new_with_table_source_predicate(|_| true)),
+        );
+        let insert_at = [
+            "push_down_filter",
+            "cayenne_reassociate_cross_join",
+            "eliminate_cross_join",
+        ]
+        .iter()
+        .filter_map(|name| rules.iter().position(|rule| rule.name() == *name))
+        .max()
+        .map_or(rules.len(), |position| position + 1);
+        rules.insert(insert_at, Arc::new(ReorderJoinRule::default()));
+        rules
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "TPC-DS Q64 table schemas are a catalog, not control flow"
+    )]
+    fn register_q64_tpcds_tables(ctx: &SessionContext) -> Result<()> {
+        use async_trait::async_trait;
+        use datafusion::catalog::{Session, TableProvider};
+        use datafusion::common::stats::Precision;
+        use datafusion::common::{ColumnStatistics, Statistics};
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::logical_expr::{Expr, TableType};
+        use datafusion::physical_plan::ExecutionPlan;
+
+        #[derive(Debug)]
+        struct StatsTable {
+            schema: Arc<Schema>,
+            num_rows: usize,
+        }
+
+        #[async_trait]
+        impl TableProvider for StatsTable {
+            fn schema(&self) -> Arc<Schema> {
+                Arc::clone(&self.schema)
+            }
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+            fn statistics(&self) -> Option<Statistics> {
+                let column_statistics = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|_| ColumnStatistics {
+                        null_count: Precision::Absent,
+                        max_value: Precision::Absent,
+                        min_value: Precision::Absent,
+                        sum_value: Precision::Absent,
+                        distinct_count: Precision::Inexact(self.num_rows.max(1)),
+                        byte_size: Precision::Absent,
+                    })
+                    .collect();
+                Some(Statistics {
+                    num_rows: Precision::Inexact(self.num_rows),
+                    total_byte_size: Precision::Absent,
+                    column_statistics,
+                })
+            }
+            async fn scan(
+                &self,
+                state: &dyn Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[Expr],
+                limit: Option<usize>,
+            ) -> Result<Arc<dyn ExecutionPlan>> {
+                EmptyTable::new(Arc::clone(&self.schema))
+                    .scan(state, projection, filters, limit)
+                    .await
+            }
+        }
+
+        fn empty(ctx: &SessionContext, name: &str, cols: &[(&str, DataType)]) -> Result<()> {
+            let schema = Arc::new(Schema::new(
+                cols.iter()
+                    .map(|(n, t)| Field::new(*n, t.clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            // SF-1-ish TPC-DS sizes so filter-propagation cardinality gates fire
+            // the way they do on the lab (`EmptyTable` has no stats → skip).
+            let num_rows = match name {
+                "store_sales" | "catalog_sales" => 2_880_000,
+                "store_returns" | "catalog_returns" => 280_000,
+                "customer" => 100_000,
+                "customer_address" => 50_000,
+                "customer_demographics" => 1_920_800,
+                "date_dim" => 73_049,
+                "household_demographics" => 7_200,
+                "income_band" => 20,
+                "item" => 18_000,
+                "promotion" => 300,
+                "store" => 12,
+                other => panic!("missing TPC-DS SF-1 row count for {other}"),
+            };
+            ctx.register_table(name, Arc::new(StatsTable { schema, num_rows }))?;
+            Ok(())
+        }
+
+        empty(
+            ctx,
+            "catalog_sales",
+            &[
+                ("cs_item_sk", DataType::Int64),
+                ("cs_order_number", DataType::Int64),
+                ("cs_ext_list_price", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "catalog_returns",
+            &[
+                ("cr_item_sk", DataType::Int64),
+                ("cr_order_number", DataType::Int64),
+                ("cr_refunded_cash", DataType::Int64),
+                ("cr_reversed_charge", DataType::Int64),
+                ("cr_store_credit", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "store_sales",
+            &[
+                ("ss_sold_date_sk", DataType::Int64),
+                ("ss_item_sk", DataType::Int64),
+                ("ss_customer_sk", DataType::Int64),
+                ("ss_cdemo_sk", DataType::Int64),
+                ("ss_hdemo_sk", DataType::Int64),
+                ("ss_addr_sk", DataType::Int64),
+                ("ss_store_sk", DataType::Int64),
+                ("ss_promo_sk", DataType::Int64),
+                ("ss_ticket_number", DataType::Int64),
+                ("ss_wholesale_cost", DataType::Int64),
+                ("ss_list_price", DataType::Int64),
+                ("ss_coupon_amt", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "store_returns",
+            &[
+                ("sr_item_sk", DataType::Int64),
+                ("sr_ticket_number", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "date_dim",
+            &[("d_date_sk", DataType::Int64), ("d_year", DataType::Int64)],
+        )?;
+        empty(
+            ctx,
+            "store",
+            &[
+                ("s_store_sk", DataType::Int64),
+                ("s_store_name", DataType::Utf8),
+                ("s_zip", DataType::Utf8),
+            ],
+        )?;
+        empty(
+            ctx,
+            "customer",
+            &[
+                ("c_customer_sk", DataType::Int64),
+                ("c_current_cdemo_sk", DataType::Int64),
+                ("c_current_hdemo_sk", DataType::Int64),
+                ("c_current_addr_sk", DataType::Int64),
+                ("c_first_sales_date_sk", DataType::Int64),
+                ("c_first_shipto_date_sk", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "customer_demographics",
+            &[
+                ("cd_demo_sk", DataType::Int64),
+                ("cd_marital_status", DataType::Utf8),
+            ],
+        )?;
+        empty(ctx, "promotion", &[("p_promo_sk", DataType::Int64)])?;
+        empty(
+            ctx,
+            "household_demographics",
+            &[
+                ("hd_demo_sk", DataType::Int64),
+                ("hd_income_band_sk", DataType::Int64),
+            ],
+        )?;
+        empty(
+            ctx,
+            "customer_address",
+            &[
+                ("ca_address_sk", DataType::Int64),
+                ("ca_street_number", DataType::Utf8),
+                ("ca_street_name", DataType::Utf8),
+                ("ca_city", DataType::Utf8),
+                ("ca_zip", DataType::Utf8),
+            ],
+        )?;
+        empty(
+            ctx,
+            "income_band",
+            &[("ib_income_band_sk", DataType::Int64)],
+        )?;
+        empty(
+            ctx,
+            "item",
+            &[
+                ("i_item_sk", DataType::Int64),
+                ("i_product_name", DataType::Utf8),
+                ("i_color", DataType::Utf8),
+                ("i_current_price", DataType::Int64),
+            ],
+        )?;
         Ok(())
     }
 

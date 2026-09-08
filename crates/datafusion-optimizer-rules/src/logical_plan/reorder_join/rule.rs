@@ -27,8 +27,12 @@ limitations under the License.
 //! and selectivities come from `TableProvider` statistics through `cost`. The
 //! algorithm is polynomial (it does not enumerate all orders) and only finds
 //! left-deep plans — it never produces bushy trees. Islands larger than 12
-//! relations (`TPC-DS` Q64 `cross_sales`) use a greedy left-deep chain instead,
-//! so planning stays bounded.
+//! relations (`TPC-DS` Q64 `cross_sales`) use a greedy left-deep chain instead.
+//! Under a multi-input non-join (`MaterializedCte`, `Union`) a child above that
+//! cap is left in SQL `FROM` order: recursing into it rebuilds the tree, later
+//! rules fragment it with `Projection`s, and the next pass estimates cardinality
+//! on an unflattened join tree (exponential in join depth). The CTE still
+//! executes once.
 //!
 //! # Pipeline position
 //!
@@ -70,17 +74,16 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion_common::{
     Result,
     tree_node::{Transformed, TreeNode},
 };
 use datafusion_expr::LogicalPlan;
 
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
-
 use super::{
     cost::{DefaultCostEstimator, JoinCostEstimator},
-    left_deep_join_plan::{ReorderOutcome, optimal_left_deep_join_plan},
+    left_deep_join_plan::{ReorderOutcome, is_wide_join_island, optimal_left_deep_join_plan},
 };
 
 /// Optimizer-rule wrapper around [`optimal_left_deep_join_plan`].
@@ -125,11 +128,19 @@ impl OptimizerRule for ReorderJoinRule {
         let start = std::time::Instant::now();
 
         // Multi-input non-join roots (`Union`, `MaterializedCte`, …) are not a
-        // single join tree. Recurse into each input so each side still
-        // reorders; failing the whole plan leaves a 20-way join inside a
-        // materialized CTE in SQL `FROM` order (TPC-DS Q64).
+        // single join tree. Recurse into each *small* input so those sides
+        // still reorder. Recursing into a wide island (`TPC-DS` Q64
+        // `cross_sales` under `MaterializedCte`) rebuilds the tree; later rules
+        // fragment it and the next pass estimates cardinality exponentially.
+        // Leave SQL `FROM` order for those producers; the CTE still executes once.
         if !matches!(plan, LogicalPlan::Join(_)) && plan.inputs().len() > 1 {
-            return plan.map_children(|child| self.rewrite(child, config));
+            return plan.map_children(|child| {
+                if is_wide_join_island(&child) {
+                    Ok(Transformed::no(child))
+                } else {
+                    self.rewrite(child, config)
+                }
+            });
         }
 
         // No joins anywhere in the plan: nothing to reorder. Returning the input unchanged.

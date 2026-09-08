@@ -129,9 +129,14 @@ pub fn optimal_left_deep_join_plan(
 
     // Deterministic enumeration can reproduce the input order (e.g. an
     // already-optimal plan); report that as a no-op so the optimizer converges.
-    // Skip the deep `LogicalPlan` equality on wide islands — comparing two
-    // 18-way join trees is itself a planning-time sink (`TPC-DS` Q64).
-    if join_operator_count(&original) <= IK84_MAX_RELATIONS && reordered == original {
+    // Wide islands skip deep `LogicalPlan` equality (itself a planning-time
+    // sink on an 18-way tree) and compare scan order instead.
+    let order_unchanged = if is_wide_join_island(&original) {
+        table_scan_order(&reordered) == table_scan_order(&original)
+    } else {
+        reordered == original
+    };
+    if order_unchanged {
         return ReorderOutcome::Completed(Transformed::no(original));
     }
 
@@ -396,7 +401,7 @@ pub fn query_graph_to_optimal_left_deep_join_plan(
     best.into_logical_plan(query_graph)
 }
 
-fn join_operator_count(plan: &LogicalPlan) -> usize {
+pub(crate) fn join_operator_count(plan: &LogicalPlan) -> usize {
     let mut count = 0;
     let _ = plan.apply(|node| {
         if matches!(node, LogicalPlan::Join(_)) {
@@ -405,6 +410,28 @@ fn join_operator_count(plan: &LogicalPlan) -> usize {
         Ok(TreeNodeRecursion::Continue)
     });
     count
+}
+
+/// `true` when `plan` has more join operators than [`IK84_MAX_RELATIONS`].
+///
+/// Used as a conservative proxy for graph size: a left-deep `n`-relation
+/// island has `n - 1` joins, so this is true for every island IK84 would
+/// refuse, and also for a smaller island that grew extra semi/anti joins.
+pub(crate) fn is_wide_join_island(plan: &LogicalPlan) -> bool {
+    join_operator_count(plan) > IK84_MAX_RELATIONS
+}
+
+/// Left-to-right `TableScan` names. Cheap stand-in for `LogicalPlan` equality
+/// on a wide island: same order means greedy reproduced SQL `FROM` order.
+fn table_scan_order(plan: &LogicalPlan) -> Vec<String> {
+    let mut names = Vec::new();
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            names.push(scan.table_name.to_string());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    names
 }
 
 fn node_cardinality(

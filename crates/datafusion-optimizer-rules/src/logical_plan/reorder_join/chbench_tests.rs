@@ -31,6 +31,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::optimizer::Optimizer;
+use datafusion::optimizer::OptimizerContext;
 use datafusion::optimizer::OptimizerRule;
 use datafusion::optimizer::eliminate_cross_join::EliminateCrossJoin;
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
@@ -386,32 +387,11 @@ fn register_q64_shaped_tables(ctx: &SessionContext) {
     }
 }
 
-/// `TPC-DS` Q64-shaped snowflake: one fact plus ~17 dimensions (including
-/// repeated aliases). CTE materialization exposes this island to join
-/// reorder; IK84 is capped and greedy left-deep must finish in bounded time.
-#[tokio::test]
-async fn reorder_q64_shaped_snowflake_plans_in_bounded_time() {
-    // Only the join-reorder prerequisites — the default optimizer's later
-    // rules (`optimize_projections`, invariant checks in debug) are out of
-    // scope. The lab hang was this island sitting under `MaterializedCte`.
-    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
-        Arc::new(EliminateCrossJoin::new()),
-        Arc::new(ExtractEquijoinPredicate::new()),
-        Arc::new(PushDownFilter::new()),
-        Arc::new(ReorderJoinRule::default()),
-    ];
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_optimizer_rules(rules)
-        .build();
-    let ctx = SessionContext::new_with_state(state);
-    register_q64_shaped_tables(&ctx);
-
-    // Snowflake matching Q64 `cross_sales`: fact + returns + 3 date_dim +
-    // store + customer + 2 demographics + promotion + 2 household + 2
-    // addresses + 2 income_band + item. `order_line` stands in for
-    // `store_sales` so we reuse the existing chbench fact stats.
-    let sql = "\
+/// Snowflake matching Q64 `cross_sales`: fact + returns + 3 `date_dim` +
+/// store + customer + 2 demographics + promotion + 2 household + 2
+/// addresses + 2 `income_band` + item. `order_line` stands in for
+/// `store_sales` so we reuse the existing chbench fact stats.
+const Q64_SHAPED_SQL: &str = "\
 SELECT ol.ol_i_id, count(*) AS cnt
 FROM order_line ol, store_returns sr, date_dim d1, date_dim d2, date_dim d3,
      store s, customer c, customer_demographics cd1, customer_demographics cd2,
@@ -437,8 +417,29 @@ WHERE ol.ol_i_id = sr.sr_item_sk
   AND i.i_data LIKE '%b%'
 GROUP BY ol.ol_i_id";
 
+/// `TPC-DS` Q64-shaped snowflake: one fact plus ~17 dimensions (including
+/// repeated aliases). CTE materialization exposes this island to join
+/// reorder; IK84 is capped and greedy left-deep must finish in bounded time.
+#[tokio::test]
+async fn reorder_q64_shaped_snowflake_plans_in_bounded_time() {
+    // Only the join-reorder prerequisites — the default optimizer's later
+    // rules (`optimize_projections`, invariant checks in debug) are out of
+    // scope. The lab hang was this island sitting under `MaterializedCte`.
+    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+        Arc::new(EliminateCrossJoin::new()),
+        Arc::new(ExtractEquijoinPredicate::new()),
+        Arc::new(PushDownFilter::new()),
+        Arc::new(ReorderJoinRule::default()),
+    ];
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register_q64_shaped_tables(&ctx);
+
     let start = std::time::Instant::now();
-    let plan = reordered_plan(&ctx, sql).await;
+    let plan = reordered_plan(&ctx, Q64_SHAPED_SQL).await;
     let elapsed = start.elapsed();
     assert!(
         elapsed < std::time::Duration::from_secs(5),
@@ -454,4 +455,60 @@ GROUP BY ol.ol_i_id";
             "Q64-shaped reorder dropped `{table}` in {elapsed:?}; plan:\n{plan}"
         );
     }
+}
+
+/// `Union` is the same multi-input non-join shape as `MaterializedCte`.
+/// Recursing join reorder into a wide child is the `TPC-DS` Q64 hang; those
+/// children must stay in SQL `FROM` order.
+#[tokio::test]
+async fn reorder_skips_wide_islands_under_union() {
+    use datafusion_expr::LogicalPlanBuilder;
+
+    use super::left_deep_join_plan::{is_wide_join_island, join_operator_count};
+
+    let prep_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+        Arc::new(EliminateCrossJoin::new()),
+        Arc::new(ExtractEquijoinPredicate::new()),
+        Arc::new(PushDownFilter::new()),
+    ];
+    let prep_ctx = SessionContext::new_with_state(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rules(prep_rules)
+            .build(),
+    );
+    register_q64_shaped_tables(&prep_ctx);
+
+    let wide = prep_ctx
+        .sql(Q64_SHAPED_SQL)
+        .await
+        .expect("parse Q64-shaped SQL")
+        .into_optimized_plan()
+        .expect("prereq optimize");
+    assert!(
+        is_wide_join_island(&wide),
+        "fixture must exceed the IK84 cap; join count = {}",
+        join_operator_count(&wide)
+    );
+
+    let union = LogicalPlanBuilder::from(wide.clone())
+        .union(wide)
+        .expect("union of two wide islands")
+        .build()
+        .expect("union plan");
+
+    let start = std::time::Instant::now();
+    let rewritten = ReorderJoinRule::default()
+        .rewrite(union, &OptimizerContext::new())
+        .expect("reorder rewrite");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "wide Union reorder took {elapsed:?}"
+    );
+    assert!(
+        !rewritten.transformed,
+        "wide Union children must keep SQL FROM order; plan:\n{}",
+        rewritten.data
+    );
 }
