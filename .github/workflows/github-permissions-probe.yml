@@ -45,3 +45,64 @@ jobs:
         with:
           name: contents-write-permissions
           path: github-api-results/
+  inspect-macos-artifact:
+    runs-on: spiceai-macos
+    timeout-minutes: 5
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
+    steps:
+      - name: Inspect executable before any checkout
+        shell: bash
+        env:
+          PROBE_SLOT: ${{ matrix.slot }}
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib, json, os, shutil, subprocess
+          directory = Path(os.environ['RUNNER_TEMP']) / ('pr13939-macho-' + os.environ['PROBE_SLOT'])
+          directory.mkdir(parents=True, exist_ok=True)
+          report = {'runner': os.environ['RUNNER_NAME'], 'files': []}
+          def command(args):
+              try:
+                  result = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+                  return {'command': args, 'status': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+              except OSError as error:
+                  return {'command': args, 'errno': error.errno, 'error': str(error)}
+              except subprocess.TimeoutExpired:
+                  return {'command': args, 'error': '30-second timeout'}
+          def digest(path):
+              result = hashlib.sha256()
+              with path.open('rb') as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b''):
+                      result.update(block)
+              return result.hexdigest()
+          report['platform'] = [command(['sw_vers']), command(['df', '-Pk', os.environ['RUNNER_WORKSPACE']])]
+          if 'macmini-runner-04-' in os.environ['RUNNER_NAME']:
+              path = Path('/opt/github-runner-03/_work/spiceai/spiceai/target/lint/deps/system_open-5c8244dacabfc0db')
+              if path.is_file():
+                  stat = path.stat()
+                  entry = {'path': str(path), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns, 'inode': stat.st_ino, 'sha256_before': digest(path)}
+                  if stat.st_size <= 64 * 1024 * 1024:
+                      shutil.copy2(path, directory / path.name)
+                  entry['checks'] = [command(args) for args in (
+                      ['file', str(path)], ['otool', '-hvl', str(path)],
+                      ['codesign', '--verify', '--verbose=4', str(path)],
+                      ['lsof', str(path)], [str(path), '--list', '--format', 'terse'])]
+                  entry['sha256_after'] = digest(path)
+                  report['files'].append(entry)
+              else:
+                  report['observation'] = 'The named executable is no longer present'
+          else:
+              report['observation'] = 'Different physical host; no build artifacts inspected'
+          (directory / 'report.json').write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          PYTHON
+      - name: Preserve executable diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-executable-${{ matrix.slot }}
+          path: ${{ runner.temp }}/pr13939-macho-${{ matrix.slot }}/
