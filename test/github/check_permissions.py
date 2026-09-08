@@ -33,6 +33,17 @@ HELP = (
 )
 
 
+def redact(value, token: str):
+    """Remove the credential before formatting or JSON-escaping diagnostics."""
+    if isinstance(value, str):
+        return value.replace(token, "[REDACTED]") if token else value
+    if isinstance(value, list):
+        return [redact(item, token) for item in value]
+    if isinstance(value, dict):
+        return {redact(key, token): redact(item, token) for key, item in value.items()}
+    return value
+
+
 def check(endpoint: str, token: str, artifacts: Path):
     artifacts.mkdir(parents=True, exist_ok=True)
     observations = []
@@ -66,9 +77,7 @@ def check(endpoint: str, token: str, artifacts: Path):
                 ) as response:
                     headers = response.headers
                     body = json.load(response)
-                errors = json.loads(
-                    json.dumps(body.get("errors") or []).replace(token, "[REDACTED]")
-                )
+                errors = redact(body.get("errors") or [], token)
                 repository = (body.get("data") or {}).get("repository") or {}
                 edges = (repository.get("stargazers") or {}).get("edges") or []
                 observation = {
@@ -171,9 +180,7 @@ def check(endpoint: str, token: str, artifacts: Path):
         raise RuntimeError(message) from None
     finally:
         # Record errors and counts, never tokens or users' profile fields.
-        diagnostic = json.dumps(observations, indent=2)
-        if token:
-            diagnostic = diagnostic.replace(token, "[REDACTED]")
+        diagnostic = json.dumps(redact(observations, token), indent=2)
         (artifacts / "permissions.json").write_text(diagnostic)
 
 

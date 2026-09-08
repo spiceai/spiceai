@@ -98,7 +98,14 @@ class PermissionCheckTests(unittest.TestCase):
             check=False,
         )
         artifact = (Path(self.directory.name) / "permissions.json").read_text()
-        for sensitive in (TOKEN, "never-log@example.test"):
+        for sensitive in (
+            TOKEN,
+            "never-log@example.test",
+            token.strip(),
+            json.dumps(token.strip())[1:-1],
+        ):
+            if not sensitive:
+                continue
             self.assertNotIn(sensitive, result.stdout + result.stderr + artifact)
         return result, json.loads(artifact)
 
@@ -127,6 +134,16 @@ class PermissionCheckTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(artifact[0]["errors"][0]["message"], "[REDACTED]")
+
+    def test_json_escaped_credentials_are_redacted(self):
+        for token in ('test"credential', "test\\credential"):
+            with self.subTest(token_shape="quote" if '"' in token else "backslash"):
+                result, artifact = self.run_check(
+                    [(200, {"errors": [{"type": "FORBIDDEN", "message": token}]}, {})],
+                    token=token,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(artifact[0]["errors"][0]["message"], "[REDACTED]")
 
     def test_graphql_errors_fail_even_with_http_success(self):
         result, artifact = self.run_check([(200, FORBIDDEN, {})])
