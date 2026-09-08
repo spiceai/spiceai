@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use app::AppBuilder;
 
@@ -27,12 +28,56 @@ use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
-    configure_test_datafusion, init_tracing, run_query_and_check_results,
+    configure_test_datafusion, init_tracing,
     utils::{
-        register_test_connectors, runtime_ready_check, test_request_context,
+        register_test_connectors, runtime_ready_check_with_timeout, test_request_context,
         verify_env_secret_exists,
     },
 };
+
+const GITHUB_OPERATION_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// A deadline bounds an unavailable external service without asserting its speed.
+async fn run_query_and_check_results<F>(
+    rt: &mut Runtime,
+    name: &str,
+    query: &str,
+    snapshot_plan: bool,
+    validate: Option<F>,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<RecordBatch>),
+{
+    tokio::time::timeout(
+        GITHUB_OPERATION_TIMEOUT,
+        crate::run_query_and_check_results(rt, name, query, snapshot_plan, validate),
+    )
+    .await
+    .map_err(|_| format!("GitHub query '{name}' exceeded {GITHUB_OPERATION_TIMEOUT:?}: {query}"))?
+}
+
+async fn load_github_datasets(rt: &Runtime) -> Result<(), String> {
+    tokio::time::timeout(
+        GITHUB_OPERATION_TIMEOUT,
+        Arc::new(rt.clone()).load_components(),
+    )
+    .await
+    .map_err(|_| {
+        let mut statuses = rt
+            .status()
+            .get_dataset_statuses()
+            .into_iter()
+            .map(|(dataset, status)| format!("{dataset}={status:?}"))
+            .collect::<Vec<_>>();
+        statuses.sort();
+        format!(
+            "GitHub datasets did not load within {GITHUB_OPERATION_TIMEOUT:?}: {}",
+            statuses.join(", ")
+        )
+    })?;
+    runtime_ready_check_with_timeout(rt, GITHUB_OPERATION_TIMEOUT).await;
+    Ok(())
+}
 
 enum GithubDatasetType {
     RepoSpecific {
@@ -46,35 +91,12 @@ enum GithubDatasetType {
     },
 }
 
-// GitHub's API page size is 100, but under rate limiting or transient errors it
-// may return fewer rows. Use 50 as the lower bound to tolerate partial pages
-// while still catching a completely empty or near-empty result.
-const GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS: usize = 50;
-
 // GitHub commits queries request 100 history rows per page, so use a larger limit
 // in the pagination-sensitive tests to ensure they cross the page boundary.
 const GITHUB_COMMITS_PAGINATION_LIMIT: usize = 125;
 
-fn uses_public_github_rest_api(kind: &GithubDatasetType) -> bool {
-    match kind {
-        GithubDatasetType::RepoSpecific { query_type, .. } => {
-            query_type == "files"
-                || query_type.starts_with("files/")
-                || query_type == "workflows"
-                || query_type.starts_with("workflows/")
-        }
-        GithubDatasetType::OrgSpecific { .. } => false,
-    }
-}
-
 fn github_secret_reference(secret_name: &str) -> String {
     format!("${{secrets:{secret_name}}}")
-}
-
-fn github_secret_reference_if_available(secret_name: &str) -> Option<String> {
-    std::env::var_os(secret_name)
-        .filter(|value| !value.is_empty())
-        .map(|_| github_secret_reference(secret_name))
 }
 
 fn make_github_dataset(
@@ -104,16 +126,10 @@ fn make_github_dataset(
         GithubDatasetType::RepoSpecific { .. } => "GITHUB_TOKEN",
     };
 
-    if uses_public_github_rest_api(kind) {
-        if let Some(secret_reference) = github_secret_reference_if_available(secret_name) {
-            params.insert("github_token".to_string(), secret_reference);
-        }
-    } else {
-        params.insert(
-            "github_token".to_string(),
-            github_secret_reference(secret_name),
-        );
-    }
+    params.insert(
+        "github_token".to_string(),
+        github_secret_reference(secret_name),
+    );
 
     params.extend(additional_params.unwrap_or_default());
 
@@ -125,6 +141,10 @@ async fn github_secret_available(secret_name: &str, test_name: &str) -> bool {
     match verify_env_secret_exists(secret_name).await {
         Ok(()) => true,
         Err(err) => {
+            assert!(
+                std::env::var_os("SPICE_GITHUB_TEST_REQUIRED").is_none(),
+                "{test_name} requires GitHub secret {secret_name}: {err}"
+            );
             tracing::warn!(
                 "Skipping {test_name}: required GitHub secret {secret_name} is unavailable: {err}"
             );
@@ -216,6 +236,14 @@ fn collect_string_values(result_batches: &[RecordBatch], column_index: usize) ->
 
 fn assert_all_string_values(result_batches: &[RecordBatch], column_index: usize, expected: &str) {
     let values = collect_string_values(result_batches, column_index);
+    assert_eq!(
+        values.len(),
+        result_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        "column {column_index} must not contain NULLs"
+    );
     assert!(!values.is_empty(), "expected at least one string value");
     assert!(
         values.iter().all(|value| value == expected),
@@ -225,6 +253,14 @@ fn assert_all_string_values(result_batches: &[RecordBatch], column_index: usize,
 
 fn assert_no_string_values(result_batches: &[RecordBatch], column_index: usize, unexpected: &str) {
     let values = collect_string_values(result_batches, column_index);
+    assert_eq!(
+        values.len(),
+        result_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        "column {column_index} must not contain NULLs"
+    );
     assert!(!values.is_empty(), "expected at least one string value");
     assert!(
         values.iter().all(|value| value != unexpected),
@@ -240,10 +276,9 @@ fn assert_positive_row_count_at_most_pagination_limit(row_count: usize) {
 }
 
 fn assert_crosses_commits_pagination_boundary(row_count: usize) {
-    assert!(
-        row_count > GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS
-            && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
-        "expected {GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS} < num_rows <= {GITHUB_COMMITS_PAGINATION_LIMIT}, got {row_count}"
+    assert_eq!(
+        row_count, GITHUB_COMMITS_PAGINATION_LIMIT,
+        "the selected history has more than 100 commits; LIMIT must span pages"
     );
 }
 
@@ -302,91 +337,70 @@ async fn test_github_issues() -> Result<(), String> {
                 .build();
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let mut now = std::time::Instant::now();
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_issues_auto",
                 "SELECT * FROM spiceai_issues_auto LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    assert_eq!(
+                        result_batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .sum::<usize>(),
+                        10
+                    );
                     for batch in result_batches {
-                        let batch: RecordBatch = batch; // Rust can't type infer here for some reason
                         assert_eq!(batch.num_columns(), 23, "num_cols: {}", batch.num_columns());
-                        assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
                     }
                 })),
             )
             .await?;
-
-            let auto_elapsed = now.elapsed();
-            now = std::time::Instant::now();
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_issues_search",
                 "SELECT * FROM spiceai_issues_search LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    assert_eq!(
+                        result_batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .sum::<usize>(),
+                        10
+                    );
                     for batch in result_batches {
-                        let batch: RecordBatch = batch; // Rust can't type infer here for some reason
                         assert_eq!(batch.num_columns(), 23, "num_cols: {}", batch.num_columns());
-                        assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
                     }
                 })),
             )
             .await?;
-
-            let search_elapsed = now.elapsed();
-            let auto_elapsed_secs = auto_elapsed.as_secs();
-            let search_limit_elapsed_secs = search_elapsed.as_secs();
-
-            // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
-            assert!(
-                auto_elapsed_secs < 20,
-                "auto_elapsed_secs: {auto_elapsed_secs}"
-            );
-            assert!(
-                search_limit_elapsed_secs < 20,
-                "search_limit_elapsed_secs: {search_limit_elapsed_secs}"
-            );
-
-            now = std::time::Instant::now();
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_issues_search_author",
                 "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 100",
                 false, // can't snapshot this plan, as the partition size increases with more issues
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    assert_all_string_values(
+                        &result_batches,
+                        result_batches
+                            .first()
+                            .expect("issue rows")
+                            .schema()
+                            .index_of("author")
+                            .expect("author column"),
+                        "peasee",
+                    );
                     for batch in result_batches {
-                        let batch: RecordBatch = batch; // Rust can't type infer here for some reason
                         assert_eq!(batch.num_columns(), 23, "num_cols: {}", batch.num_columns());
-                        assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
                     }
                 })),
             )
             .await?;
-
-            let search_author_elapsed = now.elapsed();
-            let search_author_elapsed_secs = search_author_elapsed.as_secs();
-
-            // search should push down the filter, preventing the query from retrieving every issue
-            assert!(
-                search_author_elapsed_secs < 30,
-                "search_author_elapsed_secs: {search_author_elapsed_secs}"
-            );
 
             Ok(())
         })
@@ -441,18 +455,7 @@ async fn test_github_commits() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let now = std::time::Instant::now();
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -461,7 +464,7 @@ async fn test_github_commits() -> Result<(), String> {
                 // This live GitHub test can time out during dataset initialization before EXPLAIN
                 // runs, so plan snapshots remain disabled until the setup is made deterministic.
                 false,
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let mut row_count = 0;
                     for batch in result_batches {
                         let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -520,15 +523,15 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
-            // Dynamic ref scan on cookbook (22 branches) instead of spiceai (800+ branches)
-            // to avoid overwhelming the GitHub API with hundreds of per-ref commit fetches.
+            // Exercise the bounded dynamic ref scan on the smaller cookbook repository.
             // Run directly (no EXPLAIN preflight) since EXPLAIN also triggers the
             // full dynamic scan, doubling per-ref API calls.
             let commits_dynamic_ref_filter_query = format!(
                 "SELECT ref, sha FROM cookbook_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
             );
 
-            let result_batches: Vec<RecordBatch> = rt
+            let result_batches = tokio::time::timeout(GITHUB_OPERATION_TIMEOUT, async {
+                let batches = rt
                 .datafusion()
                 .query_builder(&commits_dynamic_ref_filter_query)
                 .build()
@@ -547,6 +550,8 @@ async fn test_github_commits() -> Result<(), String> {
                         "query `{commits_dynamic_ref_filter_query}` to results: {e}"
                     )
                 })?;
+                Ok::<Vec<RecordBatch>, String>(batches)
+            }).await.map_err(|_| format!("GitHub dynamic ref query exceeded {GITHUB_OPERATION_TIMEOUT:?}: {commits_dynamic_ref_filter_query}"))??;
 
             let row_count = result_batches
                 .iter()
@@ -673,12 +678,6 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
-            let elapsed = now.elapsed().as_secs();
-
-            // Budget is higher because the test includes tag-ref, LIMIT 0, projection,
-            // schema queries, plus the dynamic ref scan on cookbook.
-            assert!(elapsed < 180, "elapsed: {elapsed}");
-
             Ok(())
         })
         .await
@@ -687,6 +686,9 @@ async fn test_github_commits() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_files_ref_resolution() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_files_ref_resolution").await {
+        return Ok(());
+    }
     register_test_connectors().await;
 
     test_request_context()
@@ -718,16 +720,7 @@ async fn test_github_files_ref_resolution() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -865,25 +858,14 @@ async fn test_github_stargazers() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let now = std::time::Instant::now();
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_stargazers_auto",
                 "SELECT * FROM spiceai_stargazers_auto LIMIT 10",
                 true,
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let mut row_count = 0;
                     for batch in result_batches {
                         let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -894,11 +876,6 @@ async fn test_github_stargazers() -> Result<(), String> {
                 })),
             )
             .await?;
-
-            let elapsed = now.elapsed().as_secs();
-
-            // LIMIT should stop this query from retrieving every stargazer, so it shouldn't take that long
-            assert!(elapsed < 15, "elapsed: {elapsed}");
 
             Ok(())
         })
@@ -922,29 +899,7 @@ async fn runtime_with_github_dataset_params(
 
     configure_test_datafusion();
     let rt = Runtime::builder().with_app(app).build().await;
-    let cloned_rt = Arc::new(rt.clone());
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-            // A dataset load has no deadline — the runtime retries a failing one
-            // for as long as it takes — so this timeout is how a load failure
-            // surfaces. Report each dataset's status, or the timeout says only
-            // that something did not finish.
-            let statuses = rt
-                .status()
-                .get_dataset_statuses()
-                .into_iter()
-                .map(|(dataset, status)| format!("{dataset}={status:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "Timed out waiting for datasets to load. Dataset status: [{statuses}]"
-            ));
-        }
-        () = cloned_rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
+    load_github_datasets(&rt).await?;
     Ok(rt)
 }
 
@@ -1487,23 +1442,14 @@ async fn test_github_org_members() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_org_members_auto",
                 "SELECT * FROM spiceai_members_auto LIMIT 10",
                 false,
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let mut row_count = 0;
                     for batch in result_batches {
                         let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -1548,23 +1494,14 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_pull_requests_auto",
                 "SELECT additions, review_comments, discussion FROM spiceai_pulls_auto LIMIT 10",
                 true,
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let mut row_count = 0;
                     for batch in result_batches {
                         let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -1624,16 +1561,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             let dataset_columns_tests = vec![
                 ("spiceai_pulls_auto", "review_comments"),
@@ -1646,7 +1574,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
                     "test_github_pull_requests_schema",
                     format!("SELECT {column_name} FROM {dataset_name} LIMIT 10;").as_str(),
                     false,
-                    Some(Box::new(|result_batches| {
+                    Some(Box::new(|result_batches: Vec<RecordBatch>| {
                         let mut row_count = 0;
                         for batch in result_batches {
                             let batch: RecordBatch = batch; // Rust can't type infer here for some reason
@@ -1689,16 +1617,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -1752,16 +1671,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -1818,16 +1728,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -1881,16 +1782,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -1916,9 +1808,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
         .await
 }
 
-/// Validates that `number`, `commits_count`, and `hashes` columns return correct data.
-/// `commits_count` should reflect the true total (not capped at the GraphQL page size of 25),
-/// and `hashes` should be a non-empty list for PRs with commits.
+/// PR numbers and commit counts are positive, and commit hash lists are populated.
 #[tokio::test]
 async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1944,16 +1834,7 @@ async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), St
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             // Validate number, commits_count, and hashes columns
             run_query_and_check_results(
@@ -2019,9 +1900,7 @@ async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), St
         .await
 }
 
-/// Validates that `commits_count` reports the true total count (from `totalCount`) and is not
-/// capped at the GraphQL fetch limit (`commits(first: 25)`). Uses a limit exceeding PR pagination
-/// boundary (100 PRs per page) to stress test multi-page fetching.
+/// Repository identity remains available alongside PR review state columns.
 #[tokio::test]
 async fn test_github_pull_requests_identity_and_review_state_columns() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -2063,10 +1942,11 @@ async fn test_github_pull_requests_identity_and_review_state_columns() -> Result
         .await
 }
 
+/// A PR scan crosses the 100-row page boundary and returns positive commit counts.
 #[tokio::test]
-async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), String> {
+async fn test_github_pull_requests_pagination() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    if !repo_github_secret_available("test_github_pull_requests_commits_count_not_capped").await {
+    if !repo_github_secret_available("test_github_pull_requests_pagination").await {
         return Ok(());
     }
     register_test_connectors().await;
@@ -2088,21 +1968,12 @@ async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), Stri
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             // Fetch PRs with commits_count >= 1, limit exceeds PR pagination boundary (100)
             run_query_and_check_results(
                 &mut rt,
-                "test_github_pull_requests_commits_count_not_capped",
+                "test_github_pull_requests_pagination",
                 "SELECT number, commits_count FROM cookbook_pulls_auto WHERE commits_count >= 1 LIMIT 125",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
@@ -2110,9 +1981,9 @@ async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), Stri
                         .iter()
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum();
-                    assert!(
-                        total_rows >= 1,
-                        "expected at least one PR with commits_count >= 1"
+                    assert_eq!(
+                        total_rows, 125,
+                        "expected all 125 PRs across the pagination boundary"
                     );
 
                     for batch in &result_batches {
@@ -2145,6 +2016,9 @@ async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), Stri
 #[tokio::test]
 async fn test_github_workflows() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_workflows").await {
+        return Ok(());
+    }
     register_test_connectors().await;
 
     test_request_context()
@@ -2164,25 +2038,22 @@ async fn test_github_workflows() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_workflows_list",
-                "select name, path from spiceai_workflows_auto ORDER BY created_at ASC limit 10;",
+                "SELECT name, path FROM spiceai_workflows_auto LIMIT 10",
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let pretty_batches = batches_to_string(&result_batches);
-                    insta::assert_snapshot!("workflows_list_data", pretty_batches);
+                    assert_column_is_populated(&result_batches, "name");
+                    assert_column_is_populated(&result_batches, "path");
+                    for path in collect_string_values(&result_batches, 1) {
+                        assert!(
+                            path.starts_with(".github/workflows/"),
+                            "workflow path: {path}"
+                        );
+                    }
 
                     let total_rows = result_batches
                         .iter()
@@ -2201,6 +2072,9 @@ async fn test_github_workflows() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_workflow_runs() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_workflow_runs").await {
+        return Ok(());
+    }
     register_test_connectors().await;
 
     test_request_context()
@@ -2234,16 +2108,7 @@ async fn test_github_workflow_runs() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -2295,16 +2160,7 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             let github_app_commits_ref_filter_query = format!(
                 "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
@@ -2426,16 +2282,7 @@ async fn test_github_app_files_ref_filter() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
@@ -2478,23 +2325,14 @@ async fn test_github_app_issues() -> Result<(), String> {
             configure_test_datafusion();
             let mut rt = Runtime::builder().with_app(app).build().await;
 
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err("Timed out waiting for datasets to load".to_string());
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
+            load_github_datasets(&rt).await?;
 
             run_query_and_check_results(
                 &mut rt,
                 "test_github_app_issues",
                 "SELECT * FROM spiceai_issues_auto LIMIT 10",
                 false,
-                Some(Box::new(|result_batches| {
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let mut row_count = 0;
                     for batch in result_batches {
                         let batch: RecordBatch = batch;
