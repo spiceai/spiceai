@@ -34,6 +34,35 @@ Rules:
 - **Report negative results.** When the run contradicts your reading of the code, the reading was wrong: withdraw the claim rather than re-arguing it from the source.
 - The bar scales with the cost of being wrong, never down to zero: a correctness or data-loss claim needs a run of the engine, not a passing assertion.
 
+## User-facing surface — an Enhancement with PM and UX/DX review before it changes
+
+Spice's product *is* its surface: everything a user configures, calls, reads, or scripts against. Each piece is a contract someone already depends on — a Spicepod they wrote, a dashboard and alert built on a metric name, a `grep` on a log line, a client parsing CLI output — so a change to it is a product decision, not an implementation detail. It is designed and reviewed in an Enhancement issue, never improvised inside a PR.
+
+**The bar is absolute industry-leading UX/DX.** Every surface is kept as simple, easy, flexible, powerful, and understandable as it can be — not as good as the best peer ships today, but the simplest experience that could exist, the one that feels obvious in hindsight and makes everyone else catch up. Concretely: the shortest golden path in the category (fewest steps and required params from zero to first result); a zero-config common case, with defaults that are right for most users; one obvious way to do each thing; consensus naming, so a user of Snowflake, ClickHouse, Databricks, or Kubernetes already knows the term; flexibility from a few composable concepts rather than a long list of knobs; power that costs the simple case nothing; errors that name the exact fix; and no implementation detail leaking into a name (`storage_size_gb`, not `storage_claim_size_gb`). Simplicity is measured in concepts a user has to learn, not in conveniences: a field on an existing resource beats a new resource, endpoint, or param, and a new concept is a *no* until the proposal shows what the user cannot do without it.
+
+**The surface is all of it.** The list names the main areas; the rule is *anything a user interacts with, reads, or depends on*:
+
+- **Spicepod (`spicepod.yaml`)**: every section and field, every connector/accelerator/model/catalog `params` key, accepted values, defaults, validation, and the `${ secrets:… }`/`${ env:… }` syntax — everything `.schema/spicepod.schema.json` describes.
+- **APIs, every protocol**: HTTP (`/v1/*`, `/health`, `/v1/ready`, `/v1/status`), the OpenAI-compatible endpoints, Arrow Flight and Flight SQL (including their actions), the OpenTelemetry ingest endpoint, the Prometheus `/metrics` endpoint, and the SQL surface itself — dialect, functions/UDFs and their signatures, `runtime.*` system tables (`runtime.task_history`, `runtime.metrics`, …) and `information_schema`, result column names and types. Includes paths and verbs, request/response shapes and field names, status codes, headers (`Cache-Control`, `Spice-Cache-Key`), error bodies, and everything `.schema/openapi.json` describes.
+- **Metrics**: names, labels and label values, units, instrument types, semantics, and the absent-vs-`0` convention (see *Metrics*).
+- **CLI (`spice`)**: commands and subcommands, flags and their defaults, prompts, table/JSON output columns and formatting, exit codes, and what it prints on success and on failure.
+- **Runtime (`spiced`)**: command-line flags and arguments, default ports and bind addresses (`docs/decisions/002-default-ports.md`), startup/shutdown/failure output, health and readiness semantics, exit codes.
+- **Logs**: the wording, level, and fields of every `error!`/`warn!`/`info!` a user can see (see *Logging*) — users alert and `grep` on them.
+- **Environment variables**: `SPICE_*`/`SPICED_*` names, semantics, defaults, and precedence against Spicepod fields and CLI flags.
+- **Everything else a user reads or depends on**: error messages, on-disk layout and file names (`.spice/`, acceleration and data files), Docker images and entrypoints, the columns of task history, and the docs and cookbook recipes the change would invalidate.
+
+**What counts as a change**: adding, removing, renaming, or deprecating any of the above; changing a default, type, accepted values, format, precedence, status or exit code, or semantics; removing a log line, changing its level, or changing what it means. A bug fix that makes the surface behave as documented is not a surface change, and neither is rewording a message to meet the *Logging* guidelines; a fix that changes the documented behavior is.
+
+**The gate**: before building any of it there is an Enhancement issue (`.github/ISSUE_TEMPLATE/enhancement.md`) whose *Specification* shows the exact surface — the YAML, the request and response, the CLI transcript, the metric names, the log lines — and whose Done-Done `PM/Design Review` and `DX/UX Review` items are ticked. The review judges the intended final experience against the bar above, not the implementation, and says where the proposal settles for parity with a peer when it could lead. The `enhancement-pm-ux-review` skill runs that review and writes the PM and UX/DX sign-off calls into the issue.
+
+Rules:
+
+- **No signed-off Enhancement, no surface.** If a task needs a surface change and no signed-off Enhancement exists, don't invent the surface in the PR: draft the Enhancement with the proposed surface in its Specification, run the review, and stop for the sign-off before building the user-visible part. Build everything that doesn't depend on the surface in the meantime — the reviewers should get a design question, not a working implementation to rubber-stamp.
+- **The PR ships exactly the reviewed surface.** Link the Enhancement; a rename, an extra param, or a changed default discovered during implementation goes back through the issue, not into the diff. Fill in the PR template's *Breaking Changes* section and add the `breaking change` label when the change is incompatible, and its *Docs* section whenever docs must follow. `.schema/spicepod.schema.json` and `.schema/openapi.json` are generated from the code by CI (`tools/spicepodschema`, `tools/spiceschema`), so the Rust types, `ParameterSpec`s, and OpenAPI annotations are where the reviewed surface is encoded — check that the regenerated schema diff shows exactly what was signed off.
+- **In review, surface without a signed-off Enhancement is a blocking finding**, whatever the quality of the code.
+- **Simplify before you add, and pick best-for-the-user over easiest-to-build.** Question every requirement, delete scope, and try to meet the need with existing surface — a smarter default, a generalized field — before minting a new concept (the Enhancement template's *The Algorithm*). When the superior experience costs more engineering, propose it anyway and name the cost; the simplest experience is usually the hardest to build, and that is the point.
+- **When unsure whether something is surface, it is.** Internal traits, crate layout, plan shapes, and performance work are not — until their effect reaches the user: a query that returns different rows or types, a metric that moves, a log line that disappears.
+
 ## Build, test, lint (expensive — read first)
 
 Full workspace and release builds take 20–35 minutes. Minimize large builds:
@@ -61,7 +90,7 @@ make lint-rust-fix      # Auto-fix lint issues
 - **Stacked PRs are supported and need no force-push.** Base the child branch on the parent branch; once the parent squash-merges, restack an *unpushed* child with `git rebase --onto`, and a *pushed* one by merging `trunk` and then auditing — that merge can silently restore files the child deleted: `docs/dev/stacked_prs.md`.
 - Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`) — fix the underlying failure.
 - Investigate before destructive ops (`reset --hard`, `checkout --`, `clean -f`): unfamiliar files or branches may be in-progress work.
-- Branch from `trunk` (or from the parent branch when stacking, per the bullet above), link the issue, add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
+- Branch from `trunk` (or from the parent branch when stacking, per the bullet above), link the issue — a PR that touches the user-facing surface links its signed-off Enhancement (see *User-facing surface*) — and add tests. Style: `docs/dev/style_guide.md`, `docs/dev/error_handling.md`.
 - If a PR's checks stop triggering (only ~2 checks appear), check for a merge conflict first (`mergeStateStatus: DIRTY`) — merge `trunk` into the branch to re-trigger.
 - **PR descriptions** *may* describe the old behavior and what was wrong with it — that context is what makes the `git` history worth reading. But never use internal/local tracking labels in a PR (title, body, or commits): phase/step numbers, plan-item IDs, or any shorthand coined in a planning doc or working session (e.g. `PR 6.1`, `Phase 3`, `step 2b`) mean nothing to a reviewer or a future reader and must stay in your local notes.
 - **Code comments describe how the code works or *why it is the way it is* — never how it *used to* work** (that is what `git` history is for). Drop "previously/originally/historically/moved from…" narration. A comment may cite a GitHub issue when it adds context the code can't — especially a regression test that exists because of that issue (`// regression test for #NNNN`).
@@ -146,7 +175,7 @@ Async code must reach an `.await` at least every ~100µs — blocking a runtime 
 
 `tracing::` macros only — never the `log::` crate. Keep every log/error message on a single line: no embedded newlines or `\`-continuations that insert them.
 
-**Every `error!`/`warn!`/`info!` a user can see is a user-facing message** and follows the same guidelines as the errors above (`docs/dev/error_handling.md`): name the affected dataset/model/catalog (and schema/table), give an actionable fix with a docs link, and use no internal vocabulary ("table provider", "read provider", "connection pool", "metadata"). Put the resource *in the message text*, not only in a `tracing` field.
+**Every `error!`/`warn!`/`info!` a user can see is a user-facing message** and follows the same guidelines as the errors above (`docs/dev/error_handling.md`): name the affected dataset/model/catalog (and schema/table), give an actionable fix with a docs link, and use no internal vocabulary ("table provider", "read provider", "connection pool", "metadata"). Put the resource *in the message text*, not only in a `tracing` field. These lines are user-facing surface (see *User-facing surface*): users alert and `grep` on them, so removing one, changing its level, or changing what it means goes through the Enhancement review; rewording one to meet these guidelines does not.
 
 - **State one problem, then its impact** — `failed to {action}, so {what the user can no longer do}. Cause: {source}` — never the impact and the failure as two sentences, which reads as two separate incidents and leaves the reader unsure which one to chase. "Catalog 'pg' failed to list the tables of schema 'sales', so no table in that schema is registered and queries against 'pg.sales' will not resolve" beats "registered no table from schema sales … Failed to list its tables: …".
 - **A `warn!` on a degrade-and-continue path must say what the user will observe**, not only what failed internally. That line is the only explanation they will ever get for a table that is silently absent, so it is load-bearing rather than cosmetic.
@@ -157,7 +186,7 @@ Async code must reach an `.await` at least every ~100µs — blocking a runtime 
 
 ### Metrics
 
-`runtime-metrics` owns the shared instruments (`crates/runtime-metrics/src/acceleration.rs` and its siblings); a per-component observable set (e.g. the Postgres replication `MetricSpec`s) is for what only that component can see. One distinction decides the shape of everything below — whether the occurrence is an *event* or a *rate*:
+Metric names, labels, and units are user-facing surface — dashboards and alerts are built on them — so a new or changed instrument goes through the Enhancement review (see *User-facing surface*) and follows `docs/dev/metrics.md` naming. `runtime-metrics` owns the shared instruments (`crates/runtime-metrics/src/acceleration.rs` and its siblings); a per-component observable set (e.g. the Postgres replication `MetricSpec`s) is for what only that component can see. One distinction decides the shape of everything below — whether the occurrence is an *event* or a *rate*:
 
 - **An event is an infrequent occurrence of interest: log it, and let a metric carry its values.** Rebuilding an acceleration, a replication slot invalidated, a dataset that failed to load. Someone reads these one at a time, so the occurrence belongs in a log line, which states it with everything a metric cannot carry — which dataset, why, and what to do about it. A counter that only says "it happened" is that same fact with the explanation stripped off. What the metric adds is the *quantity* no prose can reconstruct: time spent, rows and bytes processed, resulting size or lag.
 - **A frequent occurrence is not an event, and its rate is a measurement rather than a fact.** Nobody reads cache evictions or cache hits one at a time; what they read is the rate and how it moves. That is a metric from the outset (`{prefix}_cache_evictions`, `dataset_acceleration_cdc_apply_path_total`) and the question of logging each one never arises. Give it a value alongside the count wherever one exists — `replication_reconnects_total` is paired with `replication_disconnected_ms_total`, which is what says whether a reconnect storm actually cost anything.
@@ -171,6 +200,7 @@ Distinguish "none yet" from "not applicable", because an absent series and a `0`
 
 ### User-facing configuration
 
+- **Config is user-facing surface**: a new, renamed, or re-defaulted Spicepod field, connector `params` key, CLI flag, or environment variable needs the signed-off Enhancement (see *User-facing surface*) before it is built; the review is where the name, the accepted values, and the default get decided.
 - **No boolean params in user-facing config** (Spicepod fields, connector `params`, CLI flags): a bool can't grow a third state and hides which value means "on". Use `#[serde(rename_all = "snake_case")]` enums whose variants describe behavior, mirroring precedent: `on_zero_results: return_empty|use_source`, `unsupported_type_action: error|warn|ignore|string`, `ready_state: on_load|on_registration|on_schema_resolved`, `check_availability: auto|disabled`, `on_schema_change: block|fail|append_new_columns|sync_all_columns`. Default (`#[default]`) to the conservative, back-compat-preserving variant. Booleans remain fine in internal, non-config code.
 - When behavior depends on the connector/engine, add a capability/trait method defaulting to the universally-safe modes, validate config against it, and return a structured configuration error for unsupported modes — never silently ignore. Forward the method through every wrapper (next section).
 
@@ -210,7 +240,7 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "<full 40-cha
 2. `runtime/src/dataconnector/{connector}.rs` — factory; register in `runtime/src/dataconnector/mod.rs`
 3. Feature-gate as above; add an integration test in `test/spicepods/{connector}/`; document in README.md
 
-For any feature: check whether it needs a new extension point; test correctness edge cases (NULLs, empty sets, boundaries, coercions, large datasets); no blocking in async; follow the error-message format; update user docs; lint green.
+For any feature: if it adds or changes user-facing surface, get the signed-off Enhancement first (see *User-facing surface*); check whether it needs a new extension point; test correctness edge cases (NULLs, empty sets, boundaries, coercions, large datasets); no blocking in async; follow the error-message format; update user docs; lint green.
 
 ## Setup & references
 
