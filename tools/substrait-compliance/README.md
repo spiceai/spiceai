@@ -13,7 +13,7 @@ report-only; it does not fail the repository on a low pass rate.
 |------|--------|
 | IBM tag | `v0.1.1` ([release](https://github.com/IBM/substrait-compliance/releases/tag/v0.1.1)) |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `spiceai-54` @ `6006901cb602d845ee1441269d6eaa142c2580a6` (workspace `[patch.crates-io]`; merged spiceai/datafusion#215) |
+| spiceai/datafusion fork | `spiceai-54` @ `c2fbafe20cbc1d65aadedb2626a3ad4f37c5ff55` (workspace `[patch.crates-io]`; includes spiceai/datafusion#215) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1**. The same example on tag
@@ -23,7 +23,7 @@ expected-output CSVs come from **`v0.1.1`**.
 Nothing from the IBM repository is vendored. The suite is cloned at run
 time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
-## Mode A baseline (this pin)
+## Mode A baseline (measured 2026-09-05 on `6006901cb602d845ee1441269d6eaa142c2580a6`)
 
 | Suite | PASS | FAIL | SKIP | ERROR | Total |
 |-------|------|------|------|-------|-------|

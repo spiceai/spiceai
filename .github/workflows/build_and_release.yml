@@ -181,6 +181,8 @@ jobs:
     needs: setup-matrix
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      # Internal builds include PostgreSQL acceleration for benchmarks; tagged releases omit it.
+      SPICED_FEATURES: ${{ matrix.target.is_tagged_release && 'release,models' || 'release,models,postgres-accel' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -239,17 +241,10 @@ jobs:
         uses: ./.github/actions/install-protoc
 
       # Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
-      # Non-release builds include postgres-accel for benchmark testing
       - name: Build spiced and spice CLI
-        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && !matrix.target.is_tagged_release
+        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows'
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,postgres-accel -p spiced -p spice --target-dir ../../target
-
-      # Release builds exclude optional accelerators from the distributed binary
-      - name: Build spiced and spice CLI (release)
-        if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows' && matrix.target.is_tagged_release
-        working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features "$SPICED_FEATURES" -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -279,10 +274,11 @@ jobs:
           destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
       ## ODBC variant - for internal testing
+      # Keep the CLI selected so shared dependency features match the default build.
       - name: Build spiced (odbc)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         working-directory: bin/spiced
-        run: cargo build --release --features release,odbc,models --target-dir ../../target
+        run: cargo build --release --features "$SPICED_FEATURES,odbc" -p spiced -p spice --target-dir ../../target
 
       - name: tar binary (odbc)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')

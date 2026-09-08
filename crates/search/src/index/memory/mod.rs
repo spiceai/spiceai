@@ -24,7 +24,7 @@ limitations under the License.
 //! contents as `LogicalPlan`s. Nearest-neighbor search is brute-force exact
 //! k-NN over the SIMD distance kernels in `runtime-datafusion-udfs`.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::filter;
@@ -201,43 +201,58 @@ impl MemoryVectorIndex {
         primary_keys: &[Option<String>],
         embedding_vectors: &[Option<Vec<f32>>],
     ) -> Result<(RecordBatch, Vec<String>, Vec<String>), Error> {
-        let mut keys = Vec::with_capacity(primary_keys.len());
-        let mut rejected = Vec::new();
-        let mask: BooleanArray = primary_keys
-            .iter()
-            .zip(embedding_vectors.iter())
-            .map(|(key, vector)| {
-                let keep = match (key, vector) {
-                    (Some(key), Some(vector)) => {
-                        // All-zero / all-NaN vectors have no defined direction and
-                        // would corrupt similarity scores — skip them.
-                        let valid = !vector.iter().all(|&v| v == 0.0 || v.is_nan());
-                        if valid {
-                            keys.push(key.clone());
-                        } else {
-                            rejected.push(key.clone());
-                            tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values. Any vector already stored for this record is removed, so it is not returned at its previous value"
-                            );
-                        }
-                        valid
-                    }
-                    (None, _) => {
-                        // No key to address an earlier entry with, so there is
-                        // nothing this write can evict.
+        // Per row: the key this row would be stored under and what the write did with it,
+        // or `None` for a row no write can address. In batch order, because the eviction
+        // decision is which row *decides* a repeated key.
+        let mut rows: Vec<Option<(&str, write_util::RowOutcome)>> =
+            Vec::with_capacity(primary_keys.len());
+        for (key, vector) in primary_keys.iter().zip(embedding_vectors.iter()) {
+            rows.push(match (key, vector) {
+                (Some(key), Some(vector)) => {
+                    // A vector with no defined direction would corrupt similarity scores —
+                    // skip it, and evict whatever the key already holds.
+                    if let Some(rejection) = write_util::classify_vector(vector) {
+                        let reason = rejection.reason();
                         tracing::warn!(
-                            "Skipping a record for memory vector index '{INDEX_NAME}': the primary key is NULL"
+                            "Skipping record '{key}' for memory vector index '{INDEX_NAME}': {reason}. Any vector already stored for this record is removed, so it is not returned at its previous value"
                         );
-                        false
+                        Some((key.as_str(), write_util::RowOutcome::Rejected))
+                    } else {
+                        Some((key.as_str(), write_util::RowOutcome::Indexed))
                     }
-                    // NULL/empty search text — nothing to index, and an entry
-                    // stored under this key from an earlier text must go with it.
-                    (Some(key), None) => {
-                        rejected.push(key.clone());
-                        false
-                    }
+                }
+                (None, _) => {
+                    // No key to address an earlier entry with, so there is
+                    // nothing this write can evict.
+                    tracing::warn!(
+                        "Skipping a record for memory vector index '{INDEX_NAME}': the primary key is NULL"
+                    );
+                    None
+                }
+                // NULL/empty search text — nothing to index, and an entry
+                // stored under this key from an earlier text must go with it.
+                (Some(key), None) => Some((key.as_str(), write_util::RowOutcome::Rejected)),
+            });
+        }
+
+        let evicted = write_util::keys_to_evict(rows.iter().flatten().copied());
+        let evicted_keys: HashSet<&str> = evicted.iter().map(String::as_str).collect();
+
+        // An indexable row is still dropped when a later row of the same batch decided its
+        // key against it: `upsert` deletes `evicted` and then stores this batch, so keeping
+        // the row here would write the stale entry straight back over its own eviction.
+        let mut keys = Vec::with_capacity(rows.len());
+        let mask: BooleanArray = rows
+            .iter()
+            .map(|row| {
+                let Some((key, write_util::RowOutcome::Indexed)) = row else {
+                    return Some(false);
                 };
-                Some(keep)
+                if evicted_keys.contains(key) {
+                    return Some(false);
+                }
+                keys.push((*key).to_string());
+                Some(true)
             })
             .collect();
 
@@ -263,7 +278,6 @@ impl MemoryVectorIndex {
                 index: INDEX_NAME.to_string(),
             },
         )?;
-        let evicted = write_util::keys_to_evict(rejected, keys.iter().map(String::as_str));
         Ok((batch, keys, evicted))
     }
 }
@@ -515,6 +529,9 @@ mod tests {
     struct ByteEmbed;
 
     fn byte_vector(text: &str) -> Vec<f32> {
+        if let Some(shape) = unindexable_shape(text) {
+            return shape;
+        }
         let dim = usize::try_from(DIM).expect("DIM is positive");
         let mut vector = vec![0.0_f32; dim];
         for (i, b) in text.bytes().enumerate() {
@@ -552,6 +569,23 @@ mod tests {
                 ))
             }),
         ))
+    }
+
+    /// Text that embeds to the `n`th shape of [`write_util::unindexable_shapes`], so a row
+    /// can carry one through the real embed -> classify -> store path.
+    fn unindexable_text(n: usize) -> String {
+        format!("\u{1}shape:{n}")
+    }
+
+    /// Resolve [`unindexable_text`] back to its vector, so the fixture cannot cover a
+    /// narrower set than the classifier's own test does.
+    fn unindexable_shape(text: &str) -> Option<Vec<f32>> {
+        let n: usize = text.strip_prefix("\u{1}shape:")?.parse().ok()?;
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        write_util::unindexable_shapes(dim)
+            .into_iter()
+            .nth(n)
+            .map(|(_, vector, _)| vector)
     }
 
     fn memory_index() -> MemoryVectorIndex {
@@ -906,5 +940,171 @@ mod tests {
             .expect("the write window closes");
 
         assert_eq!(indexed_ids(&index), vec![1, 3]);
+    }
+
+    /// Regression test for #13848. One batch carries id=1 twice: an indexable row first,
+    /// then the row that *decides* the key, whose text the write rejects. The table
+    /// resolves a repeated key last-write-wins, so id=1's standing value is the rejected
+    /// one; leaving the earlier row's vector searchable under that key would answer a
+    /// search from text the same batch had already replaced.
+    #[tokio::test]
+    async fn a_repeated_key_whose_deciding_row_is_rejected_keeps_nothing_indexed() {
+        let index = memory_index();
+        write_batch(
+            &index,
+            batch_with_contents(
+                &[1, 2, 1],
+                &[Some("first"), Some("other"), Some(REJECTED_TEXT)],
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![2],
+            "id=1's deciding row was rejected, so no vector for it may remain searchable"
+        );
+        assert_eq!(
+            stored_vector(&index, 1),
+            None,
+            "the vector of the text the same batch replaced is exactly what must not survive"
+        );
+    }
+
+    /// The other direction: the key is rejected first and stored after, so the row that
+    /// decides it is the one the write indexes and the key stays in the index.
+    #[tokio::test]
+    async fn a_repeated_key_stored_after_being_rejected_stays_indexed() {
+        let index = memory_index();
+        write_batch(
+            &index,
+            batch_with_contents(
+                &[1, 2, 1],
+                &[Some(REJECTED_TEXT), Some("other"), Some("last")],
+            ),
+        )
+        .await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 2]);
+        assert_eq!(
+            stored_vector(&index, 1),
+            Some(byte_vector("last")),
+            "the deciding row is indexable, so the key keeps the vector that row produced"
+        );
+    }
+
+    /// A key whose deciding row is rejected must not take an unrelated key's entry with it,
+    /// including one written by an earlier batch.
+    #[tokio::test]
+    async fn evicting_a_superseded_key_leaves_its_neighbours_indexed() {
+        let index = memory_index();
+        write_batch(&index, batch(&[1, 2, 3])).await;
+
+        write_batch(
+            &index,
+            batch_with_contents(&[2, 2], &[Some("rewritten"), Some(REJECTED_TEXT)]),
+        )
+        .await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 3]);
+    }
+
+    /// The vector the store currently holds for `id`, if any.
+    fn stored_vector(index: &MemoryVectorIndex, id: i64) -> Option<Vec<f32>> {
+        use arrow::array::{Array, FixedSizeListArray, Float32Array};
+        let store = index.store.read();
+        for b in store.batches() {
+            let (id_idx, _) = b
+                .schema()
+                .column_with_name("id")
+                .expect("the stored schema carries the primary key");
+            let (vec_idx, _) = b
+                .schema()
+                .column_with_name("content_embedding")
+                .expect("the stored schema carries the embedding column");
+            let ids = b
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vectors = b
+                .column(vec_idx)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("the embedding column is a FixedSizeList");
+            for row in 0..b.num_rows() {
+                if ids.value(row) == id && !vectors.is_null(row) {
+                    let values = vectors.value(row);
+                    return Some(
+                        values
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .expect("embeddings are Float32")
+                            .values()
+                            .to_vec(),
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Regression test for #13872. One batch carries id=1 twice and the row that *decides*
+    /// it embeds to a vector the index cannot use. Before the shared classifier, only the
+    /// all-zero / all-NaN shapes were a rejection here, so a partially non-finite deciding
+    /// row evicted nothing: search kept answering id=1 at the vector its previous text
+    /// produced, and the unusable vector was stored beside it.
+    #[tokio::test]
+    async fn every_unindexable_shape_evicts_its_key_and_stores_nothing() {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        for (n, (name, _, _)) in write_util::unindexable_shapes(dim).into_iter().enumerate() {
+            let index = memory_index();
+            let deciding = unindexable_text(n);
+            write_batch(
+                &index,
+                batch_with_contents(
+                    &[1, 2, 1],
+                    &[Some("first"), Some("other"), Some(deciding.as_str())],
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                indexed_ids(&index),
+                vec![2],
+                "id=1's deciding row embeds to a {name} vector, so no vector for it may \
+                 remain searchable"
+            );
+            assert_eq!(
+                stored_vector(&index, 1),
+                None,
+                "the vector of the text the same batch replaced is exactly what must not \
+                 survive"
+            );
+        }
+    }
+
+    /// The fixture is only meaningful if the sentinel texts really embed to the shapes the
+    /// classifier rejects — otherwise the guard above passes for the wrong reason.
+    #[test]
+    fn the_unindexable_fixture_really_embeds_to_a_rejected_vector() {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        for (n, (name, vector, expected)) in
+            write_util::unindexable_shapes(dim).into_iter().enumerate()
+        {
+            let embedded = byte_vector(&unindexable_text(n));
+            // `total_cmp` rather than `==`, so `NaN` compares equal to itself and the two
+            // vectors are held to the bit patterns they actually carry. Lengths first,
+            // because `zip` would otherwise pass a prefix off as the whole shape.
+            assert_eq!(embedded.len(), vector.len());
+            assert!(
+                embedded
+                    .iter()
+                    .zip(vector.iter())
+                    .all(|(a, b)| a.total_cmp(b) == std::cmp::Ordering::Equal),
+                "the sentinel text for {name} must embed to that shape"
+            );
+            assert_eq!(write_util::classify_vector(&embedded), Some(expected));
+        }
     }
 }
