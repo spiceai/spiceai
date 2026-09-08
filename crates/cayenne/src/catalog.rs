@@ -43,6 +43,16 @@ pub enum CatalogError {
     },
 
     /// Table not found
+    /// A shutdown WAL checkpoint that `SQLite` refused because another connection was
+    /// still reading. Worded as the cause clause it is reported as, and kept distinct
+    /// from [`CatalogError::Database`] because nothing is lost: the frames stay in the
+    /// log and the next open replays them, so a caller can report this without treating
+    /// the shutdown as failed.
+    #[snafu(display(
+        "the write-ahead log could not be truncated because another connection was still reading the metastore ({checkpointed} of {log} frames were written back to the database)"
+    ))]
+    WalCheckpointBusy { log: i32, checkpointed: i32 },
+
     #[snafu(display("Table not found: {table_name}"))]
     TableNotFound {
         /// Name of the table that was not found

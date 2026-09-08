@@ -1525,30 +1525,38 @@ impl MetastoreBackend for SqliteMetastore {
             && let Some(conn) = pool.conns.first()
         {
             let guard = conn.lock().await;
-            guard
+            let checkpoint: Option<(i32, i32, i32)> = guard
                 .call(|conn| {
                     // Check if WAL mode is enabled
                     let journal_mode: String =
                         conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
-                    if journal_mode.eq_ignore_ascii_case("wal") {
+                    let checkpoint = if journal_mode.eq_ignore_ascii_case("wal") {
                         tracing::debug!("Truncating Cayenne catalog WAL log");
-                        // Truncate the WAL log to persist changes and reduce file size
-                        // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
-                        let _: (i32, i32, i32) =
+                        // Truncate the WAL log to persist changes and reduce file size.
+                        // `wal_checkpoint` REPORTS refusal in its first result column
+                        // rather than raising: with a concurrent reader it returns
+                        // busy = 1 and leaves the log in place, so discarding the row
+                        // would let an un-truncated log read as a completed shutdown.
+                        Some(
                             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                            })?;
-                    }
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
 
                     // Run optimize to improve query performance for future connections
-                    // PRAGMA optimize may return rows indicating what was optimized
+                    // PRAGMA optimize may return rows indicating what was optimized.
+                    // Runs whatever the checkpoint reported — a busy log is no reason to
+                    // skip it, and the caller decides what a refusal means.
                     tracing::debug!("Running optimize on Cayenne catalog");
                     let mut stmt = conn.prepare("PRAGMA optimize")?;
                     let mut rows = stmt.query([])?;
                     while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
 
-                    Ok::<_, rusqlite::Error>(())
+                    Ok::<_, rusqlite::Error>(checkpoint)
                 })
                 .await
                 .map_err(
@@ -1556,6 +1564,12 @@ impl MetastoreBackend for SqliteMetastore {
                         message: format!("Failed to shutdown catalog: {e}"),
                     },
                 )?;
+
+            if let Some((busy, log, checkpointed)) = checkpoint
+                && busy != 0
+            {
+                return Err(CatalogError::WalCheckpointBusy { log, checkpointed });
+            }
             // Note: We intentionally do not explicitly close the connections here.
             // Closing pool connections while other pool slots remain open would be
             // inconsistent; instead we rely on normal drop semantics to clean up
@@ -2060,6 +2074,67 @@ mod tests {
     /// across the `.await`s in the test body (the writes are tiny) without the
     /// held-guard-across-await lint.
     static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` REPORTS a refusal in its first result column
+    /// instead of raising: with a concurrent reader holding a snapshot it returns
+    /// `busy = 1` and leaves the log in place. Discarding that row let an un-truncated
+    /// log read as a completed shutdown, so a metastore nobody flushed reported success.
+    #[tokio::test]
+    async fn shutdown_reports_a_wal_checkpoint_a_reader_blocked() {
+        let _guard = CONFIG_LOCK.lock().await;
+        // A blocked checkpoint waits out `busy_timeout_ms` before reporting, and the
+        // 30s default would be the whole runtime of this test. The wait is not what is
+        // under test — the reported result is — so shorten it.
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            busy_timeout_ms: 250,
+            ..SqliteMetastoreConfig::default()
+        });
+
+        let (dir, metastore) = temp_metastore();
+        let db_path = dir.path().join("cayenne_test.db");
+
+        metastore
+            .execute(ExecuteParams {
+                sql: "CREATE TABLE t (x INTEGER)",
+                params: vec![],
+            })
+            .await
+            .expect("failed to create the test table");
+        for i in 0..256 {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT INTO t (x) VALUES (?1)",
+                    params: vec![MetastoreValue::Integer(i)],
+                })
+                .await
+                .expect("failed to write a row");
+        }
+
+        // A separate connection holding an open read snapshot, as an in-flight scan does.
+        let reader = rusqlite::Connection::open(&db_path).expect("failed to open the reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .expect("failed to take a read snapshot");
+
+        let blocked = metastore.shutdown().await;
+        assert!(
+            matches!(blocked, Err(CatalogError::WalCheckpointBusy { .. })),
+            "a checkpoint a reader blocked must be reported, not swallowed: {blocked:?}"
+        );
+
+        // And once the reader releases, the same call succeeds — so the report above is
+        // the blocked checkpoint and not some unrelated shutdown failure.
+        reader
+            .execute_batch("COMMIT")
+            .expect("failed to release the read snapshot");
+        drop(reader);
+        metastore
+            .shutdown()
+            .await
+            .expect("shutdown must succeed once nothing is reading");
+
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+    }
 
     fn temp_metastore() -> (tempfile::TempDir, SqliteMetastore) {
         let dir = tempfile::tempdir().expect("tempdir");

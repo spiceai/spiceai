@@ -4533,7 +4533,14 @@ impl DataAccelerator for CayenneAccelerator {
                     "{}",
                     metastore_shutdown_flush_warning(path, &datasets, &e.to_string())
                 );
-                first_error.get_or_insert(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                // A log the checkpoint could not truncate is reported, not failed: every
+                // frame is still in it and the next open replays them, so the shutdown
+                // did not lose anything and the warning above is the whole story.
+                // Anything else means a step of the shutdown genuinely did not run.
+                if !matches!(e, cayenne::CatalogError::WalCheckpointBusy { .. }) {
+                    first_error
+                        .get_or_insert(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                }
             }
         }
         if let Some(e) = first_error {
