@@ -390,6 +390,21 @@ pub struct CayenneAccelerator {
     /// find none of its table names there, and mint a fresh `table_id` over data it
     /// can no longer reach.
     catalogs: Arc<parking_lot::Mutex<HashMap<String, CatalogCell>>>,
+    /// Every metastore this accelerator has opened, keyed by connection string, so
+    /// `shutdown` can flush each one.
+    ///
+    /// Separate from `catalogs` because that map only holds the lazily-initialized cells
+    /// the unpartitioned path reuses. A partitioned table builds its own concrete
+    /// `CayenneCatalog` — `CayennePartitionedInsertStrategy` opens a shared
+    /// `MetastoreTransaction` across partitions and cannot do that through a trait
+    /// object — and the memory catalog has its own cell, so neither would be reachable
+    /// from `catalogs`. A pod whose Cayenne datasets are all partitioned would then
+    /// flush nothing on shutdown.
+    ///
+    /// Keyed by connection string rather than per catalog object: `shutdown` truncates
+    /// the WAL of the file the DSN names, so one flush per metastore is both sufficient
+    /// and all that can usefully run.
+    shutdown_registry: Arc<parking_lot::Mutex<HashMap<String, Arc<dyn cayenne::MetadataCatalog>>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -1233,6 +1248,7 @@ impl CayenneAccelerator {
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
             catalogs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            shutdown_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2491,7 +2507,24 @@ impl CayenneAccelerator {
                     .or_insert_with(|| Arc::new(OnceCell::new())),
             )
         };
-        Self::init_cayenne_catalog(&cell, connection_string).await
+        let catalog = Self::init_cayenne_catalog(&cell, connection_string.clone()).await?;
+        self.register_for_shutdown(connection_string, &catalog);
+        Ok(catalog)
+    }
+
+    /// Record a catalog so `shutdown` flushes the metastore it names.
+    ///
+    /// First registration for a connection string wins: later catalogs on the same DSN
+    /// address the same file, and flushing it once is all `shutdown` can usefully do.
+    fn register_for_shutdown(
+        &self,
+        connection_string: String,
+        catalog: &Arc<dyn cayenne::MetadataCatalog>,
+    ) {
+        self.shutdown_registry
+            .lock()
+            .entry(connection_string)
+            .or_insert_with(|| Arc::clone(catalog));
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -2501,7 +2534,13 @@ impl CayenneAccelerator {
     async fn get_or_create_memory_catalog(&self) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
         let connection_string =
             format!("sqlite://file:/cayenne-mem-{}?vfs=memdb", self.instance_id);
-        Self::init_cayenne_catalog(&self.memory_catalog, connection_string).await
+        let catalog =
+            Self::init_cayenne_catalog(&self.memory_catalog, connection_string.clone()).await?;
+        // Registered like any other: the memdb has nothing to checkpoint, but keeping the
+        // registry the single record of what this accelerator opened is what stops the next
+        // catalog path from being the one nobody remembers to flush.
+        self.register_for_shutdown(connection_string, &catalog);
+        Ok(catalog)
     }
 
     /// Apply the `mode: memory` overrides to a table's [`cayenne::metadata::VortexConfig`]:
@@ -3999,7 +4038,7 @@ impl DataAccelerator for CayenneAccelerator {
                 _ => format!("sqlite://{metadata_dir}/cayenne.db"),
             };
             let catalog_concrete: Arc<cayenne::CayenneCatalog> = Arc::new(
-                cayenne::CayenneCatalog::new(catalog_connection_string)
+                cayenne::CayenneCatalog::new(catalog_connection_string.clone())
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?,
             );
@@ -4015,6 +4054,10 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationInitializationFailedSnafu)?;
+
+            // This catalog is built here rather than through `get_or_create_catalog`, so it
+            // is not in the `catalogs` cache and shutdown would never see it.
+            self.register_for_shutdown(catalog_connection_string, &catalog);
 
             // Get or create table_id from catalog
             let table_metadata = catalog
@@ -4396,10 +4439,10 @@ impl DataAccelerator for CayenneAccelerator {
         // Every metastore this accelerator opened, not just one: each has its own WAL
         // to flush, and skipping the others would leave their last writes unconsolidated.
         let catalogs: Vec<(String, Arc<dyn cayenne::MetadataCatalog>)> = {
-            let catalogs = self.catalogs.lock();
-            catalogs
+            let registry = self.shutdown_registry.lock();
+            registry
                 .iter()
-                .filter_map(|(dsn, cell)| cell.get().map(|c| (dsn.clone(), Arc::clone(c))))
+                .map(|(dsn, catalog)| (dsn.clone(), Arc::clone(catalog)))
                 .collect()
         };
 
@@ -5853,6 +5896,76 @@ mod tests {
                 .expect("failed to list catalog b")
                 .is_empty(),
             "a table created against one metastore must not appear in another"
+        );
+    }
+
+    /// `shutdown` flushes what the shutdown registry holds, so every path that opens a
+    /// metastore has to register it. A catalog built outside `get_or_create_catalog` —
+    /// the partitioned path does exactly that — would otherwise never have its WAL
+    /// checkpointed, and a pod whose Cayenne datasets are all partitioned would flush
+    /// nothing at all.
+    #[tokio::test]
+    async fn every_opened_metastore_is_registered_for_shutdown() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("failed to create dir a");
+        std::fs::create_dir_all(&dir_b).expect("failed to create dir b");
+        let (a, b) = (dir_a.to_string_lossy(), dir_b.to_string_lossy());
+
+        let accelerator = CayenneAccelerator::new();
+        assert!(
+            accelerator.shutdown_registry.lock().is_empty(),
+            "nothing is registered before a catalog is opened"
+        );
+
+        accelerator
+            .get_or_create_catalog(&a, "sqlite")
+            .await
+            .expect("failed to open catalog a");
+        accelerator
+            .get_or_create_catalog(&b, "sqlite")
+            .await
+            .expect("failed to open catalog b");
+        accelerator
+            .get_or_create_memory_catalog()
+            .await
+            .expect("failed to open the memory catalog");
+
+        let registered: Vec<String> = {
+            let registry = accelerator.shutdown_registry.lock();
+            let mut keys: Vec<String> = registry.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            registered.len(),
+            3,
+            "each distinct metastore must be registered exactly once, got {registered:?}"
+        );
+        assert!(
+            registered.iter().any(|dsn| dsn.contains("/a/cayenne.db")),
+            "catalog a is missing from the shutdown registry: {registered:?}"
+        );
+        assert!(
+            registered.iter().any(|dsn| dsn.contains("/b/cayenne.db")),
+            "catalog b is missing from the shutdown registry: {registered:?}"
+        );
+        assert!(
+            registered.iter().any(|dsn| dsn.contains("vfs=memdb")),
+            "the memory catalog is missing from the shutdown registry: {registered:?}"
+        );
+
+        // Reopening the same metastore must not add a second entry: shutdown truncates the
+        // WAL of the file the DSN names, so one flush per metastore is all that can run.
+        accelerator
+            .get_or_create_catalog(&a, "sqlite")
+            .await
+            .expect("failed to reopen catalog a");
+        assert_eq!(
+            accelerator.shutdown_registry.lock().len(),
+            3,
+            "reopening a metastore must not register it twice"
         );
     }
 
