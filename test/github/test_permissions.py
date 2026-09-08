@@ -59,9 +59,13 @@ class PermissionCheckTests(unittest.TestCase):
                     )
                 )
                 status, body, headers = owner.responses.popleft()
+                if status is None:
+                    self.close_connection = True
+                    return
                 payload = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)
-                self.send_header("Content-Length", str(len(payload)))
+                if "Content-Length" not in headers:
+                    self.send_header("Content-Length", str(len(payload)))
                 for name, value in headers.items():
                     self.send_header(name, value)
                 self.end_headers()
@@ -174,6 +178,27 @@ class PermissionCheckTests(unittest.TestCase):
         result, artifact = self.run_check([(503, {}, {}), (200, SUCCESS, {})])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(artifact), 2)
+
+    def test_disconnected_request_recovers(self):
+        result, artifact = self.run_check([(None, None, {}), (200, SUCCESS, {})])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn("transport_error", artifact[0])
+
+    def test_truncated_response_recovers(self):
+        result, artifact = self.run_check(
+            [(200, b'{"data":', {"Content-Length": "1000"}), (200, SUCCESS, {})]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn("transport_error", artifact[0])
+
+    def test_persistent_disconnect_is_bounded(self):
+        result, artifact = self.run_check([(None, None, {})] * 3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(artifact), 3)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_persistent_transient_failure_is_bounded(self):
         result, artifact = self.run_check([(503, {}, {})] * 3)

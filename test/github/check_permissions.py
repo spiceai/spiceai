@@ -5,6 +5,7 @@
 
 import argparse
 from email.utils import parsedate_to_datetime
+from http.client import IncompleteRead
 import json
 import math
 import os
@@ -108,10 +109,11 @@ def check(endpoint: str, token: str, artifacts: Path):
                         payload.get("message", "") if isinstance(payload, dict) else ""
                     )
                     observation["message"] = str(message).replace(token, "[REDACTED]")
-                except (ValueError, TimeoutError):
+                except (ValueError, TimeoutError, ConnectionError, IncompleteRead):
                     observation["message"] = "GitHub returned no readable JSON error"
+                finally:
+                    error.close()
                 observations.append(observation)
-                error.close()
                 rate_limited = error.code == 429 or (
                     error.code == 403
                     and (
@@ -121,12 +123,15 @@ def check(endpoint: str, token: str, artifacts: Path):
                     )
                 )
                 retryable = rate_limited or error.code in (500, 502, 503, 504)
-            except (URLError, TimeoutError) as error:
+            except (URLError, TimeoutError, ConnectionError, IncompleteRead) as error:
                 observation = {
                     "attempt": attempt + 1,
-                    "transport_error": str(error.reason)
-                    if isinstance(error, URLError)
-                    else str(error),
+                    "transport_error": redact(
+                        str(error.reason)
+                        if isinstance(error, URLError)
+                        else str(error),
+                        token,
+                    ),
                 }
                 observations.append(observation)
                 retryable = True
