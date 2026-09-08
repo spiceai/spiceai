@@ -29,6 +29,29 @@ partitions. That job and the live E2E job share a queued workflow concurrency
 group because GitHub quotas span processes. Failed tests are not rerun by
 nextest; HTTP retries remain the connector's responsibility.
 
+Both live CI jobs explicitly request `contents: write` for `GITHUB_TOKEN`.
+GitHub's GraphQL `repository.stargazers` read requires it: the
+[permission reproduction](https://github.com/spiceai/spiceai/actions/runs/34186688336)
+returns `FORBIDDEN` with `contents: read` (and with `read-all`), and one row with
+`contents: write`. Removing `email` from the query does not change that result.
+Checkout does not persist the token. The existing organization App credentials
+remain separate for organization and App-authentication tests.
+
+`check_permissions.py` verifies the full one-row stargazers selection before
+the live tests start. HTTP-success responses containing GraphQL errors fail;
+authentication and permission errors are not retried. Transient transport,
+server, and rate-limit failures get at most three attempts with a 60-second
+retry budget and a 15-second socket timeout; the CI step has a two-minute hard
+timeout. A rate-limit delay beyond the budget fails explicitly without retrying
+early, including GitHub's one-minute minimum when no timing headers are given.
+The uploaded `permissions.json` records errors and row counts, without
+tokens or profile fields. Its CLI is tested against a local HTTP server:
+
+```sh
+python3 -m unittest discover -s test/github -p test_permissions.py -v
+GITHUB_TOKEN=... python3 test/github/check_permissions.py --artifacts /tmp/github-api-results
+```
+
 For local integration testing, supply `GITHUB_TOKEN`, `GITHUB_ORG_TOKEN`, and
 the app credentials `GITHUB_CLIENT_ID`, `GITHUB_INSTALLATION_ID`, and
 `GITHUB_PRIVATE_KEY` through the environment or the runtime's dotenv secret

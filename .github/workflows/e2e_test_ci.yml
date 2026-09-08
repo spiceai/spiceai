@@ -1681,6 +1681,10 @@ jobs:
       - build
       - setup-matrix
     timeout-minutes: 15
+    permissions:
+      # Required by GitHub's GraphQL stargazers read query; match integration.
+      # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
+      contents: write
     concurrency:
       group: github-connector-live-api
       queue: max
@@ -1695,6 +1699,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify GitHub API permissions
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1745,6 +1757,7 @@ jobs:
         with:
           name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
           path: |
+            github-api-results/
             github-fixture-results/
             github-live-results/
             test_app/spice.log

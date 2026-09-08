@@ -510,7 +510,10 @@ jobs:
     runs-on: spiceai-dev-runners
     timeout-minutes: 40
     permissions:
-      contents: read
+      # GitHub's GraphQL stargazers connection rejects contents: read, including
+      # read-all. The read query requires contents: write on GITHUB_TOKEN.
+      # Reproduction: https://github.com/spiceai/spiceai/actions/runs/34186688336
+      contents: write
     # Shared with the live E2E smoke test: API quotas span processes and runs.
     concurrency:
       group: github-connector-live-api
@@ -520,6 +523,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Test GitHub permission diagnostics
+        run: python3 -m unittest discover -s test/github -p test_permissions.py -v
+
+      - name: Verify GitHub API permissions
+        timeout-minutes: 2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -579,6 +591,13 @@ jobs:
           cargo nextest run --workspace-remap "${PWD}" \
             --archive-file ./integration_tests/integration_tests.tar.zst \
             --test-threads 1 -E 'binary_id(=runtime::integration) & test(/^github::/)'
+
+      - name: Upload GitHub permission diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: github-api-permissions
+          path: github-api-results/
 
       - name: Upload integration snapshots artifact
         id: create_snapshot_archive
