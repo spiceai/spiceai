@@ -3,164 +3,45 @@ on:
   push:
     branches: [ci/github-permissions-pr-13939]
 jobs:
-  contents:
+  contents-read:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
-      - name: Request stargazers with and without email
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test diagnostics
+        run: python3 -m unittest discover -s test/github -p test_permissions.py -v
+      - name: Verify full stargazers selection
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-          failed = False
-          for email in ('', 'email'):
-              query = ('{ repository(owner: "spiceai", name: "spiceai") { stargazers(first: 1) { edges { starredAt node { login name avatarUrl bio location company ' + email + ' twitterUsername } } pageInfo { hasNextPage endCursor } } } }')
-              request = urllib.request.Request('https://api.github.com/graphql', data=json.dumps({'query': query}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'spice-github-permissions-reproduction'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      body = json.load(response)
-              except urllib.error.HTTPError as error:
-                  print(json.dumps({'includes_email': bool(email), 'http_status': error.code, 'error': error.read().decode()}))
-                  failed = True
-                  continue
-              errors = body.get('errors', [])
-              edges = ((body.get('data') or {}).get('repository') or {}).get('stargazers') or {}
-              print(json.dumps({'includes_email': bool(email), 'errors': errors, 'rows': len(edges.get('edges', []))}))
-              failed |= bool(errors)
-          raise SystemExit(1 if failed else 0)
-          PYTHON
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: contents-read-permissions
+          path: github-api-results/
   contents-write:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: Request stargazers with and without email
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test diagnostics
+        run: python3 -m unittest discover -s test/github -p test_permissions.py -v
+      - name: Verify full stargazers selection
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-          failed = False
-          for email in ('', 'email'):
-              query = ('{ repository(owner: "spiceai", name: "spiceai") { stargazers(first: 1) { edges { starredAt node { login name avatarUrl bio location company ' + email + ' twitterUsername } } pageInfo { hasNextPage endCursor } } } }')
-              request = urllib.request.Request('https://api.github.com/graphql', data=json.dumps({'query': query}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'spice-github-permissions-reproduction'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      body = json.load(response)
-              except urllib.error.HTTPError as error:
-                  print(json.dumps({'includes_email': bool(email), 'http_status': error.code, 'error': error.read().decode()}))
-                  failed = True
-                  continue
-              errors = body.get('errors', [])
-              edges = ((body.get('data') or {}).get('repository') or {}).get('stargazers') or {}
-              print(json.dumps({'includes_email': bool(email), 'errors': errors, 'rows': len(edges.get('edges', []))}))
-              failed |= bool(errors)
-          raise SystemExit(1 if failed else 0)
-          PYTHON
-  issues-write:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Request stargazers with and without email
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-          failed = False
-          for email in ('', 'email'):
-              query = ('{ repository(owner: "spiceai", name: "spiceai") { stargazers(first: 1) { edges { starredAt node { login name avatarUrl bio location company ' + email + ' twitterUsername } } pageInfo { hasNextPage endCursor } } } }')
-              request = urllib.request.Request('https://api.github.com/graphql', data=json.dumps({'query': query}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'spice-github-permissions-reproduction'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      body = json.load(response)
-              except urllib.error.HTTPError as error:
-                  print(json.dumps({'includes_email': bool(email), 'http_status': error.code, 'error': error.read().decode()}))
-                  failed = True
-                  continue
-              errors = body.get('errors', [])
-              edges = ((body.get('data') or {}).get('repository') or {}).get('stargazers') or {}
-              print(json.dumps({'includes_email': bool(email), 'errors': errors, 'rows': len(edges.get('edges', []))}))
-              failed |= bool(errors)
-          raise SystemExit(1 if failed else 0)
-          PYTHON
-  pulls-write:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Request stargazers with and without email
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-          failed = False
-          for email in ('', 'email'):
-              query = ('{ repository(owner: "spiceai", name: "spiceai") { stargazers(first: 1) { edges { starredAt node { login name avatarUrl bio location company ' + email + ' twitterUsername } } pageInfo { hasNextPage endCursor } } } }')
-              request = urllib.request.Request('https://api.github.com/graphql', data=json.dumps({'query': query}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'spice-github-permissions-reproduction'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      body = json.load(response)
-              except urllib.error.HTTPError as error:
-                  print(json.dumps({'includes_email': bool(email), 'http_status': error.code, 'error': error.read().decode()}))
-                  failed = True
-                  continue
-              errors = body.get('errors', [])
-              edges = ((body.get('data') or {}).get('repository') or {}).get('stargazers') or {}
-              print(json.dumps({'includes_email': bool(email), 'errors': errors, 'rows': len(edges.get('edges', []))}))
-              failed |= bool(errors)
-          raise SystemExit(1 if failed else 0)
-          PYTHON
-  write-all:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions: write-all
-    steps:
-      - name: Request stargazers with and without email
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-          failed = False
-          for email in ('', 'email'):
-              query = ('{ repository(owner: "spiceai", name: "spiceai") { stargazers(first: 1) { edges { starredAt node { login name avatarUrl bio location company ' + email + ' twitterUsername } } pageInfo { hasNextPage endCursor } } } }')
-              request = urllib.request.Request('https://api.github.com/graphql', data=json.dumps({'query': query}).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'User-Agent': 'spice-github-permissions-reproduction'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      body = json.load(response)
-              except urllib.error.HTTPError as error:
-                  print(json.dumps({'includes_email': bool(email), 'http_status': error.code, 'error': error.read().decode()}))
-                  failed = True
-                  continue
-              errors = body.get('errors', [])
-              edges = ((body.get('data') or {}).get('repository') or {}).get('stargazers') or {}
-              print(json.dumps({'includes_email': bool(email), 'errors': errors, 'rows': len(edges.get('edges', []))}))
-              failed |= bool(errors)
-          raise SystemExit(1 if failed else 0)
-          PYTHON
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 test/github/check_permissions.py --artifacts github-api-results
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: contents-write-permissions
+          path: github-api-results/
