@@ -2343,10 +2343,10 @@ impl MetadataCatalog for CayenneCatalog {
         // logs from reopening the existing one. An accelerated dataset that has
         // run before is expected to REOPEN; if it mints instead, every row it
         // previously accelerated is still on disk under the old table_id but no
-        // longer reachable, and the only visible symptom is a dataset that
-        // silently starts empty. Say so at the moment it happens, with the ids
-        // needed to find the orphaned directory.
-        tracing::info!(
+        // longer reachable. Record the ids needed to find that directory, at
+        // debug: creating a table is the normal first-use outcome, so this is
+        // diagnostic detail rather than something every start should report.
+        tracing::debug!(
             table_name = table_name.as_str(),
             table_id = table_id.as_str(),
             path = base_path.as_str(),
