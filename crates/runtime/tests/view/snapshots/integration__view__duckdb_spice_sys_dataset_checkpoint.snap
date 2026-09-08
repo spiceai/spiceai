@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/view/mod.rs
+expression: pretty
+---
++---------------+
+| dataset_name  |
++---------------+
+| taxi_trips_vw |
++---------------+

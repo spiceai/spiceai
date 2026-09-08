@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: count_all_posts"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                            |
++---------------+---------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                       |
+|               |  Projection: count(Int64(1)) AS total_count                                                                                     |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                             |
+|               |     TableScan: create_post projection=[]                                                                                        |
+| physical_plan | SchemaCastScanExec                                                                                                              |
+|               |   CooperativeExec                                                                                                               |
+|               |     BytesProcessedExec                                                                                                          |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT count(1) AS "total_count" FROM "create_post" |
+|               |                                                                                                                                 |
++---------------+---------------------------------------------------------------------------------------------------------------------------------+

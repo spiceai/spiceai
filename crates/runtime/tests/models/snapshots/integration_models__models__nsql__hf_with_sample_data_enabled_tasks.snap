@@ -1,0 +1,186 @@
+---
+source: crates/runtime/tests/models/mod.rs
+expression: response
+---
++------------------------+-------------------------------------------------------------------------------------------+
+| task                   | input                                                                                     |
++------------------------+-------------------------------------------------------------------------------------------+
+| nsql                   | how many records (as 'total_records') are in taxi_trips dataset?                          |
+| tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                                    |
+| tool_use::sample_data  | DistinctColumns({"dataset":"spice.public.taxi_trips","limit":3,"cols":null})              |
+| sql_query              | SELECT "VendorID" FROM (                                                                  |
+|                        |                 SELECT "VendorID", 1 as priority                                          |
+|                        |                 FROM (SELECT DISTINCT "VendorID" FROM spice.public.taxi_trips)            |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT "VendorID", 2 as priority                                          |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, "VendorID"                                                 |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT tpep_pickup_datetime FROM (                                                        |
+|                        |                 SELECT tpep_pickup_datetime, 1 as priority                                |
+|                        |                 FROM (SELECT DISTINCT tpep_pickup_datetime FROM spice.public.taxi_trips)  |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT tpep_pickup_datetime, 2 as priority                                |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, tpep_pickup_datetime                                       |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT tpep_dropoff_datetime FROM (                                                       |
+|                        |                 SELECT tpep_dropoff_datetime, 1 as priority                               |
+|                        |                 FROM (SELECT DISTINCT tpep_dropoff_datetime FROM spice.public.taxi_trips) |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT tpep_dropoff_datetime, 2 as priority                               |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, tpep_dropoff_datetime                                      |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT passenger_count FROM (                                                             |
+|                        |                 SELECT passenger_count, 1 as priority                                     |
+|                        |                 FROM (SELECT DISTINCT passenger_count FROM spice.public.taxi_trips)       |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT passenger_count, 2 as priority                                     |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, passenger_count                                            |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT trip_distance FROM (                                                               |
+|                        |                 SELECT trip_distance, 1 as priority                                       |
+|                        |                 FROM (SELECT DISTINCT trip_distance FROM spice.public.taxi_trips)         |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT trip_distance, 2 as priority                                       |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, trip_distance                                              |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT "RatecodeID" FROM (                                                                |
+|                        |                 SELECT "RatecodeID", 1 as priority                                        |
+|                        |                 FROM (SELECT DISTINCT "RatecodeID" FROM spice.public.taxi_trips)          |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT "RatecodeID", 2 as priority                                        |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, "RatecodeID"                                               |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT store_and_fwd_flag FROM (                                                          |
+|                        |                 SELECT store_and_fwd_flag, 1 as priority                                  |
+|                        |                 FROM (SELECT DISTINCT store_and_fwd_flag FROM spice.public.taxi_trips)    |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT store_and_fwd_flag, 2 as priority                                  |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, store_and_fwd_flag                                         |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT "PULocationID" FROM (                                                              |
+|                        |                 SELECT "PULocationID", 1 as priority                                      |
+|                        |                 FROM (SELECT DISTINCT "PULocationID" FROM spice.public.taxi_trips)        |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT "PULocationID", 2 as priority                                      |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, "PULocationID"                                             |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT "DOLocationID" FROM (                                                              |
+|                        |                 SELECT "DOLocationID", 1 as priority                                      |
+|                        |                 FROM (SELECT DISTINCT "DOLocationID" FROM spice.public.taxi_trips)        |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT "DOLocationID", 2 as priority                                      |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, "DOLocationID"                                             |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT payment_type FROM (                                                                |
+|                        |                 SELECT payment_type, 1 as priority                                        |
+|                        |                 FROM (SELECT DISTINCT payment_type FROM spice.public.taxi_trips)          |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT payment_type, 2 as priority                                        |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, payment_type                                               |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT fare_amount FROM (                                                                 |
+|                        |                 SELECT fare_amount, 1 as priority                                         |
+|                        |                 FROM (SELECT DISTINCT fare_amount FROM spice.public.taxi_trips)           |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT fare_amount, 2 as priority                                         |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, fare_amount                                                |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT extra FROM (                                                                       |
+|                        |                 SELECT extra, 1 as priority                                               |
+|                        |                 FROM (SELECT DISTINCT extra FROM spice.public.taxi_trips)                 |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT extra, 2 as priority                                               |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, extra                                                      |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT mta_tax FROM (                                                                     |
+|                        |                 SELECT mta_tax, 1 as priority                                             |
+|                        |                 FROM (SELECT DISTINCT mta_tax FROM spice.public.taxi_trips)               |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT mta_tax, 2 as priority                                             |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, mta_tax                                                    |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT tip_amount FROM (                                                                  |
+|                        |                 SELECT tip_amount, 1 as priority                                          |
+|                        |                 FROM (SELECT DISTINCT tip_amount FROM spice.public.taxi_trips)            |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT tip_amount, 2 as priority                                          |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, tip_amount                                                 |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT tolls_amount FROM (                                                                |
+|                        |                 SELECT tolls_amount, 1 as priority                                        |
+|                        |                 FROM (SELECT DISTINCT tolls_amount FROM spice.public.taxi_trips)          |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT tolls_amount, 2 as priority                                        |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, tolls_amount                                               |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT improvement_surcharge FROM (                                                       |
+|                        |                 SELECT improvement_surcharge, 1 as priority                               |
+|                        |                 FROM (SELECT DISTINCT improvement_surcharge FROM spice.public.taxi_trips) |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT improvement_surcharge, 2 as priority                               |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, improvement_surcharge                                      |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT total_amount FROM (                                                                |
+|                        |                 SELECT total_amount, 1 as priority                                        |
+|                        |                 FROM (SELECT DISTINCT total_amount FROM spice.public.taxi_trips)          |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT total_amount, 2 as priority                                        |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, total_amount                                               |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT congestion_surcharge FROM (                                                        |
+|                        |                 SELECT congestion_surcharge, 1 as priority                                |
+|                        |                 FROM (SELECT DISTINCT congestion_surcharge FROM spice.public.taxi_trips)  |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT congestion_surcharge, 2 as priority                                |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, congestion_surcharge                                       |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT "Airport_fee" FROM (                                                               |
+|                        |                 SELECT "Airport_fee", 1 as priority                                       |
+|                        |                 FROM (SELECT DISTINCT "Airport_fee" FROM spice.public.taxi_trips)         |
+|                        |                 UNION ALL                                                                 |
+|                        |                 SELECT "Airport_fee", 2 as priority                                       |
+|                        |                 FROM spice.public.taxi_trips                                              |
+|                        |             ) combined                                                                    |
+|                        |             ORDER BY priority, "Airport_fee"                                              |
+|                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT store_and_fwd_flag_embedding FROM spice.public.taxi_trips LIMIT 3                  |
+| tool_use::sample_data  | RandomSample({"dataset":"spice.public.taxi_trips","limit":3})                             |
+| sql_query              | SELECT * FROM spice.public.taxi_trips LIMIT 3                                             |
+| sql_query              | SELECT COUNT(*) AS total_records FROM "taxi_trips"                                        |
++------------------------+-------------------------------------------------------------------------------------------+

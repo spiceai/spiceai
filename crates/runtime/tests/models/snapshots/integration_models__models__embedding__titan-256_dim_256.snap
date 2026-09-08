@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/models/embedding.rs
+expression: normalize_embeddings_response(response)
+---
+{
+  "data": [
+    {
+      "embedding": "array_256_items",
+      "index": 0,
+      "object": "embedding"
+    }
+  ],
+  "model": "titan-256",
+  "object": "list",
+  "usage": {
+    "prompt_tokens": 9,
+    "total_tokens": 9
+  }
+}

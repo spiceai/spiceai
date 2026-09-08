@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q67"
+---
++------------+-----------+-----------------+----------------+--------+-------+-------+------------+------------+----+
+| i_category | i_class   | i_brand         | i_product_name | d_year | d_qoy | d_moy | s_store_id | sumsales   | rk |
++------------+-----------+-----------------+----------------+--------+-------+-------+------------+------------+----+
+| Books      | arts      | amalgmaxi #11   |                |        |       |       |            | 299867.65  | 55 |
+| Books      | arts      | amalgmaxi #12   |                |        |       |       |            | 206268.47  | 74 |
+| Books      | arts      | amalgmaxi #2    |                |        |       |       |            | 219634.95  | 71 |
+| Books      | arts      | amalgmaxi #5    |                |        |       |       |            | 323177.69  | 44 |
+| Books      | arts      | amalgmaxi #9    |                |        |       |       |            | 287900.90  | 57 |
+| Books      | arts      |                 |                |        |       |       |            | 1674385.04 | 13 |
+| Books      | business  | importomaxi #8  |                |        |       |       |            | 527694.37  | 24 |
+| Books      | business  | importomaxi #9  |                |        |       |       |            | 329008.56  | 41 |
+| Books      | business  |                 |                |        |       |       |            | 1398557.61 | 16 |
+| Books      | computers | exportimaxi #12 |                |        |       |       |            | 178056.09  | 83 |
++------------+-----------+-----------------+----------------+--------+-------+-------+------------+------------+----+

@@ -1,0 +1,4 @@
+id,data
+1,"{""name"":""alice"",""age"":30,""active"":true,""score"":4.5,""tags"":[""a"",""b""]}"
+2,"{""name"":""bob"",""age"":25,""active"":false,""score"":3.2,""tags"":[""c""]}"
+3,"{""name"":""charlie"",""age"":35,""active"":true,""score"":4.8,""tags"":[""d"",""e"",""f""]}"

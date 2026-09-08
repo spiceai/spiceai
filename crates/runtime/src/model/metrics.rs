@@ -1,0 +1,166 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{sync::LazyLock, time::Duration};
+
+use async_openai::types::chat::{
+    ChatCompletionNamedToolChoice, ChatCompletionNamedToolChoiceCustom,
+    ChatCompletionToolChoiceOption, CreateChatCompletionRequest, CustomName, FunctionName,
+    ToolChoiceOptions,
+};
+use async_openai::types::responses::CreateResponse;
+use opentelemetry::{
+    Key, KeyValue, StringValue, Value, global,
+    metrics::{Counter, Histogram, Meter},
+};
+
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llms"));
+
+pub(crate) static LLM_REQUESTS: LazyLock<Counter<u64>> =
+    LazyLock::new(|| METER.u64_counter("llm_requests").build());
+
+pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("llm_failures")
+        .with_description("Number of embedding failures.")
+        .build()
+});
+
+pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("llm_internal_request_duration_ms")
+        .with_unit("ms")
+        .with_description("The duration of running an embedding(s) internally.")
+        .build()
+});
+
+pub(crate) static LLM_PROMPT_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("llm_prompt_tokens_total")
+        .with_description("Total prompt (input) tokens consumed by LLM requests.")
+        .build()
+});
+
+pub(crate) static LLM_COMPLETION_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("llm_completion_tokens_total")
+        .with_description("Total completion (output) tokens produced by LLM requests.")
+        .build()
+});
+
+pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue> {
+    #[expect(clippy::cast_possible_wrap)]
+    let mut labels = vec![
+        KeyValue::new(
+            Key::new("stream"),
+            Value::Bool(req.stream.unwrap_or_default()),
+        ),
+        KeyValue::new(
+            Key::new("request_level_tools"),
+            Value::I64(req.tools.as_deref().unwrap_or_default().len() as i64),
+        ),
+        KeyValue::new(Key::new("model"), Value::String(req.model.clone().into())),
+    ];
+
+    if let Some(ref choice) = req.tool_choice {
+        let choice_str: StringValue = match choice {
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => "auto".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None) => "none".into(),
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => "required".into(),
+            ChatCompletionToolChoiceOption::AllowedTools(_) => "allowed_tools".into(),
+            ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
+                function: FunctionName { name, .. },
+            })
+            | ChatCompletionToolChoiceOption::Custom(ChatCompletionNamedToolChoiceCustom {
+                custom: CustomName { name },
+            }) => format!("function:{name}").into(),
+        };
+        labels.push(KeyValue::new(
+            Key::new("tool_choice"),
+            Value::String(choice_str),
+        ));
+    }
+
+    #[expect(deprecated)]
+    if let Some(ref user) = req.user {
+        labels.push(KeyValue::new(
+            Key::new("user"),
+            Value::String(user.clone().into()),
+        ));
+    }
+
+    if let Some(ref metadata) = req.metadata {
+        labels.push(KeyValue::new(
+            Key::new("metadata"),
+            Value::String(format!("{metadata:?}").into()),
+        ));
+    }
+
+    labels
+}
+
+pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
+    #[expect(clippy::cast_possible_wrap)]
+    let mut labels = vec![
+        KeyValue::new(
+            Key::new("stream"),
+            Value::Bool(req.stream.unwrap_or_default()),
+        ),
+        KeyValue::new(
+            Key::new("request_level_tools"),
+            Value::I64(req.tools.as_deref().unwrap_or_default().len() as i64),
+        ),
+        KeyValue::new(
+            Key::new("model"),
+            Value::String(req.model.clone().unwrap_or_default().into()),
+        ),
+        KeyValue::new(Key::new("responses_api"), Value::Bool(true)),
+    ];
+
+    if let Some(ref metadata) = req.metadata {
+        labels.push(KeyValue::new(
+            Key::new("metadata"),
+            Value::String(format!("{metadata:?}").into()),
+        ));
+    }
+
+    if let Some(ref instructions) = req.instructions {
+        labels.push(KeyValue::new(
+            Key::new("instructions"),
+            Value::String(instructions.clone().into()),
+        ));
+    }
+
+    labels
+}
+
+pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[KeyValue]) {
+    LLM_REQUESTS.add(1, labels);
+    LLM_INTERNAL_DURATION_MS.record(duration.as_secs_f64(), labels);
+    if is_failure {
+        FAILURES.add(1, labels);
+    }
+}
+
+/// Records token usage metrics from a completed LLM request.
+pub(crate) fn handle_token_metrics(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    labels: &[KeyValue],
+) {
+    LLM_PROMPT_TOKENS.add(u64::from(prompt_tokens), labels);
+    LLM_COMPLETION_TOKENS.add(u64::from(completion_tokens), labels);
+}

@@ -1,0 +1,19 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q1"
+---
++---------------+---------------------------------------------------------------------------------+
+| plan_type     | plan                                                                            |
++---------------+---------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                   |
+|               |   BytesProcessedNode                                                            |
+|               |     TableScan: hits projection=[]                                               |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(*)]                              |
+|               |   CoalescePartitionsExec                                                        |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                        |
+|               |       BytesProcessedExec                                                        |
+|               |         SchemaCastScanExec                                                      |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
+|               |             MemoryExec: partitions=1, partition_sizes=[12218]                   |
+|               |                                                                                 |
++---------------+---------------------------------------------------------------------------------+

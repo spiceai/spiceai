@@ -1,0 +1,749 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
+use super::types::{MessageRole, StopReason, Usage};
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::chat::{
+        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CompletionTokensDetails, CompletionUsage,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType,
+        PromptTokensDetails, Role,
+    },
+};
+use futures::{Stream, StreamExt};
+use reqwest_eventsource::Error as SseError;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::HashMap, pin::Pin, sync::Arc};
+
+use tokio::sync::Mutex;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum MessageCreateStreamResponse {
+    #[serde(rename = "message_start")]
+    MessageStart { message: MessageStartMessage },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        index: u32,
+        content_block: ContentBlock,
+    },
+    #[serde(rename = "ping")]
+    Ping,
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta { index: u32, delta: Delta },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop { index: u32 },
+
+    #[serde(rename = "message_delta")]
+    MessageDelta { delta: MessageDelta, usage: Usage },
+    #[serde(rename = "message_stop")]
+    MessageStop,
+    /// Anthropic answers a mid-stream failure with an `error` event over an HTTP 200 stream — an
+    /// `overloaded_error` when it sheds load partway through a generation, and the other error
+    /// types with it. Without a variant for it the packet is a serde failure, and the caller is
+    /// handed the deserializer's "unknown variant" complaint instead of the failure Anthropic
+    /// actually reported.
+    #[serde(rename = "error")]
+    Error { error: ApiError },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MessageStartMessage {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub role: String,
+    pub model: String,
+    pub stop_sequence: Option<String>,
+    pub usage: Usage,
+    pub content: Vec<String>,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse(ContentBlockToolUse),
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+}
+
+impl ContentBlock {
+    pub fn into_completion(self) -> ChatCompletionStreamResponseDelta {
+        match self {
+            ContentBlock::Text { text } => ChatCompletionStreamResponseDelta {
+                content: Some(text),
+                function_call: None,
+                tool_calls: None,
+                refusal: None,
+                role: None,
+            },
+            ContentBlock::ToolUse(ContentBlockToolUse { id, name, .. }) => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: Some(id),
+                        r#type: Some(FunctionType::Function),
+                        function: Some(FunctionCallStream {
+                            name: Some(name),
+                            arguments: None,
+                        }),
+                    }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
+                    refusal: None,
+                    role: None,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContentBlockToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum Delta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
+}
+
+impl Delta {
+    pub fn into_completion(
+        self,
+        role: Option<&MessageRole>,
+        tool_content: Option<&ContentBlockToolUse>,
+    ) -> ChatCompletionStreamResponseDelta {
+        match (self, tool_content) {
+            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
+                content: Some(text),
+                function_call: None,
+                tool_calls: None,
+                refusal: None,
+                role: match role {
+                    Some(MessageRole::Assistant) => Some(Role::Assistant),
+                    Some(MessageRole::User) => Some(Role::User),
+                    None => None,
+                },
+            },
+            (
+                Delta::InputJsonDelta { partial_json },
+                Some(ContentBlockToolUse {
+                    id, name: _name, ..
+                }),
+            ) => ChatCompletionStreamResponseDelta {
+                content: None,
+                function_call: None,
+                tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                    index: 0,
+                    id: Some(id.clone()),
+                    r#type: Some(FunctionType::Function),
+                    function: Some(FunctionCallStream {
+                        name: None, // Intentially leave empty to match OpenAI's format.
+                        arguments: Some(partial_json),
+                    }),
+                }]),
+                refusal: None,
+                role: match role {
+                    Some(MessageRole::Assistant) => Some(Role::Assistant),
+                    Some(MessageRole::User) => Some(Role::User),
+                    None => None,
+                },
+            },
+
+            // This should never happen, but we need to handle it as an 'empty' response.
+            (Delta::InputJsonDelta { partial_json: _ }, None) => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
+                    refusal: None,
+                    role: match role {
+                        Some(MessageRole::Assistant) => Some(Role::Assistant),
+                        Some(MessageRole::User) => Some(Role::User),
+                        None => None,
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MessageDelta {
+    pub stop_reason: Option<StopReason>,
+    pub stop_sequence: Option<String>,
+}
+
+/// Convert the stream of Anthropic [`MessageCreateStreamResponse`] into a stream of `OpenAI` compatible [`async_openai::types::CreateChatCompletionStreamResponse`].
+///
+/// Except for differences in the stream packet formats, the core difference are:
+///
+///  +---------------------------------------------------------+---------------------------------------------------------+
+///  | Anthropic                                               | `OpenAI`                                                  |
+///  +---------------------------------------------------------+---------------------------------------------------------+
+///  | Only first packet for a specific tool has tool metadata | All packets for a tool have tool metadata               |
+///  |                                                         |                                                         |
+///  | Initial message has initial usage details. Last message | Last message has usage details.                         |
+///  | has additional usage details.                           |                                                         |
+///  |                                                         |                                                         |
+///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
+///  +---------------------------------------------------------+---------------------------------------------------------+
+///
+pub fn transform_stream(
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
+) -> ChatCompletionResponseStream {
+    // As mentioned above, only first tool packet has tool metadata.
+    // Format:
+    //  First Message: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}
+    //  Subsequent Messages: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}
+    //
+    // We need to keep track of the `.content_block` and the index of the tool delta to associate the tool call with the correct content block.
+    // Map `.index` to `.content_block`
+    #[derive(Clone, Default)]
+    struct StreamState {
+        id: Option<String>,
+        model: Option<String>,
+        role: Option<MessageRole>,
+        usage: Option<CompletionUsage>,
+        tool_id_to_content_block: HashMap<u32, ContentBlockToolUse>,
+        tool_id_to_tool_delta_idx: HashMap<u32, i32>,
+    }
+
+    let state = Arc::new(Mutex::new(StreamState::default()));
+
+    let transformed_stream = stream
+        .filter_map(move |item| {
+            let inner_state = Arc::clone(&state);
+            async move {
+                let mut state = inner_state.lock().await;
+                match item {
+                    Ok(MessageCreateStreamResponse::MessageStart {
+                        message:
+                            MessageStartMessage {
+                                id: inner_id,
+                                role: inner_role,
+                                usage: inner_usage,
+                                model,
+                                ..
+                            },
+                    }) => {
+                        state.role = MessageRole::from_opt(&inner_role);
+                        state.id = Some(inner_id);
+                        state.usage = Some(inner_usage.into());
+                        state.model = Some(model);
+                        Some(create_anthropic_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &state.model.clone().unwrap_or_default(),
+                            None,
+                            None,
+                        ))
+                    }
+                    Ok(MessageCreateStreamResponse::ContentBlockStart {
+                        index,
+                        content_block,
+                    }) => {
+                        if let ContentBlock::ToolUse(t) = &content_block {
+                            state.tool_id_to_content_block.insert(index, t.clone());
+                            state.tool_id_to_tool_delta_idx.insert(index, 0);
+                        }
+                        Some(create_anthropic_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &state.model.clone().unwrap_or_default(),
+                            None,
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                delta: content_block.into_completion(),
+                                finish_reason: None,
+                                logprobs: None,
+                            }),
+                        ))
+                    }
+                    Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
+                        let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
+                        state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
+
+                        Some(create_anthropic_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &state.model.clone().unwrap_or_default(),
+                            None,
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                logprobs: None,
+                                finish_reason: None,
+                                delta: delta.into_completion(
+                                    state.role.as_ref(),
+                                    state.tool_id_to_content_block.get(&index),
+                                ),
+                            }),
+                        ))
+                    }
+                    Ok(MessageCreateStreamResponse::MessageDelta {
+                        delta: MessageDelta { stop_reason, .. },
+                        usage: inner_usage,
+                    }) => {
+                        // Update usage
+                        if let Some(ref mut u) = state.usage {
+                            add_usage_delta(u, inner_usage);
+                        }
+                        Some(create_anthropic_stream_response(
+                            &state.id.clone().unwrap_or_default(),
+                            &state.model.clone().unwrap_or_default(),
+                            state.usage.clone(),
+                            Some(ChatChoiceStream {
+                                index: 0,
+                                logprobs: None,
+                                finish_reason: match stop_reason {
+                                    Some(
+                                        StopReason::EndTurn
+                                        | StopReason::StopSequence
+                                        | StopReason::PauseTurn,
+                                    ) => Some(FinishReason::Stop),
+                                    Some(
+                                        StopReason::MaxTokens
+                                        | StopReason::ModelContextWindowExceeded,
+                                    ) => Some(FinishReason::Length),
+                                    Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
+                                    None => None,
+                                },
+                                delta: ChatCompletionStreamResponseDelta {
+                                    content: None,
+                                    function_call: None,
+                                    tool_calls: None,
+                                    role: None,
+                                    refusal: None,
+                                },
+                            }),
+                        ))
+                    }
+                    Ok(
+                        MessageCreateStreamResponse::Ping
+                        | MessageCreateStreamResponse::ContentBlockStop { .. }
+                        | MessageCreateStreamResponse::MessageStop,
+                    ) => None,
+                    Ok(MessageCreateStreamResponse::Error { error }) => {
+                        // An error Anthropic delivered as a stream packet is the same failure as
+                        // one it delivered as an HTTP status, and is reported the same way.
+                        let formatted_error =
+                            format_anthropic_stream_error(OpenAIError::ApiError(error));
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
+                    }
+                    Err(e) => {
+                        let formatted_error = format_anthropic_stream_error(e);
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
+                    }
+                }
+            }
+        })
+        // Because we don't early exit on [`MessageCreateStreamResponse::MessageStop`], we need to handle stream end explicitly, otherwise we will infinite loop on the stream.
+        .take_while(|item| {
+            let keep_going = !matches!(item, Err(OpenAIError::ApiError(ApiError { message, .. })) if SseError::StreamEnded{}.to_string().eq(message));
+            futures::future::ready(keep_going)
+        });
+
+    Box::pin(transformed_stream)
+}
+
+fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
+    let delta = CompletionUsage::from(delta);
+
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
+    usage.prompt_tokens_details = combine_prompt_token_details(
+        usage.prompt_tokens_details.take(),
+        delta.prompt_tokens_details,
+    );
+    usage.completion_tokens_details = combine_completion_token_details(
+        usage.completion_tokens_details.take(),
+        delta.completion_tokens_details,
+    );
+}
+
+fn combine_prompt_token_details(
+    current: Option<PromptTokensDetails>,
+    delta: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(PromptTokensDetails {
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            cached_tokens: combine_opt_u32(current.cached_tokens, delta.cached_tokens),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_completion_token_details(
+    current: Option<CompletionTokensDetails>,
+    delta: Option<CompletionTokensDetails>,
+) -> Option<CompletionTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(CompletionTokensDetails {
+            accepted_prediction_tokens: combine_opt_u32(
+                current.accepted_prediction_tokens,
+                delta.accepted_prediction_tokens,
+            ),
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            reasoning_tokens: combine_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
+            rejected_prediction_tokens: combine_opt_u32(
+                current.rejected_prediction_tokens,
+                delta.rejected_prediction_tokens,
+            ),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamErrorKind {
+    RateLimit,
+    Overloaded,
+    Authentication,
+    Permission,
+    Other,
+}
+
+/// What a streaming failure is, resolved from Anthropic's own error taxonomy.
+///
+/// The `type` field is the discriminator, not the message text: Anthropic echoes request detail
+/// back in an `invalid_request_error`, so a prompt, tool name, or model id that happens to carry
+/// `403` or `429` reads as a credential or rate-limit failure under a substring test — and the
+/// replacement message drops the original, leaving the real cause unrecoverable from the log.
+///
+/// The message tests survive only for an error carrying no `type` at all. A proxy in front of
+/// Anthropic may answer that way, and so does a 5xx from Anthropic itself: the SSE client does not
+/// parse a server-error body, and hands the whole thing over as an untyped message. A pre-stream
+/// `overloaded_error` therefore arrives untyped and lands in `Other`, while the same condition
+/// delivered as a mid-stream packet is typed and reaches the arm below — settling that difference
+/// means parsing the 5xx body, which is the client's job rather than this function's.
+fn classify_stream_error(api_error: &ApiError) -> StreamErrorKind {
+    match api_error.r#type.as_deref() {
+        // Anthropic's documented error types. Its 401 and its 403 stay apart because they are
+        // answered differently: a rejected key is rotated, a key without access is granted it.
+        Some("rate_limit_error") => StreamErrorKind::RateLimit,
+        Some("overloaded_error") => StreamErrorKind::Overloaded,
+        Some("authentication_error") => StreamErrorKind::Authentication,
+        Some("permission_error") => StreamErrorKind::Permission,
+        Some(_) => StreamErrorKind::Other,
+        None => classify_untyped_stream_error(&api_error.message),
+    }
+}
+
+/// The message tests, reached only when the error carries no `type`.
+fn classify_untyped_stream_error(message: &str) -> StreamErrorKind {
+    let lowered = message.to_lowercase();
+
+    if lowered.contains("too many requests") || lowered.contains("429") {
+        return StreamErrorKind::RateLimit;
+    }
+
+    if lowered.contains("401")
+        || lowered.contains("403")
+        || lowered.contains("authentication")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
+        return StreamErrorKind::Authentication;
+    }
+
+    StreamErrorKind::Other
+}
+
+fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::ApiError(api_error) = error else {
+        return error;
+    };
+
+    // A `not_found_error` arrives already explained by `explain_model_not_found`, which names the
+    // model and the parameter to change. Returning it untouched keeps that explanation, and keeps
+    // the `not_found_error` type a downstream check can still read.
+    if api_error.r#type.as_deref() == Some("not_found_error") {
+        return OpenAIError::ApiError(api_error);
+    }
+
+    // Anthropic's own message is carried through as the cause in every arm: the kind says what to
+    // do about the failure, and the cause is the only thing that says which request it was.
+    let (message, kind) = match classify_stream_error(&api_error) {
+        StreamErrorKind::RateLimit => (
+            format!(
+                "Anthropic API rate limit exceeded ({}). Check your limits at https://console.anthropic.com/settings/limits and retry shortly.",
+                api_error.message
+            ),
+            "AnthropicRateLimitError",
+        ),
+        StreamErrorKind::Overloaded => (
+            format!(
+                "Anthropic is overloaded and shed the request ({}). Retry with backoff — the model is temporarily unavailable rather than misconfigured.",
+                api_error.message
+            ),
+            "AnthropicOverloadedError",
+        ),
+        StreamErrorKind::Authentication => (
+            format!(
+                "Anthropic rejected the API key ({}). Check the key the model is configured with at https://console.anthropic.com/settings/keys.",
+                api_error.message
+            ),
+            "AnthropicAuthenticationError",
+        ),
+        StreamErrorKind::Permission => (
+            format!(
+                "The Anthropic API key is not permitted to make this request ({}). Grant it access to the model and workspace the request names, or configure the model with a key that has it.",
+                api_error.message
+            ),
+            "AnthropicPermissionError",
+        ),
+        StreamErrorKind::Other => (
+            format!("Anthropic streaming error: {}", api_error.message),
+            "AnthropicStreamError",
+        ),
+    };
+
+    OpenAIError::ApiError(ApiError {
+        message,
+        r#type: Some(kind.to_string()),
+        param: api_error.param,
+        code: api_error.code,
+    })
+}
+
+/// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
+fn create_anthropic_stream_response(
+    id: &str,
+    model: &str,
+    usage: Option<CompletionUsage>,
+    choice: Option<ChatChoiceStream>,
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+    let choices = match choice {
+        Some(c) => vec![c],
+        None => vec![],
+    };
+
+    crate::streaming_utils::create_stream_response(id, model, choices, usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_delta_accumulates_cache_tokens() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(3),
+            ..Usage::default()
+        }
+        .into();
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+                cache_creation_input_tokens: Some(5),
+                cache_read_input_tokens: Some(7),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, 27);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 32);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn usage_delta_saturates_token_counts() {
+        let mut usage = CompletionUsage {
+            prompt_tokens: u32::MAX - 1,
+            completion_tokens: u32::MAX - 1,
+            total_tokens: u32::MAX - 1,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(u32::MAX - 1),
+                audio_tokens: Some(u32::MAX - 1),
+            }),
+            completion_tokens_details: None,
+        };
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(2),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens),
+            Some(u32::MAX - 1)
+        );
+    }
+    /// The streaming path explains a model-not-found upstream of `transform_stream`, so the
+    /// explanation has to survive this function. It did not: the fallback arm re-types every
+    /// `ApiError` as `AnthropicStreamError`, which both buried the actionable message behind a
+    /// `Anthropic streaming error:` prefix and made a downstream check for `not_found_error`
+    /// unreachable.
+    #[test]
+    fn an_explained_model_not_found_passes_through_unchanged() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-sonnet-4-6",
+            true,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-sonnet-4-6".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+        let OpenAIError::ApiError(before) = &explained else {
+            panic!("the explanation must stay an ApiError");
+        };
+        let expected = before.message.clone();
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert_eq!(after.message, expected);
+        assert_eq!(after.r#type.as_deref(), Some("not_found_error"));
+    }
+
+    /// The `type` decides, and a message is never consulted when there is one. An
+    /// `invalid_request_error` echoes the caller's own request detail back, which is the shape a
+    /// message test reads wrong — it must classify the same whatever that detail happens to say.
+    #[test]
+    fn a_typed_error_is_never_classified_from_its_message() {
+        for message in [
+            "tools.0.name: `lookup_429` is invalid",
+            "messages.0.content.0.text: expected a string, got 403",
+            "system: the prompt may not ask for too many requests",
+        ] {
+            assert_eq!(
+                classify_stream_error(&ApiError {
+                    message: message.to_string(),
+                    r#type: Some("invalid_request_error".to_string()),
+                    param: None,
+                    code: None,
+                }),
+                StreamErrorKind::Other,
+                "{message}"
+            );
+        }
+    }
+
+    /// A model id whose snapshot date contains `403` is what makes the pass-through above
+    /// load-bearing rather than cosmetic: without it the explanation is replaced by a generic
+    /// one, and an error carrying no `type` at all falls to the message tests, where such an id
+    /// reads as a credential failure.
+    #[test]
+    fn a_model_id_containing_403_is_not_reported_as_an_auth_failure() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-3-5-sonnet-20240403",
+            false,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-3-5-sonnet-20240403".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert!(
+            after.message.contains("does not serve that model id"),
+            "the model-not-found explanation must survive: {}",
+            after.message
+        );
+        assert!(
+            !after.message.contains("authentication failed"),
+            "a model id is not a credential problem: {}",
+            after.message
+        );
+    }
+}

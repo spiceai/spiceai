@@ -1,0 +1,22 @@
+[package]
+description = "Custom serializable DataFusion execution plans for the Spice runtime (UDTF invocation, deferred Iceberg scan) and synchronous table resolution for distributed decode"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-execution-plans"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow-schema.workspace = true
+data_components = { path = "../data_components" }
+datafusion.workspace = true
+futures.workspace = true
+iceberg-datafusion.workspace = true
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-proto = { path = "../runtime-proto" }
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

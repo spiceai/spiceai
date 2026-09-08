@@ -1,0 +1,23 @@
+[package]
+name = "runtime-parameters-typed"
+description = "Typed spicepod component parameters: the TypedParams trait and its support runtime."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+secrecy.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+util = { path = "../util" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

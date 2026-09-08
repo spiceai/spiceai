@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++-----+
+| age |
++-----+
+| 30  |
+| 25  |
+| 35  |
++-----+

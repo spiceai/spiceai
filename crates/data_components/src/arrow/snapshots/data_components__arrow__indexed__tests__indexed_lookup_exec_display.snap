@@ -1,0 +1,6 @@
+---
+source: crates/data_components/src/arrow/indexed.rs
+expression: "format!(\"Single column: {}\\nMultiple columns: {}\", output, output2)"
+---
+Single column: IndexedLookupExec: indexed_scan on [id]
+Multiple columns: IndexedLookupExec: indexed_scan on [tenant_id, user_id]

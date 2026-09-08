@@ -1,0 +1,8 @@
+version: v1
+kind: Spicepod
+name: spicepod_with_only_search_results
+runtime:
+  caching:
+    search_results:
+      enabled: true
+      item_ttl: 1s

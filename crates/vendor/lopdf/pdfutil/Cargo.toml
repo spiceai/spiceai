@@ -1,0 +1,16 @@
+[package]
+authors = ["Junfeng Liu <china.liujunfeng@gmail.com>"]
+description = "A utility for PDF document manipulation."
+documentation = "https://docs.rs/crate/lopdf/"
+edition = "2024"
+homepage = "https://github.com/J-F-Liu/lopdf/tree/master/pdfutil"
+license = "MIT"
+name = "pdfutil"
+repository = "https://github.com/J-F-Liu/lopdf.git"
+version = "0.4.0"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+lopdf = { version = "*", path = "../" }

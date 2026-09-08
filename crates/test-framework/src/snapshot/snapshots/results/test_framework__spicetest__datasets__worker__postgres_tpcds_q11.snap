@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q11"
+---
++------------------+---------------------+--------------------+--------------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address               |
++------------------+---------------------+--------------------+--------------------------------------+
+| AAAAAAAAADNDAAAA | Robert              | Cass               | Robert.Cass@FI6orCmqi96.edu          |
+| AAAAAAAAAIBFAAAA | Sharon              | Steele             | Sharon.Steele@5Cj48dPpxgA.edu        |
+| AAAAAAAABDDEAAAA | Jake                | Lawrence           | Jake.Lawrence@USvo40k3jRcK2SGXX8.com |
+| AAAAAAAABFPBAAAA | Beth                | Sanches            | Beth.Sanches@yhhagS7RXZ9.edu         |
+| AAAAAAAABGLFAAAA |                     |                    | Sharon.Perez@3EtK.com                |
+| AAAAAAAABMJDAAAA | Brenda              | Castillo           | Brenda.Castillo@Qrbt7ADo.com         |
+| AAAAAAAACEBDAAAA | Gloria              | Bailey             | Gloria.Bailey@8AZGJrfgOZMzEZ8.org    |
+| AAAAAAAADHEGAAAA |                     |                    | Lloyd.Long@EaFsDE.com                |
+| AAAAAAAAEAHCAAAA | Berry               | Torres             | Berry.Torres@d.com                   |
+| AAAAAAAAEGHDAAAA | Nicolas             | Tyree              | Nicolas.Tyree@p.com                  |
++------------------+---------------------+--------------------+--------------------------------------+

@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/oracle/mod.rs
+expression: formatted
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                          |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test_tbl.VAL_NUMBER DESC NULLS FIRST, fetch=2                                                                                           |
+|               |   TableScan: test_tbl projection=[ID, VAL_NUMBER, VAL_VARCHAR2]                                                                               |
+| physical_plan | CooperativeExec                                                                                                                               |
+|               |   BytesProcessedExec                                                                                                                          |
+|               |     OracleExec sql=SELECT "ID", "VAL_NUMBER", "VAL_VARCHAR2" FROM "TEST_TABLE" ORDER BY "VAL_NUMBER" DESC NULLS FIRST FETCH FIRST 2 ROWS ONLY |
+|               |                                                                                                                                               |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+

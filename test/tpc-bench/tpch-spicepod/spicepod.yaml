@@ -1,0 +1,111 @@
+version: v1
+kind: Spicepod
+name: tpch-spicepod
+
+datasets:
+  - from: postgres:customer
+    name: customer
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:lineitem
+    name: lineitem
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:nation
+    name: nation
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:orders
+    name: orders
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:part
+    name: part
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:partsupp
+    name: partsupp
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+  - from: postgres:region
+    name: region
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+  
+  - from: postgres:supplier
+    name: supplier
+    acceleration:
+      enabled: true
+      refresh_mode: full
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: tpch
+      pg_user: postgres
+      pg_pass: postgres
+      pg_sslmode: prefer
+
+secrets:
+  store: env

@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: nation_pk_lookup"
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                     |
++---------------+--------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: nation projection=[n_nationkey, n_name, n_regionkey, n_comment], full_filters=[nation.n_nationkey = Int32(1)] |
+| physical_plan | SchemaCastScanExec                                                                                                       |
+|               |   CooperativeExec                                                                                                        |
+|               |     BytesProcessedExec                                                                                                   |
+|               |       IndexedLookupExec: indexed_scan on [n_nationkey]                                                                   |
+|               |                                                                                                                          |
++---------------+--------------------------------------------------------------------------------------------------------------------------+

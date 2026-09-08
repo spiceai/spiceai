@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: formatted
+---
++---------------------------------------------------------------------------------------+
+| _location                                                                             |
++---------------------------------------------------------------------------------------+
+| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-01/data_0.parquet |
+| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-01-02/data_0.parquet |
+| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-02-01/data_0.parquet |
+| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-10/data_0.parquet |
+| s3://spiceai-public-datasets/test_documents_partitioned/day=2022-03-15/data_0.parquet |
++---------------------------------------------------------------------------------------+

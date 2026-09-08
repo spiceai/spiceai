@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+assertion_line: 1657
+expression: plan
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                           |
++---------------+--------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: CAST(sp.s.events.region AS LargeUtf8) AS region, sp.s.events.id, CAST(sp.s.events.payload AS LargeUtf8) AS payload |
+|               |   Sort: sp.s.events.region ASC NULLS LAST, sp.s.events.id ASC NULLS LAST                                                       |
+|               |     SubqueryAlias: sp.s.events                                                                                                 |
+|               |       TableScan: sp.s.events projection=[region, id, payload]                                                                  |
+| physical_plan | ProjectionExec: expr=[CAST(region@0 AS LargeUtf8) as region, id@1 as id, CAST(payload@2 AS LargeUtf8) as payload]              |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                              |
+|               |     CooperativeExec                                                                                                            |
+|               |       BytesProcessedExec                                                                                                       |
+|               |         FlightSqlExec sql=SELECT region, id, payload FROM sp.s.events ORDER BY region ASC NULLS LAST, id ASC NULLS LAST        |
+|               |                                                                                                                                |
++---------------+--------------------------------------------------------------------------------------------------------------------------------+

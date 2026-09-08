@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/flight/do_get.rs
+expression: result_str
+---
++----+------+------+
+| id | col1 | col2 |
++----+------+------+
+| 1  | A    | X    |
+| 2  | B    | Y    |
+| 3  | A    | X    |
+| 4  | C    | Z    |
+| 5  | B    | X    |
+| 6  | A    | Y    |
+| 7  | C    | Z    |
+| 8  | C    | X    |
+| 9  | B    | Y    |
+| 10 | A    | Z    |
++----+------+------+

@@ -1,0 +1,558 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
+
+use crate::{
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
+    Runtime, UnableToAttachViewSnafu,
+    component::view::{View, ViewBuilder},
+    datafusion::DeferredRefreshOutcome,
+    secrets::Secrets,
+    status, view,
+};
+use app::App;
+use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+#[cfg(feature = "duckdb")]
+use futures::stream::StreamExt;
+use itertools::Itertools;
+use runtime_metrics as metrics;
+use snafu::prelude::*;
+use tokio::sync::RwLock;
+use util::topological_ordering::{
+    construct_effected_in_topological_order, construct_topological_ordering,
+};
+use util::warn_spaced;
+
+/// Represents a validated view with its parsed dependencies
+pub(crate) struct ValidatedView {
+    pub(crate) view: Arc<View>,
+    pub(crate) dependencies: Vec<TableReference>,
+}
+
+/// Extract view dependencies from SQL and return them in topological order.
+/// Returns None if a cycle is detected.
+fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<Arc<View>>> {
+    if validated_views.is_empty() {
+        return None;
+    }
+
+    // Build dependency map
+    let deps_map: HashMap<TableReference, Vec<TableReference>> = validated_views
+        .iter()
+        .map(|vv| (vv.view.name.clone(), vv.dependencies.clone()))
+        .collect();
+
+    // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+    let view_names: HashSet<_> = deps_map.keys().cloned().collect();
+    let view_only_deps: HashMap<_, _> = deps_map
+        .into_iter()
+        .map(|(view, deps)| {
+            let filtered_deps: Vec<_> = deps
+                .into_iter()
+                .filter(|dep| view_names.contains(dep))
+                .collect();
+            (view, filtered_deps)
+        })
+        .collect();
+
+    if let Some(ordered_names) = construct_topological_ordering(view_only_deps) {
+        // Return views in topological order
+        Some(
+            ordered_names
+                .into_iter()
+                .filter_map(|name| {
+                    let view = validated_views
+                        .iter()
+                        .find(|vv| vv.view.name == name)
+                        .map(|vv| Arc::clone(&vv.view));
+                    if view.is_none() {
+                        tracing::warn!("View {name} returned by topological ordering but not found in views vector");
+                    }
+                    view
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        tracing::warn!("Circular dependency detected in views. Loading views in original order.");
+        Some(
+            validated_views
+                .iter()
+                .map(|vv| Arc::clone(&vv.view))
+                .collect(),
+        )
+    }
+}
+
+impl Runtime {
+    pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
+        // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
+        // already validated the same views with `LogErrors(true)` before its snapshot
+        // checks, so reporting again here only prints each view's load error, and each
+        // view's discarded-acceleration warning, twice per startup.
+        let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
+
+        // Determine the dependency order for views based on their SQL dependencies
+        let views_in_dependency_order = order_views_by_dependencies(&validated_views)
+            .unwrap_or_else(|| {
+                validated_views
+                    .iter()
+                    .map(|vv| Arc::clone(&vv.view))
+                    .collect()
+            });
+
+        for view in views_in_dependency_order {
+            let runtime = Arc::clone(&self);
+            let secrets = runtime.secrets();
+            if let Err(e) = runtime.load_view(&view, secrets) {
+                let view_name = &view.name;
+                tracing::error!("Unable to load view {view_name}: {e}");
+            }
+        }
+    }
+
+    /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
+    /// Skips any that fail to parse and logs an error for them.
+    #[expect(clippy::result_large_err)]
+    pub(crate) fn get_valid_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<ValidatedView> {
+        let rt_ref = Arc::clone(&self);
+        let status = Arc::clone(&self.status);
+
+        // `LogErrors(false)` regardless of this call's own flag: this is a name
+        // lookup, not a dataset load. Both paths that reach here with
+        // `LogErrors(true)` — `load_datasets`, and `apply_dataset_diff` ahead of
+        // `apply_view_diff` — already call `get_valid_datasets(app,
+        // LogErrors(true))` themselves, so nothing is silenced by this; passing
+        // the flag through only made each dataset's load error, and each
+        // dataset's discarded-acceleration warning, print twice per load.
+        let datasets = Arc::clone(&self)
+            .get_valid_datasets(app, LogErrors(false))
+            .iter()
+            .map(|ds| ds.name.clone())
+            .collect::<HashSet<_>>();
+
+        app.views
+            .iter()
+            .cloned()
+            .map(|spicepod_view| {
+                ViewBuilder::try_from(spicepod_view)
+                    .map(|builder| builder.build_with(Arc::clone(&rt_ref), Arc::clone(app)))
+            })
+            .zip(&app.views)
+            .filter_map(|(view, spicepod_view)| match view {
+                Ok(view) => {
+                    // only load this view if the name isn't used by an existing dataset
+                    if datasets.contains(&view.name) {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                view = &spicepod_view.name,
+                                "View name is already in use by a dataset."
+                            );
+                        }
+                        return None;
+                    }
+
+                    // Validate SQL and extract dependencies in a single parse
+                    let sql = view.sql.as_ref();
+                    let statements = match DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}) {
+                        Ok(stmts) => stmts,
+                        Err(e) => {
+                            if log_errors.0 {
+                                metrics::views::LOAD_ERROR.add(1, &[]);
+                                tracing::error!("View '{}' has invalid SQL: {}", view.name, e);
+                                status.update_view(&view.name, status::ComponentStatus::error_with_message(e.to_string()));
+                            }
+                            return None;
+                        }
+                    };
+
+                    if statements.is_empty() {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!("View '{}' has empty SQL statement", view.name);
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Empty SQL statement".to_string()));
+                        }
+                        return None;
+                    }
+
+                    if statements.len() > 1 {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View '{}' contains multiple SQL statements. Only one SELECT statement is allowed per view",
+                                view.name
+                            );
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("Multiple SQL statements".to_string()));
+                        }
+                        return None;
+                    }
+
+                    let statement = statements.into_iter().next()?;
+
+                    // Validate it's a SELECT statement (views should only contain queries)
+                    // DataFusion's Statement enum wraps sqlparser statements
+                    let is_query = match &statement {
+                        datafusion::sql::parser::Statement::Statement(boxed_stmt) => {
+                            matches!(**boxed_stmt, datafusion::sql::sqlparser::ast::Statement::Query(_))
+                        }
+                        _ => false,
+                    };
+
+                    if !is_query {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View '{}' must contain a SELECT query",
+                                view.name
+                            );
+                            status.update_view(&view.name, status::ComponentStatus::error_with_message("View must contain a SELECT query".to_string()));
+                        }
+                        return None;
+                    }
+
+                    // Extract dependencies from the validated statement
+                    let dependencies = view::get_dependent_table_names(&statement);
+
+                    // `enabled: false` turns the whole acceleration block off, so anything
+                    // else set in it is read, accepted and then never applied — the same for
+                    // a view as for a dataset (#13514). Reported from here — the load path,
+                    // behind `log_errors` — rather than from `ViewBuilder::try_from`, which
+                    // read-only callers run too.
+                    //
+                    // Last, after every rejection above has had its chance: a view that
+                    // collides with a dataset name or fails SQL validation never loads, so
+                    // nothing of its acceleration block is silently discarded and warning
+                    // about it would only add noise to the error that actually matters.
+                    crate::init::dataset::warn_about_discarded_acceleration_settings(
+                        crate::component::AcceleratedComponent::View,
+                        &spicepod_view.name,
+                        spicepod_view.acceleration.as_ref(),
+                        log_errors,
+                    );
+
+                    Some(ValidatedView {
+                        view: Arc::new(view),
+                        dependencies,
+                    })
+                }
+                Err(e) => {
+                    if log_errors.0 {
+                        metrics::views::LOAD_ERROR.add(1, &[]);
+                        tracing::error!(view = &spicepod_view.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "duckdb")]
+    pub(crate) async fn get_initialized_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Arc<View>> {
+        let valid_views = Arc::clone(&self).get_valid_views(app, log_errors);
+        futures::stream::iter(valid_views)
+            .filter_map(|validated_view| async move {
+                let view = &validated_view.view;
+                match (view.is_accelerated(), view.is_accelerator_initialized().await) {
+                    (true, true) | (false, _) => Some(Arc::clone(view)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            metrics::views::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
+                                "View {view_name} is accelerated but the accelerator failed to initialize.",
+                                view_name = &view.name.to_string(),
+                            );
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+            .await
+    }
+
+    /// Initialize views configured with accelerators before registering the datasets.
+    /// This ensures that the required resources for acceleration are available before registration,
+    /// which is important for acceleration federation for some acceleration engines (e.g. `DuckDB`).
+    pub(crate) async fn initialize_views_accelerators(&self, views: &[ValidatedView]) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        for validated_view in views {
+            let view = &validated_view.view;
+            // Non-accelerated views or disabled acceleration don't need initialization
+            if view.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
+                continue;
+            }
+
+            let Some(acceleration_settings) = &view.acceleration else {
+                unreachable!("acceleration is Some and enabled");
+            };
+
+            let accelerator = match self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .context(AcceleratorEngineNotAvailableSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                }) {
+                Ok(accelerator) => accelerator,
+                Err(err) => {
+                    let view_name = &view.name;
+                    self.status.update_view(
+                        view_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
+                    metrics::views::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
+                    continue;
+                }
+            };
+
+            match accelerator.init(view.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
+                    name: acceleration_settings.engine.to_string(),
+                },
+            ) {
+                Ok(_) => {
+                    // Initialization successful, continue to next view
+                }
+                Err(err) => {
+                    let view_name = &view.name;
+                    self.status.update_view(
+                        view_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
+                    metrics::views::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", view_name.table());
+                }
+            }
+        }
+    }
+
+    #[expect(clippy::result_large_err)]
+    fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+        let df = Arc::clone(&self.df);
+        let register_task = df
+            .register_view(Arc::clone(view), secrets)
+            .context(UnableToAttachViewSnafu)
+            .inspect_err(|e| {
+                self.status.update_view(
+                    &view.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
+            })?;
+
+        let runtime = Arc::clone(&self);
+        let view = Arc::clone(view);
+        let df = Arc::clone(&self.df);
+
+        tokio::task::spawn(async move {
+            let view_name = view.name.clone();
+            let notifier = register_task.await;
+            match notifier {
+                Ok(Some((instance, completion))) => {
+                    // `instance` was captured where the view was registered, so
+                    // the schedule below is checked against the view this task
+                    // actually registered rather than against whatever the name
+                    // resolves to once the refresh lands.
+                    match df
+                        .await_refresh_completion(instance, Some(completion))
+                        .await
+                    {
+                        DeferredRefreshOutcome::Apply => {}
+                        DeferredRefreshOutcome::Abandoned => {
+                            // The accelerated table was dropped before its initial
+                            // refresh landed. Creating the schedule now would
+                            // resurrect one for a view that is no longer there.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed before its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                        DeferredRefreshOutcome::TableChanged => {
+                            // A `remove_view` landed after the completion was
+                            // recorded, so this would give a removed view a live
+                            // refresh schedule, or a replaced one a schedule built
+                            // from its predecessor's settings.
+                            tracing::debug!(
+                                "Accelerated view '{view_name}' was removed or replaced after its initial refresh completed; not creating a refresh schedule."
+                            );
+                            return;
+                        }
+                    }
+
+                    if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
+                        tracing::error!(
+                            "Failed to create refresh schedule for accelerated view '{view_name}': {e}."
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create refresh schedule for accelerated view '{view_name}': {e}"
+                    );
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn remove_view(self: Arc<Self>, name: &TableReference) {
+        if self.df.table_exists(name) {
+            if self.df.is_accelerated(name).await
+                && let Err(e) = Arc::clone(&self)
+                    .remove_dataset_or_view_schedule(name)
+                    .await
+            {
+                tracing::warn!(
+                    "Failed to remove refresh schedule for accelerated view {}: {e}",
+                    &name
+                );
+            }
+
+            if let Err(e) = self.df.remove_view(name).await {
+                tracing::warn!("Unable to unload view {}: {}", name, e);
+                return;
+            }
+        }
+
+        // Removing a view may cause cached LogicalPlans that reference it
+        // to be obsolete, so we invalidate them.
+        self.df.clear_cached_plans().await;
+
+        tracing::info!("Unloaded view {}", name);
+    }
+
+    async fn update_view(self: Arc<Self>, view: &Arc<View>) {
+        self.status
+            .update_view(&view.name, status::ComponentStatus::Refreshing);
+        Arc::clone(&self).remove_view(&view.name).await;
+        let secrets = self.secrets();
+        let _ = self.load_view(view, secrets);
+    }
+
+    /// Update views based on changed between the current and new app.
+    /// This function will update views that have changed, and remove views that are no longer in the app.
+    /// It will also update views that have dependencies that have changed.
+    pub(crate) async fn apply_view_diff(
+        self: Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
+        let validated_views = Arc::clone(&self).get_valid_views(new_app, LogErrors(true));
+        let existing_validated_views =
+            Arc::clone(&self).get_valid_views(current_app, LogErrors(false));
+
+        let views_that_changed = validated_views
+            .iter()
+            .filter_map(|vv| {
+                match existing_validated_views
+                    .iter()
+                    .find(|evv| vv.view.name == evv.view.name)
+                {
+                    Some(old_vv) => {
+                        if old_vv.view == vv.view {
+                            None // No change, don't include
+                        } else {
+                            Some(vv.view.name.clone()) // Changed, include the name
+                        }
+                    }
+                    None => Some(vv.view.name.clone()), // New view, include the name
+                }
+            })
+            .collect_vec();
+
+        // Remove views that are no longer in the app
+        for view in &current_app.views {
+            if !new_app.views.iter().any(|v| v.name == view.name) {
+                let view_builder = match ViewBuilder::try_from(view.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Could not remove view {}: {e}", view.name);
+                        continue;
+                    }
+                };
+                self.status
+                    .update_view(&view_builder.name, status::ComponentStatus::Disabled);
+                Arc::clone(&self).remove_view(&view_builder.name).await;
+            }
+        }
+
+        // Get ordering of views to load, including those unchanged but with dependencies that have changed
+        // If we can't determine the order, we'll just load the views in the order they are in the app
+        let affected_views_in_order_of_dependencies = {
+            // Build dependency map from already-parsed dependencies
+            let view_names: HashSet<_> = validated_views
+                .iter()
+                .map(|vv| vv.view.name.clone())
+                .collect();
+
+            // Filter out dependencies that are not views (e.g., datasets) to prevent false cycle detection
+            let view_only_deps: HashMap<_, _> = validated_views
+                .iter()
+                .map(|vv| {
+                    let filtered_deps: Vec<_> = vv
+                        .dependencies
+                        .iter()
+                        .filter(|dep| view_names.contains(dep))
+                        .cloned()
+                        .collect();
+                    (vv.view.name.clone(), filtered_deps)
+                })
+                .collect();
+
+            construct_effected_in_topological_order(view_only_deps, &views_that_changed)
+                .unwrap_or_else(|| {
+                    validated_views
+                        .iter()
+                        .map(|vv| vv.view.name.clone())
+                        .collect()
+                })
+        };
+
+        for view_name in affected_views_in_order_of_dependencies {
+            if let Some(validated_view) =
+                validated_views.iter().find(|vv| vv.view.name == view_name)
+            {
+                let runtime = Arc::clone(&self);
+                if existing_validated_views
+                    .iter()
+                    .any(|evv| evv.view.name == validated_view.view.name)
+                {
+                    // Update view even if unchanged, as it may have dependencies that have changed
+                    runtime.update_view(&validated_view.view).await;
+                } else {
+                    runtime.status.update_view(
+                        &validated_view.view.name,
+                        status::ComponentStatus::Initializing,
+                    );
+                    let secrets = runtime.secrets();
+                    let _ = runtime.load_view(&validated_view.view, secrets);
+                }
+            }
+        }
+    }
+}

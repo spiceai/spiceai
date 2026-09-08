@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q2"
+---
++-----------+--------------------+----------------+-----------+----------------+------------------------------------------+-----------------+-----------------------------------------------------------------------------------+
+| s_acctbal | s_name             | n_name         | p_partkey | p_mfgr         | s_address                                | s_phone         | s_comment                                                                         |
++-----------+--------------------+----------------+-----------+----------------+------------------------------------------+-----------------+-----------------------------------------------------------------------------------+
+| 9999.70   | Supplier#000239544 | UNITED KINGDOM | 6739531   | Manufacturer#4 | ,6oexY7ft68JKJCN1SQ LUO5Xf               | 33-509-584-9496 | ets are. blithely special accounts wake across t                                  |
+| 9999.65   | Supplier#000143654 | FRANCE         | 2393647   | Manufacturer#3 | HhHCZ,RosE8He4uYvyIDqsPZe,7cZiJh1y9,     | 16-166-504-5864 |  special accounts. never dogged deposits                                          |
+| 9999.49   | Supplier#000615014 | GERMANY        | 12365001  | Manufacturer#3 | 4C,uOuJDig7z,4e                          | 17-780-902-4027 |  pinto beans affix along th                                                       |
+| 9999.28   | Supplier#000494480 | ROMANIA        | 17244462  | Manufacturer#3 | hNB2qcYmnyeqrd em,o29TxzLwwrl            | 29-756-312-1779 | ly. slyly final pains detect furiously qu                                         |
+| 9998.87   | Supplier#000826281 | ROMANIA        | 14326252  | Manufacturer#3 | LkGmLSAjbjgKS5ZRepL                      | 29-775-451-4774 |  slyly silent accounts affix furiously across the final, even ideas; tithe        |
+| 9998.56   | Supplier#000039514 | UNITED KINGDOM | 7539499   | Manufacturer#2 | fUN95rpikfiqeGo,okl,27ItSq9fMpr          | 33-317-828-7758 | olites use about the blithely regular warhorses. carefully final instructions a   |
+| 9997.89   | Supplier#000319666 | RUSSIA         | 19319665  | Manufacturer#1 | SZtdx3rzXnFuiVuJzKathV9                  | 32-972-151-6038 | furiously ironic pearls. furiously regular foxes along the furiously              |
+| 9997.85   | Supplier#000718770 | ROMANIA        | 718769    | Manufacturer#1 | 2173woKsCg7zpHCqhiEXFTmYYqpT4XONnRAsUryE | 29-663-409-2865 | posits sleep across the blithely express requests.                                |
+| 9997.83   | Supplier#000348318 | FRANCE         | 9348317   | Manufacturer#4 | AvfnvjCFAg1aNpj                          | 16-718-707-5676 | e pending requests: furiously even deposits boost furiously slyly even requests.  |
+| 9997.73   | Supplier#000329974 | RUSSIA         | 4079969   | Manufacturer#3 | eKtIadopsE                               | 32-268-488-7178 | uickly. furiously ironic requests are slyly above the regula                      |
++-----------+--------------------+----------------+-----------+----------------+------------------------------------------+-----------------+-----------------------------------------------------------------------------------+

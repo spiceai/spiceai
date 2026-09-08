@@ -1,0 +1,425 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use arrow::compute::cast;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow_flight::{
+    FlightData, PutResult,
+    decode::{DecodedPayload, FlightDataDecoder},
+    error::FlightError,
+    flight_service_server::FlightService,
+    sql::{Any, Command},
+};
+use arrow_tools::map_entries::MapEntriesNormalizer;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::collect;
+use datafusion::prelude::SessionContext;
+use prost::Message;
+use tokio_stream::adapters::Peekable;
+use tonic::{Request, Response, Status, Streaming};
+
+use crate::{FlightSqlService, flightsql, handle_datafusion_error, to_tonic_err};
+
+pub(crate) async fn handle(
+    ctx: Arc<SessionContext>,
+    request: Request<Streaming<FlightData>>,
+) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
+    let mut streaming_flight: Peekable<Streaming<FlightData>> =
+        tokio_stream::StreamExt::peekable(request.into_inner());
+
+    let Some(Ok(first_message)) = streaming_flight.peek().await else {
+        return Err(Status::invalid_argument("no flight data provided"));
+    };
+    let Some(fd) = first_message.flight_descriptor.clone() else {
+        return Err(Status::invalid_argument("no flight descriptor provided"));
+    };
+    let cmd = fd.cmd.clone();
+    let descriptor_path = fd.path.clone();
+
+    let Ok(message) = Any::decode(&*cmd) else {
+        return do_put_raw(ctx, streaming_flight, None).await;
+    };
+
+    match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
+        Command::CommandPreparedStatementQuery(cmd) => {
+            flightsql::prepared_statement_query::do_put_query(cmd, streaming_flight).await
+        }
+        Command::CommandPreparedStatementUpdate(cmd) => {
+            flightsql::prepared_statement_update::do_put_update(cmd, streaming_flight).await
+        }
+        Command::CommandStatementUpdate(cmd) => flightsql::statement_update::do_put(ctx, cmd).await,
+        Command::CommandStatementIngest(cmd) => {
+            let path_override = ingest_command_path_override(&cmd, &descriptor_path);
+            do_put_raw(ctx, streaming_flight, path_override).await
+        }
+        _ => do_put_raw(ctx, streaming_flight, None).await,
+    }
+}
+
+fn ingest_command_path_override(
+    ingest_cmd: &arrow_flight::sql::CommandStatementIngest,
+    descriptor_path: &[String],
+) -> Option<Vec<String>> {
+    match (ingest_cmd.catalog.as_ref(), ingest_cmd.schema.as_ref()) {
+        (Some(catalog), Some(schema)) => Some(vec![
+            catalog.clone(),
+            schema.clone(),
+            ingest_cmd.table.clone(),
+        ]),
+        // If command is under-qualified, prefer descriptor path when present.
+        (Some(catalog), None) => {
+            if descriptor_path.is_empty() {
+                Some(vec![catalog.clone(), ingest_cmd.table.clone()])
+            } else {
+                None
+            }
+        }
+        (None, Some(schema)) => {
+            if descriptor_path.is_empty() {
+                Some(vec![schema.clone(), ingest_cmd.table.clone()])
+            } else {
+                None
+            }
+        }
+        (None, None) => {
+            if descriptor_path.is_empty() {
+                Some(vec![ingest_cmd.table.clone()])
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn resolve_table_path(path: &[String]) -> datafusion::sql::TableReference {
+    match path.len() {
+        3 => datafusion::sql::TableReference::full(
+            path[0].as_str(),
+            path[1].as_str(),
+            path[2].as_str(),
+        ),
+        2 => datafusion::sql::TableReference::partial(path[0].as_str(), path[1].as_str()),
+        _ => datafusion::sql::TableReference::parse_str(&path.join(".")),
+    }
+}
+
+async fn decode_flight_batches(
+    table: &datafusion::sql::TableReference,
+    streaming: Peekable<Streaming<FlightData>>,
+) -> Result<
+    (
+        arrow_schema::SchemaRef,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    Status,
+> {
+    let streaming = tokio_stream::StreamExt::map(streaming, |r| {
+        r.map_err(|s| FlightError::Tonic(Box::new(s)))
+    });
+    let mut decoder = FlightDataDecoder::new(streaming);
+
+    let mut schema: Option<arrow_schema::SchemaRef> = None;
+    let mut batches = Vec::new();
+
+    while let Some(msg) = futures::TryStreamExt::try_next(&mut decoder)
+        .await
+        .map_err(to_tonic_err)?
+    {
+        match msg.payload {
+            DecodedPayload::None => {}
+            DecodedPayload::Schema(decoded_schema) => {
+                if schema.is_some() {
+                    return Err(Status::invalid_argument(
+                        "DoPut stream must contain a single schema message",
+                    ));
+                }
+                schema = Some(decoded_schema);
+            }
+            DecodedPayload::RecordBatch(batch) => {
+                if schema.is_none() {
+                    return Err(Status::invalid_argument(
+                        "DoPut stream must include schema before record batches",
+                    ));
+                }
+                batches.push(batch);
+            }
+        }
+    }
+
+    let schema = schema.ok_or_else(|| {
+        Status::invalid_argument("DoPut stream must include at least one schema message")
+    })?;
+
+    normalize_map_entries(table, &schema, batches)
+}
+
+/// Brings a decoded `DoPut` stream in line with the Arrow map layout.
+///
+/// A client is free to declare a `MAP`'s `entries` field nullable, which the layout forbids. Such
+/// a batch decodes cleanly and then fails in whichever kernel first rebuilds the column, so it is
+/// corrected at the boundary rather than carried into the insert plan. One stream carries one
+/// schema, so what its batches need is resolved once, and the corrected schema is returned with
+/// them — it is the one they now carry.
+fn normalize_map_entries(
+    table: &datafusion::sql::TableReference,
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+    let normalizer = MapEntriesNormalizer::for_schema(schema);
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            normalizer.normalize(batch).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "Failed to read the Arrow data sent to table '{table}' ({e}), so no rows were written. \
+                     Send the MAP column with an `entries` field that is non-nullable and holds no null entries, as the Arrow map layout requires. \
+                     See: https://spiceai.org/docs/api/arrow-flight-sql"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok((Arc::clone(normalizer.schema()), batches))
+}
+
+/// Cast columns in `batches` to match `target_schema` where the types differ
+/// but are compatible (e.g. `Timestamp(µs)` → `Timestamp(ns)`).
+fn coerce_batches_to_schema(
+    src_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    target_schema: &Schema,
+) -> DFResult<(SchemaRef, Vec<RecordBatch>)> {
+    if src_schema.fields().len() == target_schema.fields().len()
+        && src_schema
+            .fields()
+            .iter()
+            .zip(target_schema.fields().iter())
+            .all(|(s, t)| s.data_type() == t.data_type())
+    {
+        return Ok((src_schema, batches));
+    }
+
+    let target_fields = target_schema.fields();
+    let coerced_batches = batches
+        .into_iter()
+        .map(|batch| {
+            if batch.num_columns() != target_fields.len() {
+                return Ok(batch);
+            }
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(target_fields.iter())
+                .map(|(col, target_field)| {
+                    if col.data_type() == target_field.data_type() {
+                        Ok(Arc::clone(col))
+                    } else {
+                        cast(col, target_field.data_type())
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    }
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            RecordBatch::try_new(Arc::new(target_schema.clone()), columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    Ok((Arc::new(target_schema.clone()), coerced_batches))
+}
+
+async fn do_put_raw(
+    ctx: Arc<SessionContext>,
+    mut streaming: Peekable<Streaming<FlightData>>,
+    path_override: Option<Vec<String>>,
+) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
+    let Some(Ok(first_message)) = streaming.peek().await else {
+        return Err(Status::invalid_argument("no flight data provided"));
+    };
+    let Some(fd) = first_message.flight_descriptor.clone() else {
+        return Err(Status::invalid_argument("no flight descriptor provided"));
+    };
+
+    let path = path_override.as_ref().unwrap_or(&fd.path);
+    if path.is_empty() {
+        return Err(Status::invalid_argument("no path provided"));
+    }
+
+    let table = resolve_table_path(path);
+    let table_provider = ctx
+        .table_provider(table.clone())
+        .await
+        .map_err(handle_datafusion_error)?;
+
+    let (schema, batches) = decode_flight_batches(&table, streaming).await?;
+
+    // Cast batches to the table's schema for compatible type differences
+    // (e.g. Timestamp(µs) incoming vs Timestamp(ns) in the table).
+    let table_schema = table_provider.schema();
+    let (schema, batches) = coerce_batches_to_schema(schema, batches, &table_schema)
+        .map_err(handle_datafusion_error)?;
+
+    let insert_plan = table_provider
+        .insert_into(
+            &ctx.state(),
+            MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                .map_err(handle_datafusion_error)?,
+            InsertOp::Append,
+        )
+        .await
+        .map_err(handle_datafusion_error)?;
+    collect(insert_plan, ctx.task_ctx())
+        .await
+        .map_err(handle_datafusion_error)?;
+
+    Ok(Response::new(
+        Box::pin(futures::stream::iter(vec![Ok(PutResult::default())]))
+            as <FlightSqlService as FlightService>::DoPutStream,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_map_entries;
+
+    /// The table a `DoPut` resolved to, as `do_put_raw` would have resolved it.
+    fn test_table() -> datafusion::sql::TableReference {
+        datafusion::sql::TableReference::partial("sales", "orders")
+    }
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Schema};
+    use std::sync::Arc;
+
+    /// Builds a `MapArray` the way the Flight decoder does — straight from `ArrayData`, so
+    /// neither of `MapArray::try_new`'s `entries` checks runs and a client's non-conforming
+    /// declaration survives the decode.
+    fn map_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
+        use arrow::array::{Array, ArrayData, ArrayRef, MapArray, StringArray, StructArray};
+        use arrow::buffer::Buffer;
+        use arrow::datatypes::{DataType, Field, Fields};
+
+        let rows = entry_nulls
+            .as_ref()
+            .map_or(1, arrow::buffer::NullBuffer::len);
+        let entry_fields: Fields = vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into();
+        let data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields.clone()),
+                true,
+            )),
+            false,
+        );
+
+        let keys: Vec<String> = (0..rows).map(|i| format!("k{i}")).collect();
+        let values: Vec<String> = (0..rows).map(|i| format!("v{i}")).collect();
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
+        let data = ArrayData::builder(data_type.clone())
+            .len(rows)
+            .add_buffer(Buffer::from_slice_ref(&offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
+            vec![Arc::new(MapArray::from(data)) as ArrayRef],
+        )
+        .expect("map batch")
+    }
+
+    /// Regression test for #13495: a client declaring a `MAP`'s `entries` nullable — which the
+    /// Arrow map layout forbids — is corrected before the batches reach the insert plan, and the
+    /// schema returned alongside them is the corrected one they now carry.
+    #[test]
+    fn a_nullable_entries_map_written_by_a_client_is_corrected_before_the_insert() {
+        let batch = map_batch(None);
+        let declared = batch.schema();
+
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        match schema.field(0).data_type() {
+            DataType::Map(entries, _) => assert!(
+                !entries.is_nullable(),
+                "the schema handed to the insert plan still declares nullable entries"
+            ),
+            other => panic!("expected a Map column, got {other:?}"),
+        }
+        let [normalized] = batches.as_slice() else {
+            panic!("one batch in, one batch out");
+        };
+        assert_eq!(&normalized.schema(), &schema);
+        assert_eq!(normalized.num_rows(), 1);
+    }
+
+    /// The one shape relabelling cannot fix is refused where the column can still be named, and
+    /// the refusal reaches the client as an argument error rather than an internal one.
+    #[test]
+    fn a_map_whose_entries_carry_nulls_is_refused_by_name() {
+        let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
+        let declared = batch.schema();
+
+        let status = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect_err("entries carrying nulls have no representation to relabel to");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains("'m'")
+                && status.message().contains("'sales.orders'")
+                && status.message().contains("arrow-flight-sql"),
+            "the refusal must name the column and the table it was written to, and point at the docs: {}",
+            status.message()
+        );
+    }
+
+    /// A stream holding no `Map` at all is handed on untouched, under its own schema.
+    #[test]
+    fn a_stream_holding_no_map_is_handed_on_untouched() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "n",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1])) as arrow::array::ArrayRef],
+        )
+        .expect("int batch");
+        let declared = batch.schema();
+
+        let (schema, batches) = normalize_map_entries(&test_table(), &declared, vec![batch])
+            .expect("nothing to normalize");
+        assert!(Arc::ptr_eq(&schema, &declared));
+        assert_eq!(batches.len(), 1);
+    }
+}

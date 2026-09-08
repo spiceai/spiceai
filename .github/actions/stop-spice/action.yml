@@ -1,0 +1,44 @@
+name: 'Stop Spice'
+description: |
+  Stops the Spice runtime started by `spice run` — both the `spice` CLI and the
+  `spiced` child that actually binds the ports — and waits for those ports to be
+  released, so a reused self-hosted runner does not hand an orphaned listener to
+  the next job (#12058).
+inputs:
+  working-directory:
+    description: 'Directory the runtime was started from (where spice.log lives)'
+    required: false
+    default: '.'
+  ports:
+    description: |
+      Space-separated TCP ports to wait for release. Empty lets the script use
+      the ports this job allocated (SPICE_HTTP_PORT / SPICE_FLIGHT_PORT), and
+      spiced's defaults when it allocated none.
+    required: false
+    default: ''
+  print-log:
+    description: 'Print spice.log after stopping'
+    required: false
+    default: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - name: Stop spice
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SPICE_STOP_PORTS: ${{ inputs.ports }}
+      # Invoked through `bash` so the step does not depend on the script's
+      # executable bit surviving a checkout on every platform.
+      run: bash "${GITHUB_ACTION_PATH}/stop_spice.sh"
+
+    - name: Print spice.log
+      if: ${{ inputs.print-log == 'true' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -f spice.log ]; then
+          cat spice.log
+        else
+          echo "no spice.log in $(pwd)"
+        fi

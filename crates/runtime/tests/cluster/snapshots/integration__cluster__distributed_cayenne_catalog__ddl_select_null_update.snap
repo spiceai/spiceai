@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                           |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: tcat.myschema.users.id, CAST(tcat.myschema.users.name AS LargeUtf8) AS name, CAST(tcat.myschema.users.email AS LargeUtf8) AS email |
+|               |   SubqueryAlias: tcat.myschema.users                                                                                                           |
+|               |     TableScan: tcat.myschema.users projection=[id, name, email], full_filters=[tcat.myschema.users.id = Int64(4)]                              |
+| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name, CAST(email@2 AS LargeUtf8) as email]                                      |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                         |
+|               |     CooperativeExec                                                                                                                            |
+|               |       BytesProcessedExec                                                                                                                       |
+|               |         FlightSqlExec sql=SELECT id, name, email FROM tcat.myschema.users WHERE (("id" = 4))                                                   |
+|               |                                                                                                                                                |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------+

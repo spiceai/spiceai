@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q20"
+---
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| i_item_id        | i_item_desc                                                                                                                             | i_category | i_class | i_current_price | itemrevenue | revenueratio |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+
+| AAAAAAAAAADDCAAA | Often proposed terms can read. Prematurely early years ought to take here tiny, english police. Black                                   | Children   | infants | 49.77           | 51056.48    | 0.056778     |
+| AAAAAAAAAADICAAA | Now satisfied feelings include entire players. Retail, local s                                                                          | Children   | infants | 5.68            | 30981.15    | 0.034453     |
+| AAAAAAAAAAEECAAA | Whole plans acquire so empty orders. Important patterns allow for a houses; houses can forget just by a mec                             | Children   | infants | 3.18            | 48791.30    | 0.054259     |
+| AAAAAAAAAAEMAAAA | Soon dead bottles save inches; clearly certain interests should earn always magistrates.                                                | Children   | infants | 0.99            | 45233.23    | 0.050302     |
+| AAAAAAAAAAFADAAA | Common, total times give politically. New, new roads make now good products. However foreign systems                                    | Children   | infants | 0.43            | 46594.29    | 0.051816     |
+| AAAAAAAAAAFHBAAA | Far options could play to a cattle. Others shall get moreover new others. Almost german issues will not introduce here often bri        | Children   | infants | 5.94            | 23590.27    | 0.026234     |
+| AAAAAAAAAAFNCAAA | Different grounds should not give areas. Cleverly unlike cats meet. White children                                                      | Children   | infants | 5.89            | 12590.94    | 0.014002     |
+| AAAAAAAAAAFPAAAA | Profits choose teachers. Light force                                                                                                    | Children   | infants | 4.37            | 36344.11    | 0.040417     |
+| AAAAAAAAAAGEAAAA | Local, armed trusts might know. Right women might not like. Foreign, dark readers might flow more certain sides. Home old rivers can re | Children   | infants | 4.51            | 32525.12    | 0.036170     |
+| AAAAAAAAAAHIBAAA | New years must like civil, local views. General qualifications ensure in the                                                            | Children   | infants | 3.62            | 38423.99    | 0.042730     |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------+------------+---------+-----------------+-------------+--------------+

@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-sqlite[memory].yaml
+    query_set: clickbench
+    query_overrides: sqlite
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800

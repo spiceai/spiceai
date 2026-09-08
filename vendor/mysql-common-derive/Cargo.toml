@@ -1,0 +1,41 @@
+# Vendored fork of `mysql-common-derive` v0.32.1 (MIT OR Apache-2.0),
+# upstream: https://github.com/blackbeam/rust_mysql_common
+#
+# Why this is vendored (see vendor/mysql-common-derive/README.md):
+#   The only purpose of this fork is to drop the `proc-macro-error2` dependency,
+#   which is unmaintained (RUSTSEC-2026-0173). `proc-macro-error2` was this
+#   crate's sole pull-in of that advisory; its `abort!`/`Diagnostic` usage has
+#   been migrated to `syn::Error`-based compile errors. The generated derive
+#   output (`FromValue`/`FromRow`) is unchanged for valid input.
+#
+# Wired in via `[patch.crates-io]` in the workspace root Cargo.toml.
+[package]
+name = "mysql-common-derive"
+edition = "2021"
+description = "Derive macros for MySql common primitives (spiceai vendored fork; proc-macro-error2 removed)"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/blackbeam/rust_mysql_common"
+documentation = "https://docs.rs/mysql-common-derive"
+repository = "https://github.com/blackbeam/rust_mysql_common"
+keywords = ["mysql", "database", "derive"]
+categories = ["database"]
+version = "0.32.1"
+
+[lib]
+proc-macro = true
+bench = false
+
+[dependencies]
+darling = "0.20.1"
+heck = "0.5.0"
+num-bigint = "0.4.3"
+proc-macro-crate = "3"
+proc-macro2 = "1.0.42"
+quote = "1.0.9"
+syn = { version = "2.0", features = ["full"] }
+termcolor = "1.1.3"
+thiserror = "2"
+
+[dev-dependencies]
+serde = { version = "1.0.93", features = ["derive"] }
+serde_json = "1.0.93"

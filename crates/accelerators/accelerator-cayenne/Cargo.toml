@@ -1,0 +1,91 @@
+##
+## Copyright 2024-2026 The Spice.ai OSS Authors
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##      https://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+
+[package]
+name = "accelerator-cayenne"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Cayenne data accelerator: implements data-accelerator-api::DataAccelerator over the native Cayenne engine."
+
+[dependencies]
+data-accelerator-api = { path = "../../data-accelerator-api" }
+app = { path = "../../app" }
+cayenne = { path = "../../cayenne", features = ["turso", "partition-table-provider"] }
+data_components = { path = "../../data_components" }
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite"] }
+runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-checkpoint-sqlite = { path = "../../runtime-checkpoint-sqlite" }
+runtime-checkpoint-turso = { path = "../../runtime-checkpoint-turso" }
+runtime-object-store = { path = "../../runtime-object-store" }
+runtime-resources = { path = "../../runtime-resources" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-table-partition = { path = "../../runtime-table-partition" }
+async-trait.workspace = true
+datafusion.workspace = true
+linkme.workspace = true
+paste.workspace = true
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../../arrow_tools" }
+futures.workspace = true
+spicepod = { path = "../../spicepod" }
+tracing.workspace = true
+byte-unit.workspace = true
+cpu-budget = { path = "../../cpu-budget" }
+aws-config.workspace = true
+bytes.workspace = true
+opentelemetry.workspace = true
+runtime-secrets = { path = "../../runtime-secrets" }
+secrecy.workspace = true
+url.workspace = true
+util = { path = "../../util", features = ["datafusion", "http"] }
+aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
+aws-sdk-s3.workspace = true
+datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
+fundu.workspace = true
+object_store.workspace = true
+search = { path = "../../search" }
+serde_json.workspace = true
+spice-table = { path = "../../spice-table" }
+tokio-stream.workspace = true
+uuid.workspace = true
+vortex-datafusion.workspace = true
+rusqlite.workspace = true
+turso-shared.workspace = true
+itertools.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+
+[dev-dependencies]
+# Test-only, and deliberately dev-only: these sit in the `runtime` tier, so a normal
+# dependency would be an upward edge. The cache-refresh tests live here because they
+# need this crate's `create_table_provider`.
+runtime-table = { path = "../../runtime-table" }
+spice-table = { path = "../../spice-table" }
+insta.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }
+datafusion-table-providers = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

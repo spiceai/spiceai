@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/iceberg/delete/mod.rs
+expression: pretty
+---
+++
+++

@@ -1,0 +1,12 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&result)?
+---
++------------+
+| amount_f64 |
++------------+
+| -4.56      |
+| 1.23       |
+| 100.0      |
+|            |
++------------+

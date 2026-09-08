@@ -1,0 +1,220 @@
+name: Setup sccache
+description: 'composite action'
+
+inputs:
+  minio_endpoint:
+    description: 'MinIO endpoint (used for Linux and Windows)'
+    required: false
+  spiceio_endpoint:
+    description: 'Spiceio S3-compatible endpoint (used for macOS)'
+    required: false
+  minio_access_key:
+    description: >-
+      MinIO access key. Required by every configuration that signs its requests, which is
+      all of them except macOS via `spiceio_endpoint`. The action needs it here rather than
+      wherever cargo eventually runs, because the pre-flight below signs a request before
+      rustc is ever wrapped.
+    required: false
+  minio_secret_key:
+    description: 'MinIO secret key. See minio_access_key.'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set sccache environment variables
+      if: inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')
+      shell: bash
+      # Read through `env` rather than interpolating `${{ }}` into the script, so a value
+      # containing shell metacharacters stays a value.
+      env:
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+        SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
+      run: |
+        echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
+        echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+        # Job-private config + daemon. Self-hosted Macs run several GitHub
+        # runners as the same uid, so ~/.config/sccache/config and the default
+        # daemon port 4226 are shared. A sibling job's spiceio auto-increments
+        # onto the next port, overwrites that file, and this job's sccache then
+        # probes a Connection-refused endpoint (see run 32895059022).
+        #
+        # A hashed TCP port is not job-unique (20k values) and sccache v0.9.1
+        # attaches to whatever daemon already holds that port — `--zero-stats`
+        # then succeeds against the stale job's config. Unix gets a socket
+        # under RUNNER_TEMP instead; Windows (no UDS) gets an ephemeral TCP
+        # port. Both use a finite idle timeout: a unique listen address plus
+        # IDLE_TIMEOUT=0 would leak one immortal daemon per job.
+        conf_dir="${RUNNER_TEMP}/sccache"
+        mkdir -p "$conf_dir"
+        echo "SCCACHE_CONF=${conf_dir}/config" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=7200" >> "$GITHUB_ENV"
+
+        if [[ "${RUNNER_OS}" != "Windows" ]]; then
+          sock="${conf_dir}/sccache.sock"
+          rm -f "$sock"
+          echo "SCCACHE_SERVER_UDS=${sock}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_UDS=${sock}"
+        else
+          port=""
+          if command -v python3 >/dev/null 2>&1; then
+            port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          elif command -v python >/dev/null 2>&1; then
+            port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          fi
+          if [[ -z "${port}" ]]; then
+            ident="${GITHUB_RUN_ID:-0}:${GITHUB_JOB:-job}:${GITHUB_RUN_ATTEMPT:-1}:${RUNNER_NAME:-}"
+            hash=$(printf '%s' "$ident" | cksum | awk '{print $1}')
+            port=$((42000 + hash % 20000))
+          fi
+          echo "SCCACHE_SERVER_PORT=${port}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_PORT=${port}"
+        fi
+
+        # Credentials have to be in the environment from here on -- before the cache config
+        # is written and before the pre-flight signs its probe request -- and not in
+        # whichever later step happens to run cargo. A probe that cannot sign falls through
+        # to the EC2 instance metadata service, which a self-hosted runner does not have;
+        # the pre-flight then clears `RUSTC_WRAPPER` for the whole job and the build
+        # compiles uncached, reporting nothing worse than a `::warning::`. Owning the
+        # credentials here is what makes that ordering impossible to get wrong at a call
+        # site.
+        # Export only where the cache actually signs. macOS prefers `spiceio_endpoint` and
+        # writes `no_credentials = true` for it, so keys are unnecessary there -- and
+        # `$GITHUB_ENV` is job-wide, so exporting them anyway would leave MinIO credentials
+        # in every later step's environment, where they can displace that step's own AWS
+        # identity. Linux and Windows always write `no_credentials = false`, and macOS falls
+        # back to the signing minio path whenever the spiceio endpoint resolves empty, so
+        # both of those still need them.
+        if [[ "${RUNNER_OS}" == "macOS" && -n "${SPICEIO_ENDPOINT}" ]]; then
+          echo "Compiler cache signs no requests on this path; leaving credentials out of the job environment."
+        elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
+          echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}" >> $GITHUB_ENV
+        else
+          # Warn rather than fail: a cache that cannot answer is meant to degrade, and
+          # failing here would fail builds for an infrastructure outage -- in the merge queue
+          # that dequeues the whole batch (see #12770).
+          echo "::warning::No compiler-cache credentials supplied (minio_access_key/minio_secret_key). This cache configuration signs its requests, so the pre-flight will disable the cache and this job will compile uncached."
+        fi
+
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
+      uses: ./.github/actions/configure-apt
+
+    - name: Set up sccache (Linux)
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
+      shell: bash
+      run: |
+        sudo apt-get update && sudo apt-get install wget -y
+        wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+        tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+        sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
+        : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
+        mkdir -p "$(dirname "${SCCACHE_CONF}")"
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > "${SCCACHE_CONF}"
+
+    - name: Set up sccache (macOS)
+      if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
+      shell: bash
+      run: |
+        if ! command -v sccache &> /dev/null; then
+          echo "::warning::sccache is not installed on this macOS runner; building without the compiler cache."
+          exit 0
+        fi
+        sccache --version
+
+        SCCACHE_ENDPOINT="http://localhost:9000"
+        SCCACHE_REGION="us-east-1"
+        SCCACHE_NO_CREDS="false"
+
+        # Use spiceio if its endpoint was provided
+        if [[ -n "${{ inputs.spiceio_endpoint }}" ]]; then
+          SCCACHE_ENDPOINT="${{ inputs.spiceio_endpoint }}"
+          SCCACHE_REGION="us-west-1"
+          SCCACHE_NO_CREDS="true"
+          echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
+          echo "Using spiceio at $SCCACHE_ENDPOINT"
+        elif [[ -n "${{ inputs.minio_endpoint }}" ]]; then
+          SCCACHE_ENDPOINT="${{ inputs.minio_endpoint }}"
+          echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
+          echo "Using MinIO at $SCCACHE_ENDPOINT"
+        else
+          echo "sccache endpoint not configured"
+          exit 0
+        fi
+
+        : "${SCCACHE_CONF:=${RUNNER_TEMP}/sccache/config}"
+        mkdir -p "$(dirname "${SCCACHE_CONF}")"
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > "${SCCACHE_CONF}"
+
+    - name: Set up sccache (Windows)
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Download and install sccache
+        $sccacheVersion = "v0.9.1"
+        $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
+        $sccacheZip = "$env:TEMP\sccache.zip"
+        $sccacheDir = "$env:USERPROFILE\sccache"
+
+        Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
+        Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
+        $sccacheExtractedDir = Join-Path $sccacheDir "sccache-$sccacheVersion-x86_64-pc-windows-msvc"
+        $sccacheExePath = Join-Path $sccacheExtractedDir "sccache.exe"
+        if (-not (Test-Path $sccacheExePath)) {
+          Write-Error "sccache.exe not found at expected path: $sccacheExePath"
+          exit 1
+        }
+        $sccacheBinDir = Split-Path $sccacheExePath -Parent
+        echo "$sccacheBinDir" >> $env:GITHUB_PATH
+
+        # Configure sccache (job-private path from SCCACHE_CONF, not the
+        # per-user APPDATA file — several self-hosted runners can share one uid).
+        $configPath = $env:SCCACHE_CONF
+        if ([string]::IsNullOrEmpty($configPath)) {
+          $configPath = Join-Path $env:RUNNER_TEMP "sccache\config"
+        }
+        $configDir = Split-Path $configPath -Parent
+        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
+        $config | Out-File -FilePath $configPath -Encoding utf8
+
+    - name: Confirm the compiler cache answers before wrapping rustc
+      if: (runner.os == 'Linux' && inputs.minio_endpoint != '') || (runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != ''))
+      shell: bash
+      # Invoked through `bash` rather than as `./…` so the step does not depend on
+      # the script's executable bit surviving a checkout on every platform.
+      run: bash "$GITHUB_ACTION_PATH/verify_compiler_cache.sh"
+
+    - name: Confirm the compiler cache answers before wrapping rustc (Windows)
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
+      shell: pwsh
+      run: |
+        # `--zero-stats` goes through sccache's connect_or_start_server, so it fails
+        # when the server cannot come up. `--show-stats` does not: with no daemon
+        # running it reports synthesized empty stats and exits 0, succeeding on
+        # exactly the unreachable storage this step exists to catch.
+        $ErrorActionPreference = 'Continue'
+        $reachable = $false
+        $detail = 'sccache was not found on PATH'
+        if (Get-Command sccache -ErrorAction SilentlyContinue) {
+          $output = & sccache --zero-stats 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            $reachable = $true
+          } else {
+            $detail = ($output -replace '\r?\n', ' ').Trim()
+          }
+        }
+        if ($reachable) {
+          Write-Output 'Compiler cache is reachable.'
+        } else {
+          Write-Output "::warning::Compiler cache is unreachable; building without it. sccache reported: $detail"
+          "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SCCACHE_SETUP=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        }

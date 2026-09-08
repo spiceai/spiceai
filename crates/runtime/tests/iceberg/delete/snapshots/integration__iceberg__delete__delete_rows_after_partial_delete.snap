@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/iceberg/delete/mod.rs
+expression: pretty
+---
++---------+-------------+----------+
+| int_col | boolean_col | long_col |
++---------+-------------+----------+
+| 1       | true        | 100      |
+| 2       | true        | 200      |
++---------+-------------+----------+

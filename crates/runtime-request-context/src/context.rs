@@ -1,0 +1,1185 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#![allow(clippy::missing_errors_doc)]
+
+use super::{CacheControl, CacheKeyType, CacheNamespace, Protocol, UserAgent, baggage};
+use crate::TraceParent;
+use app::App;
+use futures::{Stream, StreamExt};
+use http::HeaderMap;
+use opentelemetry::KeyValue;
+use regex::Regex;
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use sha2::{Digest, Sha256};
+use spicepod::component::runtime::UserAgentCollection;
+use std::sync::atomic::Ordering;
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    sync::{
+        Arc, LazyLock, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicI16, AtomicU8},
+    },
+};
+use tokio_util::sync::CancellationToken;
+
+static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static FLIGHTSQL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+static INTERNAL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
+
+type Extensions = HashMap<TypeId, Arc<dyn Extension + Send + Sync>>;
+
+pub struct RequestContext {
+    // Use an AtomicU8 to allow updating the protocol without locking
+    protocol: AtomicU8,
+    cache_control: CacheControl,
+    client_supplied_cache_key: Option<String>,
+    /// Optional explicit override for the cache namespace. When `None`, the
+    /// namespace is derived from `protocol` + `auth_principal` on demand by
+    /// [`Self::cache_namespace`]. Set explicitly by callers that need to
+    /// inherit a namespace from another context (e.g. SWR background
+    /// revalidation must run under the originating user's namespace, not
+    /// `System`).
+    cache_namespace_override: Option<CacheNamespace>,
+    dimensions: Vec<KeyValue>,
+    auth_principal: OnceLock<AuthPrincipalRef>,
+    extensions: RwLock<Extensions>,
+    trace_parent: Option<TraceParent>,
+    /// The trace id the client pinned for this request, from either
+    /// [`crate::SPICE_TRACE_ID_HEADER`] or `traceparent`. `None` when the
+    /// client supplied neither, or for a context built without headers — the
+    /// runtime then numbers the request's tasks itself.
+    client_trace_id: Option<Arc<str>>,
+    /// A trace id this runtime minted earlier in the same protocol exchange
+    /// and already handed to the client, so this request's work has to be
+    /// recorded under it. Flight SQL splits one query across two RPCs:
+    /// `GetFlightInfo` returns the id and carries it to `DoGet` in the ticket
+    /// (see `flight::traced_ticket`), which is what makes the id a client
+    /// reads name the execution rather than the planning call.
+    ///
+    /// Set after the context is built, because a ticket is not a header — it
+    /// is decoded once the RPC is already being dispatched. [`OnceLock`]
+    /// because a request has exactly one: a second write would fork the id
+    /// mid-request, so it is ignored.
+    propagated_trace_id: OnceLock<Arc<str>>,
+    /// Whether a task in this request has already joined the propagated trace.
+    ///
+    /// Only the first one does. A nested task — a cache fill, a sub-query — is
+    /// already inside that trace through the task above it, and re-anchoring it
+    /// would replace its real parent and flatten the `task_history` tree.
+    trace_joined: AtomicBool,
+    nested_query_level: AtomicI16,
+    /// The raw `authorization` header value from the incoming request, if present.
+    /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
+    authorization_header: Option<String>,
+    /// Cancellation token for cooperative cancellation of work performed on behalf
+    /// of this request (query execution, search, LLM tool loops, etc.).
+    ///
+    /// The token is cancelled either when the request future is dropped (e.g. the
+    /// client disconnects) via a drop-guard installed by the transport layer, or
+    /// when an administrative cancel is issued against a registered query id.
+    cancellation_token: CancellationToken,
+    /// Maximum wall-clock lifetime for queries executed on behalf of this
+    /// request: planning, admission wait, execution, and result streaming all
+    /// count. Resolved at build time from an explicit override or the app's
+    /// `runtime.query.timeout`; `Protocol::Internal` requests are exempt
+    /// unless explicitly overridden. `None` = no timeout.
+    query_timeout: Option<std::time::Duration>,
+}
+
+#[async_trait::async_trait]
+pub trait Extension: std::any::Any + Send + Sync {
+    async fn load(&self) {
+        // no-op
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+tokio::task_local! {
+    static REQUEST_CONTEXT: Arc<RequestContext>;
+}
+
+/// An internal request context that is used outside the context of a client request.
+static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
+    LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
+
+static CLIENT_CACHE_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r"^([\w-]{1,128})$") {
+        Ok(compiled) => compiled,
+        Err(e) => unreachable!("Unable to compile regexp: {}", e),
+    });
+
+const AUTHORIZATION_SCOPE_FINGERPRINT_BYTES: usize = 16;
+
+#[derive(Copy, Clone)]
+pub struct AsyncMarker {
+    marker: PhantomData<()>,
+}
+
+impl AsyncMarker {
+    // This can only be called in async contexts due to .await
+    #[must_use]
+    #[expect(clippy::unused_async)]
+    pub async fn new() -> Self {
+        AsyncMarker {
+            marker: PhantomData,
+        }
+    }
+}
+
+impl RequestContext {
+    #[must_use]
+    pub fn builder(protocol: Protocol) -> RequestContextBuilder {
+        RequestContextBuilder::new(protocol)
+    }
+
+    /// Returns the current request context, or an internal context if this is called outside of a request.
+    ///
+    /// The `AsyncMarker` is required because this function MUST only be called from asynchronous code.
+    ///
+    /// Usage:
+    /// ```rust,no_run
+    /// let ctx = RequestContext::current(AsyncMarker::new().await);
+    /// ```
+    ///
+    /// Additionally, the request context is lost on `tokio::spawn` - to keep the context across a spawned task boundary,
+    /// wrap the asynchronous code in a `scope` call.
+    ///
+    /// ```rust,no_run
+    /// let ctx = RequestContext::current(AsyncMarker::new().await);
+    /// tokio::spawn(
+    ///     ctx.scope(async move {
+    ///             // ...
+    ///         })
+    /// );
+    /// ```
+    #[must_use]
+    pub fn current(_marker: AsyncMarker) -> Arc<Self> {
+        REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .ok()
+            .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
+    }
+
+    /// **UNSAFE: Use `RequestContext::current` instead.**
+    ///
+    /// Returns the current request context, or an internal context if this is called outside of a request.
+    ///
+    /// # Safety
+    /// This method is unsafe and should not be used in most cases. It allows access to the request context from synchronous code,
+    /// which can easily lead to subtle bugs and undefined behavior if the context is not actually present.
+    /// Always prefer using [`RequestContext::current`] with an [`AsyncMarker`] in async code to ensure correct context handling.
+    #[must_use]
+    pub unsafe fn current_sync() -> Arc<Self> {
+        REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .ok()
+            .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
+    }
+
+    /// Runs the provided future with the current request context.
+    pub async fn scope<F>(self: Arc<Self>, f: F) -> F::Output
+    where
+        F: Future,
+    {
+        REQUEST_CONTEXT.scope(self, f).await
+    }
+
+    /// Spawns `future` onto the Tokio runtime bound to the current request
+    /// context, so work that outlives the calling task — e.g. a background job
+    /// — still runs as the originating principal. Outside a request this binds
+    /// the internal context.
+    pub fn spawn_current<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let context = REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::clone(&INTERNAL_REQUEST_CONTEXT));
+        tokio::spawn(context.scope(future))
+    }
+
+    /// Wraps provided stream with the current request context.
+    pub fn scope_stream<S>(self: Arc<Self>, stream: S) -> impl Stream<Item = S::Item>
+    where
+        S: Stream,
+    {
+        let pinned = Box::pin(stream);
+        futures::stream::unfold((pinned, self), |(mut stream, ctx)| {
+            let ctx_clone = Arc::clone(&ctx);
+            ctx_clone.scope(async move { stream.next().await.map(|item| (item, (stream, ctx))) })
+        })
+    }
+
+    /// Retries the provided future from the closure `r` times until it fails or succeeds.
+    pub async fn scope_retry<F, Fut, T, E>(self: Arc<Self>, r: u16, f: F) -> Fut::Output
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let mut try_count = 0;
+        loop {
+            let fut = f();
+            match REQUEST_CONTEXT.scope(Arc::clone(&self), fut).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    try_count += 1;
+                    if try_count >= r {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn to_dimensions(&self) -> Vec<KeyValue> {
+        let mut dimensions = Vec::with_capacity(self.dimensions.len() + 2);
+        dimensions.push(KeyValue::new("protocol", self.protocol().as_str()));
+        dimensions.extend(self.dimensions.iter().cloned());
+        // Low-cardinality scope dimension: `public` / `principal` / `system`.
+        // Never includes the principal id.
+        dimensions.push(KeyValue::new(
+            "cache_namespace_kind",
+            self.cache_namespace().kind(),
+        ));
+        dimensions
+    }
+
+    #[must_use]
+    pub fn to_protocol_dimensions(&self) -> &'static [KeyValue] {
+        let protocol = self.protocol();
+        match protocol {
+            Protocol::Http => {
+                HTTP_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::Flight => {
+                FLIGHT_DIMENSIONS.get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())])
+            }
+            Protocol::FlightSQL => FLIGHTSQL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Internal => INTERNAL_DIMENSIONS
+                .get_or_init(|| vec![KeyValue::new("protocol", protocol.as_str())]),
+            Protocol::Invalid => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Protocol {
+        Protocol::from(self.protocol.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn update_protocol(&self, protocol: Protocol) {
+        self.protocol
+            .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn cache_control(&self) -> CacheControl {
+        self.cache_control
+    }
+
+    /// The cache namespace this request is executing under.
+    ///
+    /// Computed once per call from `protocol` + `auth_principal`, unless an
+    /// explicit override was set on the builder (used by SWR background
+    /// revalidation and similar flows that must inherit the originating
+    /// request's namespace).
+    ///
+    /// Mapping:
+    /// - `Protocol::Internal` → [`CacheNamespace::System`].
+    /// - Authenticated principal whose `stable_id()` is `Some(id)` →
+    ///   [`CacheNamespace::Principal(id)`].
+    /// - Anything else (no principal, anonymous principal) →
+    ///   [`CacheNamespace::Public`].
+    #[must_use]
+    pub fn cache_namespace(&self) -> CacheNamespace {
+        if let Some(ns) = &self.cache_namespace_override {
+            return ns.clone();
+        }
+        if matches!(self.protocol(), Protocol::Internal) {
+            return CacheNamespace::System;
+        }
+        match self.auth_principal.get().and_then(|p| p.stable_id()) {
+            Some(id) => CacheNamespace::Principal(Arc::from(id.as_ref())),
+            None => CacheNamespace::Public,
+        }
+    }
+
+    #[must_use]
+    pub fn client_supplied_cache_key(&self) -> &Option<String> {
+        &self.client_supplied_cache_key
+    }
+
+    #[must_use]
+    pub fn trace_parent(&self) -> &Option<TraceParent> {
+        &self.trace_parent
+    }
+
+    /// The trace id this request's caller pinned, if any.
+    ///
+    /// `Some` means the id is the client's to correlate on, so it has to be
+    /// written to the `runtime.task_history` row as well as the log. `None`
+    /// means the runtime numbers each task itself.
+    #[must_use]
+    pub fn client_trace_id(&self) -> Option<&Arc<str>> {
+        self.client_trace_id.as_ref()
+    }
+
+    /// The trace id an earlier RPC of this same exchange already returned to
+    /// the client, if one was carried in.
+    ///
+    /// Unlike [`Self::client_trace_id`] this id is the runtime's own, so the
+    /// task that adopts it can join that trace outright rather than declaring
+    /// an override the exporter has to reconcile afterwards.
+    #[must_use]
+    pub fn propagated_trace_id(&self) -> Option<&Arc<str>> {
+        self.propagated_trace_id.get()
+    }
+
+    /// Records `trace_id` as this request's propagated id, and returns the id
+    /// the request ends up using.
+    ///
+    /// The first id to arrive wins: once a task has resolved one it has
+    /// already logged under it, so a later write cannot move it. Serves both
+    /// the request that *receives* an id (the ticket at `DoGet`) and the one
+    /// that *mints* it before any work runs (`GetFlightInfo`), which is why it
+    /// hands back the winner rather than reporting whether it stored one.
+    pub fn propagate_trace_id(&self, trace_id: Arc<str>) -> &Arc<str> {
+        self.propagated_trace_id.get_or_init(|| trace_id)
+    }
+
+    /// The propagated id, for the request's first task only.
+    ///
+    /// That task anchors itself on the trace; every task under it is already
+    /// inside it and must keep the parent it has, so they are handed `None`.
+    pub fn claim_propagated_trace(&self) -> Option<&Arc<str>> {
+        let trace_id = self.propagated_trace_id.get()?;
+        (!self.trace_joined.swap(true, Ordering::Relaxed)).then_some(trace_id)
+    }
+
+    /// The id this request's work is recorded under, if one is already
+    /// settled: the id the client pinned, else one an earlier RPC of the same
+    /// exchange returned.
+    ///
+    /// The single spelling of that precedence. A task with neither resolves an
+    /// id of its own from its span, which only the task-history layer can do —
+    /// see `task_history::correlation`.
+    #[must_use]
+    pub fn settled_trace_id(&self) -> Option<&Arc<str>> {
+        self.client_trace_id()
+            .or_else(|| self.propagated_trace_id())
+    }
+
+    /// Returns the raw `authorization` header value from the incoming request, if present.
+    #[must_use]
+    pub fn authorization_header(&self) -> Option<&str> {
+        self.authorization_header.as_deref()
+    }
+
+    #[must_use]
+    pub fn scoped_client_supplied_cache_key(&self) -> Option<String> {
+        self.client_supplied_cache_key.as_deref().map(|cache_key| {
+            let auth_scope = self
+                .authorization_header
+                .as_deref()
+                .map_or_else(|| "anonymous".to_string(), authorization_scope_fingerprint);
+            format!("{auth_scope}:{cache_key}")
+        })
+    }
+
+    pub fn extension<T>(&self) -> Option<T>
+    where
+        T: Extension + Clone,
+    {
+        let extensions = self.extensions.read().ok()?;
+        let type_id = TypeId::of::<T>();
+        extensions
+            .get(&type_id)?
+            .as_any()
+            .downcast_ref::<T>()
+            .cloned()
+    }
+
+    pub fn insert_extension<T: Extension + Send + Sync>(&self, extension: T) {
+        if let Ok(mut extensions) = self.extensions.write() {
+            extensions.insert(extension.type_id(), Arc::new(extension));
+        }
+    }
+
+    pub async fn load_extensions(&self) {
+        // Cannot hold `RwLockReadGuard` across async boundary.
+        let extensions = {
+            let Ok(guard) = self.extensions.read() else {
+                return;
+            };
+            guard.values().cloned().collect::<Vec<_>>()
+        };
+
+        for ext in extensions {
+            ext.load().await;
+        }
+    }
+
+    /// Enters a query on this request, reporting whether it is the only one
+    /// running — the transition from no queries to some.
+    ///
+    /// Independent queries can share one request context and overlap, so this
+    /// means "the request went from idle to busy", not "this query encloses the
+    /// others". A caller pairing an acquire with a release must take the
+    /// release from [`Self::exited_top_level_query`] rather than remembering
+    /// this answer, because the query that opened the request is not
+    /// guaranteed to be the one that closes it.
+    pub fn entered_top_level_query(&self) -> bool {
+        self.nested_query_level.fetch_add(1, Ordering::Relaxed) == 0
+    }
+
+    /// Leaves a query on this request, reporting whether it was the last one
+    /// running — the transition back to idle, and the release that pairs with
+    /// [`Self::entered_top_level_query`]'s acquire.
+    pub fn exited_top_level_query(&self) -> bool {
+        self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
+    }
+
+    /// Returns the cancellation token bound to this request's lifetime.
+    ///
+    /// The token is cancelled when the request is aborted (client disconnect,
+    /// administrative cancel, or transport-level shutdown). Long-running work
+    /// performed on behalf of this request should check this token cooperatively.
+    #[must_use]
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Returns a child cancellation token that is cancelled when either this
+    /// request's token is cancelled or the child is cancelled explicitly.
+    ///
+    /// Use this to create scoped cancellation for a sub-operation (for example,
+    /// a single query within a request that may execute many queries).
+    #[must_use]
+    pub fn child_cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.child_token()
+    }
+
+    /// Returns `true` if cancellation has been requested for this request.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    /// Cancels this request's cancellation token, signalling all cooperating
+    /// operations to stop. This is used by the administrative cancel paths.
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    /// Maximum wall-clock lifetime for queries executed on behalf of this
+    /// request (`runtime.query.timeout`); `None` = no timeout.
+    #[must_use]
+    pub fn query_timeout(&self) -> Option<std::time::Duration> {
+        self.query_timeout
+    }
+}
+
+impl AuthRequestContext for RequestContext {
+    fn set_auth_principal(
+        &self,
+        auth_principal: AuthPrincipalRef,
+    ) -> Result<(), super::GenericError> {
+        self.auth_principal
+            .set(auth_principal)
+            .map_err(|_| "Failed to set auth principal".into())
+    }
+
+    fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
+        self.auth_principal.get()
+    }
+}
+
+pub struct RequestContextBuilder {
+    protocol: Protocol,
+    cache_control: CacheControl,
+    client_supplied_cache_key: Option<String>,
+    cache_namespace_override: Option<CacheNamespace>,
+    app: Option<Arc<App>>,
+    user_agent: UserAgent,
+    baggage: Vec<KeyValue>,
+    extensions: Extensions,
+    trace_parent: Option<TraceParent>,
+    client_trace_id: Option<Arc<str>>,
+    authorization_header: Option<String>,
+    cancellation_token: Option<CancellationToken>,
+    query_timeout: Option<std::time::Duration>,
+}
+
+impl RequestContextBuilder {
+    #[must_use]
+    pub fn new(protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            cache_control: CacheControl::Cache(CacheKeyType::Default),
+            client_supplied_cache_key: None,
+            cache_namespace_override: None,
+            app: None,
+            user_agent: UserAgent::Absent,
+            baggage: vec![],
+            extensions: Extensions::default(),
+            trace_parent: None,
+            client_trace_id: None,
+            authorization_header: None,
+            cancellation_token: None,
+            query_timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_extension(mut self, extension: impl Extension) -> Self {
+        self.extensions
+            .insert(extension.type_id(), Arc::new(extension));
+        self
+    }
+
+    #[must_use]
+    pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
+        self.app = app;
+        self
+    }
+
+    #[must_use]
+    pub fn from_headers(mut self, headers: &HeaderMap) -> Self {
+        let user_agent_collection = self
+            .app
+            .as_ref()
+            .map_or(UserAgentCollection::default(), |app| {
+                app.user_agent_collection()
+            });
+        self.user_agent = match user_agent_collection {
+            UserAgentCollection::Full => UserAgent::from_headers(headers),
+            UserAgentCollection::Disabled => UserAgent::Absent,
+        };
+        self.cache_control = CacheControl::from_headers(headers);
+        self.client_supplied_cache_key = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::ClientSupplied) => headers
+                .get("Spice-Cache-Key")
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string),
+            _ => None,
+        };
+
+        self.baggage.extend(baggage::from_headers(headers));
+
+        self.authorization_header = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        match super::extract_trace_parent(headers) {
+            Ok(trace_parent) => {
+                self.trace_parent = trace_parent;
+            }
+            Err(e) => {
+                tracing::warn!("Received invalid `traceparent` HTTP header: {e}");
+            }
+        }
+
+        match super::extract_trace_id(headers) {
+            Ok(trace_id) => {
+                self.client_trace_id = trace_id;
+            }
+            Err(e) => tracing::warn!("Received invalid HTTP header: {e}"),
+        }
+
+        self
+    }
+
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: UserAgent) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = cache_control;
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_supplied_cache_key(mut self, cache_key: Option<String>) -> Self {
+        self.client_supplied_cache_key = cache_key;
+        self
+    }
+
+    /// Override the cache namespace for this request, bypassing the
+    /// `protocol` + `auth_principal` derivation in
+    /// [`RequestContext::cache_namespace`]. Use this only for flows that
+    /// must inherit a namespace from another request — most importantly
+    /// SWR background revalidation, which runs under `Protocol::Internal`
+    /// (would otherwise be `System`) but must store its result under the
+    /// originating user's namespace so the user actually sees the refresh.
+    #[must_use]
+    pub fn with_cache_namespace(mut self, cache_namespace: CacheNamespace) -> Self {
+        self.cache_namespace_override = Some(cache_namespace);
+        self
+    }
+
+    #[must_use]
+    pub fn with_baggage(mut self, baggage: Vec<KeyValue>) -> Self {
+        self.baggage = baggage;
+        self
+    }
+
+    #[must_use]
+    pub fn with_trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
+        self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Pins the trace id the runtime records for this request's tasks,
+    /// bypassing both headers. Used to carry a caller's id across a transport
+    /// boundary (scheduler → executor) that does not replay the original
+    /// request's headers.
+    #[must_use]
+    pub fn with_client_trace_id(mut self, client_trace_id: Option<Arc<str>>) -> Self {
+        self.client_trace_id = client_trace_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
+        self.authorization_header = authorization_header;
+        self
+    }
+
+    /// Explicitly sets the query timeout for this request, overriding the
+    /// default derived from the app's `runtime.query.timeout` in `build()`.
+    /// This is the hook for callers that resolve a caller-specific timeout
+    /// (e.g. a future per-user policy); an explicit value applies even to
+    /// `Protocol::Internal` contexts, which are otherwise exempt.
+    #[must_use]
+    pub fn with_query_timeout(mut self, query_timeout: Option<std::time::Duration>) -> Self {
+        self.query_timeout = query_timeout;
+        self
+    }
+
+    /// Supplies a pre-existing cancellation token to use as this request's
+    /// cancellation token. If unset, a fresh token is created in `build()`.
+    ///
+    /// Use this to parent a request's cancellation token to a broader scope
+    /// (for example, a scheduler-side request token derived from an executor-side
+    /// token so that cancellation cascades).
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    #[must_use]
+    pub fn baggage_mut(&mut self) -> &mut Vec<KeyValue> {
+        &mut self.baggage
+    }
+
+    #[must_use]
+    pub fn build(self) -> RequestContext {
+        let mut dimensions = self.baggage;
+
+        let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
+            dimensions.push(KeyValue::new("runtime", super::RUNTIME_NAME));
+            dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
+            dimensions.push(KeyValue::new(
+                "runtime_system",
+                Arc::clone(&*super::RUNTIME_SYSTEM),
+            ));
+        };
+
+        match self.user_agent {
+            UserAgent::Absent => (),
+            UserAgent::Raw(raw) => {
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
+                dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
+                add_runtime_dimensions(&mut dimensions);
+            }
+            UserAgent::Parsed(parsed) => {
+                dimensions.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
+                dimensions.push(KeyValue::new(
+                    "client_version",
+                    Arc::clone(&parsed.client_version),
+                ));
+
+                if let Some(client_system) = &parsed.client_system {
+                    dimensions.push(KeyValue::new("client_system", Arc::clone(client_system)));
+                }
+                // Display appends runtime identity; keep that combined value for metric
+                // continuity (runtime is also recorded separately below).
+                dimensions.push(KeyValue::new(
+                    "user_agent",
+                    UserAgent::Parsed(parsed).to_string(),
+                ));
+                add_runtime_dimensions(&mut dimensions);
+            }
+        }
+
+        let user_cache_key = self
+            .client_supplied_cache_key
+            .and_then(Self::sanitize_cache_key);
+
+        // Apply the runtime parameter `runtime.caching.sql_results.cache_key_type` to the cache control if set.
+        let cache_control = match self.cache_control {
+            CacheControl::Cache(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::Cache(cache_key_type)
+            }
+            CacheControl::MaxStale(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::MaxStale(cache_key_type, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::Default, duration) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::MinFresh(cache_key_type, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::Default) => {
+                let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+                CacheControl::OnlyIfCached(cache_key_type)
+            }
+            // If sanitized out, fall back to default
+            CacheControl::Cache(CacheKeyType::ClientSupplied) if user_cache_key.is_none() => {
+                CacheControl::Cache(CacheKeyType::Default)
+            }
+            CacheControl::MaxStale(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::MaxStale(CacheKeyType::Default, duration)
+            }
+            CacheControl::MinFresh(CacheKeyType::ClientSupplied, duration)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::MinFresh(CacheKeyType::Default, duration)
+            }
+            CacheControl::OnlyIfCached(CacheKeyType::ClientSupplied)
+                if user_cache_key.is_none() =>
+            {
+                CacheControl::OnlyIfCached(CacheKeyType::Default)
+            }
+            cache_control => cache_control,
+        };
+
+        // Resolve the effective query timeout: an explicit override wins;
+        // otherwise externally-issued requests inherit the app's
+        // `runtime.query.timeout`. `Protocol::Internal` (acceleration
+        // refreshes, health checks, task history) is exempt. Mirrors how
+        // `CacheKeyType::from_app_runtime` resolves per-request settings.
+        let query_timeout = self.query_timeout.or_else(|| {
+            if matches!(self.protocol, Protocol::Internal) {
+                return None;
+            }
+            self.app
+                .as_ref()
+                .and_then(|app| app.runtime.query.as_ref())
+                // Invalid values are warned about once at runtime startup and
+                // disable the timeout; here they simply resolve to `None`.
+                .and_then(|query| query.timeout().ok().flatten())
+        });
+
+        // A `traceparent` pins the trace id just as the bare header does; the
+        // bare one is resolved first so it wins when a request carries both.
+        let client_trace_id = self.client_trace_id.or_else(|| {
+            self.trace_parent
+                .as_ref()
+                .map(|tp| Arc::from(tp.trace_id.to_string()))
+        });
+
+        RequestContext {
+            protocol: AtomicU8::new(self.protocol as u8),
+            cache_control,
+            client_supplied_cache_key: user_cache_key,
+            cache_namespace_override: self.cache_namespace_override,
+            dimensions,
+            auth_principal: OnceLock::new(),
+            extensions: RwLock::new(self.extensions),
+            trace_parent: self.trace_parent,
+            client_trace_id,
+            propagated_trace_id: OnceLock::new(),
+            trace_joined: AtomicBool::new(false),
+            nested_query_level: AtomicI16::new(0),
+            authorization_header: self.authorization_header,
+            cancellation_token: self.cancellation_token.unwrap_or_default(),
+            query_timeout,
+        }
+    }
+
+    fn sanitize_cache_key(key: String) -> Option<String> {
+        if CLIENT_CACHE_KEY_REGEX.is_match(&key) {
+            Some(key)
+        } else {
+            None
+        }
+    }
+}
+
+fn authorization_scope_fingerprint(authorization_header: &str) -> String {
+    let digest = Sha256::digest(authorization_header.as_bytes());
+    let mut fingerprint = String::with_capacity(5 + (AUTHORIZATION_SCOPE_FINGERPRINT_BYTES * 2));
+    fingerprint.push_str("auth:");
+
+    for byte in &digest[..AUTHORIZATION_SCOPE_FINGERPRINT_BYTES] {
+        push_hex_byte(&mut fingerprint, *byte);
+    }
+
+    fingerprint
+}
+
+fn push_hex_byte(buf: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    buf.push(HEX[usize::from(byte >> 4)] as char);
+    buf.push(HEX[usize::from(byte & 0x0f)] as char);
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{HeaderMap, HeaderValue};
+
+    use crate::{CacheControl, CacheKeyType, Protocol, RequestContextBuilder};
+
+    /// A task spawned via `spawn_current` observes the spawning request's
+    /// context rather than the internal context. Results-cache namespacing and
+    /// principal-scoped authz/masking depend on it.
+    #[tokio::test]
+    async fn spawn_current_carries_request_context() {
+        use crate::{AsyncMarker, CacheNamespace, RequestContext};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        let (tx, rx) = oneshot::channel();
+        context
+            .scope(async move {
+                RequestContext::spawn_current(async move {
+                    let namespace =
+                        RequestContext::current(AsyncMarker::new().await).cache_namespace();
+                    tx.send(namespace).expect("receiver alive");
+                });
+            })
+            .await;
+
+        assert_eq!(
+            rx.await.expect("spawned task reported its context"),
+            CacheNamespace::Public
+        );
+    }
+
+    const PINNED_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const TRACEPARENT_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+    const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    /// A caller with no trace-context tooling pins the id with the bare header.
+    #[test]
+    fn client_trace_id_comes_from_the_spice_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static(PINNED_TRACE_ID),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(PINNED_TRACE_ID)
+        );
+    }
+
+    /// A `traceparent` on its own still pins the id — that is how the id
+    /// reached `runtime.task_history` before the bare header existed.
+    #[test]
+    fn client_trace_id_falls_back_to_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(TRACEPARENT_TRACE_ID)
+        );
+        assert!(
+            ctx.trace_parent().is_some(),
+            "the parent span must survive so the task still records what it is a child of"
+        );
+    }
+
+    /// Both present: the header the caller set deliberately beats the one a
+    /// proxy or APM agent injects, and the parent span is kept regardless.
+    #[test]
+    fn spice_header_wins_over_traceparent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(TRACEPARENT));
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static(PINNED_TRACE_ID),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx.client_trace_id().map(AsRef::as_ref),
+            Some(PINNED_TRACE_ID)
+        );
+        assert!(ctx.trace_parent().is_some());
+    }
+
+    /// A malformed id is not the client's to correlate on, so the runtime
+    /// numbers the task itself rather than recording an unusable value.
+    #[test]
+    fn malformed_spice_header_leaves_the_id_to_the_runtime() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::SPICE_TRACE_ID_HEADER,
+            HeaderValue::from_static("not-a-trace-id"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert!(ctx.client_trace_id().is_none());
+    }
+
+    /// Nothing pinned — no client id, so nothing is written to the
+    /// `task_history` row on the client's behalf.
+    #[test]
+    fn no_headers_means_no_client_trace_id() {
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&HeaderMap::new())
+            .build();
+
+        assert!(ctx.client_trace_id().is_none());
+    }
+
+    #[test]
+    fn test_bind_client_supplied_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.append("cache-control", HeaderValue::from_static("cache"));
+
+        // Test user-provided cache key
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo"));
+        let ctx_happy_path = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx_happy_path.cache_control,
+            CacheControl::Cache(CacheKeyType::ClientSupplied)
+        );
+        assert_eq!(
+            ctx_happy_path.client_supplied_cache_key,
+            Some(String::from("foo"))
+        );
+
+        // Test invalid user cache key falling back to default behavior
+        headers.remove("Spice-Cache-Key");
+        headers.append("Spice-Cache-Key", HeaderValue::from_static("foo$$"));
+
+        let ctx_bad_user_key = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(
+            ctx_bad_user_key.cache_control,
+            CacheControl::Cache(CacheKeyType::Default)
+        );
+        assert_eq!(ctx_bad_user_key.client_supplied_cache_key, None);
+    }
+
+    #[test]
+    fn test_scoped_client_supplied_cache_key_hashes_authorization_header() {
+        let auth_header_1 = "Bearer alice".to_string();
+        let auth_header_2 = "Bearer bob".to_string();
+
+        let ctx1 = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some(auth_header_1.clone()))
+            .build();
+
+        let ctx2 = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some(auth_header_1.clone()))
+            .build();
+
+        let ctx3 = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .with_authorization_header(Some(auth_header_2))
+            .build();
+
+        let key1 = ctx1
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+        let key2 = ctx2
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+        let key3 = ctx3
+            .scoped_client_supplied_cache_key()
+            .expect("scoped key should be present");
+
+        assert!(key1.ends_with(":shared-key"));
+        assert!(key1.starts_with("auth:"));
+        assert_eq!(key1.len(), "auth:".len() + 32 + ":shared-key".len());
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+        assert!(!key1.contains(&auth_header_1));
+    }
+
+    #[test]
+    fn test_scoped_client_supplied_cache_key_defaults_to_anonymous() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::ClientSupplied))
+            .with_client_supplied_cache_key(Some("shared-key".to_string()))
+            .build();
+
+        assert_eq!(
+            ctx.scoped_client_supplied_cache_key().as_deref(),
+            Some("anonymous:shared-key")
+        );
+    }
+
+    #[test]
+    fn test_cancellation_token_starts_uncancelled() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        assert!(!ctx.is_cancelled());
+        assert!(!ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_signals_token() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        ctx.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_child_cancellation_token_inherits_parent_cancel() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        assert!(!child.is_cancelled());
+        ctx.cancel();
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancelling_child_does_not_cancel_parent() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!ctx.is_cancelled());
+    }
+
+    /// Builds an app whose spicepod sets `runtime.query.timeout` to the given
+    /// human-readable duration string.
+    fn app_with_query_timeout(timeout: &str) -> std::sync::Arc<app::App> {
+        let mut app = app::AppBuilder::new("test").build();
+        app.runtime.query = Some(spicepod::component::runtime::Query {
+            timeout: Some(timeout.to_string()),
+            ..Default::default()
+        });
+        std::sync::Arc::new(app)
+    }
+
+    /// External requests derive their query timeout from the app's
+    /// `runtime.query.timeout`.
+    #[test]
+    fn test_query_timeout_derived_from_app_runtime() {
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .build();
+        assert_eq!(
+            ctx.query_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// Internal requests (acceleration refreshes, health checks) are exempt
+    /// from the app-derived query timeout.
+    #[test]
+    fn test_query_timeout_exempts_internal_protocol() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .build();
+        assert_eq!(ctx.query_timeout(), None);
+    }
+
+    /// Without an app (or with no `runtime.query.timeout` configured) no
+    /// timeout applies; an invalid configured value also resolves to no
+    /// timeout rather than failing the build.
+    #[test]
+    fn test_query_timeout_absent_or_invalid_resolves_to_none() {
+        let no_app = RequestContextBuilder::new(Protocol::Http).build();
+        assert_eq!(no_app.query_timeout(), None);
+
+        let invalid = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("not-a-duration")))
+            .build();
+        assert_eq!(invalid.query_timeout(), None);
+    }
+
+    /// An explicit `with_query_timeout` override wins over the app-derived
+    /// default and applies even to `Protocol::Internal` contexts.
+    #[test]
+    fn test_query_timeout_explicit_override_wins() {
+        let overridden = RequestContextBuilder::new(Protocol::Http)
+            .with_app_opt(Some(app_with_query_timeout("30s")))
+            .with_query_timeout(Some(std::time::Duration::from_secs(5)))
+            .build();
+        assert_eq!(
+            overridden.query_timeout(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        let internal = RequestContextBuilder::new(Protocol::Internal)
+            .with_query_timeout(Some(std::time::Duration::from_secs(5)))
+            .build();
+        assert_eq!(
+            internal.query_timeout(),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn test_with_cancellation_token_uses_supplied_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cancellation_token(token.clone())
+            .build();
+        token.cancel();
+        assert!(ctx.is_cancelled());
+    }
+}

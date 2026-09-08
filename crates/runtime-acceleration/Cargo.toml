@@ -1,0 +1,80 @@
+[package]
+description = "Acceleration support for the Spice runtime"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-acceleration"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+byte-unit.workspace = true
+app = { path = "../app" }
+arrow.workspace = true
+datafusion-table-providers.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
+async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+bytes.workspace = true
+chrono.workspace = true
+datafusion.workspace = true
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "extensions-full",
+], optional = true }
+fundu.workspace = true
+futures.workspace = true
+object_store.workspace = true
+opentelemetry.workspace = true
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-query-engine = { path = "../runtime-query-engine" }
+telemetry = { path = "../telemetry" }
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-object-store = { path = "../runtime-object-store" }
+runtime-secrets = { path = "../runtime-secrets" }
+rusqlite = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tar = "0.4"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+tracing.workspace = true
+turso = { workspace = true, optional = true }
+url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+utoipa = { workspace = true, optional = true }
+uuid = { version = "1", features = ["v7"] }
+
+[features]
+default = []
+duckdb = ["dep:duckdb"]
+openapi = ["dep:utoipa"]
+snapshots = []
+sqlite = ["dep:rusqlite"]
+# An `AccelerationSource` the engine crates can build in their own tests.
+test-support = []
+turso = ["dep:turso"]
+
+[dev-dependencies]
+anyhow = { workspace = true }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+futures.workspace = true
+hex = "0.4"
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+harness = false
+name = "snapshot_operations"
+
+[lints]
+workspace = true

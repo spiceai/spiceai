@@ -1,0 +1,16 @@
+---
+source: crates/llms/src/chat/nsql/mod.rs
+expression: req_str
+---
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. For tables with schemas and catalogs '\"catalog\".\"schema\".\"table\"' not '\"catalog.schema.table\"'."
+    }
+  ],
+  "model": "model_id",
+  "response_format": {
+    "type": "text"
+  }
+}

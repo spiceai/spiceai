@@ -1,0 +1,126 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug spiced",
+      "program": "${workspaceFolder}/target/debug/spiced",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build",
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug spice sql",
+      "program": "${workspaceFolder}/target/debug/spiced",
+      "args": ["--repl"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator (Search)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "search",
+        "--ready-wait",
+        "1800",
+        "--concurrency",
+        "10",
+        "-p",
+        "./test/spicepods/search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
+        "--benchmark-dataset",
+        "quora_retrieval"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Append)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "append",
+        "--ready-wait",
+        "300",
+        "--query-set",
+        "tpch",
+        "--load-steps",
+        "10",
+        "--load-interval",
+        "20",
+        "--duration",
+        "240",
+        "--with-conflict-data",
+        "--with-retention-data",
+        "-p",
+        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Dispatch)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "dispatch",
+        "./tools/testoperator/dispatch/tpch/sf1/accelerated/append/",
+        "--workflow",
+        "append",
+        "--github-token",
+        "<GITHUB_TOKEN>"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "name": "[Rust] spice version",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--package", "spice"],
+        "problemMatcher": "$rustc"
+      },
+      "args": ["version"],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "attach",
+      "name": "[Rust] Attach to spiced",
+      "program": "~/.spice/bin/spiced",
+      "pid": "${input:pid}"
+    },
+    {
+      "name": "[Rust] Debug runtime benchmark",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--package", "runtime", "--bench", "bench"],
+        "problemMatcher": "$rustc"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pid",
+      "type": "promptString",
+      "description": "pid of the process (Get this `pgrep spiced`)"
+    }
+  ]
+}

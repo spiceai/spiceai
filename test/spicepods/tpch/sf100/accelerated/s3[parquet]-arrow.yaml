@@ -1,0 +1,65 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-arrow
+
+# Limit query execution memory to prevent OOM on CI runner.
+# HashJoin cannot spill to disk, so the limit must be high enough to fit
+# the build side of the largest joins (Q18, Q20).
+runtime:
+  query:
+    memory_limit: 18GiB
+
+datasets:
+  - from: s3://benchmarks/tpch_sf100/customer.parquet
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration
+      enabled: true
+  # Limit large tables to prevent OOM on CI runner (https://github.com/spiceai/spiceai/issues/10729)
+  # lineitem: 120M/600M (~20%), orders: 30M/150M (~20%), partsupp: 16M/80M (~20%)
+  - from: s3://benchmarks/tpch_sf100/lineitem.parquet
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      enabled: true
+      # SF100 has 600M lineitem rows. Order keys go up to ~600M
+      # l_orderkey <= 120M keeps ~120M rows (~20%).
+      refresh_sql: 'SELECT * FROM lineitem WHERE l_orderkey <= 120000000'
+  - from: s3://benchmarks/tpch_sf100/nation.parquet
+    name: nation
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/orders.parquet
+    name: orders
+    params: *s3_params
+    acceleration:
+      enabled: true
+      # SF100 has 150M orders rows. Order keys are sparse (max ~600M, ~25% density).
+      # o_orderkey <= 120M keeps ~30M rows (~20%)
+      refresh_sql: 'SELECT * FROM orders WHERE o_orderkey <= 120000000'
+  - from: s3://benchmarks/tpch_sf100/part.parquet
+    name: part
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/partsupp.parquet
+    name: partsupp
+    params: *s3_params
+    acceleration:
+      enabled: true
+      # SF100 has 80M partsupp rows (20M parts × 4 suppliers each).
+      # ps_partkey <= 4M keeps 16M rows (~20%)
+      refresh_sql: 'SELECT * FROM partsupp WHERE ps_partkey <= 4000000'
+  - from: s3://benchmarks/tpch_sf100/region.parquet
+    name: region
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/supplier.parquet
+    name: supplier
+    params: *s3_params
+    acceleration: *acceleration

@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: rows_fmt
+---
++----+--------------+-------+
+| id | name         | score |
++----+--------------+-------+
+| 2  | Jane Smith   | 92    |
+| 4  | Emily Brown  | 89    |
+| 6  | Sarah Wilson | 94    |
+| 8  | Lisa Taylor  | 88    |
+| 10 | Anna Garcia  | 90    |
++----+--------------+-------+

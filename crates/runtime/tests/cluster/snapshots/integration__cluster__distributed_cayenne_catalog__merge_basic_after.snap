@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+assertion_line: 1190
+expression: plan
+---
++---------------+---------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: mcat.s.inventory.id, CAST(mcat.s.inventory.name AS LargeUtf8) AS name, mcat.s.inventory.qty |
+|               |   Sort: mcat.s.inventory.id ASC NULLS LAST                                                              |
+|               |     SubqueryAlias: mcat.s.inventory                                                                     |
+|               |       TableScan: mcat.s.inventory projection=[id, name, qty]                                            |
+| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name, qty@2 as qty]                      |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true       |
+|               |     CooperativeExec                                                                                     |
+|               |       BytesProcessedExec                                                                                |
+|               |         FlightSqlExec sql=SELECT id, name, qty FROM mcat.s.inventory ORDER BY id ASC NULLS LAST         |
+|               |                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------+

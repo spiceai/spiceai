@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q79"
+---
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt     | profit    |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+
+| Adair       | Kimberly     | Midway                               | 49022            | 0.00    | -3657.14  |
+| Adkins      | John         | Midway                               | 71388            | 0.00    | -6535.76  |
+| Ahrens      | Mario        | Midway                               | 14328            | 741.04  | -10403.59 |
+| Ainsworth   | Matthew      | Midway                               | 49453            | 2871.20 | -13930.22 |
+| Akins       | Kevin        | Midway                               | 60915            | 3891.54 | -12877.43 |
+| Aldridge    | Douglas      | Midway                               | 65237            | 648.68  | -5624.29  |
+| Allison     | Becky        | Midway                               | 17371            | 701.04  | -11451.79 |
+| Alvarez     | Donnell      | Midway                               | 70491            | 2798.69 | -1589.63  |
+| Alvarez     | Donnell      | Midway                               | 70491            |         |           |
+| Ames        | Tiffany      | Midway                               | 21978            | 874.53  | -8484.61  |
++-------------+--------------+--------------------------------------+------------------+---------+-----------+

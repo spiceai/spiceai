@@ -1,0 +1,1 @@
+SELECT l_linenumber FROM tpch.tpch.lineitem WHERE l_linenumber = (SELECT MAX(l_linenumber) FROM tpch.tpch.lineitem);

@@ -1,0 +1,13 @@
+name: 'Install PowerShell'
+description: 'Install PowerShell'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install PowerShell
+      shell: cmd
+      run: |
+        curl -L -o pwsh.msi https://github.com/PowerShell/PowerShell/releases/download/v7.4.0/PowerShell-7.4.0-win-x64.msi
+        msiexec /i pwsh.msi /quiet /qn /norestart
+        REM Verify PowerShell version
+        "C:\Program Files\PowerShell\7\pwsh" -Command "$PSVersionTable.PSVersion"
+        echo C:\Program Files\PowerShell\7>> %GITHUB_PATH%

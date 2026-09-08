@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: "format!(\"{schema}\")"
+---
+Field { "document_id": nullable LargeUtf8 }, Field { "doc_content": nullable LargeUtf8 }, Field { "compression": nullable LargeUtf8 }, Field { "compression_level": nullable Int64 }, Field { "ingested_at": nullable Timestamp(µs) }, Field { "method": nullable LargeUtf8 }, Field { "filename": nullable LargeUtf8 }, Field { "size": nullable Float64 }, Field { "_row_id": nullable Int64 }, Field { "_row_commit_version": nullable Float64 }, Field { "day": Utf8 }, Field { "_location": nullable Utf8 }

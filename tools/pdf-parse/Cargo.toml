@@ -1,0 +1,19 @@
+[package]
+description = "Parses a PDF with either the liteparse (PDFium) backend or the pdf-inspector (pure-Rust) backend so their extracted text can be compared"
+edition.workspace = true
+license-file.workspace = true
+name = "pdf-parse"
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+clap = { workspace = true, features = ["derive"] }
+document_parse = { path = "../../crates/document_parse" }
+pdf-inspector = "0.1.7"
+serde_json.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

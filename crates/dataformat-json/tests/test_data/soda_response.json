@@ -1,0 +1,63 @@
+{
+  "meta": {
+    "view": {
+      "id": "test-1234",
+      "name": "Test Dataset",
+      "columns": [
+        {
+          "id": -1,
+          "name": "sid",
+          "fieldName": ":sid",
+          "dataTypeName": "meta_data",
+          "position": 0,
+          "renderTypeName": "meta_data"
+        },
+        {
+          "id": -1,
+          "name": "id",
+          "fieldName": ":id",
+          "dataTypeName": "meta_data",
+          "position": 1,
+          "renderTypeName": "meta_data"
+        },
+        {
+          "id": 1,
+          "name": "City",
+          "fieldName": "city",
+          "dataTypeName": "text",
+          "position": 2,
+          "renderTypeName": "text"
+        },
+        {
+          "id": 2,
+          "name": "Population",
+          "fieldName": "population",
+          "dataTypeName": "number",
+          "position": 3,
+          "renderTypeName": "number"
+        },
+        {
+          "id": -1,
+          "name": "created_at",
+          "fieldName": ":created_at",
+          "dataTypeName": "meta_data",
+          "position": 4,
+          "renderTypeName": "meta_data"
+        },
+        {
+          "id": 3,
+          "name": "Active",
+          "fieldName": "active",
+          "dataTypeName": "checkbox",
+          "position": 5,
+          "renderTypeName": "checkbox"
+        }
+      ]
+    }
+  },
+  "data": [
+    ["row-sid-1", 1, "Seattle", 750000, "2024-01-01T00:00:00", true],
+    ["row-sid-2", 2, "Portland", 650000, "2024-01-02T00:00:00", false],
+    ["row-sid-3", 3, "Vancouver", 700000, "2024-01-03T00:00:00", true]
+  ]
+}

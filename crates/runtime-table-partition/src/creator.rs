@@ -1,0 +1,99 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{any::Any, fmt::Debug};
+
+use async_trait::async_trait;
+use datafusion::{
+    common::Constraints, error::DataFusionError, logical_expr::TableProviderFilterPushDown,
+    prelude::Expr, scalar::ScalarValue,
+};
+use snafu::prelude::*;
+
+use crate::Partition;
+
+pub mod filename;
+
+type StdError = Box<dyn std::error::Error + Send + Sync>;
+
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display("Failed to create an accelerated partition: {source}"))]
+    CreatePartition { source: StdError },
+    #[snafu(display("Failed to infer accelerated partitions: {source}"))]
+    InferringPartitions { source: StdError },
+    #[snafu(display(
+        "The 'partition_by' expressions are different from the expressions used to create the existing partition files. Revert the 'partition_by' expressions, delete the partition files, or change the location the partition files are stored to create new partitions."
+    ))]
+    PartitionByExpressionsChanged,
+}
+
+#[async_trait]
+pub trait PartitionCreator: AsAny + Debug + Send + Sync {
+    /// Whether partitions this creator produces accept writes addressed to the
+    /// partition table itself, rather than only through the creating engine's
+    /// own insert path. Only such creators can be the target of a partitioned
+    /// dual-write.
+    ///
+    /// Defaults to `false`: a creator opts in, so a new implementation is never
+    /// silently treated as dual-writable.
+    fn accepts_direct_partition_writes(&self) -> bool {
+        false
+    }
+    /// Create a new [`Partition`] using the given partition values.
+    ///
+    /// For single-column partitions, pass a single-element vector.
+    /// For composite partitions (e.g., `partition_by: [year, month]`), pass
+    /// multiple values in the same order as the partition expressions.
+    ///
+    /// # Errors
+    /// Returns an error when creating a [`Partition`] is unsuccessful.
+    async fn create_partition(
+        &self,
+        partition_values: Vec<ScalarValue>,
+    ) -> Result<Partition, Error>;
+
+    /// Find and load previously created [`Partition`]s
+    ///
+    /// # Errors
+    /// Returns an error when [`Partition`]s cannot be inferred.
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, Error>;
+
+    /// See [`TableProvider::supports_filters_pushdown`].
+    ///
+    /// # Errors
+    /// See [`TableProvider::supports_filters_pushdown`].
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
+
+    /// Returns the constraints (primary key, unique, etc.) for partitions.
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
+}

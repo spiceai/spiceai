@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/ready_state/mod.rs
+expression: explain_str
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                            |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                       |
+|               |  Projection: native_on_schema_resolved_duckdb.id                                                                                                                |
+|               |   TableScan: native_on_schema_resolved_duckdb projection=[id]                                                                                                   |
+| physical_plan | SchemaCastScanExec                                                                                                                                              |
+|               |   CooperativeExec                                                                                                                                               |
+|               |     BytesProcessedExec                                                                                                                                          |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "native_on_schema_resolved_duckdb"."id" FROM "native_on_schema_resolved_duckdb" |
+|               |                                                                                                                                                                 |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------+

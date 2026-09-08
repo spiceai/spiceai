@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q16"
+---
++----------+--------------------------+--------+--------------+
+| p_brand  | p_type                   | p_size | supplier_cnt |
++----------+--------------------------+--------+--------------+
+| Brand#14 | STANDARD POLISHED COPPER | 3      | 168          |
+| Brand#44 | STANDARD PLATED TIN      | 9      | 168          |
+| Brand#13 | MEDIUM BRUSHED COPPER    | 3      | 164          |
+| Brand#33 | STANDARD ANODIZED BRASS  | 49     | 160          |
+| Brand#35 | PROMO BURNISHED TIN      | 9      | 160          |
+| Brand#42 | MEDIUM ANODIZED NICKEL   | 49     | 160          |
+| Brand#11 | SMALL BRUSHED STEEL      | 45     | 156          |
+| Brand#14 | ECONOMY BRUSHED COPPER   | 19     | 156          |
+| Brand#15 | ECONOMY ANODIZED COPPER  | 23     | 156          |
+| Brand#34 | ECONOMY POLISHED BRASS   | 19     | 156          |
++----------+--------------------------+--------+--------------+

@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/cluster/in_memory_shuffle.rs
+expression: pretty
+---
++-------+-------+
+| name  | score |
++-------+-------+
+| Frank | 95    |
+| Mia   | 93    |
+| Diana | 92    |
+| Ivy   | 91    |
+| Bob   | 90    |
++-------+-------+

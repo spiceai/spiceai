@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+snapshot_kind: text
+---
+[
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  },
+  {
+    "subject": "math"
+  }
+]

@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q74"
+---
++------------------+---------------------+--------------------+
+| customer_id      | customer_first_name | customer_last_name |
++------------------+---------------------+--------------------+
+| AAAAAAAAFHACBAAA |                     |                    |
+| AAAAAAAABKOPAAAA | Gary                |                    |
+| AAAAAAAAIADEBAAA | Diane               | Aldridge           |
+| AAAAAAAALIOPAAAA | Derek               | Allen              |
+| AAAAAAAAIBHHAAAA | Jennifer            | Ballard            |
+| AAAAAAAAHMJNAAAA | Ryan                | Baptiste           |
+| AAAAAAAACGKBBAAA | Betty               | Bell               |
+| AAAAAAAAKBCABAAA | Debra               | Bell               |
+| AAAAAAAAHJLAAAAA | Audrey              | Beltran            |
+| AAAAAAAAEOAKAAAA | Molly               | Benjamin           |
++------------------+---------------------+--------------------+

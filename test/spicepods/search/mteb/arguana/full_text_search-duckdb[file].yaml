@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: full_text_search-duckdb[file]
+datasets:
+
+  # MTEB ArguAna Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
+  # https://huggingface.co/datasets/mteb/arguana
+
+  - from: file:./corpus.parquet
+    name: corpus
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+    columns:
+      - name: text
+        full_text_search:
+          enabled: true
+          row_id:
+            - _id
+
+  - from: file:./queries.parquet
+    name: test_queries
+    acceleration:
+      enabled: true
+
+  - from: file:./data.parquet
+    name: relevance_data
+    acceleration:

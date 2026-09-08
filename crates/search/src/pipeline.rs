@@ -1,0 +1,361 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+     https://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
+use datafusion::{
+    catalog::TableProvider,
+    common::Column,
+    datasource::DefaultTableSource,
+    error::DataFusionError,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Expr as SqlExpr, Value, ValueWithSpan},
+            dialect::GenericDialect,
+            parser::Parser,
+            tokenizer::Token,
+        },
+    },
+};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
+use itertools::Itertools;
+use snafu::{ResultExt, Snafu};
+use util::format_datafusion_error;
+
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
+    aggregation::{self, AggregationResult, CandidateAggregation, Error as AggregationError},
+    generation::{self, CandidateGeneration},
+};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error occurred retrieving candidate search results: {source}"))]
+    CandidateGenerationError { source: generation::Error },
+
+    #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
+    CandidateAggregationError { source: aggregation::Error },
+
+    #[snafu(display(
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {}",
+        format_datafusion_error(source)
+    ))]
+    SearchRequestConstructionError { source: DataFusionError },
+
+    #[snafu(display("An invalid keyword was specified: {keyword}"))]
+    InvalidKeyword { keyword: String },
+}
+
+impl Error {
+    #[must_use]
+    pub fn is_user_error(&self) -> bool {
+        matches!(self, Error::CandidateAggregationError { source } if source.is_user_error())
+    }
+}
+
+pub use runtime_query_engine::query_engine::QueryEngine;
+
+pub struct SearchPipeline<A>
+where
+    A: CandidateAggregation,
+{
+    generators: Vec<Arc<dyn CandidateGeneration>>,
+    aggregator: A,
+    engine: Arc<dyn QueryEngine>,
+}
+
+fn candidate_pool_limit<A: CandidateAggregation>(
+    aggregator: &A,
+    generator_count: usize,
+    limit: usize,
+) -> usize {
+    // A single generator is returned directly by RRF, so it must retain the
+    // user-visible limit. Only multiple generators can benefit from a wider
+    // pre-fusion candidate pool.
+    if generator_count > 1 {
+        aggregator.candidate_pool_size(limit)
+    } else {
+        limit
+    }
+}
+
+impl<A: CandidateAggregation> SearchPipeline<A> {
+    #[must_use]
+    pub fn new(
+        generators: Vec<Arc<dyn CandidateGeneration>>,
+        aggregator: A,
+        engine: Arc<dyn QueryEngine>,
+    ) -> Self {
+        SearchPipeline {
+            generators,
+            aggregator,
+            engine,
+        }
+    }
+
+    /// Runs the search pipeline with the provided parameters.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn run(
+        &self,
+        query: String,
+        tbl: &TableReference,
+        opt_filter: Option<Expr>,
+        addition_projection: Vec<Expr>,
+        primary_keys: Vec<Column>,
+        keywords: &[String],
+        limit: usize,
+    ) -> std::result::Result<Option<AggregationResult>, Error> {
+        let columns: Vec<_> = [
+            primary_keys.iter().map(|c| col(c.clone())).collect(),
+            addition_projection,
+            vec![ident(SEARCH_SCORE_COLUMN_NAME)],
+        ]
+        .concat()
+        .into_iter()
+        .unique()
+        .collect();
+
+        let candidate_limit = candidate_pool_limit(&self.aggregator, self.generators.len(), limit);
+
+        let generation_results: Vec<VectorSearchGenerationResult> =
+            futures::future::try_join_all(self.generators.iter().map(|g| async {
+                let content_col = g.value_derived_from();
+
+                // The column name for each `.generator` will be different, and therefore the
+                // keyword filter [`Expr`] must be made differently.
+                let mut filters = prepare_keywords(keywords, &content_col)?;
+                if let Some(ref f) = opt_filter {
+                    filters.push(f.clone());
+                }
+
+                let mut columns = columns.clone();
+                columns.push(ident(g.value_projection_name()).alias(SEARCH_VALUE_COLUMN_NAME));
+
+                let lp = construct_logical_plan(
+                    g.search(query.clone())
+                        .context(SearchRequestConstructionSnafu)?,
+                    tbl,
+                    columns,
+                    filters,
+                    &primary_keys,
+                    Some(candidate_limit),
+                )
+                .context(SearchRequestConstructionSnafu)?;
+
+                let data = self.engine.execute_plan(lp).await.map_err(|e| {
+                    Error::CandidateGenerationError {
+                        source: generation::Error::InternalError {
+                            source: Box::new(e),
+                        },
+                    }
+                })?;
+
+                Ok(VectorSearchGenerationResult {
+                    data,
+                    derived_from: content_col,
+                })
+            }))
+            .await?;
+
+        match self
+            .aggregator
+            .aggregate(generation_results, primary_keys, limit)
+            .await
+        {
+            Ok(a) => Ok(Some(a)),
+            Err(AggregationError::NoCandidatesGenerated) => Ok(None),
+            Err(e) => Err(e).context(CandidateAggregationSnafu),
+        }
+    }
+}
+
+fn construct_logical_plan(
+    tbl: Arc<dyn TableProvider>,
+    name: &TableReference,
+    columns: Vec<Expr>,
+    filters: Vec<Expr>,
+    primary_keys: &[Column],
+    limit: Option<usize>,
+) -> Result<LogicalPlan, DataFusionError> {
+    let mut scan =
+        LogicalPlanBuilder::scan(name.clone(), Arc::new(DefaultTableSource::new(tbl)), None)?;
+
+    if let Some(filter) = filters.into_iter().reduce(Expr::and) {
+        scan = scan.filter(filter)?;
+    }
+    let mut sort_exprs = vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)];
+    sort_exprs.extend(
+        primary_keys
+            .iter()
+            .map(|pk| SortExpr::new(col(pk.clone()), true, true)),
+    );
+    scan.project(columns)?
+        .sort_with_limit(sort_exprs, limit)?
+        .build()
+}
+
+/// Convert each keyword into an `ILIKE %keyword%` [`Expr`].
+///
+/// Also validates keywords against being SQL injections.
+fn prepare_keywords(keywords: &[String], column: &str) -> Result<Vec<Expr>, Error> {
+    keywords
+        .iter()
+        .map(|k| validate_keyword_to_ilike(k, column))
+        .collect::<Result<Vec<Expr>, Error>>()
+}
+
+/// Ensure the provided keywords are valid string literal, useable as a keyword in an ILIKE expression (i.e. no SQL injection).
+pub fn valid_keywords(keywords: &[String]) -> Result<Vec<String>, Error> {
+    keywords
+        .iter()
+        .map(|k| {
+            validate_keyword_to_ilike(k.as_str(), "target_column")?; // emulate the use of the keyword in the query.
+            Ok(k.clone())
+        })
+        .collect::<Result<Vec<String>, _>>()
+}
+
+pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, Error> {
+    let lower = k.to_lowercase();
+    let pattern = format!("%{lower}%");
+    let expression = format!("{target_column} ILIKE '{pattern}'");
+    let parser = Parser::new(&GenericDialect {});
+    let mut parser = parser.try_with_sql(&expression).map_err(|err| {
+        tracing::trace!("failed to parse 'keywords' for search. {err}");
+        Error::InvalidKeyword {
+            keyword: k.to_string(),
+        }
+    })?;
+
+    // The keyword will exist on its own if nothing else is present.
+    let ilike_expr = parser.parse_expr().map_err(|err| {
+        tracing::trace!("failed to parse 'keywords' for search. {err}");
+        Error::InvalidKeyword {
+            keyword: k.to_string(),
+        }
+    })?;
+
+    let SqlExpr::ILike {
+        expr,
+        pattern: parsed_pattern,
+        ..
+    } = &ilike_expr
+    else {
+        tracing::trace!(
+            "failed to parse 'keywords' for search. expected ILIKE, but got {ilike_expr:?}"
+        );
+        return Err(Error::InvalidKeyword {
+            keyword: k.to_string(),
+        });
+    };
+
+    if let (
+        SqlExpr::Identifier(id),
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(v),
+            ..
+        }),
+    ) = (expr.as_ref(), parsed_pattern.as_ref())
+    {
+        if id.value != target_column {
+            tracing::trace!(
+                "failed to parse 'keywords' for search. expected {target_column}, but got {}",
+                id.value
+            );
+            return Err(Error::InvalidKeyword {
+                keyword: k.to_string(),
+            });
+        }
+
+        if v != &pattern {
+            tracing::trace!(
+                "failed to parse 'keywords' for search. expected '{pattern}', but got {v}"
+            );
+            return Err(Error::InvalidKeyword {
+                keyword: k.to_string(),
+            });
+        }
+    } else {
+        tracing::trace!(
+            "failed to parse 'keywords' for search. expected identifiers, but got {expr:?} - {parsed_pattern:?}"
+        );
+        return Err(Error::InvalidKeyword {
+            keyword: k.to_string(),
+        });
+    }
+
+    // Ensure the expression is the last token.
+    let next_token = parser.next_token();
+    if next_token != Token::EOF {
+        tracing::trace!(
+            "failed to parse 'keywords' for search. expected EOF, but got {next_token:?}"
+        );
+        return Err(Error::InvalidKeyword {
+            keyword: k.to_string(),
+        });
+    }
+
+    Ok(ident(target_column).ilike(lit(pattern)))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::aggregation::reciprocal_rank::ReciprocalRankFusion;
+
+    /// Regression test for #12242: the HTTP pipeline gives every RRF leg a
+    /// wider candidate pool, but does not widen a direct single-leg response.
+    #[test]
+    fn rrf_candidate_limit_is_widened_only_for_fusion() {
+        assert_eq!(candidate_pool_limit(&ReciprocalRankFusion, 2, 10), 40);
+        assert_eq!(candidate_pool_limit(&ReciprocalRankFusion, 1, 10), 10);
+    }
+
+    #[test]
+    fn test_search_request_prepare_keywords() {
+        let keywords = vec![
+            "keyword1".to_string(),
+            "\"key word2\"".to_string(),
+            "key word3".to_string(),
+            "keYwOrD4".to_string(),
+        ];
+        // Test all lowercase
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hello")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+
+        // Test with casing
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hElLo")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+    }
+
+    #[test]
+    fn test_search_request_parse_keywords() {
+        let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
+        let result = valid_keywords(&keywords);
+        result.expect("should be valid search keywords");
+
+        // Test keyword with a space
+        let keywords = vec!["keyword 1".to_string()];
+        let result = valid_keywords(&keywords);
+        result.expect("should be valid search keywords");
+
+        // Test empty keyword
+        let keywords = vec![String::new()];
+        let result = valid_keywords(&keywords);
+        result.expect("should be valid search keywords");
+
+        // Test escaping keyword
+        let keywords = vec!["'); DROP TABLE testing;".to_string()];
+        let result = valid_keywords(&keywords);
+        result.expect_err("should be invalid search keywords");
+    }
+}

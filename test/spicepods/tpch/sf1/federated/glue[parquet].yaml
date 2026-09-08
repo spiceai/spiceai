@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: glue[parquet]-federated
+
+datasets:
+  - from: glue:tpch.customer
+    name: customer
+    params: &glue_params
+      glue_region: us-east-1
+      glue_key: ${secrets:GLUE_AWS_KEY}
+      glue_secret: ${secrets:GLUE_AWS_SECRET}
+  - from: glue:tpch.lineitem
+    name: lineitem
+    params: *glue_params
+  - from: glue:tpch.nation
+    name: nation
+    params: *glue_params
+  - from: glue:tpch.orders
+    name: orders
+    params: *glue_params
+  - from: glue:tpch.part
+    name: part
+    params: *glue_params
+  - from: glue:tpch.partsupp
+    name: partsupp
+    params: *glue_params
+  - from: glue:tpch.region
+    name: region
+    params: *glue_params
+  - from: glue:tpch.supplier
+    name: supplier
+    params: *glue_params

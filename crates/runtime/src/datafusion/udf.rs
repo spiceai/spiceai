@@ -1,0 +1,1541 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use crate::datafusion::udtf::flatten_json::{
+    FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
+};
+use crate::datafusion::udtf::json_properties::{
+    FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
+};
+use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
+use crate::embeddings::udtf::VectorSearchTableFunc;
+use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
+use datafusion::execution::FunctionRegistry;
+use datafusion::logical_expr::ScalarUDF;
+use datafusion::prelude::SessionContext;
+use parking_lot::RwLock;
+#[cfg(feature = "models")]
+use runtime_datafusion_udfs::{ai::Ai, embed};
+// The UDF *names* are no longer part of any production path here — each function
+// registers its own deny-list entry — but both test modules still assert against
+// them, so they are imported for tests only.
+#[cfg(all(test, feature = "models"))]
+use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
+use runtime_query_engine::query_engine::QueryEngine;
+use runtime_search::full_text_udtf::TextSearchTableFunc;
+use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
+use runtime_search::rrf;
+use runtime_search::rrf::RRF_UDF_NAME;
+use runtime_search::search_engine::parse_explicit_primary_keys;
+use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
+use runtime_secrets::{ExposeSecret, get_params_with_secrets};
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
+// `runtime-datafusion-udfs` gates its `embed` module on `models`, so without that
+// feature the name has no registration there — but `embed` must still be denied,
+// so register it here alongside the fallback constant.
+#[cfg(not(feature = "models"))]
+runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION_FALLBACK, EMBED_UDF_NAME);
+use serde_json::Value;
+use spicepod::component::function::{Function, FunctionKind, Volatility};
+use util::in_tracing_context_async;
+
+// `rand` is a Spice alias over DataFusion's `RandomFunc`, registered by
+// `register_core_scalar_udfs` below, so its deny-list entry is declared here
+// rather than in a UDF crate.
+runtime_udfs_api::register_spice_function!(RAND_SPICE_FUNCTION, "rand");
+
+pub use runtime_datafusion::udf::register_core_scalar_udfs;
+
+pub async fn register_udfs(runtime: &crate::Runtime) {
+    let ctx = &runtime.df.ctx;
+    register_core_scalar_udfs(ctx);
+
+    ctx.register_udf(
+        TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )
+        .into(),
+    );
+    ctx.register_udtf(
+        TEXT_SEARCH_UDTF_NAME,
+        Arc::new(TextSearchTableFunc::new(
+            Arc::downgrade(&runtime.df) as _,
+            crate::search::util::RuntimeTableProviderExplorer,
+        )),
+    );
+
+    // `executor_table('endpoint','table')` — fetch a peer executor's partition
+    // of a table over Flight SQL (the distributed broadcast-join primitive).
+    ctx.register_udtf(
+        EXECUTOR_TABLE_UDTF_NAME,
+        Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
+    );
+
+    let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
+    ctx.register_udf(
+        VectorSearchTableFunc::new(Arc::downgrade(&runtime.df), explicit_pks.clone()).into(),
+    );
+    ctx.register_udtf(
+        VECTOR_SEARCH_UDTF_NAME,
+        Arc::new(VectorSearchTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            explicit_pks,
+        )),
+    );
+
+    ctx.register_udf(rrf::ReciprocalRankFusion::from_ctx(ctx).into());
+    ctx.register_udtf(
+        RRF_UDF_NAME,
+        Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
+    );
+
+    // `rerank(input, model => ..., document => ..., ...)` — reorders a
+    // scored result set using a reranker model. Registered as both a scalar
+    // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
+    // list, same trick vector_search/text_search/rrf use) and a UDTF (the
+    // actual `FROM rerank(...)` implementation).
+    let weak_df: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
+        Arc::downgrade(&runtime.df) as _;
+    ctx.register_udf(
+        RerankTableFunc::new(
+            std::sync::Weak::clone(&weak_df),
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )
+        .into(),
+    );
+    ctx.register_udtf(
+        RERANK_UDTF_NAME,
+        Arc::new(RerankTableFunc::new(
+            weak_df,
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )),
+    );
+
+    // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
+    // and generic JSON shredders. Registered as both UDTF (FROM-clause,
+    // literal input) and ScalarUDF returning `List<Struct<...>>` (per-row /
+    // LATERAL via UNNEST).
+    ctx.register_udtf(
+        FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        Arc::new(FlattenJsonPropertiesTableFunc::new()),
+    );
+    ctx.register_udf(FlattenJsonPropertiesScalar::new().into());
+    ctx.register_udtf(
+        FLATTEN_JSON_UDTF_NAME,
+        Arc::new(FlattenJsonTableFunc::new()),
+    );
+    ctx.register_udf(FlattenJsonScalar::new().into());
+    ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
+    ctx.register_udf(JsonTreeScalar::new().into());
+
+    #[cfg(feature = "models")]
+    {
+        ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
+        ctx.register_udf(
+            Ai::new(runtime.completion_llms(), runtime.model_rate_controllers())
+                .into_async_udf()
+                .into_scalar_udf(),
+        );
+    }
+
+    in_tracing_context_async(register_user_functions(runtime, ctx)).await;
+}
+
+/// Emits the user-defined functions BETA warning at most once per
+/// process. Called from both startup registration and hot-reload so the
+/// user sees it whenever a `functions:` entry becomes active for the
+/// first time.
+fn warn_beta_once() {
+    static BETA_WARNING: std::sync::Once = std::sync::Once::new();
+    BETA_WARNING.call_once(|| {
+        let supported_sources = runtime_datafusion_udfs::user_functions::supported_schemes();
+        tracing::warn!(
+            "User-defined functions (spicepod `functions:` section) are in BETA. Supported sources in this build are {supported_sources}; APIs and on-disk \
+             format may change before general availability. See: \
+             https://spiceai.org/docs/reference/spicepod/functions"
+        );
+    });
+}
+
+async fn register_user_functions(runtime: &crate::Runtime, ctx: &SessionContext) {
+    let Some(app) = runtime.read_app().await else {
+        return;
+    };
+    if app.functions.is_empty() {
+        return;
+    }
+    if !app.runtime.functions.enabled {
+        tracing::error!(
+            "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
+        );
+        return;
+    }
+
+    warn_beta_once();
+
+    let enabled_functions = enabled_function_declarations(&app.functions);
+    if enabled_functions.is_empty() {
+        return;
+    }
+
+    let enabled_functions = resolve_function_params(runtime.secrets(), &enabled_functions).await;
+    let (built, errors) =
+        runtime_datafusion_udfs::user_functions::build_all(&enabled_functions).await;
+    for err in &errors {
+        tracing::error!("{err}");
+    }
+
+    let mut registered_function_names = Vec::new();
+    let mut functions_to_expose_as_tools = Vec::new();
+    for (decl, built) in built {
+        match built {
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udf(udf.as_ref().clone());
+                registered_function_names.push(decl.name.clone());
+                if function_executes_code(&decl) {
+                    add_code_executing_function(&decl.name);
+                }
+                upsert_user_function_info(info_from_decl(&decl));
+                tracing::info!(
+                    name = %decl.name,
+                    from = %decl.from,
+                    "Registered user function"
+                );
+                functions_to_expose_as_tools.push(decl);
+            }
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &decl.name) {
+                    tracing::error!(name = %decl.name, existing_name = %existing_name, "Failed to register user table function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udtf(&decl.name, udtf);
+                registered_function_names.push(decl.name.clone());
+                if function_executes_code(&decl) {
+                    add_code_executing_function(&decl.name);
+                }
+                upsert_user_function_info(info_from_decl(&decl));
+                tracing::info!(
+                    name = %decl.name,
+                    from = %decl.from,
+                    "Registered user table function"
+                );
+                if decl.as_tool {
+                    tracing::warn!(name = %decl.name, "User table functions cannot be exposed as tools; skipping tool exposure");
+                }
+            }
+        }
+    }
+    add_user_functions_to_deny_list(registered_function_names);
+    for decl in functions_to_expose_as_tools {
+        maybe_register_function_as_tool(runtime, &decl).await;
+    }
+}
+
+/// If `decl.as_tool` is true, construct a [`FunctionAsTool`] adapter and
+/// insert it into the runtime's tool registry. Failures to build the
+/// adapter (unsupported types) are logged at WARN and do not fail
+/// function registration — the function remains callable via SQL.
+///
+/// When a tool is already registered under the same name (either a built-in
+/// or a spicepod `tools:` entry loaded earlier) we log at WARN and skip —
+/// silent overwrites were the pre-review behaviour and would mask
+/// misconfiguration.
+async fn maybe_register_function_as_tool(runtime: &crate::Runtime, decl: &Function) {
+    if !decl.as_tool {
+        return;
+    }
+    let df_dyn = Arc::clone(&runtime.df) as Arc<dyn QueryEngine>;
+    let df_weak = Arc::downgrade(&df_dyn);
+    match runtime_tools::builtin::function_tool::build(decl, df_weak) {
+        Ok(adapter) => {
+            let tool: Arc<dyn tools::SpiceModelTool> = Arc::new(adapter);
+            let name = decl.name.clone();
+            let mut tools_map = runtime.tools.write().await;
+            if tools_map.contains_key(&name) {
+                tracing::warn!(
+                    name = %name,
+                    "Name collision — a tool with this name is already registered; \
+                     not exposing the function as a tool. Rename one, or set `as_tool: false` on the function."
+                );
+                return;
+            }
+            tools_map.insert(name.clone(), crate::tools::Tooling::FunctionTool(tool));
+            tracing::info!(name = %name, "Exposed user function as tool");
+        }
+        Err(e) => {
+            tracing::warn!(
+                name = %decl.name,
+                "Skipping tool exposure for user function: {e}"
+            );
+        }
+    }
+}
+
+/// Register an async-backed [`ScalarUDF`] into the session context and
+/// add its name to the federation deny-list in one call. Used by the
+/// tool→SQL bridge so the tool-registration path doesn't need to know
+/// about the deny-list as an implementation detail.
+pub fn register_async_user_udf(ctx: &SessionContext, udf: &ScalarUDF, name: &str) -> bool {
+    if let Some(existing_name) = registered_scalar_udf_name(ctx, name) {
+        tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+        return false;
+    }
+    if let Some(existing_name) = registered_table_udf_name(ctx, name) {
+        tracing::warn!(name = %name, existing_name = %existing_name, "Skipping async user UDF registration because a table function with this name is already registered; rename the function to avoid changing query semantics");
+        return false;
+    }
+    ctx.register_udf(udf.clone());
+    add_user_function_to_deny_list(name);
+    add_code_executing_function(name);
+    true
+}
+
+/// Return the exact registered scalar UDF name that collides with `name`, if any.
+#[must_use]
+pub fn registered_scalar_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+    ctx.udfs()
+        .into_iter()
+        .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
+}
+
+/// Return the exact registered table-function name that collides with `name`, if any.
+#[must_use]
+pub fn registered_table_udf_name(ctx: &SessionContext, name: &str) -> Option<String> {
+    ctx.state()
+        .table_functions()
+        .keys()
+        .find(|registered_name| registered_name.eq_ignore_ascii_case(name))
+        .cloned()
+}
+
+fn function_executes_code(decl: &Function) -> bool {
+    let scheme = decl
+        .from
+        .split_once(':')
+        .map_or(decl.from.as_str(), |(scheme, _)| scheme)
+        .to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https")
+}
+
+fn enabled_function_declarations(functions: &[Function]) -> Vec<Function> {
+    functions
+        .iter()
+        .filter(|decl| decl.enabled)
+        .cloned()
+        .collect()
+}
+
+async fn resolve_function_params(
+    secrets: Arc<tokio::sync::RwLock<runtime_secrets::Secrets>>,
+    functions: &[Function],
+) -> Vec<Function> {
+    let mut resolved = Vec::with_capacity(functions.len());
+    for decl in functions {
+        let mut decl = decl.clone();
+        let string_params = decl
+            .params
+            .iter()
+            .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_string())))
+            .collect::<HashMap<_, _>>();
+        if !string_params.is_empty() {
+            let params_with_secrets =
+                get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
+            for (key, value) in params_with_secrets {
+                decl.params
+                    .insert(key, Value::String(value.expose_secret().to_string()));
+            }
+        }
+        resolved.push(decl);
+    }
+    resolved
+}
+
+pub(crate) fn effective_user_function_volatility(decl: &Function) -> &'static str {
+    match decl.volatility {
+        Volatility::Immutable if function_executes_code(decl) => "stable",
+        Volatility::Immutable => "immutable",
+        Volatility::Stable => "stable",
+        Volatility::Volatile => "volatile",
+    }
+}
+
+fn info_from_decl(decl: &Function) -> UserFunctionInfo {
+    UserFunctionInfo {
+        name: decl.name.clone(),
+        kind: decl.kind.as_str().to_string(),
+        volatility: effective_user_function_volatility(decl).to_string(),
+        from: decl.from.clone(),
+        description: decl.description.clone(),
+    }
+}
+
+/// Rebuild + re-register user functions against `new_app`, removing any
+/// that are no longer declared. Called on spicepod hot-reload.
+///
+/// Discards the cached logical plans when the registered set changes: a
+/// cached plan embeds the `Arc<ScalarUDF>` it was planned against, so it
+/// keeps evaluating a dropped or redefined function's own body no matter
+/// what the session context now holds for that name. Dataset and view
+/// registration already discard them for the same reason.
+pub async fn apply_function_diff(
+    runtime: &crate::Runtime,
+    current_app: &Arc<app::App>,
+    new_app: &Arc<app::App>,
+) {
+    if apply_function_diff_inner(runtime, current_app, new_app).await {
+        runtime.df.clear_cached_plans().await;
+    }
+}
+
+/// The body of [`apply_function_diff`]. Returns whether the registered set
+/// changed, which is what makes a cached plan over a user function stale.
+async fn apply_function_diff_inner(
+    runtime: &crate::Runtime,
+    current_app: &Arc<app::App>,
+    new_app: &Arc<app::App>,
+) -> bool {
+    let ctx = &runtime.df.ctx;
+    let current_enabled = current_app.runtime.functions.enabled;
+    let new_enabled = new_app.runtime.functions.enabled;
+
+    // First pass: collect every function that needs to go away (removed or
+    // changed). Do all the lock-free work (DF deregister, deny-list, info
+    // registry) first so the tools-map write lock is held only once for the
+    // batch of tool drops.
+    let mut functions_to_drop: Vec<String> = Vec::new();
+    let mut tools_to_drop: Vec<String> = Vec::new();
+    for current in &current_app.functions {
+        let current_registered = current_enabled && current.enabled;
+        let needs_drop = current_registered
+            && match new_app.functions.iter().find(|f| f.name == current.name) {
+                Some(next) => !new_enabled || !next.enabled || next != current,
+                None => true,
+            };
+        if needs_drop {
+            match current.kind {
+                FunctionKind::Scalar => {
+                    ctx.deregister_udf(&current.name);
+                }
+                FunctionKind::Table => {
+                    ctx.deregister_udtf(&current.name);
+                }
+            }
+            functions_to_drop.push(current.name.clone());
+            remove_code_executing_function(&current.name);
+            remove_user_function_info(&current.name);
+            if current.kind == FunctionKind::Scalar && current.as_tool {
+                tools_to_drop.push(current.name.clone());
+            }
+            tracing::info!(name = %current.name, "Deregistered user function");
+        }
+    }
+    remove_user_functions_from_deny_list(&functions_to_drop);
+    if !tools_to_drop.is_empty() {
+        let mut tools_map = runtime.tools.write().await;
+        for name in &tools_to_drop {
+            if matches!(
+                tools_map.get(name),
+                Some(crate::tools::Tooling::FunctionTool(_))
+            ) {
+                tools_map.remove(name);
+            }
+        }
+    }
+
+    if new_app.functions.is_empty() {
+        return !functions_to_drop.is_empty();
+    }
+    if !new_enabled {
+        tracing::error!(
+            "User-defined functions are declared but disabled. Set `runtime.functions.enabled: true` to register spicepod `functions:` entries."
+        );
+        return !functions_to_drop.is_empty();
+    }
+
+    let functions_to_register = new_app
+        .functions
+        .iter()
+        .filter(|next| next.enabled)
+        .filter(|next| {
+            !current_enabled
+                || match current_app.functions.iter().find(|f| f.name == next.name) {
+                    Some(prev) => !prev.enabled || prev != *next,
+                    None => true,
+                }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let functions_to_register =
+        resolve_function_params(runtime.secrets(), &functions_to_register).await;
+    let (built, errors) =
+        runtime_datafusion_udfs::user_functions::build_all(&functions_to_register).await;
+    for err in &errors {
+        tracing::error!("{err}");
+    }
+
+    let mut registered_function_names = Vec::new();
+    let mut functions_to_expose_as_tools = Vec::new();
+    for (next, built) in built {
+        match built {
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Scalar(udf) => {
+                warn_beta_once();
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udf(udf.as_ref().clone());
+                registered_function_names.push(next.name.clone());
+                if function_executes_code(&next) {
+                    add_code_executing_function(&next.name);
+                }
+                upsert_user_function_info(info_from_decl(&next));
+                tracing::info!(name = %next.name, from = %next.from, "Registered user function");
+                functions_to_expose_as_tools.push(next);
+            }
+            runtime_datafusion_udfs::user_functions::BuiltFunction::Table(udtf) => {
+                warn_beta_once();
+                if let Some(existing_name) = registered_scalar_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user table function because a scalar UDF with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                if let Some(existing_name) = registered_table_udf_name(ctx, &next.name) {
+                    tracing::error!(name = %next.name, existing_name = %existing_name, "Failed to register user table function because a table function with this name is already registered; rename the function to avoid changing query semantics");
+                    continue;
+                }
+                ctx.register_udtf(&next.name, udtf);
+                registered_function_names.push(next.name.clone());
+                if function_executes_code(&next) {
+                    add_code_executing_function(&next.name);
+                }
+                upsert_user_function_info(info_from_decl(&next));
+                tracing::info!(name = %next.name, from = %next.from, "Registered user table function");
+                if next.as_tool {
+                    tracing::warn!(name = %next.name, "User table functions cannot be exposed as tools; skipping tool exposure");
+                }
+            }
+        }
+    }
+    // Computed before `registered_function_names` is moved into the deny list.
+    let changed = !registered_function_names.is_empty() || !functions_to_drop.is_empty();
+    add_user_functions_to_deny_list(registered_function_names);
+    for next in functions_to_expose_as_tools {
+        maybe_register_function_as_tool(runtime, &next).await;
+    }
+
+    changed
+}
+
+/// Names of UDFs whose invocation can execute external code or make RPC/API
+/// calls. Read-only API keys are not allowed to plan or execute these functions.
+static CODE_EXECUTING_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(vec![]));
+
+/// Metadata for a currently-registered user-defined function. Surfaced
+/// through the `list_udfs()` UDTF and the `/v1/functions` HTTP endpoint.
+#[derive(Clone, Debug)]
+pub struct UserFunctionInfo {
+    pub name: String,
+    pub kind: String,
+    pub volatility: String,
+    pub from: String,
+    pub description: Option<String>,
+}
+
+/// Registry of user-function metadata keyed by name. Kept in sync with
+/// the `DataFusion` session context and the federation deny-list.
+static USER_FUNCTION_INFO: LazyLock<RwLock<Vec<UserFunctionInfo>>> =
+    LazyLock::new(|| RwLock::new(vec![]));
+
+/// Snapshot the current user-function metadata, ordered by registration.
+#[must_use]
+pub fn user_function_infos() -> Vec<UserFunctionInfo> {
+    USER_FUNCTION_INFO.read().clone()
+}
+
+fn upsert_user_function_info(info: UserFunctionInfo) {
+    let mut guard = USER_FUNCTION_INFO.write();
+    if let Some(existing) = guard.iter_mut().find(|i| i.name == info.name) {
+        *existing = info;
+    } else {
+        guard.push(info);
+    }
+}
+
+fn remove_user_function_info(name: &str) {
+    USER_FUNCTION_INFO.write().retain(|i| i.name != name);
+}
+
+/// Add a user function name to the federation deny-list. Idempotent.
+pub fn add_user_function_to_deny_list(name: &str) {
+    runtime_udfs_api::add_user_function(name);
+}
+
+fn add_user_functions_to_deny_list(names: impl IntoIterator<Item = String>) {
+    runtime_udfs_api::add_user_functions(names);
+}
+
+/// Remove a user function name from the federation deny-list. No-op if
+/// not present.
+pub fn remove_user_function_from_deny_list(name: &str) {
+    runtime_udfs_api::remove_user_function(name);
+}
+
+fn remove_user_functions_from_deny_list(names: &[String]) {
+    runtime_udfs_api::remove_user_functions(names);
+}
+
+/// Add a function name to the read-write API key requirement set. Idempotent.
+pub fn add_code_executing_function(name: &str) {
+    let mut guard = CODE_EXECUTING_FUNCTION_NAMES.write();
+    if !guard.iter().any(|n| n == name) {
+        guard.push(name.to_string());
+    }
+}
+
+/// Remove a function name from the read-write API key requirement set.
+pub fn remove_code_executing_function(name: &str) {
+    CODE_EXECUTING_FUNCTION_NAMES
+        .write()
+        .retain(|function_name| function_name != name);
+}
+
+/// Returns true when a function requires a read-write API key to execute.
+#[must_use]
+pub fn is_code_executing_function(name: &str) -> bool {
+    CODE_EXECUTING_FUNCTION_NAMES
+        .read()
+        .iter()
+        .any(|function_name| function_name.eq_ignore_ascii_case(name))
+}
+
+pub use runtime_datafusion::function_support::{
+    deny_spice_functions_for_duckdb, deny_spice_functions_for_duckdb_table_providers,
+    deny_spice_functions_for_mysql_table_providers,
+    deny_spice_functions_for_postgres_table_providers,
+    deny_spice_functions_for_sqlite_table_providers,
+};
+pub use runtime_udfs_api::{
+    deny_spice_functions_for_table_providers, deny_spice_specific_functions,
+    deny_spice_specific_functions_excluding,
+};
+
+#[cfg(test)]
+mod deny_list_registration_tests {
+    //! The deny-list is derived from a `linkme` slice, so a registration whose
+    //! crate is not linked simply vanishes — and a missing name does not fail
+    //! loudly, it makes the function federatable. This module keeps the expected
+    //! set written out by hand, as *test* data only, and asserts the registry
+    //! still contains all of it. Adding a UDF therefore fails a test rather than
+    //! silently pushing a Spice function down to a remote source.
+
+    use std::collections::HashSet;
+
+    use crate::datafusion::pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME};
+    use runtime_datafusion_udfs::{
+        bucket::BUCKET_SCALAR_UDF_NAME,
+        cosine_distance::COSINE_DISTANCE_UDF_NAME,
+        digest_many::DIGEST_UDF_NAME,
+        inner_product::INNER_PRODUCT_UDF_NAME,
+        l2_distance::{L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME},
+        l2_norm::L2_NORM_UDF_NAME,
+        truncate::TRUNCATE_SCALAR_UDF_NAME,
+    };
+    use runtime_datafusion_udfs::{
+        flatten_json::FLATTEN_JSON_UDTF_NAME, json_properties::FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        json_tree::JSON_TREE_UDTF_NAME,
+    };
+    use runtime_search::rerank::RERANK_UDTF_NAME;
+    // `EMBED_UDF_NAME` / `AI_UDF_NAME` resolve from the parent module, which
+    // defines or imports them depending on the `models` feature.
+    #[cfg(feature = "models")]
+    use super::AI_UDF_NAME;
+    use super::EMBED_UDF_NAME;
+
+    /// Every Spice-specific function name expected to be denied for federation.
+    ///
+    /// Written out by hand on purpose: it is the independent expectation the
+    /// link-time registry is checked against. The JSON function names are
+    /// excluded — the registry derives those from `datafusion-functions-json`
+    /// rather than from a name constant.
+    fn expected_denied_spice_function_names() -> Vec<String> {
+        [
+            "rand",
+            BUCKET_SCALAR_UDF_NAME,
+            COSINE_DISTANCE_UDF_NAME,
+            INNER_PRODUCT_UDF_NAME,
+            L2_DISTANCE_UDF_NAME,
+            L2_SQUARED_DISTANCE_UDF_NAME,
+            L2_NORM_UDF_NAME,
+            TRUNCATE_SCALAR_UDF_NAME,
+            OBJ_DESCRIPTION_UDF_NAME,
+            COL_DESCRIPTION_UDF_NAME,
+            EMBED_UDF_NAME,
+            #[cfg(feature = "models")]
+            AI_UDF_NAME,
+            DIGEST_UDF_NAME,
+            FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+            FLATTEN_JSON_UDTF_NAME,
+            JSON_TREE_UDTF_NAME,
+            RERANK_UDTF_NAME,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn registry_contains_every_expected_spice_function() {
+        let expected: HashSet<String> =
+            expected_denied_spice_function_names().into_iter().collect();
+        let registered: HashSet<String> = runtime_udfs_api::spice_function_names()
+            .into_iter()
+            .collect();
+
+        let missing: Vec<&String> = expected.difference(&registered).collect();
+        assert!(
+            missing.is_empty(),
+            "these Spice functions have no link-time registration, so they would federate: {missing:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::{DataType, Float64Type};
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{ColumnarValue, Volatility as DataFusionVolatility, create_udf};
+    use datafusion::prelude::{Expr, lit};
+    use datafusion::scalar::ScalarValue;
+    use datafusion_functions_json::udfs::{
+        json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
+        json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
+    };
+    use runtime_datafusion::function_support::POSTGRES_PUSHABLE_ARRAY_FUNCTIONS;
+    use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
+    use runtime_datafusion_udfs::inner_product::{DOT_PRODUCT_UDF_ALIAS, INNER_PRODUCT_UDF_NAME};
+    use runtime_datafusion_udfs::{
+        bucket::Bucket, cosine_distance::CosineDistance, digest_many::INSTANCE, truncate::Truncate,
+    };
+    use runtime_udfs_api::datafusion_nested_function_names;
+    use std::collections::HashSet;
+
+    /// The Spice function names the deny-list is built from — now the link-time
+    /// registry rather than a static in this module.
+    fn builtin_denied_names() -> Vec<String> {
+        runtime_udfs_api::spice_function_names()
+    }
+
+    use super::*;
+
+    /// Helper to create a scalar function expression for testing function support.
+    fn make_json_expr(udf: Arc<datafusion::logical_expr::ScalarUDF>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![lit("{}"), lit("key")]))
+    }
+
+    fn spice_udf(
+        impl_: impl Into<datafusion::logical_expr::ScalarUDF>,
+    ) -> Arc<datafusion::logical_expr::ScalarUDF> {
+        Arc::new(impl_.into())
+    }
+
+    fn stub_scalar_udf(name: &str) -> ScalarUDF {
+        create_udf(
+            name,
+            vec![],
+            DataType::Int64,
+            DataFusionVolatility::Immutable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(1))))),
+        )
+    }
+
+    #[test]
+    fn registered_scalar_udf_name_detects_case_insensitive_collision() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(stub_scalar_udf("custom_fn"));
+
+        assert_eq!(
+            registered_scalar_udf_name(&ctx, "CUSTOM_FN").as_deref(),
+            Some("custom_fn")
+        );
+    }
+
+    #[test]
+    fn register_async_user_udf_skips_existing_scalar_udf() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(stub_scalar_udf("existing_fn"));
+
+        assert!(!register_async_user_udf(
+            &ctx,
+            &stub_scalar_udf("Existing_Fn"),
+            "Existing_Fn"
+        ));
+        assert!(!ctx.udfs().contains("Existing_Fn"));
+    }
+
+    fn test_user_function(name: &str, enabled: bool) -> Function {
+        use spicepod::component::function::{
+            FunctionArg, FunctionKind, FunctionReturns, Signature, Volatility,
+        };
+
+        Function {
+            name: name.to_string(),
+            from: "sql".to_string(),
+            enabled,
+            description: None,
+            kind: FunctionKind::Scalar,
+            volatility: Volatility::Immutable,
+            signature: Signature {
+                tables: vec![],
+                args: vec![FunctionArg {
+                    name: "x".to_string(),
+                    arrow_type: "int64".to_string(),
+                }],
+                returns: Some(FunctionReturns::Scalar("int64".to_string())),
+            },
+            body: Some("x".to_string()),
+            body_ref: None,
+            metadata: std::collections::HashMap::new(),
+            params: std::collections::HashMap::new(),
+            depends_on: vec![],
+            metrics: None,
+            as_tool: true,
+        }
+    }
+
+    #[test]
+    fn enabled_function_declarations_filters_disabled_functions() {
+        let functions = vec![
+            test_user_function("enabled_fn", true),
+            test_user_function("disabled_fn", false),
+        ];
+
+        let enabled = enabled_function_declarations(&functions);
+
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "enabled_fn");
+    }
+
+    #[test]
+    fn effective_volatility_caps_remote_immutable_to_stable() {
+        let mut function = test_user_function("remote_fn", true);
+        function.from = "https://example.com/udf".to_string();
+
+        assert_eq!(effective_user_function_volatility(&function), "stable");
+
+        function.volatility = spicepod::component::function::Volatility::Volatile;
+        assert_eq!(effective_user_function_volatility(&function), "volatile");
+    }
+
+    #[tokio::test]
+    async fn resolve_function_params_expands_string_secret_refs() {
+        use spicepod::component::secret::Secret;
+
+        let env_file = std::env::temp_dir().join(format!(
+            "spice_udf_params_{}_{}.env",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&env_file, "UDF_TOKEN=resolved-token\n")
+            .expect("test env file should be written");
+
+        let mut secret_params = HashMap::new();
+        secret_params.insert(
+            "file_path".to_string(),
+            env_file.to_string_lossy().into_owned(),
+        );
+        let mut secrets = runtime_secrets::Secrets::new();
+        secrets
+            .load_from(&[Secret {
+                from: "env".to_string(),
+                name: "env".to_string(),
+                description: None,
+                params: Some(spicepod::param::Params::from_string_map(secret_params)),
+            }])
+            .await
+            .expect("env secret store should load");
+
+        let mut function = test_user_function("remote_fn", true);
+        function.params.insert(
+            "auth_bearer".to_string(),
+            Value::String("${ secrets:UDF_TOKEN }".to_string()),
+        );
+        function
+            .params
+            .insert("batch_size".to_string(), Value::Number(16_u64.into()));
+
+        let resolved =
+            resolve_function_params(Arc::new(tokio::sync::RwLock::new(secrets)), &[function]).await;
+
+        assert_eq!(
+            resolved[0].params.get("auth_bearer"),
+            Some(&Value::String("resolved-token".to_string()))
+        );
+        assert_eq!(
+            resolved[0].params.get("batch_size"),
+            Some(&Value::Number(16_u64.into()))
+        );
+
+        std::fs::remove_file(env_file).ok();
+    }
+
+    #[test]
+    fn deny_list_blocks_json_functions() {
+        let support = deny_spice_specific_functions();
+
+        let json_udfs = vec![
+            json_get_udf(),
+            json_get_str_udf(),
+            json_get_int_udf(),
+            json_get_float_udf(),
+            json_get_bool_udf(),
+            json_get_json_udf(),
+            json_as_text_udf(),
+            json_contains_udf(),
+            json_length_udf(),
+        ];
+
+        for udf in json_udfs {
+            let name = udf.name().to_string();
+            let expr = make_json_expr(udf);
+            assert!(
+                !support.supports(&expr, None),
+                "{name} should be denied by deny_spice_specific_functions"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_list_blocks_spice_builtins() {
+        let support = deny_spice_specific_functions();
+
+        let spice_udfs: Vec<Arc<datafusion::logical_expr::ScalarUDF>> = vec![
+            spice_udf(CosineDistance::new()),
+            spice_udf(Bucket::new()),
+            spice_udf(Truncate::new()),
+            Arc::new(INSTANCE.clone()),
+            spice_udf(FlattenJsonPropertiesScalar::new()),
+            spice_udf(FlattenJsonScalar::new()),
+            spice_udf(JsonTreeScalar::new()),
+        ];
+
+        for udf in spice_udfs {
+            let name = udf.name().to_string();
+            let expr = make_json_expr(udf);
+            assert!(
+                !support.supports(&expr, None),
+                "{name} should be denied by deny_spice_specific_functions"
+            );
+        }
+    }
+
+    /// Build a no-arg scalar-function expression with the given name so we can
+    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
+    fn make_named_expr(name: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(stub_scalar_udf(name)),
+            vec![],
+        ))
+    }
+
+    /// The same probe with one argument, for a name whose backend answers
+    /// per-call as well as per-name: a `FunctionSupport` carrying a
+    /// [`ScalarCallSupport`](datafusion_table_providers::util::supported_functions::ScalarCallSupport)
+    /// asks its dialect to render the call, and the no-arg probe is a call the
+    /// planner cannot build and the dialect refuses on arity alone.
+    fn make_named_expr_of_one_arg(name: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(stub_scalar_udf(name)),
+            vec![lit("  padded  ")],
+        ))
+    }
+
+    #[test]
+    fn table_providers_default_deny_list_denies_spice_functions() {
+        // The default table-providers-typed deny-list (wired into the ADBC
+        // connector for every profile other than BigQuery) has no dialect
+        // carve-out: every built-in Spice UDF must be denied while ordinary
+        // functions still federate.
+        let support = deny_spice_functions_for_table_providers();
+        let json_name = json_get_str_udf().name().to_string();
+        for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} is a Spice-only function and must be denied"
+            );
+        }
+        assert!(
+            support.supports(&make_named_expr("upper"), None),
+            "non-Spice functions must not be denied"
+        );
+    }
+
+    #[test]
+    fn postgres_deny_list_denies_incompatible_array_functions() {
+        // PostgreSQL (and PostgreSQL-wire backends such as Redshift) can't run
+        // DataFusion's array functions that it lacks, spells differently, or
+        // implements with a different signature/semantics. The reported failure
+        // is `array_contains` (canonical `array_has`) being pushed into Redshift.
+        let support = deny_spice_functions_for_postgres_table_providers();
+        for name in [
+            "array_has",      // canonical name
+            "array_contains", // alias the planner actually puts in the plan (the reported bug)
+            "list_has",       // another array_has alias
+            "make_array",     // PostgreSQL uses `ARRAY[...]` syntax
+            "array_concat",   // PostgreSQL spells it `array_cat`
+            "array_cat",      // ...and that DataFusion spelling is only an alias here
+            "array_length",   // PostgreSQL requires an explicit dimension argument
+            "array_remove",   // DataFusion removes first match, PostgreSQL removes all
+            "array_replace",  // DataFusion replaces first match, PostgreSQL replaces all
+            "array_dims",     // DataFusion returns a list, PostgreSQL returns text
+            "flatten",
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} is incompatible with PostgreSQL and must be denied"
+            );
+        }
+        // The exact PostgreSQL function names keep pushing down.
+        for &name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
+            assert!(
+                support.supports(&make_named_expr(name), None),
+                "{name} matches PostgreSQL exactly and should still federate"
+            );
+        }
+        // ...but their DataFusion-only aliases (which PostgreSQL doesn't define)
+        // stay denied so they aren't unparsed into invalid remote SQL.
+        for name in [
+            "list_append",
+            "array_push_back",
+            "array_join",
+            "list_position",
+        ] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} is a DataFusion-only alias with no PostgreSQL equivalent and must be denied"
+            );
+        }
+        // Spice-only functions stay denied too.
+        assert!(
+            !support.supports(&make_named_expr(EMBED_UDF_NAME), None),
+            "Spice-only functions must remain denied for Postgres"
+        );
+        // Ordinary scalar functions still federate.
+        assert!(
+            support.supports(&make_named_expr("upper"), None),
+            "non-array, non-Spice functions must not be denied for Postgres"
+        );
+        // The generic table-providers deny-list does NOT touch array functions,
+        // confirming this carve-out is Postgres-specific.
+        assert!(
+            deny_spice_functions_for_table_providers()
+                .supports(&make_named_expr("array_has"), None),
+            "the generic deny-list must not deny array functions"
+        );
+    }
+
+    #[test]
+    fn postgres_pushable_array_functions_are_real_datafusion_functions() {
+        // Guard against typos / drift: every name we allow to push down must
+        // actually be a DataFusion nested function, otherwise the carve-out is a
+        // no-op that silently denies it.
+        let known: HashSet<&str> = datafusion_nested_function_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in POSTGRES_PUSHABLE_ARRAY_FUNCTIONS {
+            assert!(
+                known.contains(*name),
+                "{name} is in the Postgres pushable list but is not a DataFusion nested function"
+            );
+        }
+    }
+
+    #[test]
+    fn btrim_is_denied_only_for_the_backends_that_lack_it() {
+        // `trim(col)` resolves to the `btrim` UDF and federates under that
+        // canonical name. Three of the four SQL backends we can reach have no
+        // `btrim` and answer a pushed-down `trim` with an error rather than a
+        // row (issue #13794): DuckDB `Catalog Error: Scalar Function with name
+        // btrim does not exist!`, SQLite `no such function: btrim`, MySQL
+        // `FUNCTION <db>.btrim does not exist`.
+        //
+        // DuckDB is handled in its dialect instead, which rewrites the call to
+        // `trim` and keeps the pushdown, so `btrim` must stay *allowed* there —
+        // denying it as well would silently give up a pushdown that works.
+        // PostgreSQL has `btrim` natively and must keep pushing it down too.
+        for (backend, support, denied) in [
+            (
+                "sqlite",
+                deny_spice_functions_for_sqlite_table_providers(),
+                true,
+            ),
+            (
+                "mysql",
+                deny_spice_functions_for_mysql_table_providers(),
+                true,
+            ),
+            (
+                "postgres",
+                deny_spice_functions_for_postgres_table_providers(),
+                false,
+            ),
+            (
+                "duckdb",
+                deny_spice_functions_for_duckdb_table_providers(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                support.supports(&make_named_expr_of_one_arg("btrim"), None),
+                !denied,
+                "btrim pushdown for {backend} is wrong: expected denied={denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_and_mysql_deny_lists_still_deny_every_spice_function() {
+        // The invariant: a backend-specific list is the generic Spice deny-list
+        // *plus* that backend's extras, never a replacement for it. A Spice-only
+        // function reaching either backend is the unknown-function failure of
+        // issue #10703, so `btrim` must be additive to that set rather than the
+        // whole of it.
+        let json_name = json_get_str_udf().name().to_string();
+        for (backend, support) in [
+            ("sqlite", deny_spice_functions_for_sqlite_table_providers()),
+            ("mysql", deny_spice_functions_for_mysql_table_providers()),
+        ] {
+            for name in &builtin_denied_names() {
+                assert!(
+                    !support.supports(&make_named_expr(name), None),
+                    "{name} must stay denied for {backend}"
+                );
+            }
+            assert!(
+                !support.supports(&make_named_expr(json_name.as_str()), None),
+                "{json_name} must stay denied for {backend}"
+            );
+            assert!(
+                support.supports(&make_named_expr("upper"), None),
+                "an ordinary function must still federate to {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_deny_list_allows_dialect_native_functions() {
+        // The DuckDB unparser dialect rewrites these into native DuckDB SQL
+        // (cosine_distance -> array_cosine_distance, inner_product ->
+        // array_inner_product, rand -> random()), so they must federate rather
+        // than be denied. Note `rand` is allowed purely by virtue of being in the
+        // dialect — no manual carve-out.
+        let support = deny_spice_functions_for_duckdb();
+        for name in [COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"] {
+            assert!(
+                support.supports(&make_named_expr(name), None),
+                "{name} has a native DuckDB equivalent and should be pushed down"
+            );
+        }
+        // No native DuckDB equivalent — must stay denied.
+        let json_name = json_get_str_udf().name().to_string();
+        for name in [EMBED_UDF_NAME, json_name.as_str()] {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} has no native DuckDB equivalent and must stay denied"
+            );
+        }
+    }
+
+    #[test]
+    fn default_deny_list_denies_every_builtin() {
+        // Exhaustive "cannot push down" coverage: with no backend carve-out, the
+        // generic deny-list must block EVERY Spice-specific built-in (including
+        // functions a specific dialect could otherwise push down, e.g.
+        // cosine_distance / rand).
+        let support = deny_spice_specific_functions();
+        for name in &builtin_denied_names() {
+            assert!(
+                !support.supports(&make_named_expr(name), None),
+                "{name} must be denied by the default (backend-agnostic) deny-list"
+            );
+        }
+    }
+
+    #[test]
+    fn excluding_subtracts_only_listed_native_functions() {
+        let support = deny_spice_specific_functions_excluding(&[COSINE_DISTANCE_UDF_NAME]);
+        assert!(
+            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None),
+            "explicitly-excluded cosine_distance should be allowed"
+        );
+        assert!(
+            !support.supports(&make_named_expr("rand"), None),
+            "rand was not excluded and must stay denied"
+        );
+        // An empty exclusion behaves exactly like the default deny-list.
+        let default_support = deny_spice_specific_functions_excluding(&[]);
+        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME), None));
+    }
+
+    #[test]
+    fn duckdb_carveout_tracks_the_dialect() {
+        // Regression guard: the DuckDB allow-state of every built-in deny-listed
+        // function must match exactly what the DuckDB dialect can unparse, so the
+        // dialect and the deny-list can never drift.
+        let native: HashSet<&str> = runtime_datafusion::dialect::duckdb_native_function_names()
+            .into_iter()
+            .collect();
+        let support = deny_spice_functions_for_duckdb();
+        for denied in &builtin_denied_names() {
+            let expected_allowed = native.contains(denied.as_str());
+            assert_eq!(
+                support.supports(&make_named_expr(denied), None),
+                expected_allowed,
+                "{denied}: DuckDB allow-state must match dialect native support"
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_pushable_set_is_exactly_the_dialect_natives() {
+        // Pin the exact set of deny-listed Spice functions that CAN be pushed
+        // down to DuckDB. Everything else in the deny-list CANNOT. This makes the
+        // can/can't partition explicit: if a dialect change makes another Spice
+        // function pushable (or stops one), this test must be updated on purpose.
+        //
+        // `cosine_distance` -> array_cosine_distance, `inner_product` ->
+        // array_inner_product, `rand` -> random(). (Note: l2 distance federates
+        // via the non-deny-listed `array_distance` UDF, so it isn't part of this
+        // deny-list carve-out.)
+        use std::collections::BTreeSet;
+        let support = deny_spice_functions_for_duckdb();
+        let denied_names = builtin_denied_names();
+        let pushable: BTreeSet<&str> = denied_names
+            .iter()
+            .filter(|name| support.supports(&make_named_expr(name), None))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            pushable,
+            BTreeSet::from([COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"]),
+            "unexpected change to the set of Spice functions pushable to DuckDB"
+        );
+    }
+
+    /// Build a `SessionContext` the way `builder.rs` does: `DataFusion` defaults
+    /// first (which, with `nested_expressions`, register `DataFusion` 54's
+    /// `cosine_distance` / `inner_product` / `dot_product`), then Spice's core
+    /// scalar UDFs, which override them by name.
+    fn ctx_like_runtime() -> SessionContext {
+        let state = SessionStateBuilder::new().with_default_features().build();
+        let ctx = SessionContext::new_with_state(state);
+        register_core_scalar_udfs(&ctx);
+        ctx
+    }
+
+    async fn eval_f64(ctx: &SessionContext, sql: &str) -> datafusion::common::Result<f64> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(batches[0].column(0).as_primitive::<Float64Type>().value(0))
+    }
+
+    /// Locks in that Spice's `cosine_distance` — not `DataFusion` 54's same-named
+    /// built-in — is the impl bound after registration, and that it keeps the
+    /// `(1 - similarity) / 2` remap to `[0, 1]`. `DataFusion`'s built-in returns
+    /// `1 - similarity` over `[0, 2]`; if it ever shadowed Spice's UDF the
+    /// orthogonal case below would be `1.0` instead of `0.5`, silently changing
+    /// every `vector_search` relevance score (`score = 1 - cosine_distance`).
+    #[tokio::test]
+    async fn cosine_distance_keeps_spice_zero_to_one_semantics() {
+        let ctx = ctx_like_runtime();
+
+        let identical = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (identical - 0.0).abs() < 1e-9,
+            "identical vectors must be 0.0, got {identical}"
+        );
+
+        let orthogonal = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [0.0, 1.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (orthogonal - 0.5).abs() < 1e-9,
+            "orthogonal vectors must be 0.5 (Spice's [0,1] remap); 1.0 would mean \
+             DataFusion 54's built-in shadowed Spice's cosine_distance, got {orthogonal}"
+        );
+
+        let opposite = eval_f64(&ctx, "SELECT cosine_distance([1.0, 0.0], [-1.0, 0.0])")
+            .await
+            .expect("cosine_distance over List literals should evaluate");
+        assert!(
+            (opposite - 1.0).abs() < 1e-9,
+            "opposite vectors must be 1.0 (top of Spice's [0,1] range), got {opposite}"
+        );
+    }
+
+    /// Locks in that both `inner_product` and its `dot_product` alias resolve to
+    /// Spice's SIMD UDF rather than `DataFusion` 54's built-in. Spice's impl
+    /// accepts only `FixedSizeList<Float32, N>`; `DataFusion`'s accepts
+    /// `List`/`LargeList` of any numeric and would return `11.0` for the call
+    /// below. A `FixedSizeList` coercion error is therefore the discriminator
+    /// that Spice's impl — including for the `dot_product` alias key — is bound.
+    #[tokio::test]
+    async fn inner_product_and_dot_product_bind_to_spice_impl() {
+        let ctx = ctx_like_runtime();
+
+        for name in [INNER_PRODUCT_UDF_NAME, DOT_PRODUCT_UDF_ALIAS] {
+            let err = eval_f64(&ctx, &format!("SELECT {name}([1.0, 2.0], [3.0, 4.0])"))
+                .await
+                .expect_err(&format!(
+                    "{name} over List<Float64> must error — Spice's FixedSizeList<Float32>-only \
+                     impl should be bound, not DataFusion 54's List-accepting built-in"
+                ));
+            assert!(
+                err.to_string().contains("FixedSizeList"),
+                "{name}: expected a FixedSizeList coercion error from Spice's impl, got: {err}"
+            );
+        }
+    }
+
+    /// A one-function app: `myscale(x)` as a `from: sql` scalar with the given
+    /// body, parsed from YAML so the declaration is the shape a spicepod
+    /// produces. `functions:` is enabled, since registration is opt-in.
+    fn app_with_body(body: &str) -> Arc<app::App> {
+        let function: Function = yaml::from_str(&format!(
+            "
+name: myscale
+from: sql
+kind: scalar
+volatility: immutable
+signature:
+  args: [{{ name: x, type: int64 }}]
+  returns: int64
+body: \"{body}\"
+"
+        ))
+        .expect("the function declaration should parse");
+
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_function(function)
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// The same app with no `functions:` at all — what a hot reload that
+    /// removes the declaration produces.
+    fn app_with_no_functions() -> Arc<app::App> {
+        Arc::new(
+            app::AppBuilder::new("plan_cache_function_diff")
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// A runtime built from `app`, with the plans cache `Runtime::init_caching`
+    /// installs unconditionally, plus a cached plan for `sql` and the key it
+    /// was cached under.
+    async fn runtime_with_cached_plan(
+        app: &Arc<app::App>,
+        sql: &'static str,
+    ) -> (
+        crate::Runtime,
+        Arc<crate::datafusion::DataFusion>,
+        Arc<dyn cache::TabledCacheProvider<datafusion::logical_expr::LogicalPlan> + Send + Sync>,
+        cache::key::RawCacheKey,
+    ) {
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::clone(app)))
+            .build()
+            .await;
+        let df = Arc::clone(&runtime.df);
+        let plans = df
+            .plans_cache_provider()
+            .expect("the plans cache is installed unconditionally");
+
+        // Any hasher works — the key only has to be the same on every lookup.
+        let key = cache::key::CacheKey::Query(sql, None)
+            .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql)
+            .await
+            .expect("the query over myscale should plan");
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "precondition: the plan must be cached, or the test cannot observe staleness"
+        );
+
+        (runtime, df, plans, key)
+    }
+
+    /// A cached logical plan embeds the `Arc<ScalarUDF>` it was planned
+    /// against, so it keeps evaluating that UDF's own body regardless of what
+    /// the session context now holds for the name. The plan cache is installed
+    /// unconditionally with a one-hour TTL, so a hot reload that redefines a
+    /// `functions:` body must discard the cached plans or the old body keeps
+    /// answering the same SQL for up to an hour.
+    ///
+    /// Regression test for #13873.
+    #[tokio::test]
+    async fn function_diff_discards_cached_plans_so_a_redefined_body_answers() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let tripling = app_with_body("x * 3");
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        let cached = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .await
+            .expect("the cached plan should come back");
+        assert_eq!(
+            eval_i64(&df.ctx, cached).await,
+            42,
+            "precondition: the first body must be the one that answers"
+        );
+
+        // The hot reload: `myscale` is redefined, which takes the same drop
+        // path as a removal (`next != current`) and then re-registers.
+        apply_function_diff(&runtime, &doubling, &tripling).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "a function diff must discard the cached plans; a plan left in the cache still holds \
+             the pre-reload ScalarUDF"
+        );
+
+        let replanned = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .await
+            .expect("the same SQL should re-plan after the reload");
+        assert_eq!(
+            eval_i64(&df.ctx, replanned).await,
+            63,
+            "the redefined body must answer; 42 means the cached plan's old ScalarUDF answered"
+        );
+    }
+
+    /// The removal path has its own exit from the diff: a reload that drops
+    /// every `functions:` entry returns through `new_app.functions.is_empty()`
+    /// before any registration runs, so that arm has to report the drop on its
+    /// own. A plan surviving it still holds the removed function and keeps
+    /// answering for a name the user has taken away.
+    ///
+    /// Regression test for #13873.
+    #[tokio::test]
+    async fn function_diff_discards_cached_plans_when_a_reload_removes_every_function() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let removed = app_with_no_functions();
+        let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        // Exits through the `new_app.functions.is_empty()` arm, not the tail.
+        apply_function_diff(&runtime, &doubling, &removed).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            0,
+            "removing every function must discard the cached plans; a plan left in the cache \
+             still holds the removed ScalarUDF"
+        );
+
+        // Re-planning now fails to resolve the name, which is the correct
+        // outcome: the user removed the function. The point is that the query
+        // no longer silently answers from the copy the cached plan held.
+        let err = df
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .await
+            .expect_err("the removed function must not resolve after the reload");
+        assert!(
+            err.to_string().contains("myscale"),
+            "the planning error should name the removed function, got: {err}"
+        );
+    }
+
+    /// The signal is "the registered set changed", not "a reload happened":
+    /// a reload that leaves `functions:` untouched must keep the cached plans,
+    /// or every unrelated spicepod edit throws away the whole plan cache.
+    #[tokio::test]
+    async fn function_diff_keeps_cached_plans_when_the_function_set_is_unchanged() {
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_body("x * 2");
+        let same = app_with_body("x * 2");
+        let (runtime, _df, plans, _key) = runtime_with_cached_plan(&doubling, SQL).await;
+
+        apply_function_diff(&runtime, &doubling, &same).await;
+
+        plans.checkpoint().await;
+        assert_eq!(
+            plans.item_count().await,
+            1,
+            "an unchanged function set must not discard cached plans"
+        );
+    }
+
+    /// Execute a planned query expected to yield a single `Int64` value.
+    async fn eval_i64(ctx: &SessionContext, plan: datafusion::logical_expr::LogicalPlan) -> i64 {
+        let batches = datafusion::dataframe::DataFrame::new(ctx.state(), plan)
+            .collect()
+            .await
+            .expect("the plan should execute");
+        batches[0]
+            .column(0)
+            .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+            .value(0)
+    }
+}

@@ -1,0 +1,2273 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! `DataFusion` `TableProvider` implementation for Cayenne tables.
+//!
+//! # Virtual File Concept
+//!
+//! Cayenne treats "files" as virtual files, where each file is actually a Vortex
+//! `ListingTable` at a unique directory. The catalog's `DataFile` entries track metadata
+//! for these virtual files, but all actual I/O operations delegate to the corresponding
+//! `ListingTable`:
+//!
+//! - **Reading**: Query the `ListingTable` for the specific file directory
+//! - **Appending**: Append data via the `ListingTable` (creates new Vortex files)
+//! - **Deleting**: Delete the `ListingTable`'s directory
+//! - **Stats**: Get statistics from the `ListingTable`
+//!
+//! A Cayenne table can have multiple virtual files (`ListingTables`), each in its own
+//! subdirectory (e.g., `file_000001/`, `file_000002/`). When querying the table,
+//! the provider reads from all active virtual files.
+//!
+//! # Module Organization
+//!
+//! - [`table`]: `CayenneTableProvider` implementation — schema, deletion strategy,
+//!   listing-fence, snapshot state, post-write maintenance scheduler, and the
+//!   `DataFusion` `TableProvider` impl.
+//! - [`scan`]: `CayenneAccelerationExec` wrapper, round-robin repartitioning used to
+//!   fan unsorted writes across multiple writer partitions, dynamic-filter
+//!   gather/dedup, and `SnapshotScanRef` — the in-flight-scan ref-count guard that
+//!   pins a snapshot's Vortex files against GC for the read's lifetime.
+//! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
+//!   `vortex_datafusion::VortexFormat` to attach per-file position-based
+//!   deletion vectors and to gate decimal→float predicate pushdown.
+//! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
+//!   regular (non-CDC) write path uses for both append and overwrite modes.
+//! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
+//!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /
+//!   Stage B CDC path consumed by `runtime/src/accelerated_table/refresh_task`.
+//! - [`staging_wal`]: Staging WAL for crash-safe staged appends. Three-phase
+//!   commit lifecycle: `prepare` (write WAL) → `apply_under_barrier` (move +
+//!   listing-cache invalidation) → `finish` (drop write guard).
+//! - [`overwrite`]: Catalog-pointer-flip path for overwrite-mode writes.
+//! - [`delete`]: Deletion vector handling and filtering.
+//!   - [`delete::sink`]: position- and key-based deletion sinks for SQL `DELETE`.
+//!   - [`delete::filter_exec`]: `Int64PkDeletionFilterExec` and
+//!     `KeyBasedDeletionFilterExec` — per-row PK probes applied at scan time.
+//!   - [`delete::vector_io`]: Arrow IPC deletion-vector file writer / reader.
+//! - [`deletion_index`]: Bloom-prefiltered `DeletionIndex` (Int64 PKs) and
+//!   `KeyDeletionIndex` (composite byte keys) used by the filter execs.
+//! - [`deletion_strategy`]: `PkDeletionStrategyWithCache` — the per-table
+//!   deletion strategy and its atomically-published `ArcSwap<DeletionSnapshot>`.
+//! - [`compaction`]: Tiered small-files picker and `BackgroundCompactor`.
+//! - [`retention`]: Time-based retention filter builder + SQL retention DDL.
+//! - [`streaming`]: Streaming execution plan for write operations.
+//! - [`context`]: `CayenneContext` — shared Vortex format, upload semaphore,
+//!   `RuntimeEnv`, and config.
+//! - [`utils`]: Numeric conversion utilities.
+//! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
+//! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
+//!   coordinator (feature-gated).
+pub(crate) mod cold_partition;
+pub(crate) mod column_stats;
+pub(crate) mod compaction;
+pub(crate) mod compaction_writer;
+pub(crate) mod constants;
+pub(crate) mod context;
+pub(crate) mod delete;
+pub mod deletion_index;
+pub(crate) mod deletion_strategy;
+pub(crate) mod delta_encoding;
+pub(crate) mod fadvise_tier;
+pub(crate) mod file_digest;
+pub(crate) mod file_pruning;
+pub(crate) mod fsync_tier;
+pub(crate) mod inlined_cache;
+pub(crate) mod maintenance;
+pub(crate) mod maintenance_metrics;
+pub(crate) mod manifest;
+pub(crate) mod mem_tier;
+pub(crate) mod mem_tier_budget;
+pub(crate) mod memory_account;
+pub(crate) mod mutation_writer;
+pub(crate) mod on_conflict;
+pub(crate) mod overwrite;
+pub mod partitioned_wal;
+pub(crate) mod pk_index;
+pub(crate) mod pk_keyset_budget;
+pub(crate) mod pk_validation;
+pub(crate) mod predicate_stats;
+pub(crate) mod query_admission;
+pub(crate) mod retention;
+pub(crate) mod scan;
+pub(crate) mod sink;
+pub(crate) mod staged_upsert;
+pub(crate) mod staging_wal;
+pub(crate) mod streaming;
+pub(crate) mod structural_version;
+pub(crate) mod table;
+pub(crate) mod transaction;
+pub(crate) mod tuning;
+pub(crate) mod utils;
+pub(crate) mod vortex_format;
+pub(crate) mod wal_checksum;
+pub(crate) mod write_budget;
+pub(crate) mod zorder;
+
+// Re-export the main type at the module level for convenience
+pub use compaction::{
+    begin_compaction_shutdown, compaction_budget, compaction_budget_permits,
+    drain_compaction_tasks, in_flight_compaction_tasks, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle,
+};
+pub use context::CayenneContext;
+pub use mem_tier::SlotAdvancer;
+pub use mem_tier_budget::{
+    clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, release_bytes as release_global_mem_tier_bytes,
+    set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
+};
+pub use on_conflict::PreparedOnConflictDeletionPublish;
+pub use overwrite::PreparedOverwrite;
+pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_keyset_budget::{
+    force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
+    release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
+};
+pub use query_admission::set_query_admission_governor;
+pub use retention::TimeRetentionFilterBuilder;
+pub use scan::CayenneAccelerationExec;
+pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
+pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
+pub use table::{
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
+    PreparedAppendSnapshotPublish,
+};
+pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
+pub use tuning::{
+    QueryObservations, deregister_query_observations, global_qph, record_global_query,
+    record_query_latency, register_query_observations, set_cpu_burstable, set_global_memory_budget,
+};
+pub use write_budget::{
+    EncodeBudgetSnapshot, cap_global_encode_concurrency, encode_budget_snapshot,
+    set_global_encode_concurrency,
+};
+
+// Re-export deletion utilities for advanced use cases
+pub use delete::CayenneDeletionSink;
+
+use crate::catalog::CatalogError;
+use snafu::prelude::*;
+
+/// Result type for Cayenne table provider operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Error types for Cayenne table provider operations.
+#[derive(Debug, Snafu)]
+#[expect(missing_docs)]
+pub enum Error {
+    /// Catalog operation failed (DB commit, sequence increment, partition ops).
+    #[snafu(display("{source}"))]
+    Catalog { source: CatalogError },
+
+    /// `DataFusion` plan/execution error (scan, sort, insert, listing table ops).
+    #[snafu(transparent)]
+    DataFusion {
+        source: datafusion_common::DataFusionError,
+    },
+
+    /// Filesystem I/O error.
+    #[snafu(transparent)]
+    IoError { source: std::io::Error },
+
+    /// Object store operation failure (list, delete, put).
+    #[snafu(display("Failed to {operation} for table '{table}': {source}"))]
+    ObjectStore {
+        /// What operation was attempted (e.g., "list objects for snapshot cleanup").
+        operation: &'static str,
+        table: String,
+        source: object_store::Error,
+    },
+
+    /// Vortex file operation failure (open, scan, read).
+    #[snafu(display("Failed to {operation} for table '{table}': {source}"))]
+    Vortex {
+        /// What operation was attempted (e.g., "open vortex file for deletion scan").
+        operation: &'static str,
+        table: String,
+        source: Box<vortex::error::VortexError>,
+    },
+
+    /// Data constraint violation: null PK, duplicate PK, row overflow.
+    #[snafu(display("Data validation failed for table '{table}': {message}"))]
+    DataValidation { table: String, message: String },
+
+    /// A `mode: memory` (in-RAM) table reached its configured memory limit. Memory
+    /// mode never spills to disk, so the write is rejected rather than silently
+    /// dropped or grown unbounded.
+    #[snafu(display(
+        "Failed to write to dataset {table} (cayenne): the in-memory accelerator reached its \
+         memory limit ({limit_bytes} bytes; resident {resident_bytes} + incoming {incoming_bytes}). \
+         Use 'mode: file' for durable on-disk acceleration, or raise the limit with the \
+         'cayenne_cdc_mem_tier_max_bytes' parameter. \
+         See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    MemTierLimitExceeded {
+        table: String,
+        limit_bytes: u64,
+        resident_bytes: u64,
+        incoming_bytes: u64,
+    },
+
+    /// Failed to parse a snapshot or table URL.
+    #[snafu(display("Failed to parse URL '{url}': {source}"))]
+    UrlParse {
+        url: String,
+        source: url::ParseError,
+    },
+
+    /// Arrow error during schema or type conversion.
+    #[snafu(transparent)]
+    Arrow { source: arrow::error::ArrowError },
+
+    /// RwLock/Mutex poisoned or semaphore closed. Requires table reload or process restart.
+    #[snafu(display("Lock poisoned for table '{table}': {lock}"))]
+    LockPoisoned { table: String, lock: &'static str },
+
+    /// Spawned task panicked (`JoinSet` or `spawn_blocking`).
+    #[snafu(display("Task panicked for table '{table}': {source}"))]
+    TaskPanicked {
+        table: String,
+        source: tokio::task::JoinError,
+    },
+
+    /// Internal invariant violation or missing configuration. Should never happen in normal operation.
+    #[snafu(display("Internal error in table '{table}': {message}"))]
+    Internal { table: String, message: String },
+
+    #[snafu(display(
+        "Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"
+    ))]
+    TooManyOpenFiles { file_path: String },
+
+    /// A previous write was interrupted, leaving the table in a potentially
+    /// inconsistent state. The staging WAL file must be resolved before the
+    /// table can be used.
+    #[snafu(display("Table '{table}' may be in an inconsistent state: {message}"))]
+    IncompleteWrite { table: String, message: String },
+
+    /// Operation is not yet implemented.
+    #[snafu(display("Unsupported operation: {operation}"))]
+    Unsupported { operation: &'static str },
+
+    /// A transaction lost an optimistic-concurrency race: the
+    /// target table was committed to between this transaction's start and its
+    /// commit. Retryable at the newest committed state.
+    #[snafu(display(
+        "Transaction write conflict on table '{table}': the table changed since the transaction started; retry"
+    ))]
+    WriteConflict { table: String },
+
+    /// Invalid number of children provided to an execution plan.
+    #[snafu(display(
+        "Invalid number of children for CayenneAccelerationExec: expected 1, got {children_count}"
+    ))]
+    InvalidChildrenCount { children_count: usize },
+}
+
+impl From<CatalogError> for Error {
+    fn from(source: CatalogError) -> Self {
+        Error::Catalog { source }
+    }
+}
+
+impl From<Error> for datafusion_common::DataFusionError {
+    fn from(err: Error) -> Self {
+        match err {
+            // Unwrap DataFusion errors back to their original form
+            Error::DataFusion { source } => source,
+            other => datafusion_common::DataFusionError::External(Box::new(other)),
+        }
+    }
+}
+
+impl From<Error> for CatalogError {
+    fn from(err: Error) -> Self {
+        match err {
+            // Unwrap catalog errors back to their original form
+            Error::Catalog { source } => source,
+            other => CatalogError::InvalidOperation {
+                message: other.to_string(),
+                source: Box::new(other),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::MetadataCatalog;
+    use crate::cayenne_catalog::CayenneCatalog;
+    use crate::metadata::CreateTableOptions;
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion_catalog::TableProvider;
+    use datafusion_expr::dml::InsertOp;
+    use datafusion_physical_plan::collect;
+    use datafusion_table_providers::util::column_reference::ColumnReference;
+    use datafusion_table_providers::util::on_conflict::OnConflict;
+    use futures::future::join_all;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Insert a single batch via `insert_into()` (append mode).
+    async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) {
+        let ctx = SessionContext::new();
+        let schema = Arc::clone(batch.schema_ref());
+        let input_exec = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("Failed to create MemorySourceConfig");
+        let plan = provider
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("Failed to create insert plan");
+        collect(plan, ctx.task_ctx())
+            .await
+            .expect("Failed to execute insert");
+    }
+
+    /// Helper to create a test catalog with a table containing sample data
+    async fn setup_test_table(
+        connection_string: &str,
+        ctx: &SessionContext,
+    ) -> (Arc<CayenneCatalog>, crate::metadata::TableMetadata, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for test");
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog schema and tables");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let table_name = "test_table";
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create test table in catalog");
+
+        let table_metadata = catalog
+            .get_table(table_name)
+            .await
+            .expect("Failed to get table metadata from catalog");
+
+        tracing::info!("Created table '{}' with ID {}", table_name, table_id);
+
+        // Create provider and insert test data
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+            .await
+            .expect("Failed to create CayenneTableProvider instance");
+
+        // Insert 1000 rows of test data
+        let mut id_values = Vec::new();
+        let mut name_values = Vec::new();
+        for i in 0..1000 {
+            id_values.push(i);
+            name_values.push(format!("name_{i}"));
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(id_values)),
+                Arc::new(StringArray::from(name_values)),
+            ],
+        )
+        .expect("Failed to create RecordBatch with test data");
+
+        // Create a memory exec plan from the batch
+        let mem_config = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("Failed to create MemorySourceConfig from test data");
+        let mem_exec = DataSourceExec::new(Arc::new(mem_config));
+
+        let insert_result = provider
+            .insert_into(&ctx.state(), Arc::new(mem_exec), InsertOp::Append)
+            .await
+            .expect("Failed to create insert execution plan");
+
+        // Execute the insert plan to actually write the data
+        let batches = collect(insert_result, ctx.task_ctx())
+            .await
+            .expect("Failed to execute insert plan and write test data");
+
+        tracing::info!("Insert completed, wrote {} batches", batches.len());
+
+        (catalog, table_metadata, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for concurrent reads test");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_turso() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for concurrent reads test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_concurrent_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_impl(&connection_string).await;
+    }
+
+    /// Core concurrent read test implementation
+    async fn test_concurrent_reads_impl(connection_string: &str) {
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
+
+        // Create multiple concurrent readers
+        let num_readers = 20;
+        let num_queries_per_reader = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider in concurrent reader task");
+
+                let mut total_rows = 0;
+                for query_num in 0..num_queries_per_reader {
+                    // Execute a full table scan
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("Failed to create scan plan in concurrent reader");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("Failed to collect scan results in concurrent reader");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    total_rows += row_count;
+
+                    if query_num == 0 {
+                        tracing::info!(
+                            "Reader {} first query returned {} rows",
+                            reader_id,
+                            row_count
+                        );
+                    }
+                }
+
+                total_rows
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for (idx, result) in results.iter().enumerate() {
+            match result {
+                Ok(total_rows) => {
+                    assert_eq!(
+                        *total_rows,
+                        1000 * num_queries_per_reader,
+                        "Reader {idx} read incorrect number of rows"
+                    );
+                }
+                Err(e) => panic!("Reader {idx} failed: {e}"),
+            }
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers successfully completed {} queries each",
+            num_readers,
+            num_queries_per_reader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_filters_turso() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for filter test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_filter_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_filters_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with various filter conditions
+    async fn test_concurrent_reads_with_filters_impl(connection_string: &str) {
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
+
+        let num_readers = 10;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for filter test reader");
+
+                // Register the table with DataFusion so we can run SQL queries
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("Failed to register table with DataFusion context");
+
+                // Execute various queries with filters
+                let queries = vec![
+                    ("SELECT COUNT(*) FROM test_table WHERE id < 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id >= 500", 500),
+                    ("SELECT COUNT(*) FROM test_table WHERE id % 2 = 0", 500),
+                    ("SELECT COUNT(*) FROM test_table", 1000),
+                ];
+
+                for (query, expected_count) in &queries {
+                    let df = ctx.sql(query).await.expect("Failed to execute SQL query");
+                    let batches = df.collect().await.expect("Failed to collect query results");
+
+                    // Extract count from result
+                    let count = batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("Failed to downcast count column to Int64Array")
+                        .value(0);
+
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let count_usize = count as usize;
+                    assert_eq!(
+                        count_usize, *expected_count,
+                        "Reader {reader_id} query '{query}' returned incorrect count"
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all readers to complete
+        let results = join_all(handles).await;
+
+        // Verify all readers completed successfully
+        for result in results {
+            result.expect("Filter test concurrent reader task should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with filters completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_sqlite() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temporary directory for projection test");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_concurrent_reads_with_projections_turso() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for projection test (Turso)");
+        let db_path = temp_dir.path().join("cayenne_projection_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_concurrent_reads_with_projections_impl(&connection_string).await;
+    }
+
+    /// Test concurrent reads with different column projections
+    async fn test_concurrent_reads_with_projections_impl(connection_string: &str) {
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
+
+        let num_readers = 15;
+
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for projection test reader");
+
+                ctx.register_table("test_table", Arc::new(provider))
+                    .expect("Failed to register table for projection test");
+
+                // Test different projection patterns
+                let queries = vec![
+                    "SELECT id FROM test_table",
+                    "SELECT name FROM test_table",
+                    "SELECT id, name FROM test_table",
+                    "SELECT name, id FROM test_table",
+                ];
+
+                for query in &queries {
+                    let df = ctx
+                        .sql(query)
+                        .await
+                        .expect("Failed to execute projection query");
+                    let batches = df
+                        .collect()
+                        .await
+                        .expect("Failed to collect projection query results");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(
+                        row_count, 1000,
+                        "Reader {reader_id} query '{query}' returned incorrect row count"
+                    );
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+
+        for result in results {
+            result.expect("Projection test concurrent reader task should complete successfully");
+        }
+
+        tracing::info!(
+            "✓ {} concurrent readers with projections completed successfully",
+            num_readers
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_concurrency_stress_sqlite() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for high concurrency stress test");
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn test_high_concurrency_stress_turso() {
+        let temp_dir = TempDir::new().expect(
+            "Failed to create temporary directory for high concurrency stress test (Turso)",
+        );
+        let db_path = temp_dir.path().join("cayenne_stress_test.db");
+        let connection_string = format!("libsql://{}", db_path.to_string_lossy());
+        test_high_concurrency_stress_impl(&connection_string).await;
+    }
+
+    /// Stress test with high concurrency (50 readers, 50 queries each)
+    async fn test_high_concurrency_stress_impl(connection_string: &str) {
+        let ctx = SessionContext::new();
+        let (catalog, table_metadata, _temp_dir) = setup_test_table(connection_string, &ctx).await;
+
+        let num_readers = 50;
+        let queries_per_reader = 50;
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+
+        for reader_id in 0..num_readers {
+            let catalog_clone = Arc::clone(&catalog);
+            let table_name = table_metadata.table_name.clone();
+
+            let handle = tokio::spawn(async move {
+                let ctx = SessionContext::new();
+                let catalog_trait: Arc<dyn MetadataCatalog> = catalog_clone;
+                let provider =
+                    CayenneTableProvider::new(&table_name, catalog_trait, ctx.runtime_env())
+                        .await
+                        .expect("Failed to create provider for stress test reader");
+
+                for _ in 0..queries_per_reader {
+                    let plan = provider
+                        .scan(&ctx.state(), None, &[], None)
+                        .await
+                        .expect("Failed to create scan plan in stress test");
+
+                    let batches = collect(plan, ctx.task_ctx())
+                        .await
+                        .expect("Failed to collect scan results in stress test");
+
+                    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 1000, "Reader {reader_id} got wrong row count");
+                }
+
+                reader_id
+            });
+
+            handles.push(handle);
+        }
+
+        let results = join_all(handles).await;
+        let duration = start.elapsed();
+
+        for result in results {
+            result.expect("Stress test concurrent reader task should complete successfully");
+        }
+
+        let total_queries = num_readers * queries_per_reader;
+        let qps = f64::from(total_queries) / duration.as_secs_f64();
+
+        tracing::info!(
+            "✓ Stress test: {} concurrent readers × {} queries = {} total queries in {:.2}s ({:.0} qps)",
+            num_readers,
+            queries_per_reader,
+            total_queries,
+            duration.as_secs_f64(),
+            qps
+        );
+    }
+
+    /// Test that data is sorted when `sort_columns` is configured
+    #[tokio::test]
+    async fn test_sort_columns() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory for sort test");
+        let data_path = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_path).expect("Failed to create data directory");
+
+        let connection_string =
+            format!("sqlite://{}/cayenne.db", temp_dir.path().to_string_lossy());
+        let catalog = Arc::new(
+            crate::CayenneCatalog::new(connection_string).expect("Failed to create catalog"),
+        );
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Configure table with sort columns
+        let vortex_config = crate::metadata::VortexConfig {
+            sort_columns: vec!["timestamp".to_string(), "id".to_string()],
+            ..Default::default()
+        };
+
+        let table_options = crate::metadata::CreateTableOptions {
+            table_name: "sorted_test".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config,
+        };
+
+        let ctx = SessionContext::new();
+        let table = CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env())
+            .await
+            .expect("Failed to create table");
+
+        // Insert unsorted data
+        let unsorted_ids = vec![5i64, 3, 1, 4, 2];
+        let unsorted_timestamps = vec![100i64, 200, 50, 150, 75];
+        let unsorted_values = vec![50i64, 30, 10, 40, 20];
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(unsorted_ids)),
+                Arc::new(Int64Array::from(unsorted_timestamps)),
+                Arc::new(Int64Array::from(unsorted_values)),
+            ],
+        )
+        .expect("Failed to create record batch");
+
+        let ctx = SessionContext::new();
+        let input_exec =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("memory exec");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("insert_into");
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("Failed to insert data");
+
+        // Ordinary writes are intentionally unsorted for throughput.
+        // Compaction (sort_and_rewrite_data) sorts the data and flushes inline
+        // rows to Vortex files with tight zone-map bounds.
+        table
+            .sort_and_rewrite_data(128 * 1024 * 1024)
+            .await
+            .expect("Failed to sort and rewrite data");
+
+        // Verify data is sorted by timestamp, then by id
+        let ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("Failed to create scan plan");
+
+        let result_batches = collect(scan_plan, ctx.task_ctx())
+            .await
+            .expect("Failed to collect results");
+
+        assert!(!result_batches.is_empty(), "Should have result batches");
+
+        // Combine all batches
+        let combined = arrow::compute::concat_batches(&schema, &result_batches)
+            .expect("Failed to concatenate batches");
+
+        let timestamp_col = combined
+            .column_by_name("timestamp")
+            .expect("timestamp column exists")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("timestamp is Int64Array");
+
+        let id_col = combined
+            .column_by_name("id")
+            .expect("id column exists")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64Array");
+
+        // Verify sorted order: timestamp ascending, then id ascending
+        let expected_timestamps = [50i64, 75, 100, 150, 200];
+        let expected_ids = [1i64, 2, 5, 4, 3];
+
+        for i in 0..5 {
+            assert_eq!(
+                timestamp_col.value(i),
+                expected_timestamps[i],
+                "Row {i} timestamp should be sorted"
+            );
+            assert_eq!(
+                id_col.value(i),
+                expected_ids[i],
+                "Row {i} id should match expected order"
+            );
+        }
+
+        tracing::info!("✓ Data sorted correctly by sort_columns");
+    }
+
+    /// Test that multiple upsert rounds with different PKs survive restart correctly.
+    ///
+    /// Previously: `load_protected_snapshots` computed a single global `max_delete_seq`
+    /// from ALL deletion vectors and only kept snapshots where `seq > max_delete_seq`.
+    /// With multiple upsert rounds, later rounds raised the global max, causing earlier
+    /// protected snapshots to be dropped and their data lost on restart.
+    ///
+    /// The test verifies that after a restart, all upserted rows are preserved correctly.
+    ///
+    /// Scenario:
+    ///   Round 1: insert alice(100), bob(200), clint(300)
+    ///   Round 2: upsert alice(101), bob(201)  — creates a delete and new snapshot A
+    ///   Round 3: upsert clint(301)            — creates a delete and new snapshot B
+    ///   Restart → should still have exactly 3 rows: alice(101), bob(201), clint(301)
+    #[tokio::test]
+    async fn test_multi_upsert_rounds_survive_restart() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temp directory for multi-upsert restart test");
+        let db_path = temp_dir.path().join("cayenne_multi_upsert.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir)
+            .expect("Failed to create data directory for multi-upsert restart test");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("email", DataType::Utf8, false),
+            Field::new("username", DataType::Utf8, false),
+            Field::new("items_bought", DataType::Int64, false),
+        ]));
+
+        // Create catalog
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string.clone())
+                .expect("Failed to create CayenneCatalog for multi-upsert restart test"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog for multi-upsert restart test");
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+
+        let table_options = CreateTableOptions {
+            table_name: "users".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["email".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "email".to_string(),
+            ]))),
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog_trait),
+            table_options,
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect("Failed to create table for multi-upsert restart test");
+        let provider = Arc::new(provider);
+
+        // ---- Round 1: Initial insert of all 3 users ----
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "alice@sample.com",
+                    "bob@umbrellacorp.com",
+                    "clint@bobsumbrellas.com",
+                ])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "clint"])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .expect("to create batch");
+        insert_batch(&provider, batch1).await;
+
+        // ---- Round 2: Upsert alice and bob only (clint unchanged) ----
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "alice@sample.com",
+                    "bob@umbrellacorp.com",
+                ])),
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+                Arc::new(Int64Array::from(vec![101, 201])),
+            ],
+        )
+        .expect("to create batch");
+        insert_batch(&provider, batch2).await;
+
+        // ---- Round 3: Upsert clint only (alice and bob unchanged) ----
+        let batch3 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["clint@bobsumbrellas.com"])),
+                Arc::new(StringArray::from(vec!["clint"])),
+                Arc::new(Int64Array::from(vec![301])),
+            ],
+        )
+        .expect("to create batch");
+        insert_batch(&provider, batch3).await;
+
+        // Verify pre-restart: should have exactly 3 rows with latest values
+        let ctx = SessionContext::new();
+        ctx.register_table("users", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("Failed to register table for pre-restart check");
+        let df = ctx
+            .sql("SELECT email, items_bought FROM users ORDER BY email")
+            .await
+            .expect("Failed to query pre-restart");
+        let pre_batches = df.collect().await.expect("Failed to collect pre-restart");
+        let pre_results = format!(
+            "{}",
+            pretty_format_batches(&pre_batches).expect("format pre-restart results")
+        );
+        insta::assert_snapshot!("restart_after_upserts_before_restart", pre_results);
+
+        // ---- Restart: drop provider, re-open from fresh catalog ----
+        drop(provider);
+        drop(ctx);
+
+        let catalog2 = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to re-create CayenneCatalog after restart"),
+        );
+        catalog2
+            .init()
+            .await
+            .expect("Failed to re-initialize catalog after restart");
+        let catalog_trait2: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
+
+        let ctx2 = SessionContext::new();
+        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
+            .open("users")
+            .await
+            .expect("Failed to reopen table after restart");
+        let provider2 = Arc::new(provider2);
+
+        ctx2.register_table("users", Arc::clone(&provider2) as Arc<dyn TableProvider>)
+            .expect("Failed to register table post-restart");
+
+        let df2 = ctx2
+            .sql("SELECT email, items_bought FROM users ORDER BY email")
+            .await
+            .expect("Failed to query post-restart");
+        let post_batches = df2.collect().await.expect("Failed to collect post-restart");
+        let post_results = format!(
+            "{}",
+            pretty_format_batches(&post_batches).expect("format post-restart results")
+        );
+        insta::assert_snapshot!("restart_after_upserts_after_restart", post_results);
+
+        tracing::info!("✓ Multi-round upsert data survives restart correctly");
+    }
+
+    /// Regression test: upsert should persist insert records to catalog so state survives restart.
+    #[tokio::test]
+    async fn test_upsert_persists_insert_records_for_restart() {
+        let temp_dir =
+            TempDir::new().expect("Failed to create temp directory for upsert restart test");
+        let db_path = temp_dir.path().join("cayenne_upsert_restart.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir)
+            .expect("Failed to create data directory for upsert restart test");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("email", DataType::Utf8, false),
+            Field::new("items_bought", DataType::Int64, false),
+        ]));
+
+        let catalog = Arc::new(
+            CayenneCatalog::new(connection_string.clone())
+                .expect("Failed to create CayenneCatalog for upsert restart test"),
+        );
+        catalog
+            .init()
+            .await
+            .expect("Failed to initialize catalog for upsert restart test");
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+
+        let table_options = CreateTableOptions {
+            table_name: "users".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["email".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "email".to_string(),
+            ]))),
+            base_path: data_dir.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let provider = CayenneTableProvider::create_table(
+            Arc::clone(&catalog_trait),
+            table_options,
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect("Failed to create table for upsert restart test");
+
+        // Initial insert. Use enough rows to bypass inlining so this test keeps
+        // exercising the file-backed upsert path and its insert-record metadata.
+        let initial_row_count = table::INLINE_MAX_ROWS + 1;
+        let mut emails: Vec<String> = (0..initial_row_count)
+            .map(|idx| format!("user{idx}@sample.com"))
+            .collect();
+        emails[0] = "alice@sample.com".to_string();
+        let mut items_bought: Vec<i64> = (0..initial_row_count)
+            .map(|idx| i64::try_from(idx).expect("test row index fits in i64"))
+            .collect();
+        items_bought[0] = 100;
+
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(emails)),
+                Arc::new(Int64Array::from(items_bought)),
+            ],
+        )
+        .expect("to create initial batch");
+        insert_batch(&provider, batch1).await;
+
+        // Upsert same PK with new value (must create delete+insert sequence metadata).
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["alice@sample.com"])),
+                Arc::new(Int64Array::from(vec![101])),
+            ],
+        )
+        .expect("to create upsert batch");
+        insert_batch(&provider, batch2).await;
+
+        // Restart by creating fresh catalog/provider instances.
+        drop(provider);
+        drop(catalog);
+
+        let catalog2 = Arc::new(
+            CayenneCatalog::new(connection_string)
+                .expect("Failed to re-create CayenneCatalog after restart"),
+        );
+        catalog2
+            .init()
+            .await
+            .expect("Failed to re-initialize catalog after restart");
+        let catalog_trait2: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
+
+        let ctx2 = SessionContext::new();
+        let provider2 = CayenneTableProviderBuilder::new(catalog_trait2, ctx2.runtime_env())
+            .open("users")
+            .await
+            .expect("Failed to reopen table after restart");
+
+        let provider2 = Arc::new(provider2);
+        ctx2.register_table("users", Arc::clone(&provider2) as Arc<dyn TableProvider>)
+            .expect("Failed to register reopened table");
+
+        let df = ctx2
+            .sql("SELECT items_bought FROM users WHERE email = 'alice@sample.com'")
+            .await
+            .expect("Failed to query reopened table");
+        let batches = df
+            .collect()
+            .await
+            .expect("Failed to collect query results after restart");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "Expected a single row for alice");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("items_bought should be Int64")
+            .value(0);
+        assert_eq!(value, 101, "Latest upserted value should be visible");
+    }
+
+    /// Verifies that `CayenneDataSink::write_all` normalizes incoming batch schemas
+    /// to match the table schema. CDC (Debezium) batches can arrive with `NonNullable`
+    /// columns when the table schema declares them as `Nullable`, which would cause a
+    /// Vortex assertion failure without normalization.
+    #[tokio::test]
+    async fn test_insert_normalizes_nullable_schema_mismatch() {
+        let temp_dir = TempDir::new()
+            .expect("Failed to create temporary directory for schema normalization test");
+        let db_path = temp_dir.path().join("cayenne_schema_norm_test.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+
+        let catalog = Arc::new(
+            CayenneCatalog::new(&connection_string)
+                .expect("Failed to create CayenneCatalog instance"),
+        );
+        catalog.init().await.expect("to initialize catalog");
+
+        // Table schema: id NOT NULL, name NULLABLE
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let table_options = CreateTableOptions {
+            table_name: "schema_norm_test".to_string(),
+            schema: Arc::clone(&table_schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: temp_dir.path().to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::create_table(catalog_trait, table_options, ctx.runtime_env())
+                .await
+                .expect("to create Cayenne table");
+
+        // Input schema: id NULLABLE (mismatches table's NOT NULL), name NULLABLE
+        // This simulates what CDC/Debezium sends — all columns as nullable.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )
+        .expect("to create input batch");
+
+        // Insert with mismatched nullability — should succeed after normalization
+        let input_exec =
+            MemorySourceConfig::try_new_exec(&[vec![input_batch]], Arc::clone(&input_schema), None)
+                .expect("to create MemorySourceConfig");
+
+        let insert_plan = provider
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("to insert into table with mismatched nullability");
+
+        collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("to execute insert");
+        // Verify the data is readable and the output schema matches the table schema
+        let scan_plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan after normalized insert");
+
+        let result = collect(scan_plan, ctx.task_ctx())
+            .await
+            .expect("to collect scan results");
+
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "Expected 2 rows after insert");
+
+        // The output schema must match the table schema (Nullable for name),
+        // not the input schema
+        assert_eq!(
+            result[0].schema(),
+            table_schema,
+            "Output schema should match the table schema, not the input schema"
+        );
+    }
+
+    fn widening_plan(
+        stored: &Schema,
+        incoming: &Schema,
+        constraint_columns: &[String],
+    ) -> arrow_tools::schema_evolution::WideningPlan {
+        let ctx = arrow_tools::schema_evolution::EvolutionContext { constraint_columns };
+        match arrow_tools::schema_evolution::classify(stored, incoming, &ctx) {
+            arrow_tools::schema_evolution::SchemaEvolution::Widening(plan) => plan,
+            other => panic!("Expected widening classification, got: {other:?}"),
+        }
+    }
+
+    async fn query_count(ctx: &SessionContext, sql: &str) -> i64 {
+        let df = ctx.sql(sql).await.expect("to plan query");
+        let batches = df.collect().await.expect("to collect query results");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) should be Int64")
+            .value(0)
+    }
+
+    /// Restart-time read-side verification: old NARROWER Vortex files must scan
+    /// correctly under the widened logical schema — including statistics-based
+    /// file pruning with a filter on the widened column, and a filter on an
+    /// ADDED column over pre-evolution files (missing-column null-fill in the
+    /// Vortex opener).
+    #[tokio::test]
+    async fn schema_evolution_restart_scans_old_files_under_widened_schema() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_restart.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Disable write-entry inlining so the pre-evolution rows land in real
+        // Vortex files — the adaptation under test (widened-type filter +
+        // added-column null-fill) is the file read path, not the inline corpus.
+        let vortex_config = crate::metadata::VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            inline_max_buffer_bytes: 0,
+            ..crate::metadata::VortexConfig::default()
+        };
+
+        let table_name = "evolution_restart";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider");
+
+        let ids: Vec<i64> = (0..1000).collect();
+        let vs: Vec<i32> = (0..1000).collect();
+        let names: Vec<String> = (0..1000).map(|i| format!("name_{i}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int32Array::from(vs)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+        drop(provider);
+
+        // Restart-time engine evolution: widen `v` Int32 -> Int64 and append a
+        // nullable `tag` column, committed via update_table_schema.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        catalog
+            .update_table_schema(&table_metadata.table_id, &plan.evolved_schema)
+            .await
+            .expect("to update table schema");
+
+        // "Restart": a fresh provider must open with the evolved schema.
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        assert_eq!(
+            provider.schema().as_ref(),
+            plan.evolved_schema.as_ref(),
+            "reopened provider should expose the evolved schema"
+        );
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+
+        // Filter on the WIDENED column over old Int32 files (exercises the
+        // stats-pruning + expression-adaptation path with an Int64 predicate).
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart WHERE v > 500").await,
+            499
+        );
+        // Filter on the ADDED column over pre-evolution files (null-fill).
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag IS NULL"
+            )
+            .await,
+            1000
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag = 'x'"
+            )
+            .await,
+            0
+        );
+
+        // Post-evolution write: a value outside Int32 range plus the new column.
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&plan.evolved_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1000_i64])),
+                Arc::new(Int64Array::from(vec![5_000_000_000_i64])),
+                Arc::new(StringArray::from(vec!["name_1000"])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("to build widened batch");
+        insert_batch(&provider, new_batch).await;
+
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart").await,
+            1001
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag = 'x'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE v > 2147483647"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// The inline-corpus half of the restart-evolution contract: rows small
+    /// enough to live in `cayenne_inlined_data` must scan correctly under a
+    /// schema widened while the provider was closed.
+    ///
+    /// `evolve_schema_live` flushes the corpus before its own swap, but the
+    /// open-time evolution in `try_widening_schema_evolution` commits the evolved
+    /// schema straight to the metastore, leaving a corpus a width behind for the
+    /// next provider to read. Without the decode-time adaptation the scan resolves
+    /// live-schema column indices against the narrower stored batch and fails with
+    /// `project index N out of bounds`.
+    #[tokio::test]
+    async fn schema_evolution_restart_scans_inlined_rows_under_widened_schema() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_inlined.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Inlining left at its defaults (1,024 rows / 1 MiB / 4 MiB), so this
+        // handful of rows is admitted to the corpus instead of a Vortex file —
+        // the contrast with `schema_evolution_restart_scans_old_files_under_widened_schema`,
+        // which zeroes the caps to force the file path.
+        let table_name = "evolution_restart_inlined";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider");
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![10_i32, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+
+        // Guard the premise: if these rows ever stop being inlined this test would
+        // silently degrade into a duplicate of the file-backed case above.
+        assert!(
+            !catalog
+                .get_inlined_data(&table_metadata.table_id)
+                .await
+                .expect("to read inlined data")
+                .is_empty(),
+            "rows under the default inline caps must land in the inline corpus"
+        );
+        drop(provider);
+
+        // Restart-time engine evolution: widen `v` Int32 -> Int64 and append a
+        // nullable `tag` column, exactly as `try_widening_schema_evolution` commits
+        // it at open — the corpus is NOT rewritten.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        catalog
+            .update_table_schema(&table_metadata.table_id, &plan.evolved_schema)
+            .await
+            .expect("to update table schema");
+
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+
+        // The whole corpus is served, not zero rows and not an error.
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart_inlined").await,
+            5
+        );
+        // Added column over pre-evolution inlined rows (null-fill).
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE tag IS NULL"
+            )
+            .await,
+            5
+        );
+        // Widened column under an Int64 predicate over Int32-encoded inlined rows.
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE v > 25"
+            )
+            .await,
+            3
+        );
+        // A projection that reaches the ADDED column is the index the unadapted
+        // batch could not resolve.
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM (SELECT id, v, name, tag FROM evolution_restart_inlined)"
+            )
+            .await,
+            5
+        );
+
+        // Post-evolution write lands at the widened width alongside the adapted corpus.
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&plan.evolved_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![6_i64])),
+                Arc::new(Int64Array::from(vec![5_000_000_000_i64])),
+                Arc::new(StringArray::from(vec!["f"])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("to build widened batch");
+        insert_batch(&provider, new_batch).await;
+
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart_inlined").await,
+            6
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE tag = 'x'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE v > 2147483647"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// `create_table` against an existing table whose ONLY configuration
+    /// difference is a widening schema change: evolves in place when the
+    /// runtime-provided `schema_evolution` mode allows it, and keeps the
+    /// legacy pin-stored-schema behavior otherwise.
+    #[tokio::test]
+    async fn schema_evolution_create_table_widening_gate() {
+        use crate::metadata::SchemaEvolutionMode;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_gate.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let added_only_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let pk_widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let options_for =
+            |table: &str, schema: &Arc<Schema>, mode: SchemaEvolutionMode| -> CreateTableOptions {
+                CreateTableOptions {
+                    table_name: table.to_string(),
+                    schema: Arc::clone(schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        schema_evolution: mode,
+                        ..crate::metadata::VortexConfig::default()
+                    },
+                }
+            };
+
+        // Disabled (legacy): the stored schema is pinned.
+        let table = "t_disabled";
+        let id_before = catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
+            .await
+            .expect("create");
+        let id_after = catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
+            .await
+            .expect("re-create with changed schema");
+        assert_eq!(id_before, id_after);
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "disabled mode must pin the stored schema"
+        );
+
+        // Widen: the full widening set evolves in place, same table_id.
+        let table = "t_widen";
+        let id_before = catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let id_after = catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("re-create with widened schema");
+        assert_eq!(id_before, id_after);
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            widened_schema.as_ref(),
+            "widen mode must commit the evolved schema"
+        );
+
+        // AddColumnsOnly: a type widening is OUTSIDE the evolution set (pinned)…
+        let table = "t_addonly";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("create");
+        catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("re-create with widened schema");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "append_new_columns must not evolve type widening"
+        );
+        // …but a pure nullable column add IS evolved.
+        catalog
+            .create_table(options_for(
+                table,
+                &added_only_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("re-create with added column");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            added_only_schema.as_ref(),
+            "append_new_columns must evolve added nullable columns"
+        );
+
+        // Constraint guard: widening a PRIMARY KEY column is Incompatible
+        // (typed PK row-encodings) — pinned even under Widen.
+        let table = "t_pkguard";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        catalog
+            .create_table(options_for(
+                table,
+                &pk_widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("re-create with widened PK schema");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "PK type widening must classify Incompatible and pin the stored schema"
+        );
+
+        // Non-schema config differences must keep today's behavior even when
+        // the schema also widened (schema must be the ONLY difference).
+        let table = "t_mixed_diff";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let mut mixed = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
+        mixed.vortex_config.sort_columns = vec!["id".to_string()];
+        catalog
+            .create_table(mixed)
+            .await
+            .expect("re-create with mixed config + schema diff");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "a non-schema config difference must keep the legacy pin path"
+        );
+    }
+
+    /// Repairing the stored declaration rewrites no file, so a table that already holds rows
+    /// ends up with a corpus whose own Arrow IPC schema still declares `entries` nullable while
+    /// the reopened table declares it non-nullable. This pins that the disagreement is readable
+    /// — on both tiers: served from the inline corpus, and again after a checkpoint has flushed
+    /// it to a Vortex file, which has no map dtype and rebuilds one from the table's schema.
+    ///
+    /// Rows are written through the ordinary insert path so the sequence bookkeeping is real,
+    /// then the stored blob is replaced with the same rows re-serialized under the
+    /// pre-conformance declaration — the on-disk state a legacy table is actually in.
+    ///
+    /// Note what this does and does not guard. It is a forward guard against a later change
+    /// making the repair break legacy reads; it is **not** a guard on the repair itself, and it
+    /// cannot be: removing the repair makes the stored declaration agree with the blob again, so
+    /// there is no disagreement left to read. It also records a measured fact — the read path
+    /// tolerates this mismatch, so the unreadable-column shape #13549 describes is not what a
+    /// Cayenne scan does with it. What the repair demonstrably prevents is on the comparison
+    /// side; see `normalize_for_comparison`.
+    #[tokio::test]
+    async fn legacy_inline_map_data_is_readable_once_the_declaration_is_repaired() {
+        use arrow::array::Array;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_legacy_map_data.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let schema_with = |entries_nullable: bool| {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("headers", map_of(entries_nullable), true),
+            ]))
+        };
+        let batch_with = |entries_nullable: bool| {
+            let entries = arrow::array::StructArray::from(vec![
+                (
+                    Arc::new(Field::new("keys", DataType::Utf8, false)),
+                    Arc::new(StringArray::from(vec!["a", "b"])) as arrow::array::ArrayRef,
+                ),
+                (
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(StringArray::from(vec![Some("1"), Some("2")]))
+                        as arrow::array::ArrayRef,
+                ),
+            ]);
+            let offsets = arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
+            let map = arrow::array::make_array(
+                arrow::array::ArrayData::builder(map_of(entries_nullable))
+                    .len(2)
+                    .add_buffer(offsets.into_inner().into_inner())
+                    .add_child_data(entries.to_data())
+                    .build()
+                    .expect("build the map array"),
+            );
+            RecordBatch::try_new(
+                schema_with(entries_nullable),
+                vec![Arc::new(Int32Array::from(vec![1, 2])), map],
+            )
+            .expect("batch")
+        };
+
+        let table_name = "legacy_map_data";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: schema_with(false),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        insert_batch(&provider, batch_with(false)).await;
+        let table_id = catalog
+            .get_table(table_name)
+            .await
+            .expect("get table")
+            .table_id;
+        assert!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count")
+                > 0,
+            "the write must land in the inline corpus, or this test proves nothing about it"
+        );
+
+        // Re-serialize the identical rows under the pre-conformance declaration and put those
+        // bytes back. Only the declaration differs; every key and value is the same.
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema_with(true))
+                    .expect("ipc writer");
+            writer.write(&batch_with(true)).expect("write");
+            writer.finish().expect("finish");
+        }
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open the metastore directly");
+            let swapped = conn
+                .execute(
+                    "UPDATE cayenne_inlined_data SET data_ipc = ?1 WHERE table_id = ?2",
+                    rusqlite::params![ipc, table_id],
+                )
+                .expect("swap in the legacy blob");
+            assert_eq!(
+                swapped, 1,
+                "exactly one inline blob should have been replaced"
+            );
+        }
+
+        // Reopen: `get_table` repairs the stored declaration; the blob keeps the old one.
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("register");
+
+        let read_back = |ctx: SessionContext| async move {
+            let batches = ctx
+                .sql("SELECT id, headers FROM legacy_map_data ORDER BY id")
+                .await
+                .expect("plan the scan")
+                .collect()
+                .await
+                .expect("a row written under the forbidden declaration must still be readable");
+            pretty_format_batches(&batches).expect("format").to_string()
+        };
+
+        let expected = "\
++----+---------+
+| id | headers |
++----+---------+
+| 1  | {a: 1}  |
+| 2  | {b: 2}  |
++----+---------+";
+        assert_eq!(
+            read_back(ctx.clone()).await,
+            expected,
+            "served from the inline corpus"
+        );
+
+        // Same rows again once they have been flushed to a Vortex file: Vortex has no map dtype
+        // and restores one from the table's schema, so the repaired declaration is what it
+        // rebuilds against.
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush the inline corpus to a Vortex file");
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_id)
+                .await
+                .expect("inlined count"),
+            0,
+            "the corpus must actually be flushed, or the second read repeats the first"
+        );
+        assert_eq!(
+            read_back(ctx).await,
+            expected,
+            "served from a Vortex file written out of the legacy blob"
+        );
+    }
+
+    /// A widening plan is built from a source schema, and a source is free to declare a `MAP`'s
+    /// `entries` field nullable — which the Arrow map layout forbids and `MapArray::try_new`
+    /// refuses. Adding such a column under `append_new_columns` must not leave a column no
+    /// kernel can rebuild on a table that was readable a moment earlier.
+    ///
+    /// This is the Cayenne end of the normalization `classify` applies, exercised the way
+    /// production reaches it — the CDC path hands `evolve_schema_live` a plan the classifier
+    /// built. The metastore write and the in-memory swap are asserted separately: they are two
+    /// different stores, and a declaration that reaches only one of them leaves the other
+    /// advertising a type its own catalog disagrees with.
+    #[tokio::test]
+    async fn schema_evolution_live_installs_a_conforming_map_entries_declaration() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_map.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let map_of = |entries_nullable: bool| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+
+        let table_name = "evolution_map_entries";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        // The source adds a nullable `headers` MAP whose `entries` it declares nullable.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("headers", map_of(true), true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        assert_eq!(
+            plan.evolved_schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &map_of(false),
+            "the classifier must not hand on a plan carrying the declaration the Arrow map layout forbids"
+        );
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        let expected = map_of(false);
+        assert_eq!(
+            provider
+                .schema()
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the live provider must not advertise a column no kernel can rebuild"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .field_with_name("headers")
+                .expect("headers")
+                .data_type(),
+            &expected,
+            "the metastore must hold the conforming declaration too"
+        );
+    }
+
+    /// Live evolution sequencing: rows pending in the inline corpus written
+    /// PRE-evolution are flushed to a Vortex file before the schema swap (the
+    /// inline branch is unioned projection-only, so a swap with pending inline
+    /// rows would be mistyped), the swap is idempotent, and the PK constraint
+    /// guard rejects a key-widening plan.
+    #[tokio::test]
+    async fn schema_evolution_live_swap_flushes_inline_corpus() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_live.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let table_name = "evolution_live";
+        // Default VortexConfig keeps write-entry inlining ON (inline_max_rows
+        // 1024), so the small batch below lands in the inline corpus.
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())),
+                Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+        assert!(
+            catalog
+                .get_inlined_data_count(&table_metadata.table_id)
+                .await
+                .expect("inlined count")
+                > 0,
+            "small write should land in the inline corpus"
+        );
+
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        assert_eq!(
+            provider.schema().as_ref(),
+            plan.evolved_schema.as_ref(),
+            "live provider should expose the evolved schema after the swap"
+        );
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_metadata.table_id)
+                .await
+                .expect("inlined count"),
+            0,
+            "the inline corpus must be flushed before the schema swap"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .as_ref(),
+            plan.evolved_schema.as_ref(),
+            "the metastore must hold the evolved schema"
+        );
+
+        // Idempotent: re-applying the same plan is a no-op.
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("re-applying the same plan should no-op");
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_live").await,
+            10
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_live WHERE tag IS NULL"
+            )
+            .await,
+            10
+        );
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_live WHERE v >= 5").await,
+            5
+        );
+
+        // Constraint guard, live path: a plan that widens the PK column must
+        // be rejected (typed PK row-encodings cannot be widened in place).
+        let pk_widening = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let pk_plan = widening_plan(plan.evolved_schema.as_ref(), &pk_widening, &[]);
+        assert!(
+            provider.evolve_schema_live(&pk_plan).await.is_err(),
+            "widening a PK column must be rejected by the live path"
+        );
+    }
+}

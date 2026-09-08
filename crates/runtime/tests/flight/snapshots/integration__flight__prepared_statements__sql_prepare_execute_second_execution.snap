@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/flight/prepared_statements.rs
+expression: results2_str
+---
++---+---+
+| a | b |
++---+---+
+| 2 | b |
+| 2 | b |
++---+---+

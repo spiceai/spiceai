@@ -1,0 +1,5 @@
+---
+source: crates/cpu-budget/src/lib.rs
+expression: "CpuBudget::resolve(&CpuConfig::default(),\n&quota(18, 4000)).expect(\"valid\").summary_line()"
+---
+CPU budget: 4 cores (source: cgroup CPU limit; host reports 18, declared CPU request unset, cgroup share unset, cgroup limit 4 cores) → 4 main worker threads, 3 per dedicated runtime pool, 4 target partitions

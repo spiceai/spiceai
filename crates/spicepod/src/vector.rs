@@ -1,0 +1,61 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    param::Params,
+    partitioning::{PartitionedBy, deserialize_partition_by, serialize_partition_by},
+};
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct VectorStore {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+
+    /// Partition expressions used to organize vector data.
+    ///
+    /// Each item accepts either:
+    /// - a plain expression string, for example `"YEAR(created_at)"` or
+    ///   `"bucket(100, user_id)"`; or
+    /// - a single-entry mapping of a partition name to an expression, for
+    ///   example `{ year: "YEAR(created_at)" }`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_partition_by",
+        deserialize_with = "deserialize_partition_by"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Vec<crate::partitioning::PartitionedBySchema>")
+    )]
+    pub partition_by: Vec<PartitionedBy>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
+const fn default_true() -> bool {
+    true
+}

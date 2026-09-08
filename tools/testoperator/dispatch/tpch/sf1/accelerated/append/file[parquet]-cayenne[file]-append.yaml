@@ -1,0 +1,4 @@
+tests:
+  append:
+    spicepod_path: accelerated/append/file[parquet]-cayenne[file]-append.yaml
+    query_set: tpch

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+---------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: scat.hr.records.id, CAST(scat.hr.records.employee AS LargeUtf8) AS employee           |
+|               |   Sort: scat.hr.records.id ASC NULLS LAST                                                         |
+|               |     SubqueryAlias: scat.hr.records                                                                |
+|               |       TableScan: scat.hr.records projection=[id, employee]                                        |
+| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(employee@1 AS LargeUtf8) as employee]                      |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true |
+|               |     CooperativeExec                                                                               |
+|               |       BytesProcessedExec                                                                          |
+|               |         FlightSqlExec sql=SELECT id, employee FROM scat.hr.records ORDER BY id ASC NULLS LAST     |
+|               |                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------+

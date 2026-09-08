@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: partsupp_rand_1"
+---
++---------------+---------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: partsupp.ps_partkey = Int64(1) AND partsupp.ps_suppkey = Int64(2)                               |
+|               |   TableScan: partsupp projection=[ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment]       |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                             |
+|               |   FilterExec: ps_partkey@0 = 1 AND ps_suppkey@1 = 2                                                     |
+|               |     SchemaCastScanExec                                                                                  |
+|               |       BytesProcessedExec                                                                                |
+|               |         DataSourceExec: partitions=16, partition_sizes=[7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6] |
+|               |                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------+

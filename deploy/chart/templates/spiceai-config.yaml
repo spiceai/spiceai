@@ -1,0 +1,12 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    {{- include "spiceai.labels" . | indent 4 }}
+    app: {{ .Release.Name }}
+  name: {{ template "spiceai.fullname" .  }}-spicepod
+  namespace: {{ template "spiceai.namespace" . }}
+data:
+  spicepod.yaml: |
+    {{- toYaml .Values.spicepod | nindent 4 }}

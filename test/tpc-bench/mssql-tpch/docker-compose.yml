@@ -1,0 +1,9 @@
+services:
+ mssql_tpch:
+    image: ghcr.io/spiceai/spice-mssql-bench:latest
+    ports:
+      - 1433:1433
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=S3cretP@ssw0rd
+      - DB_NAME=tpch_sf1

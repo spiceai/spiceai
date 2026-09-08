@@ -1,0 +1,280 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The embedding contract.
+//!
+//! An embedder turns text into vectors. Implemented by provider crates; called by the
+//! runtime's embedding columns, the vector index, and search — none of which name a
+//! provider.
+
+use std::{fmt::Debug, sync::Arc};
+
+use async_openai::types::embeddings::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
+    EncodingFormat,
+};
+use async_trait::async_trait;
+use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+use hf_hub::api::tokio::ApiError as HfApiError;
+use snafu::{ResultExt, Snafu};
+use tokio::{runtime::Handle, task};
+
+pub use async_openai::types::embeddings::EmbeddingInput;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display(
+        "Embedding health check failed. {source}. Verify the embedding configuration."
+    ))]
+    HealthCheckError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to prepare input for embedding: {source}"))]
+    FailedToPrepareInput {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to create embedding: {source}"))]
+    FailedToCreateEmbedding {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Embedding rate limit exceeded. {source}."))]
+    RateLimited {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Invalid `pooling` parameter value: {value}. Use `cls`, `mean`, `splade`, or `last_token`."
+    ))]
+    InvalidPoolingMode { value: String },
+
+    #[snafu(display("Failed to create text chunker for embedding: {source}"))]
+    FailedToCreateChunker {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to create tokenizer for embedding: {source}"))]
+    FailedToCreateTokenizer {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to load embedding model: {source}"))]
+    FailedToInstantiateEmbeddingModel {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "When preparing an embedding model, an issue occurred with the Huggingface API. {source}. Verify the model configuration, and try again."
+    ))]
+    FailedWithHFApi { source: HfApiError },
+
+    #[snafu(display(
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    UnknownModelSource { from: String },
+
+    #[snafu(display(
+        "The specified model '{model_name}' does not exist. Verify the model name and try again."
+    ))]
+    ModelDoesNotExist { model_name: String },
+
+    #[snafu(display(
+        "The specified local model path '{path}' does not exist. Verify the path and try again."
+    ))]
+    LocalModelPathDoesNotExist { path: String },
+
+    #[snafu(display(
+        "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
+    ))]
+    UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
+    MissingParamError { param_key: &'static str },
+
+    #[snafu(display("`param.{param_key}: {value}` is invalid: {reason}."))]
+    InvalidParamError {
+        param_key: &'static str,
+        value: String,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
+    ))]
+    ModelNotProvided { model_source: String },
+
+    #[snafu(display(
+        "The model '{model_id}' pins revision '{revision}', but source '{model_source}' cannot load a pinned revision. Remove ':{revision}' to load the repository's default revision, and try again."
+    ))]
+    RevisionPinningUnsupported {
+        model_source: String,
+        model_id: String,
+        revision: String,
+    },
+
+    #[snafu(display("Embedding rate limit exceeded. Retry after a short delay: {source}"))]
+    FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
+
+    #[snafu(display(
+        "Invalid OpenAI usage tier '{tier}'. Specify a valid tier of 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'."
+    ))]
+    InvalidOpenAITier { tier: String },
+
+    #[snafu(display("Failed to extract embeddings from AWS Bedrock: {message}"))]
+    FailedToExtractEmbeddings { message: String },
+
+    #[snafu(display("Failed to construct request blobs: {message}"))]
+    FailedToConstructRequestBlobs { message: String },
+
+    #[snafu(display("Unsupported embedding input for {model}: {message}"))]
+    UnsupportedEmbeddingInput { model: String, message: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Convert the float-vector representation to the desired format.
+#[must_use]
+pub fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector {
+    match format {
+        EncodingFormat::Float => EmbeddingVector::Float(array),
+        EncodingFormat::Base64 => {
+            let base64_str = EmbeddingVector::Float(array).into();
+            EmbeddingVector::Base64(base64_str)
+        }
+    }
+}
+
+#[async_trait]
+pub trait Embed: Debug + Sync + Send {
+    async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        None
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        if let Some(model_name) = self.model_name() {
+            Some((model_name, input).into())
+        } else {
+            tracing::trace!(
+                "dyn Embed does not implement model_name, therefore cannot generate cache key solely against embedding input: {:?} ",
+                self
+            );
+            None
+        }
+    }
+
+    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
+        if let Some(embeddings_cache) = self.cache()
+            && let Some(cached) = embeddings_cache
+                .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
+                .await
+        {
+            return Some(cached);
+        }
+
+        None
+    }
+
+    async fn put_cached_embed(&self, key: CacheKey<'_>, value: CachedEmbeddingResult) {
+        if let Some(embeddings_cache) = self.cache() {
+            embeddings_cache
+                .put_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64(), value)
+                .await;
+        }
+    }
+
+    /// [`Self::embed`] from a synchronous context, by parking the current blocking
+    /// thread rather than the async worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::embed`] returns.
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        task::block_in_place(move || Handle::current().block_on(self.embed(input)))
+    }
+
+    fn supports_sync_embeddings(&self) -> bool {
+        false
+    }
+
+    /// Configured model parallelism as read by an execution plan.
+    /// `None` if unsupported.
+    fn parallelism(&self) -> Option<usize> {
+        None
+    }
+
+    /// A basic health check to ensure the model can process future [`Self::embed`] requests.
+    /// Default implementation is a basic call to [`embed()`].
+    async fn health(&self) -> Result<()> {
+        self.embed(EmbeddingInput::String("health".to_string()))
+            .await
+            .boxed()
+            .context(HealthCheckSnafu)?;
+        Ok(())
+    }
+
+    /// The chunker this embedder splits oversized input with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FailedToCreateChunker`] when `cfg` does not describe a usable
+    /// chunker.
+    fn chunker(&self, cfg: &ChunkingConfig) -> Result<Arc<dyn Chunker>> {
+        Ok(Arc::new(
+            RecursiveSplittingChunker::with_character_sizer(cfg)
+                .boxed()
+                .context(FailedToCreateChunkerSnafu)?,
+        ))
+    }
+
+    /// Returns the size of the embedding vector returned by the model. Return -1 if the size should be inferred from [`Embed::embed`] method.
+    fn size(&self) -> i32;
+
+    /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
+    /// implementation will be constructed based on the trait's [`embed`] method.
+    #[expect(clippy::cast_possible_truncation)]
+    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
+        let format = req.encoding_format.unwrap_or_default();
+        let result = self.embed(req.input).await?;
+
+        Ok(CreateEmbeddingResponse {
+            object: "list".to_string(),
+            model: req.model.clone(),
+            data: result
+                .into_iter()
+                .enumerate()
+                .map(|(i, emb)| Embedding {
+                    index: i as u32,
+                    object: "embedding".to_string(),
+                    embedding: encode_embedding(&format, emb),
+                })
+                .collect(),
+            usage: EmbeddingUsage {
+                prompt_tokens: 0,
+                total_tokens: 0,
+            },
+        })
+    }
+}

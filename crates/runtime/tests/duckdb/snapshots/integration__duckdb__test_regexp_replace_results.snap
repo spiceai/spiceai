@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++-------------------------------------------------------------------+
+| regexp_replace(csv_test.region,Utf8("AMERICA"),Utf8("AUSTRALIA")) |
++-------------------------------------------------------------------+
+| AUSTRALIA                                                         |
+| NORTH AUSTRALIA                                                   |
+| SOUTH AUSTRALIA                                                   |
+| EUROPE                                                            |
+| ASIA                                                              |
+| AFRICA                                                            |
++-------------------------------------------------------------------+

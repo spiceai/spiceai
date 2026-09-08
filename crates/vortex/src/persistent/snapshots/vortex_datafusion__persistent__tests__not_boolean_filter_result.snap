@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: result_fmt
+---
++----+
+| id |
++----+
+| 2  |
+| 4  |
++----+

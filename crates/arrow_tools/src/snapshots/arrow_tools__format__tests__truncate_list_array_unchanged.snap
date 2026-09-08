@@ -1,0 +1,27 @@
+---
+source: crates/arrow_tools/src/format.rs
+expression: "write_to_json_value(output).expect(\"could not write ListArray to JSON\")"
+snapshot_kind: text
+---
+[
+  {
+    "col": [
+      0,
+      1,
+      2
+    ]
+  },
+  {
+    "col": [
+      3,
+      4,
+      5
+    ]
+  },
+  {
+    "col": [
+      6,
+      7
+    ]
+  }
+]

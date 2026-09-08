@@ -1,0 +1,11 @@
+version: v1
+kind: Spicepod
+name: test_append_cron_schedule
+datasets:
+  - name: names
+    from: file:test_append_cron_schedule.csv
+    time_column: updated_at
+    acceleration:
+      enabled: true
+      refresh_cron: "*/15 * * * * *" # every 15 seconds
+      refresh_mode: append

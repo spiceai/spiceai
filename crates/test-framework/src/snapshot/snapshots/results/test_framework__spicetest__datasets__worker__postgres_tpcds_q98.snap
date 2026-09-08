@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q98"
+---
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+
+| i_item_id        | i_item_desc                                                                                                                                                         | i_category | i_class     | i_current_price | itemrevenue | revenueratio |
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+
+| AAAAAAAAAABBAAAA | Sides let essentially quite new materials. Sources must read now with the journals; sometimes financial supporters                                                  | Men        | accessories | 5.21            | 4537.43     | 1.388023     |
+| AAAAAAAAABAAAAAA | Unquestionably different demands may not turn worldwide false, wide police. Satisfied, littl                                                                        | Men        | accessories | 6.49            | 191.66      | 0.058629     |
+| AAAAAAAAACGAAAAA | Other, likely eyes call thoroughly english others. Grounds think more initially friendly forms. Responsible minutes would use as. Present, individual sit           | Men        | accessories | 6.86            | 5418.53     | 1.657556     |
+| AAAAAAAAAEDAAAAA | Modern farmers decide wild, usual efforts. Great needs matter without the communities; levels might abandon on a pa                                                 | Men        | accessories | 87.37           | 9534.08     | 2.916523     |
+| AAAAAAAAAFBBAAAA | Sufficient priorities ought to calm greatly great aspirations; waiting studies start just total artists. Minutes might include free centuries. Images make          | Men        | accessories | 2.08            | 5727.35     | 1.752025     |
+| AAAAAAAAAFIAAAAA | Early, wide jobs cry key curtains; soviet, local minutes cannot attract national children. Ideal officials may like highly changes. In a                            | Men        | accessories | 3.67            | 10482.48    | 3.206644     |
+| AAAAAAAAALCAAAAA | Male clergy used to get. Remotely tall funds might come independent women. Th                                                                                       | Men        | accessories | 2.07            | 5796.75     | 1.773255     |
+| AAAAAAAAAOMAAAAA | Different, used others require just. Only mass meals shall not bear arou                                                                                            | Men        | accessories | 6.29            | 5972.36     | 1.826975     |
+| AAAAAAAABFHAAAAA | So increased fears might ask conceivably far important feet. Total weeks would not like differences. Actions drag conclusions. Only try                             | Men        | accessories | 0.28            | 2929.78     | 0.896234     |
+| AAAAAAAABMDAAAAA | Years used to play there conditions. Men identify early present, traditional periods. Local, demanding masters claim for a plants. Political events would get in or | Men        | accessories | 8.66            | 8571.09     | 2.621940     |
++------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+

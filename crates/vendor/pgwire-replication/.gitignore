@@ -1,0 +1,15 @@
+/target
+Cargo.lock
+
+.docker
+docker-data
+testcontainers
+
+*.log
+
+.idea/
+.vscode/
+*.iml
+
+.DS_Store
+Thumbs.db

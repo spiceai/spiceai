@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q48"
+---
++------------------------------+
+| sum(store_sales.ss_quantity) |
++------------------------------+
+| 28670                        |
++------------------------------+

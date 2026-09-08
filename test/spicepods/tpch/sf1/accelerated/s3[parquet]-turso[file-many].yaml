@@ -1,0 +1,82 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-turso[file-many]
+datasets:
+  - from: s3:customer.parquet
+    name: customer
+    params: &s3_params
+      s3_endpoint: http://minio:9000
+      s3_region: us-east-1
+      s3_bucket: tpch-sf1
+      s3_key: data
+      s3_access_key_id: ${secrets:AWS_ACCESS_KEY_ID}
+      s3_secret_access_key: ${secrets:AWS_SECRET_ACCESS_KEY}
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/customer.db
+  - from: s3:lineitem.parquet
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/lineitem.db
+  - from: s3:nation.parquet
+    name: nation
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/nation.db
+  - from: s3:orders.parquet
+    name: orders
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/orders.db
+  - from: s3:part.parquet
+    name: part
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/part.db
+  - from: s3:partsupp.parquet
+    name: partsupp
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/partsupp.db
+  - from: s3:region.parquet
+    name: region
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/region.db
+  - from: s3:supplier.parquet
+    name: supplier
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      params:
+        turso_file: .spice/data/supplier.db

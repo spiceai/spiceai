@@ -1,0 +1,20 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: revenue DESC NULLS FIRST, oorder.o_entry_d ASC NULLS LAST
+  Projection: order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, sum(order_line.ol_amount) AS revenue, oorder.o_entry_d
+    Aggregate: groupBy=[[order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, oorder.o_entry_d]], aggr=[[sum(order_line.ol_amount)]]
+      Projection: oorder.o_entry_d, order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, order_line.ol_amount
+        Inner Join: oorder.o_w_id = order_line.ol_w_id, oorder.o_d_id = order_line.ol_d_id, oorder.o_id = order_line.ol_o_id
+          Projection: oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
+            Inner Join: oorder.o_w_id = new_order.no_w_id, oorder.o_d_id = new_order.no_d_id, oorder.o_id = new_order.no_o_id
+              Projection: oorder.o_id, oorder.o_w_id, oorder.o_d_id, oorder.o_entry_d
+                Inner Join: oorder.o_c_id = customer.c_id, oorder.o_w_id = customer.c_w_id, oorder.o_d_id = customer.c_d_id
+                  Filter: oorder.o_entry_d > TimestampNanosecond(1167696000000000000, None)
+                    TableScan: oorder projection=[o_id, o_c_id, o_w_id, o_d_id, o_entry_d]
+                  Projection: customer.c_id, customer.c_w_id, customer.c_d_id
+                    Filter: customer.c_state LIKE Utf8("A%")
+                      TableScan: customer projection=[c_id, c_w_id, c_d_id, c_state]
+              TableScan: new_order projection=[no_o_id, no_w_id, no_d_id]
+          TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_amount]

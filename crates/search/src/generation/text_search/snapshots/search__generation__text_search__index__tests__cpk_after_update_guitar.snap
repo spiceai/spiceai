@@ -1,0 +1,6 @@
+---
+source: crates/search/src/generation/text_search/index.rs
+expression: "search_and_format(&search_index, \"guitar\").await"
+---
+++
+++

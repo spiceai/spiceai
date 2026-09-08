@@ -1,0 +1,75 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-inferredsort
+# Layout-pruning A/B pod for the adaptive cold layout (F4).
+#
+# Reproduces the PRODUCTION condition that made F4 inert: schema inference fills
+# 'cayenne_sort_columns' from the source's declared order (the primary key, for a
+# PostgreSQL CDC table), which every F4 gate then read as "the operator chose a
+# sort order". An S3/parquet source has no catalog to infer from, so the plain
+# cayenne pod leaves sort_columns empty and F4 already fires there — which is why
+# that pod cannot A/B the fix. Here the inference outcome is pinned explicitly:
+# the PK as the sort order, tagged 'inferred'.
+#
+# Expected: pre-fix, observations are ignored and compaction clusters by the PK,
+# so the selective l_shipdate predicates in q6/q12/q14/q15 prune nothing. Post-fix,
+# observed filter columns outrank the inferred PK and those queries prune.
+# Measure files_scanned / bytes from EXPLAIN ANALYZE — NOT wall-clock, and NOT QPH.
+datasets:
+  - from: s3://benchmarks/tpch_sf100/customer.parquet
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration: &acceleration
+      enabled: true
+      engine: cayenne
+      mode: file
+  - from: s3://benchmarks/tpch_sf100/lineitem.parquet
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      params:
+        # What inference would produce for a CDC'd lineitem: the primary key.
+        # l_shipdate — the column q6/q12/q14/q15 actually filter — is NOT a PK
+        # prefix, so PK-major files each span the whole 7-year date range and
+        # zone maps prune nothing.
+        cayenne_sort_columns: l_orderkey,l_linenumber
+        cayenne_sort_columns_origin: inferred
+  - from: s3://benchmarks/tpch_sf100/nation.parquet
+    name: nation
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/orders.parquet
+    name: orders
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      params:
+        cayenne_sort_columns: o_orderkey
+        cayenne_sort_columns_origin: inferred
+  - from: s3://benchmarks/tpch_sf100/part.parquet
+    name: part
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/partsupp.parquet
+    name: partsupp
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/region.parquet
+    name: region
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3://benchmarks/tpch_sf100/supplier.parquet
+    name: supplier
+    params: *s3_params
+    acceleration: *acceleration

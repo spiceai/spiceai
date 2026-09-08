@@ -1,0 +1,110 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::odbcconn::ODBCDbConnectionPool;
+use async_trait::async_trait;
+use data_components::function_support::FunctionSupport;
+use datafusion::{
+    datasource::TableProvider,
+    sql::{TableReference, unparser::dialect::Dialect},
+};
+use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use snafu::prelude::*;
+use std::sync::Arc;
+
+use data_components::Read;
+use data_components::federation::create_spice_federated_table_provider;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("The table '{table_name}' doesn't exist in the ODBC data source"))]
+    TableDoesntExist { table_name: String },
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct ODBCTableFactory<'a> {
+    pool: Arc<ODBCDbConnectionPool<'a>>,
+    dialect: Option<Arc<dyn Dialect + Send + Sync>>,
+    function_support: Option<FunctionSupport>,
+}
+
+impl<'a> ODBCTableFactory<'a>
+where
+    'a: 'static,
+{
+    #[must_use]
+    pub fn new(
+        pool: Arc<ODBCDbConnectionPool<'a>>,
+        dialect: Option<Arc<dyn Dialect + Send + Sync>>,
+    ) -> Self {
+        Self {
+            pool,
+            dialect,
+            function_support: None,
+        }
+    }
+
+    /// Install the federation function deny-list. Functions on the list (Spice-only
+    /// UDFs such as `json_get_str`) are evaluated locally instead of being pushed
+    /// into the SQL sent through ODBC, where the remote engine would reject the
+    /// unknown function. See issue #10703.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
+    }
+}
+
+#[async_trait]
+impl<'a> Read for ODBCTableFactory<'a>
+where
+    'a: 'static,
+{
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
+
+        let table = SqlTable::new(
+            "odbc",
+            &dyn_pool,
+            table_reference.clone(),
+            Some(Engine::ODBC),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let table = if let Some(dialect) = &self.dialect {
+            table.with_dialect(Arc::clone(dialect))
+        } else {
+            table
+        };
+
+        let sql_table = Arc::new(table);
+        let schema = sql_table.schema();
+        let table_provider = Arc::new(create_spice_federated_table_provider(
+            sql_table,
+            schema,
+            table_reference,
+            self.function_support.clone(),
+        ));
+
+        Ok(table_provider)
+    }
+}

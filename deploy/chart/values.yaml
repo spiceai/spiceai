@@ -1,0 +1,150 @@
+# Additional labels to add to all resources
+additionalLabels: {}
+
+image:
+  repository: ghcr.io/spiceai/spiceai-nightly
+  tag: latest-models # 2.3.0-unstable
+replicaCount: 1
+
+# Update strategy for the Deployment (used when stateful.enabled is false).
+# strategy:
+#   type: Recreate
+
+# Update strategy for the StatefulSet (used when stateful.enabled is true).
+# updateStrategy:
+#   type: RollingUpdate
+
+service:
+  # type can be null, ClusterIP, NodePort, or LoadBalancer
+  type: null
+  additionalAnnotations: {}
+  # If service type is LoadBalancer, specify the source IP ranges to whitelist
+  # loadBalancerSourceRanges:
+  #   - 10.0.0.0/8
+  #   - 172.16.0.0/12
+  # The selector to use for the service
+  # selector:
+  #   custom-selector: value
+
+serviceAccount:
+  # Specifies whether a ServiceAccount should be created
+  create: false
+  # The name of the ServiceAccount to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name:
+  # Annotations to add to the ServiceAccount (e.g. for AWS IRSA, GKE Workload Identity)
+  annotations: {}
+  # Examples:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-spice-role
+  #   iam.gke.io/gcp-service-account: my-sa@my-project.iam.gserviceaccount.com
+
+# Resource requests and limits
+# resources:
+#   limits:
+#     cpu: 1000m
+#     memory: 2Gi
+#   requests:
+#     cpu: 500m
+#     memory: 1Gi
+
+# Override the default command for spiced
+# command:
+#   - /usr/local/bin/spiced
+#   - --http
+#   - 0.0.0.0:8090
+#   - --metrics
+#   - 0.0.0.0:9090
+#   - --flight
+#   - 0.0.0.0:50051
+
+# Configure Kubernetes probes for the Spice.ai runtime container.
+# Omitted probe fields keep these defaults, so overrides can be partial.
+# If a probe value is omitted entirely, the template renders these defaults.
+# If exec, tcpSocket, or grpc is configured, the template omits the default httpGet handler.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /v1/ready
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+# Additional environment variables
+# additionalEnv:
+#   - name: ENV_VAR_NAME
+#     value: "value"
+#   - name: SECRET_ENV_VAR
+#     valueFrom:
+#       secretKeyRef:
+#         name: my-secret
+#         key: my-key
+
+# Define volumes to be mounted to the container
+# volumes:
+#   - name: custom-data
+#     persistentVolumeClaim:
+#       claimName: my-custom-pvc
+#   - name: config-volume
+#     configMap:
+#       name: custom-config
+
+# Define volume mounts for the container
+# volumeMounts:
+#   - name: custom-data
+#     mountPath: /data
+#   - name: config-volume
+#     mountPath: /config
+
+# Use a StatefulSet with a PVC for the data volume
+stateful:
+  enabled: false
+  # Storage class for the volume claim template
+  storageClass: 'standard'
+  # Size of each PV in the StatefulSet
+  size: 1Gi
+  # Mount path in container
+  mountPath: /data
+
+monitoring:
+  podMonitor:
+    enabled: false
+    # Set labels for the PodMonitor, use this to define your scrape label for Prometheus Operator
+    additionalLabels: {}
+
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+
+  datasets: []
+  # Example:
+  # - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+  #   name: taxi_trips
+  #   description: Demo taxi trips in s3
+  #   params:
+  #     file_format: parquet
+  #   acceleration:
+  #     enabled: true
+  #     engine: duckdb
+  #     mode: file
+  #     params:
+  #       duckdb_file: /data/taxi_trips.db
+  #     # Uncomment to refresh the acceleration on a schedule
+  #     # refresh_check_interval: 1h
+  #     # refresh_mode: full

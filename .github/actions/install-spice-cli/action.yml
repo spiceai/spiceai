@@ -1,0 +1,55 @@
+name: 'Install Spice CLI'
+description: 'Installs the Spice CLI locally from build artifacts directory'
+inputs:
+  build-path:
+    description: 'Directory containing Spice CLI'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Spice CLI
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        echo "Installing Spice from local folder: ${{ inputs.build-path }}"
+
+        chmod +x "${{ inputs.build-path }}/spice"
+
+        mkdir -p "$HOME/.spice/bin"
+
+        mv "${{ inputs.build-path }}/spice" "$HOME/.spice/bin"
+
+        echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+        echo "Spice binaries installed successfully into $HOME/.spice/bin."
+        ls -la "$HOME/.spice/bin"
+
+    - name: Install Spice CLI (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $spiceBin = ".spice\bin"
+        $spiceCliInstallDir = Join-Path $HOME $spiceBin
+        $spiceCliFileName = "spice.exe"
+        $spiceCliFullPath= Join-Path $spiceCliInstallDir $spiceCliFileName
+
+        Write-Host "Spice CLI directory created"
+        New-Item -Path $spiceCliInstallDir -ItemType Directory -Force > $null
+
+        Write-Host "Moving spice CLI"
+        Move-Item -Force "${{ inputs.build-path }}\spice.exe" -Destination $spiceCliFullPath
+
+        echo "$spiceCliInstallDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Verify Spice installation
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        spice version
+
+    - name: Verify Spice installation (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        spice version

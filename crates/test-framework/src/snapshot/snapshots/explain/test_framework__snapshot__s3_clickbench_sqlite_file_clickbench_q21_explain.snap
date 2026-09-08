@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q21"
+---
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                               |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                                                                                                 |
+|               |   Federated                                                                                                                                                                                                                                        |
+|               |  Projection: count(*)                                                                                                                                                                                                                              |
+|               |   Aggregate: groupBy=[[]], aggr=[[count(*)]]                                                                                                                                                                                                       |
+|               |     TableScan: hits projection=[], full_filters=[hits.URL LIKE Utf8("%google%")]                                                                                                                                                                   |
+| physical_plan | BytesProcessedExec                                                                                                                                                                                                                                 |
+|               |   SchemaCastScanExec                                                                                                                                                                                                                               |
+|               |     VirtualExecutionPlan name=sqlite compute_context=/tmp/.tmpcHLWhJ/.spice/data/accelerated_sqlite.db sql=SELECT count(*) FROM hits WHERE hits."URL" LIKE '%google%' rewritten_sql=SELECT count(*) FROM `hits` WHERE `hits`.`URL` LIKE '%google%' |
+|               |                                                                                                                                                                                                                                                    |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

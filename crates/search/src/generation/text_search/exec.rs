@@ -1,0 +1,192 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+     https://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use std::{fmt::Formatter, sync::Arc};
+
+use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
+use async_stream::stream;
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::SendableRecordBatchStream,
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+    },
+    prelude::Expr as LogicalExpr,
+};
+
+use futures::StreamExt;
+
+use super::FullTextSearchFieldIndex;
+
+/// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
+pub struct FullTextSearchExec {
+    pub(super) index: Arc<FullTextSearchFieldIndex>,
+    pub(super) query: String,
+    filters: Vec<LogicalExpr>,
+    limit: usize,
+    plan_properties: Arc<PlanProperties>,
+}
+
+impl FullTextSearchExec {
+    pub fn try_new(
+        index: &Arc<FullTextSearchFieldIndex>,
+        query: String,
+        schema: SchemaRef,
+        projection: Option<&Vec<usize>>,
+        filters: Vec<LogicalExpr>,
+        limit: usize,
+    ) -> Result<Self, ArrowError> {
+        let schema = match projection {
+            Some(proj) => Arc::new(schema.project(proj.as_slice())?),
+            None => schema,
+        };
+
+        Ok(Self {
+            index: Arc::clone(index),
+            query,
+            filters,
+            limit,
+            plan_properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        })
+    }
+}
+
+impl std::fmt::Debug for FullTextSearchExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullTextSearchTableExec")
+            .field("index", &self.index)
+            .field("query", &self.query)
+            .field("filters", &self.filters)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+impl DisplayAs for FullTextSearchExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FullTextSearchTableExec q={}, limit={}",
+            self.query, self.limit
+        )?;
+        if !self.filters.is_empty() {
+            let filters = self
+                .filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, ", filters=[{filters}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionPlan for FullTextSearchExec {
+    fn name(&self) -> &'static str {
+        "FullTextSearchTableExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::clone(&self) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let idx = Arc::clone(&self.index);
+        let schema = self.schema();
+        let limit = self.limit;
+        let query = self.query.clone();
+
+        // Translate the pushed-down SQL filters into tantivy queries up front (cheap, sync). Any
+        // filter that fails to translate was advertised as pushable by `supports_filters_pushdown`
+        // but cannot be built — a lockstep bug — so fail the scan rather than silently drop it.
+        let filter_queries = match idx.translate_filters(&self.filters) {
+            Ok(queries) => queries,
+            Err(e) => {
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    futures::stream::once(async move { Err(e) }),
+                )));
+            }
+        };
+
+        let s = stream! {
+            match idx
+                .search(query, filter_queries, limit)
+                .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
+                Ok(mut stream) => {
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Err(e) => yield Err(e),
+                            Ok(rb) => {
+                                // Apply projection in the declared schema order. A missing
+                                // field is a corrupt result page, not a column to omit: omitting
+                                // it shifts every following column by position.
+                                let rb_schema = rb.schema();
+                                let proj = schema
+                                    .fields()
+                                    .iter()
+                                    .map(|f| {
+                                        rb_schema.index_of(f.name()).map_err(|_| {
+                                            DataFusionError::Internal(format!(
+                                                "Full text search result page is missing column '{}': expected schema {schema}, got {rb_schema}",
+                                                f.name(),
+                                            ))
+                                        })
+                                    })
+                                    .collect::<DataFusionResult<Vec<_>>>();
+
+                                match proj {
+                                    Ok(proj) => {
+                                        let projected = rb.project(proj.as_slice()).map_err(DataFusionError::from);
+                                        yield projected.and_then(|projected| {
+                                            RecordBatch::try_new(Arc::clone(&schema), projected.columns().to_vec())
+                                                .map_err(DataFusionError::from)
+                                        });
+                                    }
+                                    Err(e) => yield Err(e),
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            }
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), s)))
+    }
+}

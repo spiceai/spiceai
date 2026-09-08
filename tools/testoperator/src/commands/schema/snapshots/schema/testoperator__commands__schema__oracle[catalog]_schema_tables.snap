@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for oracle[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| oracle_tpch   | TPCH_SF1           | CUSTOMER     | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | LINEITEM     | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | NATION       | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | ORDERS       | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | PART         | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | PARTSUPP     | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | REGION       | BASE TABLE |
+| oracle_tpch   | TPCH_SF1           | SUPPLIER     | BASE TABLE |
+| oracle_tpch   | information_schema | columns      | VIEW       |
+| oracle_tpch   | information_schema | df_settings  | VIEW       |
+| oracle_tpch   | information_schema | parameters   | VIEW       |
+| oracle_tpch   | information_schema | routines     | VIEW       |
+| oracle_tpch   | information_schema | schemata     | VIEW       |
+| oracle_tpch   | information_schema | tables       | VIEW       |
+| oracle_tpch   | information_schema | views        | VIEW       |
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
++---------------+--------------------+--------------+------------+

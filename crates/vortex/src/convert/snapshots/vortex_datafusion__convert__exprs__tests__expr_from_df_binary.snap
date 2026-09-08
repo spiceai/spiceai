@@ -1,0 +1,8 @@
+---
+source: crates/vortex/src/convert/exprs.rs
+expression: result.display_tree().to_string()
+---
+vortex.binary(=)
+├── lhs: vortex.get_item(left)
+│   └── input: vortex.root()
+└── rhs: vortex.literal(42i32)

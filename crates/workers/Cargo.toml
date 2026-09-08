@@ -1,0 +1,23 @@
+[package]
+description = "Workers"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "workers"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-openai.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+llms = { path = "../llms", default-features = false }
+rand.workspace = true
+spicepod = { path = "../spicepod" }
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

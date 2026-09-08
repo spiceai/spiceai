@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++--------+
+| active |
++--------+
+| true   |
+| false  |
+| true   |
++--------+

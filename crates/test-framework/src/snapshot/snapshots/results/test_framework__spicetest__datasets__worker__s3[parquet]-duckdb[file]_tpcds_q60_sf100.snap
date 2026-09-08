@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q60"
+---
++------------------+-------------+
+| i_item_id        | total_sales |
++------------------+-------------+
+| AAAAAAAAAAADBAAA | 115821.12   |
+| AAAAAAAAAAAFCAAA | 58709.61    |
+| AAAAAAAAAAAKAAAA | 111965.06   |
+| AAAAAAAAAAALAAAA | 78142.36    |
+| AAAAAAAAAAALCAAA | 102678.44   |
+| AAAAAAAAAAAMBAAA | 129208.47   |
+| AAAAAAAAAAAMCAAA | 93286.32    |
+| AAAAAAAAAABABAAA | 54706.86    |
+| AAAAAAAAAABDBAAA | 99346.43    |
+| AAAAAAAAAABEAAAA | 117634.32   |
++------------------+-------------+

@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-arrow-partitioned.yaml
+    query_set: tpcds
+    ready_wait: 600
+    runner_type: spiceai-dev-runners
+  throughput:
+    spicepod_path: accelerated/s3[parquet]-arrow-partitioned.yaml
+    query_set: tpcds
+    ready_wait: 600
+    runner_type: spiceai-dev-large-runners
+  load:
+    spicepod_path: accelerated/s3[parquet]-arrow-partitioned.yaml
+    query_set: tpcds
+    ready_wait: 600
+    runner_type: spiceai-dev-large-runners
+    duration: 28800

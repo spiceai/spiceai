@@ -1,0 +1,27 @@
+[package]
+description = "Spice Scheduler"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "scheduler"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+croner = "3.0.0"
+snafu.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

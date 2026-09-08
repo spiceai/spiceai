@@ -1,0 +1,24 @@
+---
+source: crates/datafusion-optimizer-rules/src/logical_plan/reorder_join/chbench_tests.rs
+expression: plan
+---
+Sort: nation.n_name ASC NULLS LAST, l_year DESC NULLS FIRST
+  Projection: nation.n_name, date_part(Utf8("YEAR"),oorder.o_entry_d) AS l_year, sum(order_line.ol_amount) AS sum_profit
+    Aggregate: groupBy=[[nation.n_name, date_part(Utf8("YEAR"), oorder.o_entry_d)]], aggr=[[sum(order_line.ol_amount)]]
+      Projection: order_line.ol_amount, oorder.o_entry_d, nation.n_name
+        Inner Join: order_line.ol_w_id = oorder.o_w_id, order_line.ol_d_id = oorder.o_d_id, order_line.ol_o_id = oorder.o_id
+          Projection: nation.n_name, order_line.ol_o_id, order_line.ol_w_id, order_line.ol_d_id, order_line.ol_amount
+            Inner Join: stock.s_i_id = order_line.ol_i_id, stock.s_w_id = order_line.ol_supply_w_id, item.i_id = order_line.ol_i_id
+              Inner Join: stock.s_i_id = item.i_id
+                Projection: nation.n_name, stock.s_w_id, stock.s_i_id
+                  Inner Join: supplier.su_suppkey = mod(stock.s_w_id * stock.s_i_id, Int64(10000))
+                    Projection: nation.n_name, supplier.su_suppkey
+                      Inner Join: nation.n_nationkey = supplier.su_nationkey
+                        TableScan: nation projection=[n_nationkey, n_name]
+                        TableScan: supplier projection=[su_suppkey, su_nationkey]
+                    TableScan: stock projection=[s_w_id, s_i_id]
+                Projection: item.i_id
+                  Filter: item.i_data LIKE Utf8("%BB")
+                    TableScan: item projection=[i_id, i_data]
+              TableScan: order_line projection=[ol_o_id, ol_w_id, ol_d_id, ol_i_id, ol_supply_w_id, ol_amount]
+          TableScan: oorder projection=[o_id, o_w_id, o_d_id, o_entry_d]

@@ -1,0 +1,9 @@
+version: v1beta1
+kind: Spicepod
+name: elasticsearch-federated-basic
+
+datasets:
+  - from: elasticsearch:test_products
+    name: products
+    params:
+      endpoint: http://localhost:9200

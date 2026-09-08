@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: databricks[sql_warehouse]-federated
+
+datasets:
+  - from: databricks:spiceai_sandbox.tpch.partsupp
+    name: partsupp
+    params: &databricks_sql_warehouse_params
+      mode: sql_warehouse
+      client_timeout: 600s
+      databricks_token: ${ secrets:SQL_WAREHOUSE_DATABRICKS_TOKEN }
+      databricks_endpoint: ${ secrets:SQL_WAREHOUSE_DATABRICKS_HOST }
+      databricks_sql_warehouse_id: ${ secrets:SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }
+  - from: databricks:spiceai_sandbox.tpch.customer
+    name: customer
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.lineitem
+    name: lineitem
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.nation
+    name: nation
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.orders
+    name: orders
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.region
+    name: region
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.supplier
+    name: supplier
+    params: *databricks_sql_warehouse_params
+  - from: databricks:spiceai_sandbox.tpch.part
+    name: part
+    params: *databricks_sql_warehouse_params

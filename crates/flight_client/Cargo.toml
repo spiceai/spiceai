@@ -1,0 +1,38 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "flight_client"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+parking_lot.workspace = true
+rustls-native-certs = "0.8.2"
+secrecy.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tonic = { workspace = true, features = [
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }
+tower.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

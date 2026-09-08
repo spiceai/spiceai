@@ -1,0 +1,106 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/spice/spice
+bin/spice/.spice
+bin/spice/data
+bin/spiced/spiced
+bin/spiced/.spice
+bin/spiced/data
+spicepods
+Makefile.local
+
+*.parquet
+spicepod.yaml
+!test/tpc-bench/tpch-spicepod/spicepod.yaml
+!examples/cosmosdb-connector/spicepod.yaml
+!examples/cdc-debezium-ingest/spicepod.yaml
+!test/spicepods/chbench/local-writeback/spicepod.yaml
+
+target/
+
+# Debug binaries
+__debug_bin
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+.DS_Store
+
+dist
+
+venv
+venv-acknowledgements
+venv_acknowledgements
+
+# AI
+__pycache__
+venv
+.venv
+
+# Output of the benchmarks and tests setup
+/test/tpc-bench/tmp/
+/test/tpc-bench/tpch-kit
+/test/tpc-bench/tpcds-kit
+/test/tpc-bench/oracle/*.log
+/test/tpc-bench/oracle/*.csv
+/test/tpc-bench/oracle/*.bad
+
+.vscode/settings.json
+.idea/
+
+# Nix
+/result
+
+.env
+.make-lint.log
+.spice
+.data/
+data/
+./testoperator
+.oracle
+!test/spicepods/
+!test/nsql_bench/spicepod.yaml
+!test/nsql_bench/data
+!crates/runtime/tests/acceleration/data
+!crates/runtime/tests/acceleration/spicepods
+
+# Database files
+*.db
+*.db-wal
+*.db.wal
+*.db-shm
+*.db-log
+*.duckdb
+*.duckdb.wal
+
+# Cluster logs
+cluster_logs/
+
+# Insta snapshot artifacts
+*.pending-snap
+
+# Claude worktrees
+.claude/
+
+# Distributed helper script working directory
+.distributed/
+
+# insta writes these when a snapshot assertion fails; they are the rejected
+# candidate, reviewed with `cargo insta review` and never committed.
+*.snap.new
+
+# `connector-nfs` is its own workspace root (see its Cargo.toml), so cargo
+# writes a lockfile beside it. It is a library, and its resolution is already
+# pinned by the workspace lock it is built alongside, so committing a second one
+# would only give it something to drift from.
+/crates/data-connectors/connector-nfs/Cargo.lock

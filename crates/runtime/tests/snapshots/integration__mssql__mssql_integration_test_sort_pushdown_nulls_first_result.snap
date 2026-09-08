@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/mssql/mod.rs
+description: MSSQL Sort Pushdown DESC NULLS FIRST Results
+---
++----------+-------------+-------------+
+| col_long | col_varchar | col_decimal |
++----------+-------------+-------------+
+|          |             |             |
+| 1        | varchar     | 1.11        |
++----------+-------------+-------------+

@@ -1,0 +1,26 @@
+[package]
+description = "Spice OSS Open Telemetry Publisher"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "otelpublisher"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+  "gen-tonic-messages",
+  "gen-tonic",
+  "metrics",
+] }
+tokio.workspace = true
+tonic = { workspace = true, features = [
+  "transport",
+  "tls-ring",
+  "tls-native-roots",
+] }
+
+[lints]
+workspace = true

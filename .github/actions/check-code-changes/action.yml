@@ -1,0 +1,100 @@
+# Copyright 2025 The Spice.ai OSS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: 'Check Code Changes'
+description: 'Detects if there are relevant code changes that require running tests'
+
+inputs:
+  filters:
+    description: >-
+      dorny/paths-filter `filters` YAML; must define a `code_changes` group.
+      Defaults to the standard repo-wide code paths.
+    required: false
+    # Every tracked `.rs` file, and the Rust-gate config files below
+    # (clippy/rustfmt/nextest/layers, the lint guards), must be COVERED by some
+    # glob here — together they are every path in RUST_AFFECTING_PATH_PATTERN
+    # (scripts/signoff). This list stays a deliberate superset — it is the shared
+    # "did any code change" default, so it also gates integration and E2E — but a
+    # Rust-gate path missing here lets the merge queue report `Rust Lint` and
+    # `Build and Test` green without running a step, so with the same path
+    # missing from the pattern it would land on trunk unchecked.
+    # scripts/check_rust_gate_paths.py pins the coverage. See docs/dev/ci_signoff.md.
+    default: |
+      code_changes:
+        - '.github/**'
+        - 'crates/**'
+        - 'bin/**'
+        - 'test/**'
+        - 'tools/**'
+        # Tracked Rust sources compiled into the workspace through a
+        # `[patch.crates-io]` entry, so a change here is a change to what the
+        # runtime links.
+        - 'vendor/**'
+        - 'install/**'
+        - 'Cargo.toml'
+        - 'Cargo.lock'
+        - 'go.mod'
+        - 'go.sum'
+        - 'Makefile'
+        # Dot-prefixed directories are spelled out literally even though
+        # dorny/paths-filter runs picomatch with `dot: true`, so `**` would
+        # reach them: `.ci/clippy.toml` is the config the lint gate actually
+        # reads, and naming it keeps that explicit rather than incidental.
+        - '.ci/**'
+        - '.config/**'
+        - '.cargo/**'
+        - '**/clippy.toml'
+        - '.clippy.toml'
+        - '**/rustfmt.toml'
+        - '.rustfmt.toml'
+        - '**/nextest.toml'
+        - '**/layers.toml'
+        - 'scripts/check_crate_layers.py'
+        - 'scripts/check_table_layers.py'
+        - 'scripts/check_rust_gate_paths.py'
+        - 'scripts/test_check_rust_gate_paths.py'
+        - 'scripts/check_module_reachability.py'
+        # The reachability guard's own regression harness runs in `lint-rust`,
+        # so a change to it changes what the Rust gate enforces.
+        - 'scripts/test_check_module_reachability.py'
+        - 'scripts/check_fork_patches.py'
+        - 'scripts/test_check_fork_patches.py'
+        - 'docs/dev/fork_patches.md'
+        - 'rust-toolchain'
+        - 'rust-toolchain.toml'
+
+outputs:
+  relevant_changes:
+    description: 'Whether there are relevant code changes'
+    value: ${{ steps.check_changes.outputs.relevant_changes }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect all code changes
+      id: changed-code-files
+      uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      with:
+        filters: ${{ inputs.filters }}
+
+    - name: Check for relevant changes
+      id: check_changes
+      shell: bash
+      run: |
+        result='${{ steps.changed-code-files.outputs.code_changes }}'
+        if [ "$result" != "true" ] && [ "$result" != "false" ]; then
+          echo "::error::check-code-changes: the 'filters' input must define a 'code_changes' group"
+          exit 1
+        fi
+        echo "relevant_changes=$result" >> "$GITHUB_OUTPUT"

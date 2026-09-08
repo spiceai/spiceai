@@ -1,0 +1,17 @@
+version: v1
+kind: Spicepod
+name: postgres-arrow
+datasets:
+  - from: postgres:hits
+    name: hits
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_sql: "SELECT * FROM hits LIMIT 50000000" # dev-runners do not have enough memory for full clickbench in-memory
+    params:
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: clickbench
+      pg_sslmode: disable

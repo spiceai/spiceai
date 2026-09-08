@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: region_pk_lookup"
+---
++---------------+-------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                        |
++---------------+-------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: region projection=[r_regionkey, r_name, r_comment], full_filters=[region.r_regionkey = Int32(1)] |
+| physical_plan | SchemaCastScanExec                                                                                          |
+|               |   CooperativeExec                                                                                           |
+|               |     BytesProcessedExec                                                                                      |
+|               |       IndexedLookupExec: indexed_scan on [r_regionkey]                                                      |
+|               |                                                                                                             |
++---------------+-------------------------------------------------------------------------------------------------------------+

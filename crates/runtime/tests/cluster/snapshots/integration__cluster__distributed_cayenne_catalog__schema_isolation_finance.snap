@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                         |
++---------------+----------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: scat.finance.records.id ASC NULLS LAST                                                 |
+|               |   SubqueryAlias: scat.finance.records                                                        |
+|               |     TableScan: scat.finance.records projection=[id, amount]                                  |
+| physical_plan | CooperativeExec                                                                              |
+|               |   BytesProcessedExec                                                                         |
+|               |     FlightSqlExec sql=SELECT id, amount FROM scat.finance.records ORDER BY id ASC NULLS LAST |
+|               |                                                                                              |
++---------------+----------------------------------------------------------------------------------------------+

@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&result)?
+---
++---------+-----+
+| name    | age |
++---------+-----+
+| Alice   | 30  |
+| Charlie | 35  |
++---------+-----+

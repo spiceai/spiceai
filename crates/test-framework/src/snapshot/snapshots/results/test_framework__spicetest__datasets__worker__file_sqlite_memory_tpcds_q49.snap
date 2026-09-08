@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q49"
+---
++---------+------+--------------+-------------+---------------+
+| channel | item | return_ratio | return_rank | currency_rank |
++---------+------+--------------+-------------+---------------+
+| catalog | 125  | 0.00000000   | 1           | 1             |
++---------+------+--------------+-------------+---------------+

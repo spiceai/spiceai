@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+# =============================================================================
+# VIEWS TEST FILE
+# Tests SQL view definitions
+# =============================================================================
+version: v1
+kind: Spicepod
+name: views-test
+
+views:
+  # Simple view with inline SQL
+  - name: simple_view
+    sql: SELECT * FROM users WHERE id > 100
+
+  # View with multi-line SQL using pipe syntax
+  - name: joined_view
+    sql: |
+      SELECT p.*, o.order_date
+      FROM users p
+      JOIN orders o ON p.id = o.user_id
+
+  # Aggregation view
+  - name: aggregated_view
+    sql: |
+      SELECT
+        date_trunc('day', created_at) as day,
+        count(*) as total_count,
+        sum(amount) as total_amount
+      FROM transactions
+      GROUP BY 1
+
+  # View with filtering and ordering
+  - name: filtered_view
+    sql: |
+      SELECT
+        id,
+        name,
+        email,
+        created_at
+      FROM users
+      WHERE status = 'active'
+        AND created_at > '2024-01-01'
+      ORDER BY created_at DESC
+      LIMIT 1000
+
+  # View with window functions
+  - name: window_view
+    sql: |
+      SELECT
+        id,
+        name,
+        amount,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) as rank,
+        SUM(amount) OVER (PARTITION BY category) as category_total
+      FROM products
+
+  # View with CTEs (Common Table Expressions)
+  - name: cte_view
+    sql: |
+      WITH active_users AS (
+        SELECT id, name, email
+        FROM users
+        WHERE status = 'active'
+      ),
+      user_orders AS (
+        SELECT user_id, COUNT(*) as order_count
+        FROM orders
+        GROUP BY user_id
+      )
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        COALESCE(o.order_count, 0) as order_count
+      FROM active_users u
+      LEFT JOIN user_orders o ON u.id = o.user_id
+
+  # View with subquery
+  - name: subquery_view
+    sql: |
+      SELECT *
+      FROM users
+      WHERE id IN (
+        SELECT DISTINCT user_id
+        FROM orders
+        WHERE order_date > '2024-01-01'
+      )
+
+  # View with UNION
+  - name: union_view
+    sql: |
+      SELECT id, name, 'user' as source
+      FROM users
+      UNION ALL
+      SELECT id, company_name as name, 'company' as source
+      FROM companies

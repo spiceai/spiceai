@@ -1,0 +1,29 @@
+[package]
+description = "Public-endpoint TLS for the Spice runtime: server config with hot-reloadable certificates and a Flight mTLS acceptor"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-tls"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+futures.workspace = true
+notify = "8.2.0"
+opentelemetry.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tokio-rustls = "0.26.0"
+tokio-stream = { workspace = true, features = ["net"] }
+tracing.workspace = true
+x509-certificate.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

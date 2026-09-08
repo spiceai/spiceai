@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q34"
+---
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
++-------------+--------------+--------------+-----------------------+------------------+-----+
+| Aaron       | Jason        | Sir          | Y                     | 19881108         | 16  |
+| Abbott      | Elna         | Ms.          | N                     | 5688422          | 15  |
+| Abbott      | Randall      | Mr.          | N                     | 23240360         | 15  |
+| Abernathy   | Thomas       | Mr.          | Y                     | 2835889          | 16  |
+| Abney       | Jose         | Mr.          | N                     | 10077930         | 15  |
+| Acevedo     | Nathaniel    | Dr.          | N                     | 1840259          | 15  |
+| Acker       | Matthew      | Sir          | N                     | 21021245         | 15  |
+| Ackerman    | Pauline      | Miss         | Y                     | 18849041         | 16  |
+| Acosta      | Barbara      | Mrs.         | N                     | 3089254          | 15  |
+| Acosta      | Richard      | Sir          | N                     | 20466041         | 16  |
++-------------+--------------+--------------+-----------------------+------------------+-----+

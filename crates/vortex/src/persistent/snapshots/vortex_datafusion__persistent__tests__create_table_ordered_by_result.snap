@@ -1,0 +1,11 @@
+---
+source: crates/vortex/src/persistent/mod.rs
+expression: pretty_format_batches(&r)?
+---
++---------+------+
+| c1      | c2   |
++---------+------+
+| air     | 5    |
+| alabama | 2000 |
+| balloon | 42   |
++---------+------+

@@ -1,0 +1,37 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                   |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: CAST(p.name AS LargeUtf8) AS name, total_qty                                                                                                               |
+|               |   Sort: p.name ASC NULLS LAST                                                                                                                                          |
+|               |     Projection: p.name, sum(o.quantity) AS total_qty                                                                                                                   |
+|               |       Aggregate: groupBy=[[p.name]], aggr=[[sum(o.quantity)]]                                                                                                          |
+|               |         Projection: o.quantity, p.name                                                                                                                                 |
+|               |           Inner Join: o.product_id = p.product_id                                                                                                                      |
+|               |             SubqueryAlias: o                                                                                                                                           |
+|               |               SubqueryAlias: jcat.store.orders                                                                                                                         |
+|               |                 TableScan: jcat.store.orders projection=[product_id, quantity]                                                                                         |
+|               |             SubqueryAlias: p                                                                                                                                           |
+|               |               SubqueryAlias: jcat.store.products                                                                                                                       |
+|               |                 TableScan: jcat.store.products projection=[product_id, name]                                                                                           |
+| physical_plan | ProjectionExec: expr=[CAST(name@0 AS LargeUtf8) as name, total_qty@1 as total_qty]                                                                                     |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                                                                      |
+|               |     SortPreservingMergeExec: [name@0 ASC NULLS LAST]                                                                                                                   |
+|               |       SortExec: expr=[name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                             |
+|               |         ProjectionExec: expr=[name@0 as name, sum(o.quantity)@1 as total_qty]                                                                                          |
+|               |           AggregateExec: mode=FinalPartitioned, gby=[name@0 as name], aggr=[sum(o.quantity)]                                                                           |
+|               |             RepartitionExec: partitioning=Hash([name@0], 3), input_partitions=3                                                                                        |
+|               |               AggregateExec: mode=Partial, gby=[name@1 as name], aggr=[sum(o.quantity)]                                                                                |
+|               |                 HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(product_id@0, product_id@0)], projection=[quantity@1, name@3] |
+|               |                   CooperativeExec                                                                                                                                      |
+|               |                     BytesProcessedExec                                                                                                                                 |
+|               |                       FlightSqlExec sql=SELECT product_id, quantity FROM jcat.store.orders                                                                             |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                 |
+|               |                     CooperativeExec                                                                                                                                    |
+|               |                       BytesProcessedExec                                                                                                                               |
+|               |                         FlightSqlExec sql=SELECT product_id, name FROM jcat.store.products                                                                             |
+|               |                                                                                                                                                                        |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

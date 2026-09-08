@@ -1,0 +1,34 @@
+# Scenario queries for testing secondary index hash lookups
+# These queries filter on secondary indexed columns and should use IndexedLookupExec
+name: hash_index_secondary_lookup
+
+queries:
+  # Customer table: secondary unique index on c_name
+  - name: customer_secondary_lookup
+    sql: SELECT * FROM customer WHERE c_name = 'Customer#000000001'
+    expected_results:
+      row_count: 1
+
+  # Part table: secondary unique index on p_name
+  - name: part_secondary_lookup
+    sql: SELECT * FROM part WHERE p_name = 'goldenrod lavender spring chocolate lace'
+    expected_results:
+      row_count: 1
+
+  # Supplier table: secondary unique index on s_name
+  - name: supplier_secondary_lookup
+    sql: SELECT * FROM supplier WHERE s_name = 'Supplier#000000001'
+    expected_results:
+      row_count: 1
+
+  # Nation table: secondary unique index on n_name
+  - name: nation_secondary_lookup
+    sql: SELECT * FROM nation WHERE n_name = 'ALGERIA'
+    expected_results:
+      row_count: 1
+
+  # Region table: secondary unique index on r_name
+  - name: region_secondary_lookup
+    sql: SELECT * FROM region WHERE r_name = 'AFRICA'
+    expected_results:
+      row_count: 1

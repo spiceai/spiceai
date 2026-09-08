@@ -1,0 +1,13 @@
+---
+source: crates/repl/src/lib.rs
+expression: result
+---
+-[ RECORD 1 ]---
+id   | 1000
+name | name_1000
+-[ RECORD 2 ]---
+id   | 1001
+name | name_1001
+-[ RECORD 3 ]---
+id   | 1002
+name | name_1002

@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q7"
+---
++---------------+---------------------------------------------------------------------+
+| plan_type     | plan                                                                |
++---------------+---------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: c                                                    |
+|               |   Projection: mssql.dbo.orders.o_orderkey AS key                    |
+|               |     Limit: skip=0, fetch=10                                         |
+|               |       TableScan: mssql.dbo.orders projection=[o_orderkey], fetch=10 |
+| physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                          |
+|               |   CooperativeExec                                                   |
+|               |     BytesProcessedExec                                              |
+|               |       SqlServerExec sql=SELECT TOP 10 o_orderkey FROM dbo.orders    |
+|               |                                                                     |
++---------------+---------------------------------------------------------------------+

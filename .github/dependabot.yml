@@ -1,0 +1,57 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  - package-ecosystem: 'cargo' # See documentation for possible values
+    directory: '/' # Location of package manifests
+    schedule:
+      interval: 'weekly'
+    # enforce-pull-with-spice requires both a kind/ and an area/ label, and it is
+    # a required check — without area/ these bumps cannot enter the merge queue
+    # however green their Attestation is.
+    labels:
+      - 'rust'
+      - 'kind/dependencies'
+      - 'area/build'
+    groups:
+      aws-sdk:
+        patterns:
+          - 'aws-*'
+      rust-dependencies:
+        patterns:
+          - '*'
+
+  - package-ecosystem: 'github-actions' # See documentation for possible values
+    # Note: directory: '/' covers .github/workflows/ (and root action.yml per docs), but composite
+    # actions in .github/actions/*/action.yml are not auto-scanned; use explicit directories (or
+    # globs like '/.github/actions/*' if supported by the Dependabot version) to cover them.
+    # See https://github.com/dependabot/dependabot-core/issues/6704
+    directories:
+      - '/'
+      - '/.github/actions/*'
+    schedule:
+      interval: 'weekly'
+    labels:
+      - 'github_actions'
+      - 'kind/dependencies'
+      - 'area/ci'
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - '*'
+
+  - package-ecosystem: 'docker' # See documentation for possible values
+    directory: '/' # Location of package manifests
+    schedule:
+      interval: 'weekly'
+    labels:
+      - 'docker'
+      - 'kind/dependencies'
+      - 'area/build'
+    groups:
+      docker-dependencies:
+        patterns:
+          - '*'

@@ -1,0 +1,3095 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use arrow::{
+    array::{
+        Array, ArrayData, ArrayRef, BinaryViewArray, DictionaryArray, GenericByteViewArray,
+        ListArray, MutableArrayData, PrimitiveArray, RecordBatch, RecordBatchOptions,
+        StringViewArray, StructArray, UInt64Array, downcast_dictionary_array, make_array,
+        new_null_array,
+    },
+    buffer::{Buffer, NullBuffer, OffsetBuffer},
+    compute::take,
+    datatypes::{
+        ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, BinaryViewType, ByteViewType,
+        DataType, Field, FieldRef, SchemaRef, StringViewType, TimeUnit,
+    },
+    error::ArrowError,
+};
+use arrow_cast::{CastOptions, cast_with_options};
+use arrow_schema::Schema;
+use datafusion::common::metadata::ScalarAndMetadata;
+use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use snafu::{ResultExt, prelude::*};
+use std::sync::Arc;
+
+use crate::format::{FormatOperation, format_column_data};
+use crate::type_rewrite::relabel_array_data;
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error converting record batch: {source}"))]
+    UnableToConvertRecordBatch { source: arrow::error::ArrowError },
+
+    #[snafu(display("Field is not nullable: {field}"))]
+    FieldNotNullable { field: String },
+}
+
+impl From<Error> for DataFusionError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::UnableToConvertRecordBatch {
+                source: arrow_error,
+            } => DataFusionError::ArrowError(Box::new(arrow_error), None),
+            Error::FieldNotNullable { .. } => {
+                DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
+            }
+        }
+    }
+}
+
+/// Cast a given record batch into a new record batch with the given schema.
+///
+/// # Errors
+///
+/// This function will return an error if the record batch cannot be cast.
+pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+    let existing_schema = record_batch.schema();
+
+    // Re-label the batch wholesale when the target asks for nothing the columns do not already
+    // carry. `Fields::contains` pairs positionally and demands equal length, so this covers a
+    // schema that only relaxes a field — a column the target adds is handled per column below.
+    //
+    // `Schema::contains` answers "is this assignable", which permits a nested field's nullability
+    // to differ; `RecordBatch` requires a column's type and its field's type to be identical, and
+    // `with_schema` re-labels the schema without touching the columns. So a merely-assignable
+    // schema taken through here yields a batch advertising a type none of its columns carries,
+    // which reads as aligned and then fails in whichever kernel first rebuilds a column. Only an
+    // exact match may skip the per-column work below.
+    if schema.contains(&existing_schema) && declares_the_same_types(&schema, &existing_schema) {
+        return record_batch
+            .with_schema(schema)
+            .context(UnableToConvertRecordBatchSnafu);
+    }
+
+    let cast_options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+
+    let cols = schema
+        .fields()
+        .into_iter()
+        .map(|field| {
+            if let (Ok(existing_field), Some(column)) = (
+                record_batch.schema().field_with_name(field.name()),
+                record_batch.column_by_name(field.name()),
+            ) {
+                // Identical to the schema-level test above, for the same reason: `contains`
+                // alone would pass the column through still carrying a type `RecordBatch::try_new`
+                // then refuses against the field declaring it.
+                if field.contains(existing_field) && field.data_type() == existing_field.data_type()
+                {
+                    Ok(Arc::clone(column))
+                } else {
+                    cast_column(column, existing_field.data_type(), field, &cast_options)
+                }
+            } else if field.is_nullable() {
+                Ok(new_null_array(field.data_type(), record_batch.num_rows()))
+            } else {
+                FieldNotNullableSnafu {
+                    field: field.name(),
+                }
+                .fail()
+            }
+        })
+        .collect::<Result<Vec<Arc<dyn Array>>>>()?;
+
+    // Handle empty schema case (e.g., for aggregate queries like `SELECT COUNT(1) FROM table`).
+    // Arrow requires either columns or an explicit row count when creating a RecordBatch.
+    if cols.is_empty() {
+        return RecordBatch::try_new_with_options(
+            schema,
+            cols,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows())),
+        )
+        .context(UnableToConvertRecordBatchSnafu);
+    }
+
+    RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
+}
+
+/// Whether the two schemas declare identical types, field by field — the condition `RecordBatch`
+/// enforces, as distinct from the assignability [`Schema::contains`] answers.
+///
+/// Paired positionally, the way `Fields::contains` pairs them, so this and the test it qualifies
+/// are answering about the same field pairs rather than two pairings that could disagree when a
+/// name repeats. Names themselves are not re-compared: `contains` has already established those.
+fn declares_the_same_types(target: &SchemaRef, existing: &SchemaRef) -> bool {
+    target.fields().len() == existing.fields().len()
+        && target
+            .fields()
+            .iter()
+            .zip(existing.fields())
+            .all(|(target_field, existing_field)| {
+                Arc::ptr_eq(target_field, existing_field)
+                    || target_field.data_type() == existing_field.data_type()
+            })
+}
+
+/// Returns `true` when `source` → `target` is a timestamp-to-timestamp cast that
+/// only changes the time unit (and possibly the timezone string), meaning the
+/// underlying physical values need rescaling and may overflow on far-future/past
+/// sentinel dates.
+fn is_timestamp_unit_cast(source: &DataType, target: &DataType) -> bool {
+    matches!(
+        (source, target),
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _))
+    ) && timestamp_unit(source) != timestamp_unit(target)
+}
+
+fn timestamp_unit(dt: &DataType) -> Option<&TimeUnit> {
+    match dt {
+        DataType::Timestamp(unit, _) => Some(unit),
+        _ => None,
+    }
+}
+
+/// Cast a single column, with special handling for timestamp unit conversions
+/// that may overflow (e.g. far-future sentinel values like year 9999 when
+/// converting from microseconds to nanoseconds).
+fn cast_column(
+    column: &ArrayRef,
+    source_type: &DataType,
+    target_field: &Field,
+    strict_options: &CastOptions,
+) -> Result<ArrayRef> {
+    if is_nullability_relaxing_relabel(source_type, target_field.data_type()) {
+        return relabel_nullability(column, target_field);
+    }
+
+    match cast_with_options(column.as_ref(), target_field.data_type(), strict_options) {
+        Ok(casted) => Ok(casted),
+        Err(ref e)
+            if is_timestamp_unit_cast(source_type, target_field.data_type())
+                && is_overflow_error(e) =>
+        {
+            tracing::warn!(
+                "Timestamp overflow casting column '{}' from {source_type:?} to {:?}. Values outside the representable range will be NULL.",
+                target_field.name(),
+                target_field.data_type(),
+            );
+            let safe_options = CastOptions {
+                safe: true,
+                ..strict_options.clone()
+            };
+            cast_with_options(column.as_ref(), target_field.data_type(), &safe_options)
+                .context(UnableToConvertRecordBatchSnafu)
+        }
+        Err(e) => Err(e).context(UnableToConvertRecordBatchSnafu),
+    }
+}
+
+fn is_overflow_error(e: &ArrowError) -> bool {
+    matches!(
+        e,
+        ArrowError::CastError(msg) | ArrowError::ArithmeticOverflow(msg)
+            if msg.contains("Overflow") || msg.contains("overflow")
+    )
+}
+
+/// Whether `target` can be reached from `source` by relabelling alone: the two describe the same
+/// values in the same buffers, and `target` only ever *relaxes* a nested field's nullability.
+///
+/// Narrowing is deliberately excluded and left to `arrow_cast::cast`. Whether a non-nullable field
+/// may hold nulls is not the simple question it looks like — Arrow requires a non-nullable struct
+/// child's nulls to be a *subset of its parent's*, not absent, so a masked null is legal — and the
+/// reachability rule differs again for a list-like parent, whose offsets decide which child slots
+/// are addressed at all. `cast` already implements those rules; a second, stricter transcription of
+/// them here would refuse arrays Arrow considers valid.
+///
+/// `arrow_cast::cast` has no path for such a pair. For a `Map` it hands the target `entries` field
+/// straight to `MapArray::try_new`, which refuses a nullable one, so two `Map` types differing only
+/// there fail with `MapArray entries cannot contain nulls` whether or not a null is involved — a
+/// message that names neither the column nor the real disagreement.
+///
+/// Only the child-bearing types whose children [`relabel_array_data`] pairs positionally are
+/// walked; everything else is compared whole. A type this does not know about — a `Union`,
+/// `Dictionary` or `RunEndEncoded` carrying the difference — therefore fails the test and keeps
+/// its existing cast path rather than being relabelled on a pairing that was never checked.
+///
+/// Field names and metadata have to match. A rename is a different question from a nullability
+/// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
+/// from a pair of renames, which positional pairing would then carry across transposed.
+fn is_nullability_relaxing_relabel(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (DataType::List(source_item), DataType::List(target_item))
+        | (DataType::LargeList(source_item), DataType::LargeList(target_item))
+        | (DataType::ListView(source_item), DataType::ListView(target_item))
+        | (DataType::LargeListView(source_item), DataType::LargeListView(target_item)) => {
+            is_field_nullability_relaxing_relabel(source_item, target_item)
+        }
+        (
+            DataType::FixedSizeList(source_item, source_len),
+            DataType::FixedSizeList(target_item, target_len),
+        ) if source_len == target_len => {
+            is_field_nullability_relaxing_relabel(source_item, target_item)
+        }
+        (
+            DataType::Map(source_entries, source_sorted),
+            DataType::Map(target_entries, target_sorted),
+        ) if source_sorted == target_sorted => {
+            is_field_nullability_relaxing_relabel(source_entries, target_entries)
+        }
+        (DataType::Struct(source_fields), DataType::Struct(target_fields))
+            if source_fields.len() == target_fields.len() =>
+        {
+            source_fields
+                .iter()
+                .zip(target_fields)
+                .all(|(source_field, target_field)| {
+                    is_field_nullability_relaxing_relabel(source_field, target_field)
+                })
+        }
+        _ => source == target,
+    }
+}
+
+/// The [`is_nullability_relaxing_relabel`] test for one field pair.
+fn is_field_nullability_relaxing_relabel(source: &FieldRef, target: &FieldRef) -> bool {
+    source.name() == target.name()
+        && source.metadata() == target.metadata()
+        && source.dict_is_ordered() == target.dict_is_ordered()
+        // At least as permissive: a nullable source under a non-nullable target is a narrowing.
+        && (target.is_nullable() || !source.is_nullable())
+        && is_nullability_relaxing_relabel(source.data_type(), target.data_type())
+}
+
+/// Carries `column` to `target_field`'s type by relabelling its declaration, sharing every buffer —
+/// values, offsets and validity — with the original.
+///
+/// Only called for a pair [`is_nullability_relaxing_relabel`] accepts, so no value changes meaning.
+fn relabel_nullability(column: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
+    relabel_array_data(column.to_data(), target_field.data_type())
+        .map(make_array)
+        .context(UnableToConvertRecordBatchSnafu)
+}
+
+/// Flattens a list of struct types with a single field into a list of primitive types.
+/// The struct field must be a primitive type.
+/// If the struct has multiple fields, all except the first field will be ignored.
+///
+/// # Errors
+///
+/// This function will return an error if the column cannot be cast to a list of struct types with a single field.
+pub fn to_primitive_type_list(
+    column: &ArrayRef,
+    field: &Arc<Field>,
+) -> Result<(ArrayRef, Arc<Field>), ArrowError> {
+    if let DataType::List(inner_field) = field.data_type()
+        && let DataType::Struct(struct_fields) = inner_field.data_type()
+        && struct_fields.len() == 1
+    {
+        let list_item_field = Arc::clone(&struct_fields[0]);
+
+        let original_list_array =
+            column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or(ArrowError::CastError(
+                    "Failed to downcast to ListArray".into(),
+                ))?;
+
+        let struct_array = original_list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or(ArrowError::CastError(
+                "Failed to downcast to StructArray".into(),
+            ))?;
+
+        let struct_column_array = Arc::clone(struct_array.column(0));
+
+        let new_list_field = Arc::new(Field::new(
+            field.name(),
+            DataType::List(Arc::clone(&list_item_field)),
+            field.is_nullable(),
+        ));
+        let new_list_array = ListArray::new(
+            list_item_field,
+            OffsetBuffer::new(Buffer::from_slice_ref(original_list_array.value_offsets()).into()),
+            struct_column_array,
+            original_list_array.logical_nulls(),
+        );
+
+        return Ok((Arc::new(new_list_array), new_list_field));
+    }
+
+    Err(ArrowError::CastError("Invalid column type".into()))
+}
+
+/// Recursively truncates the data in a [`RecordBatch`] to the specified maximum number of characters.
+/// The truncation is applies to [`DataType::Utf8`] and [`DataType::Utf8View`] data.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_string_columns(
+    record_batch: &RecordBatch,
+    max_characters: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let columns = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            format_column_data(
+                Arc::clone(column),
+                field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RecordBatch::try_new(schema, columns)
+}
+
+/// Truncates any column in the [`RecordBatch`] that is a list of numerical values to the first `max_elements` elements.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_numeric_column_length(
+    record_batch: &RecordBatch,
+    max_elements: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let column_and_fields = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if is_numeric_list(field) {
+                let new_column = format_column_data(
+                    Arc::clone(column),
+                    field,
+                    FormatOperation::TruncateListLength(max_elements),
+                )?;
+                let new_field = Arc::new(Field::new(
+                    field.name(),
+                    new_column.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                Ok((new_column, new_field))
+            } else {
+                Ok((Arc::clone(column), Arc::clone(field)))
+            }
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+
+    let (columns, fields) = column_and_fields
+        .into_iter()
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+}
+
+/// Converts a record batch with a single row into `ParamValues`
+///
+/// # Errors
+/// Returns an error when a value in an array cannot be converted into a scalar.
+pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
+    let num_columns = batch.num_columns();
+
+    // Fast path: empty batch
+    if num_columns == 0 {
+        return Ok(ParamValues::from(Vec::<ScalarValue>::new()));
+    }
+
+    let schema = batch.schema_ref();
+
+    // Pre-allocate with exact capacity to avoid reallocation
+    let mut list_params: Vec<(usize, ScalarValue)> = Vec::with_capacity(num_columns);
+    let mut named_params: Vec<(String, ScalarValue)> = Vec::with_capacity(num_columns);
+    let mut is_list = true;
+    let mut needs_sort = false;
+    let mut prev_index = 0usize;
+    let mut has_prev_index = false;
+
+    // Single pass: determine type and collect values simultaneously
+    for col_index in 0..num_columns {
+        let array = batch.column(col_index);
+        let scalar = ScalarValue::try_from_array(array, 0)?;
+        let name = schema.field(col_index).name();
+
+        // Check if name is a parameter index (with or without $ prefix)
+        let index = if let Some(stripped) = name.strip_prefix('$') {
+            stripped.parse::<usize>().ok()
+        } else {
+            name.parse::<usize>().ok()
+        };
+        if let Some(index) = index {
+            if has_prev_index && index < prev_index {
+                needs_sort = true;
+            }
+            prev_index = index;
+            has_prev_index = true;
+            list_params.push((index, scalar));
+            continue;
+        }
+
+        // Not a numbered parameter - switch to named mode
+        is_list = false;
+        named_params.push((name.clone(), scalar));
+    }
+
+    if is_list && !list_params.is_empty() {
+        if needs_sort {
+            list_params.sort_unstable_by_key(|(index, _)| *index);
+        }
+
+        // Extract just the values (compiler can optimize this to a move)
+        Ok(ParamValues::List(
+            list_params
+                .into_iter()
+                .map(|(_, value)| ScalarAndMetadata::from(value))
+                .collect(),
+        ))
+    } else {
+        // Convert list_params back to named if we have mixed types
+        // IMPORTANT: Preserve the '$' prefix for positional parameters to maintain consistency
+        // with DataFusion's parameter naming convention. DataFusion's SQL parser and parameter
+        // resolution expect positional parameters to be named "$1", "$2", etc.
+        // Mixed mode occurs when we have both "$1" style and "param_name" style parameters.
+        if !list_params.is_empty() {
+            for (index, value) in list_params {
+                // Preserve the '$' prefix format: "$1", "$2", etc.
+                named_params.push((format!("${index}"), value));
+            }
+        }
+        Ok(ParamValues::Map(
+            named_params
+                .into_iter()
+                .map(|(k, v)| (k, ScalarAndMetadata::from(v)))
+                .collect(),
+        ))
+    }
+}
+
+fn is_numeric_list(field: &Arc<Field>) -> bool {
+    match field.data_type() {
+        DataType::LargeListView(inner)
+        | DataType::FixedSizeList(inner, _)
+        | DataType::LargeList(inner)
+        | DataType::ListView(inner)
+        | DataType::List(inner) => inner.data_type().is_numeric(),
+        _ => false,
+    }
+}
+
+/// For a given [`RecordBatch`], replace a given column, by name, with a new [`ArrayRef`] data.
+///
+/// If `col` is not in [`RecordBatch`], no change occurs.
+///
+/// # Errors
+///
+/// This function will return an error if it unexpectedly fails to create a new [`RecordBatch`].
+pub fn replace_column_in_record(
+    rb: RecordBatch,
+    col: &str,
+    data: &ArrayRef,
+) -> Result<RecordBatch, ArrowError> {
+    let Some((idx, _)) = rb.schema().column_with_name(col) else {
+        return Ok(rb);
+    };
+    let schema = Schema::new(
+        rb.schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    Arc::unwrap_or_clone(Arc::clone(f))
+                        .with_data_type(data.data_type().clone())
+                        .into()
+                } else {
+                    Arc::clone(f)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let columns = rb
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, arr)| {
+            if i == idx {
+                Arc::clone(data)
+            } else {
+                Arc::clone(arr)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(schema.into(), columns)
+}
+
+/// How many times its own rows' worth of memory a column may retain before a
+/// compact copy is worth making. A slice that keeps twice what it needs is
+/// still cheaper to hold than to rebuild.
+const COMPACTION_RETENTION_RATIO: usize = 2;
+
+/// Minimum bytes a compaction must reclaim, summed across the batch's
+/// columns, to be worth its copies.
+///
+/// Per batch, not per column: a wide result can waste under any per-column
+/// floor in every column and still waste many times its own bytes per entry
+/// (issue #13172). The ratio gate bounds each copy's cost, so the floor only
+/// keeps near-compact batches copy-free.
+const COMPACTION_MIN_RECLAIMED_BYTES: usize = 4 * 1024;
+
+/// Whether a type holds data in variadic buffers, which
+/// [`ArrayData::get_slice_memory_size`] does not walk.
+///
+/// The view types are the ones that do: they keep their bytes in data buffers
+/// the layout does not describe, so `get_slice_memory_size` counts only their
+/// 16-byte views. A *top-level* view column is measured and compacted by the
+/// view-specific path below; one nested inside a container is reachable by
+/// neither, so such a column would be measured as if its data buffers were
+/// free, and must be left alone rather than copied on every store for nothing.
+fn contains_view_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => contains_view_type(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_view_type(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_view_type(field.data_type())),
+        DataType::Dictionary(_, value_type) => contains_view_type(value_type),
+        _ => false,
+    }
+}
+
+/// Whether `data_type` is, or holds anywhere within it, a dictionary.
+///
+/// This recurses because its consumer does: `MutableArrayData::new` builds a
+/// child `MutableArrayData` for every struct field, list value and union
+/// variant, so a dictionary nested inside a container reaches the same
+/// dictionary-key overflow that a top-level one does.
+fn contains_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => contains_dictionary(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionary(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionary(field.data_type())),
+        _ => false,
+    }
+}
+
+/// How many bytes are reclaimable from a column retaining `retained` where its
+/// rows need `needed`, or `None` when the copy would not pay for itself.
+///
+/// Gates only the retention ratio; the reclaim floor is applied per batch,
+/// against [`COMPACTION_MIN_RECLAIMED_BYTES`].
+fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
+    (retained > needed && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
+        .then(|| retained - needed)
+}
+
+/// How many bytes a view column retains beyond the bytes its own rows use.
+///
+/// A view array's values live in shared data buffers that slicing never
+/// narrows — `slice` only trims the 16-byte views — so a one-row slice of a
+/// wide-string batch keeps every data buffer of the batch it came from. This
+/// matters by default rather than in a corner: `DataFusion` reads Parquet
+/// `Utf8`/`Binary` columns as `Utf8View`/`BinaryView`
+/// (`schema_force_view_types`), so ordinary string results take this path.
+///
+/// The ratio this decides on is arrow's own: `InProgressByteViewArray` gcs a
+/// source when its data buffers exceed twice the bytes its views reference
+/// (`arrow-select`, `coalesce/byte_view.rs`), for the same reason.
+fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
+    let array = column.as_any().downcast_ref::<GenericByteViewArray<B>>()?;
+
+    // Count every allocation [`compact_column`] rebuilds: views, data
+    // buffers, and the null buffer. For a slice, all three are the parent's
+    // whole allocations — even an all-inline slice retains data buffers it
+    // references nothing of, which compaction drops entirely.
+    let nulls = array.nulls();
+    let retained = array.views().inner().capacity()
+        + array
+            .data_buffers()
+            .iter()
+            .map(Buffer::capacity)
+            .sum::<usize>()
+        + nulls.map_or(0, |nulls| nulls.inner().inner().capacity());
+    let views_bytes = array.len().saturating_mul(std::mem::size_of::<u128>());
+    let null_bytes = nulls.map_or(0, |_| array.len().div_ceil(8));
+
+    // `total_buffer_bytes_used` walks every view, so bound the reclaim first:
+    // the compacted array cannot be smaller than its views alone. This is what
+    // keeps an already-compact column — the common case — off that walk.
+    worth_compacting(retained, views_bytes)?;
+
+    worth_compacting(
+        retained,
+        views_bytes + array.total_buffer_bytes_used() + null_bytes,
+    )
+}
+
+/// Whether any buffer under `column` is a custom allocation — memory freed by
+/// its own owner rather than by the buffer, which
+/// [`arrow::buffer::Buffer::has_custom_allocation`] reports.
+///
+/// Such a buffer's `capacity` is the size recorded when it was built, and the
+/// allocation actually kept alive may be larger, so the comparison
+/// [`reclaimable_bytes`] makes cannot see what the column really pins. Three
+/// paths produce them and in each the buffer is a window onto something bigger:
+/// a result imported over the Arrow C data interface points into the producer's
+/// chunk; `arrow-flight` builds every array buffer of a batch as a slice of the
+/// one IPC message body; and `parquet`'s byte-view readers hand a view column
+/// the page itself as its data block.
+///
+/// Walks children and the null buffer as well as the column's own buffers,
+/// because a struct or list column is only as decoupled as its least decoupled
+/// part.
+fn rests_on_foreign_memory(column: &ArrayRef) -> bool {
+    fn walk(data: &arrow::array::ArrayData) -> bool {
+        data.buffers().iter().any(Buffer::has_custom_allocation)
+            || data
+                .nulls()
+                .is_some_and(|nulls| nulls.buffer().has_custom_allocation())
+            || data.child_data().iter().any(walk)
+    }
+
+    walk(&column.to_data())
+}
+
+fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
+    match column.data_type() {
+        DataType::Utf8View => return view_reclaimable_bytes::<StringViewType>(column),
+        DataType::BinaryView => return view_reclaimable_bytes::<BinaryViewType>(column),
+        // `rebuild_view_leaves` can copy a container's views, but nothing
+        // measures a *slice* of one: `get_slice_memory_size` counts a view's
+        // views buffer without the data it points into, and `compacted_memory_size`
+        // feeds an admission pre-check from this estimate, so guessing here would
+        // under-predict what the entry holds. A foreign one is still decoupled —
+        // that path runs off `columns_to_decouple`, not off this measurement.
+        data_type if contains_view_type(data_type) => return None,
+        // A top-level dictionary goes to `rebuild_dictionary`, and its size is
+        // measurable like any other array's. One nested inside a container is
+        // still left alone: `MutableArrayData` shares a dictionary's values
+        // wholesale rather than narrowing them, and panics outright building an
+        // extend for one whose value count does not fit its key type — a
+        // `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow and
+        // trips it (`build_extend_dictionary` returns `None`, which
+        // `MutableArrayData::with_capacities` unwraps with `expect`). The extend
+        // is built per child, so a `Struct<Dictionary<UInt8, _>>` reaches the
+        // same `expect`.
+        DataType::Dictionary(..) => {}
+        data_type if contains_dictionary(data_type) => return None,
+        _ => {}
+    }
+
+    // `Err` means the type's buffers cannot be measured from its layout, which
+    // is the same situation as a nested view type: there is no honest
+    // comparison to make, so leave the column alone.
+    let needed = column.to_data().get_slice_memory_size().ok()?;
+
+    worth_compacting(column.get_array_memory_size(), needed)
+}
+
+/// Decouples the array [`take`] produced from whatever it selected from.
+///
+/// Mirrors [`dictionary_values_can_be_rebuilt`], which predicts the same answer
+/// from the type alone; the two must agree or a column is promised a copy that
+/// does not arrive.
+fn decouple_taken(values: ArrayRef) -> Option<ArrayRef> {
+    match values.data_type() {
+        DataType::Dictionary(..) => {
+            let values = &values;
+            downcast_dictionary_array!(
+                values => rebuild_dictionary(values),
+                _ => None,
+            )
+        }
+        // `gc` rebuilds a view over its own data buffer.
+        DataType::Utf8View | DataType::BinaryView => Some(compact_column(&values)),
+        data_type if contains_view_type(data_type) || contains_dictionary(data_type) => {
+            Some(compact_column(&values))
+        }
+        // Everything else `take` builds afresh.
+        _ => Some(values),
+    }
+}
+
+/// Rebuilds `dictionary` over only the values its keys still reference.
+///
+/// `MutableArrayData` cannot do this: it shares a dictionary's values wholesale
+/// rather than narrowing them, and panics outright building an extend for one
+/// whose value count does not fit its key type. Taking the referenced values and
+/// remapping the keys onto them allocates both afresh, so the rebuilt dictionary
+/// both reclaims the unreferenced values and stops resting on memory it does not
+/// own — and it does so unconditionally, which matters because the array that
+/// most needs decoupling is usually the one where every value is referenced.
+fn rebuild_dictionary<K: ArrowDictionaryKeyType>(
+    dictionary: &DictionaryArray<K>,
+) -> Option<ArrayRef> {
+    let referenced = dictionary.occupancy();
+    let mut remap = vec![K::Native::ZERO; dictionary.values().len()];
+    let mut keep = Vec::with_capacity(referenced.count_set_bits());
+    for (new, old) in referenced.set_indices().enumerate() {
+        // `new <= old`, and `old` indexed a dictionary already keyed by `K`.
+        *remap.get_mut(old)? = K::Native::from_usize(new)?;
+        keep.push(old as u64);
+    }
+
+    // `take` allocates the selection itself but shares what it selected *from*:
+    // an inner dictionary's values, a view array's data buffers. Rebuilding the
+    // taken values in turn is what lets a dictionary of dictionaries be copied.
+    let values = decouple_taken(take(dictionary.values(), &UInt64Array::from(keep), None).ok()?)?;
+    let keys = dictionary
+        .keys()
+        .values()
+        .iter()
+        // A null key's index is arbitrary rather than in range; it stays null
+        // whatever it maps to.
+        .map(|key| {
+            remap
+                .get(key.as_usize())
+                .copied()
+                .unwrap_or(K::Native::ZERO)
+        })
+        .collect::<Vec<_>>();
+    // Collecting the validity copies it too. Sharing it would keep the whole
+    // foreign array alive: every buffer an FFI import produces holds the same
+    // release callback, so retaining any one of them retains all of them.
+    let nulls = dictionary
+        .keys()
+        .nulls()
+        .map(|nulls| nulls.iter().collect::<NullBuffer>());
+
+    DictionaryArray::try_new(PrimitiveArray::<K>::new(keys.into(), nulls), values)
+        .ok()
+        .map(|dictionary| Arc::new(dictionary) as ArrayRef)
+}
+
+/// Rebuilds every view nested inside `array` over data buffers it owns.
+///
+/// [`MutableArrayData`] copies a container's offsets and validity but hands a
+/// view child the data buffers it selects from, so a container that has just
+/// been copied still points into the producer's memory. `gc`ing each view leaf
+/// and rebuilding the parents around it is the remaining half — and it is only
+/// the remaining half, which is why this runs *after* the copy rather than
+/// instead of it: `gc` alone would leave the offsets and validity shared.
+fn rebuild_view_leaves(array: &ArrayRef) -> ArrayRef {
+    match array.data_type() {
+        // `compact_column` gc's a view leaf and copies it; it recurses no
+        // further, since a leaf holds no children.
+        DataType::Utf8View | DataType::BinaryView => compact_column(array),
+        data_type if contains_view_type(data_type) => {
+            with_rebuilt_children(array, rebuild_view_leaves)
+        }
+        _ => Arc::clone(array),
+    }
+}
+
+/// Rebuilds every dictionary inside `array` over the values its keys reference.
+///
+/// Runs *before* the copy, where [`rebuild_view_leaves`] must run after. Either
+/// order decouples — `rebuild_dictionary` allocates whichever values it is
+/// handed — but `MutableArrayData` shares a dictionary's values wholesale, so
+/// running first is what keeps the producer's whole dictionary from being
+/// carried through the copy when only a few of its values are referenced.
+fn rebuild_dictionary_leaves(array: &ArrayRef) -> ArrayRef {
+    match array.data_type() {
+        DataType::Dictionary(..) => downcast_dictionary_array!(
+            array => rebuild_dictionary(array),
+            _ => None,
+        )
+        .unwrap_or_else(|| Arc::clone(array)),
+        data_type if contains_dictionary(data_type) => {
+            with_rebuilt_children(array, rebuild_dictionary_leaves)
+        }
+        _ => Arc::clone(array),
+    }
+}
+
+/// `array` with `rebuild` applied to each child, keeping its own buffers.
+///
+/// The parent's offsets and validity are shared rather than copied: this runs
+/// either side of the `MutableArrayData` copy that owns them.
+fn with_rebuilt_children(array: &ArrayRef, rebuild: fn(&ArrayRef) -> ArrayRef) -> ArrayRef {
+    let data = array.to_data();
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| rebuild(&make_array(child.clone())).to_data())
+        .collect::<Vec<_>>();
+
+    let mut builder = ArrayData::builder(data.data_type().clone())
+        .len(data.len())
+        .offset(data.offset())
+        .nulls(data.nulls().cloned())
+        .child_data(children);
+    for buffer in data.buffers() {
+        builder = builder.add_buffer(buffer.clone());
+    }
+    // A rebuild that does not validate is not worth having: leave the column as
+    // it is rather than store one whose children no longer match its offsets.
+    builder
+        .build()
+        .map_or_else(|_| Arc::clone(array), make_array)
+}
+
+/// Copies `column`'s rows into buffers sized for exactly those rows.
+///
+/// ([`arrow::compute::concat`] cannot be used: it returns a single input
+/// untouched.) View arrays are `gc`'d first — `MutableArrayData` copies
+/// their data buffers wholesale — while `MutableArrayData` in turn rebuilds
+/// the views and null allocations that `gc`'s fast paths reuse, which for a
+/// slice belong to the parent.
+fn compact_column(column: &ArrayRef) -> ArrayRef {
+    if matches!(column.data_type(), DataType::Dictionary(..)) {
+        let rebuilt = downcast_dictionary_array!(
+            column => rebuild_dictionary(column),
+            _ => None,
+        );
+        if let Some(rebuilt) = rebuilt {
+            return rebuilt;
+        }
+    }
+
+    // Narrow any dictionary below the top before the copy: `MutableArrayData`
+    // shares a dictionary's values, so copying first would carry the producer's
+    // whole dictionary through.
+    let prepared = if contains_dictionary(column.data_type()) {
+        rebuild_dictionary_leaves(column)
+    } else {
+        Arc::clone(column)
+    };
+
+    let gced: Option<ArrayRef> = match prepared.data_type() {
+        DataType::Utf8View => prepared
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|array| Arc::new(array.gc()) as ArrayRef),
+        DataType::BinaryView => prepared
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .map(|array| Arc::new(array.gc()) as ArrayRef),
+        _ => None,
+    };
+    let source = gced.as_ref().unwrap_or(&prepared);
+
+    let copied = if contains_dictionary(source.data_type()) {
+        // `MutableArrayData` builds an extend per child and refuses a dictionary
+        // whose value count does not fit its key type — a `Dictionary(UInt8, _)`
+        // holding 256 values is legal Arrow it cannot express, and it panics
+        // rather than returning. `take` carries no such limit and rebases
+        // offsets and copies validity the same way. It shares a dictionary's
+        // values rather than narrowing them, which is exactly what the pre-pass
+        // above has already made the batch's own.
+        let Ok(indices) = u64::try_from(source.len()) else {
+            return Arc::clone(column);
+        };
+        match take(
+            source.as_ref(),
+            &UInt64Array::from_iter_values(0..indices),
+            None,
+        ) {
+            Ok(taken) => taken,
+            // Leave the column alone rather than return a partial copy.
+            Err(_) => return Arc::clone(column),
+        }
+    } else {
+        let data = source.to_data();
+        let mut compacted = MutableArrayData::new(vec![&data], false, source.len());
+        compacted.extend(0, 0, source.len());
+        make_array(compacted.freeze())
+    };
+
+    // A container's view children come out of that copy still selecting from
+    // the buffers they arrived on, so they need a second pass. A view leaf was
+    // already gc'd above.
+    if matches!(
+        copied.data_type(),
+        DataType::Utf8View | DataType::BinaryView
+    ) {
+        copied
+    } else {
+        rebuild_view_leaves(&copied)
+    }
+}
+
+/// Returns `batch` with every column that retains substantially more memory
+/// than its own rows need replaced by a compact copy.
+///
+/// [`RecordBatch::slice`] is zero-copy by design: a sliced batch keeps its
+/// parent's whole buffers alive, and `get_array_memory_size` reports those
+/// retained buffers rather than the rows the slice contains. A single row
+/// carved out of a scan batch — what `LIMIT`/`OFFSET` produces — therefore
+/// costs, and is billed, the entire batch it came from. Anything that holds a
+/// batch past the scan that produced it (the SQL results cache, an in-memory
+/// index) should compact it first, so the memory it pins is proportional to
+/// the rows it kept.
+///
+/// Already-compact columns are shared, not copied — as is the whole batch
+/// when its total reclaim is under [`COMPACTION_MIN_RECLAIMED_BYTES`] — so a
+/// batch with little to reclaim costs a reference-count clone.
+///
+/// See [`compacted_memory_size`] for deciding whether the copy is worth making
+/// *before* paying for it.
+#[must_use]
+pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
+    let decouple = columns_to_decouple(batch);
+    let (plan, total_reclaimable) = compaction_plan(batch, &decouple);
+
+    if total_reclaimable == 0 && !decouple.iter().any(|d| *d) {
+        return batch.clone();
+    }
+
+    tracing::trace!(
+        rows = batch.num_rows(),
+        reclaimable_bytes = total_reclaimable,
+        decoupled_columns = decouple.iter().filter(|d| **d).count(),
+        "Compacting record batch"
+    );
+
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .zip(&plan)
+        .zip(&decouple)
+        .map(|((column, reclaim), decouple)| {
+            // `reclaim` is a saving worth making; `decouple` is memory this
+            // batch cannot bound while it shares it. Either is reason to copy.
+            if (reclaim.is_some() && total_reclaimable > 0) || *decouple {
+                compact_column(column)
+            } else {
+                Arc::clone(column)
+            }
+        })
+        .collect();
+
+    // The row count is carried explicitly so a batch with no columns keeps it.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    match RecordBatch::try_new_with_options(batch.schema(), columns, &options) {
+        Ok(compacted) => compacted,
+        Err(e) => {
+            // Compaction preserves every column's type and length, so this is
+            // unreachable; keeping the original is always safe.
+            tracing::warn!("Failed to compact a record batch, keeping it as read: {e}");
+            batch.clone()
+        }
+    }
+}
+
+/// Roughly what `batch` would occupy once [`compact_retained_buffers`] has run
+/// over it, computed without copying anything.
+///
+/// A caller that holds a memory budget should bill a batch this, not
+/// `get_array_memory_size`, and should only compact a batch it has decided to
+/// keep — otherwise a result too large to store is copied in full before being
+/// discarded.
+///
+/// It is an estimate, not the exact figure: buffer capacities are rounded up on
+/// allocation, so the compacted batch can measure a little either side of this.
+/// It is meant for deciding whether a copy is worth making, and a caller that
+/// must not exceed a hard limit should still measure what it actually built.
+#[must_use]
+pub fn compacted_memory_size(batch: &RecordBatch) -> usize {
+    // Measures every column: this predicts a size rather than deciding a copy,
+    // and a caller weighing whether a result can be stored at all needs the
+    // figure for the whole batch.
+    let (_, total_reclaimable) = compaction_plan(batch, &vec![false; batch.num_columns()]);
+
+    batch
+        .get_array_memory_size()
+        .saturating_sub(total_reclaimable)
+}
+
+/// Per-column reclaimable bytes — `None` where a copy would not pay for
+/// itself or the type cannot be measured — and the batch-wide total.
+///
+/// The total carries the floor: it is zero when the columns together reclaim
+/// less than [`COMPACTION_MIN_RECLAIMED_BYTES`], and both entry points
+/// consume it, so what one predicts is what the other frees.
+fn compaction_plan(batch: &RecordBatch, decouple: &[bool]) -> (Vec<Option<usize>>, usize) {
+    // A column already known to need copying does not need measuring: how many
+    // bytes it would reclaim cannot change the outcome, and for a foreign
+    // buffer that figure is the one number here that is not trustworthy
+    // anyway. Every source measured so far — DuckDB and ADBC over the C data
+    // interface, Flight's message body, Parquet's view pages, Vortex's
+    // `bytes::Bytes` — lands in this branch for every column, so it is the
+    // common path rather than an optimisation for a corner.
+    let plan: Vec<Option<usize>> = batch
+        .columns()
+        .iter()
+        .zip(decouple)
+        .map(|(column, decouple)| {
+            if *decouple {
+                None
+            } else {
+                reclaimable_bytes(column)
+            }
+        })
+        .collect();
+    let total: usize = plan.iter().flatten().sum();
+
+    if total < COMPACTION_MIN_RECLAIMED_BYTES {
+        (plan, 0)
+    } else {
+        (plan, total)
+    }
+}
+
+/// Whether `batch` holds a column that rests on memory it does not own and
+/// cannot be copied off it.
+///
+/// Whether `batch` still rests on memory it does not own.
+///
+/// Meant for a batch [`compact_retained_buffers`] has already been over: that
+/// copies every foreign-backed column, so anything still foreign afterwards is a
+/// copy that did not decouple — a kernel sharing what it selected from rather
+/// than narrowing it.
+///
+/// Deliberately an observation and not a prediction. Which types a copy fully
+/// decouples is a property of arrow's kernels, not of our code: `take` shares a
+/// view array's data buffers and an inner dictionary's values, and a type added
+/// upstream tomorrow may share something else. A predicate enumerating them is
+/// wrong the moment that changes, and wrong *silently* — the entry is billed for
+/// the buffers it declares while pinning an allocation it does not. Asking the
+/// batch cannot drift.
+///
+/// A caller that retains batches should decline one that answers `true`: for a
+/// foreign buffer `capacity` reports the length the producer declared, and every
+/// buffer an FFI import produces shares one release callback, so such an entry
+/// looks compact while holding the producer's whole chunk alive.
+#[must_use]
+pub fn rests_on_unowned_memory(batch: &RecordBatch) -> bool {
+    batch.columns().iter().any(rests_on_foreign_memory)
+}
+
+/// Which columns must be copied to decouple them from memory someone else owns,
+/// regardless of what [`compaction_plan`] estimates.
+///
+/// The estimate is exactly what cannot be trusted here: a foreign buffer reports
+/// the size it was built with, so a column pinning a whole page or message body
+/// looks perfectly compact and both the retention ratio and the batch-wide floor
+/// decline to copy it. Those two tests ask whether a copy reclaims enough bytes
+/// to be worth making; for these columns the question is instead whether the
+/// entry can bound what it holds at all, and it cannot while it shares the
+/// producer's memory.
+///
+/// Every foreign-backed column is copied, whatever its type: no arrow type is
+/// refused a copy now that a dictionary-bearing container goes through [`take`]
+/// rather than `MutableArrayData`. Whether the copy *succeeded* in decoupling is
+/// then observed rather than predicted — see [`rests_on_unowned_memory`].
+fn columns_to_decouple(batch: &RecordBatch) -> Vec<bool> {
+    batch
+        .columns()
+        .iter()
+        .map(rests_on_foreign_memory)
+        .collect()
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema, TimeUnit},
+        json::ReaderBuilder,
+    };
+
+    use super::*;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Utf8, false),
+        ]))
+    }
+
+    fn to_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::LargeUtf8, false),
+            Field::new("c", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        ]))
+    }
+
+    fn batch_input() -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                Arc::new(StringArray::from(vec![
+                    "2024-01-13 03:18:09.000000",
+                    "2024-01-13 03:18:09",
+                    "2024-01-13 03:18:09.000",
+                ])),
+            ],
+        )
+        .expect("record batch should not panic")
+    }
+
+    #[test]
+    fn test_string_to_timestamp_conversion() {
+        let result = try_cast_to(batch_input(), to_schema()).expect("converted");
+        assert_eq!(3, result.num_rows());
+    }
+
+    /// Test that `try_cast_to` handles empty schema correctly.
+    /// This is needed for aggregate queries like `SELECT COUNT(1) FROM table`
+    /// which have an empty projection (no columns selected from the table).
+    #[test]
+    fn test_try_cast_to_empty_schema() {
+        // Input batch has columns but we want to cast to an empty schema
+        let input_batch = batch_input();
+        assert_eq!(3, input_batch.num_rows());
+        assert_eq!(3, input_batch.num_columns());
+
+        // Target schema has no columns (like projection=[] for COUNT queries)
+        let empty_schema = Arc::new(Schema::empty());
+
+        // This should succeed, preserving the row count
+        let result = try_cast_to(input_batch, empty_schema).expect("should handle empty schema");
+        assert_eq!(3, result.num_rows(), "row count should be preserved");
+        assert_eq!(0, result.num_columns(), "should have no columns");
+    }
+
+    fn parse_json_to_batch(json_data: &str, schema: SchemaRef) -> RecordBatch {
+        let reader = ReaderBuilder::new(schema)
+            .build(std::io::Cursor::new(json_data))
+            .expect("Failed to create JSON reader");
+
+        reader
+            .into_iter()
+            .next()
+            .expect("Expected a record batch")
+            .expect("Failed to read record batch")
+    }
+
+    #[test]
+    fn test_to_primitive_type_list() {
+        let input_batch_json_data = r#"
+            {"labels": [{"id": 1}, {"id": 2}]}
+            {"labels": null}
+            {"labels": null}
+            {"labels": null}
+            {"labels": [{"id": 3}, {"id": null}]}
+            {"labels": [{"id": 4,"name":"test"}, {"id": null,"name":null}]}
+            {"labels": null}
+            "#;
+
+        let input_batch = parse_json_to_batch(
+            input_batch_json_data,
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                DataType::List(Arc::new(Field::new(
+                    "struct",
+                    DataType::Struct(vec![Field::new("id", DataType::Int32, true)].into()),
+                    true,
+                ))),
+                true,
+            )])),
+        );
+
+        let expected_list_json_data = r#"
+            {"labels": [1, 2]}
+            {"labels": null}
+            {"labels": null}
+            {"labels": null}
+            {"labels": [3, null]}
+            {"labels": [4, null]}
+            {"labels": null}
+            "#;
+
+        let expected_list_batch = parse_json_to_batch(
+            expected_list_json_data,
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                DataType::List(Arc::new(Field::new("id", DataType::Int32, true))),
+                true,
+            )])),
+        );
+
+        let (processed_array, processed_field) = to_primitive_type_list(
+            input_batch.column(0),
+            &Arc::new(input_batch.schema().field(0).clone()),
+        )
+        .expect("to_primitive_type_list should succeed");
+
+        let processed_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![processed_field])),
+            vec![processed_array],
+        )
+        .expect("should create new record batch");
+
+        assert_eq!(expected_list_batch, processed_batch);
+    }
+
+    #[test]
+    fn test_truncate_record_batch_data_complex_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "labels",
+            DataType::List(Arc::new(Field::new(
+                "struct",
+                DataType::Struct(
+                    vec![
+                        Field::new("id", DataType::Int32, true),
+                        Field::new("name", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ))),
+            true,
+        )]));
+
+        let input_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "123456789"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test12345"}, {"id": null,"name":null}]}
+            "#;
+
+        let input_batch = parse_json_to_batch(input_batch_json_data, Arc::clone(&schema));
+
+        let processed_batch = truncate_string_columns(&input_batch, 5)
+            .expect("truncate_record_batch_data should succeed");
+
+        let expected_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "12345"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test1"}, {"id": null,"name":null}]}
+            "#;
+
+        let expected_batch = parse_json_to_batch(expected_batch_json_data, schema);
+
+        assert_eq!(processed_batch, expected_batch);
+    }
+
+    fn create_record_batch(
+        schema: Vec<(&str, DataType)>,
+        columns: Vec<Arc<dyn arrow::array::Array>>,
+    ) -> RecordBatch {
+        let fields = schema
+            .into_iter()
+            .map(|(name, dt)| Field::new(name, dt, true))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("new RecordBatch")
+    }
+
+    fn assert_param_values_eq(result: ParamValues, expected: ParamValues) {
+        match (result, expected) {
+            (ParamValues::List(result_vec), ParamValues::List(expected_vec)) => {
+                assert_eq!(result_vec.len(), expected_vec.len(), "List lengths differ");
+                for (r, e) in result_vec.iter().zip(expected_vec.iter()) {
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
+                    assert_eq!(r.value(), e.value(), "ScalarValue mismatch");
+                }
+            }
+            (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
+                assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
+                for (key, expected_value) in expected_map {
+                    let result_value = result_map.get(&key).expect("key in result map");
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
+                    assert_eq!(
+                        result_value.value(),
+                        expected_value.value(),
+                        "ScalarValue mismatch for key {key}",
+                    );
+                }
+            }
+            (result, expected) => {
+                panic!("Mismatched ParamValues variants: got {result:?}, expected {expected:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("$2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::from(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters_no_dollar() {
+        let batch = create_record_batch(
+            vec![("1", DataType::Int32), ("2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::from(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_named_parameters() {
+        let batch = create_record_batch(
+            vec![("param1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(100)])),
+                Arc::new(StringArray::from(vec![Some("world")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        expected_map.insert("param1".to_string(), ScalarValue::Int32(Some(100)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("world".to_string())),
+        );
+        let expected = ParamValues::from(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_mixed_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10)])),
+                Arc::new(StringArray::from(vec![Some("test")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        // Preserve the '$' prefix for positional parameters in mixed mode
+        expected_map.insert("$1".to_string(), ScalarValue::Int32(Some(10)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("test".to_string())),
+        );
+        let expected = ParamValues::from(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters_out_of_order() {
+        let batch = create_record_batch(
+            vec![("$2", DataType::Int32), ("$1", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(200)])),
+                Arc::new(StringArray::from(vec![Some("first")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::from(vec![
+            ScalarValue::Utf8(Some("first".to_string())),
+            ScalarValue::Int32(Some(200)),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_list() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32)],
+            vec![Arc::new(Int32Array::from(vec![Some(1)]))],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::from(vec![ScalarValue::Int32(Some(1))]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_named() {
+        let batch = create_record_batch(
+            vec![("x", DataType::Utf8)],
+            vec![Arc::new(StringArray::from(vec![Some("value")]))],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        expected_map.insert(
+            "x".to_string(),
+            ScalarValue::Utf8(Some("value".to_string())),
+        );
+        let expected = ParamValues::from(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    /// Casting Decimal128(38,9) → Decimal128(38,27) must return an error when
+    /// the upscale would overflow, instead of silently producing NULL.
+    #[test]
+    fn test_try_cast_to_decimal_overflow_returns_error() {
+        use arrow::array::Decimal128Array;
+
+        // Value with 12 integer digits: 110_367_043_872.497010000
+        // Internal i128 at scale 9 = 110367043872497010000
+        let value_i128: i128 = 110_367_043_872_497_010_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        // Target schema with wider scale (38,27) — only allows 11 integer digits
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let err =
+            try_cast_to(batch, target_schema).expect_err("Decimal overflow should return an error");
+        assert!(
+            matches!(err, Error::UnableToConvertRecordBatch { .. }),
+            "Expected UnableToConvertRecordBatch, got: {err:?}"
+        );
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("is too large to store in a Decimal128"),
+            "Expected overflow message, got: {err_msg}"
+        );
+    }
+
+    /// Casting Decimal128 with values that fit should succeed.
+    #[test]
+    fn test_try_cast_to_decimal_no_overflow_succeeds() {
+        use arrow::array::Decimal128Array;
+
+        // Value with 11 integer digits: 99_999_999_999.000000000 (fits in 38-27=11 digits)
+        let value_i128: i128 = 99_999_999_999_000_000_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_ok(),
+            "Decimal cast should succeed when value fits: {result:?}"
+        );
+    }
+
+    /// Casting Timestamp(Microsecond) → Timestamp(Nanosecond) with a far-future
+    /// sentinel value (year 9999) should not panic. Overflowing values become NULL
+    /// via the safe-cast fallback.
+    #[test]
+    fn test_try_cast_to_timestamp_us_to_ns_overflow_produces_null() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        // 9999-12-31T23:59:59.999 in microseconds — overflows when multiplied by 1000
+        let sentinel_us: i64 = 253_402_300_799_999_000;
+        let normal_us: i64 = 1_700_000_000_000_000; // ~2023-11-14
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let source_array =
+            TimestampMicrosecondArray::from(vec![Some(sentinel_us), Some(normal_us), None])
+                .with_timezone("UTC");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_ok(),
+            "timestamp µs→ns cast should not fail on overflow: {:?}",
+            result.err()
+        );
+
+        let casted = result.expect("already checked");
+        let ts_col = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+
+        // Overflowing sentinel becomes NULL
+        assert!(ts_col.is_null(0), "overflowing sentinel should be NULL");
+        // Normal value is correctly scaled (µs * 1000 = ns)
+        assert_eq!(ts_col.value(1), normal_us * 1000);
+        // Original NULL stays NULL
+        assert!(ts_col.is_null(2), "original NULL should stay NULL");
+    }
+
+    /// Casting Timestamp(Microsecond) → Timestamp(Nanosecond) when all values fit
+    /// should succeed with exact values (no fallback needed).
+    #[test]
+    fn test_try_cast_to_timestamp_us_to_ns_no_overflow() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        let value_us: i64 = 1_700_000_000_000_000; // ~2023-11-14
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let source_array =
+            TimestampMicrosecondArray::from(vec![Some(value_us)]).with_timezone("UTC");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(result.is_ok(), "cast should succeed: {:?}", result.err());
+
+        let casted = result.expect("already checked");
+        let ts_col = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+        assert_eq!(ts_col.value(0), value_us * 1000);
+    }
+
+    /// Non-timestamp overflow errors should still propagate (no fallback).
+    #[test]
+    fn test_try_cast_to_non_timestamp_overflow_still_errors() {
+        use arrow::array::Decimal128Array;
+
+        // A value that overflows Decimal128(10, 2)
+        let value: i128 = 99_999_999_999_000_000_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_err(),
+            "non-timestamp overflow should still return an error"
+        );
+    }
+
+    /// `rows` strings of `value_len` identical characters, varying by row so a
+    /// compaction that took the wrong row is visible.
+    fn payloads(rows: usize, value_len: usize) -> Vec<String> {
+        (0..rows)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    value_len,
+                )
+                .collect()
+            })
+            .collect()
+    }
+
+    /// A batch of wide strings, big enough that slicing one row out of it
+    /// retains far more than that row needs.
+    fn wide_string_batch(rows: usize, value_len: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let ids: Vec<i32> = (0..i32::try_from(rows).expect("rows fits in i32")).collect();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(payloads(rows, value_len))),
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    fn row_payload(batch: &RecordBatch, row: usize) -> String {
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(row)
+            .to_string()
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// A one-row slice of a large batch must not keep the whole batch alive.
+    #[test]
+    fn compact_retained_buffers_releases_a_slices_parent_buffers() {
+        let batch = wide_string_batch(2_000, 4_096);
+        let sliced = batch.slice(1_000, 1);
+        assert_eq!(
+            sliced.get_array_memory_size(),
+            batch.get_array_memory_size(),
+            "a slice retains its parent's buffers, which is the defect under test"
+        );
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), 1);
+        assert_eq!(compacted.schema(), sliced.schema());
+        assert_eq!(
+            row_payload(&compacted, 0),
+            row_payload(&sliced, 0),
+            "compaction must preserve the row's value"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a one-row slice of a 2000-row batch should retain a small fraction of it, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// Every row of a multi-row slice survives, in order.
+    #[test]
+    fn compact_retained_buffers_preserves_every_row_of_a_slice() {
+        let batch = wide_string_batch(500, 1_024);
+        let sliced = batch.slice(100, 300);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), sliced.num_rows());
+        for row in 0..sliced.num_rows() {
+            assert_eq!(
+                row_payload(&compacted, row),
+                row_payload(&sliced, row),
+                "row {row} changed under compaction"
+            );
+        }
+        let ids = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id is an Int32Array");
+        assert_eq!(ids.value(0), 100, "the slice's first row must be preserved");
+    }
+
+    /// Nulls inside the slice survive, and nulls outside it are not adopted.
+    #[test]
+    fn compact_retained_buffers_preserves_nulls_within_the_slice() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]));
+        let values: Vec<Option<String>> = payloads(2_000, 4_096)
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| (row % 3 != 0).then_some(value))
+            .collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])
+            .expect("valid batch");
+        let sliced = batch.slice(999, 3);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        let before = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        let after = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(after.null_count(), before.null_count());
+        for row in 0..before.len() {
+            assert_eq!(after.is_null(row), before.is_null(row), "row {row} nullity");
+            if !before.is_null(row) {
+                assert_eq!(after.value(row), before.value(row), "row {row} value");
+            }
+        }
+    }
+
+    /// Every buffer an FFI import produces carries the same release callback, so
+    /// retaining any one of them retains the whole foreign array. A rebuilt
+    /// dictionary must therefore share none of them — keys, validity, offsets or
+    /// value data.
+    #[test]
+    fn a_foreign_dictionary_is_rebuilt_onto_memory_the_batch_owns() {
+        use arrow::array::{ArrayData, DictionaryArray, cast::AsArray};
+        use arrow::datatypes::UInt8Type;
+
+        fn foreign(bytes: Vec<u8>) -> Buffer {
+            let backing: Arc<Vec<u8>> = Arc::new(bytes);
+            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+            // SAFETY: `backing` is kept alive by the `Allocation` handed to the
+            // buffer, and is never mutated.
+            unsafe {
+                Buffer::from_custom_allocation(
+                    ptr,
+                    backing.len(),
+                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+                )
+            }
+        }
+
+        let values = ArrayData::builder(DataType::Utf8)
+            .len(3)
+            .add_buffer(foreign(
+                [0_i32, 2, 4, 6]
+                    .iter()
+                    .flat_map(|o| o.to_le_bytes())
+                    .collect(),
+            ))
+            .add_buffer(foreign(b"aabbcc".to_vec()))
+            .build()
+            .expect("a valid Utf8 array");
+        let dictionary: ArrayRef = make_array(
+            ArrayData::builder(DataType::Dictionary(
+                Box::new(DataType::UInt8),
+                Box::new(DataType::Utf8),
+            ))
+            .len(4)
+            .add_buffer(foreign(vec![0, 2, 0, 1]))
+            // The last row is null, so value 1 ("bb") is unreferenced.
+            .null_bit_buffer(Some(foreign(vec![0b0000_0111])))
+            .add_child_data(values)
+            .build()
+            .expect("a valid dictionary"),
+        );
+        assert!(
+            rests_on_foreign_memory(&dictionary),
+            "the fixture must actually rest on foreign memory, or this proves nothing"
+        );
+
+        let batch = RecordBatch::try_from_iter(vec![("d", dictionary)]).expect("a batch");
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            !rests_on_foreign_memory(compacted.column(0)),
+            "a rebuilt dictionary must share no buffer with the array it came from"
+        );
+
+        let rebuilt = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("still a dictionary");
+        assert_eq!(
+            rebuilt.values().len(),
+            2,
+            "the value only a null key pointed at is dropped"
+        );
+        let strings = rebuilt.values().as_string::<i32>();
+        let read: Vec<Option<&str>> = (0..rebuilt.len())
+            .map(|row| {
+                (!rebuilt.is_null(row)).then(|| strings.value(rebuilt.keys().value(row) as usize))
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![Some("aa"), Some("cc"), Some("aa"), None],
+            "remapping the keys must not change what the rows say"
+        );
+    }
+
+    /// `take` hands an inner dictionary's values straight through, so an outer
+    /// dictionary rebuilt over them would still rest on the memory they arrived
+    /// on. [`rebuild_dictionary`] rebuilds what it took, so the shape is copied
+    /// rather than declined — and the batch is not stored pinning an allocation
+    /// nothing bills for.
+    #[test]
+    fn a_dictionary_of_dictionaries_is_rebuilt_all_the_way_down() {
+        use arrow::array::{ArrayData, DictionaryArray, Int8Array, Int32Array};
+        use arrow::datatypes::{Int8Type, Int32Type};
+
+        fn foreign(bytes: Vec<u8>) -> Buffer {
+            let backing: Arc<Vec<u8>> = Arc::new(bytes);
+            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+            // SAFETY: `backing` outlives the buffer through the `Allocation`,
+            // and is never mutated.
+            unsafe {
+                Buffer::from_custom_allocation(
+                    ptr,
+                    backing.len(),
+                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+                )
+            }
+        }
+
+        let inner_values = ArrayData::builder(DataType::Utf8)
+            .len(2)
+            .add_buffer(foreign(
+                [0_i32, 1, 2].iter().flat_map(|o| o.to_le_bytes()).collect(),
+            ))
+            .add_buffer(foreign(b"ab".to_vec()))
+            .build()
+            .expect("a valid Utf8 array");
+        let inner = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0_i8, 1]),
+            make_array(inner_values),
+        )
+        .expect("a valid inner dictionary");
+        let column: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1, 0]),
+                Arc::new(inner) as ArrayRef,
+            )
+            .expect("a valid outer dictionary"),
+        );
+
+        assert!(
+            rests_on_foreign_memory(&column),
+            "the fixture must actually rest on foreign memory, or this proves nothing"
+        );
+        let batch = RecordBatch::try_from_iter(vec![("d", column)]).expect("a one-column batch");
+        let compacted = compact_retained_buffers(&batch);
+        assert!(
+            !rests_on_unowned_memory(&compacted),
+            "the rebuild has to reach the inner values for the batch to be storable"
+        );
+        assert!(
+            !rests_on_foreign_memory(compacted.column(0)),
+            "an outer dictionary is only decoupled if the rebuild reaches the values \
+             its `take` shared"
+        );
+
+        let rebuilt = compacted.column(0);
+        let read: Vec<String> = (0..rebuilt.len())
+            .map(|row| {
+                arrow::util::display::array_value_to_string(rebuilt, row)
+                    .expect("a displayable value")
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec!["a", "b", "a"],
+            "rebuilding both levels must not change what the rows say"
+        );
+    }
+
+    /// A `Dictionary(UInt8, _)` whose 256 values are every one referenced fills
+    /// its key space, and `MutableArrayData` cannot express it: its extend is
+    /// built through `max.try_into()` on the key type, which fails on 256 even
+    /// though the keys `0..=255` indexing those values are all valid. It panics
+    /// rather than returning, so the container copy goes through `take`, which
+    /// carries no such limit — and must come back with the same type it went in
+    /// with, since a cache hit returning a differently-keyed dictionary than the
+    /// miss that filled it would be worse than not caching at all.
+    #[test]
+    fn a_foreign_saturated_dictionary_in_a_struct_is_copied_not_declined() {
+        use arrow::array::{ArrayData, cast::AsArray};
+        use arrow::datatypes::UInt8Type;
+
+        fn foreign(bytes: Vec<u8>) -> Buffer {
+            let backing: Arc<Vec<u8>> = Arc::new(bytes);
+            let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+            // SAFETY: `backing` outlives the buffer through the `Allocation`,
+            // and is never mutated.
+            unsafe {
+                Buffer::from_custom_allocation(
+                    ptr,
+                    backing.len(),
+                    Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+                )
+            }
+        }
+
+        // 256 distinct two-character values, so every one is addressable by a
+        // `u8` key and the set exactly fills the key space.
+        let names: Vec<[u8; 2]> = (0..=255_u8)
+            .map(|value| [b'a' + value / 16, b'a' + value % 16])
+            .collect();
+        let offsets: Vec<u8> = (0..=256_i32)
+            .map(|index| index * 2)
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let values = ArrayData::builder(DataType::Utf8)
+            .len(256)
+            .add_buffer(foreign(offsets))
+            .add_buffer(foreign(names.concat()))
+            .build()
+            .expect("a valid Utf8 array");
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let dictionary = ArrayData::builder(dictionary_type.clone())
+            .len(256)
+            .add_buffer(foreign((0..=255_u8).collect()))
+            .add_child_data(values)
+            .build()
+            .expect("a valid dictionary");
+        let column: ArrayRef = make_array(
+            ArrayData::builder(DataType::Struct(
+                vec![Field::new("d", dictionary_type, false)].into(),
+            ))
+            .len(256)
+            .add_child_data(dictionary)
+            .build()
+            .expect("a valid struct array"),
+        );
+
+        assert!(
+            rests_on_foreign_memory(&column),
+            "the fixture must actually rest on foreign memory, or this proves nothing"
+        );
+        let batch = RecordBatch::try_from_iter(vec![("s", Arc::clone(&column))])
+            .expect("a one-column batch");
+        // Must not panic: a cache write is not allowed to abort the query that
+        // filled it.
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            !rests_on_foreign_memory(compacted.column(0)),
+            "a saturated dictionary must still be copied off the producer's memory"
+        );
+        assert_eq!(
+            compacted.column(0).data_type(),
+            column.data_type(),
+            "the copy must not re-key the dictionary: a cache hit has to match the miss"
+        );
+
+        let rebuilt = compacted.column(0).as_struct().column(0);
+        let rebuilt = rebuilt
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<UInt8Type>>()
+            .expect("still a UInt8-keyed dictionary");
+        assert_eq!(
+            rebuilt.values().len(),
+            256,
+            "every value is still referenced"
+        );
+        let strings = rebuilt.values().as_string::<i32>();
+        assert_eq!(
+            (0..rebuilt.len())
+                .map(|row| strings
+                    .value(rebuilt.keys().value(row) as usize)
+                    .to_string())
+                .collect::<Vec<_>>(),
+            names
+                .iter()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect::<Vec<_>>(),
+            "copying must not change which row maps to which value"
+        );
+    }
+
+    /// A batch that retains nothing extra is shared, not copied.
+    /// Guard for the `Buffer::has_custom_allocation` patch on our arrow-rs fork
+    /// (spiceai/arrow-rs#25, branch `spiceai-58`). See `docs/dev/fork_patches.md`.
+    ///
+    /// A batch whose buffers are owned by someone else must be copied on the way
+    /// into anything that retains it, even though the reclaim estimate says
+    /// there is nothing to reclaim — because for such a buffer that estimate is
+    /// the size the producer declared, not what it keeps alive. If a fork re-cut
+    /// drops the predicate this stops holding, so the assertion is on the
+    /// outcome (the copy is decoupled) rather than on the predicate itself.
+    #[test]
+    fn a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim() {
+        // Exactly sized, so nothing looks reclaimable — the shape a driver
+        // import or a Flight message body presents.
+        use arrow::array::{ArrayData, Int64Array};
+
+        let backing: Arc<Vec<u8>> = Arc::new(1_i64.to_le_bytes().repeat(4));
+        let ptr = std::ptr::NonNull::new(backing.as_ptr().cast_mut()).expect("non-null");
+        let foreign = unsafe {
+            Buffer::from_custom_allocation(
+                ptr,
+                backing.len(),
+                Arc::clone(&backing) as Arc<dyn arrow::alloc::Allocation>,
+            )
+        };
+        assert!(
+            foreign.has_custom_allocation(),
+            "the fixture must actually be foreign owned, or this proves nothing"
+        );
+
+        let data = ArrayData::builder(DataType::Int64)
+            .len(4)
+            .add_buffer(foreign)
+            .build()
+            .expect("a valid Int64 array");
+        let batch =
+            RecordBatch::try_from_iter(vec![("v", Arc::new(Int64Array::from(data)) as ArrayRef)])
+                .expect("a one-column batch");
+
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            !compacted.column(0).to_data().buffers()[0].has_custom_allocation(),
+            "compaction must copy a column off memory it does not own, so what the \
+             entry holds is bounded by what it was billed"
+        );
+        assert_eq!(
+            compacted
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("still an Int64Array")
+                .values(),
+            &[1_i64; 4],
+            "decoupling must not change the rows"
+        );
+    }
+
+    /// The count is a property of the type, not of the rows — which is what
+    /// makes charging per buffer meaningful rather than a proxy for size.
+    ///
+    /// Checked at two row counts, because "does not depend on the data" is
+    /// exactly the part that could be wrong, and against a nullable column with
+    /// and without nulls, which is the one place the type does *not* settle it.
+    #[test]
+    fn buffers_in_batch_does_not_move_with_the_rows() {
+        use arrow::array::{Float64Array, Int64Array};
+
+        let mut counts = Vec::new();
+        for rows in [1_usize, 100] {
+            let ids: Vec<i64> = (0..rows)
+                .map(|i| i64::try_from(i).expect("a test row index fits an i64"))
+                .collect();
+            let names: Vec<String> = (0..rows).map(|i| format!("name-{i}")).collect();
+            let batch = RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int64Array::from(ids.clone())) as ArrayRef),
+                (
+                    "name",
+                    Arc::new(StringArray::from(
+                        names.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+                (
+                    "score",
+                    Arc::new(Float64Array::from(
+                        ids.iter()
+                            .map(|i| f64::from(u32::try_from(*i).expect("fits a u32")))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+            ])
+            .expect("a three-column batch");
+            counts.push(buffers_in_batch(&batch));
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "an Int64 + Utf8 + Float64 batch holds the same buffers at 1 row and at 100"
+        );
+        assert_eq!(counts[0], 4, "Int64[1] + Utf8[2] + Float64[1]");
+
+        // The null buffer is the part the type does not settle, and the reason
+        // this counts rather than reading the count off the schema: a nullable
+        // column with no nulls allocates none.
+        let with_nulls = RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![Some(1_i64), None, Some(3)])) as ArrayRef,
+            true,
+        )])
+        .expect("a nullable column");
+        let no_nulls = RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+            true,
+        )])
+        .expect("a nullable column with no nulls");
+        assert_eq!(
+            buffers_in_batch(&with_nulls),
+            2,
+            "values plus a null buffer"
+        );
+        assert_eq!(
+            buffers_in_batch(&no_nulls),
+            1,
+            "an identically typed column with no nulls allocates no null buffer, so \
+             a schema-derived count would run a whole buffer per column ahead"
+        );
+    }
+
+    #[test]
+    fn compact_retained_buffers_leaves_a_compact_batch_untouched() {
+        let batch = wide_string_batch(4, 16);
+
+        let compacted = compact_retained_buffers(&batch);
+
+        for (idx, column) in batch.columns().iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(column, compacted.column(idx)),
+                "column {idx} of an already-compact batch was copied"
+            );
+        }
+    }
+
+    /// A slice small enough that copying it would not pay for itself is left
+    /// alone, so the common case of many small batches costs no copies.
+    #[test]
+    fn compact_retained_buffers_ignores_a_slice_below_the_reclaim_floor() {
+        let batch = wide_string_batch(16, 64);
+        let sliced = batch.slice(1, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(1), compacted.column(1)),
+            "a slice retaining under the floor should not be copied"
+        );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/13172>.
+    /// The reclaim floor applies to the batch, not to each column: a wide
+    /// result can waste under the floor in every single column and still
+    /// waste many times its own bytes per entry.
+    #[test]
+    fn compact_retained_buffers_compacts_a_wide_batch_wasting_little_per_column() {
+        let columns = 24;
+        let fields: Vec<Field> = (0..columns)
+            .map(|i| Field::new(format!("c{i}"), DataType::Utf8, false))
+            .collect();
+        let arrays: Vec<ArrayRef> = (0..columns)
+            .map(|_| Arc::new(StringArray::from(payloads(150, 8))) as ArrayRef)
+            .collect();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("valid batch");
+        let sliced = batch.slice(50, 1);
+
+        // The fixture must keep every column under the floor on its own —
+        // otherwise this would pass under a per-column floor too and guard
+        // nothing.
+        for (index, column) in sliced.columns().iter().enumerate() {
+            let reclaim = reclaimable_bytes(column).expect("column should be reclaimable");
+            assert!(
+                reclaim < COMPACTION_MIN_RECLAIMED_BYTES,
+                "column {index} reclaims {reclaim} on its own, at or above the floor"
+            );
+        }
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            compacted.get_array_memory_size() * 10 < sliced.get_array_memory_size(),
+            "a one-row slice of a wide batch should be billed a fraction of its parent, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+        assert_eq!(compacted, sliced, "compaction must not change any value");
+    }
+
+    fn wide_view_batch(rows: usize, value_len: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(payloads(
+                rows, value_len,
+            )))],
+        )
+        .expect("valid batch")
+    }
+
+    /// Slicing a view array trims only its 16-byte views — the data buffers
+    /// holding the values are kept whole. `DataFusion` reads Parquet strings as
+    /// `Utf8View` by default (`schema_force_view_types`), so this is the
+    /// ordinary path for a string result, not a corner of it.
+    #[test]
+    fn compact_retained_buffers_releases_a_view_slices_data_buffers() {
+        let batch = wide_view_batch(2_000, 4_096);
+        let sliced = batch.slice(1_000, 1);
+        assert!(
+            sliced.get_array_memory_size() > 4 * 1024 * 1024,
+            "a view slice retains its parent's data buffers, which is the defect under test; got {}",
+            sliced.get_array_memory_size()
+        );
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), 1);
+        let before = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("StringViewArray");
+        let after = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("StringViewArray");
+        assert_eq!(after.value(0), before.value(0), "the row's value changed");
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a one-row view slice should retain a small fraction of its parent, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// A view column whose buffers are already sized for its rows is shared,
+    /// not copied. The builder rounds data blocks up (8 KiB minimum), so the
+    /// fixture is gc'd first to get a genuinely compact column — the
+    /// builder-rounded original is itself reclaimable, by design.
+    #[test]
+    fn compact_retained_buffers_leaves_a_compact_view_column_untouched() {
+        let raw = wide_view_batch(4, 16);
+        let column: ArrayRef = Arc::new(
+            raw.column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("StringViewArray")
+                .gc(),
+        );
+        let batch = RecordBatch::try_new(raw.schema(), vec![column]).expect("valid batch");
+
+        let compacted = compact_retained_buffers(&batch);
+
+        assert!(
+            Arc::ptr_eq(batch.column(0), compacted.column(0)),
+            "an already-compact view column was copied"
+        );
+    }
+
+    /// A sliced view nested inside a container is left alone.
+    ///
+    /// `rebuild_view_leaves` can copy such a column — that is what decouples one
+    /// arriving over Flight — but nothing measures how much a *slice* of it
+    /// retains. `get_slice_memory_size` counts a view's views buffer without the
+    /// data it points into, and `compacted_memory_size` feeds the admission
+    /// pre-check from that estimate, so measuring the container that way would
+    /// under-predict what the entry holds. Until the per-container windowing is
+    /// written, the reclaim is passed up rather than guessed at.
+    #[test]
+    fn compact_retained_buffers_leaves_a_nested_view_column_alone() {
+        let inner: ArrayRef = Arc::new(StringViewArray::from_iter_values(payloads(2_000, 4_096)));
+        let struct_array = StructArray::from(vec![(
+            Arc::new(Field::new("payload", DataType::Utf8View, true)),
+            inner,
+        )]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wrapper",
+            struct_array.data_type().clone(),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).expect("valid batch");
+        let sliced = batch.slice(1_000, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "a nested view slice must not be compacted while nothing measures it"
+        );
+    }
+
+    /// A `Dictionary(UInt8, _)` holding exactly 256 values is valid Arrow, but
+    /// arrow's `MutableArrayData` panics building an extend for it. Compaction
+    /// must never reach that path. `rebuild_dictionary` goes nowhere near it.
+    #[test]
+    fn compact_retained_buffers_rebuilds_a_full_range_dictionary() {
+        use arrow::array::{DictionaryArray, UInt8Array};
+        use arrow::datatypes::UInt8Type;
+
+        let values = StringArray::from(
+            (0..256)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        );
+        // A key buffer far past the reclaim floor, so nothing but the type
+        // check could keep this column away from compaction.
+        let keys = UInt8Array::from(
+            (0..200_000)
+                .map(|row| u8::try_from(row % 256).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values))
+                .expect("valid dictionary"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![dictionary]).expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+        let expected = logical_value(sliced.column(0));
+
+        // Must not panic — a cache write is not allowed to abort the query that
+        // filled it.
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted.num_rows(), 1);
+        assert_eq!(
+            logical_value(compacted.column(0)),
+            expected,
+            "rebuilding the dictionary must not change what the row says"
+        );
+
+        let rebuilt = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("still a dictionary");
+        assert_eq!(
+            rebuilt.values().len(),
+            1,
+            "only the value the surviving key references is kept"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a one-row slice of a 200k-key dictionary must not keep the whole key buffer: {} vs {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// The one string a single-row dictionary column stands for.
+    fn logical_value(column: &ArrayRef) -> String {
+        use arrow::array::{DictionaryArray, cast::AsArray};
+        use arrow::datatypes::UInt8Type;
+
+        let dictionary = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("a dictionary column");
+        let values = dictionary.values().as_string::<i32>();
+        values
+            .value(dictionary.keys().value(0) as usize)
+            .to_string()
+    }
+
+    /// A sliced dictionary nested in a struct is left alone for the same reason
+    /// a sliced nested view is: the copy would work, but nothing measures how
+    /// much such a slice retains, so there is no honest reclaim to act on.
+    #[test]
+    fn compact_retained_buffers_leaves_a_struct_wrapped_dictionary_slice_alone() {
+        use arrow::array::{DictionaryArray, StructArray, UInt8Array};
+        use arrow::datatypes::UInt8Type;
+
+        let values = StringArray::from(
+            (0..256)
+                .map(|value| format!("value-{value}"))
+                .collect::<Vec<_>>(),
+        );
+        let keys = UInt8Array::from(
+            (0..200_000)
+                .map(|row| u8::try_from(row % 256).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values))
+                .expect("valid dictionary"),
+        );
+        let inner = Field::new("d", dictionary.data_type().clone(), true);
+        let column: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(inner),
+            Arc::clone(&dictionary),
+        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert!(
+            Arc::ptr_eq(sliced.column(0), compacted.column(0)),
+            "a struct holding a dictionary slice must not be compacted while nothing \
+             measures it"
+        );
+        assert_eq!(compacted.num_rows(), 1);
+    }
+
+    /// A slice whose values all fit inline still shares its parent's views
+    /// allocation — 16 bytes per parent row — so it is rebuilt into a views
+    /// buffer sized for its own rows. Part of issue #13172's `LIMIT`/`OFFSET`
+    /// route: short-string tables produce exactly this shape.
+    #[test]
+    fn compact_retained_buffers_releases_an_inline_view_slices_views_buffer() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        // 12 bytes or fewer is stored inline, with no data buffer.
+        let values = (0..200_000)
+            .map(|row| (row % 7 != 0).then(|| format!("r{row:0>8}")))
+            .collect::<StringViewArray>();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("valid batch");
+        let sliced = batch.slice(100_000, 2);
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(
+            compacted, sliced,
+            "compaction must preserve every value and null"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "a two-row inline slice should release its parent's views and null buffers, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// A column that does have data buffers, sliced down to rows whose values
+    /// all fit inline: nothing in the data buffers is referenced, so they are
+    /// dropped entirely along with the parent's views allocation.
+    #[test]
+    fn compact_retained_buffers_drops_an_inline_slices_unreferenced_data_buffers() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8View,
+            true,
+        )]));
+        // Row 0 is long enough to force a data buffer; every other row is
+        // inline, so a slice past row 0 references none of it.
+        let mut values: Vec<String> = vec![std::iter::repeat_n('L', 65_536).collect()];
+        values.extend((1..200_000).map(|row| format!("r{row:0>8}")));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringViewArray::from_iter_values(values))],
+        )
+        .expect("valid batch");
+        let sliced = batch.slice(100_000, 1);
+
+        let column = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("StringViewArray");
+        assert!(
+            !column.data_buffers().is_empty() && column.total_buffer_bytes_used() == 0,
+            "the slice must retain a data buffer while referencing none of it"
+        );
+
+        let compacted = compact_retained_buffers(&sliced);
+
+        assert_eq!(compacted, sliced, "the row's value changed");
+        let after = compacted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("StringViewArray");
+        assert!(
+            after.data_buffers().is_empty(),
+            "no view references out-of-line data, so no data buffer should survive"
+        );
+        assert!(
+            compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
+            "an inline-only slice should release both halves of its parent, got {} of {}",
+            compacted.get_array_memory_size(),
+            sliced.get_array_memory_size()
+        );
+    }
+
+    /// The pre-copy estimate is what a caller bills a batch before deciding to
+    /// pay for the copy, so it has to track what compaction actually produces —
+    /// within the rounding that buffer allocation adds.
+    #[test]
+    fn compacted_memory_size_tracks_the_compacted_batch() {
+        let nullable_view_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(
+                payloads(2_000, 4_096)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, value)| (row % 3 != 0).then_some(value))
+                    .collect::<StringViewArray>(),
+            )],
+        )
+        .expect("valid batch");
+
+        for (name, sliced) in [
+            (
+                "string slice",
+                wide_string_batch(2_000, 4_096).slice(1_000, 1),
+            ),
+            ("view slice", wide_view_batch(2_000, 4_096).slice(1_000, 1)),
+            ("nullable view slice", nullable_view_batch.slice(1_000, 2)),
+            ("already compact", wide_string_batch(8, 16)),
+        ] {
+            let predicted = compacted_memory_size(&sliced);
+            let actual = compact_retained_buffers(&sliced).get_array_memory_size();
+            let slack = actual / 10 + 4_096;
+            assert!(
+                predicted + slack >= actual && predicted <= actual + slack,
+                "{name}: estimate {predicted} is not within {slack} of the compacted {actual}"
+            );
+        }
+    }
+
+    /// The estimate is what stops a batch too large to cache from being copied
+    /// in full and then discarded, so it must be far below the retained size
+    /// for exactly the slices compaction targets.
+    #[test]
+    fn compacted_memory_size_is_a_small_fraction_of_a_slices_retained_size() {
+        for sliced in [
+            wide_string_batch(2_000, 4_096).slice(1_000, 1),
+            wide_view_batch(2_000, 4_096).slice(1_000, 1),
+        ] {
+            let predicted = compacted_memory_size(&sliced);
+            assert!(
+                predicted * 100 < sliced.get_array_memory_size(),
+                "estimated {predicted} against a retained {}",
+                sliced.get_array_memory_size()
+            );
+        }
+    }
+
+    /// A batch with no columns keeps its row count.
+    #[test]
+    fn compact_retained_buffers_preserves_a_column_less_row_count() {
+        let options = RecordBatchOptions::new().with_row_count(Some(7));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)
+                .expect("valid batch");
+
+        let compacted = compact_retained_buffers(&batch);
+
+        assert_eq!(compacted.num_rows(), 7);
+    }
+}
+
+#[cfg(test)]
+mod nullability_alignment_tests {
+    use super::*;
+    use arrow::array::{ArrayData, Int32Array, MapArray, StringArray, StructArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Fields;
+
+    fn entry_fields() -> Fields {
+        vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into()
+    }
+
+    fn map_type(entries_nullable: bool) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields()),
+                entries_nullable,
+            )),
+            false,
+        )
+    }
+
+    /// Builds a `MapArray` the way the IPC reader does — through `From<ArrayData>`, which
+    /// performs neither of the two `entries` checks. That is why a column declaring `entries`
+    /// nullable reaches schema alignment at all.
+    fn map_from_parts(
+        entries_nullable: bool,
+        entry_nulls: Option<NullBuffer>,
+        offsets: &[i32],
+        keys: Vec<&str>,
+        values: Vec<Option<&str>>,
+    ) -> MapArray {
+        let entries = StructArray::try_new(
+            entry_fields(),
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(map_type(entries_nullable))
+            .len(offsets.len() - 1)
+            .add_buffer(Buffer::from_slice_ref(offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        MapArray::from(data)
+    }
+
+    fn batch_of(name: &str, column: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                column.data_type().clone(),
+                true,
+            )])),
+            vec![column],
+        )
+        .expect("batch")
+    }
+
+    fn schema_of(name: &str, data_type: DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, data_type, true)]))
+    }
+
+    /// The address of the key column's value buffer, so a rebuild can be told from a relabel.
+    fn keys_buffer_ptr(column: &ArrayRef) -> *const u8 {
+        let map = column
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map column");
+        map.keys().to_data().buffers()[1].as_ptr()
+    }
+
+    fn map_pairs(batch: &RecordBatch) -> Vec<(String, Option<String>)> {
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map column");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("keys");
+        let values = map
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("values");
+
+        (0..keys.len())
+            .map(|i| {
+                (
+                    keys.value(i).to_string(),
+                    values.is_valid(i).then(|| values.value(i).to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// Regression test for #13285. `Schema::contains` permits a nested field's nullability to
+    /// differ, but `RecordBatch` requires a column's type and its field's type to be identical,
+    /// and `with_schema` re-labels the schema while leaving the columns alone. So alignment used
+    /// to hand back a batch advertising `entries` nullable over a column that still carried it
+    /// non-nullable — no error, and a schema contradicting its own data.
+    #[test]
+    fn an_aligned_batch_advertises_the_type_its_columns_actually_carry() {
+        let column = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 2],
+            vec!["a", "b"],
+            vec![Some("1"), None],
+        )) as ArrayRef;
+
+        let aligned = try_cast_to(
+            batch_of("col_map", column),
+            schema_of("col_map", map_type(true)),
+        )
+        .expect("a nested nullability flag is a declaration, not a value");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type(),
+            "the batch must not advertise a type none of its columns carries"
+        );
+        assert_eq!(aligned.schema().field(0).data_type(), &map_type(true));
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![
+                ("a".to_string(), Some("1".to_string())),
+                ("b".to_string(), None),
+            ],
+            "relabelling shares the buffers, so every key and value survives it unchanged"
+        );
+    }
+
+    /// The same disagreement where the schema-level path cannot fire: a sibling column genuinely
+    /// needs a cast, so every column is decided on its own. `Field::contains` waved the map column
+    /// through unchanged and `RecordBatch::try_new` then refused the batch it built, naming two
+    /// `Map` types that differ somewhere in a rendering of the whole type.
+    ///
+    /// The target here declares `entries` nullable, which the Arrow map layout does not allow;
+    /// aligning to it is still the right answer, because alignment delivers the schema it was
+    /// asked for. Bringing an illegal declaration into line is `map_entries`' job, at ingress.
+    #[test]
+    fn a_map_column_beside_one_needing_a_cast_is_aligned_rather_than_refused() {
+        let map_column = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 1],
+            vec!["a"],
+            vec![Some("1")],
+        )) as ArrayRef;
+        let keys_before = keys_buffer_ptr(&map_column);
+        let source = Schema::new(vec![
+            Field::new("col_map", map_type(false), true),
+            Field::new("n", DataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(source),
+            vec![map_column, Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::new(vec![
+            Field::new("col_map", map_type(true), true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+
+        let aligned =
+            try_cast_to(batch, target).expect("one column needing a cast must not fail the other");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type()
+        );
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![("a".to_string(), Some("1".to_string()))]
+        );
+        assert_eq!(aligned.column(1).data_type(), &DataType::Int64);
+        assert_eq!(
+            keys_buffer_ptr(aligned.column(0)),
+            keys_before,
+            "the relabel carries the values across by reference rather than rebuilding them"
+        );
+    }
+
+    /// The disagreement is not always at the top of the type. A `Map` nested inside a `Struct`
+    /// is reached through the struct arm of the walk, and `Field::contains` relaxes a nested
+    /// nullability flag at any depth — so the column was waved through carrying a struct type the
+    /// field declaring it did not match.
+    #[test]
+    fn a_map_nested_inside_a_struct_is_aligned() {
+        let struct_of = |entries_nullable: bool| {
+            DataType::Struct(
+                vec![
+                    Field::new("m", map_type(entries_nullable), true),
+                    Field::new("n", DataType::Int32, true),
+                ]
+                .into(),
+            )
+        };
+        let inner = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 1],
+            vec!["a"],
+            vec![Some("1")],
+        )) as ArrayRef;
+        let DataType::Struct(source_fields) = struct_of(false) else {
+            unreachable!("built as a struct above")
+        };
+        let column = Arc::new(
+            StructArray::try_new(
+                source_fields,
+                vec![inner, Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+                None,
+            )
+            .expect("struct"),
+        ) as ArrayRef;
+
+        let aligned = try_cast_to(
+            batch_of("col_struct", column),
+            schema_of("col_struct", struct_of(true)),
+        )
+        .expect("a nested map's declaration is still only a declaration");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type(),
+            "the batch must not advertise a type none of its columns carries"
+        );
+        assert_eq!(aligned.schema().field(0).data_type(), &struct_of(true));
+        assert_eq!(aligned.num_rows(), 1);
+    }
+
+    /// Narrowing is not a relabel, and the boundary is load-bearing rather than tidy. Whether a
+    /// non-nullable field may hold nulls depends on its parent: Arrow requires a non-nullable
+    /// struct child's nulls to be a *subset of its parent's* rather than absent, so a masked null
+    /// is legal, and a list-like parent's offsets decide which child slots are addressed at all.
+    /// `arrow_cast::cast` already implements those rules — and already serves this direction — so
+    /// the narrowing pair keeps that path instead of a second, stricter transcription here.
+    #[test]
+    fn a_narrowed_nested_field_is_not_relabelled() {
+        assert!(
+            !is_nullability_relaxing_relabel(&map_type(true), &map_type(false)),
+            "a nullable source under a non-nullable target is a narrowing"
+        );
+        assert!(
+            is_nullability_relaxing_relabel(&map_type(false), &map_type(true)),
+            "the relaxing direction is what a relabel carries"
+        );
+    }
+
+    /// The narrowing direction still aligns end to end, through the cast path. Arrow performs it,
+    /// so restricting the relabel must not have taken it away.
+    ///
+    /// Deliberately not killed by any neuter in this module: it pins behaviour this change leaves
+    /// alone, so it is a positive control on Arrow rather than a guard on the logic above.
+    #[test]
+    fn a_narrowed_nested_field_still_aligns_through_the_cast_path() {
+        let column = Arc::new(map_from_parts(
+            true,
+            None,
+            &[0, 2],
+            vec!["a", "b"],
+            vec![Some("1"), None],
+        )) as ArrayRef;
+
+        let aligned = try_cast_to(
+            batch_of("col_map", column),
+            schema_of("col_map", map_type(false)),
+        )
+        .expect("arrow_cast serves the narrowing direction");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type()
+        );
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![
+                ("a".to_string(), Some("1".to_string())),
+                ("b".to_string(), None),
+            ]
+        );
+    }
+
+    /// A rename is a different question from a nullability flag. Admitting it here would make a
+    /// reorder of same-typed sibling fields indistinguishable from a pair of renames, which
+    /// positional pairing would carry across transposed — so a renamed field keeps the cast path.
+    #[test]
+    fn a_renamed_nested_field_is_not_relabelled() {
+        let renamed_entries = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(entry_fields()),
+                true,
+            )),
+            false,
+        );
+
+        // Both pairs relax `entries` from non-nullable to nullable, so the name is the only
+        // thing that can decide them.
+        assert!(
+            !is_nullability_relaxing_relabel(&map_type(false), &renamed_entries),
+            "a renamed entries field is not a nullability difference"
+        );
+        assert!(
+            is_nullability_relaxing_relabel(&map_type(false), &map_type(true)),
+            "the same pair under the original name is a relabel"
+        );
+    }
+
+    /// `sorted` is a promise about the order of the entries buffer, not a declaration about it,
+    /// so a pair differing there is not relabellable however the nullability flags line up.
+    #[test]
+    fn a_map_with_a_different_sorted_flag_is_not_relabelled() {
+        let sorted = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields()),
+                true,
+            )),
+            true,
+        );
+
+        // Differs from the accepted `map_type(false)` -> `map_type(true)` pair only in `sorted`.
+        assert!(!is_nullability_relaxing_relabel(&map_type(false), &sorted));
+        assert!(is_nullability_relaxing_relabel(
+            &map_type(false),
+            &map_type(true)
+        ));
+    }
+
+    /// A `FixedSizeList`'s length is how many values each row owns, so a pair differing there
+    /// describes a different layout however the nullability flags line up.
+    #[test]
+    fn a_fixed_size_list_of_a_different_length_is_not_relabelled() {
+        let fixed = |len: i32, item_nullable: bool| {
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int32, item_nullable)),
+                len,
+            )
+        };
+
+        // The two differ in exactly one thing — the length — so only that can decide them.
+        assert!(!is_nullability_relaxing_relabel(
+            &fixed(2, false),
+            &fixed(3, true)
+        ));
+        assert!(is_nullability_relaxing_relabel(
+            &fixed(2, false),
+            &fixed(2, true)
+        ));
+    }
+
+    /// A type this walk does not know about fails the test and keeps its cast path, rather than
+    /// being relabelled on a child pairing that was never checked.
+    #[test]
+    fn a_difference_carried_by_an_unwalked_type_is_not_relabelled() {
+        let source = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(true)));
+        let target = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(false)));
+
+        assert!(!is_nullability_relaxing_relabel(&source, &target));
+    }
+
+    /// An extension type lives in a field's metadata and renames what its storage buffers mean,
+    /// so a pair differing there is not a nullability-only relabel however the flags line up.
+    #[test]
+    fn a_changed_extension_type_is_not_relabelled() {
+        let extension = |name: &str| {
+            Arc::new(
+                Field::new("item", DataType::FixedSizeBinary(16), false).with_metadata(
+                    [("ARROW:extension:name".to_string(), name.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+        };
+
+        assert!(!is_nullability_relaxing_relabel(
+            &DataType::List(extension("arrow.uuid")),
+            &DataType::List(extension("arrow.opaque")),
+        ));
+    }
+
+    /// The relabel path must not swallow the casts that already worked: a genuine type change
+    /// still goes through `arrow_cast`.
+    #[test]
+    fn a_genuine_type_change_still_casts() {
+        let batch = batch_of("n", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef);
+
+        let casted = try_cast_to(batch, schema_of("n", DataType::Int64)).expect("int widening");
+
+        assert_eq!(casted.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(casted.num_rows(), 2);
+    }
+}
+
+/// How many Arrow buffers `batch` holds, children and null buffers included.
+///
+/// Each is a separate allocation, and each costs more than the bytes it was
+/// asked for — which is why a cache entry is charged per buffer as well as per
+/// byte. See `cache`'s `BUFFER_OVERHEAD_BYTES`.
+///
+/// Counted rather than derived from the schema, though the schema very nearly
+/// settles it: buffer count is a property of the *type*, and a five-column
+/// result laid out identically at 1 row and at 100. The exception is the null
+/// buffer, which exists only once an array actually holds a null — so a
+/// nullable column that happens to have none would be over-counted by a whole
+/// buffer, and columns are usually nullable. The walk is O(columns) once per
+/// stored entry, beside a compaction copy already being paid for.
+#[must_use]
+pub fn buffers_in_batch(batch: &RecordBatch) -> usize {
+    fn walk(data: &arrow::array::ArrayData) -> usize {
+        data.buffers().len()
+            + usize::from(data.nulls().is_some())
+            + data.child_data().iter().map(walk).sum::<usize>()
+    }
+
+    batch.columns().iter().map(|c| walk(&c.to_data())).sum()
+}

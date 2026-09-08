@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/file/mod.rs
+description: File Integration Test Results
+---
++-----------+
+| content   |
++-----------+
+| Testing 1 |
+| Testing 2 |
+| Testing 3 |
+|           |
++-----------+

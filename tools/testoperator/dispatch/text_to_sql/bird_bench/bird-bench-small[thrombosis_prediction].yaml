@@ -1,0 +1,24 @@
+tests:
+  text_to_sql:
+    - model_name: grok420
+      benchmark_queryset: bird-bench-small[thrombosis_prediction]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: thrombosis_prediction
+    - model_name: claude-haiku-3-5
+      benchmark_queryset: bird-bench-small[thrombosis_prediction]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: thrombosis_prediction
+    - model_name: grok420
+      benchmark_queryset: bird-bench-small[thrombosis_prediction]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: thrombosis_prediction-evidence
+      use_evidence: true
+    - model_name: claude-haiku-3-5
+      benchmark_queryset: bird-bench-small[thrombosis_prediction]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: thrombosis_prediction-evidence
+      use_evidence: true

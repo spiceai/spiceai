@@ -1,0 +1,5 @@
+---
+source: crates/data_components/src/s3_vectors/partition.rs
+expression: "to_stable_string(partition_by).expect(\"stable string\")"
+---
+ScalarFunction(bucket(Literal(10), Column(a)))

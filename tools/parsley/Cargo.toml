@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "parsley"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+chunking = { path = "../../crates/chunking" }
+clap = { workspace = true, features = ["derive"] }
+document_parse = { path = "../../crates/document_parse" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+spicepod = { path = "../../crates/spicepod" }
+tiktoken-rs = "0.9.1"
+tokenizers = { workspace = true, features = ["http"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

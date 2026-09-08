@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT SUM(small_decimal), SUM(medium_decimal), SUM(large_decimal), SUM(precise_decimal) FROM decimal"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                              |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]]               |
+|               |   BytesProcessedNode                                                                                                                                              |
+|               |     TableScan: decimal projection=[small_decimal, medium_decimal, large_decimal, precise_decimal]                                                                 |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)]       |
+|               |   CoalescePartitionsExec                                                                                                                                          |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[sum(decimal.small_decimal), sum(decimal.medium_decimal), sum(decimal.large_decimal), sum(decimal.precise_decimal)] |
+|               |       BytesProcessedExec                                                                                                                                          |
+|               |         SchemaCastScanExec                                                                                                                                        |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                    |
+|               |             SQLiteSqlExec sql=SELECT "small_decimal", "medium_decimal", "large_decimal", "precise_decimal" FROM decimal                                           |
+|               |                                                                                                                                                                   |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+

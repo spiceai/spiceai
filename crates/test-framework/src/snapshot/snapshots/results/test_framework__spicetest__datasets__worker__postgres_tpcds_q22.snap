@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q22"
+---
++----------------------+---------------------+--------------+------------+-------+
+| i_product_name       | i_brand             | i_class      | i_category | qoh   |
++----------------------+---------------------+--------------+------------+-------+
+| oughtoughtcallyought | exportiedu pack #2  | kids         | Shoes      | 75.0  |
+| oughtoughtcallyought | exportiedu pack #2  | kids         |            | 75.0  |
+| oughtoughtcallyought | exportiedu pack #2  |              |            | 75.0  |
+| oughtoughtcallyought |                     |              |            | 75.0  |
+| oughtn stoughtought  | maxicorp #8         | womens watch | Jewelry    | 106.0 |
+| oughtn stoughtought  | maxicorp #8         | womens watch |            | 106.0 |
+| oughtn stoughtought  | maxicorp #8         |              |            | 106.0 |
+| oughtn stoughtought  |                     |              |            | 106.0 |
+| n stoughtationought  | edu packedu pack #2 | athletic     | Shoes      | 107.0 |
+| n stoughtationought  | edu packedu pack #2 | athletic     |            | 107.0 |
++----------------------+---------------------+--------------+------------+-------+

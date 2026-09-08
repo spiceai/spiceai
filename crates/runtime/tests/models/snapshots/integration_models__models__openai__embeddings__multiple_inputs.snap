@@ -1,0 +1,24 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: normalize_embeddings_response(response)
+---
+{
+  "data": [
+    {
+      "embedding": "array_256_items",
+      "index": 0,
+      "object": "embedding"
+    },
+    {
+      "embedding": "array_256_items",
+      "index": 1,
+      "object": "embedding"
+    }
+  ],
+  "model": "openai_embeddings",
+  "object": "list",
+  "usage": {
+    "prompt_tokens": 8,
+    "total_tokens": 8
+  }
+}

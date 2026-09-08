@@ -1,0 +1,39 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp, round_scores)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "data": {
+        "cp_catalog_number": 1
+      },
+      "dataset": "multi_column_search",
+      "matches": {
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make "
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 8
+      },
+      "_score": "0.01"
+    },
+    {
+      "data": {
+        "cp_catalog_number": 1
+      },
+      "dataset": "multi_column_search",
+      "matches": {
+        "cp_department": [
+          "DEPARTMENT"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "_score": "0.01"
+    }
+  ]
+}

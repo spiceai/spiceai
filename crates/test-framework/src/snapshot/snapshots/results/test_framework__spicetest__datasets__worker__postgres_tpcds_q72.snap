@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q72"
+---
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------+------------+----------+-------+-----------+
+| i_item_desc                                                                                                                                                        | w_warehouse_name    | d_week_seq | no_promo | promo | total_cnt |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------+------------+----------+-------+-----------+
+| Able bodies would not find. Primary, capable million                                                                                                               | Conventional childr | 5206       | 0        | 1     | 1         |
+| Across significant children include high, notable others. Trousers reflect excessive, british styles. Narro                                                        | Conventional childr | 5170       | 0        | 1     | 1         |
+| Already                                                                                                                                                            | Conventional childr | 5193       | 0        | 1     | 1         |
+| Also perfect clothes entertain american terms. Left teams will make maybe specific minds. Poor years could pursue perhaps military sports; however little centres  | Conventional childr | 5214       | 0        | 1     | 1         |
+| Aspects cope nervously cold metals. Wives should provide oral, concerned months. Low courts take real, formal indians. Perhaps ancient pp. produce diffe           | Conventional childr | 5172       | 0        | 1     | 1         |
+| Big, western sentences could use; prices bring average board                                                                                                       | Conventional childr | 5194       | 0        | 1     | 1         |
+| Bloody insufficient goods could deter largely capable, slow processes. Young stores shall not imply both still potentia                                            | Conventional childr | 5209       | 0        | 1     | 1         |
+| Bright advisers explain i                                                                                                                                          | Conventional childr | 5204       | 0        | 1     | 1         |
+| Broad shoes may not                                                                                                                                                | Conventional childr | 5168       | 0        | 1     | 1         |
+| Central, dry pockets cope even eyes. Delicate houses know steadily;                                                                                                | Conventional childr | 5199       | 0        | 1     | 1         |
++--------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------+------------+----------+-------+-----------+

@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/ducklake/mod.rs
+expression: plan
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                               |
+|               |  Projection: my_orders.id, my_orders.total                                                                                                              |
+|               |   TableScan: my_orders projection=[id, total], full_filters=[my_orders.id > Int64(1)]                                                                   |
+| physical_plan | SchemaCastScanExec                                                                                                                                      |
+|               |   CooperativeExec                                                                                                                                       |
+|               |     BytesProcessedExec                                                                                                                                  |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "id", "total" FROM "ducklake"."main"."orders" WHERE ("orders"."id" > 1) |
+|               |                                                                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------+

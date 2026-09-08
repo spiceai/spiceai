@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++-----------------------------------------------+
+| regexp_match(csv_test.region,Utf8("AMERICA")) |
++-----------------------------------------------+
+| []                                            |
+| [AMERICA]                                     |
+| [AMERICA]                                     |
+| []                                            |
+| []                                            |
+| []                                            |
++-----------------------------------------------+

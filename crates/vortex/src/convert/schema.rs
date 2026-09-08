@@ -1,0 +1,809 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::collections::HashMap;
+
+use arrow_schema::DataType;
+use arrow_schema::Field;
+use arrow_schema::Schema;
+use datafusion_common::Result as DFResult;
+use datafusion_common::exec_datafusion_err;
+use vortex::arrow::ArrowSession;
+use vortex::dtype::DType;
+
+/// Calculate the physical Arrow schema for a Vortex file given its `DType` and the expected logical schema.
+///
+/// Some Arrow types don't roundtrip cleanly through Vortex's `DType` system:
+/// - Dictionary types lose their encoding (become the value type)
+/// - Utf8/LargeUtf8 become `Utf8View`
+/// - Binary/LargeBinary become `BinaryView`
+/// - `RunEndEncoded` loses its encoding
+/// - `Map` has no `DType` and is stored as `List<Struct<keys, values>>`
+/// - Lists are even more complex, with various sizes and physical layouts that are lost
+///
+/// For these types, we use the logical schema's type instead of the `DType`'s natural Arrow
+/// conversion, since Vortex's Arrow executor can produce these types when requested.
+pub fn calculate_physical_schema(
+    dtype: &DType,
+    reference_logical_schema: &Schema,
+    arrow_session: &ArrowSession,
+) -> DFResult<Schema> {
+    let DType::Struct(struct_dtype, _) = dtype else {
+        return Err(exec_datafusion_err!(
+            "Expected struct dtype for schema conversion"
+        ));
+    };
+
+    // `Schema::field_with_name` is a linear scan (Arrow keeps no name index), so
+    // resolving each of the file's fields against the reference schema that way is
+    // O(fields^2) per file — and this runs on every file open, with the same
+    // reference schema, so the cost repeats per file across a scan. Index the
+    // reference schema once (first match wins, matching `field_with_name`) and the
+    // per-field lookup becomes O(1).
+    let logical_by_name: HashMap<&str, &Field> = {
+        let logical_fields = reference_logical_schema.fields();
+        let mut by_name = HashMap::with_capacity(logical_fields.len());
+        for field in logical_fields {
+            by_name
+                .entry(field.name().as_str())
+                .or_insert(field.as_ref());
+        }
+        by_name
+    };
+
+    let fields: Vec<Field> = struct_dtype
+        .names()
+        .iter()
+        .zip(struct_dtype.fields())
+        .map(|(name, field_dtype)| {
+            let logical_field = logical_by_name.get(name.as_ref()).copied();
+            let arrow_type = match &logical_field {
+                Some(lf) => {
+                    calculate_physical_field_type(&field_dtype, lf.data_type(), arrow_session)?
+                }
+                None => arrow_session
+                    .to_arrow_field(name.as_ref(), &field_dtype)
+                    .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?
+                    .data_type()
+                    .clone(),
+            };
+
+            Ok(match logical_field {
+                Some(lf) => lf
+                    .clone()
+                    .with_data_type(arrow_type)
+                    .with_nullable(field_dtype.is_nullable()),
+                // FieldName's Display escapes control bytes (`\x08` → `\u{8}`),
+                // so `to_string` would rename the column. `as_ref` keeps the
+                // raw name. See spiraldb/vortex#9049.
+                None => Field::new(name.as_ref(), arrow_type, field_dtype.is_nullable()),
+            })
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+
+    Ok(Schema::new_with_metadata(
+        fields,
+        reference_logical_schema.metadata().clone(),
+    ))
+}
+
+/// Calculate the physical Arrow type for a field, preferring the logical type when the
+/// `DType` doesn't roundtrip cleanly.
+fn calculate_physical_field_type(
+    dtype: &DType,
+    logical_type: &DataType,
+    arrow_session: &ArrowSession,
+) -> DFResult<DataType> {
+    // Check if the logical type is one that doesn't roundtrip through DType
+    Ok(match logical_type {
+        // Non-view string/binary types become view types after roundtrip
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+            if dtype.is_binary() || dtype.is_utf8() {
+                logical_type.clone()
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
+        // Dictionary types lose their encoding when converted to DType, and RunEndEncoded loses its encoding.
+        DataType::Dictionary(..) | DataType::RunEndEncoded(..) => logical_type.clone(),
+
+        // For struct types, recursively check each field
+        DataType::Struct(logical_fields) => {
+            if let DType::Struct(struct_dtype, _) = dtype {
+                let physical_fields: Vec<Field> = struct_dtype
+                    .names()
+                    .iter()
+                    .zip(struct_dtype.fields())
+                    .map(|(name, field_dtype)| {
+                        let logical_field =
+                            logical_fields.iter().find(|f| f.name() == name.as_ref());
+                        let arrow_type = match &logical_field {
+                            Some(lf) => calculate_physical_field_type(
+                                &field_dtype,
+                                lf.data_type(),
+                                arrow_session,
+                            )?,
+                            None => arrow_session
+                                .to_arrow_field(name.as_ref(), &field_dtype)
+                                .map_err(|e| {
+                                    exec_datafusion_err!("Failed to convert dtype to arrow: {e}")
+                                })?
+                                .data_type()
+                                .clone(),
+                        };
+
+                        Ok(match logical_field {
+                            Some(lf) => lf
+                                .as_ref()
+                                .clone()
+                                .with_data_type(arrow_type)
+                                .with_nullable(field_dtype.is_nullable()),
+                            None => {
+                                // Same as the top-level unmatched branch: do
+                                // not go through FieldName's Display.
+                                Field::new(name.as_ref(), arrow_type, field_dtype.is_nullable())
+                            }
+                        })
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+
+                DataType::Struct(physical_fields.into())
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
+        // For list types, recursively check the element type
+        DataType::List(logical_elem) | DataType::LargeList(logical_elem) => {
+            if let DType::List(elem_dtype, _) = dtype {
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
+                match logical_type {
+                    DataType::List(_) => DataType::List(physical_field.into()),
+                    DataType::LargeList(_) => DataType::LargeList(physical_field.into()),
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
+        // The map identity - the entries field name, the key and value names, and the
+        // `ordered` flag - survives only in the logical schema, so it is re-applied here or
+        // the column reads back as the list it is stored as.
+        DataType::Map(logical_entries, ordered) => {
+            if let DType::List(entries_dtype, _) = dtype {
+                let physical_entries_type = calculate_physical_field_type(
+                    entries_dtype,
+                    logical_entries.data_type(),
+                    arrow_session,
+                )?;
+                let physical_entries = logical_entries
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_entries_type);
+                DataType::Map(physical_entries.into(), *ordered)
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
+        // For fixed-size list types, recursively check the element type
+        DataType::FixedSizeList(logical_elem, size) => {
+            if let DType::FixedSizeList(elem_dtype, ..) = dtype {
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
+                DataType::FixedSizeList(physical_field.into(), *size)
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+
+        // For list view types, recursively check the element type
+        DataType::ListView(logical_elem) | DataType::LargeListView(logical_elem) => {
+            if let DType::List(elem_dtype, _) = dtype {
+                let physical_elem_type = calculate_physical_field_type(
+                    elem_dtype,
+                    logical_elem.data_type(),
+                    arrow_session,
+                )?;
+                let physical_field = logical_elem
+                    .as_ref()
+                    .clone()
+                    .with_data_type(physical_elem_type);
+                match logical_type {
+                    DataType::ListView(_) => DataType::ListView(physical_field.into()),
+                    DataType::LargeListView(_) => DataType::LargeListView(physical_field.into()),
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err(exec_datafusion_err!(
+                    "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
+                ));
+            }
+        }
+        // All other types roundtrip cleanly, use the DType's natural conversion
+        _ => arrow_session
+            .to_arrow_field("", dtype)
+            .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?
+            .data_type()
+            .clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::Fields;
+    use vortex::arrow::ArrowSession;
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
+    use vortex::dtype::StructFields;
+
+    use super::*;
+
+    #[test]
+    fn test_dict_conversion() {
+        // Dictionary types lose their encoding when converted to DType, but we should
+        // preserve the original logical type in the physical schema.
+        let logical_schema = Schema::new(vec![Field::new(
+            "dict_col",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]);
+
+        // Vortex DType for dictionary is just the value type (Utf8)
+        let dtype = DType::Struct(
+            StructFields::from_iter([("dict_col", DType::Utf8(Nullability::Nullable))]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("dictionary physical schema should be calculated");
+
+        // Should preserve the dictionary type from the logical schema
+        assert_eq!(
+            physical_schema.field(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+    }
+
+    /// Arrow's `Map` is stored as `List<Struct<keys, values>>`, so the file's `DType` alone
+    /// reads back as a list. The reference schema is the only place the map identity
+    /// survives, and reconciliation has to re-apply it or a map column comes back as a list
+    /// and no longer matches the table it was written from.
+    #[test]
+    fn test_map_type_is_restored_from_the_reference_schema() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let map_type = DataType::Map(Arc::new(entries), false);
+        let logical_schema = Schema::new(vec![Field::new("headers", map_type.clone(), true)]);
+
+        // What the file actually holds: a nullable list of non-nullable key/value structs.
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "headers",
+                DType::List(
+                    Arc::new(DType::Struct(
+                        StructFields::from_iter([
+                            ("keys", DType::Utf8(Nullability::NonNullable)),
+                            ("values", DType::Utf8(Nullability::Nullable)),
+                        ]),
+                        Nullability::NonNullable,
+                    )),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("map physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &map_type);
+    }
+
+    #[test]
+    fn test_reconciliation_matches_by_name_not_position() {
+        // The reference schema lists columns in the opposite order to the file
+        // DType. Reconciliation must match fields by name (via the name index),
+        // so each output field takes the matching reference field's preserved
+        // logical type regardless of position.
+        let logical_schema = Schema::new(vec![
+            Field::new(
+                "b_dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("a_utf8", DataType::Utf8, false),
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("a_utf8", DType::Utf8(Nullability::NonNullable)),
+                ("b_dict", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("schema should reconcile by name");
+
+        // Output follows the DType field order; types come from the matching
+        // reference fields.
+        assert_eq!(physical.field(0).name(), "a_utf8");
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(physical.field(1).name(), "b_dict");
+        assert_eq!(
+            physical.field(1).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+    }
+
+    #[test]
+    fn test_duplicate_reference_name_uses_first_match() {
+        // A reference schema with duplicate field names must resolve against the
+        // FIRST match, matching Arrow's `field_with_name`; the name index
+        // preserves that via first-insert-wins.
+        let logical_schema = Schema::new(vec![
+            Field::new("x", DataType::Utf8, false),     // first "x" wins
+            Field::new("x", DataType::LargeUtf8, true), // second "x" ignored
+        ]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([("x", DType::Utf8(Nullability::NonNullable))]),
+            Nullability::NonNullable,
+        );
+
+        let physical = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+            .expect("duplicate-name reconciliation should pick the first match");
+
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_utf8_variants_preserved() {
+        // Non-view string types become view types after roundtrip through DType,
+        // but we should preserve the original logical type.
+        let logical_schema = Schema::new(vec![
+            Field::new("utf8_col", DataType::Utf8, false),
+            Field::new("large_utf8_col", DataType::LargeUtf8, true),
+            Field::new("binary_col", DataType::Binary, false),
+            Field::new("large_binary_col", DataType::LargeBinary, true),
+        ]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("utf8_col", DType::Utf8(Nullability::NonNullable)),
+                ("large_utf8_col", DType::Utf8(Nullability::Nullable)),
+                ("binary_col", DType::Binary(Nullability::NonNullable)),
+                ("large_binary_col", DType::Binary(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("utf8/binary physical schema should be calculated");
+
+        assert_eq!(physical_schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(physical_schema.field(1).data_type(), &DataType::LargeUtf8);
+        assert_eq!(physical_schema.field(2).data_type(), &DataType::Binary);
+        assert_eq!(physical_schema.field(3).data_type(), &DataType::LargeBinary);
+    }
+
+    #[test]
+    fn test_failing_conversion_incompatible_types() {
+        let logical_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "col",
+                DType::Primitive(PType::I32, Nullability::NonNullable),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
+        assert!(
+            result
+                .expect_err("incompatible dtype should fail schema calculation")
+                .to_string()
+                .contains("not compatible with")
+        );
+
+        // Test struct vs non-struct mismatch
+        let logical_schema = Schema::new(vec![Field::new(
+            "col",
+            DataType::Struct(Fields::empty()),
+            false,
+        )]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([("col", DType::Utf8(Nullability::NonNullable))]),
+            Nullability::NonNullable,
+        );
+
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
+        assert!(
+            result
+                .expect_err("incompatible dtype should fail schema calculation")
+                .to_string()
+                .contains("not compatible with")
+        );
+    }
+
+    #[test]
+    fn test_nested_struct_conversion() {
+        let logical_schema = Schema::new(vec![
+            Field::new(
+                "outer_col",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("inner_utf8", DataType::Utf8, false),
+                    Field::new("inner_int", DataType::Int64, true),
+                ])),
+                true,
+            ),
+            Field::new("simple_col", DataType::Int32, false),
+        ]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                (
+                    "outer_col",
+                    DType::Struct(
+                        StructFields::from_iter([
+                            ("inner_utf8", DType::Utf8(Nullability::NonNullable)),
+                            (
+                                "inner_int",
+                                DType::Primitive(PType::I64, Nullability::Nullable),
+                            ),
+                        ]),
+                        Nullability::Nullable,
+                    ),
+                ),
+                (
+                    "simple_col",
+                    DType::Primitive(PType::I32, Nullability::NonNullable),
+                ),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("nested struct physical schema should be calculated");
+
+        // Check outer structure
+        assert_eq!(physical_schema.fields().len(), 2);
+
+        // Check nested struct preserves Utf8 (not Utf8View)
+        let outer_field = physical_schema.field(0);
+        if let DataType::Struct(inner_fields) = outer_field.data_type() {
+            assert_eq!(inner_fields.len(), 2);
+            assert_eq!(inner_fields[0].data_type(), &DataType::Utf8);
+            assert_eq!(inner_fields[1].data_type(), &DataType::Int64);
+        } else {
+            panic!("Expected struct type for outer_col");
+        }
+    }
+
+    #[test]
+    fn test_list_with_dict_elements() {
+        // Test that list types with dictionary elements preserve the dictionary type
+        let inner_field = Field::new(
+            "item",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let logical_schema = Schema::new(vec![Field::new(
+            "list_col",
+            DataType::List(Arc::new(inner_field)),
+            true,
+        )]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "list_col",
+                DType::List(
+                    Arc::new(DType::Utf8(Nullability::Nullable)),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("list-with-dict physical schema should be calculated");
+
+        if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
+            assert_eq!(
+                elem_field.data_type(),
+                &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            );
+        } else {
+            panic!("Expected list type");
+        }
+    }
+
+    #[test]
+    fn test_non_struct_dtype_error() {
+        // Test that non-struct DType produces an error
+        let logical_schema = Schema::new(vec![Field::new("col", DataType::Int32, false)]);
+
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+
+        let result = calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default());
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("non-struct dtype should fail schema calculation")
+                .to_string()
+                .contains("Expected struct dtype")
+        );
+    }
+
+    #[test]
+    fn test_field_and_schema_metadata_preserved() {
+        use std::collections::HashMap;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("logicalType".to_string(), "TIMESTAMP_LTZ".to_string());
+        let field_with_metadata =
+            Field::new("ts_col", DataType::Utf8, true).with_metadata(field_metadata.clone());
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("parquet.avro.schema".to_string(), "...".to_string());
+        let logical_schema = Schema::new_with_metadata(
+            vec![
+                field_with_metadata,
+                Field::new("plain_col", DataType::Int64, false),
+            ],
+            schema_metadata.clone(),
+        );
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("ts_col", DType::Utf8(Nullability::Nullable)),
+                (
+                    "plain_col",
+                    DType::Primitive(PType::I64, Nullability::NonNullable),
+                ),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("metadata-preserving physical schema should be calculated");
+
+        assert_eq!(physical_schema.metadata(), &schema_metadata);
+        assert_eq!(physical_schema.field(0).metadata(), &field_metadata);
+    }
+
+    #[test]
+    fn test_nested_list_element_metadata_preserved() {
+        use std::collections::HashMap;
+
+        let mut elem_metadata = HashMap::new();
+        elem_metadata.insert("extension:type".to_string(), "json".to_string());
+        let inner_field =
+            Field::new("item", DataType::Utf8, true).with_metadata(elem_metadata.clone());
+        let logical_schema = Schema::new(vec![Field::new(
+            "list_col",
+            DataType::List(Arc::new(inner_field)),
+            true,
+        )]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([(
+                "list_col",
+                DType::List(
+                    Arc::new(DType::Utf8(Nullability::Nullable)),
+                    Nullability::Nullable,
+                ),
+            )]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("nested-list element-metadata physical schema should be calculated");
+
+        if let DataType::List(elem_field) = physical_schema.field(0).data_type() {
+            assert_eq!(elem_field.metadata(), &elem_metadata);
+        } else {
+            panic!("Expected list type");
+        }
+    }
+
+    /// Names carrying raw control bytes must reach Arrow byte-for-byte.
+    /// `FieldName`'s `Display` escapes via `StringEscape`, so building the
+    /// field with `to_string` renames `\x08` to the literal five characters
+    /// `\u{8}`. The scanned batch then disagrees with the table schema the
+    /// scan was planned against, and the query fails with "column types must
+    /// match schema types".
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_column_names_are_not_escaped() {
+        let column_names = ["plain", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(
+            column_names
+                .iter()
+                .map(|n| Field::new(*n, DataType::Utf8, true))
+                .collect::<Fields>(),
+        );
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("plain", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("control-byte column names should reconcile");
+
+        let names: Vec<&str> = physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, column_names);
+    }
+
+    /// Same, one level down: struct children are built at a separate call
+    /// site in `calculate_physical_field_type`. The children here are
+    /// run-end-encoded dictionaries, so this also covers the branches that
+    /// take the type from the reference schema instead of the `DType`.
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_struct_field_names_are_not_escaped() {
+        let label_names = ["app", "\u{8}", "check_id\u{10}"];
+        let ree = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new(
+                "values",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            )),
+        );
+        let logical_schema = Schema::new(vec![Field::new_struct(
+            "labels",
+            label_names
+                .iter()
+                .map(|n| Field::new(*n, ree.clone(), true))
+                .collect::<Fields>(),
+            false,
+        )]);
+
+        let labels_dtype = DType::Struct(
+            StructFields::from_iter([
+                ("app", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("labels", labels_dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("control-byte struct field names should reconcile");
+
+        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
+            panic!("expected labels to be a struct");
+        };
+        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, label_names);
+    }
+
+    /// Fields present in the file `DType` but not the reference schema take
+    /// their Arrow name from `FieldName` at the `Field::new` sites. Those
+    /// sites must use `as_ref`, not `to_string` (`Display` escapes).
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_unmatched_column_names_are_not_escaped() {
+        let column_names = ["plain", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(vec![Field::new("other", DataType::Int32, false)]);
+
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("plain", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("unmatched control-byte column names should not be escaped");
+
+        let names: Vec<&str> = physical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, column_names);
+    }
+
+    /// Same unmatched-name path one level down, at the `Field::new` site in
+    /// `calculate_physical_field_type`.
+    ///
+    /// Regression test for spiraldb/vortex#9049.
+    #[test]
+    fn test_control_byte_unmatched_struct_field_names_are_not_escaped() {
+        let label_names = ["app", "\u{8}", "check_id\u{10}"];
+        let logical_schema = Schema::new(vec![Field::new_struct(
+            "labels",
+            Fields::from(vec![Field::new("other", DataType::Utf8, true)]),
+            false,
+        )]);
+
+        let labels_dtype = DType::Struct(
+            StructFields::from_iter([
+                ("app", DType::Utf8(Nullability::Nullable)),
+                ("\u{8}", DType::Utf8(Nullability::Nullable)),
+                ("check_id\u{10}", DType::Utf8(Nullability::Nullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+        let dtype = DType::Struct(
+            StructFields::from_iter([("labels", labels_dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default())
+                .expect("unmatched nested control-byte names should not be escaped");
+
+        let DataType::Struct(labels) = physical_schema.field(0).data_type() else {
+            panic!("expected labels to be a struct");
+        };
+        let names: Vec<&str> = labels.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, label_names);
+    }
+}

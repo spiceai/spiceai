@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q9"
+---
++-----------+--------+----------------+
+| nation    | o_year | sum_profit     |
++-----------+--------+----------------+
+| ALGERIA   | 1998   | 271504046.5508 |
+| ALGERIA   | 1997   | 457035986.9555 |
+| ALGERIA   | 1996   | 457125199.0414 |
+| ALGERIA   | 1995   | 460972497.0491 |
+| ALGERIA   | 1994   | 456444975.7127 |
+| ALGERIA   | 1993   | 456449926.4138 |
+| ALGERIA   | 1992   | 459548354.7680 |
+| ARGENTINA | 1998   | 277792984.9141 |
+| ARGENTINA | 1997   | 467555914.5594 |
+| ARGENTINA | 1996   | 473886192.7453 |
++-----------+--------+----------------+

@@ -1,0 +1,6 @@
+tests:
+  bench:
+    spicepod_path: accelerated/on_zero_results/file[parquet]-cayenne[file]-on_zero_results_small.yaml
+    query_set: clickbench
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800

@@ -1,0 +1,17 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: post_json_default_content_type"
+snapshot_kind: text
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                              |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                         |
+|               |  Projection: post_json_default.request_path, post_json_default.request_body, post_json_default.content                                                                                                            |
+|               |   TableScan: post_json_default projection=[request_path, request_body, content]                                                                                                                                   |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                |
+|               |   CooperativeExec                                                                                                                                                                                                 |
+|               |     BytesProcessedExec                                                                                                                                                                                            |
+|               |       VirtualExecutionPlan name=duckdb compute_context=:memory: initial_sql=SELECT "post_json_default"."request_path", "post_json_default"."request_body", "post_json_default"."content" FROM "post_json_default" |
+|               |                                                                                                                                                                                                                   |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

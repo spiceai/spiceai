@@ -1,0 +1,121 @@
+name: Configure apt mirrors and retries
+description: >-
+  Configures apt with retry settings and switches to Ubuntu mirrors
+  geographically close to our self-hosted runners (Pittsburgh Teraswitch
+  datacenter) to avoid transient archive.ubuntu.com mirror-sync failures.
+  Safe no-op on non-Linux runners.
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure apt mirrors and retries (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Retry transient failures, force IPv4, and keep per-request timeouts
+        # reasonable. archive.ubuntu.com's load balancer can return a stale
+        # mirror mid-update; retries + a closer primary mirror mitigate this.
+        sudo tee /etc/apt/apt.conf.d/99-spice-retries > /dev/null <<'EOF'
+        Acquire::Retries "5";
+        Acquire::Retries::Delay::Maximum "10";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        Acquire::ForceIPv4 "true";
+        EOF
+
+        # GitHub-hosted Ubuntu runner images can include the git-core PPA.
+        # It is not needed for CI and can make apt update fail when Launchpad
+        # times out.
+        if [ -d /etc/apt/sources.list.d ]; then
+          while IFS= read -r -d '' SOURCE_FILE; do
+            if sudo grep -Eq 'ppa\.launchpadcontent\.net/git-core/ppa|git-core/ppa' "${SOURCE_FILE}"; then
+              echo "Removing git-core PPA apt source: ${SOURCE_FILE}"
+              sudo rm -f "${SOURCE_FILE}"
+            fi
+          done < <(
+            sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+              \( -name '*.list' -o -name '*.sources' \) -print0
+          )
+        fi
+
+        # Ordered list of Ubuntu archive mirrors close to Pittsburgh, PA
+        # (Teraswitch datacenter), with reliable fallbacks. The deb822
+        # sources format supports multiple URIs per source, and apt will
+        # try them in order on transport errors. The classic
+        # /etc/apt/sources.list format has no built-in failover, so only
+        # the primary is used there (the retry policy above still helps).
+        #
+        # Verified on https://launchpad.net/ubuntu/+archivemirrors :
+        #   - mirror.pit.teraswitch.com       (Pittsburgh, PA - Teraswitch)
+        #   - mirrors.edge.kernel.org         (global kernel.org CDN)
+        ARCHIVE_MIRRORS=(
+          "http://mirror.pit.teraswitch.com/ubuntu/"
+          "http://mirrors.edge.kernel.org/ubuntu/"
+          "http://archive.ubuntu.com/ubuntu/"
+        )
+
+        # Security updates are only published on security.ubuntu.com; keep
+        # that as-is but add the same retry policy above.
+        PRIMARY="${ARCHIVE_MIRRORS[0]}"
+        # Space-separated list used for deb822 URIs field (enables real
+        # multi-URI failover on noble+).
+        ALL_MIRRORS="${ARCHIVE_MIRRORS[*]}"
+
+        # Ubuntu 24.04 (noble) ships sources in deb822 format at
+        # /etc/apt/sources.list.d/ubuntu.sources; older releases use
+        # /etc/apt/sources.list. Handle both.
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources \
+                  /etc/apt/sources.list.d/ubuntu.sources.bak
+          # Ubuntu's default deb822 file has separate archive and security
+          # stanzas. Replace only the archive URIs line and leave the
+          # security stanza untouched.
+          sudo sed -i -E \
+            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
+            /etc/apt/sources.list.d/ubuntu.sources
+          # If the substitution had no effect, surface diagnostics but do not
+          # fail the action.
+          if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "::warning::configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt"
+            echo "--- current ubuntu.sources URIs ---" >&2
+            grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
+          fi
+        fi
+        if [ -f /etc/apt/sources.list ]; then
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          # Classic sources.list has no multi-URI support; point every
+          # archive.ubuntu.com / us.archive.ubuntu.com entry (http or
+          # https) at the primary mirror. Retries above handle transient
+          # failures.
+          sudo sed -i -E \
+            -e "s|https?://archive\.ubuntu\.com/ubuntu/?|${PRIMARY}|g" \
+            -e "s|https?://us\.archive\.ubuntu\.com/ubuntu/?|${PRIMARY}|g" \
+            /etc/apt/sources.list
+        fi
+
+        echo "apt primary archive mirror: ${PRIMARY}"
+        echo "deb822 mirror failover list: ${ALL_MIRRORS}"
+        echo "apt retry policy installed at /etc/apt/apt.conf.d/99-spice-retries"
+
+    - name: Verify apt mirror configuration (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        echo "=== /etc/apt/apt.conf.d/99-spice-retries ==="
+        cat /etc/apt/apt.conf.d/99-spice-retries
+
+        echo "=== Active URIs in ubuntu.sources (deb822) ==="
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          echo "not present"
+        fi
+
+        echo "=== Active archive lines in sources.list (classic) ==="
+        if [ -f /etc/apt/sources.list ]; then
+          grep 'archive\.ubuntu\.com' /etc/apt/sources.list | grep -v '^#' || true
+        else
+          echo "not present"
+        fi

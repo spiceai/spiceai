@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::fmt::Formatter;
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::Weak;
+
+use datafusion_common::Result as DFResult;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::exec_datafusion_err;
+use datafusion_datasource::TableSchema;
+use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_groups::FileGroupPartitioner;
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_stream::FileOpener;
+use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::conjunction;
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
+use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use datafusion_physical_plan::DisplayFormatType;
+use datafusion_physical_plan::PhysicalExpr;
+use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
+use datafusion_physical_plan::filter_pushdown::PushedDown;
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use object_store::ObjectStore;
+use object_store::path::Path;
+use vortex::file::VORTEX_FILE_EXTENSION;
+use vortex::layout::LayoutReader;
+use vortex::metrics::DefaultMetricsRegistry;
+use vortex::metrics::MetricsRegistry;
+use vortex::session::VortexSession;
+use vortex_utils::aliases::dash_map::DashMap;
+
+use super::opener::VortexOpener;
+use super::segment_cache::SharedSegmentCache;
+use crate::ProjectionPushdown;
+use crate::ScanConcurrency;
+use crate::VortexTableOptions;
+use crate::convert::exprs::DefaultExpressionConvertor;
+use crate::convert::exprs::ExpressionConvertor;
+use crate::persistent::reader::DefaultVortexReaderFactory;
+use crate::persistent::reader::VortexReaderFactory;
+
+/// Execution plan for reading one or more Vortex files, intended to be consumed by [`DataSourceExec`].
+///
+/// [`DataSourceExec`]: datafusion_datasource::source::DataSourceExec
+#[derive(Clone)]
+pub struct VortexSource {
+    pub(crate) session: VortexSession,
+    pub(crate) table_schema: TableSchema,
+    pub(crate) projection: ProjectionExprs,
+    /// Combined predicate expression containing all filters from `DataFusion` query planning.
+    /// Used with `FilePruner` to skip files based on statistics and partition values.
+    pub(crate) full_predicate: Option<PhysicalExprRef>,
+    /// Subset of predicates that can be pushed down into Vortex scan operations.
+    /// These are expressions that Vortex can efficiently evaluate during scanning.
+    pub(crate) vortex_predicate: Option<PhysicalExprRef>,
+    pub(crate) batch_size: Option<usize>,
+    df_metrics: ExecutionPlanMetricsSet,
+    /// Shared layout readers, the source only lives as long as one scan.
+    ///
+    /// Sharing the readers allows us to only read every layout once from the file, even across partitions.
+    layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
+    /// Shared full-file natural split ranges keyed by path.
+    natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
+    expression_convertor: Arc<dyn ExpressionConvertor>,
+    pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
+    vx_metrics_registry: Arc<dyn MetricsRegistry>,
+    file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    segment_cache: Option<Arc<SharedSegmentCache>>,
+    target_partitions: Option<usize>,
+    /// Whether to enable expression pushdown into the underlying Vortex scan.
+    options: VortexTableOptions,
+    /// When `false`, [`FileSource::supports_repartitioning`] returns `false`, so
+    /// `DataFusion`'s `repartition_file_scans` rule will not byte-range-split this
+    /// source's file group. Highly selective scans (PK point lookups) set this:
+    /// the fan-out only multiplies per-split Vortex footer-opens the lookup never
+    /// needs. Default `true`, preserving full-scan read parallelism.
+    allow_repartitioning: bool,
+}
+
+impl VortexSource {
+    /// Creates a new `VortexSource` with default configuration and a provided [`VortexSession`].
+    /// Meant to be used with a [`FileScanConfig`] to scan a file with the provided schema.
+    ///
+    /// Can be configured using the provided methods.
+    #[must_use]
+    pub fn new(table_schema: TableSchema, session: VortexSession) -> Self {
+        let full_schema = table_schema.table_schema();
+        let indices = (0..full_schema.fields().len()).collect::<Vec<_>>();
+        let projection = ProjectionExprs::from_indices(&indices, full_schema);
+
+        Self {
+            session,
+            table_schema,
+            projection,
+            full_predicate: None,
+            vortex_predicate: None,
+            batch_size: None,
+            df_metrics: ExecutionPlanMetricsSet::default(),
+            layout_readers: Arc::new(DashMap::default()),
+            natural_split_ranges: Arc::new(DashMap::default()),
+            expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
+            vortex_reader_factory: None,
+            vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
+            file_metadata_cache: None,
+            segment_cache: None,
+            target_partitions: None,
+            options: VortexTableOptions::default(),
+            allow_repartitioning: true,
+        }
+    }
+
+    /// Set projection-expression pushdown behavior for the underlying Vortex scan.
+    #[must_use]
+    pub fn with_projection_pushdown(mut self, mode: ProjectionPushdown) -> Self {
+        self.options.projection_pushdown = mode;
+        self
+    }
+
+    /// Set an [`ExpressionConvertor`] to control how `DataFusion` expressions should be converted and pushed down.
+    #[must_use]
+    pub fn with_expression_convertor(
+        mut self,
+        expr_convertor: Arc<dyn ExpressionConvertor>,
+    ) -> Self {
+        self.expression_convertor = expr_convertor;
+        self
+    }
+
+    /// Set a user-defined factory to create the underlying [`VortexReadAt`]
+    ///
+    /// [`VortexReadAt`]: vortex::io::VortexReadAt
+    #[must_use]
+    pub fn with_vortex_reader_factory(
+        mut self,
+        vortex_reader_factory: Arc<dyn VortexReaderFactory>,
+    ) -> Self {
+        self.vortex_reader_factory = Some(vortex_reader_factory);
+        self
+    }
+
+    /// Returns the [`MetricsRegistry`] attached to this source.
+    #[must_use]
+    pub fn metrics_registry(&self) -> &Arc<dyn MetricsRegistry> {
+        &self.vx_metrics_registry
+    }
+
+    /// Override the file metadata cache
+    #[must_use]
+    pub fn with_file_metadata_cache(
+        mut self,
+        file_metadata_cache: Arc<dyn FileMetadataCache>,
+    ) -> Self {
+        self.file_metadata_cache = Some(file_metadata_cache);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_segment_cache(mut self, segment_cache: Arc<SharedSegmentCache>) -> Self {
+        self.segment_cache = Some(segment_cache);
+        self
+    }
+
+    /// Set the underlying scan concurrency mode. This limit is used per Vortex scan operation.
+    #[must_use]
+    pub fn with_scan_concurrency(mut self, scan_concurrency: ScanConcurrency) -> Self {
+        self.options.scan_concurrency = scan_concurrency;
+        self
+    }
+
+    /// Returns the table options for this source.
+    #[must_use]
+    pub fn options(&self) -> &VortexTableOptions {
+        &self.options
+    }
+
+    /// Set the table options for this source.
+    #[must_use]
+    pub fn with_options(mut self, opts: VortexTableOptions) -> Self {
+        self.options = opts;
+        self
+    }
+
+    /// Control whether `DataFusion` may byte-range-split this source's file group
+    /// (see [`FileSource::supports_repartitioning`]). Set `false` for highly
+    /// selective scans (e.g. PK point lookups), where splitting one file into N
+    /// partitions only multiplies the per-split Vortex footer-open cost without
+    /// reducing work — exactly one split contains the matching row. Default
+    /// `true`, so full scans keep their intra-file read parallelism.
+    #[must_use]
+    pub fn with_repartitioning(mut self, allow: bool) -> Self {
+        self.allow_repartitioning = allow;
+        self
+    }
+
+    /// The number of splits this source decodes CONCURRENTLY inside one file scan
+    /// for `base_config`.
+    ///
+    /// Exposed so a caller that accounts scan memory against a pool can charge for
+    /// every in-flight decode rather than for a single emitted batch: a scan that
+    /// resolves to N holds up to N canonicalized batches at once. Resolution is
+    /// plan-time-stable — it reads only the file groups, the pushed-down limit, and
+    /// this source's target partitions — so an accounting caller sees the same value
+    /// `create_file_opener` will use.
+    ///
+    /// [`Self::create_file_opener`] resolves through this method, so the accounting
+    /// and the scan cannot drift apart.
+    #[must_use]
+    pub fn resolved_scan_concurrency(&self, base_config: &FileScanConfig) -> usize {
+        resolve_scan_concurrency(
+            self.options.scan_concurrency,
+            self.effective_target_partitions(base_config),
+            planned_file_count(&base_config.file_groups),
+            base_config.limit.is_some() && self.vortex_predicate.is_none(),
+            cpu_budget::cpu_budget().scan_split_concurrency(),
+        )
+    }
+
+    /// Partition count the concurrency derivation divides across the planned files:
+    /// the count the physical optimizer pushed in through [`Self::repartitioned`],
+    /// falling back to the planned group count when the scan was never repartitioned.
+    fn effective_target_partitions(&self, base_config: &FileScanConfig) -> usize {
+        self.target_partitions
+            .unwrap_or_else(|| base_config.file_groups.len().max(1))
+    }
+}
+
+impl FileSource for VortexSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn FileOpener>> {
+        let batch_size = self
+            .batch_size
+            .ok_or_else(|| exec_datafusion_err!("batch_size must be supplied to VortexSource"))?;
+
+        let expr_adapter_factory = base_config
+            .expr_adapter_factory
+            .as_ref()
+            .map_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory), Arc::clone);
+
+        let vortex_reader_factory = self.vortex_reader_factory.as_ref().map_or_else(
+            || Arc::new(DefaultVortexReaderFactory::new(object_store)),
+            Arc::clone,
+        );
+
+        let planned_file_count = planned_file_count(&base_config.file_groups);
+        let target_partitions = self.effective_target_partitions(base_config);
+        let scan_concurrency = self.resolved_scan_concurrency(base_config);
+
+        tracing::debug!(
+            scan_concurrency,
+            mode = %self.options.scan_concurrency,
+            target_partitions,
+            planned_partitions = base_config.file_groups.len(),
+            planned_file_count,
+            limit = ?base_config.limit,
+            has_filter = self.vortex_predicate.is_some(),
+            "Resolved Vortex scan concurrency"
+        );
+
+        let opener = VortexOpener {
+            partition,
+            session: self.session.clone(),
+            vortex_reader_factory,
+            projection: self.projection.clone(),
+            filter: self.vortex_predicate.as_ref().map(Arc::clone),
+            file_pruning_predicate: self.full_predicate.as_ref().map(Arc::clone),
+            expr_adapter_factory,
+            table_schema: self.table_schema.clone(),
+            batch_size,
+            limit: base_config.limit.map(|l| l as u64),
+            metrics_registry: Arc::clone(&self.vx_metrics_registry),
+            layout_readers: Arc::clone(&self.layout_readers),
+            natural_split_ranges: Arc::clone(&self.natural_split_ranges),
+            has_output_ordering: !base_config.output_ordering.is_empty(),
+            expression_convertor: Arc::clone(&self.expression_convertor),
+            file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
+            segment_cache: self.segment_cache.as_ref().map(Arc::clone),
+            object_store_url: Arc::from(base_config.object_store_url.as_str()),
+            projection_pushdown: self.options.projection_pushdown.enabled(),
+            scan_concurrency: Some(scan_concurrency),
+        };
+
+        Ok(Arc::new(opener))
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        let mut source = self.clone();
+        source.batch_size = Some(batch_size);
+        Arc::new(source)
+    }
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.vortex_predicate.as_ref().map(Arc::clone)
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        &self.df_metrics
+    }
+
+    fn file_type(&self) -> &str {
+        VORTEX_FILE_EXTENSION
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                if let Some(ref predicate) = self.vortex_predicate {
+                    write!(f, ", predicate: {predicate}")?;
+                }
+            }
+            // Use TreeRender style key=value formatting to display the predicate
+            DisplayFormatType::TreeRender => {
+                if let Some(ref predicate) = self.vortex_predicate {
+                    writeln!(f, "predicate={}", fmt_sql(predicate.as_ref()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.allow_repartitioning
+    }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+        config: &FileScanConfig,
+    ) -> DFResult<Option<FileScanConfig>> {
+        let target_partitions = target_partitions.max(1);
+        let mut source = self.clone();
+        source.target_partitions = Some(target_partitions);
+
+        let mut updated_config = config.clone();
+        updated_config.file_source = Arc::new(source);
+
+        if config.file_compression_type.is_compressed() || !self.supports_repartitioning() {
+            return Ok(Some(updated_config));
+        }
+
+        if let Some(repartitioned_file_groups) = FileGroupPartitioner::new()
+            .with_target_partitions(target_partitions)
+            .with_repartition_file_min_size(repartition_file_min_size)
+            .with_preserve_order_within_groups(output_ordering.is_some())
+            .repartition_file_groups(&config.file_groups)
+        {
+            updated_config.file_groups = repartitioned_file_groups;
+        }
+
+        Ok(Some(updated_config))
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        if filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![],
+            ));
+        }
+
+        let mut source = self.clone();
+        source.target_partitions = Some(config.execution.target_partitions.max(1));
+
+        // Every filter contributes to the file-pruning predicate used by `FilePruner`
+        // to eliminate whole files via statistics / partition values.
+        source.full_predicate = match source.full_predicate {
+            Some(predicate) => Some(conjunction(
+                std::iter::once(predicate).chain(filters.iter().map(Arc::clone)),
+            )),
+            None => Some(conjunction(filters.iter().map(Arc::clone))),
+        };
+
+        // A filter is row-evaluated inside the Vortex scan only if the convertor can
+        // translate it. Hash-join *dynamic* filters appear here as a `lit(true)`
+        // placeholder and are accepted; the per-conjunct decision of what actually
+        // enters the scan (cheap min/max bounds vs. the expensive `InList` membership)
+        // is deferred to file-open time in `VortexOpener`, once the dynamic filter has
+        // materialized into its real expression.
+        let row_eval: Vec<bool> = filters
+            .iter()
+            .map(|expr| {
+                self.expression_convertor
+                    .can_be_pushed_down(expr, self.table_schema.file_schema())
+            })
+            .collect();
+
+        if row_eval.iter().any(|&ok| ok) {
+            let supported = filters
+                .iter()
+                .zip(&row_eval)
+                .filter(|&(_, &ok)| ok)
+                .map(|(expr, _)| Arc::clone(expr));
+            let predicate = match source.vortex_predicate {
+                Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
+                None => conjunction(supported),
+            };
+            tracing::debug!(%predicate, "Saving predicate");
+            source.vortex_predicate = Some(predicate);
+        }
+
+        let pushdown_result = row_eval
+            .iter()
+            .map(|&ok| if ok { PushedDown::Yes } else { PushedDown::No })
+            .collect();
+
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_result)
+                .with_updated_node(Arc::new(source) as _),
+        )
+    }
+
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        let mut source = self.clone();
+        source.projection = self.projection.try_merge(projection)?;
+        Ok(Some(Arc::new(source)))
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        Some(&self.projection)
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        &self.table_schema
+    }
+}
+
+fn planned_file_count(file_groups: &[FileGroup]) -> usize {
+    file_groups.iter().map(FileGroup::len).sum::<usize>().max(1)
+}
+
+/// Resolves the splits one file scan decodes concurrently.
+///
+/// `max_auto_concurrency` bounds the DERIVED count only. The derivation spreads
+/// the query fan-out across the planned files, so a scan reaching few files
+/// concentrates all of it into one file — and the fan-out tracks the CPU
+/// entitlement only while `runtime.query.target_partitions` is unset. Clamping
+/// keeps a scan from running more concurrent decodes than the process has cores
+/// to run them on, each of which holds a decoded batch charged to the query pool.
+///
+/// `Explicit` is deliberately not clamped: an operator naming a count outranks a
+/// derived ceiling, as every other explicitly-set knob does.
+///
+/// Pure by design — the entitlement arrives as an argument rather than being read
+/// from the process global here, so the arithmetic stays unit-testable.
+fn resolve_scan_concurrency(
+    mode: ScanConcurrency,
+    target_partitions: usize,
+    planned_file_count: usize,
+    has_limit_without_filter: bool,
+    max_auto_concurrency: usize,
+) -> usize {
+    match mode {
+        ScanConcurrency::Auto if has_limit_without_filter => 1,
+        ScanConcurrency::Auto => target_partitions
+            .max(1)
+            .div_ceil(planned_file_count.max(1))
+            .min(max_auto_concurrency)
+            .max(1),
+        ScanConcurrency::Off => 1,
+        ScanConcurrency::Explicit(value) => value.max(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ceiling high enough not to bind, for the cases under test.
+    const UNCAPPED: usize = usize::MAX;
+
+    #[test]
+    fn auto_scan_concurrency_uses_file_count() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, false, UNCAPPED),
+            16
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 4, false, UNCAPPED),
+            4
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 32, false, UNCAPPED),
+            1
+        );
+    }
+
+    #[test]
+    fn auto_scan_concurrency_clamps_limit_without_filter_to_serial() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 16, 1, true, UNCAPPED),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_and_off_scan_concurrency_override_auto() {
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Explicit(3), 16, 1, true, UNCAPPED),
+            3
+        );
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Off, 16, 1, false, UNCAPPED),
+            1
+        );
+    }
+
+    /// The derived count must never exceed the CPU entitlement.
+    ///
+    /// `target_partitions` follows the entitlement only while
+    /// `runtime.query.target_partitions` is unset. Set above it, the derivation
+    /// would otherwise put that many decodes in flight inside ONE file scan —
+    /// more than the process can run in parallel, each holding a decoded batch
+    /// charged to the query memory pool.
+    #[test]
+    fn auto_scan_concurrency_never_exceeds_the_cpu_entitlement() {
+        // 64-way query fan-out over a single file, on an 8-core entitlement.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 1, false, 8),
+            8
+        );
+        // Already under the ceiling: the file count still governs.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 16, false, 8),
+            4
+        );
+        // An operator naming a count outranks the ceiling.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Explicit(32), 64, 1, false, 8),
+            32
+        );
+        // A degenerate ceiling must still leave a usable scan.
+        assert_eq!(
+            resolve_scan_concurrency(ScanConcurrency::Auto, 64, 1, false, 0),
+            1
+        );
+    }
+}

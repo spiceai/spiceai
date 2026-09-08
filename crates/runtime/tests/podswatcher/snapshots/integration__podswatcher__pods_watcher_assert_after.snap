@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/podswatcher/mod.rs
+expression: pretty_after
+---
++---------------+--------------+--------------+------------+
+| table_catalog | table_schema | table_name   | table_type |
++---------------+--------------+--------------+------------+
+| spice         | public       | taxi_trips_1 | BASE TABLE |
+| spice         | public       | taxi_trips_2 | BASE TABLE |
++---------------+--------------+--------------+------------+

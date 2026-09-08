@@ -1,0 +1,61 @@
+[package]
+description = "Components for a search system "
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "search"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-json.workspace = true
+arrow-schema.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+chunking = { path = "../chunking" }
+data_components = { path = "../data_components", optional = true }
+datafusion.workspace = true
+datafusion-expr.workspace = true
+datafusion-functions-json = { workspace = true }
+datafusion-table-providers = { workspace = true, optional = true }
+duckdb = { workspace = true, optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
+datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
+futures.workspace = true
+itertools.workspace = true
+llms = { path = "../llms", default-features = false, optional = true }
+parking_lot.workspace = true
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs", optional = true }
+runtime-query-engine = { path = "../runtime-query-engine" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+s3_vectors = { path = "../s3_vectors", optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+snafu.workspace = true
+spice-table = { path = "../spice-table" }
+tantivy = { workspace = true, optional = true }
+tantivy_datafusion_filter = { path = "../tantivy_datafusion_filter", optional = true }
+tokio.workspace = true
+tracing.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+
+[features]
+default = ["text_search", "s3_vectors"]
+duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
+elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
+llms = ["dep:llms", "dep:runtime-datafusion-udfs"]
+s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
+text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
+
+[dev-dependencies]
+insta = { workspace = true, features = ["json"] }
+tempfile.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

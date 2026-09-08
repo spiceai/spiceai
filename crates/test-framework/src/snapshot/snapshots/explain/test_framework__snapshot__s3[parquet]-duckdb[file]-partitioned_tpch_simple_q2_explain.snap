@@ -1,0 +1,68 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: tpch_simple_q2"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                   |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: lineitem.l_linenumber                                                                                                                                      |
+|               |   Inner Join: lineitem.l_linenumber = __scalar_sq_1.max(lineitem.l_linenumber)                                                                                         |
+|               |     TableScan: lineitem projection=[l_linenumber], full_filters=[Boolean(true)]                                                                                        |
+|               |     SubqueryAlias: __scalar_sq_1                                                                                                                                       |
+|               |       Aggregate: groupBy=[[]], aggr=[[max(lineitem.l_linenumber)]]                                                                                                     |
+|               |         TableScan: lineitem projection=[l_linenumber]                                                                                                                  |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                                                            |
+|               |   HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(max(lineitem.l_linenumber)@0, l_linenumber@0)], projection=[l_linenumber@1] |
+|               |     AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                                                                                               |
+|               |       CoalescePartitionsExec                                                                                                                                           |
+|               |         AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                                                         |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=7                                                                                        |
+|               |             SchemaCastScanExec                                                                                                                                         |
+|               |               PartitionedUnionExec                                                                                                                                     |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1992/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1993/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1994/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1995/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1996/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1997/lineitem"                                                                             |
+|               |                 CooperativeExec                                                                                                                                        |
+|               |                   BytesProcessedExec                                                                                                                                   |
+|               |                     DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1998/lineitem"                                                                             |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=7                                                                                              |
+|               |       SchemaCastScanExec                                                                                                                                               |
+|               |         PartitionedUnionExec                                                                                                                                           |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1992/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1993/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1994/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1995/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1996/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1997/lineitem" WHERE true                                                                        |
+|               |           CooperativeExec                                                                                                                                              |
+|               |             BytesProcessedExec                                                                                                                                         |
+|               |               DuckSqlExec sql= SELECT "l_linenumber" FROM "expression=1998/lineitem" WHERE true                                                                        |
+|               |                                                                                                                                                                        |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -1,0 +1,42 @@
+version: v1
+kind: Spicepod
+name: append-refresh-with-pk-and-indexes
+
+runtime:
+  task_history:
+    enabled: true
+    captured_output: truncated
+  caching:
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
+    name: data_upsert
+    time_column: DateUpdated
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: &default_refresh_check_interval 1s
+      primary_key: Id
+      indexes:
+        Id: enabled
+      on_conflict:
+        Id: upsert
+
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
+    name: data_drop
+    time_column: DateUpdated
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: Id
+      indexes:
+        Id: enabled
+      on_conflict:
+        Id: drop

@@ -1,0 +1,18 @@
+tests:
+  bench:
+    spicepod_path: federated/adbc[bigquery].yaml
+    query_set: tpch
+    query_overrides: bigquery
+    runner_type: spiceai-dev-runners
+    validate_results: true
+  throughput:
+    spicepod_path: federated/adbc[bigquery].yaml
+    query_set: tpch
+    query_overrides: bigquery
+    runner_type: spiceai-dev-runners
+  load:
+    spicepod_path: federated/adbc[bigquery].yaml
+    query_set: tpch
+    query_overrides: bigquery
+    runner_type: spiceai-dev-runners
+    duration: 28800

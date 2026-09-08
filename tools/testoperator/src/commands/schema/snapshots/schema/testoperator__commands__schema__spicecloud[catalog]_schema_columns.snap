@@ -1,0 +1,80 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema columns for spicecloud[catalog]"
+---
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+
+| table_catalog | table_schema | table_name   | column_name           | ordinal_position | data_type                                                                                 | is_nullable |
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+
+| spice         | runtime      | task_history | trace_id              | 0                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | span_id               | 1                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | parent_span_id        | 2                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | task                  | 3                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | input                 | 4                | Utf8                                                                                      | NO          |
+| spice         | runtime      | task_history | captured_output       | 5                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | start_time            | 6                | Timestamp(ns, "UTC")                                                                      | NO          |
+| spice         | runtime      | task_history | end_time              | 7                | Timestamp(ns, "UTC")                                                                      | NO          |
+| spice         | runtime      | task_history | execution_duration_ms | 8                | Float64                                                                                   | NO          |
+| spice         | runtime      | task_history | error_message         | 9                | Utf8                                                                                      | YES         |
+| spice         | runtime      | task_history | labels                | 10               | Map("entries": non-null Struct("keys": non-null Utf8, "values": non-null Utf8), unsorted) | NO          |
+| tpch          | tpch         | customer     | c_custkey             | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | customer     | c_name                | 1                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | customer     | c_address             | 2                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | customer     | c_nationkey           | 3                | Int32                                                                                     | YES         |
+| tpch          | tpch         | customer     | c_phone               | 4                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | customer     | c_acctbal             | 5                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | customer     | c_mktsegment          | 6                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | customer     | c_comment             | 7                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | lineitem     | l_orderkey            | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | lineitem     | l_partkey             | 1                | Int32                                                                                     | YES         |
+| tpch          | tpch         | lineitem     | l_suppkey             | 2                | Int32                                                                                     | YES         |
+| tpch          | tpch         | lineitem     | l_linenumber          | 3                | Int32                                                                                     | YES         |
+| tpch          | tpch         | lineitem     | l_quantity            | 4                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | lineitem     | l_extendedprice       | 5                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | lineitem     | l_discount            | 6                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | lineitem     | l_tax                 | 7                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | lineitem     | l_returnflag          | 8                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | lineitem     | l_linestatus          | 9                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | lineitem     | l_shipdate            | 10               | Date32                                                                                    | YES         |
+| tpch          | tpch         | lineitem     | l_commitdate          | 11               | Date32                                                                                    | YES         |
+| tpch          | tpch         | lineitem     | l_receiptdate         | 12               | Date32                                                                                    | YES         |
+| tpch          | tpch         | lineitem     | l_shipinstruct        | 13               | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | lineitem     | l_shipmode            | 14               | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | lineitem     | l_comment             | 15               | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | nation       | n_nationkey           | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | nation       | n_name                | 1                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | nation       | n_regionkey           | 2                | Int32                                                                                     | YES         |
+| tpch          | tpch         | nation       | n_comment             | 3                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | orders       | o_orderkey            | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | orders       | o_custkey             | 1                | Int32                                                                                     | YES         |
+| tpch          | tpch         | orders       | o_orderstatus         | 2                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | orders       | o_totalprice          | 3                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | orders       | o_orderdate           | 4                | Date32                                                                                    | YES         |
+| tpch          | tpch         | orders       | o_orderpriority       | 5                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | orders       | o_clerk               | 6                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | orders       | o_shippriority        | 7                | Int32                                                                                     | YES         |
+| tpch          | tpch         | orders       | o_comment             | 8                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_partkey             | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | part         | p_name                | 1                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_mfgr                | 2                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_brand               | 3                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_type                | 4                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_size                | 5                | Int32                                                                                     | YES         |
+| tpch          | tpch         | part         | p_container           | 6                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | part         | p_retailprice         | 7                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | part         | p_comment             | 8                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | partsupp     | ps_partkey            | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | partsupp     | ps_suppkey            | 1                | Int32                                                                                     | YES         |
+| tpch          | tpch         | partsupp     | ps_availqty           | 2                | Int32                                                                                     | YES         |
+| tpch          | tpch         | partsupp     | ps_supplycost         | 3                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | partsupp     | ps_comment            | 4                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | region       | r_regionkey           | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | region       | r_name                | 1                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | region       | r_comment             | 2                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | supplier     | s_suppkey             | 0                | Int32                                                                                     | YES         |
+| tpch          | tpch         | supplier     | s_name                | 1                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | supplier     | s_address             | 2                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | supplier     | s_nationkey           | 3                | Int32                                                                                     | YES         |
+| tpch          | tpch         | supplier     | s_phone               | 4                | LargeUtf8                                                                                 | YES         |
+| tpch          | tpch         | supplier     | s_acctbal             | 5                | Decimal128(15, 2)                                                                         | YES         |
+| tpch          | tpch         | supplier     | s_comment             | 6                | LargeUtf8                                                                                 | YES         |
++---------------+--------------+--------------+-----------------------+------------------+-------------------------------------------------------------------------------------------+-------------+

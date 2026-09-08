@@ -1,0 +1,23 @@
+version: v1
+kind: Spicepod
+name: full-refresh-with-indexes
+
+runtime:
+  task_history:
+    enabled: true
+    captured_output: truncated
+  caching:
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: duckdb:read_parquet('.spice/service_data.parquet')
+    name: data
+    acceleration:
+      enabled: true
+      engine: turso
+      mode: file
+      refresh_mode: full
+      refresh_check_interval: &default_refresh_check_interval 1s
+      indexes:
+        Id: enabled

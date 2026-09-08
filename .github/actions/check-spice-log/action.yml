@@ -1,0 +1,56 @@
+name: 'Check spice.log'
+description: 'Stops the Spice runtime and fails the job if spice.log contains an unexpected failure or error'
+inputs:
+  working-directory:
+    description: 'Directory containing spice.log'
+    required: true
+  allow:
+    description: |
+      Newline-separated extended regular expressions for known-transient log lines
+      to tolerate. Each is matched against an ANSI-stripped line, so a pattern may
+      be written in plain text (`WARN +runtime::...`). Empty by default: a job
+      tolerates nothing it has not named.
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    # Stops the `spiced` child as well as the `spice` CLI. `killall spice` here
+    # used to leave the runtime holding :8090 for the next job on the same
+    # self-hosted runner (#12058).
+    - name: Stop spice
+      uses: ./.github/actions/stop-spice
+      with:
+        working-directory: ${{ inputs.working-directory }}
+        print-log: 'false'
+
+    - name: Check logs
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ALLOW: ${{ inputs.allow }}
+      run: |
+        cat spice.log
+
+        # `spiced` logs with_ansi(true), so an allow pattern such as
+        # `WARN +runtime::...` never matches the raw `WARN\e[0m \e[2mruntime::...`.
+        # Strip the escapes before matching so the allow patterns see plain text
+        # (see run 29659183104, where an allowed transient failed the job anyway).
+        # This can go once spiced stops colorizing a non-terminal sink (#12327).
+        suspect=$(sed $'s/\x1b\\[[0-9;]*m//g' spice.log | grep -iE "(failed|error)" || true)
+
+        # One `grep -v` per pattern rather than one joined alternation: a joined
+        # pattern would need blank lines filtered out first, and an empty pattern
+        # matches every line, which silently turns the check into a no-op.
+        # `--` so a pattern that starts with `-` is read as a regex, not a flag.
+        while IFS= read -r pattern; do
+          if [[ -n "$pattern" ]]; then
+            suspect=$(printf '%s\n' "$suspect" | grep -vE -- "$pattern" || true)
+          fi
+        done <<< "$ALLOW"
+
+        if [[ -n "$suspect" ]]; then
+          echo "Failures detected in spice.log"
+          printf '%s\n' "$suspect"
+          exit 1
+        fi

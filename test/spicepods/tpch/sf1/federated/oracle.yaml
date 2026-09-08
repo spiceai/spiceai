@@ -1,0 +1,32 @@
+version: v1
+kind: Spicepod
+name: oracle-federated
+datasets:
+  - from: oracle:"TPCH_SF1"."CUSTOMER"
+    name: customer
+    params: &params
+      oracle_username: ${secrets:ORACLE_CLOUD_USERNAME}
+      oracle_password: ${secrets:ORACLE_CLOUD_PASSWORD}
+      oracle_connection_string: ${secrets:ORACLE_CLOUD_CONNECTION_STRING}
+      oracle_wallet_sso_cert: ${secrets:ORACLE_CLOUD_WALLET_SSO_CERT}
+  - from: oracle:"TPCH_SF1"."LINEITEM"
+    name: lineitem
+    params: *params
+  - from: oracle:"TPCH_SF1"."NATION"
+    name: nation
+    params: *params
+  - from: oracle:"TPCH_SF1"."ORDERS"
+    name: orders
+    params: *params
+  - from: oracle:"TPCH_SF1"."PART"
+    name: part
+    params: *params
+  - from: oracle:"TPCH_SF1"."PARTSUPP"
+    name: partsupp
+    params: *params
+  - from: oracle:"TPCH_SF1"."REGION"
+    name: region
+    params: *params
+  - from: oracle:"TPCH_SF1"."SUPPLIER"
+    name: supplier
+    params: *params

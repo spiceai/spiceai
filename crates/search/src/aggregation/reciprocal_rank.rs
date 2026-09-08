@@ -1,0 +1,858 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+     https://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::sync::Arc;
+
+use crate::aggregation::from_single_input;
+use crate::{
+    SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
+    collect_batches,
+};
+
+use super::{AggregationResult, CandidateAggregation, DatafusionSnafu};
+use super::{Error, Result};
+
+use arrow::datatypes::{DataType, SchemaRef};
+use async_trait::async_trait;
+use datafusion::common::Column;
+use datafusion::datasource::MemTable;
+use datafusion::functions_window::expr_fn::row_number;
+use datafusion::logical_expr::{
+    Expr as LogicalExpr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder,
+};
+use datafusion::logical_expr::{JoinType, Operator, binary_expr, col, lit};
+use datafusion::prelude::{SessionContext, coalesce};
+use datafusion::sql::TableReference;
+use snafu::ResultExt;
+
+/// Reciprocal Rank Fusion (RRF) is a method for combining multiple ranked sets of search results.
+/// The underlying score of the search results is not important, only the rank (per stream order).
+/// The rank, for a given entry (for some primary key `a`) is converted to a score using the formula:
+/// ```text
+/// score_a = 1 / (rank_i + k) + 1 / (rank_j + k) + ...
+/// ```
+/// Where `rank_i` is the rank of the i-th stream, and `k` is a smoothing constant (e.g. 60).
+pub struct ReciprocalRankFusion;
+
+/// Default RRF smoothing parameter used across Spice hybrid search.
+pub const DEFAULT_RRF_K: f64 = 60.0;
+
+/// Multiplier for the number of candidates each RRF input must contribute.
+///
+/// RRF ranks and fuses this wider pool before applying the user-visible result
+/// limit. Keeping the pool wider than the final response preserves documents
+/// whose combined ranks make them relevant even when no individual leg ranks
+/// them in the final result set.
+pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
+
+/// Returns the number of candidates each RRF input should contribute for a
+/// user-visible result limit.
+///
+/// The multiplication saturates so an unrepresentable pool size still yields
+/// a valid limit rather than wrapping and silently truncating candidates.
+#[must_use]
+pub fn rrf_candidate_pool_size(limit: usize) -> usize {
+    limit.saturating_mul(RRF_CANDIDATE_POOL_FACTOR)
+}
+
+const USIZE_TO_F64_CHUNK_BITS: usize = 16;
+const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
+const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
+
+#[must_use]
+pub fn reciprocal_rank_score(rank: usize, k: f64) -> f64 {
+    1.0 / (usize_to_f64(rank) + k)
+}
+
+#[must_use]
+pub fn usize_to_f64(value: usize) -> f64 {
+    let mut remaining = value;
+    let mut multiplier = 1.0;
+    let mut converted = 0.0;
+
+    while remaining > 0 {
+        let chunk_bytes = (remaining & USIZE_TO_F64_CHUNK_MASK).to_le_bytes();
+        let chunk = u16::from_le_bytes([chunk_bytes[0], chunk_bytes[1]]);
+        converted += f64::from(chunk) * multiplier;
+        remaining >>= USIZE_TO_F64_CHUNK_BITS;
+        multiplier *= USIZE_TO_F64_CHUNK_BASE;
+    }
+
+    converted
+}
+
+#[must_use]
+pub fn reciprocal_rank_fusion_scores<K, L, I>(ranked_lists: I, k: f64) -> HashMap<K, f64>
+where
+    K: Eq + Hash,
+    L: IntoIterator<Item = K>,
+    I: IntoIterator<Item = L>,
+{
+    let mut scores = HashMap::new();
+    for ranked_list in ranked_lists {
+        for (rank_index, key) in ranked_list.into_iter().enumerate() {
+            scores
+                .entry(key)
+                .and_modify(|score| *score += reciprocal_rank_score(rank_index + 1, k))
+                .or_insert_with(|| reciprocal_rank_score(rank_index + 1, k));
+        }
+    }
+    scores
+}
+
+#[async_trait]
+impl CandidateAggregation for ReciprocalRankFusion {
+    fn candidate_pool_size(&self, limit: usize) -> usize {
+        rrf_candidate_pool_size(limit)
+    }
+
+    async fn aggregate(
+        &self,
+        mut data: Vec<VectorSearchGenerationResult>,
+        primary_key: Vec<Column>,
+        limit: usize,
+    ) -> Result<AggregationResult> {
+        let num_inputs = data.len();
+        // Handle 0, or 1 candidates.
+        if num_inputs <= 1 {
+            return data
+                .pop()
+                .map(|d| from_single_input(d, primary_key))
+                .ok_or(Error::NoCandidatesGenerated);
+        }
+
+        if primary_key.is_empty() {
+            return Err(Error::NoPrimaryKey);
+        }
+
+        let schemas = data.iter().map(|d| d.data.schema()).collect::<Vec<_>>();
+        let () = verify_schema_compatibility(schemas.as_slice())?;
+
+        let ctx = SessionContext::new();
+        let mut table_names: Vec<TableReference> = Vec::with_capacity(num_inputs);
+
+        // Find all additional columns in the schema that are not part of the primary key or the expected
+        // search columns.
+        let mut additional_columns = HashSet::new();
+        let mut matches: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Inefficient, but collect each stream, convert to [`MemTable`].
+        let mut i = 0;
+        for VectorSearchGenerationResult {
+            data: stream,
+            derived_from,
+        } in data
+        {
+            let schema = stream.schema();
+            additional_columns.extend(additional_columns_of_schema(
+                &schema,
+                primary_key.as_slice(),
+            ));
+
+            let mut data = collect_batches(stream).await.context(DatafusionSnafu)?;
+            data.retain(|batch| batch.num_rows() > 0);
+
+            // If data is empty, don't use.
+            if data.is_empty() {
+                continue;
+            }
+
+            // Since we know what the `SEARCH_VALUE_COLUMN_NAME` column for the i'th column will be in the final schema,
+            // we can add it to the `matches` map now.
+            matches
+                .get_mut(derived_from.as_str())
+                .map(|v| v.push(ith_search_value_column(i)))
+                .unwrap_or_else(|| {
+                    matches.insert(derived_from.clone(), vec![ith_search_value_column(i)]);
+                });
+
+            let table_name = TableReference::bare(format!("search_candidates_{i}"));
+            table_names.push(table_name.clone());
+            let table = MemTable::try_new(schema, vec![data]).context(DatafusionSnafu)?;
+            let _ = ctx
+                .register_table(table_name, Arc::new(table))
+                .context(DatafusionSnafu)?;
+
+            i += 1;
+        }
+
+        let primary_key_str: Vec<String> = primary_key
+            .iter()
+            .map(datafusion::prelude::Column::flat_name)
+            .collect();
+
+        // Now that we've filtered empty generation data, again check for <=1 inputs.
+        if table_names.len() <= 1 {
+            let tbl = table_names.pop().ok_or(Error::NoCandidatesGenerated)?;
+            let match_keys: Vec<_> = matches.keys().cloned().collect();
+
+            return result_from_table(
+                &ctx,
+                &tbl,
+                match_keys.first().ok_or(Error::NoCandidatesGenerated)?,
+                primary_key_str.as_slice(),
+            )
+            .await;
+        }
+
+        let additional_columns = additional_columns.into_iter().collect::<Vec<_>>();
+
+        let plan = reciprocal_rank_fusion_plan(
+            &ctx,
+            table_names.as_slice(),
+            primary_key.as_slice(),
+            additional_columns.as_slice(),
+            DEFAULT_RRF_K,
+            limit,
+        )
+        .await
+        .context(DatafusionSnafu)?;
+
+        tracing::debug!("Running RRF logical plan: {plan:?}");
+        let data = ctx
+            .execute_logical_plan(plan)
+            .await
+            .context(DatafusionSnafu)?
+            .execute_stream()
+            .await
+            .context(DatafusionSnafu)?;
+
+        Ok(AggregationResult {
+            data,
+            primary_key: primary_key_str,
+            data_columns: additional_columns
+                .iter()
+                .map(datafusion::prelude::Column::flat_name)
+                .collect(),
+            matches,
+        })
+    }
+}
+
+// Construct a [`AggregationResult`] from a single table in a [`SessionContext`].
+async fn result_from_table(
+    ctx: &SessionContext,
+    tbl: &TableReference,
+    match_field: &str,
+    primary_key: &[String],
+) -> Result<AggregationResult> {
+    let df = ctx.table(tbl.clone()).await.context(DatafusionSnafu)?;
+    let data_columns = df
+        .schema()
+        .columns()
+        .iter()
+        .filter_map(|c| {
+            let name = c.name().to_string();
+            if primary_key.contains(&name) {
+                return None;
+            }
+            if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str()) {
+                return None;
+            }
+            Some(name)
+        })
+        .collect();
+    let data = df.execute_stream().await.context(DatafusionSnafu)?;
+
+    Ok(AggregationResult {
+        data,
+        primary_key: primary_key.to_vec(),
+        data_columns,
+        matches: [(
+            match_field.to_string(),
+            vec![SEARCH_VALUE_COLUMN_NAME.to_string()],
+        )]
+        .into(),
+    })
+}
+
+/// Returns a list of additional columns in the schema that are not part of the primary key or the expected
+/// search columns (i.e. score or underlying value).
+fn additional_columns_of_schema(schema: &SchemaRef, primary_key: &[Column]) -> Vec<Column> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            let name = f.name();
+            let col = Column::from_name(f.name());
+            if [SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME].contains(&name.as_str())
+                || primary_key.contains(&col)
+            {
+                return None;
+            }
+            Some(col)
+        })
+        .collect()
+}
+
+/// Verifies that all streams have the same schema and contain the required columns: [`SEARCH_VALUE_COLUMN_NAME`], [`SEARCH_SCORE_COLUMN_NAME`].
+fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
+    let Some(schema) = schemas.iter().find(|s| !s.fields.is_empty()) else {
+        return Ok(());
+    };
+
+    for s in schemas {
+        if s.fields().is_empty() {
+            // Empty schema -> empty data
+            continue;
+        }
+        if s.column_with_name(SEARCH_VALUE_COLUMN_NAME).is_none() {
+            return Err(Error::CandidateMissingRequiredColumn {
+                col: SEARCH_VALUE_COLUMN_NAME.to_string(),
+            });
+        }
+
+        if s.column_with_name(SEARCH_SCORE_COLUMN_NAME).is_none() {
+            return Err(Error::CandidateMissingRequiredColumn {
+                col: SEARCH_SCORE_COLUMN_NAME.to_string(),
+            });
+        }
+
+        // Check that the schema is the same across all streams (i.e. all same as the first).
+        // Ensure ALL columns are in the first schema with matching types.
+        // Note: We don't check nullability because different search sources may have different
+        // nullability for the same logical column (e.g., vector search vs full-text search).
+        // DataFusion can handle the union/join with different nullability.
+        // We use semantic type equality (e.g., Utf8 and LargeUtf8 are compatible) because
+        // different search sources may produce different string representations (e.g., chunked
+        // text produces LargeUtf8 while non-chunked produces Utf8).
+        let correct_columns = s.fields().iter().all(|f| {
+            let Some((_, f2)) = schema.column_with_name(f.name()) else {
+                return false;
+            };
+            are_types_compatible(f2.data_type(), f.data_type())
+        });
+        if schema.fields().len() != s.fields().len() || !correct_columns {
+            return Err(Error::InconsistentColumns {
+                s1: Arc::clone(schema),
+                s2: Arc::clone(s),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn ith_search_value_column(i: usize) -> String {
+    format!("{SEARCH_VALUE_COLUMN_NAME}_{i}")
+}
+
+/// Checks if two data types are compatible for schema aggregation purposes.
+///
+/// String types (`Utf8`, `LargeUtf8`, `Utf8View`) are considered compatible because
+/// different search sources may produce different string representations:
+/// - Non-chunked columns typically produce `Utf8`
+/// - Chunked columns (via substring operations) may produce `LargeUtf8`
+/// - View-based outputs may produce `Utf8View`
+///
+/// DataFusion can handle these differences during JOIN/COALESCE operations via implicit casting.
+fn are_types_compatible(t1: &DataType, t2: &DataType) -> bool {
+    if t1 == t2 {
+        return true;
+    }
+
+    // Treat all string types as compatible
+    let is_string_type =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+
+    if is_string_type(t1) && is_string_type(t2) {
+        return true;
+    }
+
+    false
+}
+
+/// Generates the LogicalPlan for the RRF aggregation using LogicalPlanBuilder API.
+///
+/// This function takes already-registered table names from a SessionContext and builds
+/// a logical plan that performs reciprocal rank fusion across them.
+async fn reciprocal_rank_fusion_plan(
+    ctx: &SessionContext,
+    tables: &[TableReference],
+    primary_key: &[Column],
+    additional_columns: &[Column],
+    k: f64,
+    limit: usize,
+) -> datafusion::error::Result<LogicalPlan> {
+    // 1) Build CTEs that add explicit rank per table, ranking by SEARCH_SCORE_COLUMN_NAME
+    //    Equivalent to: SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS rank FROM table
+    let mut ranked_plans: Vec<(TableReference, LogicalPlan)> = Vec::with_capacity(tables.len());
+
+    for table_name in tables {
+        // Get the table from the context
+        let table = ctx.table(table_name.clone()).await?;
+        let table_provider = table.into_unoptimized_plan();
+
+        // Build: SELECT *, ROW_NUMBER() OVER (ORDER BY score DESC) AS rank FROM table
+        let window_expr = row_number()
+            .order_by(vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])
+            .build()?
+            .alias("rank");
+
+        let ranked = LogicalPlanBuilder::from(table_provider)
+            .window(vec![window_expr])?
+            .alias(table_name.clone())?
+            .build()?;
+
+        ranked_plans.push((table_name.clone(), ranked));
+    }
+
+    // 2) Start with the first table
+    let (first_table_name, first_plan) = ranked_plans.first().ok_or_else(|| {
+        datafusion::error::DataFusionError::Plan("No tables provided for RRF".to_string())
+    })?;
+
+    let mut builder = LogicalPlanBuilder::from(first_plan.clone());
+    let mut joined_table_names = vec![first_table_name.clone()];
+
+    // 3) FULL OUTER JOIN remaining tables on primary key columns
+    for (table_name, plan) in ranked_plans.iter().skip(1) {
+        let on_exprs = primary_key.iter().map(|pk| {
+            let mut left_key_parts = joined_table_names
+                .iter()
+                .map(|joined_table| col(pk.clone().with_relation(joined_table.clone())))
+                .collect::<Vec<_>>();
+            let left_key = if left_key_parts.len() == 1 {
+                left_key_parts.swap_remove(0)
+            } else {
+                coalesce(left_key_parts)
+            };
+
+            left_key.eq(col(pk.clone().with_relation(table_name.clone())))
+        });
+
+        builder = builder.join_on(plan.clone(), JoinType::Full, on_exprs)?;
+        joined_table_names.push(table_name.clone());
+    }
+
+    // 4) Build the RRF score: SUM(COALESCE(1.0/(rank + k), 0)) across all tables
+    let rrf_score = ranked_plans
+        .iter()
+        .map(|(table_name, _)| {
+            let rank_col = col(Column::new(Some(table_name.clone()), "rank"));
+            let k_lit = lit(k);
+            let score = binary_expr(
+                lit(1.0),
+                Operator::Divide,
+                binary_expr(rank_col, Operator::Plus, k_lit),
+            );
+            coalesce(vec![score, lit(0.0)])
+        })
+        .reduce(|acc, expr| binary_expr(acc, Operator::Plus, expr))
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Plan("No tables to compute RRF score".to_string())
+        })?;
+
+    let rrf_score_final = rrf_score.alias(SEARCH_SCORE_COLUMN_NAME);
+
+    // 5) Build value columns: one per input table
+    let value_cols: Vec<LogicalExpr> = ranked_plans
+        .iter()
+        .enumerate()
+        .map(|(i, (table_name, _))| {
+            col(Column::new(
+                Some(table_name.clone()),
+                SEARCH_VALUE_COLUMN_NAME,
+            ))
+            .alias(ith_search_value_column(i))
+        })
+        .collect();
+
+    // 6) Coalesce primary key and additional columns across all tables
+    let coalesced_cols: Vec<LogicalExpr> = [primary_key, additional_columns]
+        .concat()
+        .iter()
+        .map(|col_name| {
+            let col_refs: Vec<LogicalExpr> = ranked_plans
+                .iter()
+                .map(|(table_name, _)| col(col_name.clone().with_relation(table_name.clone())))
+                .collect();
+            coalesce(col_refs).alias(col_name.to_string())
+        })
+        .collect();
+
+    // 7) Project: score, value columns, coalesced columns
+    let projection: Vec<LogicalExpr> = [vec![rrf_score_final], value_cols, coalesced_cols].concat();
+
+    builder = builder.project(projection)?;
+
+    // 8) Sort by score descending, then by primary key ascending for deterministic ordering on ties
+    let mut sort_exprs = vec![col(SEARCH_SCORE_COLUMN_NAME).sort(false, false)];
+    sort_exprs.extend(
+        primary_key
+            .iter()
+            .map(|pk| col(pk.clone()).sort(true, true)),
+    );
+    builder = builder.sort(sort_exprs)?.limit(0, Some(limit))?;
+
+    builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    use super::*;
+
+    // Note: The old SQL snapshot tests have been removed as we now use LogicalPlanBuilder.
+    // The logical plan is tested through integration tests and runtime behavior verification.
+    // If snapshot testing is needed, consider using LogicalPlan's display_indent() or explain methods.
+
+    #[test]
+    fn reciprocal_rank_fusion_scores_combines_ranked_lists() {
+        let scores = reciprocal_rank_fusion_scores(
+            vec![vec!["sql", "search"], vec!["search", "table_schema"]],
+            DEFAULT_RRF_K,
+        );
+
+        let search_score = scores
+            .get("search")
+            .expect("search should be present in fused scores");
+        let sql_score = scores
+            .get("sql")
+            .expect("sql should be present in fused scores");
+        let table_schema_score = scores
+            .get("table_schema")
+            .expect("table_schema should be present in fused scores");
+
+        assert!(search_score > sql_score);
+        assert!(sql_score > table_schema_score);
+    }
+
+    /// Regression test for #12242: both HTTP and SQL RRF use this policy to
+    /// fetch candidates before applying the final fused-result limit.
+    #[test]
+    fn rrf_candidate_pool_is_wider_than_final_result_limit() {
+        assert_eq!(rrf_candidate_pool_size(10), 40);
+        assert_eq!(rrf_candidate_pool_size(usize::MAX), usize::MAX);
+        assert_eq!(ReciprocalRankFusion.candidate_pool_size(10), 40);
+    }
+
+    #[test]
+    fn reciprocal_rank_score_decreases_past_u32_max_rank() {
+        let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit in usize");
+        let larger_rank = u32_max_rank
+            .checked_add(1)
+            .expect("test requires usize wider than u32");
+
+        assert!(
+            reciprocal_rank_score(larger_rank, DEFAULT_RRF_K)
+                < reciprocal_rank_score(u32_max_rank, DEFAULT_RRF_K)
+        );
+    }
+
+    #[test]
+    fn test_additional_columns_of_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Int8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("additional", DataType::Int8, false),
+        ]));
+        let primary_keys = vec![Column::from_name("pk")];
+        assert_eq!(
+            additional_columns_of_schema(&schema, primary_keys.as_slice()),
+            vec![Column::from_name("additional")]
+        );
+    }
+
+    /// Regression test for #10631: mixed-case column names (e.g. `LocationID`) must
+    /// retain their original casing through `additional_columns_of_schema`. Using
+    /// `Column::from_qualified_name` here would lowercase the identifier and cause
+    /// downstream plan resolution to fail with `No field named locationid` against
+    /// a schema that registered the field as `"LocationID"`.
+    #[test]
+    fn test_additional_columns_of_schema_preserves_mixed_case() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Int8, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Int8, false),
+            Field::new("LocationID", DataType::Utf8, false),
+            Field::new("Borough", DataType::Utf8, false),
+            Field::new("service_zone", DataType::Utf8, false),
+        ]));
+        let primary_keys = vec![Column::from_name("LocationID")];
+        let additional = additional_columns_of_schema(&schema, primary_keys.as_slice());
+        let names: Vec<String> = additional.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["Borough".to_string(), "service_zone".to_string()]
+        );
+        // Make sure no column got lowercased on its way through.
+        assert!(
+            !names.iter().any(|n| n == "borough"),
+            "expected Borough to retain mixed case, got {names:?}"
+        );
+    }
+
+    /// Test that verify_schema_compatibility correctly rejects schemas with mismatched column types.
+    /// After the fix (changing .any() to .all()), this test verifies that schema validation
+    /// properly catches when columns have different types.
+    #[test]
+    fn test_verify_schema_compatibility_rejects_type_mismatch() {
+        // Two schemas with:
+        // - Same required columns (__spice_value, __spice_search_score)
+        // - Same number of columns (4)
+        // - But "extra" column has different types (Int8 vs Float64)
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false), // Int8
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Float64, false), // Float64 - DIFFERENT!
+        ]));
+
+        // After fix: This should fail because "extra" has different types
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+
+        // Verify that schema validation correctly catches the type mismatch
+        assert!(
+            result.is_err(),
+            "Schema validation should fail when column types differ"
+        );
+    }
+
+    /// Test that verify_schema_compatibility accepts schemas that are truly compatible
+    #[test]
+    fn test_verify_schema_compatibility_accepts_matching_schemas() {
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false),
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false), // Same type
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(result.is_ok(), "Compatible schemas should pass validation");
+    }
+
+    fn stream_from_batch(batch: RecordBatch) -> SendableRecordBatchStream {
+        stream_from_batches(vec![batch])
+    }
+
+    fn stream_from_batches(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = batches
+            .first()
+            .expect("candidate stream should contain at least one batch")
+            .schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_merges_documents_missing_from_first_stream() {
+        let make_batch = |scores: Vec<f64>, values: Vec<&str>, ids: Vec<&str>| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(scores)) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(values)) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch")
+        };
+
+        let stream_0 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(vec![10.0], vec!["A-from-s0"], vec!["A"])),
+            derived_from: "body".to_string(),
+        };
+        let stream_1 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(
+                vec![9.0, 8.0],
+                vec!["B-from-s1", "D-from-s1"],
+                vec!["B", "D"],
+            )),
+            derived_from: "body".to_string(),
+        };
+        let stream_2 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(
+                vec![7.0, 6.0],
+                vec!["B-from-s2", "E-from-s2"],
+                vec!["B", "E"],
+            )),
+            derived_from: "body".to_string(),
+        };
+
+        let result = ReciprocalRankFusion
+            .aggregate(
+                vec![stream_0, stream_1, stream_2],
+                vec![Column::from_name("id")],
+                10,
+            )
+            .await
+            .expect("rrf aggregation should succeed");
+
+        let batches = collect_batches(result.data)
+            .await
+            .expect("should collect fused batches");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("should format output")
+            .to_string();
+
+        assert!(
+            formatted.matches("| B  |").count() == 1,
+            "expected document B exactly once, got:\n{formatted}"
+        );
+        // B is absent from stream_0, rank 1 in stream_1 (score 9.0), rank 1 in stream_2 (score 7.0).
+        // Expected RRF score: 1/(1+60) + 1/(1+60) = 2/61 ≈ 0.032786885...
+        // Output schema: __spice_search_score | __spice_value_0 | __spice_value_1 | __spice_value_2 | id
+        // So B's id appears at the END of the row, not adjacent to the score.
+        let b_row = formatted
+            .lines()
+            .find(|l| l.contains("| B  |"))
+            .unwrap_or_else(|| panic!("expected B row in:\n{formatted}"));
+        assert!(
+            b_row.contains("B-from-s1") && b_row.contains("B-from-s2"),
+            "expected B row to carry values from both streams, got:\n{b_row}"
+        );
+        // Prefix covers stable significant digits of 2/61; avoids last-digit rounding variance.
+        assert!(
+            b_row.contains("0.032786885245901"),
+            "expected B's fused score ≈ 2/61, got:\n{b_row}"
+        );
+    }
+
+    /// Regression test for #12239: an empty batch must not discard later candidates from a stream.
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_uses_candidates_after_an_empty_first_batch() {
+        let make_batch = |scores: Vec<f64>, values: Vec<&str>, ids: Vec<&str>| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(scores)) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(values)) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch")
+        };
+
+        let stream_0 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(vec![10.0], vec!["A-from-s0"], vec!["A"])),
+            derived_from: "body".to_string(),
+        };
+        let stream_1 = VectorSearchGenerationResult {
+            data: stream_from_batches(vec![
+                make_batch(vec![], vec![], vec![]),
+                make_batch(
+                    vec![9.0, 8.0],
+                    vec!["A-from-s1", "B-from-s1"],
+                    vec!["A", "B"],
+                ),
+            ]),
+            derived_from: "body".to_string(),
+        };
+
+        let result = ReciprocalRankFusion
+            .aggregate(vec![stream_0, stream_1], vec![Column::from_name("id")], 10)
+            .await
+            .expect("rrf aggregation should succeed");
+
+        let batches = collect_batches(result.data)
+            .await
+            .expect("should collect fused batches");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("should format output")
+            .to_string();
+
+        assert!(
+            formatted.contains("| B  |"),
+            "expected candidate unique to the later batch, got:\n{formatted}"
+        );
+        let a_row = formatted
+            .lines()
+            .find(|line| line.contains("| A  |"))
+            .unwrap_or_else(|| panic!("expected A row in:\n{formatted}"));
+        assert!(
+            a_row.contains("0.032786885245901"),
+            "expected A's fused score ≈ 2/61, got:\n{a_row}"
+        );
+    }
+
+    /// Test that verify_schema_compatibility accepts schemas with different nullability
+    /// since nullability differences don't prevent DataFusion from handling the aggregation.
+    #[test]
+    fn test_verify_schema_compatibility_accepts_different_nullability() {
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false), // NOT nullable
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, true), // nullable - different!
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(
+            result.is_ok(),
+            "Schemas with different nullability should pass validation"
+        );
+    }
+
+    /// Test that verify_schema_compatibility accepts Utf8 and LargeUtf8 as semantically equivalent.
+    /// This is the specific case that was failing in the multi-column search test:
+    /// when chunking is enabled on one column, it produces LargeUtf8, while non-chunked
+    /// columns produce Utf8. These should be considered compatible.
+    #[test]
+    fn test_verify_schema_compatibility_accepts_utf8_and_large_utf8() {
+        // Schema with Utf8 value column (non-chunked)
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false), // Utf8
+            Field::new("pk", DataType::Int64, false),
+        ]));
+
+        // Schema with LargeUtf8 value column (chunked)
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::LargeUtf8, false), // LargeUtf8
+            Field::new("pk", DataType::Int64, false),
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(
+            result.is_ok(),
+            "Utf8 and LargeUtf8 should be considered semantically equivalent"
+        );
+    }
+}

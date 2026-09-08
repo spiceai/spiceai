@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/acceleration/checkpoint_sqlite.rs
+expression: pretty
+---
++--------------+
+| dataset_name |
++--------------+
+| decimal      |
++--------------+

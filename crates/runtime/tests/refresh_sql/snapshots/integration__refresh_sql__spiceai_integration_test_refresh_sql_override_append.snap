@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/refresh_sql/mod.rs
+expression: results_str
+---
++-------------+------------+-------------+-----------------------------------------------------------------------------------------------+
+| n_nationkey | n_name     | n_regionkey | n_comment                                                                                     |
++-------------+------------+-------------+-----------------------------------------------------------------------------------------------+
+| 16          | MOZAMBIQUE | 0           |  beans after the carefully regular accounts r                                                 |
+| 15          | MOROCCO    | 0           | ct blithely: blithely express accounts nag carefully. silent packages haggle carefully abo    |
+| 14          | KENYA      | 0           | lyly special foxes. slyly regular deposits sleep carefully. carefully permanent accounts slee |
+| 5           | ETHIOPIA   | 0           | regular requests sleep carefull                                                               |
+| 0           | ALGERIA    | 0           | furiously regular requests. platelets affix furious                                           |
++-------------+------------+-------------+-----------------------------------------------------------------------------------------------+

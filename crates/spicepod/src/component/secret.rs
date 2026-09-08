@@ -1,0 +1,78 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::Nameable;
+use crate::param::Params;
+
+/// The secrets configuration for a Spicepod.
+///
+/// Each entry selects a secret store via `from: <provider>[:<selector>]` and
+/// may pass provider-specific configuration through `params:`.
+///
+/// `params:` values may reference environment variables using the same
+/// `${ env:KEY }` / `${ secrets:KEY }` syntax used elsewhere in the
+/// spicepod. At this bootstrap point only the env store is loaded, so
+/// `secrets:KEY` resolves against env as well; references to other stores
+/// are rejected.
+///
+/// Example:
+/// ```yaml
+/// secrets:
+///   - from: env
+///     name: env
+///     params:
+///       file_path: .env.local
+///   - from: kubernetes:my_secret_name
+///     name: k8s
+///     params:
+///       namespace: spice
+///   - from: aws_secrets_manager:my-secret
+///     name: aws
+///     params:
+///       region: ${ env:AWS_REGION }
+///       key: ${ env:AWS_ACCESS_KEY_ID }
+///       secret: ${ env:AWS_SECRET_ACCESS_KEY }
+///   - from: azure_keyvault:my-vault
+///     name: azure
+///     params:
+///       auth_method: service_principal
+///       tenant_id: ${ env:AZURE_TENANT_ID }
+///       client_id: ${ env:AZURE_CLIENT_ID }
+///       client_secret: ${ env:AZURE_CLIENT_SECRET }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Secret {
+    pub from: String,
+
+    pub name: String,
+
+    pub description: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
+impl Nameable for Secret {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}

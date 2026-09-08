@@ -1,0 +1,1 @@
+oha --method POST "http://127.0.0.1:8090/v1/sql" -D tpch_query.sql -z 10s -c 10

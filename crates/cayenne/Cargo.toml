@@ -1,0 +1,543 @@
+[package]
+authors = ["Spice.ai OSS Authors"]
+description = "Cayenne: A lakehouse format using SQLite or Turso for metadata and Vortex files for data storage"
+edition = "2024"
+license = "Apache-2.0"
+name = "cayenne"
+repository = "https://github.com/spiceai/spiceai"
+version.workspace = true
+
+[dependencies]
+cpu-budget = { path = "../cpu-budget" }
+arc-swap = { workspace = true }
+arrow = { workspace = true }
+arrow_tools = { path = "../arrow_tools" }
+datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64.workspace = true
+bytes = { workspace = true }
+chrono = { workspace = true }
+data_components = { path = "../data_components" }
+datafusion = { workspace = true }
+datafusion-catalog = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+# `DecimalAverager`: the maintained decimal AVG serves DataFusion's own
+# sum/count -> decimal quotient, so parity with a base-table re-scan is
+# structural rather than a re-implementation kept in sync by hand.
+datafusion-functions-aggregate-common = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-pruning = { workspace = true }
+datafusion-table-providers = { workspace = true }
+futures = { workspace = true }
+hash-index = { path = "../hash-index" }
+im = "15.1"
+object_store = { workspace = true }
+parking_lot = { workspace = true }
+roaring = { workspace = true }
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-request-context = { path = "../runtime-request-context" }
+runtime-table-partition = { path = "../runtime-table-partition", optional = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+telemetry = { path = "../telemetry" }
+tokio-rusqlite = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tracing = { workspace = true }
+turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
+url = { workspace = true }
+util = { path = "../util", features = ["datafusion"] }
+uuid = { workspace = true, features = ["v7"] }
+flatbuffers = { workspace = true }
+# `files` exposes `vortex::file::WriteStrategyBuilder` for the delta-encoding
+# write-strategy overrides (provider/delta_encoding.rs). The feature is already
+# enabled transitively by vortex-datafusion; naming it here keeps cayenne
+# building if that ever changes.
+vortex = { workspace = true, features = ["files"] }
+# `vortex-btrblocks` exposes the BtrBlocks compressor builder and the concrete
+# compression-scheme types (provider/delta_encoding.rs maps encoding levels to
+# scheme subsets). It is pulled transitively by vortex but with no features, so
+# name it directly to make the scheme types addressable. The `zstd` feature is
+# required for `schemes::string::ZstdScheme`, which the `compression_strategy=
+# zstd` full-tier strategy registers (the vortex umbrella's own `zstd` feature
+# does NOT turn on `vortex-btrblocks/zstd`).
+vortex-btrblocks = { workspace = true, features = ["zstd"] }
+vortex-datafusion = { workspace = true }
+vortex-scan = { workspace = true }
+vortex-session = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"], optional = true }
+chdb-rust = { version = "1", optional = true }
+# Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+aegis = { version = "0.9.3", default-features = false, features = [
+    "std",
+    "pure-rust",
+] }
+
+# Ordering-tier fsync on the staged-commit hot path (provider/fsync_tier.rs):
+# on macOS both std `sync_all` AND `sync_data` are fcntl(F_FULLFSYNC) (~4-5 ms
+# per call, measured), so the plain-fsync ordering tier needs a direct
+# libc::fsync. See the module docs for the durability rationale.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Linux compaction page-cache hygiene (`provider/fadvise_tier.rs`):
+# `sync_file_range` + `posix_fadvise(POSIX_FADV_DONTNEED)` are Linux-only and
+# not exposed by std. Keeps a background compaction from evicting the hot query
+# working set. See the module docs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+turso = ["dep:turso"]
+partition-table-provider = ["dep:runtime-table-partition"]
+# Criterion *performance* comparison benches (`benches/vs_duckdb_*`, `vs_chdb_*`).
+duckdb-bench = ["dep:duckdb"]
+chdb-bench = ["dep:chdb-rust"]
+# *Result correctness* gates (`tests/result_correctness_*`). Same optional
+# engines, separate feature names so CI/docs never conflate correctness with
+# the perf matrix in docs/dev/cayenne_vs_duckdb_benchmarks.md.
+result-correctness-duckdb = ["dep:duckdb"]
+result-correctness-chdb = ["dep:chdb-rust"]
+
+[dev-dependencies]
+tpchgen = { workspace = true }
+vortex-io = { workspace = true }
+# Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
+# longer depends on arrow-row's (unstable) row format.
+arrow-row = { workspace = true }
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+datafusion-federation.workspace = true
+datafusion-functions-aggregate = { workspace = true }
+datafusion-functions = { workspace = true }
+# Compiles the `include`/`exclude` patterns the catalog-selector tests feed to
+# `data_components::catalog_filter::TableSelector`.
+globset = { workspace = true }
+insta = { workspace = true, features = ["json"] }
+paste.workspace = true
+rstest = "0.26.1"
+# For the `pk_key_hashing` bench (FxHash for native integer PK keys) and the
+# `hll_ndv_hashing` bench (FxHash vs XXH3 for NDV sketch value hashing).
+rustc-hash = "2.1.2"
+tempfile = { workspace = true }
+test-framework = { path = "../test-framework" }
+test-log = { version = "0.2", features = ["trace"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
+tokio-stream = { workspace = true }
+
+# The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
+# primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
+# already depends on libc for `target_os = "linux"`, but a bench is a separate
+# crate and must name the dep itself.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+# `loom` model-checks the `StructuralVersion` seqlock's memory orderings
+# (`provider/structural_version.rs`). Gated on `cfg(cayenne_loom)` so it is
+# compiled ONLY under `RUSTFLAGS="--cfg cayenne_loom"` and never enters normal
+# test/CI builds. Run with:
+#   RUSTFLAGS="--cfg cayenne_loom" cargo test -p cayenne --lib \
+#     provider::structural_version --release
+[target.'cfg(cayenne_loom)'.dev-dependencies]
+loom = { workspace = true }
+
+[[bench]]
+harness = false
+name = "zorder_clustering"
+
+[[bench]]
+harness = false
+name = "layout_amp_default_on"
+
+[[bench]]
+harness = false
+name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "ivm_retraction_anchor"
+
+[[bench]]
+harness = false
+name = "mem_tier_shard_split_converter"
+
+[[bench]]
+harness = false
+name = "sharded_validation_inline"
+
+[[bench]]
+harness = false
+name = "maintained_minmax_anchor"
+
+[[bench]]
+harness = false
+name = "staged_ivm_feed"
+
+[[bench]]
+harness = false
+name = "folded_txn_decomposition"
+
+[[bench]]
+harness = false
+name = "insert_record_schema_variants"
+
+[[bench]]
+harness = false
+name = "deletion_strategies"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe_large"
+
+[[bench]]
+harness = false
+name = "position_vs_key_deletion_scan"
+
+[[bench]]
+harness = false
+name = "mutation_writer"
+
+[[bench]]
+harness = false
+name = "listing_fence_overhead"
+
+[[bench]]
+harness = false
+name = "sorted_append_overhead"
+
+[[bench]]
+harness = false
+name = "inner_join_sort_merge_rewrite"
+
+[[bench]]
+harness = false
+name = "staging_move_concurrency"
+
+[[bench]]
+harness = false
+name = "column_stats_contention"
+
+[[bench]]
+harness = false
+name = "checkpoint_fence_stall"
+
+[[bench]]
+harness = false
+name = "metastore_connection_contention"
+
+[[bench]]
+harness = false
+name = "stats_persistence_rpc_ceiling"
+
+[[bench]]
+harness = false
+name = "apply_partial_deletion_filter_per_scan"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_rpc_ceiling"
+
+[[bench]]
+harness = false
+name = "validate_on_conflict_buffering"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_per_row_alloc"
+
+[[bench]]
+harness = false
+name = "compaction_sort_serialization"
+
+[[bench]]
+harness = false
+name = "inline_memtable_read_overhead"
+
+[[bench]]
+harness = false
+name = "inline_upsert_rewrite_overhead"
+
+[[bench]]
+harness = false
+name = "cached_table_statistics_wide"
+
+[[bench]]
+harness = false
+name = "deletion_index_extend_map_clone"
+
+[[bench]]
+harness = false
+name = "deletion_vector_bitmap_to_treemap"
+
+[[bench]]
+harness = false
+name = "wide_table_key_probe_scan"
+
+[[bench]]
+harness = false
+name = "load_existing_keyset_cap_disabled"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_in_list_delete"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_ingest"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_pk_lookup"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_delete"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_burst"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_upsert"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_upsert_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_maintained_filtered_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_join"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_concurrent"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_memory_budget"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan_under_compaction"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_cdc_multitable"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "compaction_picker"
+
+[[bench]]
+harness = false
+name = "scan_listing_cache_invalidation"
+
+[[bench]]
+harness = false
+name = "int64_pk_filter_keep_mask_alloc"
+
+[[bench]]
+harness = false
+name = "key_based_filter_scratch_reuse_alloc"
+
+[[bench]]
+harness = false
+name = "position_delete_redundant_walks"
+
+[[bench]]
+harness = false
+name = "apply_partial_filter_empty_alloc"
+
+[[bench]]
+harness = false
+name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "selective_join_pk_probe"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_lookup_session_cache_warmup"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_in_list_vs_range_rewrite"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "get_max_delete_sequence_walk"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_keys_double_clone"
+
+[[bench]]
+harness = false
+name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "compaction_write_amplification"
+
+[[bench]]
+harness = false
+name = "p1_audit_coverage"
+
+[[bench]]
+harness = false
+name = "scan_under_write_attribution"
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_groupby"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+# chDB-only (does NOT link DuckDB): the maintained filtered-aggregate comparison
+# must run chDB in a process without DuckDB, since both bundled engines abort if
+# linked + run together. Sibling of vs_duckdb_maintained_filtered_groupby.
+[[bench]]
+harness = false
+name = "vs_chdb_maintained_filtered_groupby"
+required-features = ["chdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_join"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan_under_compaction"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "mem_tier_join_shapes"
+
+[[bench]]
+harness = false
+name = "mem_tier_seal_cadence"
+
+[[bench]]
+harness = false
+name = "publish_metadata_wall"
+
+[[bench]]
+harness = false
+name = "cdc_apply_simd"
+
+[[bench]]
+harness = false
+name = "compaction_io_hygiene"
+
+[[bench]]
+harness = false
+name = "pk_key_hashing"
+
+[[bench]]
+harness = false
+name = "hll_ndv_hashing"
+
+[[bench]]
+harness = false
+name = "pk_keyset_present_path"
+
+# Result *correctness* (not perf): inventory completeness + pure compare path.
+[[test]]
+name = "result_correctness_inventory_test"
+path = "tests/result_correctness_inventory_test.rs"
+
+# Static comparison-cell census over the inventory. Links no engines; prints the
+# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
+[[test]]
+name = "result_correctness_census_test"
+path = "tests/result_correctness_census_test.rs"
+
+# Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_duckdb_test"
+path = "tests/result_correctness_vs_duckdb_test.rs"
+required-features = ["result-correctness-duckdb"]
+
+# Result correctness vs chDB (SQLLancer + micro). Separate process from DuckDB
+# — the engines cannot co-link. Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_chdb_test"
+path = "tests/result_correctness_vs_chdb_test.rs"
+required-features = ["result-correctness-chdb"]
+
+# Result correctness vs SQLite (SSB + SQLLancer + micro). Always linked
+# (rusqlite is a cayenne dependency). Not a Criterion bench.
+[[test]]
+name = "result_correctness_vs_sqlite_test"
+path = "tests/result_correctness_vs_sqlite_test.rs"
+
+# Out-of-Spice oracle baseline: standalone DuckDB ↔ standalone SQLite (no
+# Cayenne / no Spice accelerators). Validates external engines agree before
+# accelerator-vs-oracle gates. Requires DuckDB feature for one side.
+[[test]]
+name = "result_correctness_standalone_engines_test"
+path = "tests/result_correctness_standalone_engines_test.rs"
+required-features = ["result-correctness-duckdb"]
+
+[lints]
+workspace = true

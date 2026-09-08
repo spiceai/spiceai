@@ -1,0 +1,72 @@
+#!/usr/bin/expect -f
+
+# Runtime response timeout
+set timeout 15:
+
+spawn spice sql
+
+proc verify_show_tables {} {
+    global timeout
+
+    set found_task_history 0
+    set reset_repl_prefix 0
+
+    expect {
+        "sql>" {
+            send "show\n"
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    expect {
+        -- "->" {
+            send "tables\n"
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    expect {
+        -- "->" {
+            send ";\n"
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    expect {
+        "task_history" {
+            set found_task_history 1
+            exp_continue
+        }
+        "sql>" {
+            set reset_repl_prefix 1
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    if { $found_task_history == 1 && $reset_repl_prefix == 1 } {
+        send_user "Validated the REPL has multi-line prompt prefixes.\n"
+    } else {
+        send_user "The REPL didn't have the right multi-line prompt prefixes!\n"
+        exit 1
+    }
+}
+
+verify_show_tables
+sleep 1
+
+# Signal to exit (Ctrl+C)
+send \x03
+
+exit 0

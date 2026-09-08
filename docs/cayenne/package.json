@@ -1,0 +1,10 @@
+{
+  "name": "cayenne-doc-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Diagram renderer for the Cayenne technical reference (see build_pdf.py). Pinned exactly, not caret-ranged: mermaid's layout engine changes between minor releases, so an unpinned bump would silently reflow every diagram in the published PDF.",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.12.0"
+  }
+}

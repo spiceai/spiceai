@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q11"
+---
++------------------+---------------------+--------------------+--------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address         |
++------------------+---------------------+--------------------+--------------------------------+
+| AAAAAAAAJIBAAAAA | Bruce               | Olvera             | Bruce.Olvera@x4L7yzc2I65OB.org |
++------------------+---------------------+--------------------+--------------------------------+
