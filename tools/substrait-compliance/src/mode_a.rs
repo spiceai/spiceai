@@ -423,4 +423,133 @@ mod tests {
         let table = batches_to_table(&batches, &schema);
         assert_eq!(table.rows, vec![vec!["EUROPE".to_string()]]);
     }
+
+    /// Isthmus TPC-H q07/q08/q09 call `extract:req_date` with an enum `YEAR`
+    /// argument. Without spiceai/datafusion#220 `from_substrait_plan` errors
+    /// (`Function argument non-Value type not supported`) and Mode A reports
+    /// ERROR for all three.
+    #[tokio::test]
+    async fn enum_function_argument_lowers_to_date_part() {
+        use std::sync::Arc;
+
+        use arrow::array::Date32Array;
+        use datafusion_substrait::substrait::proto::{
+            Expression, FunctionArgument, ProjectRel,
+            expression::{
+                FieldReference, ReferenceSegment, RexType, ScalarFunction,
+                field_reference::{ReferenceType, RootReference, RootType},
+                reference_segment::{self, StructField},
+            },
+            extensions::{
+                SimpleExtensionDeclaration,
+                simple_extension_declaration::{ExtensionFunction, MappingType},
+            },
+            function_argument::ArgType,
+            read_rel::NamedTable,
+        };
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Date32Array::from(vec![10470]))], // 1998-09-01
+        )
+        .expect("one-row Date32 batch");
+        ctx.register_batch("t", batch).expect("register table t");
+
+        let date_type = Type {
+            kind: Some(r#type::Kind::Date(r#type::Date {
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Required),
+            })),
+        };
+        let i64_type = Type {
+            kind: Some(r#type::Kind::I64(r#type::I64 {
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Required),
+            })),
+        };
+        let date_column = Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        StructField {
+                            field: 0,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::RootReference(RootReference {})),
+            }))),
+        };
+        let extract_year = Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: 1,
+                arguments: vec![
+                    FunctionArgument {
+                        arg_type: Some(ArgType::Enum("YEAR".to_string())),
+                    },
+                    FunctionArgument {
+                        arg_type: Some(ArgType::Value(date_column)),
+                    },
+                ],
+                output_type: Some(i64_type),
+                ..Default::default()
+            })),
+        };
+        let proto = Plan {
+            extensions: vec![SimpleExtensionDeclaration {
+                mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                    extension_urn_reference: 0,
+                    function_anchor: 1,
+                    name: "extract:req_date".to_string(),
+                })),
+            }],
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(Rel {
+                        rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                            input: Some(Box::new(Rel {
+                                rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                                    base_schema: Some(NamedStruct {
+                                        names: vec!["d".to_string()],
+                                        r#struct: Some(r#type::Struct {
+                                            types: vec![date_type],
+                                            type_variation_reference: 0,
+                                            nullability: i32::from(Nullability::Required),
+                                        }),
+                                    }),
+                                    read_type: Some(ReadType::NamedTable(NamedTable {
+                                        names: vec!["t".to_string()],
+                                        advanced_extension: None,
+                                    })),
+                                    ..Default::default()
+                                }))),
+                            })),
+                            expressions: vec![extract_year],
+                            ..Default::default()
+                        }))),
+                    }),
+                    names: vec!["d".to_string(), "year".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+
+        let plan = from_substrait_plan(&ctx.state(), &proto)
+            .await
+            .expect("enum function argument must lower (spiceai/datafusion#220)");
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute extract plan");
+        let schema = df.schema().as_arrow().clone();
+        let batches = df.collect().await.expect("collect extract plan");
+        let table = batches_to_table(&batches, &schema);
+        assert_eq!(table.columns[1].type_token, "bigint");
+        assert_eq!(
+            table.rows,
+            vec![vec!["1998-09-01".to_string(), "1998".to_string()]]
+        );
+    }
 }

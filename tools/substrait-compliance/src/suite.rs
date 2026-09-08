@@ -204,7 +204,8 @@ testCases:
         )
         .expect("write mini suite metadata");
         std::fs::write(dir.join("plans/q99.bin"), []).expect("write mini suite plan");
-        std::fs::write(dir.join("expected/q99.csv"), expected_csv).expect("write mini suite golden");
+        std::fs::write(dir.join("expected/q99.csv"), expected_csv)
+            .expect("write mini suite golden");
         dir
     }
 
