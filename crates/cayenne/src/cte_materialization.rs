@@ -1240,6 +1240,7 @@ mod tests {
     use datafusion::catalog::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::optimizer::Optimizer;
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 
@@ -1988,9 +1989,11 @@ mod tests {
 
     #[tokio::test]
     async fn materializing_a_repartitioned_join_cte_does_not_deadlock() -> Result<()> {
-        // Producer is a join over a multi-partition table, so physical planning
+        // Producer is a join over a four-partition table, so physical planning
         // inserts `RepartitionExec`. Sequential collect of that producer
         // deadlocks; `CoalescePartitionsExec` drives every partition at once.
+        // Completeness of the eight input keys is the check that every
+        // producer partition was drained once.
         let ctx = session_with_rule_and_partitions(4);
         register_i64_partitioned(&ctx, "t", "x", &[&[1, 2], &[3, 4], &[5, 6], &[7, 8]])?;
         let sql = "WITH expensive AS ( \
@@ -1998,12 +2001,23 @@ mod tests {
                    ) \
                    SELECT e1.x FROM expensive e1 JOIN expensive e2 ON e1.x = e2.x \
                    ORDER BY e1.x";
-        let batches = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            materialized_sql(&ctx, sql),
-        )
-        .await
-        .expect("materializing a hash-repartitioned CTE must not deadlock")?;
+        let df = ctx.sql(sql).await?;
+        let plan = df.clone().into_optimized_plan()?;
+        assert_materialized(&plan, sql);
+        let physical = df.create_physical_plan().await?;
+        let physical_display = displayable(physical.as_ref()).indent(true).to_string();
+        assert!(
+            physical_display.contains("CoalescePartitionsExec"),
+            "multi-partition CTE producer must coalesce partitions:\n{physical_display}"
+        );
+        assert!(
+            physical_display.contains("MaterializedCteExec"),
+            "physical plan should materialize the CTE:\n{physical_display}"
+        );
+        let batches =
+            tokio::time::timeout(std::time::Duration::from_secs(10), collect_sql(&ctx, sql))
+                .await
+                .expect("materializing a hash-repartitioned CTE must not deadlock")?;
         assert_eq!(
             i64_col(&batches, 0),
             vec![
@@ -2141,7 +2155,8 @@ mod tests {
 
     #[tokio::test]
     async fn duckdb_correlated_subquery_two_refs() -> Result<()> {
-        // test_materialized_cte.test: lhs vs rhs on the same CTE → 256
+        // test_materialized_cte.test: lhs vs rhs on the same CTE. The
+        // correlated `rhs.i = lhs.i` matches each of the 16 `lhs` rows once.
         let ctx = session_with_rule();
         let series: Vec<i64> = (0..16).collect();
         register_i64(&ctx, "series", "i", &series)?;

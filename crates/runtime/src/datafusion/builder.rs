@@ -2051,6 +2051,8 @@ mod tests {
     #[cfg(not(windows))]
     use datafusion_expr::{Expr, LogicalPlan};
 
+    #[cfg(not(windows))]
+    use super::CteMaterialization;
     use super::{
         CAYENNE_QUERY_MEMORY_FLOOR_PERCENT, CAYENNE_QUERY_MEMORY_PERCENT, CayenneOptimizerRules,
         DEFAULT_QUERY_MEMORY_PERCENT, DataFusionBuilder, MEM_TIER_CEILING_FRACTION,
@@ -2923,6 +2925,47 @@ mod tests {
                 "CayenneAntiJoinSortMergeRewriter",
             ],
             "Default Cayenne physical optimizer selection should preserve prior safe defaults (now including the metadata-only stats aggregate fold) without re-enabling the exact join filter"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_registers_cte_materialization_when_auto() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df_disabled = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle.clone(),
+        )
+        .build();
+        assert!(
+            !df_disabled
+                .ctx
+                .state()
+                .optimizers()
+                .iter()
+                .any(|rule| rule.name() == "cayenne_cte_materialization"),
+            "default cte_materialization=disabled must not register the Cayenne CTE rewrite"
+        );
+
+        let df_auto = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cte_materialization(CteMaterialization::Auto)
+        .build();
+        let state = df_auto.ctx.state();
+        let names: Vec<&str> = state.optimizers().iter().map(|rule| rule.name()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("cayenne_cte_materialization"),
+            "cte_materialization=auto must insert the Cayenne CTE rewrite first so both inlined copies are still identical: {names:?}"
         );
     }
 
