@@ -37,7 +37,6 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::ident;
-use futures::future::try_join_all;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
 use spice_table::{GroupPruning, Index, WriteWindow, build_key_match_predicate};
@@ -109,14 +108,22 @@ impl Index for ChunkedSearchIndex {
         cols
     }
 
+    /// One batch after another, in the order given — not concurrently. A write is an upsert of
+    /// the chunks it produced followed by the removal of what it superseded
+    /// ([`Self::remove_superseded_chunks`]), and the inner index guards each of those operations
+    /// on its own, not their sequence: two batches carrying the same key, in flight at once, let
+    /// the earlier batch's removal land after the later batch's upsert and take a chunk only the
+    /// later text produced. Running them in order is also what makes the outcome match the
+    /// table, which applies the batches in that order and keeps the last one.
     async fn compute_index(
         &self,
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        let futs = batches
-            .into_iter()
-            .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        let mut out = Vec::with_capacity(batches.len());
+        for rb in batches {
+            out.push(self.write(rb).await.map_err(DataFusionError::External)?);
+        }
+        Ok(out)
     }
 
     /// Records whether this window replaces the table's contents before forwarding, so
@@ -2520,6 +2527,9 @@ mod tests {
     struct StatefulChunkInner {
         rows: std::sync::Mutex<Vec<(i64, u64)>>,
         deletes_partial_key: bool,
+        /// Yield to the runtime after storing a batch's rows, so two writes in flight at once
+        /// interleave the way a real inner index's awaited embedding call lets them.
+        yield_on_write: bool,
     }
 
     impl StatefulChunkInner {
@@ -2527,7 +2537,13 @@ mod tests {
             Self {
                 rows: std::sync::Mutex::new(rows.to_vec()),
                 deletes_partial_key,
+                yield_on_write: false,
             }
+        }
+
+        fn yielding(mut self) -> Self {
+            self.yield_on_write = true;
+            self
         }
 
         fn remaining(&self) -> Vec<(i64, u64)> {
@@ -2659,6 +2675,9 @@ mod tests {
                         rows.push(pair);
                     }
                 }
+            }
+            if self.yield_on_write {
+                tokio::task::yield_now().await;
             }
 
             let n = record.num_rows();
@@ -3046,6 +3065,32 @@ mod tests {
         assert!(
             inner.remainders().is_empty(),
             "an index that cannot prune is never handed members to keep"
+        );
+    }
+
+    /// A write's upsert and its pruning are two operations on the inner index, so two writes for
+    /// the same key in flight at once can interleave them: the older write's pruning, keyed on
+    /// the chunks *it* produced, removes a chunk the newer write just stored, and the newer
+    /// write's own pruning cannot restore it. `compute_index` is where more than one batch is
+    /// handed over at a time, so it has to run them in order — which is also the order the table
+    /// applies them in, so the last batch's text is what stays searchable.
+    ///
+    /// The inner index yields after storing, the way a real one yields on its embedding call;
+    /// run concurrently, batch A's pruning would land after batch B's store and take `(1, 1)`.
+    #[tokio::test]
+    async fn batches_of_one_compute_index_call_do_not_interleave_their_pruning() {
+        let inner = Arc::new(StatefulChunkInner::new(&[], false).yielding());
+        let idx = ChunkedSearchIndex::new(Arc::clone(&inner) as Arc<dyn SearchIndex>, chunker());
+
+        idx.compute_index(vec![build_input(&[("x", 1)]), build_input(&[("y z", 1)])])
+            .await
+            .expect("both batches land");
+
+        assert_eq!(
+            inner.remaining(),
+            vec![(1, 0), (1, 1)],
+            "the later batch's text is complete in the index; the earlier batch's pruning must \
+             not have removed a chunk it never produced"
         );
     }
 
