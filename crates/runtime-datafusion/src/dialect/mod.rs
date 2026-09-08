@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
@@ -227,9 +227,7 @@ pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
 /// The rest stay denied, each for something `BigQuery` cannot be talked out of.
 /// `json_get_json` and `json_as_text` return the matched node's own bytes,
 /// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
-/// document holding `{"b": -1}` comes back as `{"b":-1}`. `json_contains`
-/// counts a JSON `null` as present, and `BigQuery` returns SQL NULL for such a
-/// node exactly as it does for a missing key, so the two cannot be told apart.
+/// document holding `{"b": -1}` comes back as `{"b":-1}`.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
 #[must_use]
@@ -248,8 +246,32 @@ pub fn bigquery_native_function_names() -> Vec<&'static str> {
 /// this so an untranslatable call is left to evaluate locally instead of being
 /// unparsed.
 #[must_use]
-pub fn bigquery_can_translate(call: &ScalarFunction) -> bool {
-    bigquery::can_translate(call)
+pub fn bigquery_can_translate(
+    call: &ScalarFunction,
+    scope: Option<&datafusion::common::DFSchema>,
+) -> bool {
+    bigquery::can_translate(call, scope)
+}
+
+/// Whether the `BigQuery` dialect can translate this particular aggregate call.
+///
+/// An aggregate call carries its `FILTER`, `ORDER BY` and `DISTINCT`, and the
+/// dialect can rewrite some of those shapes and not others. The deny-list
+/// installs this so a shape it cannot rewrite faithfully is left to evaluate
+/// locally instead of being unparsed into a different answer.
+#[must_use]
+pub fn bigquery_can_translate_aggregate(call: &AggregateFunction) -> bool {
+    bigquery::can_translate_aggregate(call)
+}
+
+/// Whether the `BigQuery` dialect can translate this particular window call.
+///
+/// A `FILTER` on a window call reaches no rewriting at all, so it renders
+/// verbatim into SQL `BigQuery` refuses. The deny-list installs this so the window
+/// evaluates locally instead.
+#[must_use]
+pub fn bigquery_can_translate_window(call: &WindowFunction) -> bool {
+    bigquery::can_translate_window(call)
 }
 
 /// Creates a `BigQuery` dialect that also rewrites the Spice JSON functions

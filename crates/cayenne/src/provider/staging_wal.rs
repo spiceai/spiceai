@@ -890,6 +890,14 @@ impl PreparedStagedAppend {
         &self.target_snapshot_id
     }
 
+    /// The private staging directory this append's files sit in until it
+    /// publishes — also the key its in-flight registration is held under
+    /// (`CayenneTableProvider::attach_inflight_staged_pk_keys`).
+    #[must_use]
+    pub(crate) fn staging_snapshot_id(&self) -> &str {
+        &self.staging_snapshot_id
+    }
+
     /// Build the fallible listing-table state needed to publish this deferred
     /// append. Call before the cross-partition catalog transaction commits.
     ///

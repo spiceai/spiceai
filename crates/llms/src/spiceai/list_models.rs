@@ -22,7 +22,9 @@ use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 
 use crate::config::HostedModelConfig;
-use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
+use crate::provider::{
+    ListModels, ListModelsResult, classify_openai_compatible_error, get_required_param,
+};
 use crate::spiceai::{api_base, is_cloud_platform};
 
 // Names the provider in credential/network errors. Endpoint-neutral: this lister targets the
@@ -87,23 +89,12 @@ impl ListModels for SpiceAiModelLister {
     }
 
     async fn list_models(&self) -> ListModelsResult<Vec<String>> {
-        let response = self.client.models().list().await.map_err(|e| {
-            let message = e.to_string();
-            if message.contains("401") || message.contains("Unauthorized") {
-                ListModelsError::InvalidCredentials {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else if message.contains("429") || message.contains("rate") {
-                ListModelsError::RateLimited {
-                    provider: PROVIDER_NAME.to_string(),
-                }
-            } else {
-                ListModelsError::NetworkError {
-                    provider: PROVIDER_NAME.to_string(),
-                    message,
-                }
-            }
-        })?;
+        let response = self
+            .client
+            .models()
+            .list()
+            .await
+            .map_err(|e| classify_openai_compatible_error(&e, PROVIDER_NAME))?;
 
         let models: Vec<String> = response.data.into_iter().map(|m| m.id).collect();
 
@@ -118,6 +109,7 @@ impl ListModels for SpiceAiModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ListModelsError;
 
     #[test]
     fn test_from_params_missing_key() {

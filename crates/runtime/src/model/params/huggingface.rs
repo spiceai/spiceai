@@ -19,9 +19,12 @@ use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
 /// Parameters for `from: huggingface` chat models.
+///
+/// `prefix` must equal `ModelSource::HuggingFace.short_name()` (`hf`); enforced by
+/// `model_param_prefixes_match_the_source_short_name`.
 #[derive(TypedParams)]
 #[params(
-    prefix = "huggingface",
+    prefix = "hf",
     passthrough = crate::model::params::common::PREFIXED_COMMON,
     emit_specs
 )]
@@ -35,8 +38,13 @@ pub struct HuggingFaceModelParams {
     /// Customizes the transformation of `OpenAI` chat messages into a character stream for the model.
     #[param(runtime)]
     pub chat_template: Option<String>,
-    /// The Huggingface access token.
-    pub token: Option<SecretString>,
+    /// The Hugging Face access token. `huggingface_token` is accepted as an alias.
+    // `runtime` keeps the alias unprefixed (a component alias would render as
+    // `hf_huggingface_token`). Unlike the embeddings and reranker `hf_token`, not
+    // `autoload_secret`: a chat model that names no token must not start reading
+    // one from the secret stores.
+    #[param(runtime, alias = "huggingface_token")]
+    pub hf_token: Option<SecretString>,
     /// Run the model tensor-parallel across multiple nodes (a Spice enterprise feature; standard builds are single-node only). Set to 'ring' to pool the model over the `nodes` list (the 'ring' backend currently supports exactly 2 nodes); omit or 'none' for single-node.
     #[param(runtime, default = "none")]
     pub distributed_backend: DistributedBackendSetting,

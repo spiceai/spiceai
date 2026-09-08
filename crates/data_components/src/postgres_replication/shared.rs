@@ -2351,9 +2351,24 @@ async fn attach_member(
     // `snapshot_on_resume` overrides all of that: a non-persistent
     // accelerator starts empty every boot, so WAL replay alone can never
     // reconstruct it — snapshot-then-replay is the only correct sequence.
-    let need_snapshot = params.snapshot_on_resume
-        || setup.table_added
-        || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
+    //
+    // `super::creation_cause` holds that disjunction *and* the sentence that
+    // explains it, so the reason logged below cannot describe a different rule
+    // from the one that decided (the same reason `super::rebuild_cause` exists).
+    let creation_cause = super::creation_cause(super::CreationInputs {
+        source_read_policy: if params.snapshot_on_resume {
+            if params.ephemeral_accelerator {
+                super::SourceReadPolicy::EveryStartEphemeral
+            } else {
+                super::SourceReadPolicy::EveryStartConfigured
+            }
+        } else {
+            super::SourceReadPolicy::WhenHistoryIsMissing
+        },
+        table_added: setup.table_added,
+        slot_created_this_process: !rejoining && source.slot_created_fresh.load(Ordering::Acquire),
+    });
+    let need_snapshot = creation_cause.is_some();
 
     let snapshotting = need_snapshot && params.initial_snapshot;
 
@@ -2474,12 +2489,11 @@ async fn attach_member(
         contents_implying_gap,
     );
     let rebuild_via_consumer = rebuild_cause.is_some();
-    // A rebuild is a full re-read nobody asked for, and which cause fired is what
-    // says whether to look at the source, the configuration, or the slot — so it
-    // is reported as a label rather than left to be recovered from log text. Set
-    // unconditionally (not only inside `if let Some`): the collector is reused
-    // across reattaches, so a clean resume must clear a cause an earlier attach
-    // left set, or the metric would keep exporting it as if this attach rebuilt.
+    // Recorded, not exported: the operator is told which cause fired by the
+    // warning below, and this is the same fact in the form an integration test
+    // can assert (see `ReplicationMetricsCollector::rebuild_cause`). Set
+    // unconditionally, so a clean resume clears a cause an earlier attach left
+    // behind on the reused collector.
     metrics.set_rebuild_cause(rebuild_cause.map(super::RebuildCause::label));
 
     // A member resuming on a position a previous process recorded already has a
@@ -2619,8 +2633,14 @@ async fn attach_member(
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
             rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
-            "this acceleration will be rebuilt from the source before changes are applied: {}",
-            rebuild_cause.map_or("", super::RebuildCause::reason)
+            "{}",
+            // `rebuild_via_consumer` is `rebuild_cause.is_some()`, so this arm
+            // always has a cause; the fallback is unreachable rather than a
+            // default worth reading.
+            rebuild_cause.map_or_else(String::new, |cause| super::rebuild_log_message(
+                &dataset_name,
+                cause
+            ))
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
@@ -2628,6 +2648,24 @@ async fn attach_member(
         metrics.mark_bootstrap_complete();
         Box::pin(signal.chain(live_flip_hook(source, &member_key)))
     } else if snapshotting {
+        // Reading a whole table is the most expensive thing an acceleration does,
+        // and on this path the metrics say the least: the bootstrap counters
+        // report rows and completion but never a duration (only a rebuild runs
+        // through the timed refresh path), and none of them say why the read is
+        // happening. So this line is the operator's whole account of it, and it
+        // names the condition that fired rather than leaving them to infer it
+        // from the slot and publication state.
+        // `snapshotting` implies a cause, so the `if let` never falls through.
+        if let Some(cause) = creation_cause {
+            tracing::info!(
+                dataset = %dataset_name,
+                table = %format_member(&member_key),
+                slot = %source.key.slot_name,
+                creation_cause = cause.label(),
+                "{}",
+                super::creation_log_message(&dataset_name, cause)
+            );
+        }
         // Built before `dataset_name` is moved into the snapshot input below.
         let watermark_boundary = snapshot_watermark_envelope(
             &schema,

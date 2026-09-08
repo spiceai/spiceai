@@ -95,6 +95,18 @@ fn date(name: &str) -> Field {
 
 /// Generate every TPC-H table at `scale_factor` and write it as parquet under
 /// `out_dir`, matching the layout the lane already loads from.
+/// Generate the TPC-H fixture into `out_dir` unless this generator already
+/// finished writing one there. Same reuse rule as the SSB fixture: a leftover
+/// tree from an older generator is regenerated rather than trusted.
+pub fn ensure_tpch_fixture(out_dir: &Path, scale_factor: f64) {
+    let revision = super::generator_revision(include_str!("tpch_data.rs"));
+    if super::fixture_is_current(out_dir, &revision) {
+        return;
+    }
+    write_tpch_parquet(out_dir, scale_factor);
+    super::mark_fixture_complete(out_dir, &revision);
+}
+
 pub fn write_tpch_parquet(out_dir: &Path, scale_factor: f64) {
     std::fs::create_dir_all(out_dir).expect("tpch out dir");
     for (name, batch) in tpch_batches(scale_factor) {
