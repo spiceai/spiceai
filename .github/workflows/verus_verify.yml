@@ -84,6 +84,10 @@ jobs:
 
       # Decides whether the verification work below runs. The job itself always
       # runs, so the required context is always reported.
+      #
+      # This has to cover every input that decides what `cargo verus` checks,
+      # not only the proof source. A path missing here is not a cheaper run: it
+      # reports the required context green with the verifier never invoked.
       - name: Check for changes this gate covers
         id: changes
         uses: ./.github/actions/check-code-changes
@@ -95,7 +99,42 @@ jobs:
               # workspace toolchain bump can invalidate this gate without
               # touching the crate.
               - 'rust-toolchain.toml'
+              # `vstd` is an ordinary dependency, so what is verified is resolved
+              # outside the crate: the root manifest owns `[patch.crates-io]` and
+              # can redirect `vstd` past the version string "Check pins agree"
+              # reads, the lockfile selects its proc-macro crates, and cargo
+              # config can replace the source or change how the driver is
+              # invoked.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              # The gate itself, and the two composite actions this job runs: one
+              # decides whether verification happens at all, the other installs
+              # the toolchain the driver requires.
               - '.github/workflows/verus_verify.yml'
+              - '.github/actions/check-code-changes/**'
+              - '.github/actions/setup-rust/**'
+
+      # A manual run is how someone re-checks the proofs on demand, so it must
+      # never be able to skip them. `dorny/paths-filter` has no base to diff
+      # against on a dispatch: `before` is absent from the payload, and when the
+      # dispatch ref is the default branch the filter falls back to the last
+      # commit alone (`getChangesInLastCommit`, src/main.ts). Dispatching from
+      # `trunk` after an unrelated commit would therefore report this gate green
+      # having verified nothing. `integration.yml`, `e2e_test_ci.yml`,
+      # `helm-lint.yml`, and `integration_elasticsearch.yml` force the same way.
+      - name: Decide whether to run the verifier
+        id: gate
+        env:
+          RELEVANT_CHANGES: ${{ steps.changes.outputs.relevant_changes }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEVANT_CHANGES" = 'true' ] || [ "$EVENT_NAME" = 'workflow_dispatch' ]; then
+            echo 'verify=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'verify=false' >> "$GITHUB_OUTPUT"
+          fi
 
       # Installs the toolchain `rust-toolchain.toml` pins, which is the one the
       # Verus driver is built against and the one `cargo verus` will select. The
@@ -105,11 +144,11 @@ jobs:
       # on `merge_group`, where a textual lockfile merge is what that guard exists
       # to name before any cargo work.
       - name: Set up Rust
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         uses: ./.github/actions/setup-rust
 
       - name: Check pins agree
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
           pinned=$(grep -oP 'vstd = "=\K[^"]+' crates/hash-index/Cargo.toml)
@@ -125,7 +164,7 @@ jobs:
       # rather than silently supplying the binary this job then trusts.
       - name: Cache Verus archive
         id: cache-verus
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.verus-dl
@@ -133,7 +172,7 @@ jobs:
 
       - name: Download Verus
         if: >-
-          steps.changes.outputs.relevant_changes == 'true'
+          steps.gate.outputs.verify == 'true'
           && steps.cache-verus.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,13 +183,13 @@ jobs:
             -p "$VERUS_ASSET" -O ~/.verus-dl/"$VERUS_ASSET" --clobber
 
       - name: Verify the archive digest
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
           echo "$VERUS_SHA256  $HOME/.verus-dl/$VERUS_ASSET" | sha256sum -c -
 
       - name: Extract Verus
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
           rm -rf ~/.verus && mkdir -p ~/.verus
@@ -170,7 +209,7 @@ jobs:
       # workspace toolchain bump ahead of the Verus release then fails here with
       # an explanation instead of an opaque driver error.
       - name: Check the toolchain matches
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         run: |
           set -euo pipefail
           if ! version_output=$("$VERUS_DIR/verus" --version 2>&1); then
@@ -195,7 +234,7 @@ jobs:
           fi
 
       - name: Verify
-        if: steps.changes.outputs.relevant_changes == 'true'
+        if: steps.gate.outputs.verify == 'true'
         working-directory: crates/hash-index
         run: |
           set -euo pipefail
