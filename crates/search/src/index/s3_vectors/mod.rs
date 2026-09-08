@@ -49,7 +49,7 @@ use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
-use spice_table::Index;
+use spice_table::{GroupPruning, Index};
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
@@ -399,6 +399,13 @@ impl Index for S3Vector {
                 .collect();
 
         self.delete_key_strings(key_strings).await
+    }
+
+    /// Every vector is addressed by its full composite key, and the only way to find the other
+    /// keys of a group is to list the whole index, so the chunks a shorter text no longer
+    /// produces are left in place (#13717).
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Unsupported
     }
 }
 
