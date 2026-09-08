@@ -41,7 +41,7 @@ use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
 use snafu::{ResultExt, Snafu, ensure};
-use spice_table::{Index, WriteWindow};
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,
@@ -376,6 +376,10 @@ impl Index for MemoryVectorIndex {
         self.store
             .write()
             .delete_group_remainder(group_columns, &members, &member_keys)
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
     }
 
     /// Entries live in this index's own store, not in the accelerated table row, so a

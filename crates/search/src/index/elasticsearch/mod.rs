@@ -40,7 +40,7 @@ use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
-use spice_table::{GroupPruning, Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
@@ -608,14 +608,6 @@ impl Index for ElasticsearchIndex {
     fn deletes_by_partial_key(&self) -> bool {
         true
     }
-
-    /// A `_delete_by_query` on the base key that excludes the surviving `_id`s would do this,
-    /// but it needs the exact-match addressing of the key columns that the partial-key delete
-    /// is being given; until then the chunks a shorter text no longer produces are left in
-    /// place (#13717).
-    fn group_pruning(&self) -> GroupPruning {
-        GroupPruning::Unsupported
-    }
 }
 
 impl ElasticsearchIndex {
@@ -874,11 +866,6 @@ impl Index for ElasticsearchTextIndex {
     /// Same `_delete_by_query` addressing as [`ElasticsearchIndex`].
     fn deletes_by_partial_key(&self) -> bool {
         true
-    }
-
-    /// See [`ElasticsearchIndex::group_pruning`] (#13717).
-    fn group_pruning(&self) -> GroupPruning {
-        GroupPruning::Unsupported
     }
 }
 

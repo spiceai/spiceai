@@ -2588,6 +2588,9 @@ mod tests {
             }
             Ok(())
         }
+        fn group_pruning(&self) -> GroupPruning {
+            GroupPruning::Complete
+        }
         /// Drops every row in a named group that is not itself a member — what a store does
         /// from what it already holds.
         async fn delete_group_remainder(

@@ -27,7 +27,7 @@ use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use snafu::{ResultExt, ensure};
-use spice_table::{GroupPruning, Index, WriteWindow};
+use spice_table::{Index, WriteWindow};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
     DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing,
@@ -274,13 +274,6 @@ impl Index for FullTextDatabaseIndex {
         self.delete_terms_for(&keys)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
-    }
-
-    /// Documents are addressed by a term on the full formatted key, and the writer has no way to
-    /// enumerate the keys of a group, so the chunks a shorter text no longer produces are left
-    /// in place (#13717).
-    fn group_pruning(&self) -> GroupPruning {
-        GroupPruning::Unsupported
     }
 
     fn write_start_failure_is_fatal(&self) -> bool {
