@@ -35,10 +35,11 @@ jobs:
               failed |= bool(errors)
           raise SystemExit(1 if failed else 0)
           PYTHON
-  read-all:
+  contents-write:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: read-all
+    permissions:
+      contents: write
     steps:
       - name: Request stargazers with and without email
         env:
@@ -66,12 +67,12 @@ jobs:
               failed |= bool(errors)
           raise SystemExit(1 if failed else 0)
           PYTHON
-  contents-issues:
+  issues-write:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
-      issues: read
+      issues: write
     steps:
       - name: Request stargazers with and without email
         env:
@@ -99,12 +100,12 @@ jobs:
               failed |= bool(errors)
           raise SystemExit(1 if failed else 0)
           PYTHON
-  contents-pulls:
+  pulls-write:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     steps:
       - name: Request stargazers with and without email
         env:
@@ -132,23 +133,14 @@ jobs:
               failed |= bool(errors)
           raise SystemExit(1 if failed else 0)
           PYTHON
-  org-app:
+  write-all:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions:
-      contents: read
+    permissions: write-all
     steps:
-      - name: Create organization test token
-        id: app
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
-        with:
-          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
-          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: spiceai
-          repositories: spiceai
       - name: Request stargazers with and without email
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 - <<'PYTHON'
           import json
