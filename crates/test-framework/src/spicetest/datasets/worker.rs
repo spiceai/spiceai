@@ -385,15 +385,17 @@ impl SpiceTestQueryWorker {
                                 Arc::new(DashMap::new()),
                                 &mut BTreeMap::new(),
                                 snapshot_mode,
-                                false,
+                                self.validate_on_run(true),
                             )
                             .await?;
 
                         // The warmup's timing is thrown away; its verdict is not. This is the
                         // only run of the query that compares results against their snapshot —
                         // the timed iterations below pass `Skip` for `snapshot_mode` so they
-                        // do not re-assert it — so dropping this failure is what would let a
-                        // wrong answer, or a missing baseline, finish the benchmark green.
+                        // do not re-assert it — and the only run that issues a live reference
+                        // query when `--validate` uses a reference schema. Dropping this
+                        // failure is what would let a wrong answer, or a missing baseline,
+                        // finish the benchmark green.
                         query_status = status_after_run(query_status, query_failure);
 
                         println!(
@@ -437,7 +439,7 @@ impl SpiceTestQueryWorker {
                                     Arc::clone(&query_durations),
                                     &mut row_counts,
                                     SnapshotMode::Skip, // don't attempt to snapshot results more than once
-                                    self.validate,
+                                    self.validate_on_run(false),
                                 )
                                 .await?;
 
@@ -471,6 +473,11 @@ impl SpiceTestQueryWorker {
                 row_counts,
             ))
         })
+    }
+
+    /// Whether this run of the query should compare results.
+    fn validate_on_run(&self, is_warmup: bool) -> bool {
+        should_validate_on_run(self.validate, is_warmup, self.reference_schema.is_some())
     }
 
     /// Whether this worker should stop issuing queries: shutdown was requested,
@@ -689,9 +696,11 @@ impl SpiceTestQueryWorker {
                     batches
                 };
 
-                // Validate against reference query results
+                // Validate against reference query results. Engine-vs-engine
+                // (not static TPCH CSV): scan order is not part of the answer
+                // unless the row set itself depends on ORDER BY + LIMIT.
                 let validation_result =
-                    validation::validate_with_expected_batches(&query.name, batches, &ref_batches)?;
+                    validation::validate_against_reference_batches(query, batches, &ref_batches)?;
 
                 if let QueryValidationResult::Fail(validation_reason) = validation_result {
                     eprintln!(
@@ -893,6 +902,22 @@ fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> Quer
     }
 }
 
+/// Warmup always validates when `--validate` is set: it is already materializing
+/// batches for the result snapshot, and a live reference query (TPC-DS, or TPC-H
+/// at scale factors other than 1) belongs off the timed path so the recorded
+/// durations still measure the accelerator. Timed iterations keep static-answer
+/// validation (TPC-H SF-1, scenario gold) because that is a local compare with
+/// no extra query.
+fn should_validate_on_run(validate: bool, is_warmup: bool, has_reference_schema: bool) -> bool {
+    if !validate {
+        return false;
+    }
+    if is_warmup {
+        return true;
+    }
+    !has_reference_schema
+}
+
 fn validation_result_after_reference_validation(
     validation_result: QueryValidationResult,
     reference_validation_passed: bool,
@@ -1006,6 +1031,26 @@ mod tests {
         let failed = QueryStatus::Failed(Some("snapshot assertion failed".into()));
 
         assert!(status_after_run(failed.clone(), None) == failed);
+    }
+
+    #[test]
+    fn test_reference_validation_runs_on_warmup_not_timed_iterations() {
+        assert!(
+            should_validate_on_run(true, true, true),
+            "warmup with a reference schema must compare results"
+        );
+        assert!(
+            !should_validate_on_run(true, false, true),
+            "timed iterations must not issue a second live reference query"
+        );
+        assert!(
+            should_validate_on_run(true, false, false),
+            "timed iterations keep cheap static-answer validation"
+        );
+        assert!(
+            !should_validate_on_run(false, true, true),
+            "nothing validates when --validate is off"
+        );
     }
 
     #[test]

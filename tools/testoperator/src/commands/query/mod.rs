@@ -19,6 +19,7 @@ use crate::{args::DatasetTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
+    anyhow::Context as _,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     spiced::SpicedInstance,
@@ -44,40 +45,41 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
-    let query_set = args.load_query_set()?;
-    let query_overrides = args
-        .query_overrides
-        .clone()
-        .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set
-        .get_queries(
-            query_overrides,
-            Some(&spiced_instance),
-            None,
-            args.scale_factor,
-        )
-        .await?;
-
-    let mut test = NotStarted::new()
+    let test = NotStarted::new()
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(5))
         .with_validate(args.validate)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-        .with_query_executor(executor)
-        .with_query_set(queries)
-        .with_query_set_type(query_set.clone())
-        .with_query_overrides(query_overrides);
+        .with_query_executor(executor);
 
-    if args.validate
-        && let Some(validation_data) =
-            query_set.get_validation_data(args.scenario_query_file.as_deref())?
-    {
-        test = test.with_validation_data(validation_data);
-    }
-
-    if let Some(ref_schema) = &args.reference_schema {
-        test = test.with_reference_schema(Some(ref_schema.clone()));
-    }
+    let test = if args.validate || args.reference_schema.is_some() {
+        // Result comparison needs the spicepod: either an explicit
+        // `--reference-schema` or a complete `<schema>.<table>` set already
+        // registered on the running instance. testoperator cannot inject
+        // `__test_reference.*` clones into a process it did not start.
+        let app = super::load_app(&args.common).await.context(
+            "--validate against an already-running spiced instance requires -p <spicepod.yaml> so the reference schema can be detected",
+        )?;
+        let (_, builder) = super::build_test_with_validation(args, &app, test).await?;
+        builder
+    } else {
+        let query_set = args.load_query_set()?;
+        let query_overrides = args
+            .query_overrides
+            .clone()
+            .map(test_framework::queries::QueryOverrides::from);
+        let queries = query_set
+            .get_queries(
+                query_overrides,
+                Some(&spiced_instance),
+                None,
+                args.scale_factor,
+            )
+            .await?;
+        test.with_query_set(queries)
+            .with_query_set_type(query_set)
+            .with_query_overrides(query_overrides)
+    };
 
     let benchmark_test = SpiceTest::new("local".to_string(), test)
         .with_spiced_instance(spiced_instance)

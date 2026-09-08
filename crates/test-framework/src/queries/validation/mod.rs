@@ -1086,6 +1086,42 @@ pub fn compare_query_result_batches_with_sort_check(
     })
 }
 
+/// Compare an under-test result to a live reference-schema result.
+///
+/// This is the `--validate` path for query sets that have no static answer
+/// files (TPC-DS, and TPC-H at scale factors other than 1): both sides are
+/// treated as engine answers for the same SQL on the same data. Row order
+/// follows the Cayenne correctness suite: positional equality only when the
+/// row set itself depends on order (top-level `ORDER BY` + `LIMIT`); otherwise
+/// a multiset compare so scan order cannot produce a false mismatch. A side
+/// that violates its own `ORDER BY` still fails.
+///
+/// An `ORDER BY` the sort check could not fully verify is not a failure here —
+/// the rows were still compared. Callers that need to count that hole should
+/// use [`compare_query_result_batches_with_sort_check`] directly.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn validate_against_reference_batches(
+    query: &Query,
+    actual: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
+        RowOrder::Preserved
+    } else {
+        RowOrder::Multiset
+    };
+    let comparison = compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        actual,
+        reference,
+        order,
+    )?;
+    Ok(comparison.result)
+}
+
 /// Canonical row order for multiset equality: sort by stringified cell values
 /// across all columns (same string forms used by [`validate_batches_as_strings`]).
 fn sort_batch_lexicographic_as_strings(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -1712,6 +1748,73 @@ mod test {
                 QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
             ),
             "value mismatch must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_reordered_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual batch");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("reference batch");
+
+        let query = Query::new("tpcds_q1".into(), "SELECT k, v FROM t".into(), false);
+        let result = validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&reference),
+        )
+        .expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "TPC-DS queries without ORDER BY + LIMIT must compare as a multiset: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_detects_value_mismatch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 99]))],
+        )
+        .expect("reference");
+
+        let query = Query::new("tpcds_q64".into(), "SELECT v FROM t".into(), false);
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a wrong cell must fail TPC-DS reference validation: {result:?}"
         );
     }
 

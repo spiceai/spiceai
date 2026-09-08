@@ -5,4 +5,4 @@ tests:
     runner_type: spiceai-dev-large-runners
     ready_wait: 1200
     scale_factor: 10
-    validate_results: false
+    validate_results: true
