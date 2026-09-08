@@ -7310,7 +7310,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ae32853c9b122ac3e48d6fa87c740113379c0aa3#ae32853c9b122ac3e48d6fa87c740113379c0aa3"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=a7d9a3a2787fbaaf5315fb30c2d124825b5e8e3d#a7d9a3a2787fbaaf5315fb30c2d124825b5e8e3d"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18978,7 +18978,7 @@ dependencies = [
 [[package]]
 name = "sea-query"
 version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=b18fecfa59c5e5742c81e16f58eef6ae18e95e0d#b18fecfa59c5e5742c81e16f58eef6ae18e95e0d"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -18991,7 +18991,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=b18fecfa59c5e5742c81e16f58eef6ae18e95e0d#b18fecfa59c5e5742c81e16f58eef6ae18e95e0d"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",
