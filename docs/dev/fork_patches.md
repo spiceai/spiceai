@@ -97,7 +97,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `a7d9a3a2787fbaaf5315fb30c2d124825b5e8e3d` | `phillip/13957-timestamp-precision` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `96c361a7c8d0d29c7a76b0e92acf64268da3e2a2` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
-| [sea-query](#sea-query) | `b18fecfa59c5e5742c81e16f58eef6ae18e95e0d` | `phillip/preserve-chrono-fractions` |
+| [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
 | [snowflake-rs](#snowflake-rs) | `744ffd77fe82171a805562ce001a341a94d52541` | `spiceai-58` |
 | [spark-connect-rs](#spark-connect-rs) | `5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad` | `spiceai` |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |

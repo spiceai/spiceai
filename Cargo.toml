@@ -272,7 +272,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "a7d9a3a2787fbaaf5315fb30c2d124825b5e8e3d" } # branch: phillip/13957-timestamp-precision
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "96c361a7c8d0d29c7a76b0e92acf64268da3e2a2" } # branch: spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
