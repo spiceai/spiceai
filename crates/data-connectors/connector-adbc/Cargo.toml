@@ -44,7 +44,10 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-runtime = { path = "../../runtime" }
+# The cancellation guard builds an ADBC driver in-process, so it needs the raw
+# C-ABI types the driver manager dispatches through.
+adbc_ffi.workspace = true
+runtime = { path = "../../runtime", features = ["adbc"] }
 app = { path = "../../app" }
 datafusion-federation = { workspace = true }
 

@@ -27,12 +27,21 @@
 //! Scale defaults SF1 (`CAYENNE_PARITY_*_SF`). ClickBench: `CLICKBENCH_HITS_PARQUET`
 //! or ranking-deterministic fixture + env-failure log under `CAYENNE_PARITY_SCRATCH`.
 
+// Same set the sibling `..._vs_sqlite_test.rs` carries. These went unenforced
+// while the binary's `required-features` were unmet — clippy never built the
+// target, so it never linted it either.
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::format_push_string)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::clone_on_ref_ptr)]
+#![allow(clippy::used_underscore_binding)]
 
 #[path = "correctness/support/mod.rs"]
 mod support;
@@ -47,9 +56,10 @@ use support::inventory::build_inventory;
 use support::report::{RunResult, summary_line, write_coverage_report};
 use support::{
     CayenneHarness, ParityOutcome, TPCH_TABLES, assert_all_pass_or_excluded,
-    assert_modes_agree_on_actual_results, compare_actual_results, execute_cayenne, make_dim_batch,
-    make_fact_batch, micro_bench_queries, write_parquet,
+    assert_modes_agree_on_actual_results, compare_actual_results, compare_actual_results_detailed,
+    execute_cayenne, make_dim_batch, make_fact_batch, micro_bench_queries, write_parquet,
 };
+use test_framework::queries::validation::QueryValidationFailReason;
 use test_framework::queries::{
     Query, get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
 };
@@ -78,25 +88,10 @@ fn duckdb_query_batches(conn: &Connection, sql: &str) -> Result<Vec<RecordBatch>
     Ok(batches)
 }
 
-fn generate_tpch_parquet(out_dir: &Path, sf: f64) -> PathBuf {
-    std::fs::create_dir_all(out_dir).expect("tpch out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for tpch gen");
-    conn.execute_batch(&format!(
-        "INSTALL tpch;
-         LOAD tpch;
-         CALL dbgen(sf={sf});"
-    ))
-    .expect("dbgen");
-    for table in TPCH_TABLES {
-        let path = out_dir.join(format!("{table}.parquet"));
-        conn.execute_batch(&format!(
-            "COPY {table} TO '{}' (FORMAT PARQUET);",
-            path.display()
-        ))
-        .unwrap_or_else(|e| panic!("copy {table}: {e}"));
-    }
-    out_dir.to_path_buf()
+/// Generated in-process by `tpchgen`, so this needs no network and cannot fail
+/// for environmental reasons — see `support::tpch_data`.
+fn generate_tpch_parquet(out_dir: &Path, sf: f64) {
+    support::tpch_data::write_tpch_parquet(out_dir, sf);
 }
 
 fn load_duckdb_from_parquet(
@@ -170,8 +165,26 @@ async fn run_pair_with_df_baseline(
     match (cayenne_res, duck_res) {
         (Ok(c), Ok(d)) => {
             // --- Harness compares actual result batches ---
-            let direct = compare_actual_results(query, &c, &d);
-            if matches!(direct, ParityOutcome::Pass) {
+            let compared = compare_actual_results_detailed(query, &c, &d);
+            let direct = compared.outcome;
+            // `OrderUnchecked` means the rows matched and part of the ORDER BY
+            // could not be verified — a coverage note to carry through, not a
+            // mismatch to re-adjudicate against the DataFusion baseline.
+            if matches!(
+                direct,
+                ParityOutcome::Pass | ParityOutcome::OrderUnchecked { .. }
+            ) {
+                return direct;
+            }
+            // A sort violation is one engine disagreeing with its own ORDER BY,
+            // which the DataFusion baseline cannot adjudicate: it says nothing
+            // about the side that returned the rows out of order. Sending it
+            // below would let DuckDB's violation return as `Excluded` — counted
+            // as a pass — on the strength of Cayenne matching DataFusion.
+            if matches!(
+                compared.reason,
+                Some(QueryValidationFailReason::SortOrderViolation { .. })
+            ) {
                 return direct;
             }
             if let ParityOutcome::Fail { ref detail } = direct
@@ -184,7 +197,10 @@ async fn run_pair_with_df_baseline(
                     Ok(df_batches) => {
                         // Again: harness compares actual batches only.
                         let vs_df = compare_actual_results(query, &c, &df_batches);
-                        if matches!(vs_df, ParityOutcome::Pass) {
+                        if matches!(
+                            vs_df,
+                            ParityOutcome::Pass | ParityOutcome::OrderUnchecked { .. }
+                        ) {
                             return ParityOutcome::Excluded {
                                 reason: format!(
                                     "harness: Cayenne actual results match DataFusion baseline; \
@@ -277,6 +293,49 @@ fn normalize_ts(s: &str) -> String {
 }
 
 /// Run SQL against parquet files via plain DataFusion (no Cayenne) as a baseline.
+/// Verify Cayenne on its own when DuckDB is the side that cannot run the query.
+///
+/// A DuckDB binder rejection is a fact about DuckDB, not about Cayenne. The
+/// DataFusion baseline resolves the same SQL over the same parquet, so Cayenne's
+/// rows — and, through the shared compare path, the order it returned them in —
+/// can still be checked. Recording the exclusion without doing that left these
+/// queries with no verification of Cayenne at all, in the lane whose job is to
+/// provide it.
+async fn verify_cayenne_against_baseline(
+    query: &Query,
+    cayenne: &CayenneHarness,
+    parquet_dir: &Path,
+    duckdb_reason: &str,
+) -> ParityOutcome {
+    let rows = match execute_cayenne(cayenne, query.sql.as_ref()).await {
+        Ok(rows) => rows,
+        Err(detail) => {
+            return ParityOutcome::EngineError {
+                side: "cayenne",
+                detail,
+            };
+        }
+    };
+    match datafusion_query_parquet(parquet_dir, cayenne.tables.keys(), query.sql.as_ref()).await {
+        // A pass here is still an exclusion from the *DuckDB* comparison, and is
+        // recorded as one so the inventory and the census keep agreeing; what
+        // changes is that Cayenne was actually checked before it was recorded.
+        Ok(baseline) => match compare_actual_results(query, &rows, &baseline) {
+            ParityOutcome::Pass => ParityOutcome::Excluded {
+                reason: format!(
+                    "{duckdb_reason}; Cayenne verified against the DataFusion baseline instead"
+                ),
+            },
+            judged => judged,
+        },
+        Err(e) => ParityOutcome::Excluded {
+            reason: format!(
+                "{duckdb_reason}; the DataFusion baseline could not run it either: {e}"
+            ),
+        },
+    }
+}
+
 async fn datafusion_query_parquet(
     parquet_dir: &Path,
     table_names: impl Iterator<Item = &String>,
@@ -333,10 +392,7 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
         });
     }
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory());
     let report_path = scratch.join("cayenne_duckdb_micro_parity.log");
     let mut log = String::new();
     for r in &results {
@@ -353,6 +409,12 @@ async fn micro_bench_shapes_full_result_parity_vs_duckdb() {
     );
 }
 
+/// Make sure the TPC-H fixture is on disk. Shared by the TPC-H and SpiceBench
+/// lanes, which load the same generated tables.
+fn ensure_tpch_fixture(dir: &Path, sf: f64) {
+    support::tpch_data::ensure_tpch_fixture(dir, sf);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_full_result_parity_vs_duckdb() {
     let scratch = scratch_dir();
@@ -361,9 +423,7 @@ async fn tpch_full_result_parity_vs_duckdb() {
     eprintln!("TPC-H parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
@@ -409,10 +469,7 @@ async fn tpch_full_result_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write tpch log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory());
     assert!(
         fails.is_empty(),
         "TPC-H full-result parity failures (SF={sf}): {fails:#?}\nsee {}",
@@ -448,16 +505,37 @@ const TPCDS_TABLES: &[&str] = &[
     "web_site",
 ];
 
-fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
+/// Needs network for `INSTALL tpcds`; see [`generate_tpch_parquet`].
+fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> Option<PathBuf> {
+    // The generation database is temporary and fresh per run. `dsdgen` populates
+    // a schema and cannot be run twice against the same database — a reused one
+    // fails with `Table with name "call_center" already exists` the moment
+    // regeneration actually happens, which it never did while any leftover
+    // fixture was trusted.
+    let gen_home = tempfile::tempdir().expect("tpcds gen dir");
+    let conn =
+        Connection::open(gen_home.path().join("gen.duckdb")).expect("duckdb open for tpcds gen");
+    // Only `INSTALL` reaches DuckDB's extension repository, so only it can fail
+    // for want of a network and be reported as an environment that cannot supply
+    // the fixture. Everything after it is local: a `LOAD` that fails means the
+    // installed extension is unusable, and a `dsdgen` that fails means the
+    // generator is broken. Running the three as one batch made either of those
+    // indistinguishable from having no network, which turns a regression in the
+    // fixture into a passing exclusion.
+    if let Err(e) = conn.execute_batch("INSTALL tpcds;") {
+        eprintln!("TPC-DS fixture unavailable: {e}");
+        return None;
+    }
+    conn.execute_batch("LOAD tpcds;")
+        .expect("load DuckDB's tpcds extension, which installed successfully");
+    conn.execute_batch(&format!("CALL dsdgen(sf={sf});"))
+        .expect("generate the TPC-DS fixture with dsdgen");
+
+    // Replace what is on disk only now that generation has succeeded, so a
+    // machine that could not reach the extension repository keeps the fixture it
+    // already had instead of losing it to a run that was never going to finish.
+    let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).expect("tpcds out dir");
-    let gen_db = out_dir.join("gen.duckdb");
-    let conn = Connection::open(&gen_db).expect("duckdb open for tpcds gen");
-    conn.execute_batch(&format!(
-        "INSTALL tpcds;
-         LOAD tpcds;
-         CALL dsdgen(sf={sf});"
-    ))
-    .expect("dsdgen");
 
     // Export every base table that exists after dsdgen.
     let mut stmt = conn
@@ -473,15 +551,54 @@ fn generate_tpcds_parquet(out_dir: &Path, sf: f64) -> PathBuf {
         .collect();
     for table in names {
         let path = out_dir.join(format!("{table}.parquet"));
-        if let Err(e) = conn.execute_batch(&format!(
+        // Skipping a failed export would leave a partial fixture behind, which
+        // the next run reads as a complete one because the directory is not
+        // empty. Every name here came from `information_schema` a moment ago.
+        conn.execute_batch(&format!(
             "COPY {table} TO '{}' (FORMAT PARQUET);",
             path.display()
-        )) {
-            eprintln!("skip copy {table}: {e}");
-        }
+        ))
+        .unwrap_or_else(|e| panic!("export TPC-DS table {table}: {e}"));
     }
-    out_dir.to_path_buf()
+    // The stamp says a run finished; this says it finished with the tables the
+    // suite expects. They catch different things: an interrupted export, and a
+    // `dsdgen` that quietly stops emitting one — which would otherwise surface
+    // as queries failing on both engines and settling into `Excluded`.
+    let exported: std::collections::BTreeSet<String> = std::fs::read_dir(out_dir)
+        .expect("read tpcds fixture dir")
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".parquet")
+                .map(str::to_string)
+        })
+        .collect();
+    let missing: Vec<&str> = TPCDS_TABLES
+        .iter()
+        .copied()
+        .filter(|t| !exported.contains(*t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "dsdgen produced no parquet for TPC-DS tables {missing:?} in {}",
+        out_dir.display()
+    );
+
+    // Stamped only now, with every table exported. A run killed part-way leaves
+    // the directory populated but unstamped, so the next one regenerates instead
+    // of reading a fixture that is missing tables — where the queries against
+    // those tables fail on both engines and settle into `Excluded`, which counts
+    // as a pass.
+    support::mark_fixture_complete(out_dir, TPCDS_FIXTURE_REVISION);
+    Some(out_dir.to_path_buf())
 }
+
+/// Revision for the TPC-DS fixture. Unlike SSB and TPC-H the generator is
+/// DuckDB's `dsdgen`, not code in this repo, so there is no source to digest;
+/// the stamp is carried for its completeness half, and this bumps only if the
+/// export set or the extension pin changes.
+const TPCDS_FIXTURE_REVISION: &str = "duckdb-dsdgen-1";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_and_clickbench_parity_vs_duckdb() {
@@ -493,11 +610,11 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     let sf = env_f64("CAYENNE_PARITY_TPCDS_SF", 1.0);
     eprintln!("TPC-DS parity at SF={sf}");
     let tpcds_dir = scratch.join(format!("tpcds_sf{sf}"));
-    if !tpcds_dir.join("store_sales.parquet").exists()
-        && !tpcds_dir.join("date_dim.parquet").exists()
-    {
-        generate_tpcds_parquet(&tpcds_dir, sf);
-    }
+    // Reuse only a stamped fixture. Two sentinel files said nothing about the
+    // other twenty-two, so a directory left behind by an interrupted dsdgen was
+    // read as complete and its missing tables became `Excluded` — a pass.
+    let tpcds_fixture_missing = !support::fixture_is_current(&tpcds_dir, TPCDS_FIXTURE_REVISION)
+        && generate_tpcds_parquet(&tpcds_dir, sf).is_none();
 
     // Discover exported tables.
     let exported: Vec<String> = std::fs::read_dir(&tpcds_dir)
@@ -513,24 +630,43 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
         .unwrap_or_default();
     let table_refs: Vec<&str> = exported.iter().map(String::as_str).collect();
 
-    if table_refs.is_empty() {
+    if tpcds_fixture_missing {
         results.push(RunResult {
             suite: "tpcds".into(),
             name: "*".into(),
             engine_pair: "cayenne-duckdb",
             outcome: ParityOutcome::Excluded {
-                reason: "TPC-DS parquet generation produced no tables in this environment".into(),
+                reason: "TPC-DS fixture unavailable: DuckDB's tpcds extension could not be \
+                         installed in this environment (needs network)"
+                    .into(),
             },
         });
     } else {
+        // Generation succeeded, so tables must exist. Treating their absence as
+        // another environmental exclusion would let a silent generator failure
+        // count as a pass.
+        assert!(
+            !table_refs.is_empty(),
+            "TPC-DS generation reported success but exported no tables into {}",
+            tpcds_dir.display()
+        );
         let cayenne = load_cayenne_from_parquet(&tpcds_dir, &table_refs).await;
         let (duck_temp, duck) = load_duckdb_from_parquet(&tpcds_dir, &table_refs);
         let _keep = duck_temp;
 
+        let inventory = build_inventory();
         for q in get_tpcds_test_queries(None, Some(1.0)) {
-            let outcome =
+            // Reviewed exclusions live in the inventory, so the census counts them.
+            let outcome = if let Some(reason) = inventory
+                .iter()
+                .find(|e| e.suite == "tpcds" && e.name == q.name.as_ref())
+                .and_then(|e| e.duckdb_exclusion)
+            {
+                verify_cayenne_against_baseline(&q, &cayenne, &tpcds_dir, reason).await
+            } else {
                 run_pair_with_df_baseline("tpcds", &q, &cayenne, &duck, None, Some(&tpcds_dir))
-                    .await;
+                    .await
+            };
             eprintln!("tpcds/{} -> {outcome:?}", q.name);
             results.push(RunResult {
                 suite: "tpcds".into(),
@@ -561,11 +697,11 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
             )
         }
         None => {
-            let note = format!(
+            let note =
                 "CLICKBENCH_HITS_PARQUET unset; S3 spicepod clickbench/sf1 requires credentials \
                  not available in this environment. Using ranking-deterministic local fixture \
                  (power-law group counts, unique top-K ORDER BY keys) for full-content parity."
-            );
+                    .to_string();
             let capture = scratch.join("clickbench_sf1_env_failure.log");
             std::fs::write(
                 &capture,
@@ -650,10 +786,7 @@ async fn tpcds_and_clickbench_parity_vs_duckdb() {
     eprintln!("{}", summary_line(&results));
     eprintln!("coverage report: {}", coverage_path.display());
 
-    let unexplained: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let unexplained = support::report::unexplained(&results, &build_inventory());
     assert!(
         unexplained.is_empty(),
         "unexplained TPC-DS/ClickBench parity failures: {unexplained:#?}\nsee {}",
@@ -944,7 +1077,6 @@ fn make_reduced_hits(rows: usize) -> RecordBatch {
 }
 
 // Silence unused constant warning when tables list is for documentation only.
-#[allow(dead_code)]
 fn _tpcds_tables_doc() -> &'static [&'static str] {
     TPCDS_TABLES
 }
@@ -1165,7 +1297,7 @@ async fn chbench_sf1_load_mode_matrix_vs_duckdb() {
 /// Star Schema Benchmark: classic Q1.1–Q4.3 on deterministic reduced-scale data.
 #[tokio::test(flavor = "multi_thread")]
 async fn ssb_full_result_parity_vs_duckdb() {
-    use support::ssb_data::{SSB_TABLES, ssb_queries, write_ssb_parquet};
+    use support::ssb_data::{SSB_TABLES, ensure_ssb_fixture, ssb_queries};
 
     let scratch = scratch_dir();
     std::fs::create_dir_all(&scratch).ok();
@@ -1173,9 +1305,7 @@ async fn ssb_full_result_parity_vs_duckdb() {
     eprintln!("SSB parity vs DuckDB at scale={scale}");
 
     let ssb_dir = scratch.join(format!("ssb_scale{scale}"));
-    if !ssb_dir.join("lineorder.parquet").exists() {
-        write_ssb_parquet(&ssb_dir, scale);
-    }
+    ensure_ssb_fixture(&ssb_dir, scale);
 
     let cayenne = load_cayenne_from_parquet(&ssb_dir, SSB_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&ssb_dir, SSB_TABLES);
@@ -1204,10 +1334,7 @@ async fn ssb_full_result_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write ssb log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory());
     assert!(
         fails.is_empty(),
         "SSB full-result parity failures: {fails:#?}\nsee {}",
@@ -1225,9 +1352,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
     eprintln!("SpiceBench SF1 (TPC-H scenario) parity at SF={sf}");
 
     let parquet_dir = scratch.join(format!("tpch_sf{sf}"));
-    if !parquet_dir.join("lineitem.parquet").exists() {
-        generate_tpch_parquet(&parquet_dir, sf);
-    }
+    ensure_tpch_fixture(&parquet_dir, sf);
 
     let cayenne = load_cayenne_from_parquet(&parquet_dir, TPCH_TABLES).await;
     let (duck_temp, duck) = load_duckdb_from_parquet(&parquet_dir, TPCH_TABLES);
@@ -1279,10 +1404,7 @@ async fn spicebench_sf1_tpch_scenario_parity_vs_duckdb() {
     std::fs::write(&log_path, &log).expect("write spicebench log");
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory());
     assert!(
         fails.is_empty(),
         "SpiceBench SF1 parity failures: {fails:#?}\nsee {}",
@@ -1348,10 +1470,7 @@ async fn sqllancer_corpus_parity_vs_duckdb() {
     write_coverage_report(&scratch.join("parity_coverage.md"), &results).ok();
     eprintln!("{}", summary_line(&results));
 
-    let fails: Vec<_> = results
-        .iter()
-        .filter(|r| !r.outcome.is_pass_or_excluded())
-        .collect();
+    let fails = support::report::unexplained(&results, &build_inventory());
     assert!(
         fails.is_empty(),
         "SQLLancer corpus parity failures: {fails:#?}\nsee {}",

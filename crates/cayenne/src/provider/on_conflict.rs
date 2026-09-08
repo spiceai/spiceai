@@ -26,6 +26,7 @@ use super::pk_index::{
     CachedPkIndex, CheckedOutShardedPkIndex, PendingPkExistence, PkCheckoutGuard, PkDigestSet,
     PkExistenceRef,
 };
+use super::pk_validation::null_primary_key_message;
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -708,8 +709,9 @@ impl futures::Stream for PrimaryKeyValidationStream {
                 {
                     Poll::Ready(Some(Err(datafusion_common::DataFusionError::Execution(
                         format!(
-                            "Data validation failed for table '{}': Primary key values must be non-null",
-                            this.table_name
+                            "Data validation failed for table '{}': {}",
+                            this.table_name,
+                            null_primary_key_message(&batch, &this.pk_indices)
                         ),
                     ))))
                 } else {
@@ -999,6 +1001,21 @@ impl PkDeletionSnapshot {
             Self::PositionBased => 0,
             Self::Int64Pk { tombstones } => tombstones.delete_len(),
             Self::RowConverterBased { tombstones } => tombstones.delete_len(),
+        }
+    }
+
+    /// Count of re-insert records in this snapshot — keys whose tombstone is
+    /// superseded by a later insert.
+    ///
+    /// Its ratio to [`Self::delete_len`] is how much of the index is dead
+    /// weight: in an upsert workload most tombstones are immediately superseded,
+    /// so a high ratio means the index's size is carrying history the probe no
+    /// longer needs. `0` for `PositionBased`, matching `delete_len`.
+    pub(crate) fn insert_len(&self) -> usize {
+        match self {
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.insert_len(),
+            Self::RowConverterBased { tombstones } => tombstones.insert_len(),
         }
     }
 

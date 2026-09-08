@@ -101,16 +101,28 @@ impl MemoryVectorStore {
     }
 
     /// Replace-on-rewrite insert: drops any stored row whose formatted primary
-    /// key appears in `keys`, then appends the new batch. `keys` must be
-    /// parallel to `batch` rows.
+    /// key appears in `keys` or `evicted`, then appends the new batch. `keys`
+    /// must be parallel to `batch` rows.
+    ///
+    /// `evicted` names keys this write could not index at all, so `batch` carries
+    /// no row for them and only the delete applies. Deleting them here rather
+    /// than in a separate call keeps the store's all-or-nothing delete over the
+    /// whole set, so a failure leaves every row the store held before the call.
     pub(crate) fn upsert(
         &mut self,
         batch: RecordBatch,
         keys: Vec<String>,
+        evicted: &[String],
     ) -> Result<(), DataFusionError> {
         debug_assert_eq!(batch.num_rows(), keys.len());
 
-        self.delete_by_keys(&keys)?;
+        if evicted.is_empty() {
+            self.delete_by_keys(&keys)?;
+        } else {
+            let mut all = keys.clone();
+            all.extend_from_slice(evicted);
+            self.delete_by_keys(&all)?;
+        }
         if batch.num_rows() > 0 {
             self.write_target().push(StoredBatch { batch, keys });
         }
@@ -325,7 +337,7 @@ mod tests {
 
         // `upsert` deletes the superseded rows first, so it inherits the same failure.
         store
-            .upsert(batch(&[5]), keys(&[5]))
+            .upsert(batch(&[5]), keys(&[5]), &[])
             .expect_err("a batch whose mask does not match its rows cannot be filtered");
 
         assert_eq!(
@@ -340,7 +352,7 @@ mod tests {
         let mut store = store_of(&[&[1, 2]]);
         store.begin_replace_window();
         store
-            .upsert(batch(&[3, 4]), keys(&[3, 4]))
+            .upsert(batch(&[3, 4]), keys(&[3, 4]), &[])
             .expect("staging a batch inside a replace window succeeds");
         store.write_target().push(StoredBatch {
             batch: batch(&[5, 6]),

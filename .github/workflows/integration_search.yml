@@ -71,6 +71,7 @@ jobs:
         # `cargo test` will fail if snapshot changes are needed. Always attempt
         #  to make PR if 'always' update snapshots.
         if: ${{ always() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

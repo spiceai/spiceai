@@ -918,6 +918,7 @@ jobs:
 
       - name: Push snapshots to branch
         if: ${{ github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
+        timeout-minutes: 10
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

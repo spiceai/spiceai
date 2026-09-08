@@ -1,0 +1,25 @@
+---
+source: crates/runtime/tests/github/mod.rs
+expression: batches_to_string(&result_batches)
+---
++------------------+---------------+-------------+
+| column_name      | data_type     | is_nullable |
++------------------+---------------+-------------+
+| id               | Utf8          | YES         |
+| login            | Utf8          | YES         |
+| name             | Utf8          | YES         |
+| company          | Utf8          | YES         |
+| bio              | Utf8          | YES         |
+| blog             | Utf8          | YES         |
+| twitter_username | Utf8          | YES         |
+| location         | Utf8          | YES         |
+| avatar_url       | Utf8          | YES         |
+| url              | Utf8          | YES         |
+| is_hireable      | Boolean       | YES         |
+| followers        | Int64         | YES         |
+| following        | Int64         | YES         |
+| public_repos     | Int64         | YES         |
+| created_at       | Timestamp(ms) | YES         |
+| updated_at       | Timestamp(ms) | YES         |
+| owner            | Utf8          | NO          |
++------------------+---------------+-------------+

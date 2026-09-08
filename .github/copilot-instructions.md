@@ -6,6 +6,34 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 As an AI-native database, query results can NEVER be wrong. Correctness supersedes performance, developer experience, and feature velocity. Verify transformations preserve integrity (row counts, key values); rigorously test NULLs, empty sets, boundaries, type coercions, and overflow; when uncertain, return a structured error instead of possibly-wrong data. Never corrupt data or drop errors silently.
 
+## Evidence — no claim without a reproduction
+
+**A claim needs a reading *and* a run — the evidence is required in addition to the code inspection, not instead of it.** Inspection is how you find the defect and explain *why* it happens; running something is how you establish *that* it happens. Neither substitutes for the other: a run with no reading behind it gives a symptom whose cause you are guessing at, and invites a fix aimed at the symptom; a reading with no run behind it explains behavior the system may never exhibit. Read the code closely, then go get the artifact.
+
+**Every issue, concern, bug, regression, or performance claim you raise — in a PR, a GitHub issue, a review comment, or a message to the user — must carry, alongside the reasoning, evidence produced by *running* something external to the code you read.** A plausible-looking race, overflow, or lost update that nobody has observed is a hypothesis and must be labeled one.
+
+**Strengthen the reading with a model that does not share it.** Your reading of the code and a test you write from that reading fail together, because both carry whatever you have already misunderstood. A different model reading the same code adversarially does not inherit that blind spot, and is cheap next to the bug it catches: `grok:adversarial-review` challenges the approach and the design choices, `codex:rescue` gives an independent second diagnosis, `/code-review` covers the diff. Reach for one when the reading is load-bearing — a correctness or data-loss claim, a subtle concurrency or lifetime argument, or a finding you have not been able to reproduce, where the reading is all you have.
+
+What counts as evidence:
+
+- **An actual run of Spice.ai** — `spiced` against a real Spicepod, with the query output, the log line, or the wrong row count pasted in.
+- **A benchmark or harness run** — `testoperator`, `cbench`, the CH-benCH lab — with before/after numbers from the same rig; mandatory for anything about performance, memory, or lag. Keep the diagnostics and the result data the run emits, not just the headline number: per-query timings, the `--validate` output, the run directory, and the returned rows themselves are what turn a suspicious delta into a located one, and what let someone else re-derive your conclusion instead of taking it on trust.
+- **An artifact captured off a running system** — an `EXPLAIN` or `EXPLAIN ANALYZE` plan; `runtime.metrics`, `runtime.query_history` or `runtime.task_history` rows, or a scrape of the metrics endpoint; a CPU or heap profile, a flamegraph, an allocation or RSS trace; a stack dump, core dump, or backtrace. These are first-class evidence, not a consolation prize for when a test is hard to write — for a query engine the plan often *is* the observation.
+- **An end-to-end or integration test** that fails on current code and passes on the fix, exercising the real wired path (`make test-integration`, `test/spicepods/…`, `verify-cli`).
+- **A targeted experiment**: a property/fuzz test, a SQL session, a `curl`, a `psql` CDC feed — anything that exhibits the wrong behavior directly.
+
+**Match the artifact to the claim**; the wrong one proves nothing however real it is. Wrong results need the wrong rows. A pushdown, join-order, partitioning or statistics claim needs the plan — `EXPLAIN ANALYZE` reports the rows and time each operator actually saw, which is what separates a plan that looks wrong from one that is. Latency, throughput or lag needs metrics or a profile from the same rig, never a stopwatch. Memory needs RSS under `runtime.query.memory_limit` or a heap profile. A hang needs a stack dump; a crash needs the backtrace. Much of this is queryable in-process, so the cost of getting it is usually a `SELECT`.
+
+**A unit test alone is not evidence.** A unit test written from the same reading of the code that produced the claim encodes the same misunderstanding — it can pass on wrong code and fail on correct code — and it routinely misses exactly the failures that matter here: defaulted no-op wrapper methods (see *Trait evolution & wrapper delegation*), feature-gated paths, real I/O, concurrency, and anything the harness stubs out. Land the unit test as a regression guard, but prove the bug outside it first.
+
+Rules:
+
+- **Show the artifact** — the command and its actual output or numbers, not a summary of them. "Verified" without pasted output is not verified.
+- **Demonstrate the failure before the fix and its absence after**, with the same command. A check that only ever ran green proves nothing.
+- **If you cannot reproduce it, say exactly that** — "unverified, code inspection only" — with the repro you attempted and why it did not land. Never round a hypothesis up to a bug, and never present a change driven by one as a fix.
+- **Report negative results.** When the run contradicts your reading of the code, the reading was wrong: withdraw the claim rather than re-arguing it from the source.
+- The bar scales with the cost of being wrong, never down to zero: a correctness or data-loss claim needs a run of the engine, not a passing assertion.
+
 ## Build, test, lint (expensive — read first)
 
 Full workspace and release builds take 20–35 minutes. Minimize large builds:
@@ -52,7 +80,7 @@ make lint-rust-fix      # Auto-fix lint issues
 
 ## Rust standards
 
-Workspace is edition 2024, rust-version 1.96.1 — use stable features and modern std APIs through 1.96; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
+Workspace is edition 2024, rust-version 1.97.1 — use stable features and modern std APIs through 1.97; don't code to older subsets. Runtime is 64-bit minimum: assume `usize` is at least (never exactly) 64 bits. New `.rs` files need the copyright header (`Copyright 2024-2026 The Spice.ai OSS Authors`; vendored code in `crates/vendor/` exempt).
 
 ### Error handling (critical)
 
@@ -127,6 +155,20 @@ Async code must reach an `.await` at least every ~100µs — blocking a runtime 
 - **Link the data connector's docs for anything a dataset would hit identically** (connection parameters, role grants, type handling); reserve a component-specific page for what is genuinely specific to it (for a catalog: include/exclude patterns, registration).
 - **Make the wording testable**: build a message a user depends on in a pure function and assert its text in a unit test (see `empty_catalog_warning` and `schema_discovery_warning` in `crates/data_components/src/postgres/provider.rs`), so a reword cannot quietly drop the resource, the consequence, or the docs link.
 
+### Metrics
+
+`runtime-metrics` owns the shared instruments (`crates/runtime-metrics/src/acceleration.rs` and its siblings); a per-component observable set (e.g. the Postgres replication `MetricSpec`s) is for what only that component can see. One distinction decides the shape of everything below — whether the occurrence is an *event* or a *rate*:
+
+- **An event is an infrequent occurrence of interest: log it, and let a metric carry its values.** Rebuilding an acceleration, a replication slot invalidated, a dataset that failed to load. Someone reads these one at a time, so the occurrence belongs in a log line, which states it with everything a metric cannot carry — which dataset, why, and what to do about it. A counter that only says "it happened" is that same fact with the explanation stripped off. What the metric adds is the *quantity* no prose can reconstruct: time spent, rows and bytes processed, resulting size or lag.
+- **A frequent occurrence is not an event, and its rate is a measurement rather than a fact.** Nobody reads cache evictions or cache hits one at a time; what they read is the rate and how it moves. That is a metric from the outset (`{prefix}_cache_evictions`, `dataset_acceleration_cdc_apply_path_total`) and the question of logging each one never arises. Give it a value alongside the count wherever one exists — `replication_reconnects_total` is paired with `replication_disconnected_ms_total`, which is what says whether a reconnect storm actually cost anything.
+- **A failure can be both**, and that is not a contradiction: `dataset_acceleration_refresh_errors` is counted *and* each occurrence logged, because one failure has to be diagnosed on its own while a cluster of them is a rate. The metric there is earning its place as a rate — not as a record that something happened.
+- **Break down the cause of a rate; never of an event.** A `reason`/`cause` label pays for itself when the series has enough points for the proportions to mean something and the shift between them is the signal — `{prefix}_cache_evictions{reason=size|expired|invalidated}` (`EvictionReason` in `crates/cache/src/metrics.rs`), `dataset_acceleration_refresh_errors{reason=…}`. On an event it buys one series carrying one point: nothing to graph, no proportion to watch, and a label schema that must stay stable forever for a fact a sentence states better. `RebuildCause`/`CreationCause` in `crates/data_components/src/postgres_replication/mod.rs` are the pattern — a `label()` a log query matches on, a `reason()` an operator reads, and no metric dimension at all. Keep any label set you do add small, closed, and enumerated in code as an exhaustive enum; a label whose values come from user data or error text is unbounded cardinality, not a breakdown.
+- **Before adding an instrument, check whether an existing one already reports the values.** A new name for something an established family covers splits one question in two and usually loses dimensions the family already carries. A CDC rebuild (`refresh_mode: changes`, source history gone) re-enters `RefreshTask::run` at `RefreshMode::Full`, so it *already* records `dataset_acceleration_refresh_duration_ms{mode="full"}` — the duration and rows of the re-read, which a bare event counter would have thrown away — and a changes-mode dataset emits `mode="full"` for no other reason, so that series alone is the alert. Prefer making the existing path report the new case over minting a name for it.
+
+Corollaries: a counter whose value is "how many times this event happened" is the smell the first two bullets exist to catch — an event is logged, and `_total` on a once-per-dataset occurrence promises a rate that will never be interesting; don't publish a gauge that is constant-per-process (that is configuration, and belongs in a startup log); and prefer a counter over a gauge for anything cumulative, so a scrape gap cannot hide a change.
+
+Distinguish "none yet" from "not applicable", because an absent series and a `0` are read differently and only one of them is right for each. "None yet" should be published as `0` up front so a dashboard is not empty until the first occurrence and an alert can fire on the *rise* — `EvictionReason::ALL` exists so `add(0, …)` can seed every variant. "Not applicable here" must report **no** series rather than a constant `0` that reads as a real measurement — `replication_member_attached` is absent on a dedicated slot, which has no membership to report, and `replication_bootstrap_rows_expected` is absent when the source gave no estimate, so `Some(0)` can mean a known-empty table.
+
 ### User-facing configuration
 
 - **No boolean params in user-facing config** (Spicepod fields, connector `params`, CLI flags): a bool can't grow a third state and hides which value means "on". Use `#[serde(rename_all = "snake_case")]` enums whose variants describe behavior, mirroring precedent: `on_zero_results: return_empty|use_source`, `unsupported_type_action: error|warn|ignore|string`, `ready_state: on_load|on_registration|on_schema_resolved`, `check_availability: auto|disabled`, `on_schema_change: block|fail|append_new_columns|sync_all_columns`. Default (`#[default]`) to the conservative, back-compat-preserving variant. Booleans remain fine in internal, non-config code.
@@ -143,6 +185,7 @@ A new trait method with a default impl silently no-ops in wrapper/decorator impl
 
 ## Testing
 
+- **A green unit test is not proof a bug existed or is gone** — see *Evidence — no claim without a reproduction*: reproduce outside the unit test first, then land the unit test as the regression guard.
 - **Spicepod naming**: `{connector[variant]}-{accelerator[variant]}-{test_variant}`; non-accelerated must use the `-federated` suffix. Examples: `s3[parquet]-federated`, `mysql-duckdb[file]-on_zero_results`.
 - **testoperator** is the benchmark/test harness: `cargo run -p testoperator -- run bench -p test/spicepods/tpch/sf1/federated/duckdb.yaml -s spiced -d ./.data --query-set tpch --validate` (also `run throughput … --concurrency 25`).
 - **No fixed sleeps as readiness waits**: poll the actual condition with a bounded timeout, short interval, and a failure message carrying the last observed state — `runtime_ready_check[_with_timeout]`, `wait_until_true`, `util::retry` with `FibonacciBackoffBuilder`, health/ping probes, `SELECT 1`, refresh notifiers, result polling. Fixed sleeps only when time itself is under test (TTL, backoff, cron, rate limits) — keep them short and explain them.

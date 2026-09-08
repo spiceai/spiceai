@@ -37,7 +37,6 @@ use datafusion::{
     common::{Constraint, Constraints, DataFusionError, utils::quote_identifier},
     sql::TableReference,
 };
-use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 #[cfg(test)]
@@ -507,10 +506,7 @@ fn nsql_sql_context() -> NsqlSqlContext {
 }
 
 fn column_reference_columns(reference: &str) -> Vec<String> {
-    ColumnReference::try_from(reference).map_or_else(
-        |_| vec![reference.to_string()],
-        |columns| columns.iter().map(ToString::to_string).collect(),
-    )
+    util::column_reference::parse(reference).unwrap_or_else(|_| vec![reference.to_string()])
 }
 
 fn configured_acceleration_indexes(

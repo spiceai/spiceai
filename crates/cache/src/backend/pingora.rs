@@ -314,7 +314,7 @@ where
     /// The window `keys_matching` leaves — an entry admitted after its shard was walked —
     /// is the same one moka's predicate-based invalidation leaves, since a moka predicate
     /// only matches entries last modified before it was registered. For served results it
-    /// is closed on the write side by `TableInvalidationClock`, which refuses a cache write
+    /// is closed on the write side by `TableChangeClock`, which refuses a cache write
     /// whose read began before the invalidation. In the other direction, a key matched by
     /// the scan and then rewritten by a concurrent `insert` is removed on the strength of
     /// the value the scan saw, so a fresh entry can be dropped — a cache miss, never a
@@ -538,6 +538,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{InvalidationMode, StaleRejectionReason};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Simple test value that implements Sizeable
@@ -578,7 +579,8 @@ mod tests {
         fn record_size(_size: u64) {}
         fn record_max_size(_size: u64) {}
         fn record_eviction(_reason: EvictionReason) {}
-        fn record_stale_rejection() {}
+        fn record_stale_rejection(_reason: StaleRejectionReason) {}
+        fn record_table_invalidation(_mode: InvalidationMode) {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
         fn publish_counters_at_zero() {}
     }
@@ -607,7 +609,8 @@ mod tests {
                 fn record_item_count(_count: u64) {}
                 fn record_size(_size: u64) {}
                 fn record_max_size(_size: u64) {}
-                fn record_stale_rejection() {}
+                fn record_stale_rejection(_reason: StaleRejectionReason) {}
+                fn record_table_invalidation(_mode: InvalidationMode) {}
                 fn update_hit_ratio(_hits: u64, _total: u64) {}
                 fn publish_counters_at_zero() {}
 
@@ -1315,7 +1318,8 @@ mod tests {
         fn record_size(_size: u64) {}
         fn record_max_size(_size: u64) {}
         fn record_eviction(_reason: EvictionReason) {}
-        fn record_stale_rejection() {}
+        fn record_stale_rejection(_reason: StaleRejectionReason) {}
+        fn record_table_invalidation(_mode: InvalidationMode) {}
         fn update_hit_ratio(_hits: u64, _total: u64) {}
         fn publish_counters_at_zero() {}
     }

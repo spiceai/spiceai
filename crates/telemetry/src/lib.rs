@@ -344,10 +344,68 @@ pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
 }
 
 static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static PROCESS_RESIDENT_ANON_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static PROCESS_RESIDENT_FILE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
-/// Records the process's resident set size — the number the kernel's OOM
-/// decision is made on. Budgets and pool gauges describe intent; this describes
-/// fact, and the gap between them is the off-pool/unaccounted memory.
+/// Records the process's resident memory split into anonymous and file-backed.
+///
+/// Separate metric names rather than a `kind` label on
+/// `process_resident_memory_bytes`: that gauge is published unlabelled as the
+/// total, so adding labelled series to the same family would make a bare
+/// `sum()` count the total AND its own halves.
+///
+/// **Anonymous is the one to watch.** It is the half that cannot be reclaimed,
+/// the half a heap profiler can attribute, and the half that gets a pod killed —
+/// and it moves independently of the total: measured on a Cayenne file-mode
+/// refresh workload, anonymous grew 1.4 GiB between two samples while
+/// file-backed did not move at all. Watching the sum hid that entirely.
+///
+/// On Linux `anon + file` can fall slightly below the total, which is
+/// `RssAnon + RssFile + RssShmem`; the remainder is shared memory, usually none.
+pub fn track_process_resident_split(anon: u64, file: u64, dimensions: &[KeyValue]) {
+    record_via_cached(
+        &PROCESS_RESIDENT_ANON_BYTES,
+        || {
+            global::meter("process")
+                .u64_gauge("process_resident_anon_bytes")
+                .with_description(
+                    "Anonymous resident bytes: heap and stacks, which the kernel cannot reclaim. The half of RSS that grows, that a profiler can attribute, and that triggers an OOM kill.",
+                )
+                .with_unit("By")
+                .build()
+        },
+        |gauge| gauge.record(anon, dimensions),
+    );
+    record_via_cached(
+        &PROCESS_RESIDENT_FILE_BYTES,
+        || {
+            global::meter("process")
+                .u64_gauge("process_resident_file_bytes")
+                .with_description(
+                    "File-backed resident bytes: mapped files and page cache the kernel evicts on demand. Real RSS, invisible to heap profilers, and not a leak.",
+                )
+                .with_unit("By")
+                .build()
+        },
+        |gauge| gauge.record(file, dimensions),
+    );
+}
+
+/// Records the process's total resident set size.
+///
+/// Budgets and pool gauges describe intent; this describes fact. But the gap
+/// between them is NOT all unaccounted memory: on a Cayenne file-mode workload
+/// roughly half of this figure has been measured as file-backed pages the kernel
+/// reclaims on demand — mapped metastore and Vortex files, real RSS, invisible
+/// to every heap profiler, and not a leak. Take the gap against
+/// `process_resident_anon_bytes` instead; the difference between anon and this
+/// total is page cache.
+///
+/// Nor is this the number a pod is killed on. The kernel OOM-kills on cgroup
+/// accounting, which also charges kernel memory (slab, page tables, socket
+/// buffers) that no per-process figure sees. For capacity planning use the
+/// cgroup's own `container_memory_working_set_bytes`; this family is for
+/// attributing memory to the process that allocated it.
 ///
 /// Resident memory is operator observability, not product-usage telemetry, so
 /// this binds to the OpenTelemetry **global** provider that `init_metrics`
@@ -707,6 +765,11 @@ pub struct CayenneAutotuneState {
     pub compaction_interval_ms: u64,
     /// Live small-file compaction trigger (file count).
     pub compaction_trigger_files: u64,
+    /// Live seq-prefix bake trigger — the deletion-index size the bake fires at.
+    /// Read from the same accessor the gate reads, so an experiment that pins
+    /// the value cannot report the controller's value instead of the one in
+    /// force.
+    pub bake_deletion_index_trigger: u64,
     /// Configured target Vortex file size (MB) — the reference compacted files
     /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
     pub target_file_size_mb: u64,
@@ -987,6 +1050,33 @@ pub mod cayenne {
                 .build()
         })
         .add(1, dimensions);
+    }
+
+    static DELETE_MAIN_VISIBILITY_DOWNGRADE: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts DELETEs whose main-snapshot re-insert handling was downgraded from
+    /// `Apply` to `Ignore` because a protected snapshot appeared between the plan being
+    /// built and the sink taking `write_lock`.
+    ///
+    /// The downgrade is what keeps the delete from tombstoning a key off a superseded
+    /// version and hiding the live replacement, and it is deliberately biased toward
+    /// under-deleting: rows in a snapshot published after the capture are not scanned by
+    /// that pass, and a later pass removes them. That trade is only sound while the
+    /// downgrade is rare, which is exactly what this counter is for — a rate that climbs
+    /// with ingest load means DELETEs are routinely leaving work behind, and the capture
+    /// should move under the execution-time lock instead. `dimensions` carries `table`.
+    pub fn track_delete_main_visibility_downgrade(dimensions: &[KeyValue]) {
+        DELETE_MAIN_VISIBILITY_DOWNGRADE
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_delete_main_visibility_downgrade_total")
+                    .with_description(
+                        "DELETEs whose main-snapshot re-insert handling was downgraded to Ignore because a protected snapshot was published after the scan sources were captured, labeled by table.",
+                    )
+                    .with_unit("deletes")
+                    .build()
+            })
+            .add(1, dimensions);
     }
 
     static MEM_TIER_APPLY_EPOCH: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1433,6 +1523,7 @@ pub mod cayenne {
     static AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static AT_BAKE_DELETION_INDEX_TRIGGER: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1544,6 +1635,18 @@ pub mod cayenne {
                     .build()
             })
             .record(state.compaction_trigger_files, dimensions);
+
+        AT_BAKE_DELETION_INDEX_TRIGGER
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_autotune_bake_deletion_index_trigger")
+                    .with_description(
+                        "Live seq-prefix bake trigger: the deletion-index size (`cayenne_deletion_index_len`) at which the bake fires.",
+                    )
+                    .with_unit("keys")
+                    .build()
+            })
+            .record(state.bake_deletion_index_trigger, dimensions);
         AT_TARGET_FILE_SIZE_MB
         .get_or_init(|| {
             operational_meter()
@@ -1913,8 +2016,9 @@ pub mod cayenne {
     /// Records the current size in bytes of the metastore `-wal` file, sampled on the
     /// background maintenance checkpoint tick (and after the inline backstop). A WAL
     /// that keeps growing means the passive checkpoint cannot keep pace with the CDC
-    /// commit rate. `dimensions` may carry `table` (the maintenance tick that sampled
-    /// it) — the WAL file itself is shared across the catalog's tables.
+    /// commit rate. `dimensions` carries `catalog` (the metastore path): the WAL file
+    /// is shared across the catalog's tables, so without it every dataset's metastore
+    /// would overwrite one another's sample on a single series.
     pub fn track_metastore_wal_bytes(bytes: u64, dimensions: &[KeyValue]) {
         METASTORE_WAL_BYTES
         .get_or_init(|| {
@@ -2053,6 +2157,1017 @@ pub mod cayenne {
                 .build()
         })
         .record(bytes, dimensions);
+    }
+
+    // ────────────── Cayenne maintenance + footprint observability ──────────────
+    //
+    // Two questions these answer that nothing else could: "is each maintenance
+    // operation running, and if not, why not", and "what is this dataset's disk
+    // and metastore footprint made of". Both were previously answerable only from
+    // debug logs and a hand-opened metastore.
+    //
+    // `kind` reuses the vocabulary already on `cayenne_compaction_duration_ms`
+    // (`full`, `subset_current`, `subset`, `datalake`) plus `bake`, so a single
+    // label joins an attempt to its duration and merged bytes. `outcome` is
+    // `committed` / `no_op` / `failed`, or a `declined_*` reason — the prefix
+    // makes "why is nothing being reclaimed" one PromQL selector.
+
+    /// `dimensions` plus one more label.
+    ///
+    /// Every gauge family here that splits by tier, kind, or reachability needs
+    /// this, and open-coding it made the same three lines appear six times in
+    /// one module.
+    fn with_label(
+        dimensions: &[KeyValue],
+        key: &'static str,
+        value: &'static str,
+    ) -> Vec<KeyValue> {
+        let mut labelled = Vec::with_capacity(dimensions.len() + 1);
+        labelled.extend_from_slice(dimensions);
+        labelled.push(KeyValue::new(key, value));
+        labelled
+    }
+
+    static COMPACTION_OUTCOME: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts one compaction-family attempt and how it ended. `dimensions`
+    /// carries `table`, `kind` (the same `full` / `subset_current` / `subset` /
+    /// `datalake` vocabulary as `cayenne_compaction_duration_ms`, plus `bake`),
+    /// and `outcome`.
+    ///
+    /// Every early return records exactly one outcome, so `sum by (outcome)`
+    /// over a `kind` is that pass's complete decision history. The distinction
+    /// that only this metric can draw is `declined_*` versus `no_op`: "the pass
+    /// refused to run" and "the pass ran and found nothing to do" are different
+    /// diagnoses with different fixes, and a duration histogram cannot tell them
+    /// apart because neither records a duration.
+    pub fn track_compaction_outcome(dimensions: &[KeyValue]) {
+        COMPACTION_OUTCOME
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_compaction_outcome_total")
+                    .with_description(
+                        "Cayenne compaction passes by kind and outcome. `outcome` is `committed`, `no_op` (ran, nothing to merge), `aborted_concurrent_change` (merged, then a concurrent change invalidated the inputs at commit — work paid and discarded), `failed`, or a `declined_<reason>` naming why the pass never ran.",
+                    )
+                    .with_unit("passes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
+    static MAINTENANCE_OUTCOME: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts one non-compaction maintenance attempt and how it ended.
+    /// `dimensions` carries `table`, `op` (`orphan_dv_sweep` / `retention` /
+    /// `retired_dir_sweep`), and the same `outcome` grammar as
+    /// [`track_compaction_outcome`].
+    ///
+    /// Split from the compaction family so neither carries a label the other
+    /// cannot fill: these operations have no `kind`, and a compaction has no
+    /// `op` beyond its kind.
+    pub fn track_maintenance_outcome(dimensions: &[KeyValue]) {
+        MAINTENANCE_OUTCOME
+            .get_or_init(build_maintenance_outcome)
+            .add(1, dimensions);
+    }
+
+    fn build_maintenance_outcome() -> Counter<u64> {
+        operational_meter()
+            .u64_counter("cayenne_maintenance_outcome_total")
+            .with_description(
+                "Cayenne non-compaction maintenance passes (deletion-vector sweep, retention, retired-directory sweep) by operation and outcome.",
+            )
+            .with_unit("passes")
+            .build()
+    }
+
+    /// Registers a maintenance operation's counters at zero, so they appear in
+    /// the export before anything has happened. `dimensions` carries `table`
+    /// and `op`; the outcome series is registered as `reclaimed`.
+    ///
+    /// A counter with no samples and a counter that is not implemented look
+    /// identical to a consumer — "the deletion-vector sweep has never run" and
+    /// "the deletion-vector sweep is not instrumented" are very different
+    /// conclusions to draw from an empty query, and the first is the more
+    /// alarming one. Publishing zero makes the absence of reclamation an
+    /// observation instead of a gap. (Same technique as
+    /// [`register_query_counter`], for the same reason.)
+    pub fn register_maintenance_counters(dimensions: &[KeyValue]) {
+        let with_outcome = with_label(dimensions, "outcome", "reclaimed");
+        MAINTENANCE_OUTCOME
+            .get_or_init(build_maintenance_outcome)
+            .add(0, &with_outcome);
+        track_maintenance_reclaimed(0, 0, 0, dimensions);
+        track_maintenance_tombstoned_rows(0, dimensions);
+    }
+
+    static COMPACTION_TRIGGER: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts what caused a compaction pass to be attempted. `dimensions`
+    /// carries `table`, `kind`, and `trigger` (`small_file_count`,
+    /// `protected_snapshot_count`, `protected_snapshot_age`, `deletion_index`,
+    /// `deletion_index_memory_ceiling`).
+    ///
+    /// Pairs with [`track_compaction_outcome`]: the outcome says whether work
+    /// happened, this says which threshold asked for it — together they separate
+    /// "the trigger never fired" from "it fired and the pass was declined".
+    pub fn track_compaction_trigger(dimensions: &[KeyValue]) {
+        COMPACTION_TRIGGER
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_compaction_trigger_total")
+                    .with_description(
+                        "Cayenne compaction passes attempted, by the threshold that asked for the pass.",
+                    )
+                    .with_unit("passes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
+    static MAINTENANCE_RECLAIMED_FILES: OnceLock<Counter<u64>> = OnceLock::new();
+    static MAINTENANCE_RECLAIMED_BYTES: OnceLock<Counter<u64>> = OnceLock::new();
+    static MAINTENANCE_RECLAIMED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+    static MAINTENANCE_TOMBSTONED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Records what one maintenance pass physically reclaimed: files unlinked,
+    /// bytes those files occupied, and rows dropped. `dimensions` carries `table`
+    /// and `op`.
+    ///
+    /// This is the counterpart to the footprint gauges: the gauges say how big
+    /// the dataset is, these say how much each operation is actually giving back.
+    /// A growing gauge with a flat reclaim counter is the signature of a
+    /// reclamation path that is scheduled but never doing work.
+    ///
+    /// Every series in this family is a physical release, which is what makes it
+    /// summable across `op`. Rows a pass only MARKED deleted are counted by
+    /// [`track_maintenance_tombstoned_rows`] instead, and the two families must
+    /// never be added together — see that function for why.
+    pub fn track_maintenance_reclaimed(files: u64, bytes: u64, rows: u64, dimensions: &[KeyValue]) {
+        MAINTENANCE_RECLAIMED_FILES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_maintenance_reclaimed_files_total")
+                    .with_description("Files physically unlinked by Cayenne maintenance passes.")
+                    .with_unit("files")
+                    .build()
+            })
+            .add(files, dimensions);
+        MAINTENANCE_RECLAIMED_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_maintenance_reclaimed_bytes_total")
+                    .with_description("Bytes reclaimed by Cayenne maintenance passes (the on-disk size of the files it unlinked).")
+                    .with_unit("By")
+                    .build()
+            })
+            .add(bytes, dimensions);
+        MAINTENANCE_RECLAIMED_ROWS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_maintenance_reclaimed_rows_total")
+                    .with_description("Rows physically dropped by Cayenne maintenance passes: tombstones retired from the metastore by a deletion-vector sweep. Rows a retention pass only marked deleted are counted by cayenne_maintenance_tombstoned_rows_total, which is a different quantity and must not be added to this one.")
+                    .with_unit("rows")
+                    .build()
+            })
+            .add(rows, dimensions);
+    }
+
+    /// Records rows a maintenance pass MARKED deleted: tombstones written, not
+    /// space returned. `dimensions` carries `table` and `op`; retention is the
+    /// only operation that writes any today.
+    ///
+    /// Separate from [`track_maintenance_reclaimed`] because the two count
+    /// opposite events, and one summable family cannot hold both. Retention
+    /// CREATES a tombstone, counted here; the deletion-vector sweep REMOVES one,
+    /// counted under `cayenne_maintenance_reclaimed_rows_total`. Added together
+    /// the same row lands twice — once when it is marked and once when its
+    /// tombstone is reclaimed — overstating cleanup on exactly the stalled table
+    /// an operator is investigating. Read this against the reclaim family rather
+    /// than into it: this counter climbing while
+    /// `cayenne_maintenance_reclaimed_bytes_total` stays flat is the "deletes
+    /// recorded, nothing given back" shape.
+    pub fn track_maintenance_tombstoned_rows(rows: u64, dimensions: &[KeyValue]) {
+        MAINTENANCE_TOMBSTONED_ROWS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_maintenance_tombstoned_rows_total")
+                    .with_description("Rows a Cayenne maintenance pass marked deleted without reclaiming space: a retention pass writes tombstones, and the bytes return only once a later compaction rewrites without them. NOT summable with cayenne_maintenance_reclaimed_rows_total, which counts tombstones removed rather than written.")
+                    .with_unit("rows")
+                    .build()
+            })
+            .add(rows, dimensions);
+    }
+
+    /// A table's in-memory deletion index, sampled where the seq-prefix bake
+    /// reads it. This is the *input* to the bake trigger, so without it a
+    /// `declined_below_trigger` outcome cannot be interpreted.
+    #[derive(Debug, Clone, Copy)]
+    pub struct CayenneDeletionIndexState {
+        /// Live tombstones (`delete_len`) — the value compared against the bake
+        /// trigger.
+        pub len: u64,
+        /// Re-insert records (`insert_len`). In an upsert workload most
+        /// tombstones are superseded by a re-insert, so the ratio to `keys` says
+        /// how much of the index is dead weight.
+        pub reinserts: u64,
+        /// Approximate resident bytes — the quantity the OOM backstop measures
+        /// against the query memory pool.
+        pub resident_bytes: u64,
+    }
+
+    static DELETION_INDEX_LEN: OnceLock<Gauge<u64>> = OnceLock::new();
+    static DELETION_INDEX_REINSERTS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static DELETION_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publishes the deletion-index gauges for one table. `dimensions` carries
+    /// `table`.
+    pub fn track_deletion_index(state: CayenneDeletionIndexState, dimensions: &[KeyValue]) {
+        DELETION_INDEX_LEN
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_deletion_index_len")
+                    .with_description(
+                        "Live tombstones in a Cayenne table's in-memory deletion index — the input to the seq-prefix bake trigger.",
+                    )
+                    .with_unit("keys")
+                    .build()
+            })
+            .record(state.len, dimensions);
+        DELETION_INDEX_REINSERTS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_deletion_index_reinserts")
+                    .with_description(
+                        "Re-insert records in a Cayenne table's in-memory deletion index; the fraction of `cayenne_deletion_index_len` they cover is the superseded (dead) share.",
+                    )
+                    .with_unit("keys")
+                    .build()
+            })
+            .record(state.reinserts, dimensions);
+        DELETION_INDEX_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_deletion_index_bytes")
+                    .with_description(
+                        "Approximate resident bytes of a Cayenne table's in-memory deletion index — the quantity the bake's OOM backstop measures against the query memory pool.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.resident_bytes, dimensions);
+    }
+
+    /// One Cayenne table's on-disk and metastore footprint, sampled on the
+    /// background maintenance tick.
+    ///
+    /// Counts and bytes come from the authoritative `cayenne_snapshot_file`
+    /// manifest and the `cayenne_delete_file` / `cayenne_cold_tier_file` /
+    /// inlined tables, not from a directory walk — a single aggregate query per
+    /// tick rather than a LIST per snapshot.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct CayenneTableStorage {
+        /// Data files in the current snapshot.
+        pub current_files: u64,
+        /// On-disk bytes of the current snapshot's data files.
+        pub current_bytes: u64,
+        /// Rows in the current snapshot's data files (before deletions apply).
+        pub current_rows: u64,
+        /// Data files across the protected snapshots (the merge-on-read runs).
+        pub protected_files: u64,
+        /// On-disk bytes of the protected snapshots' data files.
+        pub protected_bytes: u64,
+        /// Rows in the protected snapshots' data files (before deletions apply).
+        pub protected_rows: u64,
+        /// Files promoted to the cold object-store tier.
+        pub cold_files: u64,
+        /// Bytes of the cold-tier files.
+        pub cold_bytes: u64,
+        /// Rows in the cold-tier files.
+        pub cold_rows: u64,
+        /// Live deletion-vector files.
+        pub delete_files: u64,
+        /// On-disk bytes of the deletion-vector files. A value approaching or
+        /// exceeding `current_bytes + protected_bytes` means the deletion set
+        /// now costs more than the data it shadows.
+        pub delete_file_bytes: u64,
+        /// Tombstones recorded across those deletion-vector files.
+        pub delete_file_tombstones: u64,
+        /// Manifest rows reachable from the current snapshot or a registered
+        /// snapshot sequence.
+        pub manifest_rows_reachable: u64,
+        /// Manifest rows pointing at snapshots that are no longer live — dead
+        /// weight in the metastore until a compaction prunes them.
+        pub manifest_rows_unreachable: u64,
+        /// Registered snapshot sequences (the durable protected-snapshot set).
+        pub snapshot_sequences: u64,
+        /// Per-file pruning-statistics rows (`cayenne_snapshot_file_statistics`).
+        pub file_statistics_rows: u64,
+        /// Re-insert records held in the metastore.
+        pub insert_records: u64,
+        /// Inline (level-0) data entries not yet checkpointed to Vortex files.
+        pub inlined_entries: u64,
+        /// Rows held in those inline entries.
+        pub inlined_rows: u64,
+        /// Serialized Arrow IPC bytes held inline.
+        pub inlined_bytes: u64,
+        /// Inline tombstone entries not yet flushed to deletion vectors.
+        pub inlined_delete_entries: u64,
+        /// Tombstones held in those inline entries.
+        pub inlined_delete_rows: u64,
+    }
+
+    static STORAGE_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static STORAGE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static STORAGE_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static STORAGE_MANIFEST_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static STORAGE_METASTORE_ROWS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publishes one table's footprint gauges. `dimensions` carries `table`; a
+    /// `tier` label (`current` / `protected` / `cold` / `delete_vector` /
+    /// `inline`) splits files, bytes, and rows so the growth can be attributed
+    /// to the layer producing it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one gauge family emitted per tier; splitting it would separate the label vocabulary from the values it labels"
+    )]
+    pub fn track_table_storage(storage: &CayenneTableStorage, dimensions: &[KeyValue]) {
+        let files = STORAGE_FILES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_storage_files")
+                .with_description(
+                    "Files a Cayenne table holds, by storage tier (`current`, `protected`, `cold`, `delete_vector`). These are PATHS: a manifest path is resolved against its own snapshot's directory, so a file a new snapshot inherited via a hard link counts under both. `cayenne_maintenance_reclaimed_bytes_total` is the physical counterpart. The `inline` tier is deliberately absent — level-0 lives in metastore rows, not files, so its entry count belongs to `cayenne_metastore_table_rows` rather than a gauge measured in files.",
+                )
+                .with_unit("files")
+                .build()
+        });
+        let bytes = STORAGE_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_storage_bytes")
+                .with_description(
+                    "On-disk bytes a Cayenne table holds, by storage tier. The `delete_vector` tier is the deletion set's own footprint — compare it against `current` + `protected` to see a deletion set outgrowing the data it shadows.",
+                )
+                .with_unit("By")
+                .build()
+        });
+        let rows = STORAGE_ROWS.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_storage_rows")
+                .with_description(
+                    "Rows a Cayenne table holds, by storage tier, before deletions are applied. The `delete_vector` tier is the tombstone count.",
+                )
+                .with_unit("rows")
+                .build()
+        });
+
+        for (tier, f, b, r) in [
+            (
+                "current",
+                Some(storage.current_files),
+                storage.current_bytes,
+                storage.current_rows,
+            ),
+            (
+                "protected",
+                Some(storage.protected_files),
+                storage.protected_bytes,
+                storage.protected_rows,
+            ),
+            (
+                "cold",
+                Some(storage.cold_files),
+                storage.cold_bytes,
+                storage.cold_rows,
+            ),
+            (
+                "delete_vector",
+                Some(storage.delete_files),
+                storage.delete_file_bytes,
+                storage.delete_file_tombstones,
+            ),
+            // The inline tier has no files: level-0 lives in metastore rows.
+            // Publishing its entry count under a gauge whose unit is `files`
+            // would mix units, so a sum across tiers would overstate the object
+            // count. That entry count is `cayenne_metastore_table_rows` for
+            // `cayenne_inlined_data`.
+            ("inline", None, storage.inlined_bytes, storage.inlined_rows),
+        ] {
+            let d = with_label(dimensions, "tier", tier);
+            if let Some(f) = f {
+                files.record(f, &d);
+            }
+            bytes.record(b, &d);
+            rows.record(r, &d);
+        }
+
+        let manifest_rows = STORAGE_MANIFEST_ROWS.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_snapshot_manifest_rows")
+                .with_description(
+                    "Rows a Cayenne table holds in the `cayenne_snapshot_file` manifest, split by whether the snapshot they name is still live. A row is a (snapshot, file) pair naming one path on disk, so the reachable count equals the sum of `cayenne_storage_files` over the `current` and `protected` tiers. Unreachable rows are metastore weight no query can use.",
+                )
+                .with_unit("rows")
+                .build()
+        });
+        for (reachable, value) in [
+            ("true", storage.manifest_rows_reachable),
+            ("false", storage.manifest_rows_unreachable),
+        ] {
+            let d = with_label(dimensions, "reachable", reachable);
+            manifest_rows.record(value, &d);
+        }
+
+        let metastore_rows = STORAGE_METASTORE_ROWS.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_metastore_table_rows")
+                .with_description(
+                    "Metastore rows attributable to one Cayenne table, by metastore table — the per-table breakdown of metastore growth. These are ROW counts, not state: `cayenne_snapshot_file` counts (snapshot, file) pairs including dead snapshots' — see `cayenne_snapshot_manifest_rows{reachable}` before reading a large value as a large table.",
+                )
+                .with_unit("rows")
+                .build()
+        });
+        for (metastore_table, value) in [
+            (
+                "cayenne_snapshot_file",
+                storage.manifest_rows_reachable + storage.manifest_rows_unreachable,
+            ),
+            (
+                "cayenne_snapshot_file_statistics",
+                storage.file_statistics_rows,
+            ),
+            ("cayenne_snapshot_sequence", storage.snapshot_sequences),
+            ("cayenne_delete_file", storage.delete_files),
+            ("cayenne_insert_record", storage.insert_records),
+            ("cayenne_inlined_data", storage.inlined_entries),
+            ("cayenne_inlined_delete", storage.inlined_delete_entries),
+            ("cayenne_cold_tier_file", storage.cold_files),
+        ] {
+            let d = with_label(dimensions, "metastore_table", metastore_table);
+            metastore_rows.record(value, &d);
+        }
+    }
+
+    static METASTORE_DB_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the size in bytes of the metastore `SQLite` database file itself,
+    /// sampled (a cheap `stat()`) alongside [`track_metastore_wal_bytes`].
+    /// `dimensions` carries `catalog` (the metastore path).
+    ///
+    /// The database file plus the `-wal` file is the whole metadata footprint;
+    /// without this only the WAL half was observable.
+    pub fn track_metastore_db_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        METASTORE_DB_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_metastore_db_bytes")
+                    .with_description(
+                        "Current size in bytes of the Cayenne metastore SQLite database file.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(bytes, dimensions);
+    }
+
+    // ───────────────── Cayenne primary-key index observability ─────────────────
+    //
+    // The PK existence index is the structure an upsert-heavy CDC apply leans on
+    // hardest, and the one whose failures are silent: a discarded index is
+    // rebuilt from the table, which is correct but costs a full keyset scan and
+    // (for a bloom) re-sizes the filter. Nothing in the write-path timings
+    // separates "the index was reused" from "it was thrown away and rebuilt".
+    //
+    // The `site` label is the load-bearing one. It names WHICH store path
+    // discarded the index, and a discard concentrated at one site is what
+    // distinguishes a genuine invalidation from a checkout-time guard firing on
+    // indexes that needed no invalidating. If these are ever trimmed for
+    // cardinality, keep `site`.
+
+    /// What one Cayenne table's data directory actually holds on disk, by file
+    /// role.
+    ///
+    /// Measured by walking the directory, not read from the manifest — the
+    /// difference between the two is the point. The manifest counts the files a
+    /// scan will read; the directory also holds retired snapshot dirs awaiting
+    /// their sweep, deletion vectors nothing reclaimed, and staging left by an
+    /// interrupted write. A directory materially larger than
+    /// `cayenne_storage_bytes` is space no query can use.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct CayenneDataDirUsage {
+        /// `.vortex` data files anywhere under the table directory, including
+        /// snapshot directories the manifest no longer references.
+        pub data_files: u64,
+        /// Bytes of those data files.
+        pub data_bytes: u64,
+        /// Deletion-vector files (under `deletions/`).
+        pub deletion_vector_files: u64,
+        /// Bytes of the deletion-vector files.
+        pub deletion_vector_bytes: u64,
+        /// Files under a `_staging/` directory — an interrupted write's residue
+        /// when they outlive the write that made them.
+        pub staging_files: u64,
+        /// Bytes under `_staging/`.
+        pub staging_bytes: u64,
+        /// Everything else (write-ahead logs, temporary files).
+        pub other_files: u64,
+        /// Bytes of everything else.
+        pub other_bytes: u64,
+        /// Snapshot directories present on disk. Compare against
+        /// `cayenne_snapshot_manifest_rows` and the protected-snapshot count: a
+        /// directory count far above the live snapshot count is retired
+        /// directories the sweep has not reclaimed.
+        pub snapshot_dirs: u64,
+    }
+
+    static DATA_DIR_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static DATA_DIR_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static DATA_DIR_SNAPSHOT_DIRS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publishes one table's measured data-directory usage. `dimensions` carries
+    /// `table`; a `kind` label (`data` / `deletion_vector` / `staging` /
+    /// `other`) splits files and bytes by file role.
+    pub fn track_data_dir_usage(usage: &CayenneDataDirUsage, dimensions: &[KeyValue]) {
+        let files = DATA_DIR_FILES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_data_dir_files")
+                .with_description(
+                    "Files present in a Cayenne table's data directory by role (`data`, `deletion_vector`, `staging`, `other`), measured by walking the directory rather than reading the manifest.",
+                )
+                .with_unit("files")
+                .build()
+        });
+        let bytes = DATA_DIR_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_data_dir_bytes")
+                .with_description(
+                    "Bytes present in a Cayenne table's data directory by role. Compare against `cayenne_storage_bytes`: what the directory holds beyond what the manifest tracks is space no query can use.",
+                )
+                .with_unit("By")
+                .build()
+        });
+
+        for (kind, f, b) in [
+            ("data", usage.data_files, usage.data_bytes),
+            (
+                "deletion_vector",
+                usage.deletion_vector_files,
+                usage.deletion_vector_bytes,
+            ),
+            ("staging", usage.staging_files, usage.staging_bytes),
+            ("other", usage.other_files, usage.other_bytes),
+        ] {
+            let d = with_label(dimensions, "kind", kind);
+            files.record(f, &d);
+            bytes.record(b, &d);
+        }
+
+        DATA_DIR_SNAPSHOT_DIRS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_data_dir_snapshot_dirs")
+                    .with_description(
+                        "Snapshot directories present on disk for a Cayenne table. A count far above its live snapshot count is retired directories the sweep has not reclaimed.",
+                    )
+                    .with_unit("directories")
+                    .build()
+            })
+            .record(usage.snapshot_dirs, dimensions);
+    }
+
+    static PK_INDEX_DISCARD: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts a checked-out primary-key index that was thrown away instead of
+    /// being cached back. `dimensions` carries `table`, `site` (`table_keyset` /
+    /// `sharded_keyset`), `kind` (`exact` / `bloom`), and `reason`
+    /// (`overflowed` — the pending-key log hit its byte cap; `invalidated` — the
+    /// cache was invalidated while the index was out; `replay_over_budget` — the
+    /// replay pushed an exact keyset past its budget on a table that cannot
+    /// degrade to a bloom).
+    pub fn track_pk_index_discard(dimensions: &[KeyValue]) {
+        PK_INDEX_DISCARD
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_pk_index_discard_total")
+                    .with_description(
+                        "Cayenne primary-key indexes discarded rather than cached back, by the store site and the reason the index could no longer describe the table's live keys.",
+                    )
+                    .with_unit("indexes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
+    static PK_INDEX_PRESERVED: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts a checked-out primary-key index that was cached back for reuse —
+    /// the positive control for [`track_pk_index_discard`]. `dimensions` carries
+    /// `table`, `site`, and `kind`.
+    ///
+    /// A discard rate is uninterpretable without this: a low discard count can
+    /// mean the preserve path is healthy, or that nothing ever checked an index
+    /// out at all.
+    pub fn track_pk_index_preserved(dimensions: &[KeyValue]) {
+        PK_INDEX_PRESERVED
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_pk_index_preserved_total")
+                    .with_description(
+                        "Cayenne primary-key indexes cached back for reuse after a checkout — the positive control for `cayenne_pk_index_discard_total`.",
+                    )
+                    .with_unit("indexes")
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
+    /// Which representation a primary-key existence index currently holds.
+    ///
+    /// Reported as a numeric gauge code rather than a label, matching
+    /// `cayenne_data_storage_class`: the value is the thing that changes over
+    /// time, and a label would spread one index across three series with two of
+    /// them stale.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CayennePkIndexFormat {
+        /// No index is cached. Every conflict-validated batch rebuilds one from
+        /// the table — correct, but an O(live rows) scan inside the apply.
+        Absent = 0,
+        /// An exact keyset: every live primary key, with its row location and
+        /// (for the table-wide index) its per-key sequence stamp. Answers
+        /// "absent" with certainty, and is required by `on_conflict: do_nothing`.
+        /// Its bytes grow with the live key count until the budget is reached.
+        Exact = 1,
+        /// A bounded bloom filter: fixed bytes, no false negatives, some false
+        /// positives (which cost a validation, never correctness). What an
+        /// upsert table degrades to when the exact keyset exceeds its budget.
+        Bloom = 2,
+    }
+
+    impl CayennePkIndexFormat {
+        /// The gauge value for this format.
+        #[must_use]
+        pub const fn metric_code(self) -> u64 {
+            self as u64
+        }
+    }
+
+    static MEMORY_ACCOUNT_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static MEMORY_ACCOUNT_RESERVED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the memory Cayenne accounts for one table against the `DataFusion`
+    /// query pool: the three computed components, and the reservation those
+    /// components actually resized on the pool.
+    ///
+    /// `dimensions` carries `table`; the components are split by a `kind` label
+    /// (`keyset` / `deletion_index` / `cold_existence`).
+    ///
+    /// **Publishing both halves is the point.** `process_resident_memory_bytes`
+    /// describes fact and the pool gauges describe intent, and closing the gap
+    /// between them needs to know which side is wrong. If the components sum to
+    /// the reservation, the accounting is landing and any remaining resident
+    /// memory is off-pool structure. If they exceed it, the accounting itself is
+    /// not reaching the pool. One gauge cannot distinguish those, which is
+    /// exactly why a large resident figure next to a small
+    /// `query_memory_pool_used_bytes` was previously uninterpretable.
+    pub fn track_memory_account(
+        keyset_bytes: u64,
+        deletion_bytes: u64,
+        cold_existence_bytes: u64,
+        reserved_bytes: u64,
+        dimensions: &[KeyValue],
+    ) {
+        let components = MEMORY_ACCOUNT_BYTES.get_or_init(|| {
+            operational_meter()
+                .u64_gauge("cayenne_memory_account_bytes")
+                .with_description(
+                    "Memory Cayenne has COMPUTED for one table and registered against the DataFusion query pool, by kind (`keyset`, `deletion_index`, `cold_existence`). Compare the sum against `cayenne_memory_account_reserved_bytes`.",
+                )
+                .with_unit("By")
+                .build()
+        });
+        for (kind, bytes) in [
+            ("keyset", keyset_bytes),
+            ("deletion_index", deletion_bytes),
+            ("cold_existence", cold_existence_bytes),
+        ] {
+            let d = with_label(dimensions, "kind", kind);
+            components.record(bytes, &d);
+        }
+
+        MEMORY_ACCOUNT_RESERVED_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_memory_account_reserved_bytes")
+                    .with_description(
+                        "Bytes one Cayenne table's memory reservation currently holds on the DataFusion query pool — what actually reached the pool, against the `cayenne_memory_account_bytes` components that were computed for it.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(reserved_bytes, dimensions);
+    }
+
+    static MEM_TIER_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the resident bytes of one table's in-memory CDC tier.
+    /// `dimensions` carries `table`.
+    ///
+    /// The process-global figure (`cayenne_mem_tier_budget_used_bytes`)
+    /// says the tier is where the memory went; this says WHICH table put it
+    /// there. On a `mode: memory` table the tier holds the whole dataset
+    /// permanently, so the per-table split is what separates one such table from
+    /// a fleet of small ones.
+    pub fn track_mem_tier_bytes(bytes: u64, dimensions: &[KeyValue]) {
+        MEM_TIER_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_mem_tier_bytes")
+                    .with_description(
+                        "Resident bytes of one Cayenne table's in-memory CDC tier — the per-table breakdown of `cayenne_mem_tier_budget_used_bytes`.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(bytes, dimensions);
+    }
+
+    static SCAN_FILE_STATISTICS_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the number of entries in one table's scan file-statistics cache.
+    /// `dimensions` carries `table`.
+    ///
+    /// ENTRIES, not bytes: `DataFusion`'s cache trait exposes only `len()`, and
+    /// the per-entry `Statistics` cannot be sized through it. The entry count is
+    /// still the growth signal that matters — the cache holds one entry per file
+    /// and nothing bounds it, so a table accumulating files accumulates entries
+    /// with them, and this is the only view of that.
+    pub fn track_scan_file_statistics_entries(entries: u64, dimensions: &[KeyValue]) {
+        SCAN_FILE_STATISTICS_ENTRIES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_scan_file_statistics_entries")
+                    .with_description(
+                        "Entries in one Cayenne table's scan file-statistics cache (one per file, unbounded). Entries rather than bytes: DataFusion's cache trait exposes no per-entry size.",
+                    )
+                    .with_unit("entries")
+                    .build()
+            })
+            .record(entries, dimensions);
+    }
+
+    static INLINE_CACHE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static INLINE_CACHE_BATCHES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the resident Arrow bytes and batch count of a table's decoded
+    /// inline (level-0) view cache. `dimensions` carries `table`.
+    ///
+    /// This is an off-pool derived cache: it is not registered against the query
+    /// pool and does not appear in any budget, so before this it was resident
+    /// memory with no gauge at all. Its bytes are the *decoded* Arrow size, so
+    /// they legitimately exceed the serialized `cayenne_storage_bytes{tier="inline"}`
+    /// the same rows occupy in the metastore.
+    pub fn track_inline_cache(bytes: u64, batches: u64, dimensions: &[KeyValue]) {
+        INLINE_CACHE_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_inline_cache_bytes")
+                    .with_description(
+                        "Resident Arrow bytes of a Cayenne table's decoded inline (level-0) view cache — an off-pool derived cache that no budget bounds.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(bytes, dimensions);
+        INLINE_CACHE_BATCHES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_inline_cache_batches")
+                    .with_description(
+                        "Record batches held in a Cayenne table's decoded inline view cache.",
+                    )
+                    .with_unit("batches")
+                    .build()
+            })
+            .record(batches, dimensions);
+    }
+
+    static PK_INDEX_FORMAT: OnceLock<Gauge<u64>> = OnceLock::new();
+    static PK_INDEX_KEYS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static PK_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static PK_INDEX_BUDGET_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publishes one primary-key cache's resident bytes and the budget that
+    /// decides when it changes shape. `dimensions` carries `table` and `site`
+    /// (`table_keyset` / `sharded_keyset`).
+    ///
+    /// **Per cache, not per table.** A sharded (N>1) table keeps two of these at
+    /// once and gives each HALF the configured budget, and they transition
+    /// independently — one can be an exact keyset still growing while the other
+    /// has already degraded to a bloom. A per-table sum against a single budget
+    /// cannot express that, and the cache nearing its transition is the one worth
+    /// knowing about. Sum across `site` for a table total, or read
+    /// `cayenne_memory_account_bytes{kind="keyset"}`, which is that sum as the
+    /// memory account registers it against the query pool.
+    ///
+    /// Split from [`track_pk_index_shape`] because the two are available under
+    /// different conditions: these come from lock-free accounting counters and
+    /// can always be published, while the shape needs the cache itself.
+    ///
+    /// Only interpretable together with the format. Bytes alone cannot
+    /// distinguish an exact keyset growing toward its budget (which will degrade
+    /// to a bloom and give most of them back) from a bloom already at its fixed
+    /// size (which will not shrink); `bytes / budget_bytes` at
+    /// `cayenne_pk_index_format = 1` is the countdown to that transition.
+    pub fn track_pk_index_size(resident_bytes: u64, budget_bytes: u64, dimensions: &[KeyValue]) {
+        PK_INDEX_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_index_bytes")
+                    .with_description(
+                        "Approximate resident bytes of one Cayenne primary-key existence cache (`site`), whichever representation it holds. A sharded table keeps two, each with its own budget; sum across `site` for a table total.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(resident_bytes, dimensions);
+        PK_INDEX_BUDGET_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_index_budget_bytes")
+                    .with_description(
+                        "Effective byte budget THIS primary-key cache is bounded by — half the per-table figure on a sharded table, and already clamped by whatever the fleet has left. An exact keyset crossing it degrades to a bloom (upsert) or is dropped (exact-answer tables). The process-global ceiling is `cayenne_pk_keyset_budget_total_bytes`. 0 when unbounded.",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(budget_bytes, dimensions);
+    }
+
+    /// Publishes which representation one primary-key cache holds and how many
+    /// keys it covers. `dimensions` carries `table` and `site`.
+    ///
+    /// `keys` is `None` in bloom mode — a bloom cannot enumerate its members, and
+    /// publishing its insertion tally under a name that says "keys" made a
+    /// hot-key workload report ever-growing cardinality. It goes out as
+    /// `cayenne_pk_bloom_insertions` instead, named for what it is. `None`
+    /// records ZERO rather than skipping the gauge: a skipped gauge retains its
+    /// previous value, so an exact index that degraded to a bloom would keep
+    /// publishing its last authoritative count. `format` is the validity signal
+    /// for the pair — `keys` means something only at
+    /// [`CayennePkIndexFormat::Exact`].
+    ///
+    /// Reported per cache because the two caches transition independently, and
+    /// because a divergence in their key counts is itself a signal: they are
+    /// meant to cover the same key set in different layouts, so a gap between
+    /// them means one is stale. A per-table maximum would hide exactly that.
+    /// Do NOT sum `keys` across `site` — it double-counts every key. (Bytes do
+    /// sum; keys do not.)
+    pub fn track_pk_index_shape(
+        format: CayennePkIndexFormat,
+        keys: Option<u64>,
+        dimensions: &[KeyValue],
+    ) {
+        PK_INDEX_FORMAT
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_index_format")
+                    .with_description(
+                        "Representation of a Cayenne primary-key existence index: 0 absent (every validated batch rebuilds it), 1 exact keyset (grows with the live key count), 2 bounded bloom (fixed bytes, no false negatives).",
+                    )
+                    .build()
+            })
+            .record(format.metric_code(), dimensions);
+        // Zeroed, not skipped, when there is no authoritative count. A skipped
+        // gauge keeps its LAST value — the same reason the bloom density gauges
+        // are zeroed — so an exact index that degraded to a bloom would go on
+        // publishing its old distinct-key count beside `format = 2`, reading as
+        // authoritative cardinality a bloom cannot provide. `format` is the
+        // validity signal: `keys` is meaningful only at `format = 1`.
+        let keys = keys.unwrap_or(0);
+        PK_INDEX_KEYS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_index_keys")
+                    .with_description(
+                        "DISTINCT primary keys one Cayenne existence cache covers. Meaningful ONLY at `cayenne_pk_index_format = 1` (exact), where the count is authoritative; ZERO in bloom mode, which cannot enumerate its members and reports `cayenne_pk_bloom_insertions` instead. Must NOT be summed across `site`: the two caches hold the same key set in different layouts, so a divergence between them means one is stale.",
+                    )
+                    .with_unit("keys")
+                    .build()
+            })
+            .record(keys, dimensions);
+    }
+
+    /// One primary-key cache's bloom density, sampled on the background
+    /// maintenance tick.
+    #[derive(Debug, Clone, Copy)]
+    pub struct CayennePkBloomState {
+        /// Bits allocated by this cache's filter, or summed across its per-shard
+        /// filters — every one of them is resident.
+        pub bits: u64,
+        /// INSERTION count, not distinct keys. A bloom cannot enumerate its
+        /// members, so the filter tallies calls: re-upserting one key increments
+        /// it every time, and keys long since superseded are still counted. It is
+        /// therefore an upper bound on the distinct live keys covered.
+        pub insertions: u64,
+        /// Allocated bits per INSERTION — a LOWER BOUND on the true bits per
+        /// distinct key, since insertions are at or above distinct keys.
+        ///
+        /// The bound is in the useful direction: a value already above the
+        /// configured target proves over-allocation, because the true density is
+        /// higher still. It cannot prove the absence of over-allocation, which is
+        /// why it is named for the denominator it actually has.
+        pub bits_per_insertion: f64,
+    }
+
+    static PK_BLOOM_BITS_PER_INSERTION: OnceLock<Gauge<f64>> = OnceLock::new();
+    static PK_BLOOM_BITS: OnceLock<Gauge<u64>> = OnceLock::new();
+    static PK_BLOOM_INSERTIONS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publishes one cache's bloom density gauges. `dimensions` carries `table`
+    /// and `site`. Emit on every sample, ZEROED when that cache holds no bloom:
+    /// a skipped gauge keeps its last value, so a cache that rebuilt an exact
+    /// index would go on reporting a filter that no longer exists.
+    pub fn track_pk_bloom(state: CayennePkBloomState, dimensions: &[KeyValue]) {
+        PK_BLOOM_INSERTIONS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_bloom_insertions")
+                    .with_description(
+                        "Insertions into one Cayenne primary-key cache's bloom filters. NOT distinct keys: a bloom cannot enumerate its members, so re-upserting one key counts every time and superseded keys still count. An upper bound on the distinct live keys covered. Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
+                    )
+                    .with_unit("insertions")
+                    .build()
+            })
+            .record(state.insertions, dimensions);
+        PK_BLOOM_BITS_PER_INSERTION
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_pk_bloom_bits_per_insertion")
+                    .with_description(
+                        "Bits one Cayenne primary-key cache's bloom filters allocate per INSERTION — a lower bound on the true bits per distinct key. Already above the configured target proves over-allocation; it cannot prove the absence of it. Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
+                    )
+                    .with_unit("bits")
+                    .build()
+            })
+            .record(state.bits_per_insertion, dimensions);
+        PK_BLOOM_BITS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_bloom_bits")
+                    .with_description(
+                        "Bits one Cayenne primary-key cache's bloom filters allocate (summed across its per-shard filters). Describes a live filter ONLY at `cayenne_pk_index_format = 2`; it reads zero in every other state rather than holding its last value.",
+                    )
+                    .with_unit("bits")
+                    .build()
+            })
+            .record(state.bits, dimensions);
+    }
+
+    static PK_BLOOM_SPLIT_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts rows the primary-key bloom split on the CDC apply: `result="miss"`
+    /// rows the filter proved absent, which skip on-conflict validation
+    /// entirely, and `result="hit"` rows that had to be validated.
+    /// `dimensions` carries `table` and `result`.
+    ///
+    /// This is the filter's return on investment stated directly — the fraction
+    /// of apply rows it takes off the validation path.
+    pub fn track_pk_bloom_split_rows(rows: u64, dimensions: &[KeyValue]) {
+        PK_BLOOM_SPLIT_ROWS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_pk_bloom_split_rows_total")
+                    .with_description(
+                        "CDC apply rows split by the Cayenne primary-key bloom: `miss` rows skip on-conflict validation entirely, `hit` rows are validated.",
+                    )
+                    .with_unit("rows")
+                    .build()
+            })
+            .add(rows, dimensions);
+    }
+
+    static WRITE_SHAPE_SHARDS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Records the encode fan-out one write resolved to, together with the
+    /// branch that chose it. `dimensions` carries `table` and `decision`
+    /// (`serial_sort_columns` / `serial_required` / `size_bounded` /
+    /// `concurrency_bounded`).
+    ///
+    /// The shard count alone cannot be acted on: a fan-out of 1 caused by a
+    /// configured write concurrency is a knob to raise, while one caused by a
+    /// sort order is a structural property of the write that no knob reaches.
+    /// The `decision` label is what separates them.
+    pub fn track_write_shape_shards(shards: u64, dimensions: &[KeyValue]) {
+        WRITE_SHAPE_SHARDS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_write_shape_shards")
+                    .with_description(
+                        "Encode fan-out (shard count) a Cayenne snapshot write resolved to, labelled with the branch that chose it.",
+                    )
+                    .with_unit("shards")
+                    .build()
+            })
+            .record(shards, dimensions);
     }
 }
 

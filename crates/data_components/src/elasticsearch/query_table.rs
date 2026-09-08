@@ -667,10 +667,9 @@ fn parse_timestamp_to_unit(v: &serde_json::Value, unit: TimeUnit) -> Option<i64>
         parse_datetime_to_nanos(s)?
     } else if let Some(ms) = v.as_i64() {
         ms.checked_mul(1_000_000)?
-    } else if let Some(ms) = v.as_u64() {
-        i64::try_from(ms).ok()?.checked_mul(1_000_000)?
     } else {
-        return None;
+        let ms = v.as_u64()?;
+        i64::try_from(ms).ok()?.checked_mul(1_000_000)?
     };
     Some(match unit {
         TimeUnit::Second => nanos.div_euclid(1_000_000_000),
