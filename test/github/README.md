@@ -39,8 +39,9 @@ remain separate for organization and App-authentication tests.
 
 `check_permissions.py` verifies the full one-row stargazers selection before
 the live tests start. HTTP-success responses containing GraphQL errors fail;
-authentication and permission errors are not retried. Transient transport,
-server, and rate-limit failures get at most three attempts with a 60-second
+authentication and permission errors are not retried. Transient transport
+failures, including disconnected and truncated responses, and server/rate-limit
+failures get at most three attempts with a 60-second
 retry budget and a 15-second socket timeout; the CI step has a two-minute hard
 timeout. A rate-limit delay beyond the budget fails explicitly without retrying
 early, including GitHub's one-minute minimum when no timing headers are given.
