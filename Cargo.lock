@@ -17824,6 +17824,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-expr",
  "datafusion-federation",
+ "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
  "datafusion-spark",
