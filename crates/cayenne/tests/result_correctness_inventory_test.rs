@@ -417,6 +417,57 @@ fn a_content_only_recovery_cannot_pass_an_unverified_order() {
     );
 }
 
+/// An order nothing verified must fail the lane unless the inventory names why
+/// it cannot be verified. Counting every `OrderUnchecked` as acceptable is how a
+/// resolver regression — or an `ORDER BY` whose projection stops carrying the
+/// term — settles into a summary bucket instead of turning a lane red, which is
+/// the outcome the sort check exists to surface.
+#[test]
+fn an_unreviewed_unverified_order_fails_the_lane() {
+    use support::report::{RunResult, unexplained};
+
+    let hole = |suite: &str, name: &str| RunResult {
+        suite: suite.to_string(),
+        name: name.to_string(),
+        engine_pair: "cayenne-duckdb",
+        outcome: support::ParityOutcome::OrderUnchecked {
+            reasons: vec!["left: ORDER BY term does not map to a result column".to_string()],
+        },
+    };
+    let inventory = build_inventory();
+
+    // Reviewed in the inventory: an accepted, named hole.
+    let reviewed = [hole("tpcds", "tpcds_q36")];
+    assert!(
+        unexplained(&reviewed, &inventory).is_empty(),
+        "tpcds_q36's ORDER BY over a CASE the projection omits is reviewed"
+    );
+
+    // Not reviewed: the lane must not accept it.
+    let unreviewed = [hole("tpcds", "tpcds_q1")];
+    assert_eq!(
+        unexplained(&unreviewed, &inventory).len(),
+        1,
+        "an unverified order nobody has reviewed has to fail, not be counted"
+    );
+
+    // A violation is never covered by a review — that names an unverified order,
+    // not a wrong one.
+    let violating = [RunResult {
+        suite: "tpcds".to_string(),
+        name: "tpcds_q36".to_string(),
+        engine_pair: "cayenne-duckdb",
+        outcome: support::ParityOutcome::Fail {
+            detail: "SortOrderViolation".to_string(),
+        },
+    }];
+    assert_eq!(
+        unexplained(&violating, &inventory).len(),
+        1,
+        "a reviewed hole does not excuse a violation on the same query"
+    );
+}
+
 /// Prove the harness routes through the shipped `compare_query_result_batches`.
 #[test]
 fn harness_compare_actual_results_drives_shipped_path() {

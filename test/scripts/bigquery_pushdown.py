@@ -221,6 +221,33 @@ ORDER BY tok""",
 FROM union_values u
 WHERE u.value = 3
 ORDER BY u.value""",
+    # A recursive CTE that generates a series and joins it to a BigQuery table.
+    # BigQuery accepts `WITH RECURSIVE` only at the top level of a statement, so
+    # every layer between the plan and the driver has to leave it there: the
+    # unparser hoists it out of the derived table it plans into, and the ADBC
+    # schema fetch must not wrap the statement it is about to describe.
+    "recursive-cte-joined-to-a-table": """WITH RECURSIVE steps(n) AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT steps.n, COUNT(union_values.value) AS matches
+FROM steps
+LEFT JOIN union_values ON union_values.value = steps.n
+GROUP BY steps.n
+ORDER BY steps.n""",
+    "filtered-recursive-self-join": """WITH RECURSIVE steps AS (
+  SELECT 1 AS n
+  UNION ALL
+  SELECT n + 1 FROM steps WHERE n < 3
+)
+SELECT a.n, COUNT(union_values.value) AS matches
+FROM steps a
+JOIN steps b ON a.n = b.n
+JOIN union_values ON union_values.value = a.n
+WHERE a.n > 1 AND b.n < 3
+GROUP BY a.n
+ORDER BY a.n""",
 }
 
 EXPECTED_ROWS = {
@@ -360,6 +387,14 @@ EXPECTED_ROWS = {
         {"tok": "c", "running": 3},
         {"tok": "d", "running": 4},
     ],
+    # `union_values` holds [1, 1, 2, 2, 3], so the generated series meets two
+    # rows at 1, two at 2 and one at 3.
+    "recursive-cte-joined-to-a-table": [
+        {"n": 1, "matches": 2},
+        {"n": 2, "matches": 2},
+        {"n": 3, "matches": 1},
+    ],
+    "filtered-recursive-self-join": [{"n": 2, "matches": 2}],
 }
 
 
@@ -729,6 +764,17 @@ def assert_generated_sql(name: str, sql: str) -> None:
             raise HarnessError(
                 f"{name} binds as one SELECT for BigQuery, so it must not be scoped: {sql}"
             )
+    if name in {"recursive-cte-joined-to-a-table", "filtered-recursive-self-join"}:
+        if not sql.lstrip().upper().startswith("WITH RECURSIVE"):
+            raise HarnessError(
+                f"the recursive CTE is not at the top level of the pushed statement, "
+                f"which is the only place BigQuery accepts one: {sql}"
+            )
+        if sql.upper().count("WITH RECURSIVE") != 1:
+            raise HarnessError(
+                f"the recursive CTE was hoisted more than once, so BigQuery is asked "
+                f"to define the same name twice: {sql}"
+            )
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -846,7 +892,7 @@ def main() -> int:
                 "false",
                 str(pod_path),
             ],
-            cwd=ROOT,
+            cwd=output,
             env=environment,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -854,9 +900,15 @@ def main() -> int:
         wait_until_ready(process, http_port, timeout=180)
 
         generated_sql: dict[str, str] = {}
+        executions: dict[str, dict[str, str]] = {}
         for name, query in QUERIES.items():
             (output / f"{name}.sql").write_text(query + ";\n", encoding="utf-8")
+            query_started = datetime.now(timezone.utc)
             status, headers, body = http_sql(http_port, query)
+            executions[name] = {
+                "started": query_started.isoformat(),
+                "ended": datetime.now(timezone.utc).isoformat(),
+            }
             write_json(output / f"{name}.headers.json", headers)
             (output / f"{name}.body").write_text(body, encoding="utf-8")
             if status != 200:
@@ -879,8 +931,8 @@ def main() -> int:
             statements = pushed_statement_count(explain_body)
             if statements != 1:
                 raise HarnessError(
-                    f"{name} reaches BigQuery as {statements} statements, not one; "
-                    f"every extra one is another BigQuery job:\n{explain_body[:2000]}"
+                    f"{name} reaches BigQuery as {statements} statements, not one:\n"
+                    f"{explain_body[:2000]}"
                 )
             pushed_sql = initial_physical_sql(explain_body)
             assert_generated_sql(name, pushed_sql)
@@ -888,21 +940,17 @@ def main() -> int:
             print(f"{name}: ok ({statements} statement)")
 
         write_json(output / "generated-sql.json", generated_sql)
+        write_json(output / "executions.json", executions)
         jobs = []
         for job in sorted(
-            client.list_jobs(min_creation_time=started, max_results=100),
+            client.list_jobs(min_creation_time=started),
             key=lambda item: item.created,
         ):
             query = getattr(job, "query", None)
-            if query and not any(
-                table in query
-                for table in (
-                    "union_values",
-                    "json_values",
-                    "window_values",
-                    "regexp_values",
-                    "bucket_values",
-                )
+            default_dataset = getattr(job, "default_dataset", None)
+            if not query or (
+                dataset not in query
+                and (default_dataset is None or default_dataset.dataset_id != dataset)
             ):
                 continue
             jobs.append(
@@ -913,9 +961,21 @@ def main() -> int:
                     "state": job.state,
                     "error_result": job.error_result,
                     "query": query,
+                    "default_dataset": str(default_dataset) if default_dataset else None,
                 }
             )
         write_json(output / "bigquery-jobs.json", jobs)
+        counts = {
+            name: [
+                job["job_id"] for job in jobs
+                if execution["started"] <= job["created"] <= execution["ended"]
+            ]
+            for name, execution in executions.items()
+        }
+        write_json(output / "query-job-ids.json", counts)
+        for name, job_ids in counts.items():
+            if len(job_ids) != 1:
+                raise HarnessError(f"{name} created {len(job_ids)} BigQuery jobs: {job_ids}")
         succeeded = True
         print(f"PASS evidence={output}")
         return 0
