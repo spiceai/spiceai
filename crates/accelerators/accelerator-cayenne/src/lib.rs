@@ -6911,6 +6911,9 @@ mod tests {
     fn auto_tuned_config_fingerprint_covers_the_logged_values_only() {
         use data_accelerator_api::storage::ResolvedAccelerationStorage;
 
+        // Held fixed here; a moved metastore path has its own test below.
+        const DIR: &str = "/data/metadata/t";
+
         let hw = autotune::HardwareProfile::new(
             8,
             32 * 1024 * 1024 * 1024,
@@ -6919,13 +6922,13 @@ mod tests {
         );
         let workload = autotune::WorkloadProfile::default();
         let config = cayenne::metadata::VortexConfig::default();
-        let baseline = auto_tuned_config_fingerprint("t", &hw, &workload, &config);
+        let baseline = auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &config);
 
         // Deterministic: the same resolution fingerprints the same way, which is
         // what collapses the retry storm.
         assert_eq!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &config)
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &config)
         );
 
         // Every printed input participates.
@@ -6933,14 +6936,14 @@ mod tests {
         retuned.target_vortex_file_size_mb += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &retuned),
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &retuned),
             "a knob that appears in the line must change the fingerprint"
         );
         let mut bigger_host = hw;
         bigger_host.cores += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &bigger_host, &workload, &config),
+            auto_tuned_config_fingerprint("t", DIR, &bigger_host, &workload, &config),
             "the host basis appears in the line and must change the fingerprint"
         );
         let inferred = autotune::WorkloadProfile {
@@ -6949,12 +6952,12 @@ mod tests {
         };
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &inferred, &config),
+            auto_tuned_config_fingerprint("t", DIR, &hw, &inferred, &config),
             "the inferred workload signals appear in the line"
         );
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("other", &hw, &workload, &config),
+            auto_tuned_config_fingerprint("other", DIR, &hw, &workload, &config),
             "the fingerprint is per table"
         );
 
@@ -6965,7 +6968,7 @@ mod tests {
         unprinted.stream_publish_interval_ms += 1;
         assert_ne!(
             baseline,
-            auto_tuned_config_fingerprint("t", &hw, &workload, &unprinted)
+            auto_tuned_config_fingerprint("t", DIR, &hw, &workload, &unprinted)
         );
 
         // The calibration measurements are deliberately excluded: they are not
@@ -6975,7 +6978,7 @@ mod tests {
         probed.metastore_perf.write_mbps = Some(4_000.0);
         assert_eq!(
             baseline,
-            auto_tuned_config_fingerprint("t", &probed, &workload, &config),
+            auto_tuned_config_fingerprint("t", DIR, &probed, &workload, &config),
             "a measured storage rate is not part of the line and must not re-report it"
         );
     }
