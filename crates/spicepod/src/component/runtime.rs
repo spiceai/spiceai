@@ -1176,7 +1176,7 @@ pub struct Query {
     /// Whether the Cayenne query path should materialize a non-recursive CTE
     /// once and reuse the result at every reference.
     ///
-    /// DataFusion inlines `WITH` bodies, so a CTE used twice is planned and
+    /// `DataFusion` inlines `WITH` bodies, so a CTE used twice is planned and
     /// executed twice. `auto` finds those multi-reference CTEs whose body is
     /// expensive (aggregation, join, window, distinct, sort, unnest, or union)
     /// and that scan a Cayenne-accelerated table, computes the body once into
@@ -1200,7 +1200,7 @@ pub struct Query {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CteMaterialization {
-    /// Inline every CTE at each reference (DataFusion's default).
+    /// Inline every CTE at each reference (`DataFusion`'s default).
     #[default]
     Disabled,
     /// Materialize a CTE once when it is referenced more than once, its body is

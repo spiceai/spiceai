@@ -512,7 +512,7 @@ impl DataFusionBuilder {
 
     /// Materialize multi-reference CTEs on the Cayenne query path.
     ///
-    /// `CteMaterialization::Disabled` (the default) keeps DataFusion's inlining
+    /// `CteMaterialization::Disabled` (the default) keeps `DataFusion`'s inlining
     /// behavior. `Auto` registers the Cayenne CTE materialization optimizer.
     #[must_use]
     pub fn cte_materialization(mut self, cte_materialization: CteMaterialization) -> Self {
