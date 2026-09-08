@@ -1173,6 +1173,7 @@ mod tests {
             vec![0, 1],
             "a row the write did not touch keeps every chunk"
         );
+    }
 
     /// Regression test for #13872. One batch carries id=1 twice and the row that *decides*
     /// it embeds to a vector the index cannot use. Before the shared classifier, only the
