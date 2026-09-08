@@ -81,9 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flight_descriptor = FlightDescriptor::new_path(vec![args.path]);
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
-        .build(futures::stream::iter(
-            batches.into_iter().map(Ok).collect::<Vec<_>>(),
-        ));
+        .build(futures::stream::iter(batches.into_iter().map(Ok)));
 
     let _response: Vec<PutResult> = client
         .do_put(flight_data_stream)
