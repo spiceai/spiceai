@@ -1,0 +1,45 @@
+[
+  {
+    "variant": "arrow",
+    "exit_code": 0,
+    "evidence": "arrow-sql.json"
+  },
+  {
+    "variant": "duckdb",
+    "exit_code": 0,
+    "evidence": "duckdb-sql.json"
+  },
+  {
+    "variant": "sqlite",
+    "exit_code": 0,
+    "evidence": "sqlite-sql.json"
+  },
+  {
+    "variant": "cayenne",
+    "exit_code": 1,
+    "evidence": "cayenne-sql.json"
+  },
+  {
+    "variant": "search",
+    "sql": "SELECT article_id, tenant_id, title FROM text_search(articles, 'shipping', body) WHERE tenant_id = 'north' ORDER BY _score DESC, article_id LIMIT 5",
+    "actual": [
+      {
+        "article_id": 3,
+        "tenant_id": "north",
+        "title": "Shipping delays"
+      }
+    ]
+  },
+  {
+    "variant": "auth",
+    "authorized": false,
+    "status": 401,
+    "body": "Unauthorized"
+  },
+  {
+    "variant": "auth",
+    "authorized": true,
+    "status": 200,
+    "body": "[{\"ok\":1}]"
+  }
+]
