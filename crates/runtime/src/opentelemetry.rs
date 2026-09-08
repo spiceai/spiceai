@@ -1923,7 +1923,10 @@ mod tests {
         let widened_result =
             metric_data_to_record_batch("svc_requests", &second, &[], Some(first_schema.as_ref()));
         let widened_schema = widened_result.expect("widened batch builds").schema();
-        assert!(detect_added_columns(&first_schema, &widened_schema) == vec!["tier".to_string()]);
+        assert_eq!(
+            detect_added_columns(&first_schema, &widened_schema),
+            vec!["tier".to_string()]
+        );
 
         // Rebuilding the same data against the (evolved) widened schema yields the identical
         // field order — the invariant the OTel pre-flight relies on for the rebuilt batch.

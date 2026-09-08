@@ -238,9 +238,8 @@ pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
 /// [`bigquery_can_translate`] carry.
 ///
 /// The rest stay denied, each for something `BigQuery` cannot be talked out of.
-/// `json_get_json` and `json_as_text` return the matched node's own bytes,
-/// spacing and number spelling intact, where `JSON_QUERY` re-renders it — a
-/// document holding `{"b": -1}` comes back as `{"b":-1}`.
+/// `json_get_json` returns the matched node's own bytes, including spacing,
+/// where `JSON_QUERY` serializes containers with different whitespace.
 /// `json_get`, `json_get_array` and the union helpers carry the crate's JSON
 /// union, which has no SQL type to unparse into.
 #[must_use]
@@ -440,11 +439,11 @@ mod tests {
 
     #[test]
     fn every_carved_out_bigquery_name_is_a_function_the_deny_list_knows() {
-        let json = runtime_udfs_api::json_function_names();
+        let spice = runtime_udfs_api::spice_function_names();
         for name in bigquery_native_function_names() {
             assert!(
-                json.iter().any(|known| known == name),
-                "`{name}` is not a name `datafusion-functions-json` registers, so carving it out \
+                spice.iter().any(|known| known == name),
+                "`{name}` is not registered with the Spice deny-list, so carving it out \
                  of the deny-list does nothing"
             );
         }

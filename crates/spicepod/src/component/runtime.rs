@@ -1555,7 +1555,7 @@ mod tests {
         };
 
         // Test exact match
-        assert!(key == *"secret-api-key-12345");
+        assert_eq!(key, *"secret-api-key-12345");
 
         // Test mismatch at different positions
         assert!(key != *"xecret-api-key-12345"); // First char different
@@ -1571,7 +1571,7 @@ mod tests {
         let rw_key = ApiKey::ReadWrite {
             key: "rw-key".to_string(),
         };
-        assert!(rw_key == *"rw-key");
+        assert_eq!(rw_key, *"rw-key");
         assert!(rw_key != *"rw-key2");
     }
 
