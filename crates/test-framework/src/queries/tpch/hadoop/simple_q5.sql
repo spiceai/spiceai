@@ -1,1 +1,0 @@
-select SUM(o.o_totalprice) as total_price, l.l_linestatus from hadoop.tpch.orders o join hadoop.tpch.lineitem l on o.o_orderkey = l.l_orderkey group by l.l_linestatus order by total_price desc;

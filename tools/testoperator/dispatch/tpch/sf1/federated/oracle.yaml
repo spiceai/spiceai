@@ -1,7 +1,0 @@
-tests:
-  bench:
-    spicepod_path: federated/oracle.yaml
-    query_set: tpch
-    query_overrides: oracle
-    runner_type: spiceai-dev-runners
-    validate_results: true

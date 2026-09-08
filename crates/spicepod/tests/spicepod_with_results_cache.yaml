@@ -1,7 +1,0 @@
-version: v1
-kind: Spicepod
-name: spicepod_with_results_cache
-runtime:
-  results_cache:
-    enabled: true
-    item_ttl: 1s

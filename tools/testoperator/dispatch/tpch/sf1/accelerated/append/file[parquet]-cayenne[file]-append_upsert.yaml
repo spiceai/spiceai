@@ -1,5 +1,0 @@
-tests:
-  append:
-    spicepod_path: accelerated/append/file[parquet]-cayenne[file]-append_upsert.yaml
-    query_set: tpch
-    with_conflict_data: true

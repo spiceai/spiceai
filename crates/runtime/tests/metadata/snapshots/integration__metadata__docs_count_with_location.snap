@@ -1,9 +1,0 @@
----
-source: crates/runtime/tests/metadata/mod.rs
-expression: formatted
----
-+-----+
-| cnt |
-+-----+
-| 2   |
-+-----+

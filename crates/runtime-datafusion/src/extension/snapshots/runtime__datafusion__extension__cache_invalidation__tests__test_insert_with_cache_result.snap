@@ -1,9 +1,0 @@
----
-source: crates/runtime/src/datafusion/extension/cache_invalidation.rs
-expression: formatted
----
-+----+------+-------+
-| id | name | value |
-+----+------+-------+
-| 1  | foo  | 42.0  |
-+----+------+-------+

@@ -1,9 +1,0 @@
----
-source: crates/runtime/tests/flight/prepared_statements.rs
-expression: results1_str
----
-+--------+
-| result |
-+--------+
-| foo    |
-+--------+

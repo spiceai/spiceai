@@ -1,9 +1,0 @@
----
-source: crates/runtime-datafusion-udfs/src/bucket.rs
-expression: result
----
-+----------------------------+
-| ColumnarValue(ScalarValue) |
-+----------------------------+
-| 5                          |
-+----------------------------+

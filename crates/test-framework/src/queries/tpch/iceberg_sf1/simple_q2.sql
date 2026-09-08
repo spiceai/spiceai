@@ -1,1 +1,0 @@
-SELECT l_linenumber FROM ice.tpch_sf1.lineitem WHERE l_linenumber = (SELECT MAX(l_linenumber) FROM ice.tpch_sf1.lineitem);

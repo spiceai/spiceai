@@ -1,7 +1,0 @@
----
-source: crates/runtime/tests/models/openai.rs
-expression: "serde_json::to_string_pretty(&selector.find(&resp_value)).expect(\"Failed to serialize response.choices\")"
----
-[
-  1
-]

@@ -1,6 +1,0 @@
-tests:
-  bench:
-    spicepod_path: federated/duckdb.yaml
-    query_set: tpch[parameterized]
-    runner_type: spiceai-dev-runners
-    validate_results: true

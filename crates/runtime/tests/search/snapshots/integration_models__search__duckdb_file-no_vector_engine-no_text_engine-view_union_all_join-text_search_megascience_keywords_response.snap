@@ -1,8 +1,0 @@
----
-source: crates/runtime/tests/search/mod.rs
-expression: normalize_search_response(resp)
----
-{
-  "duration_ms": "duration_ms_val",
-  "results": []
-}

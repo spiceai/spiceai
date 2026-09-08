@@ -1,1 +1,0 @@
-SELECT "CounterID", AVG(length("URL")) AS l, COUNT(*) AS c FROM hits WHERE CAST("URL" AS TEXT) <> '' GROUP BY "CounterID" HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;

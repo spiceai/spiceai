@@ -1,1 +1,0 @@
-SELECT * FROM (SELECT o_orderkey + 1 FROM tpch.tpch.orders) AS c(key) LIMIT 10;

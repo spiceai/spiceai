@@ -1,1 +1,0 @@
-SELECT MAX(l_orderkey) FROM mssql.dbo.lineitem;

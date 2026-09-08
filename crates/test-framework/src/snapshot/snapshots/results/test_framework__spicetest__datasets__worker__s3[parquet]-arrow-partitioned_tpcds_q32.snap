@@ -1,9 +1,0 @@
----
-source: crates/test-framework/src/spicetest/datasets/worker.rs
-description: "Query: tpcds_q32"
----
-+------------------------+
-| excess discount amount |
-+------------------------+
-| 122275.56              |
-+------------------------+

@@ -1,1 +1,0 @@
-This directory contains vendored dependencies and optionally their dependency chains - for example, vendoring unmaintained dependencies which no longer receive updates.

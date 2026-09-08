@@ -1,1 +1,0 @@
-SELECT MAX("L_ORDERKEY") FROM lineitem;

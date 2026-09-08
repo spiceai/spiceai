@@ -1,9 +1,0 @@
----
-source: crates/runtime/tests/iceberg/write/mod.rs
-expression: pretty
----
-+-------+
-| count |
-+-------+
-| 2     |
-+-------+

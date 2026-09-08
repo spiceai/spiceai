@@ -1,6 +1,0 @@
----
-source: crates/runtime/tests/flight/do_put.rs
-expression: results_str
----
-++
-++

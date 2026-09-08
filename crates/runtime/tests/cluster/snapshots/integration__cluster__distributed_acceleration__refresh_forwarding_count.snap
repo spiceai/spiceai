@@ -1,9 +1,0 @@
----
-source: crates/runtime/tests/cluster/distributed_acceleration.rs
-expression: rows_fmt
----
-+-----+
-| cnt |
-+-----+
-| 10  |
-+-----+
