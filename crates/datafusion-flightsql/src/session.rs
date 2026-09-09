@@ -212,7 +212,7 @@ mod tests {
     }
 
     /// Session ids are handed to clients and accepted as bearer tokens, so they
-    /// must be CSPRNG-random rather than the time-ordered UUIDv7, whose value
+    /// must be CSPRNG-random rather than the time-ordered `UUIDv7`, whose value
     /// leaks its creation time and is partly predictable.
     #[test]
     fn an_issued_id_is_a_random_uuid() {

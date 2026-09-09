@@ -90,11 +90,7 @@ mod tests {
     #[test]
     fn a_session_id_authenticates_as_the_key_it_was_issued_against() {
         let store = SessionStore::new();
-        let session = store.issue(
-            &SessionContext::new(),
-            None,
-            Some("test-key".to_string()),
-        );
+        let session = store.issue(&SessionContext::new(), None, Some("test-key".to_string()));
 
         let session_auth = SessionAwareAuth::new(auth_with(&["test-key:rw"]), store);
 

@@ -150,8 +150,8 @@ where
         );
     // Accept a session id as a bearer token here too, so an id issued by a
     // Flight SQL handshake authenticates on the HTTP API and vice versa.
-    let auth_layer = session_auth::with_session_awareness(auth_provider, rt.sessions())
-        .map(AuthLayer::new);
+    let auth_layer =
+        session_auth::with_session_awareness(auth_provider, rt.sessions()).map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
         config,

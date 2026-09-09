@@ -163,8 +163,9 @@ async fn two_principals_naming_the_same_id_do_not_share_a_session() -> Result<()
 
     test_request_context()
         .scope(async {
-            let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
             const GUESSABLE: &str = "shared-guessable-id";
+
+            let (channel, _df) = start_spice_test_app(Some(two_key_auth()), None, None).await?;
 
             let mut first = client_for(&channel, "a", Some(GUESSABLE));
             let status = run(&mut first, "PREPARE squat AS SELECT 'a private' AS v")
