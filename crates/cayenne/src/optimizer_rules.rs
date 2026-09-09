@@ -825,7 +825,7 @@ fn try_rewrite_oversized_join(
         // Those joins are 1:1 on the grouping key; sort-merge was returning a
         // different LIMIT-100 customer set than hash join at SF-100.
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
-            if is_unknown_size_self_join(hash_join) {
+            if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
             return finish_sort_merge_rewrite(hash_join);
@@ -833,7 +833,7 @@ fn try_rewrite_oversized_join(
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
         else {
-            if is_unknown_size_self_join(hash_join) {
+            if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
             return finish_sort_merge_rewrite(hash_join);
@@ -1050,6 +1050,27 @@ fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
                 _ => false,
             }
         })
+}
+
+/// Whether an input is an `AggregateExec` (or a unary wrapper over one).
+/// TPC-DS Q78's oversized hash tables sit on `ss`/`ws`/`cs` aggregate
+/// results; fact–dimension joins (Q13) have Cayenne scans on a side and
+/// must stay hash joins — sort-merge of those swapped Decimal/Utf8 columns.
+fn input_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<AggregateExec>().is_some() {
+        return true;
+    }
+    let children = plan.children();
+    children.len() == 1 && input_is_aggregate(children[0])
+}
+
+/// Spill an unknown-size join only when it is not a CTE self-join *and* both
+/// inputs are aggregates (Q78 `ss` ⋈ `ws`). Inexact stats on a scan join
+/// (Q13) must not flip it to sort-merge.
+fn should_spill_unknown_size_join(hash_join: &HashJoinExec) -> bool {
+    !is_unknown_size_self_join(hash_join)
+        && input_is_aggregate(hash_join.left())
+        && input_is_aggregate(hash_join.right())
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
@@ -3303,6 +3324,30 @@ mod tests {
         ]))
     }
 
+    fn grouped_count_over(input: Arc<dyn ExecutionPlan>, key: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            col(key, schema.as_ref()).expect("group key"),
+            key.to_string(),
+        )]);
+        let expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("cnt".to_string())
+            .build()
+            .expect("count aggregate");
+        Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by,
+                vec![Arc::new(expr)],
+                vec![None],
+                input,
+                schema,
+            )
+            .expect("aggregate exec"),
+        )
+    }
+
     #[test]
     fn rewrites_absent_stats_hash_join_when_memory_pool_configured() {
         // Distinct schemas, like TPC-DS Q78 `ss` ⋈ `ws`. A same-schema self-join
@@ -3310,10 +3355,14 @@ mod tests {
         // `does_not_rewrite_absent_stats_same_schema_self_join`).
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
-        let left =
-            cayenne_file_exec_with_num_rows(&left_schema, "ss.vortex", Precision::Absent);
-        let right =
-            cayenne_file_exec_with_num_rows(&right_schema, "ws.vortex", Precision::Absent);
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&left_schema, "ss.vortex", Precision::Absent),
+            "ss_item_sk",
+        );
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&right_schema, "ws.vortex", Precision::Absent),
+            "ws_item_sk",
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -3395,18 +3444,59 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_inexact_stats_distinct_schema_hash_join() {
-        let left_schema = channel_schema("ss_item_sk", "ss_qty");
-        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+    fn does_not_rewrite_inexact_fact_dimension_scan_join() {
+        // TPC-DS Q13: store_sales ⋈ date_dim, inexact stats, different key
+        // names. Must stay a hash join — sort-merge swapped Decimal/Utf8.
+        let left_schema = channel_schema("ss_sold_date_sk", "ss_ext_sales_price");
+        let right_schema = channel_schema("d_date_sk", "d_year");
         let left = cayenne_file_exec_with_num_rows(
             &left_schema,
-            "ss.vortex",
+            "store_sales.vortex",
             Precision::Inexact(1_000),
         );
         let right = cayenne_file_exec_with_num_rows(
             &right_schema,
-            "ws.vortex",
+            "date_dim.vortex",
             Precision::Inexact(1_000),
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_sold_date_sk",
+            "d_date_sk",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "inexact fact-dimension joins must stay hash joins"
+        );
+    }
+
+    #[test]
+    fn rewrites_inexact_stats_distinct_schema_hash_join() {
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(
+                &left_schema,
+                "ss.vortex",
+                Precision::Inexact(1_000),
+            ),
+            "ss_item_sk",
+        );
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(
+                &right_schema,
+                "ws.vortex",
+                Precision::Inexact(1_000),
+            ),
+            "ws_item_sk",
         );
         let join = Arc::new(hash_join_with_join_type(
             left,
@@ -4050,15 +4140,21 @@ mod tests {
         // exclusion. Inexact stats on `ss` ⋈ `ws` (Q78) must still spill.
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
-        let left = cayenne_file_exec_with_num_rows(
-            &left_schema,
-            "ss.vortex",
-            Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(
+                &left_schema,
+                "ss.vortex",
+                Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
+            ),
+            "ss_item_sk",
         );
-        let right = cayenne_file_exec_with_num_rows(
-            &right_schema,
-            "ws.vortex",
-            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(
+                &right_schema,
+                "ws.vortex",
+                Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
+            ),
+            "ws_item_sk",
         );
         let join = Arc::new(hash_join_with_join_type(
             left,
