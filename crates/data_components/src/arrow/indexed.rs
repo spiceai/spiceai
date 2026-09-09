@@ -1807,9 +1807,7 @@ mod tests {
             vec!["id".to_string()],
         )
         .expect("failed to create table");
-        let ctx = SessionContext::new_with_config(
-            SessionConfig::new().with_target_partitions(8),
-        );
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
         ctx.register_table("test_table", Arc::new(table))
             .expect("failed to register");
 
