@@ -143,9 +143,9 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         // parses cleanly on a view as well as on a dataset. A dataset reads it out of the block
         // and applies it; resolve it the same way here so the key means one thing wherever it is
         // written, rather than being accepted and dropped on one of the two components. See
-        // `DatasetBuilder::try_from` for the dataset side. The deprecation warning is emitted
-        // by the load path, not from here (`init::dataset::warn_about_deprecated_ready_state`):
-        // this conversion runs on every `get_valid_views` call, a read as much as a load.
+        // `DatasetBuilder::try_from` for the dataset side. The deprecation is reported by the
+        // load path (`init::dataset::warn_about_acceleration_block`), not from this
+        // conversion, which read-only callers run too.
         #[expect(deprecated)]
         let ready_state = match view.acceleration.as_ref().map(|a| a.ready_state) {
             Some(Some(ready_state)) => ReadyState::from(ready_state),
