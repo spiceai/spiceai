@@ -45,7 +45,7 @@ use crate::suite::load_tpch_suite;
 pub const SUITE_REF: &str = "spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
-pub const DATAFUSION_FORK_REV: &str = "ce0105748e153bcfe4ae182061ad875694ab4a1c";
+pub const DATAFUSION_FORK_REV: &str = "2d566a6094a43c00bbe219632d8e83ee0134cc84";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {
@@ -55,6 +55,24 @@ enum Mode {
     /// `FlightSQL` `CommandStatementSubstraitPlan` stub (product path).
     #[value(name = "mode-b")]
     ModeB,
+}
+
+impl Mode {
+    /// The `--mode` value; also the stem of the default report paths, so a
+    /// Mode B run cannot overwrite a Mode A report.
+    fn name(self) -> &'static str {
+        match self {
+            Mode::ModeA => "mode-a",
+            Mode::ModeB => "mode-b",
+        }
+    }
+
+    fn default_output(self, extension: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "tools/substrait-compliance/results/{}-tpch.{extension}",
+            self.name()
+        ))
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -78,19 +96,15 @@ struct Args {
     #[arg(long)]
     query: Option<String>,
 
-    /// Write the JSON report here.
-    #[arg(
-        long,
-        default_value = "tools/substrait-compliance/results/mode-a-tpch.json"
-    )]
-    out_json: PathBuf,
+    /// Write the JSON report here (default
+    /// `tools/substrait-compliance/results/<mode>-tpch.json`).
+    #[arg(long)]
+    out_json: Option<PathBuf>,
 
-    /// Write the per-query CSV here.
-    #[arg(
-        long,
-        default_value = "tools/substrait-compliance/results/mode-a-tpch.csv"
-    )]
-    out_csv: PathBuf,
+    /// Write the per-query CSV here (default
+    /// `tools/substrait-compliance/results/<mode>-tpch.csv`).
+    #[arg(long)]
+    out_csv: Option<PathBuf>,
 
     /// `FlightSQL` endpoint used only by Mode B (not contacted yet).
     #[arg(long, default_value = "http://127.0.0.1:50051")]
@@ -110,6 +124,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let args = Args::parse();
+    let out_json = args
+        .out_json
+        .clone()
+        .unwrap_or_else(|| args.mode.default_output("json"));
+    let out_csv = args
+        .out_csv
+        .clone()
+        .unwrap_or_else(|| args.mode.default_output("csv"));
     let suite = load_tpch_suite(&args.suite)?;
     println!(
         "Loaded IBM suite '{}' v{} ({} cases) from {}",
@@ -133,7 +155,7 @@ async fn run() -> Result<ExitCode> {
             (
                 mode_a::ENGINE_NAME.to_string(),
                 mode_a::ENGINE_VERSION.to_string(),
-                "mode-a".to_string(),
+                args.mode.name().to_string(),
                 results,
             )
         }
@@ -156,7 +178,7 @@ async fn run() -> Result<ExitCode> {
             (
                 mode_b::ENGINE_NAME.to_string(),
                 mode_b::ENGINE_VERSION.to_string(),
-                "mode-b".to_string(),
+                args.mode.name().to_string(),
                 mode_b::FlightSqlComplianceEngine::stub_results(&owned),
             )
         }
@@ -202,10 +224,10 @@ async fn run() -> Result<ExitCode> {
         report.passed, report.failed, report.skipped, report.errored
     );
 
-    report.write_json(&args.out_json)?;
-    report.write_csv(&args.out_csv)?;
-    println!("Wrote {}", args.out_json.display());
-    println!("Wrote {}", args.out_csv.display());
+    report.write_json(&out_json)?;
+    report.write_csv(&out_csv)?;
+    println!("Wrote {}", out_json.display());
+    println!("Wrote {}", out_csv.display());
 
     // Report-only: never fail the process on a low pass rate. A non-zero
     // exit is reserved for harness I/O / load errors (already returned).

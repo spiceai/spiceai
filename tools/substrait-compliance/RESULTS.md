@@ -1,60 +1,44 @@
-# Mode A TPC-H baseline
+# Mode A TPC-H results
 
-Captured on this box against the workspace DataFusion fork
-(`spiceai-54` @ `6006901cb602d845ee1441269d6eaa142c2580a6`, merged
-[spiceai/datafusion#215](https://github.com/spiceai/datafusion/pull/215))
-after harness compare lifts for the 11 known-fail cosmetics,
-quoted-empty `""` decode (q17), the printed-scale / short-row
-compare tighten, the empty-golden load reject, and typed-header
-name/type validation (PASS count unchanged).
-
-Re-run the command below to regenerate `results/mode-a-tpch.json`
-(gitignored; CI uploads it as an artifact).
+Captured on this box against the pinned suite and the workspace `DataFusion`
+fork (`Cargo.toml` `[patch.crates-io]`). Re-run the command below to regenerate
+`results/mode-a-tpch.json` (gitignored; CI uploads it as an artifact).
 
 ## Pins
 
 | Item | Value |
 |------|--------|
-| IBM tag | `v0.1.1` |
+| Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `5ccb99672853bd768019101ebb6a7d1aa4c8f547` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the corrections in its `SPICEAI.md` |
 | `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion rev | `6006901cb602d845ee1441269d6eaa142c2580a6` (`spiceai-54`, merged spiceai/datafusion#215) |
+| spiceai/datafusion rev | `2d566a6094a43c00bbe219632d8e83ee0134cc84` (spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, which carries #215, #220 and #221) |
 | Suite | TPC-H SF 0.01 (22 queries) |
 | Oracle | DuckDB 1.2.0 (IBM goldens) |
-| Run | 2026-09-05T05:14:02Z → 05:14:06Z |
+| Run | 2026-09-09T00:55:38Z → 2026-09-09T00:55:43Z |
 
 ## Counts
 
-**Before** (VarChar / DF #215, IBM-strict compare, same pin):
-
 | PASS | FAIL | SKIP | ERROR | Total |
 |------|------|------|-------|-------|
-| 5 | 14 | 0 | 3 | 22 |
-
-**After** (this revision — compare lifts + quoted-empty decode):
-
-| PASS | FAIL | SKIP | ERROR | Total |
-|------|------|------|-------|-------|
-| 16 | 3 | 0 | 3 | 22 |
+| 22 | 0 | 0 | 0 | 22 |
 
 Command and headline output:
 
 ```text
 cargo run -p spice-substrait-compliance -- \
   --mode mode-a \
-  --suite tools/substrait-compliance/.ibm/test-suites/tpch \
-  --out-json tools/substrait-compliance/results/mode-a-tpch.json \
-  --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
+  --suite tools/substrait-compliance/.ibm/test-suites/tpch
 
-DataFusion fork rev: 6006901cb602d845ee1441269d6eaa142c2580a6
-  FAIL  q01  (cell (0,6) '25.575154' != '25.575154611454693')
+Suite: spiceai/substrait-compliance@5ccb99672853bd768019101ebb6a7d1aa4c8f547
+DataFusion fork rev: 2d566a6094a43c00bbe219632d8e83ee0134cc84
+  PASS  q01
   PASS  q02
   PASS  q03
   PASS  q04
   PASS  q05
   PASS  q06
-  ERROR q07  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
-  ERROR q08  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
-  ERROR q09  (from_substrait_plan: This feature is not implemented: Function argument non-Value type not supported)
+  PASS  q07
+  PASS  q08
+  PASS  q09
   PASS  q10
   PASS  q11
   PASS  q12
@@ -66,117 +50,78 @@ DataFusion fork rev: 6006901cb602d845ee1441269d6eaa142c2580a6
   PASS  q18
   PASS  q19
   PASS  q20
-  FAIL  q21  (row count 0 != 1)
-  FAIL  q22  (column 0 type 'string' != 'integer')
-16/3/3  pass/fail/skip+error  total=22  pass_rate=72.7%
-  passed=16 failed=3 skipped=0 errored=3
+  PASS  q21
+  PASS  q22
+
+22/0/0  pass/fail/skip+error  total=22  pass_rate=100.0%
+  passed=22 failed=0 skipped=0 errored=0
 ```
 
-Pre-#215 baseline on the same harness (same IBM tag, older DF pin
-`f9a635e6b580d5fe6ed0a70975e36014ea86c476`): **PASS 1 | FAIL 7 | SKIP 0 | ERROR 14 | Total 22**.
+## How the count moved
 
-## Known-fail flips (12)
+Every row is the same command on this box; the causes were located, not
+inferred.
 
-Harness compare in `src/compare.rs` now:
+| Step | PASS / FAIL / SKIP / ERROR | What changed |
+|------|----------------------------|--------------|
+| IBM-strict compare, first `spiceai-54` pin (`f9a635e6…`) | 1 / 7 / 0 / 14 | Isthmus `VarChar` literals were not consumed |
+| spiceai/datafusion#215 (`VarChar` literals) | 5 / 14 / 0 / 3 | 13 queries execute |
+| Value-preserving compare lifts | 16 / 3 / 0 / 3 | `COUNT` width, column names, trailing `CHAR` pad, numeric ε, quoted-empty `""` |
+| Trailing-only trim on the engine side, string↔numeric labels | 15 / 4 / 0 / 3 | q22 PASS; q02 and q10 FAIL because the golden decoder still trimmed both ends |
+| spiceai/datafusion#220 (`extract` enum arguments) | 18 / 4 / 0 / 0 | q07, q08, q09 ERROR → PASS |
+| Suite correction (q01 cutoff) + golden trailing-only trim + engine-declared decimal scale | 21 / 1 / 0 / 0 | q01, q02, q10 PASS |
+| spiceai/datafusion#226 (subquery scan qualifier) | 22 / 0 / 0 / 0 | q21 PASS |
 
-- treats `integer` / `bigint` as type-compatible (`COUNT` width)
-- does not compare column names (plan alias vs DuckDB; IBM Rust SDK skips names)
-- trims trailing `CHAR` padding on string cells (leading spaces stay significant)
-- numerics: `integer`/`bigint` exactly; floats/`double` use absolute ε
-  `1e-8` or relative `1e-14`. Printed fractional length is not a
-  tolerance. One ULP at a declared decimal scale only when both headers
-  share that scale (≥ 2)
-- quoted-empty `""` is NULL/empty (IBM TPC-H README)
-- a zero-byte, headerless, or malformed first line is an oracle-load
-  error, not an empty PASS. A typed header requires nonempty names
-  and supported type tokens (`flag:`, `:`, and `12:34:56` are not).
-  A legitimate empty result is a typed header with zero data rows
+## What each remaining failure turned out to be
 
-IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. These
-lifts apply only when **values** still match. They do not ignore
-row-count misses. `string` ↔ numeric type labels reach value compare
-(q22 country codes).
+| Query | Symptom | Cause (measured) | Fix |
+|-------|---------|------------------|-----|
+| q01 | `count_order` 29162 vs 29181 in the `N\|O` group, every sum and average of that group off; first cell reported `AVG_QTY` `25.575154` vs `25.575154611454693` | `plans/q01.bin` filtered `l_shipdate <= 1998-09-01` (Substrait date 10470) while the golden's SQL cutoff is 1998-09-02; `data/lineitem.csv` has exactly 19 rows on 1998-09-02, all `N\|O`. The averages then differed only by scale: the plan declares them `decimal(15,2)`, `DataFusion` returns `decimal(19,6)`, the golden prints the unrounded `double` | Suite: the `spiceai` branch carries date 10471 in both plan files. Harness: a `decimal(p,s)` engine column keeps its declared scale in the typed header and a `double` golden must be the actual rounded or truncated at that scale |
+| q02, q10 | `' foxes boost…'` vs `'foxes boost…'`; `' are carefully…'` vs `'are carefully…'` | `decode_csv_cell` trimmed both ends of a golden cell while the engine side trims trailing pad only; `data/supplier.csv:86`, `data/customer.csv:422` and the goldens all carry the leading space | Harness: goldens decode trailing-only |
+| q07, q08, q09 | `Function argument non-Value type not supported` | `extract:req_date` with a `YEAR` enum argument; the consumer accepted `ArgType::Value` only (upstream `main` too) | spiceai/datafusion#220: enum arguments lower to literals; `extract` is translated component by component to `date_part` cast to the declared type, with `NotImplemented` for components `date_part` defines differently |
+| q21 | `row count 0 != 1` | Both the outer scan and the EXISTS / NOT EXISTS subquery scans were qualified `LINEITEM`; decorrelation resolved `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the inner scan alone, the semi/anti joins lost their condition and `L_SUPPKEY != L_SUPPKEY` stayed behind. The same query as SQL (aliases `L1`/`L2`/`L3`) returned the golden `Supplier#000000074\|9` | spiceai/datafusion#226: a subquery's scan of a table an enclosing scope reads gets its own qualifier (`LINEITEM_1`) |
 
-| Query | Before | After | Notes |
-|-------|--------|-------|-------|
-| q01 | FAIL (`COUNT` `bigint` vs `integer`) | **FAIL** (stayed) | Type lift applied; values do **not** match. First mismatch is now cell `(0,6)` `AVG_QTY` `25.575154` vs golden `25.575154611454693` (IBM types the column `double`; printed-scale ULP no longer applies). A prior run with printed-scale on reported cell `(2,2)` `SUM_QTY` `742308.00` vs `742802.0` (N/O group, Δ = 494) — also a real miss, not re-observed here because compare stops at the first cell. |
-| q02 | FAIL (`CHAR` pad) | **PASS** | Trailing `CHAR` pad. Leading spaces are now significant (not remasured after that change) |
-| q04 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
-| q06 | FAIL (ε 1.16e-9) | **PASS** | abs ε `1e-8` |
-| q10 | FAIL (`CHAR` pad) | **PASS** | Trailing `CHAR` pad |
-| q11 | FAIL (alias `TOTAL_VALUE` vs `value`) | **PASS** | names not compared |
-| q12 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
-| q13 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
-| q15 | FAIL (`CHAR` pad) | **PASS** | Trailing-space trim |
-| q16 | FAIL (`COUNT` width) | **PASS** | `integer`/`bigint` |
-| q17 | FAIL (`''` vs `'""'`) | **PASS** | golden `""` is NULL/empty |
-| q18 | FAIL (alias `TOTAL_QTY` vs `sum(l_quantity)`) | **PASS** | names not compared |
+## Compare rules
 
-**Flipped to PASS (11):** q02, q04, q06, q10, q11, q12, q13, q15, q16, q17, q18.
+Harness compare in `src/compare.rs`:
 
-**Stayed FAIL (1):** q01 — first cell `(0,6)` `AVG_QTY` `25.575154` vs `25.575154611454693`. PASS count unchanged.
+- `integer` / `bigint` are type-compatible (`COUNT` width)
+- column names are not compared (plan alias vs DuckDB; IBM Rust SDK skips names)
+- string cells trim trailing `CHAR` pad only, on both sides; a leading space is significant
+- numerics: `integer`/`bigint` exactly; floats/`double` absolute ε `1e-8` or relative `1e-14`; printed fractional length is not a tolerance; one ULP when both headers share a declared decimal scale ≥ 2; when the engine's schema declares the actual column `decimal(p,s)` and the golden is `double`, the actual must be the golden rounded or truncated at that scale, and one unit off still fails
+- quoted-empty `""` is NULL/empty; after decode only the empty string is NULL, whitespace is a value
+- a zero-byte, headerless, or malformed first line is an oracle-load error, not an empty PASS; a legitimate empty result is a typed header with zero data rows; incomplete rows mismatch
 
-## Must-fix FAIL (2) — not softened
+IBM README is absolute ε `1e-9` and distinct `integer`/`bigint`. None of these
+rules ignores a row-count miss or a value that is not the engine's rendering
+of the golden.
 
-Investigated; left FAIL (no Spice/DF bug fix in this PR; no looser compare).
-
-| Query | Symptom (measured) | Investigation |
-|-------|--------------------|----------------|
-| q21 | row count `0` != `1` | Plan executes. Filter is `N_NAME` vs `VarChar` `"SAUDI ARABIA"` (length 25). Cardinality miss after VarChar unblocked — likely EXISTS / `CHAR` equality, not oracle cosmetics. Left FAIL. |
-| q22 | column 0 type `string` != `integer` (pre-lift) | Plan uses `substring:fchar_i32_i32` (string). Golden types `cntrycode` as `integer` (`13`, `17`, …). IBM README allows number-vs-string cross-compare; type labels now pass through to `values_match`. Mode A not remasured after this lift. |
-
-## ERROR (3) — not in this PR
+## Per-query
 
 | Query | Status | Notes |
 |-------|--------|-------|
-| q07 | ERROR | `from_substrait_plan`: `Function argument non-Value type not supported` |
-| q08 | ERROR | same |
-| q09 | ERROR | same |
-
-Leave for a separate DataFusion fork fix. Do not fake PASS.
-
-## Per-query (after this revision)
-
-| Query | Status | Notes |
-|-------|--------|-------|
-| q01 | FAIL | `AVG_QTY` `25.575154` vs `25.575154611454693` (cell `(0,6)`) |
-| q02 | **PASS** | known-fail flip (`CHAR` pad) |
-| q03 | **PASS** | unchanged |
-| q04 | **PASS** | known-fail flip (`COUNT` width) |
-| q05 | **PASS** | unchanged |
-| q06 | **PASS** | known-fail flip (ε) |
-| q07 | ERROR | non-Value function argument |
-| q08 | ERROR | non-Value function argument |
-| q09 | ERROR | non-Value function argument |
-| q10 | **PASS** | known-fail flip (`CHAR` pad) |
-| q11 | **PASS** | known-fail flip (alias) |
-| q12 | **PASS** | known-fail flip (`COUNT` width) |
-| q13 | **PASS** | known-fail flip (`COUNT` width) |
-| q14 | **PASS** | unchanged |
-| q15 | **PASS** | known-fail flip (`CHAR` pad) |
-| q16 | **PASS** | known-fail flip (`COUNT` width) |
-| q17 | **PASS** | quoted-empty `""` decode (NULL/empty) |
-| q18 | **PASS** | known-fail flip (alias) |
-| q19 | **PASS** | unchanged |
-| q20 | **PASS** | unchanged |
-| q21 | FAIL | 0 rows vs 1 (must-fix) |
-| q22 | FAIL | was `string` vs `integer` type labels; now value-compared (not remasured) |
-
-## Newly PASSing queries (11)
-
-q02, q04, q06, q10, q11, q12, q13, q15, q16, q17, q18.
-
-Previously PASS and still PASS (5): q03, q05, q14, q19, q20.
-
-## Failure groups (after this revision)
-
-| Group | Count | Queries | Meaning |
-|-------|-------|---------|---------|
-| Non-value function argument | 3 | q07, q08, q09 | Consumer gap (`from_substrait_plan`); plan never executes |
-| `AVG_QTY` scale-6 vs `double` | 1 | q01 | First cell `(0,6)` after printed-scale removal; prior run also had `SUM_QTY` 742308 vs 742802 |
-| Empty result | 1 | q21 | Plan executes; 0 rows vs 1 golden row |
-| Type mismatch (`string` vs `integer`) | 1 | q22 | `substring:fchar` vs golden `integer` — type labels now compatible; values decide (not remasured) |
-| Pass | 16 | q02–q06, q10–q20 | Values match after documented compare lifts |
+| q01 | PASS | suite cutoff corrected; averages at the engine's declared scale |
+| q02 | PASS | trailing-only golden trim (leading space kept) |
+| q03 | PASS | unchanged |
+| q04 | PASS | unchanged |
+| q05 | PASS | unchanged |
+| q06 | PASS | unchanged |
+| q07 | PASS | `extract` enum argument (fork #220) |
+| q08 | PASS | `extract` enum argument (fork #220) |
+| q09 | PASS | `extract` enum argument (fork #220) |
+| q10 | PASS | trailing-only golden trim (leading space kept) |
+| q11 | PASS | unchanged |
+| q12 | PASS | unchanged |
+| q13 | PASS | unchanged |
+| q14 | PASS | unchanged |
+| q15 | PASS | unchanged |
+| q16 | PASS | unchanged |
+| q17 | PASS | quoted-empty `""` decode |
+| q18 | PASS | unchanged |
+| q19 | PASS | unchanged |
+| q20 | PASS | unchanged |
+| q21 | PASS | subquery scan qualifier (fork #226) |
+| q22 | PASS | string↔numeric type labels reach value compare |
 
 Do not treat these counts as a merge gate. Nightly CI is report-only until a
 threshold is set from this baseline (and preferably from Mode B).

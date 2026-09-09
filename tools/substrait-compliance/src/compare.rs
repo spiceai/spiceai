@@ -290,8 +290,12 @@ fn trim_trailing_char_pad(value: &str) -> &str {
     value.trim_end()
 }
 
+/// Only the empty decoded string is NULL/empty: the golden's `""` and an
+/// engine NULL both decode to it. Whitespace is a value — a one-space actual
+/// must not pass against a NULL golden on an integer column; on a string
+/// column the trailing-pad rule decides (`" "` vs `""` still match, q15).
 fn is_null_cell(value: &str) -> bool {
-    value.trim().is_empty()
+    value.is_empty()
 }
 
 fn parse_integer(value: &str) -> Option<i128> {
@@ -796,6 +800,18 @@ mod tests {
             Some("decimal(15,1)"),
             dbl
         ));
+    }
+
+    /// Whitespace-only is a value, not NULL: a one-space actual against a
+    /// NULL golden fails on an integer column; on a string column the
+    /// trailing-pad rule still matches it to an empty golden.
+    #[test]
+    fn whitespace_only_is_a_value_not_null() {
+        let int = Some("integer");
+        assert!(!cells_match(" ", "", int, int));
+        assert!(!cells_match("", " ", int, int));
+        assert!(cells_match("", "", int, int));
+        assert!(values_match(" ", ""));
     }
 
     #[test]

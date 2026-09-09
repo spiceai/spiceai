@@ -563,4 +563,175 @@ mod tests {
             vec![vec!["1998-09-01".to_string(), "1998".to_string()]]
         );
     }
+
+    /// TPC-H q21's EXISTS / NOT EXISTS subqueries read `LINEITEM` while the
+    /// enclosing scope also reads `LINEITEM`. Without spiceai/datafusion#226
+    /// both scans share the qualifier, decorrelation resolves the correlated
+    /// predicate to the inner scan alone, and the query returns no rows
+    /// (Mode A q21: `row count 0 != 1`).
+    #[tokio::test]
+    async fn correlated_subquery_over_the_same_table_keeps_its_rows() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use datafusion_substrait::substrait::proto::{
+            Expression, FilterRel, FunctionArgument,
+            expression::{
+                FieldReference, ReferenceSegment, RexType, ScalarFunction, Subquery,
+                field_reference::{OuterReference, ReferenceType, RootReference, RootType},
+                reference_segment::{self, StructField},
+                subquery::{SetPredicate, SubqueryType, set_predicate::PredicateOp},
+            },
+            extensions::{
+                SimpleExtensionDeclaration,
+                simple_extension_declaration::{ExtensionFunction, MappingType},
+            },
+            function_argument::ArgType,
+            read_rel::NamedTable,
+        };
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .expect("three-row batch");
+        ctx.register_batch("t", batch).expect("register table t");
+
+        let i64_type = || Type {
+            kind: Some(r#type::Kind::I64(r#type::I64 {
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Required),
+            })),
+        };
+        let bool_type = || Type {
+            kind: Some(r#type::Kind::Bool(r#type::Boolean {
+                type_variation_reference: 0,
+                nullability: i32::from(Nullability::Required),
+            })),
+        };
+        let read = || Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: vec!["a".to_string(), "b".to_string()],
+                    r#struct: Some(r#type::Struct {
+                        types: vec![i64_type(), i64_type()],
+                        type_variation_reference: 0,
+                        nullability: i32::from(Nullability::Required),
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec!["t".to_string()],
+                    advanced_extension: None,
+                })),
+                ..Default::default()
+            }))),
+        };
+        let field = |index: i32, steps_out: Option<u32>| Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(ReferenceType::DirectReference(ReferenceSegment {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                        StructField {
+                            field: index,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(match steps_out {
+                    Some(steps_out) => RootType::OuterReference(OuterReference { steps_out }),
+                    None => RootType::RootReference(RootReference {}),
+                }),
+            }))),
+        };
+        let call = |reference: u32, args: Vec<Expression>| Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: reference,
+                arguments: args
+                    .into_iter()
+                    .map(|value| FunctionArgument {
+                        arg_type: Some(ArgType::Value(value)),
+                    })
+                    .collect(),
+                output_type: Some(bool_type()),
+                ..Default::default()
+            })),
+        };
+        // inner: t.a = outer.a AND t.b <> outer.b
+        let inner = Rel {
+            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                input: Some(Box::new(read())),
+                condition: Some(Box::new(call(
+                    1,
+                    vec![
+                        call(2, vec![field(0, None), field(0, Some(1))]),
+                        call(3, vec![field(1, None), field(1, Some(1))]),
+                    ],
+                ))),
+                ..Default::default()
+            }))),
+        };
+        let exists = Expression {
+            rex_type: Some(RexType::Subquery(Box::new(Subquery {
+                subquery_type: Some(SubqueryType::SetPredicate(Box::new(SetPredicate {
+                    predicate_op: i32::from(PredicateOp::Exists),
+                    tuples: Some(Box::new(inner)),
+                }))),
+            }))),
+        };
+        let extension = |anchor: u32, name: &str| SimpleExtensionDeclaration {
+            mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
+                extension_urn_reference: 0,
+                function_anchor: anchor,
+                name: name.to_string(),
+            })),
+        };
+        let proto = Plan {
+            extensions: vec![
+                extension(1, "and:bool"),
+                extension(2, "equal:any_any"),
+                extension(3, "not_equal:any_any"),
+            ],
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(Rel {
+                        rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                            input: Some(Box::new(read())),
+                            condition: Some(Box::new(exists)),
+                            ..Default::default()
+                        }))),
+                    }),
+                    names: vec!["a".to_string(), "b".to_string()],
+                })),
+            }],
+            ..Default::default()
+        };
+
+        let plan = from_substrait_plan(&ctx.state(), &proto)
+            .await
+            .expect("same-table correlated EXISTS must lower");
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute correlated EXISTS plan");
+        let schema = df.schema().as_arrow().clone();
+        let batches = df.collect().await.expect("collect correlated EXISTS plan");
+        let mut rows = batches_to_table(&batches, &schema).rows;
+        rows.sort();
+        // 1|10 and 1|20 each have a partner with the same `a` and a different
+        // `b`; 2|30 has none. Without the fork fix the result is empty.
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["1".to_string(), "20".to_string()],
+            ]
+        );
+    }
 }

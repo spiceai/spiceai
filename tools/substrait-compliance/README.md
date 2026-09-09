@@ -13,7 +13,7 @@ report-only; it does not fail the repository on a low pass rate.
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `5ccb99672853bd768019101ebb6a7d1aa4c8f547` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the corrections in its `SPICEAI.md` (TPC-H q01 shipdate cutoff) |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `spiceai-54` @ `ce0105748e153bcfe4ae182061ad875694ab4a1c` (workspace `[patch.crates-io]`; merged spiceai/datafusion#220 and #221, includes #215) |
+| spiceai/datafusion fork | `claude/substrait-subquery-scan-alias` @ `2d566a6094a43c00bbe219632d8e83ee0134cc84` (workspace `[patch.crates-io]`; spiceai/datafusion#226 head on `spiceai-54` `ce010574…`, includes #215, #220, #221) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
@@ -24,18 +24,20 @@ in `src/main.rs` carry the same pin and move together.
 Nothing from the IBM repository is vendored. The suite is cloned at run
 time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
-## Mode A baseline (measured 2026-09-05 on `6006901cb602d845ee1441269d6eaa142c2580a6`)
+## Mode A baseline (measured 2026-09-09 on the pins above)
 
 | Suite | PASS | FAIL | SKIP | ERROR | Total |
 |-------|------|------|------|-------|-------|
-| TPC-H SF 0.01 | 16 | 3 | 0 | 3 | 22 |
+| TPC-H SF 0.01 | 22 | 0 | 0 | 0 | 22 |
 
-Before compare lifts (same pin): **PASS 5 | FAIL 14 | SKIP 0 | ERROR 3**.
-After value-preserving compare lifts: **PASS 15 | FAIL 4**. Quoted-empty
-`""` decode then flips q17 (measured) → **PASS 16 | FAIL 3**. Isthmus `VarChar`
-literals no longer ERROR after DF #215. Remaining ERRORs are non-Value
-function arguments (q07, q08, q09). Per-query notes and known-fail
-flips: [`RESULTS.md`](RESULTS.md).
+Each step measured with the same command: IBM-strict compare on the first
+`spiceai-54` pin **5 / 14 / 0 / 3**; value-preserving compare lifts
+**16 / 3 / 0 / 3**; `extract` enum arguments in the fork consumer
+(spiceai/datafusion#220) **18 / 4 / 0 / 0**; the q01 suite correction with
+the golden-trim and declared-scale fixes in this harness **21 / 1 / 0 / 0**;
+a subquery scan's own qualifier in the fork consumer
+(spiceai/datafusion#226) **22 / 0 / 0 / 0**. Per-query notes:
+[`RESULTS.md`](RESULTS.md).
 
 ## Local run (Mode A)
 
@@ -52,7 +54,8 @@ cargo run -p spice-substrait-compliance -- \
 
 Single query: add `--query q01`.
 
-Mode B (encodes the FlightSQL command; does not contact `spiced`):
+Mode B (encodes the FlightSQL command; does not contact `spiced`). Each
+mode defaults to its own report paths, `results/<mode>-tpch.{json,csv}`:
 
 ```bash
 cargo run -p spice-substrait-compliance -- --mode mode-b
@@ -79,13 +82,19 @@ cosmetics — values must still match:
 - numeric ε is absolute `1e-8` or relative `1e-14` for floats/`double`
   (`decimal` vs `DuckDB` float; IBM documents absolute `1e-9`). Printed
   fractional length is not a tolerance. One ULP at a declared decimal
-  scale applies only when both headers are `decimal(p,s)` with the same
-  scale ≥ 2. `integer`/`bigint` cells compare exactly. Quoted-empty `""`
-  in a golden CSV decodes to empty/NULL; after decode only the empty
-  string is NULL. Incomplete CSV rows (field count ≠ header width)
-  mismatch.
+  scale applies when both headers are `decimal(p,s)` with the same
+  scale ≥ 2; when the engine's schema declares the actual column
+  `decimal(p,s)` and the golden is `double`, the actual must be the
+  golden rounded or truncated at that scale (q01 `AVG_QTY`
+  `decimal(19,6)` `25.575154` vs `25.575154611454693`), and a value one
+  unit off still fails. `integer`/`bigint` cells compare exactly.
+  Quoted-empty `""` in a golden CSV decodes to empty/NULL; after decode
+  only the empty string is NULL, whitespace is a value. Golden cells are
+  trimmed trailing-only, as engine cells are: a leading space is part of
+  the value (q02 `s_comment`, q10 `c_comment`). Incomplete CSV rows
+  (field count ≠ header width) mismatch.
 
-Not lifted: row-count misses (q21). `string` ↔ numeric type labels
+Not lifted: row-count misses. `string` ↔ numeric type labels
 (q22 country codes) go through to value compare.
 
 A test with no expected CSV is `SKIPPED`, never `PASSED`.
