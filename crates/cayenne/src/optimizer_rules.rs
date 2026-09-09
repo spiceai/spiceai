@@ -830,14 +830,19 @@ fn try_rewrite_oversized_join(
             return finish_sort_merge_rewrite(hash_join, true);
         }
         if !join_touches_cayenne(hash_join) {
-            // CTE-auto Q78: `ss`/`ws`/`cs` become `CteScanExec` leaves, so the
-            // join no longer touches Cayenne. EnforceDistribution then
-            // hash-repartitions that 1-partition CTE into N `HashJoinInput`s
-            // (~5 GB each at SF-100) that cannot spill. Collapse to
-            // `CollectLeft` so there is one build copy — same hash-join
-            // algorithm as the `__test_reference` oracle (a coalesced
-            // sort-merge of that oracle changed LIMIT 100 at SF-1).
-            if join_reads_materialized_cte(hash_join) {
+            // Stay a hash join (a coalesced sort-merge of the Q78 oracle
+            // changed LIMIT 100 at SF-1). Collapse `Partitioned` to
+            // `CollectLeft` so there is one `HashJoinInput` instead of N
+            // unspillable ~5 GB copies:
+            //
+            // - CTE-auto Q78: `ss`/`ws`/`cs` are `CteScanExec` leaves, so the
+            //   join no longer touches Cayenne. EnforceDistribution then
+            //   hash-repartitions that 1-partition CTE onto N build sides.
+            // - `__test_reference` Q78: the same `ss LEFT JOIN ws LEFT JOIN cs`
+            //   over file scans, no CTE. SF-100 trunk r2 OOMed the oracle
+            //   warmup (`HashJoinInput` × 5 GB, pool 107.4 / 107.5 GB) while
+            //   the Cayenne plan of the same query passed.
+            if join_reads_materialized_cte(hash_join) || should_spill_unknown_size_join(hash_join) {
                 return rewrite_partitioned_hash_join_to_collect_left(hash_join);
             }
             return Ok(None);
@@ -1112,7 +1117,10 @@ fn rewrite_partitioned_hash_join_to_collect_left(
         hash_join.on().to_vec(),
         hash_join.filter().cloned(),
         hash_join.join_type(),
-        hash_join.projection.as_ref().map(|indices| indices.to_vec()),
+        hash_join
+            .projection
+            .as_ref()
+            .map(|indices| indices.to_vec()),
         PartitionMode::CollectLeft,
         hash_join.null_equality(),
         false,
@@ -3727,15 +3735,26 @@ mod tests {
     }
 
     #[test]
-    fn does_not_rewrite_unknown_size_aggregate_inner_join_without_cayenne_scans() {
+    fn rewrites_partitioned_oracle_aggregate_join_to_collect_left() {
         // TPC-DS Q78 `--validate` oracle: `ss LEFT JOIN ws` over file scans,
         // no Cayenne exec in the tree. Distinct schemas so this is not the
         // year_total self-join skip. A coalesced sort-merge of this join
         // returns 65 rows for LIMIT 100 instead of 100 (regression for #13918).
+        // SF-100 trunk r2: Partitioned HJ made N unspillable `HashJoinInput`s
+        // (~5 GB each) that exhausted the 107.5 GB pool during the oracle
+        // warmup. CollectLeft keeps hash-join results with one build copy.
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
-        let left = grouped_count_over(inlined_exec(&left_schema), "ss_item_sk");
-        let right = grouped_count_over(inlined_exec(&right_schema), "ws_item_sk");
+        let left = hash_repartition(
+            grouped_count_over(inlined_exec(&left_schema), "ss_item_sk"),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            grouped_count_over(inlined_exec(&right_schema), "ws_item_sk"),
+            "ws_item_sk",
+            4,
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -3749,9 +3768,18 @@ mod tests {
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
-        assert!(
-            optimized.is::<HashJoinExec>(),
-            "Q78 --validate oracle (no Cayenne scans) must keep unknown-size inner aggregate joins as hash joins"
+        let rewritten = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("Q78 --validate oracle must stay a hash join, not sort-merge (LIMIT 100)");
+        assert_eq!(
+            *rewritten.partition_mode(),
+            PartitionMode::CollectLeft,
+            "must collapse N HashJoinInputs of the file-scan oracle to one build"
+        );
+        assert_eq!(
+            rewritten.left().output_partitioning().partition_count(),
+            1,
+            "CollectLeft build side must be one partition"
         );
     }
 
