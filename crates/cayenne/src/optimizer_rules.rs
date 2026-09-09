@@ -995,6 +995,14 @@ fn wrap_sort_merge_to_hash_join_schema(
         let Some(src_field) = source.fields().get(src_index) else {
             return Ok(None);
         };
+        // HashJoin projection indices are into `join_schema()`. If
+        // `SortMergeJoinExec`'s unprojected schema does not line up (right
+        // joins, swapped inputs), applying those indices yields
+        // Decimal128 vs LargeUtf8 at TPC-DS Q13 and the query fails at
+        // execute. Leave the hash join in place.
+        if src_field.data_type() != target.field(out_index).data_type() {
+            return Ok(None);
+        }
         exprs.push((
             Arc::new(Column::new(src_field.name(), src_index)) as Arc<dyn PhysicalExpr>,
             target.field(out_index).name().clone(),
