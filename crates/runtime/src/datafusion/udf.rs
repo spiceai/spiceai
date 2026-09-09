@@ -1233,13 +1233,13 @@ mod tests {
         ] {
             for name in ["regexp_match", "regexp_instr", "regexp_count"] {
                 assert!(
-                    !support.supports(&make_named_expr(name)),
+                    !support.supports(&make_named_expr(name), None),
                     "{name} has no value-preserving DuckDB rendering and must not be pushed down"
                 );
             }
             for name in ["regexp_like", "regexp_replace"] {
                 assert!(
-                    support.supports(&make_named_expr(name)),
+                    support.supports(&make_named_expr(name), None),
                     "{name} is rendered natively by the DuckDB dialect and must be pushed down"
                 );
             }
