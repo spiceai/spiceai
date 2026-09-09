@@ -324,7 +324,7 @@ fn avro_value_to_change_event(value: &AvroValue) -> Result<ChangeEvent> {
     let before = field("before")
         .map(avro_to_json)
         .transpose()?
-        .and_then(|v| if v.is_null() { None } else { Some(v) });
+        .filter(|v| !v.is_null());
 
     let after = field("after")
         .map(avro_to_json)

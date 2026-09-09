@@ -17,6 +17,9 @@ pub mod avoid_vector_columns_on_index;
 
 pub mod regexp_match_null_check;
 pub use regexp_match_null_check::RegexpMatchNullCheckRewrite;
+mod json_get_null_check;
+pub(crate) use json_get_null_check::JSON_GET_IS_NULL_NAME;
+pub use json_get_null_check::JsonGetNullCheckRewrite;
 
 #[macro_export]
 macro_rules! concrete {

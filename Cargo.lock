@@ -92,6 +92,7 @@ dependencies = [
  "data-accelerator-api",
  "data_components",
  "datafusion",
+ "datafusion-spark",
  "datafusion-table-providers",
  "duckdb",
  "futures",
@@ -5294,6 +5295,12 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
+
+[[package]]
+name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
@@ -7309,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=ae32853c9b122ac3e48d6fa87c740113379c0aa3#ae32853c9b122ac3e48d6fa87c740113379c0aa3"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=96c361a7c8d0d29c7a76b0e92acf64268da3e2a2#96c361a7c8d0d29c7a76b0e92acf64268da3e2a2"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -7620,7 +7627,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case",
+ "convert_case 0.10.0",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -9708,6 +9715,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
+ "vstd",
 ]
 
 [[package]]
@@ -17447,6 +17455,7 @@ dependencies = [
  "runtime-auth",
  "runtime-checkpoint-api",
  "runtime-checkpoint-duckdb",
+ "runtime-checkpoint-postgres",
  "runtime-checkpoint-sqlite",
  "runtime-cluster",
  "runtime-component",
@@ -17639,6 +17648,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-checkpoint-api",
  "serde_json",
+ "spicepod",
  "tempfile",
  "tokio",
  "tracing",
@@ -17685,6 +17695,7 @@ dependencies = [
  "runtime-acceleration",
  "runtime-checkpoint-api",
  "serde_json",
+ "tokio",
  "turso",
 ]
 
@@ -17816,8 +17827,10 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-expr",
  "datafusion-federation",
+ "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
+ "datafusion-spark",
  "datafusion-table-providers",
  "futures",
  "insta",
@@ -18972,7 +18985,7 @@ dependencies = [
 [[package]]
 name = "sea-query"
 version = "0.32.0-rc.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=ae75baef819513fb8d19af014972dcfa324e201a#ae75baef819513fb8d19af014972dcfa324e201a"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -18985,7 +18998,7 @@ dependencies = [
 [[package]]
 name = "sea-query-derive"
 version = "0.4.1"
-source = "git+https://github.com/spiceai/sea-query.git?rev=213b6b876068f58159ebdd5852604a021afaebf9#213b6b876068f58159ebdd5852604a021afaebf9"
+source = "git+https://github.com/spiceai/sea-query.git?rev=ae75baef819513fb8d19af014972dcfa324e201a#ae75baef819513fb8d19af014972dcfa324e201a"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",
@@ -20002,7 +20015,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "3.2.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=93b75c3c7d1a812b23d00b45adf537d7a2415496#93b75c3c7d1a812b23d00b45adf537d7a2415496"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76#3267ff355f1bc2e0f382aa0b1e0113e5b98f1d76"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -23257,6 +23270,60 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-08-30-0159"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300d269a2e06dbe54cb53084464065912ad7accbb52ae8d6c8aa7a6c521974c5"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-08-30-0159"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc040bfded82e79a708c1819c52b386ee23c0c823239334f39ced152bbdf3624"
+dependencies = [
+ "convert_case 0.4.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "synstructure 0.13.2",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-08-09-0044"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51fc115de5fb3806bc362060bb683024660ed2bc13c1183d1f01d464e4537139"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-08-02-0125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93f77ff8d121edb1bf2651335769a80a2f611da8573c3b498434a66b3162805f"
+dependencies = [
+ "indexmap 2.14.0",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-08-02-0125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17237ea6d267e457d53ce36f55b315fc9edd26eb88c765dd95e035c0b415869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "vob"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23894,6 +23961,17 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vstd"
+version = "0.0.0-2026-08-30-0159"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7169790c92857fa9441c8ba7e0c469f4fc62104caf1dfc632c318577a1a08d7a"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+]
 
 [[package]]
 name = "wait-timeout"

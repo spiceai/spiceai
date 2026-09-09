@@ -667,12 +667,7 @@ mod tests {
     /// just past the schema message, along with the decoded schema.
     async fn decoder_for(batches: Vec<RecordBatch>) -> (FlightDataDecoder, SchemaRef) {
         use arrow_flight::encode::FlightDataEncoderBuilder;
-        let input = futures::stream::iter(
-            batches
-                .into_iter()
-                .map(Ok::<RecordBatch, FlightError>)
-                .collect::<Vec<_>>(),
-        );
+        let input = futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, FlightError>));
         let flight_stream = FlightDataEncoderBuilder::new().build(input);
         let mut decoder = FlightDataDecoder::new(flight_stream);
         let schema = decode_schema(&mut decoder).await.expect("schema decoded");

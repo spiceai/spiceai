@@ -328,21 +328,18 @@ fn build_documents(
             });
         }
 
-        if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) {
-            zero_or_nan_skips += 1;
-            if zero_or_nan_samples.len() < SAMPLE_LIMIT {
-                zero_or_nan_samples.push(row);
-            }
-            if let Some(id) = primary_keys[row].as_ref() {
-                outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
-            }
-            continue;
-        }
-
-        if embedding.iter().any(|x| !x.is_finite()) {
-            non_finite_skips += 1;
-            if non_finite_samples.len() < SAMPLE_LIMIT {
-                non_finite_samples.push(row);
+        if let Some(rejection) = write_util::classify_vector(embedding) {
+            let (skips, samples) = match rejection {
+                write_util::VectorRejection::NoDirection => {
+                    (&mut zero_or_nan_skips, &mut zero_or_nan_samples)
+                }
+                write_util::VectorRejection::NonFinite => {
+                    (&mut non_finite_skips, &mut non_finite_samples)
+                }
+            };
+            *skips += 1;
+            if samples.len() < SAMPLE_LIMIT {
+                samples.push(row);
             }
             if let Some(id) = primary_keys[row].as_ref() {
                 outcomes.push((id.as_str(), write_util::RowOutcome::Rejected));
@@ -1010,6 +1007,7 @@ mod tests {
         use crate::index::elasticsearch::{
             ElasticsearchIndex, ElasticsearchIndexWriteMaintenance, unused_client,
         };
+        use crate::index::write_util;
         use crate::metadata::MetadataColumns;
 
         const DIMS: i32 = 2;
@@ -1127,6 +1125,45 @@ mod tests {
             assert_eq!(
                 evicted(&[1, 2], &[Some(vec![1.0, 2.0]), None]),
                 vec!["2".to_string()],
+            );
+        }
+
+        /// Regression test for #13872. Elasticsearch already rejected every shape, so this
+        /// is the guard that keeps it aligned with the other two backends rather than a
+        /// behaviour change — and it runs the same shared list they do, so a shape added
+        /// for one backend cannot quietly go uncovered here.
+        #[test]
+        fn every_unindexable_shape_evicts_its_document_and_indexes_nothing() {
+            let ids = [1, 2, 1];
+            for (name, deciding, _) in write_util::unindexable_shapes(2) {
+                let embeddings = [Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0]), Some(deciding)];
+                assert_eq!(
+                    evicted(&ids, &embeddings),
+                    vec!["1".to_string()],
+                    "the deciding row for _id 1 carries a {name} vector, so the document \
+                     the earlier row stored answers a search from text it no longer has"
+                );
+                assert_eq!(
+                    indexed_ids(&ids, &embeddings),
+                    vec!["2".to_string()],
+                    "re-indexing the earlier row would restore the document just deleted"
+                );
+            }
+        }
+
+        /// The control: an ordinary vector in the same position is stored and evicts nothing.
+        #[test]
+        fn an_ordinary_deciding_vector_evicts_nothing() {
+            let ids = [1, 2, 1];
+            let embeddings = [
+                Some(vec![1.0, 2.0]),
+                Some(vec![3.0, 4.0]),
+                Some(write_util::indexable_shape(2)),
+            ];
+            assert!(evicted(&ids, &embeddings).is_empty());
+            assert_eq!(
+                indexed_ids(&ids, &embeddings),
+                vec!["1".to_string(), "2".to_string(), "1".to_string()],
             );
         }
 
