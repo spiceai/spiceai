@@ -820,13 +820,22 @@ fn try_rewrite_oversized_join(
         }
         // Aggregated CTE bodies (TPC-DS Q78/Q97) often report `Absent` row
         // counts. Skipping the rewrite then leaves a non-spillable hash table
-        // that exhausts the pool. Treat unknown size as oversized.
+        // that exhausts the pool. Treat unknown size as oversized — except a
+        // same-schema self-join (TPC-DS Q4/Q11/Q74 `year_total` curr/prev).
+        // Those joins are 1:1 on the grouping key; sort-merge was returning a
+        // different LIMIT-100 customer set than hash join at SF-100.
         let Some(build_row_count) = build_input_row_estimate(hash_join) else {
+            if is_same_schema_self_join(hash_join) {
+                return Ok(None);
+            }
             return finish_sort_merge_rewrite(hash_join);
         };
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
         else {
+            if is_same_schema_self_join(hash_join) {
+                return Ok(None);
+            }
             return finish_sort_merge_rewrite(hash_join);
         };
 
@@ -994,15 +1003,15 @@ fn wrap_sort_merge_to_hash_join_schema(
     Ok(Some(Arc::new(ProjectionExec::try_new(exprs, sort_merge)?)))
 }
 
-/// Build-side (LEFT input) row count for the spillable rewrite, accepting an
-/// inexact estimate. Returns `None` only when statistics are entirely absent.
-/// Deep build sides (a join result feeding another join) rarely have exact
-/// statistics, so requiring `Precision::Exact` would skip exactly the wide
-/// multi-way joins this rewrite targets.
+/// Build-side (LEFT input) row count for the "small enough to stay a hash
+/// join" decision. Only `Precision::Exact` is trusted: an `Inexact`
+/// underestimate (TPC-DS Q78's aggregated `ss`/`ws`/`cs` bodies) would keep a
+/// 19 GB non-spillable `HashJoinInput` that then exhausts the pool. `None`
+/// means unknown → treat as oversized, except a same-schema self-join.
 fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
     match hash_join.left().partition_statistics(None).ok()?.num_rows {
-        Precision::Exact(row_count) | Precision::Inexact(row_count) => Some(row_count),
-        Precision::Absent => None,
+        Precision::Exact(row_count) => Some(row_count),
+        Precision::Inexact(_) | Precision::Absent => None,
     }
 }
 
@@ -1012,6 +1021,13 @@ fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
 fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
     !collect_cayenne_scans(hash_join.left()).is_empty()
         || !collect_cayenne_scans(hash_join.right()).is_empty()
+}
+
+/// Both inputs expose the same field names and types — the physical shape of a
+/// self-join of one CTE (TPC-DS `year_total`, `all_sales`). Distinct CTE
+/// bodies (Q78 `ss` ⋈ `ws`) do not match.
+fn is_same_schema_self_join(hash_join: &HashJoinExec) -> bool {
+    hash_join.left().schema() == hash_join.right().schema()
 }
 
 /// Count the `HashJoinExec` nodes in a plan. Used to size each join's fair
@@ -3258,12 +3274,24 @@ mod tests {
         );
     }
 
+    fn channel_schema(qty_name: &str) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new(qty_name, DataType::Int64, false),
+        ]))
+    }
+
     #[test]
     fn rewrites_absent_stats_hash_join_when_memory_pool_configured() {
-        let schema = order_line_schema();
-        let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        // Distinct schemas, like TPC-DS Q78 `ss` ⋈ `ws`. A same-schema self-join
+        // of one CTE is excluded (see
+        // `does_not_rewrite_absent_stats_same_schema_self_join`).
+        let left_schema = channel_schema("ss_qty");
+        let right_schema = channel_schema("ws_qty");
+        let left =
+            cayenne_file_exec_with_num_rows(&left_schema, "ss.vortex", Precision::Absent);
         let right =
-            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+            cayenne_file_exec_with_num_rows(&right_schema, "ws.vortex", Precision::Absent);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -3283,6 +3311,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn does_not_rewrite_absent_stats_same_schema_self_join() {
+        let schema = order_line_schema();
+        let left = cayenne_file_exec_with_num_rows(&schema, "year_total.vortex", Precision::Absent);
+        let right =
+            cayenne_file_exec_with_num_rows(&schema, "year_total.vortex", Precision::Absent);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "TPC-DS Q4/Q11/Q74 year_total self-joins must stay hash joins when stats are Absent"
+        );
+    }
+
+    #[test]
+    fn rewrites_inexact_stats_distinct_schema_hash_join() {
+        let left_schema = channel_schema("ss_qty");
+        let right_schema = channel_schema("ws_qty");
+        let left = cayenne_file_exec_with_num_rows(
+            &left_schema,
+            "ss.vortex",
+            Precision::Inexact(1_000),
+        );
+        let right = cayenne_file_exec_with_num_rows(
+            &right_schema,
+            "ws.vortex",
+            Precision::Inexact(1_000),
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "Inexact stats must not keep a TPC-DS Q78-style join as a non-spillable hash table"
+        );
+    }
+
     /// TPC-DS Q75 self-joins `all_sales` curr/prev: both sides expose `d_year`.
     /// A hash-join projection that emits right then left must survive the
     /// sort-merge rewrite as those same indices, not as "first unused field
@@ -3290,9 +3376,18 @@ mod tests {
     #[test]
     fn sort_merge_rewrite_keeps_self_join_projection_indices() {
         let schema = order_line_schema();
-        let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
-        let right =
-            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Absent);
+        // Known-large exact stats so the memory gate still rewrites a
+        // same-schema self-join (the Absent path leaves those as hash joins).
+        let left = cayenne_file_exec_with_num_rows(
+            &schema,
+            "order_line.vortex",
+            Precision::Exact(200_000),
+        );
+        let right = cayenne_file_exec_with_num_rows(
+            &schema,
+            "order_line.vortex",
+            Precision::Exact(200_000),
+        );
         let n_left = schema.fields().len();
         // Concatenated join schema is [left..., right...]. Pick right.order_id
         // then left.order_id — two columns with the same name.
@@ -3316,8 +3411,7 @@ mod tests {
         );
         assert!(join.contains_projection());
         let expected_schema = join.schema();
-        let config =
-            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3894,13 +3988,20 @@ mod tests {
     /// exact rows and would skip this — the key q78 enabler).
     #[test]
     fn rewrites_inexact_build_inner_hash_join_under_memory_gate() {
-        let schema = order_line_schema();
+        // Distinct schemas so this is not the Q4/Q11/Q74 year_total self-join
+        // exclusion. Inexact stats on `ss` ⋈ `ws` (Q78) must still spill.
+        let left_schema = channel_schema("ss_qty");
+        let right_schema = channel_schema("ws_qty");
         let left = cayenne_file_exec_with_num_rows(
-            &schema,
-            "order_line.vortex",
+            &left_schema,
+            "ss.vortex",
             Precision::Inexact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
         );
-        let right = large_exact_cayenne_file_exec(&schema, "store_sales.vortex");
+        let right = cayenne_file_exec_with_num_rows(
+            &right_schema,
+            "ws.vortex",
+            Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
