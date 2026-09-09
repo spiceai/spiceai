@@ -90,7 +90,7 @@ use super::{
 use super::managed_runtime;
 use crate::datafusion::{
     DataFusion,
-    query::cache::RequestCacheManager,
+    query::cache::{PlanRequest, PreparedExecute, RequestCacheManager},
     sql_session_extension::{SessionError, SqlSessionExtension},
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
@@ -726,6 +726,9 @@ impl Query {
                             sql.as_ref(),
                             &sql_raw_cache_key,
                             parameters,
+                            // A Ballista session holds no prepared statements,
+                            // so there is nothing here to substitute.
+                            PreparedExecute::Leave,
                         )
                         .await?
                     };
@@ -742,10 +745,13 @@ impl Query {
                                 &self.df,
                                 &session,
                                 Arc::clone(&request_context),
-                                sql.as_ref(),
-                                parameters,
+                                PlanRequest {
+                                    sql: sql.as_ref(),
+                                    parameters,
+                                    pre_parsed_plan,
+                                    prepared: PreparedExecute::Leave,
+                                },
                                 tracker,
-                                pre_parsed_plan,
                             )
                             .await?
                         }
@@ -754,10 +760,13 @@ impl Query {
                                 &self.df,
                                 &session,
                                 &request_context,
-                                sql.as_ref(),
-                                parameters,
+                                PlanRequest {
+                                    sql: sql.as_ref(),
+                                    parameters,
+                                    pre_parsed_plan,
+                                    prepared: PreparedExecute::Leave,
+                                },
                                 tracker,
-                                pre_parsed_plan,
                             )
                             .await?
                         }
@@ -1082,20 +1091,29 @@ impl Query {
                 // below and the Statement branch further down run in whichever
                 // context this picks, so `PREPARE` and the `EXECUTE` that
                 // follows it cannot land in different ones.
-                let session_scope =
-                    match Self::resolve_session(&request_context, &ctx.df.ctx) {
-                        Ok(scope) => scope,
-                        Err(e) => handle_error!(
-                            tracker,
-                            &request_context,
-                            ErrorCode::QueryPlanningError,
-                            e,
-                            UnableToExecuteQuery
-                        ),
-                    };
+                let session_scope = match Self::resolve_session(&request_context, &ctx.df.ctx) {
+                    Ok(scope) => scope,
+                    Err(e) => handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    ),
+                };
                 let mut session = session_scope
                     .as_ref()
                     .map_or_else(|| ctx.df.ctx.state(), |scope| scope.context().state());
+
+                // A read-only request keeps `EXECUTE` unresolved so
+                // `validate_sql_query_read_only` still refuses it, as it refuses
+                // every statement. Resolving first would turn that refusal into
+                // an execution of whatever the statement was prepared as.
+                let prepared = if ctx.read_only {
+                    PreparedExecute::Leave
+                } else {
+                    PreparedExecute::Resolve
+                };
 
                 // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
                 session
@@ -1127,6 +1145,7 @@ impl Query {
                                 sql.as_ref(),
                                 &raw_cache_key,
                                 parameters,
+                                prepared,
                             )
                             .await
                             {
@@ -1181,10 +1200,13 @@ impl Query {
                                     &ctx.df,
                                     &session,
                                     Arc::clone(&request_context),
-                                    sql.as_ref(),
-                                    parameters,
+                                    PlanRequest {
+                                        sql: sql.as_ref(),
+                                        parameters,
+                                        pre_parsed_plan,
+                                        prepared,
+                                    },
                                     tracker,
-                                    pre_parsed_plan,
                                 )
                                 .await?
                             }
@@ -1193,10 +1215,13 @@ impl Query {
                                     &ctx.df,
                                     &session,
                                     &request_context,
-                                    sql.as_ref(),
-                                    parameters,
+                                    PlanRequest {
+                                        sql: sql.as_ref(),
+                                        parameters,
+                                        pre_parsed_plan,
+                                        prepared,
+                                    },
                                     tracker,
-                                    pre_parsed_plan,
                                 )
                                 .await?
                             }
@@ -1323,7 +1348,7 @@ impl Query {
                     t
                 });
 
-                // Statement plans (PREPARE, EXECUTE, DEALLOCATE, SET) need special handling
+                // Statement plans (PREPARE, DEALLOCATE, SET) need special handling
                 // They modify session state rather than producing query results, so must be
                 // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
                 // [query admission] Bound the number of concurrently-executing
@@ -1340,9 +1365,11 @@ impl Query {
                 //
                 // Only plans that actually EXECUTE a (potentially heavy) query are
                 // gated: ordinary query plans, and `EXECUTE <prepared>` (which runs
-                // the prepared query). The other Statement plans — PREPARE,
-                // DEALLOCATE, SET — only mutate session state, so they must NOT
-                // consume a query permit or block behind the pool under load.
+                // the prepared query, and ordinarily reaches here already
+                // substituted for the plan it names). The other Statement plans —
+                // PREPARE, DEALLOCATE, SET — only mutate session state, so they
+                // must NOT consume a query permit or block behind the pool under
+                // load.
                 let plan_executes_query = match &*plan {
                     LogicalPlan::Statement(stmt) => {
                         matches!(stmt, datafusion::logical_expr::Statement::Execute(_))
@@ -1379,25 +1406,27 @@ impl Query {
                     Arc<dyn ExecutionPlan>,
                 ) = if matches!(&*plan, LogicalPlan::Statement(_)) {
                     // For Statement plans, use SessionContext::execute_logical_plan()
-                    // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state.
+                    // which handles PREPARE/DEALLOCATE/SET by modifying session state.
                     // These are the statements a session exists for, so they run in
                     // the session bound at the top of this block — never in one
                     // resolved separately here, which would skip its ownership check.
-                    let session_ctx = match &session_scope {
-                        Some(scope) => {
-                            tracing::debug!(
-                                "Statement plan using SQL session: {}",
-                                scope.context().session_id()
-                            );
-                            Arc::clone(scope.context())
-                        }
-                        None => {
-                            // No session: the statement mutates a context that is
-                            // discarded when the request ends, so a `PREPARE` here
-                            // is not visible to any later request.
-                            tracing::debug!("Statement plan using ad-hoc session (no SQL session)");
-                            Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
-                        }
+                    //
+                    // `EXECUTE` mutates nothing and was already substituted for the
+                    // plan it names during planning, so it arrives here only when
+                    // the request is read-only, where the validation above has
+                    // already refused it.
+                    let session_ctx = if let Some(scope) = &session_scope {
+                        tracing::debug!(
+                            "Statement plan using SQL session: {}",
+                            scope.context().session_id()
+                        );
+                        Arc::clone(scope.context())
+                    } else {
+                        // No session: the statement mutates a context that is
+                        // discarded when the request ends, so a `PREPARE` here is
+                        // not visible to any later request.
+                        tracing::debug!("Statement plan using ad-hoc session (no SQL session)");
+                        Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
@@ -1531,7 +1560,7 @@ impl Query {
 
                 Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
 
-                // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
+                // Skip schema verification for Statement plans (PREPARE/DEALLOCATE/SET),
                 // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
                 // DML extension nodes, as their logical plan schema may differ from the
                 // actual execution result (DDL/DML plans may be rewritten by analyzer rules

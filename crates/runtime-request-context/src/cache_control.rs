@@ -148,6 +148,19 @@ impl CacheControl {
         Self::Cache(cache_key_type)
     }
 
+    /// The same directive with a different cache key type. `no-cache` has no
+    /// key type to replace, so it is returned unchanged.
+    #[must_use]
+    pub fn with_cache_key_type(self, cache_key_type: CacheKeyType) -> Self {
+        match self {
+            Self::Cache(_) => Self::Cache(cache_key_type),
+            Self::MaxStale(_, duration) => Self::MaxStale(cache_key_type, duration),
+            Self::MinFresh(_, duration) => Self::MinFresh(cache_key_type, duration),
+            Self::OnlyIfCached(_) => Self::OnlyIfCached(cache_key_type),
+            Self::NoCache => Self::NoCache,
+        }
+    }
+
     /// Get the cache key type from the `CacheControl` variant
     #[must_use]
     pub fn cache_key_type(&self) -> Option<CacheKeyType> {

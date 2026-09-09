@@ -28,7 +28,8 @@ use cache::{
 use datafusion::{
     common::ParamValues,
     execution::{SendableRecordBatchStream, SessionState},
-    logical_expr::LogicalPlan,
+    logical_expr::{LogicalPlan, Statement},
+    prelude::SessionContext,
     sql::TableReference,
 };
 use futures::TryStreamExt;
@@ -44,6 +45,51 @@ use tracing::Span;
 pub(super) enum PlanOrCached {
     Plan(Box<LogicalPlan>, Option<QueryTracker>, RequestCacheManager),
     Cached(QueryResult),
+}
+
+/// Whether planning substitutes the prepared statement an `EXECUTE` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparedExecute {
+    /// `EXECUTE name(args)` becomes the prepared statement's plan with `args`
+    /// bound. That is what lets the results cache key the request, the
+    /// invalidation registry see the tables it reads, and physical planning
+    /// treat it as the ordinary query it stands for.
+    Resolve,
+
+    /// `EXECUTE` is left as a `LogicalPlan::Statement`.
+    ///
+    /// Read-only requests keep this: `validate_sql_query_read_only` refuses
+    /// every statement, and resolving one before that check would turn the
+    /// refusal into an execution. The distributed path keeps it too — its
+    /// session is a Ballista one that holds no prepared statements.
+    Leave,
+}
+
+/// What a request asks to be planned.
+///
+/// Grouped rather than passed as four more parameters: every entry point below
+/// takes the same four, and they travel together from `run_local` through to
+/// [`Query::plan_statement`].
+pub(super) struct PlanRequest<'a> {
+    pub(super) sql: &'a str,
+    /// Parameter values to bind, for a request that supplied them out of band
+    /// (Flight SQL's parameterized statements).
+    pub(super) parameters: Option<ParamValues>,
+    /// A plan already produced for `sql`, to be used instead of re-planning.
+    pub(super) pre_parsed_plan: Option<Box<LogicalPlan>>,
+    pub(super) prepared: PreparedExecute,
+}
+
+/// A planned statement, and whether planning it substituted a prepared
+/// statement.
+pub(super) struct PlannedStatement {
+    pub(super) plan: LogicalPlan,
+    /// Set when the SQL was `EXECUTE name(args)` and `plan` is the prepared
+    /// statement's plan with `args` bound. This decides the results-cache key:
+    /// the text `EXECUTE p(1)` *names* a plan that lives in the session rather
+    /// than describing one, so it cannot key an entry, while the plan it
+    /// resolved to identifies both the statement and its arguments.
+    pub(super) from_prepared_execute: bool,
 }
 
 pub(super) struct RequestCacheManager {
@@ -128,11 +174,15 @@ impl Query {
         df: &Arc<DataFusion>,
         session: &SessionState,
         request_context: Arc<RequestContext>,
-        sql: &str,
-        parameters: Option<ParamValues>,
+        request: PlanRequest<'_>,
         tracker: Option<QueryTracker>,
-        pre_parsed_plan: Option<Box<LogicalPlan>>,
     ) -> super::Result<PlanOrCached> {
+        let PlanRequest {
+            sql,
+            parameters,
+            pre_parsed_plan,
+            prepared,
+        } = request;
         let cache_control = request_context.cache_control();
         let cache_namespace = request_context.cache_namespace();
         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
@@ -153,9 +203,10 @@ impl Query {
             tracker,
             raw_key: sql_or_client_raw_key,
             ..
-        } = match Self::try_get_cached_result(
+        } = match Self::try_get_cached_result_with_control(
             df,
             &request_context,
+            cache_control,
             tracker,
             &sql_or_user_cache_key,
             sql,
@@ -171,13 +222,18 @@ impl Query {
 
         let sql_raw_cache_key =
             sql_cache_key.as_raw_key_in_namespace(Self::plan_hasher(df), ns_tag, ns_id);
-        let plan: Box<LogicalPlan> = if let Some(plan) = pre_parsed_plan {
+        let (plan, from_prepared_execute): (Box<LogicalPlan>, bool) = if let Some(plan) =
+            pre_parsed_plan
+        {
             // Reuse the pre-parsed plan to avoid re-parsing. Parameters are
-            // already bound from `check_read_only_sql`.
-            plan
+            // already bound from `check_read_only_sql`, which plans without
+            // substituting prepared statements.
+            (plan, false)
         } else {
-            match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
-                Ok(plan) => Box::new(plan),
+            match Self::plan_statement(df, session, sql, &sql_raw_cache_key, parameters, prepared)
+                .await
+            {
+                Ok(planned) => (Box::new(planned.plan), planned.from_prepared_execute),
                 Err(e) => {
                     if let super::Error::UnableToExecuteQuery { source } = e {
                         let code = ErrorCode::from(&source);
@@ -192,15 +248,31 @@ impl Query {
             }
         };
 
+        // A resolved `EXECUTE` is keyed by the plan it resolved to, whatever key
+        // type is configured. `EXECUTE p(1)` names a plan that lives in the
+        // session rather than describing one: two sessions of the same principal
+        // can each `PREPARE p` as a different query, and they share a cache
+        // namespace, so keying on that text would serve one session's rows to
+        // the other. The resolved plan is the only key that identifies both the
+        // prepared statement and its arguments. A client-supplied key is left
+        // alone — that key is the client's own contract.
+        let plan_cache_control = match cache_control.cache_key_type() {
+            Some(CacheKeyType::Raw) if from_prepared_execute => {
+                cache_control.with_cache_key_type(CacheKeyType::Default)
+            }
+            _ => cache_control,
+        };
+
         // Try to get cached results from plan.
         let CacheResponse {
             mut tracker,
             raw_key: plan_raw_cache_key,
             status,
             ..
-        } = match Self::try_get_cached_result(
+        } = match Self::try_get_cached_result_with_control(
             df,
             &request_context,
+            plan_cache_control,
             tracker,
             &CacheKey::LogicalPlan(&plan),
             sql,
@@ -214,14 +286,28 @@ impl Query {
             response => response,
         };
 
-        let request_raw_cache_key = match request_context.cache_control() {
+        // A resolved `EXECUTE` must never fall back to the SQL-text key: see
+        // `plan_cache_control` above. Every path that leaves the plan key unset
+        // (no cache provider, `no-cache`, a cached entry that failed to decode)
+        // also leaves the result unstored, but a fallback that is wrong under a
+        // future caller is worth not writing down.
+        let fallback_raw_cache_key = if from_prepared_execute {
+            CacheKey::LogicalPlan(&plan).as_raw_key_in_namespace(
+                Self::plan_hasher(df),
+                ns_tag,
+                ns_id,
+            )
+        } else {
+            sql_raw_cache_key
+        };
+        let request_raw_cache_key = match plan_cache_control {
             CacheControl::Cache(CacheKeyType::Default)
             | CacheControl::MaxStale(CacheKeyType::Default, _)
             | CacheControl::MinFresh(CacheKeyType::Default, _)
             | CacheControl::OnlyIfCached(CacheKeyType::Default) => plan_raw_cache_key,
             _ => sql_or_client_raw_key,
         }
-        .unwrap_or(sql_raw_cache_key);
+        .unwrap_or(fallback_raw_cache_key);
 
         let cache_status = Self::should_cache_results(df, &plan, status);
         tracker = tracker.map(|t| t.results_cache_hit(false));
@@ -238,11 +324,15 @@ impl Query {
         df: &Arc<DataFusion>,
         session: &SessionState,
         request_context: &RequestContext,
-        sql: &str,
-        parameters: Option<ParamValues>,
+        request: PlanRequest<'_>,
         tracker: Option<QueryTracker>,
-        pre_parsed_plan: Option<Box<LogicalPlan>>,
     ) -> super::Result<PlanOrCached> {
+        let PlanRequest {
+            sql,
+            parameters,
+            pre_parsed_plan,
+            prepared,
+        } = request;
         let cache_namespace = request_context.cache_namespace();
         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
         let raw_cache_key = CacheKey::Query(sql, parameters.as_ref()).as_raw_key_in_namespace(
@@ -253,7 +343,7 @@ impl Query {
         let plan = if let Some(plan) = pre_parsed_plan {
             plan
         } else {
-            match Self::get_plan(df, session, sql, &raw_cache_key, parameters).await {
+            match Self::get_plan(df, session, sql, &raw_cache_key, parameters, prepared).await {
                 Ok(plan) => Box::new(plan),
                 Err(super::Error::UnableToExecuteQuery { source }) => {
                     let code = ErrorCode::from(&source);
@@ -281,7 +371,23 @@ impl Query {
         sql: &str,
         sql_raw_cache_key: &RawCacheKey,
         parameters: Option<ParamValues>,
+        prepared: PreparedExecute,
     ) -> super::Result<LogicalPlan> {
+        Self::plan_statement(df, session, sql, sql_raw_cache_key, parameters, prepared)
+            .await
+            .map(|planned| planned.plan)
+    }
+
+    /// [`Self::get_plan`], reporting whether a prepared statement was
+    /// substituted. Only the results-cache key cares about the difference.
+    pub(super) async fn plan_statement(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        sql: &str,
+        sql_raw_cache_key: &RawCacheKey,
+        parameters: Option<ParamValues>,
+        prepared: PreparedExecute,
+    ) -> super::Result<PlannedStatement> {
         let plan = match df
             .get_or_create_logical_plan(session, Some(sql_raw_cache_key), sql)
             .await
@@ -294,6 +400,23 @@ impl Query {
             }
         };
 
+        // Substituting the prepared statement here, rather than at execution
+        // time, is what makes an `EXECUTE` an ordinary query for everything
+        // downstream — the results cache included.
+        //
+        // It has to happen *after* the plans cache above, which is keyed by SQL
+        // text: a prepared plan belongs to one session, so a resolved plan
+        // stored under `EXECUTE p(1)` would be handed to a session where `p` is
+        // a different query.
+        let (plan, from_prepared_execute) = match plan {
+            LogicalPlan::Statement(Statement::Execute(_))
+                if prepared == PreparedExecute::Resolve =>
+            {
+                (Self::resolve_prepared_execute(session, plan).await?, true)
+            }
+            plan => (plan, false),
+        };
+
         // Use the logical plan with parameter values for caching and lookup
         let plan = match parameters {
             Some(param_values) => plan
@@ -301,7 +424,33 @@ impl Query {
                 .context(BindingParametersSnafu)?,
             None => plan,
         };
-        Ok(plan)
+        Ok(PlannedStatement {
+            plan,
+            from_prepared_execute,
+        })
+    }
+
+    /// Substitutes the plan a prepared statement holds, with the `EXECUTE`'s
+    /// arguments bound, for the `EXECUTE` itself.
+    ///
+    /// Goes through `SessionContext::execute_logical_plan` rather than
+    /// reimplementing the substitution: that is what applies argument
+    /// simplification and the casts to the statement's declared parameter
+    /// types, and an `EXECUTE` that resolved differently here than at execution
+    /// time would file one query's rows under another's cache key. `EXECUTE` is
+    /// the one statement that mutates no session state, so resolving it early
+    /// leaves nothing to undo if the request then fails.
+    async fn resolve_prepared_execute(
+        session: &SessionState,
+        plan: LogicalPlan,
+    ) -> super::Result<LogicalPlan> {
+        let ctx = SessionContext::new_with_state(session.clone());
+        match ctx.execute_logical_plan(plan).await {
+            Ok(dataframe) => Ok(dataframe.into_unoptimized_plan()),
+            Err(e) => Err(super::Error::UnableToExecuteQuery {
+                source: find_datafusion_root(e),
+            }),
+        }
     }
 
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
@@ -312,9 +461,15 @@ impl Query {
         )
     }
 
-    async fn try_get_cached_result<'a>(
+    /// Looks `key` up in the results cache under `cache_control`.
+    ///
+    /// `cache_control` is passed rather than read from `request_context`
+    /// because a resolved `EXECUTE` is keyed by plan even where the request
+    /// asked for the SQL-text key — see `get_plan_or_cached`.
+    async fn try_get_cached_result_with_control<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
+        cache_control: CacheControl,
         mut tracker: Option<QueryTracker>,
         key: &'a CacheKey<'a>,
         sql: &str,
@@ -325,8 +480,6 @@ impl Query {
                     .with_query_tracker(tracker),
             );
         };
-
-        let cache_control = request_context.cache_control();
 
         // Validate that the provided cache key is the correct type for this request
         match (cache_control, &key) {
@@ -899,7 +1052,9 @@ mod tests {
         datafusion::{
             DataFusion,
             query::{QueryBuilder, ResultsCacheMode},
+            sql_session_extension::{ImplicitSessions, SqlSessionExtension},
         },
+        sessions::{RequestedSession, SessionStore},
         status,
     };
     use runtime_request_context::{
@@ -1137,6 +1292,23 @@ mod tests {
             vec![vec![arrow::array::RecordBatch::new_empty(schema)]],
         )
         .expect("valid mem table");
+        df.ctx
+            .register_table(TableReference::bare(name), Arc::new(table))
+            .expect("should register table");
+    }
+
+    fn register_i64_table(df: &Arc<DataFusion>, name: &'static str, values: &[i64]) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .expect("valid record batch");
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("valid mem table");
         df.ctx
             .register_table(TableReference::bare(name), Arc::new(table))
             .expect("should register table");
@@ -2548,5 +2720,349 @@ mod tests {
             .await;
 
         tracing::info!("Single-in-flight test completed successfully");
+    }
+
+    /// A request context bound to `session_id`, the way the HTTP middleware
+    /// builds one from an `x-session-id` header.
+    fn create_test_session_request_context(
+        cache_control: CacheControl,
+        sessions: &SessionStore,
+        session_id: &str,
+    ) -> Arc<RequestContext> {
+        Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(cache_control)
+                .with_extension(SqlSessionExtension::new(
+                    sessions.clone(),
+                    RequestedSession {
+                        explicit_id: Some(session_id.to_string()),
+                        bearer_token: None,
+                    },
+                    ImplicitSessions::Disabled,
+                ))
+                .build(),
+        )
+    }
+
+    /// Runs `sql` to completion in `context`, draining the result so anything
+    /// cacheable is actually stored, and returns the cache status with the
+    /// single `Int64` value produced (`None` for a statement that returns no
+    /// rows, such as `PREPARE`).
+    async fn run_i64_in_context(
+        df: &Arc<DataFusion>,
+        context: &Arc<RequestContext>,
+        sql: &str,
+    ) -> (CacheStatus, Option<i64>) {
+        let sql = sql.to_string();
+        let df = Arc::clone(df);
+        Arc::clone(context)
+            .scope(async move {
+                let result = QueryBuilder::new(&sql, df)
+                    .build()
+                    .run()
+                    .await
+                    .unwrap_or_else(|e| panic!("query '{sql}' should succeed: {e}"));
+                let cache_status = result.cache_status;
+                let records = result
+                    .data
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_or_else(|e| panic!("query '{sql}' should return records: {e}"));
+                let value = records
+                    .iter()
+                    .find(|batch| batch.num_rows() > 0)
+                    .map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap_or_else(|| {
+                                panic!("query '{sql}' should return an Int64 column")
+                            })
+                            .value(0)
+                    });
+                (cache_status, value)
+            })
+            .await
+    }
+
+    /// `EXECUTE` used to be exempt from the results cache: its plan is a
+    /// `LogicalPlan::Statement`, which `cache_is_enabled_for_plan` refuses, so
+    /// every execution of a prepared statement re-read its tables however hot
+    /// the equivalent literal query was. Each distinct argument list is its own
+    /// entry, and repeating one is served from the cache.
+    #[tokio::test]
+    async fn test_prepared_execute_is_cached_per_argument_list() {
+        let df = prepare_runtime(None).await;
+        let sessions = SessionStore::new();
+        let session = sessions.issue(&df.ctx, None, None);
+        let context = create_test_session_request_context(
+            CacheControl::Cache(CacheKeyType::Default),
+            &sessions,
+            session.id(),
+        );
+
+        let (status, value) =
+            run_i64_in_context(&df, &context, "PREPARE p(BIGINT) AS SELECT $1").await;
+        assert_eq!(
+            status,
+            CacheStatus::CacheDisabled,
+            "PREPARE mutates the session, so it is never cached"
+        );
+        assert_eq!(value, None, "PREPARE returns no rows");
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(status, CacheStatus::CacheMiss, "first EXECUTE p(1)");
+        assert_eq!(value, Some(1));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(
+            status,
+            CacheStatus::CacheHit,
+            "repeating EXECUTE p(1) is served from the cache"
+        );
+        assert_eq!(value, Some(1));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(2)").await;
+        assert_eq!(
+            status,
+            CacheStatus::CacheMiss,
+            "EXECUTE p(2) is a separate entry from EXECUTE p(1)"
+        );
+        assert_eq!(value, Some(2));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(2)").await;
+        assert_eq!(status, CacheStatus::CacheHit, "repeating EXECUTE p(2)");
+        assert_eq!(
+            value,
+            Some(2),
+            "the cached EXECUTE p(2) entry must not hold EXECUTE p(1)'s rows"
+        );
+    }
+
+    /// The same test under `cache_key_type: sql`, where the configured key is
+    /// the query text. `EXECUTE p(1)` still has to be cached, and still has to
+    /// be a different entry from `EXECUTE p(2)`.
+    #[tokio::test]
+    async fn test_prepared_execute_is_cached_with_a_sql_cache_key() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+            ..Default::default()
+        }))
+        .await;
+        let sessions = SessionStore::new();
+        let session = sessions.issue(&df.ctx, None, None);
+        let context = create_test_session_request_context(
+            CacheControl::Cache(CacheKeyType::Raw),
+            &sessions,
+            session.id(),
+        );
+
+        run_i64_in_context(&df, &context, "PREPARE p(BIGINT) AS SELECT $1").await;
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(status, CacheStatus::CacheMiss, "first EXECUTE p(1)");
+        assert_eq!(value, Some(1));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(status, CacheStatus::CacheHit, "repeating EXECUTE p(1)");
+        assert_eq!(value, Some(1));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(2)").await;
+        assert_eq!(
+            status,
+            CacheStatus::CacheMiss,
+            "EXECUTE p(2) is a separate entry from EXECUTE p(1)"
+        );
+        assert_eq!(value, Some(2));
+    }
+
+    /// Correctness guard on the key: `EXECUTE p(1)` is not self-describing —
+    /// two sessions of one principal can each `PREPARE p` as a different query,
+    /// so the same text in the same cache namespace must not serve one
+    /// session's rows to the other.
+    #[tokio::test]
+    async fn test_prepared_execute_of_the_same_name_is_not_shared_between_sessions() {
+        for cache_key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let cache_control = match cache_key_type {
+                spicepod::component::caching::CacheKeyType::Plan => {
+                    CacheControl::Cache(CacheKeyType::Default)
+                }
+                spicepod::component::caching::CacheKeyType::Sql => {
+                    CacheControl::Cache(CacheKeyType::Raw)
+                }
+            };
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type,
+                ..Default::default()
+            }))
+            .await;
+            let sessions = SessionStore::new();
+
+            // Both sessions are unowned, so they share one cache namespace —
+            // exactly the case where a text-only key would collide.
+            let first = sessions.issue(&df.ctx, None, None);
+            let second = sessions.issue(&df.ctx, None, None);
+            let first_context =
+                create_test_session_request_context(cache_control, &sessions, first.id());
+            let second_context =
+                create_test_session_request_context(cache_control, &sessions, second.id());
+
+            run_i64_in_context(&df, &first_context, "PREPARE p AS SELECT 11").await;
+            run_i64_in_context(&df, &second_context, "PREPARE p AS SELECT 22").await;
+
+            let (_, value) = run_i64_in_context(&df, &first_context, "EXECUTE p").await;
+            assert_eq!(value, Some(11), "{cache_key_type:?}");
+
+            let (_, value) = run_i64_in_context(&df, &second_context, "EXECUTE p").await;
+            assert_eq!(
+                value,
+                Some(22),
+                "{cache_key_type:?}: the second session's EXECUTE p must not be served the first \
+                session's cached rows"
+            );
+        }
+    }
+
+    /// Stale-while-revalidate applies to a prepared `EXECUTE` the same way it
+    /// applies to the literal query, and per argument list: the entry
+    /// `EXECUTE p(1)` reads is served stale and revalidated in the background,
+    /// while `EXECUTE p(2)`'s entry is untouched by that revalidation.
+    ///
+    /// The background revalidation cannot re-parse `EXECUTE p(1)` — it runs
+    /// outside the session that holds `p` — so it has to re-execute the
+    /// resolved plan. That is what this asserts by waiting for the entry to
+    /// come back as a plain hit.
+    #[tokio::test]
+    async fn test_prepared_execute_is_served_stale_while_revalidating() {
+        let df = prepare_runtime(Some(SQLResultsCacheConfig {
+            // Long enough that nothing expires on the ordinary TTL, so only the
+            // invalidation can make an entry stale.
+            item_ttl: Some("10m".to_string()),
+            cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
+            stale_while_revalidate_ttl: Some("5m".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        register_i64_table(&df, "revalidated_rows", &[1, 2]);
+        let sessions = SessionStore::new();
+        let session = sessions.issue(&df.ctx, None, None);
+        let context = create_test_session_request_context(
+            CacheControl::Cache(CacheKeyType::Default),
+            &sessions,
+            session.id(),
+        );
+
+        run_i64_in_context(
+            &df,
+            &context,
+            "PREPARE p(BIGINT) AS SELECT count(*) FROM revalidated_rows WHERE id >= $1",
+        )
+        .await;
+
+        for sql in ["EXECUTE p(1)", "EXECUTE p(2)"] {
+            assert_eq!(
+                run_i64_in_context(&df, &context, sql).await.0,
+                CacheStatus::CacheMiss,
+                "{sql} first run"
+            );
+            assert_eq!(
+                run_i64_in_context(&df, &context, sql).await.0,
+                CacheStatus::CacheHit,
+                "{sql} second run"
+            );
+        }
+
+        df.caching()
+            .invalidate_for_table(TableReference::bare("revalidated_rows"))
+            .await
+            .expect("invalidation should succeed");
+        if let Some(cache_provider) = df.results_cache_provider() {
+            cache_provider.run_pending_tasks().await;
+        }
+
+        assert_eq!(
+            run_i64_in_context(&df, &context, "EXECUTE p(1)").await.0,
+            CacheStatus::CacheStaleWhileRevalidate,
+            "a refresh must leave the previous EXECUTE result servable rather than flushing it"
+        );
+
+        // The revalidation stores a result whose read began after the refresh,
+        // so the entry becomes a plain hit again. Poll for it rather than
+        // sleeping a fixed interval.
+        let mut revalidated = false;
+        for _ in 0..100 {
+            if run_i64_in_context(&df, &context, "EXECUTE p(1)").await.0 == CacheStatus::CacheHit {
+                revalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            revalidated,
+            "background revalidation never replaced the EXECUTE entry the refresh marked stale"
+        );
+
+        // `EXECUTE p(2)` is its own entry, so it was marked stale by the same
+        // invalidation and revalidates on its own rather than riding along with
+        // `EXECUTE p(1)`.
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(2)").await;
+        assert!(
+            matches!(
+                status,
+                CacheStatus::CacheStaleWhileRevalidate | CacheStatus::CacheHit
+            ),
+            "EXECUTE p(2) should be servable from its own entry, got {status:?}"
+        );
+        assert_eq!(value, Some(1), "EXECUTE p(2) counts only id >= 2");
+    }
+
+    /// A prepared statement reads real tables, so its cached result has to be
+    /// registered against them — otherwise a refresh or a DML would leave the
+    /// entry serving pre-mutation rows forever.
+    #[tokio::test]
+    async fn test_prepared_execute_result_is_invalidated_by_its_input_tables() {
+        let df = prepare_runtime(None).await;
+        register_i64_table(&df, "prepared_rows", &[1, 2]);
+        let sessions = SessionStore::new();
+        let session = sessions.issue(&df.ctx, None, None);
+        let context = create_test_session_request_context(
+            CacheControl::Cache(CacheKeyType::Default),
+            &sessions,
+            session.id(),
+        );
+
+        run_i64_in_context(
+            &df,
+            &context,
+            "PREPARE p(BIGINT) AS SELECT count(*) FROM prepared_rows WHERE id >= $1",
+        )
+        .await;
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(status, CacheStatus::CacheMiss);
+        assert_eq!(value, Some(2));
+
+        let (status, value) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(status, CacheStatus::CacheHit);
+        assert_eq!(value, Some(2));
+
+        df.caching()
+            .invalidate_for_table(TableReference::bare("prepared_rows"))
+            .await
+            .expect("invalidating the table should succeed");
+
+        let (status, _) = run_i64_in_context(&df, &context, "EXECUTE p(1)").await;
+        assert_eq!(
+            status,
+            CacheStatus::CacheMiss,
+            "the entry must be registered against 'prepared_rows' so invalidating that table \
+            drops it"
+        );
     }
 }
