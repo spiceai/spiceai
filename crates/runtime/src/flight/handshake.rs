@@ -60,6 +60,8 @@ pub(crate) async fn handle(
         basic_auth,
     );
 
+    let owned = owner_stable_id.is_some();
+
     // `auth_token` is also the credential the session id stands in for when a
     // client presents the id as its bearer token (see `SessionAwareAuth`).
     let session = session_store.issue(&datafusion.ctx, owner_stable_id, auth_token.clone());
@@ -69,7 +71,7 @@ pub(crate) async fn handle(
     // bearer credential.
     tracing::debug!(
         authenticated = auth_token.is_some(),
-        owned = owner_stable_id.is_some(),
+        owned,
         "Created a new Flight SQL session"
     );
 
