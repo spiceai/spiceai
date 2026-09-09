@@ -123,7 +123,9 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -136,7 +138,7 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_datafusion::join_accumulator::{
     DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES, ExactLeftAccumulator,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::maintained_aggregate::{
@@ -828,7 +830,7 @@ fn try_rewrite_oversized_join(
             if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
-            return finish_sort_merge_rewrite(hash_join);
+            return finish_sort_merge_rewrite(hash_join, true);
         };
         let Some(estimated_build_bytes) =
             build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
@@ -836,7 +838,7 @@ fn try_rewrite_oversized_join(
             if !should_spill_unknown_size_join(hash_join) {
                 return Ok(None);
             }
-            return finish_sort_merge_rewrite(hash_join);
+            return finish_sort_merge_rewrite(hash_join, true);
         };
 
         // Per-join budget: the smaller of the absolute pool fraction and an even
@@ -910,11 +912,19 @@ fn try_rewrite_oversized_join(
         return Ok(None);
     }
 
-    finish_sort_merge_rewrite(hash_join)
+    finish_sort_merge_rewrite(hash_join, false)
 }
 
+/// Replace `hash_join` with a spillable `SortMergeJoinExec`.
+///
+/// `coalesce_sorts` collapses each side to one partition before sorting.
+/// Partitioned `SortExec` (one `ExternalSorter` per partition) exhausts a
+/// greedy query pool: TPC-DS Q78 at SF-100 rewrote the 19 GB hash join to
+/// sort-merge, then twenty `ExternalSorter`s each held 10–56 GB and a new
+/// sorter with 0 bytes could not allocate.
 fn finish_sort_merge_rewrite(
     hash_join: &HashJoinExec,
+    coalesce_sorts: bool,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     let sort_options = vec![SortOptions::default(); hash_join.on().len()];
     let Some(left_ordering) = join_key_ordering(
@@ -938,13 +948,24 @@ fn finish_sort_merge_rewrite(
 
     // Preserve the input partitioning. This rule runs AFTER `EnforceDistribution`,
     // so a `mode=Partitioned` `HashJoinExec` already has both inputs hash-
-    // partitioned on the join keys into N partitions;
+    // partitioned on the join keys into N partitions. Unknown-size aggregate
+    // joins coalesce first so a single spillable sorter runs instead of N,
+    // then the original N is restored so a parent Partitioned hash join still
+    // sees matching counts.
+    let output_partitioning = hash_join.properties().output_partitioning().clone();
     let left: Arc<dyn ExecutionPlan> = Arc::new(
-        SortExec::new(left_ordering, Arc::clone(hash_join.left())).with_preserve_partitioning(true),
+        SortExec::new(
+            left_ordering,
+            coalesce_for_spillable_sort(Arc::clone(hash_join.left()), coalesce_sorts),
+        )
+        .with_preserve_partitioning(true),
     );
     let right: Arc<dyn ExecutionPlan> = Arc::new(
-        SortExec::new(right_ordering, Arc::clone(hash_join.right()))
-            .with_preserve_partitioning(true),
+        SortExec::new(
+            right_ordering,
+            coalesce_for_spillable_sort(Arc::clone(hash_join.right()), coalesce_sorts),
+        )
+        .with_preserve_partitioning(true),
     );
 
     let join = SortMergeJoinExec::try_new(
@@ -959,6 +980,11 @@ fn finish_sort_merge_rewrite(
     let join: Arc<dyn ExecutionPlan> = Arc::new(join);
     let Some(join) = wrap_sort_merge_to_hash_join_schema(join, hash_join)? else {
         return Ok(None);
+    };
+    let join = if coalesce_sorts {
+        restore_hash_join_partitioning(join, &output_partitioning)?
+    } else {
+        join
     };
 
     tracing::debug!(
@@ -1031,12 +1057,17 @@ fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
         || !collect_cayenne_scans(hash_join.right()).is_empty()
 }
 
-/// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74): either
-/// both inputs share a schema, or every equi-join key has the same physical
-/// name on both sides (`customer_id = customer_id`). Distinct CTE bodies
-/// (Q78 `ss` ⋈ `ws` on `ss_item_sk = ws_item_sk`) have different key names
-/// and still spill.
+/// Unknown-size self-join of one CTE (TPC-DS `year_total` Q4/Q11/Q74).
+/// Same projected schema or same-named equi-join keys are not enough:
+/// TPC-DS Q97's `ssci` ⋈ `csci` full-outer join projects `customer_sk` /
+/// `item_sk` on both sides but reads `store_sales` vs `catalog_sales`.
+/// Distinct Cayenne scan identities are not a self-join and must still spill.
 fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
+    let left_ids = cayenne_scan_identity_set(hash_join.left());
+    let right_ids = cayenne_scan_identity_set(hash_join.right());
+    if !left_ids.is_empty() && !right_ids.is_empty() && left_ids != right_ids {
+        return false;
+    }
     if hash_join.left().schema() == hash_join.right().schema() {
         return true;
     }
@@ -1050,6 +1081,43 @@ fn is_unknown_size_self_join(hash_join: &HashJoinExec) -> bool {
                 _ => false,
             }
         })
+}
+
+fn cayenne_scan_identity_set(plan: &Arc<dyn ExecutionPlan>) -> HashSet<Arc<ScanIdentity>> {
+    collect_cayenne_scans(plan)
+        .into_iter()
+        .map(|scan| scan.identity)
+        .collect()
+}
+
+fn coalesce_for_spillable_sort(
+    plan: Arc<dyn ExecutionPlan>,
+    coalesce: bool,
+) -> Arc<dyn ExecutionPlan> {
+    if coalesce && plan.output_partitioning().partition_count() > 1 {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    } else {
+        plan
+    }
+}
+
+fn restore_hash_join_partitioning(
+    plan: Arc<dyn ExecutionPlan>,
+    partitioning: &Partitioning,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let n = partitioning.partition_count();
+    if n <= 1 || plan.output_partitioning().partition_count() == n {
+        return Ok(plan);
+    }
+    match partitioning {
+        Partitioning::Hash(exprs, _) => Ok(Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::Hash(exprs.clone(), n),
+        )?)),
+        Partitioning::RoundRobinBatch(_) | Partitioning::UnknownPartitioning(_) => Ok(Arc::new(
+            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(n))?,
+        )),
+    }
 }
 
 /// Whether an input is an `AggregateExec` (or a unary wrapper over one).
@@ -1789,6 +1857,7 @@ mod tests {
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
     use datafusion::physical_plan::Partitioning;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
@@ -3422,9 +3491,9 @@ mod tests {
             Field::new("sale_type", DataType::Int64, false),
         ]));
         let left =
-            cayenne_file_exec_with_num_rows(&left_schema, "yt1.vortex", Precision::Absent);
+            cayenne_file_exec_with_num_rows(&left_schema, "year_total.vortex", Precision::Absent);
         let right =
-            cayenne_file_exec_with_num_rows(&right_schema, "yt2.vortex", Precision::Absent);
+            cayenne_file_exec_with_num_rows(&right_schema, "year_total.vortex", Precision::Absent);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -3486,18 +3555,11 @@ mod tests {
         let left_schema = channel_schema("cs_item_sk", "cs_qty");
         let right_schema = channel_schema("ss_item_sk", "ss_qty");
         let left = grouped_count_over(
-            cayenne_file_exec_with_num_rows(
-                &left_schema,
-                "cs.vortex",
-                Precision::Inexact(1_000),
-            ),
+            cayenne_file_exec_with_num_rows(&left_schema, "cs.vortex", Precision::Inexact(1_000)),
             "cs_item_sk",
         );
-        let right = cayenne_file_exec_with_num_rows(
-            &right_schema,
-            "ss.vortex",
-            Precision::Inexact(1_000),
-        );
+        let right =
+            cayenne_file_exec_with_num_rows(&right_schema, "ss.vortex", Precision::Inexact(1_000));
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -3518,23 +3580,115 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_absent_stats_same_named_keys_distinct_sources() {
+        // TPC-DS Q97: ssci ⋈ csci full-outer join on customer_sk. Same
+        // projected names, different Cayenne sources — must spill.
+        let schema = channel_schema("customer_sk", "item_sk");
+        let left = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "store_sales.vortex", Precision::Absent),
+            "customer_sk",
+        );
+        let right = grouped_count_over(
+            cayenne_file_exec_with_num_rows(&schema, "catalog_sales.vortex", Precision::Absent),
+            "customer_sk",
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "customer_sk",
+            "customer_sk",
+            JoinType::Full,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "Q97-style same-named keys over distinct Cayenne sources must spill"
+        );
+    }
+
+    #[test]
+    fn unknown_size_sort_merge_coalesces_partitioned_inputs() {
+        // TPC-DS Q78 at SF-100: 20 partitioned ExternalSorters exhausted the
+        // greedy 107.5 GB pool. Unknown-size aggregate joins must coalesce
+        // to one partition before the spillable sort.
+        let left_schema = channel_schema("cs_item_sk", "cs_qty");
+        let right_schema = channel_schema("ss_item_sk", "ss_qty");
+        let left = hash_repartition(
+            grouped_count_over(
+                cayenne_file_exec_with_num_rows(&left_schema, "cs.vortex", Precision::Absent),
+                "cs_item_sk",
+            ),
+            "cs_item_sk",
+            8,
+        );
+        let right = hash_repartition(
+            grouped_count_over(
+                cayenne_file_exec_with_num_rows(&right_schema, "ss.vortex", Precision::Absent),
+                "ss_item_sk",
+            ),
+            "ss_item_sk",
+            8,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "cs_item_sk",
+            "ss_item_sk",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+        assert_eq!(
+            optimized.output_partitioning().partition_count(),
+            8,
+            "coalesced sort-merge must restore the original partition count"
+        );
+        let wrapper_children = optimized.children();
+        let smj_node = if optimized.is::<SortMergeJoinExec>() {
+            Arc::clone(&optimized)
+        } else {
+            Arc::clone(
+                wrapper_children
+                    .first()
+                    .expect("repartition wrapper must have a child"),
+            )
+        };
+        let smj = smj_node
+            .downcast_ref::<SortMergeJoinExec>()
+            .expect("unknown-size aggregate join must become sort-merge");
+        for (side, child) in smj.children().iter().enumerate() {
+            let sort = child
+                .downcast_ref::<SortExec>()
+                .unwrap_or_else(|| panic!("sort-merge input {side} must be SortExec"));
+            let sort_children = sort.children();
+            let sort_input = sort_children
+                .first()
+                .unwrap_or_else(|| panic!("SortExec {side} must have an input"));
+            assert!(
+                sort_input.is::<CoalescePartitionsExec>(),
+                "sort-merge input {side} must coalesce before sorting"
+            );
+        }
+    }
+
+    #[test]
     fn rewrites_inexact_stats_distinct_schema_hash_join() {
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = grouped_count_over(
-            cayenne_file_exec_with_num_rows(
-                &left_schema,
-                "ss.vortex",
-                Precision::Inexact(1_000),
-            ),
+            cayenne_file_exec_with_num_rows(&left_schema, "ss.vortex", Precision::Inexact(1_000)),
             "ss_item_sk",
         );
         let right = grouped_count_over(
-            cayenne_file_exec_with_num_rows(
-                &right_schema,
-                "ws.vortex",
-                Precision::Inexact(1_000),
-            ),
+            cayenne_file_exec_with_num_rows(&right_schema, "ws.vortex", Precision::Inexact(1_000)),
             "ws_item_sk",
         );
         let join = Arc::new(hash_join_with_join_type(
