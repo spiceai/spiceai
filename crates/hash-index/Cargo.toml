@@ -19,6 +19,11 @@ snafu.workspace = true
 telemetry = { path = "../telemetry", optional = true }
 tracing.workspace = true
 twox-hash.workspace = true
+# Specification and proof vocabulary for `src/sbbf_layout.rs`. A normal
+# `cargo build` erases the specifications, so this carries no runtime cost;
+# `cargo verus focus` re-checks the proofs. Pinned to the Verus release whose
+# verifier is run in CI — the two are versioned together.
+vstd = "=0.0.0-2026-08-30-0159"
 
 [features]
 default = []
@@ -39,3 +44,8 @@ harness = false
 
 [lints]
 workspace = true
+
+# Opts this crate into `cargo verus focus`. Without it the verifier compiles the
+# crate and checks nothing, reporting "no crates that opted into verification".
+[package.metadata.verus]
+verify = true
