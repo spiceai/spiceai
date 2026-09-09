@@ -43,22 +43,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::prelude::SessionContext;
-use http::HeaderMap;
+use http::{HeaderMap, HeaderName};
 use moka::sync::Cache;
 use runtime_auth::AuthPrincipalRef;
 use util::session_state::builder_from_existing;
 use uuid::Uuid;
 
 /// How long a session survives without being used.
-const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+const SESSION_TTL: Duration = Duration::from_hours(1);
 
 /// How many sessions the store holds before evicting the least recently used.
 /// Each holds a `DataFusion` context, so this is what bounds the memory
 /// sessions can occupy.
 const MAX_SESSIONS: u64 = 10_000;
 
-/// Header a request names its session with.
-pub const SESSION_ID_HEADER: &str = "x-session-id";
+/// Header a request names its session with. A `HeaderName` rather than a `&str`
+/// so the CORS allowlists in `http::routes` and the header lookups here share
+/// one definition, checked at compile time.
+pub const SESSION_ID_HEADER: HeaderName = HeaderName::from_static("x-session-id");
 
 /// Key prefix for implicit sessions, which are addressed by the principal that
 /// owns them rather than by an issued id. It is not a valid issued id (those are
@@ -70,8 +72,8 @@ const IMPLICIT_KEY_PREFIX: &str = "implicit:";
 pub enum SessionKind {
     /// The client asked for a session and was given an id — a Flight SQL
     /// handshake, or `POST /v1/sessions`. The id is what the client presents on
-    /// later requests, so it is a CSPRNG-random UUIDv4: it must be
-    /// unpredictable, and (unlike the time-ordered UUIDv7) must not leak when
+    /// later requests, so it is a CSPRNG-random `UUIDv4`: it must be
+    /// unpredictable, and (unlike the time-ordered `UUIDv7`) must not leak when
     /// the session was created.
     Issued,
 
@@ -389,7 +391,7 @@ mod tests {
     }
 
     /// Session ids are handed to clients and accepted as bearer tokens, so they
-    /// must be CSPRNG-random (UUIDv4) — never the time-ordered UUIDv7, whose
+    /// must be CSPRNG-random (`UUIDv4`) — never the time-ordered `UUIDv7`, whose
     /// value leaks its creation time and is partly predictable.
     #[test]
     fn an_issued_id_is_a_random_uuid() {
@@ -517,7 +519,11 @@ mod tests {
         let implicit = store.implicit_for(&SessionContext::new(), &owner);
 
         assert!(store.get_issued(implicit.id()).is_none());
-        assert!(store.get_issued(&format!("{IMPLICIT_KEY_PREFIX}{owner}")).is_none());
+        assert!(
+            store
+                .get_issued(&format!("{IMPLICIT_KEY_PREFIX}{owner}"))
+                .is_none()
+        );
     }
 
     /// The id of an issued session authenticates as the key it was issued
@@ -543,7 +549,10 @@ mod tests {
     #[test]
     fn a_request_names_the_explicit_header_and_the_bearer_token() {
         let mut headers = HeaderMap::new();
-        assert_eq!(RequestedSession::from_headers(&headers), RequestedSession::default());
+        assert_eq!(
+            RequestedSession::from_headers(&headers),
+            RequestedSession::default()
+        );
 
         headers.insert(
             http::header::AUTHORIZATION,
@@ -567,7 +576,10 @@ mod tests {
     #[test]
     fn a_blank_header_names_no_session() {
         let mut headers = HeaderMap::new();
-        headers.insert(SESSION_ID_HEADER, "   ".parse().expect("a valid header value"));
+        headers.insert(
+            SESSION_ID_HEADER,
+            "   ".parse().expect("a valid header value"),
+        );
         headers.insert(
             http::header::AUTHORIZATION,
             "Bearer ".parse().expect("a valid header value"),

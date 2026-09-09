@@ -103,7 +103,30 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 .headers()
                 .get("access-control-allow-methods")
                 .expect("cors header is present");
-            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH,OPTIONS");
+            assert_eq!(
+                cors_allow_methods_header,
+                "GET,POST,PATCH,DELETE,OPTIONS",
+                "DELETE /v1/sessions/{{session_id}} is unreachable from a browser without DELETE here"
+            );
+
+            let cors_allow_headers_header = response
+                .headers()
+                .get("access-control-allow-headers")
+                .expect("cors header is present");
+            assert_eq!(
+                cors_allow_headers_header,
+                "accept,content-type,authorization,x-session-id",
+                "a browser cannot name a session on /v1/sql without `x-session-id` here"
+            );
+
+            let cors_expose_headers_header = response
+                .headers()
+                .get("access-control-expose-headers")
+                .expect("cors header is present");
+            assert_eq!(
+                cors_expose_headers_header, "x-session-id",
+                "a browser cannot read the id POST /v1/sessions returns without this"
+            );
 
             Ok(())
         })
@@ -177,6 +200,20 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 response
                     .headers()
                     .get("access-control-allow-methods")
+                    .is_none()
+            );
+
+            assert!(
+                response
+                    .headers()
+                    .get("access-control-allow-headers")
+                    .is_none()
+            );
+
+            assert!(
+                response
+                    .headers()
+                    .get("access-control-expose-headers")
                     .is_none()
             );
 

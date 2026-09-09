@@ -19,9 +19,9 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::datafusion::sql_session_extension::{ImplicitSessions, SqlSessionExtension};
-use crate::sessions::{RequestedSession, SessionStore};
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
+use crate::sessions::{RequestedSession, SESSION_ID_HEADER, SessionStore};
 use crate::status::RuntimeStatus;
 
 use crate::Runtime;
@@ -695,9 +695,18 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
-        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
-        .allow_origin(allowed_origins)
+    cors.allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
+    .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION, SESSION_ID_HEADER])
+    // A browser can only read a response header that is exposed, and
+    // `POST /v1/sessions` returns the new session's id in one.
+    .expose_headers([SESSION_ID_HEADER])
+    .allow_origin(allowed_origins)
 }
 
 /// Map common HTTP methods to static metric labels (avoids per-request allocation).
